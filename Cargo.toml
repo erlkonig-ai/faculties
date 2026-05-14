@@ -48,6 +48,7 @@ triblespace = "0.38"
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).
 anybytes = "0.20"           # files
 base64 = "0.22"             # teams
+blake3 = "1"                # mail (deterministic entity id from Message-Id)
 chrono = { version = "0.4.39", features = ["clock"] }  # orient
 comemo = "0.5.1"            # wiki
 dirs = "5"                  # wiki
@@ -55,7 +56,10 @@ hex = "0.4"                 # gauge
 humantime = "2.3.0"         # orient, patience
 ical = "0.11"               # planner
 itertools = "0.14"          # wiki
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }  # mail (SMTP send)
 libc = "0.2"                # teams
+mailparse = "0.16"          # mail (RFC 5322 parser)
+rust-pop3-client = "0.3"    # mail (POP3 fetch, rustls-backed)
 rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }  # discord, files, teams, web
@@ -72,3 +76,9 @@ typst-syntax = "0.14"       # wiki
 GORBIE = { version = "0.13", default-features = false, features = ["typst", "markdown"], optional = true }
 egui = { version = "0.34", optional = true }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu", "std"], optional = true }
+
+
+# DEV-ONLY: route GORBIE to the local checkout so search-bar work
+# in ../GORBIE is reachable from this crate. Revert before publishing.
+[patch.crates-io]
+GORBIE = { path = "../GORBIE" }
