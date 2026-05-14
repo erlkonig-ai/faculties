@@ -60,6 +60,7 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 libc = "0.2"                # teams
 mailparse = "0.16"          # mail (RFC 5322 parser)
 rust-pop3-client = "0.3"    # mail (POP3 fetch, rustls-backed)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }  # mail (crypto provider for rust-pop3-client)
 rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }  # discord, files, teams, web

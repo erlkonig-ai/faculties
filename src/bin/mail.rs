@@ -1583,6 +1583,12 @@ fn resolve_branch(
 }
 
 fn main() -> Result<()> {
+    // rust-pop3-client depends on rustls 0.23 but doesn't select a
+    // crypto provider; install one explicitly here so the lazy
+    // default-provider lookup doesn't panic on first TLS use.
+    // Idempotent — re-installing is a no-op error we ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     let cmd = cli.command.unwrap_or(Command::Today);
 
