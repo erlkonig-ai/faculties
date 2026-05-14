@@ -4,10 +4,12 @@ use chrono::{
     DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
 };
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
 use faculties::schemas::orient::{
     CONFIG_BRANCH_ID, CONFIG_KIND_ID, KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_ORIENT_CHECKPOINT_ID,
     KIND_READ_ID, KIND_STATUS_ID, board, config_schema, local, orient_state,
 };
+use faculties::schemas::relations::relations as rel_attrs;
 use hifitime::Epoch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -217,6 +219,145 @@ fn load_reads(space: &TribleSet) -> HashMap<(Id, Id), i128> {
     reads
 }
 
+/// Resolve the mail-faculty self identity: the relations entry
+/// whose `email` attribute matches `$MAIL_USER` (case-folded).
+/// Returns None if `MAIL_USER` isn't set or if no relations entry
+/// has been auto-registered for it yet.
+fn find_mail_self(relations_space: &TribleSet) -> Option<(String, Id)> {
+    let user = std::env::var("MAIL_USER").ok()?;
+    let needle = user.trim().to_ascii_lowercase();
+    let id = find!(
+        (id: Id, e: String),
+        pattern!(relations_space, [{
+            ?id @ rel_attrs::email: ?e,
+        }])
+    )
+    .find_map(|(id, e)| {
+        if e.to_ascii_lowercase() == needle {
+            Some(id)
+        } else {
+            None
+        }
+    })?;
+    Some((user, id))
+}
+
+/// Render the "Mail (unread inbox for ...)" section. Treats absence
+/// of the `mail` branch or `MAIL_USER` env var as a graceful "skip"
+/// rather than an error — orient is a snapshot, not a config tool.
+fn render_unread_mail(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    relations_branch_id: Id,
+    message_limit: usize,
+    now_key: i128,
+) -> Result<()> {
+    // Need a relations workspace to resolve the self identity.
+    let mut rws = repo
+        .pull(relations_branch_id)
+        .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+    let rel_space = rws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+
+    let Some((user, self_id)) = find_mail_self(&rel_space) else {
+        // Either MAIL_USER isn't set or the auto-registration hasn't
+        // happened yet (no fetch/send has run). Either way, render
+        // a brief note rather than crashing.
+        println!("Mail:");
+        match std::env::var("MAIL_USER") {
+            Ok(u) => println!("- No relations entry for {u} yet (run `mail fetch` or `mail send` once)"),
+            Err(_) => println!("- MAIL_USER env var not set; skipping"),
+        }
+        return Ok(());
+    };
+
+    let mail_branch_id = match repo.ensure_branch("mail", None) {
+        Ok(id) => id,
+        Err(_) => {
+            println!("Mail (unread for {user}):");
+            println!("- mail branch not present yet");
+            return Ok(());
+        }
+    };
+    let mut mws = repo
+        .pull(mail_branch_id)
+        .map_err(|e| anyhow!("pull mail: {e:?}"))?;
+    let mail_space = mws.checkout(..).map_err(|e| anyhow!("checkout mail: {e:?}"))?;
+
+    // Collect candidate messages: KIND_MAIL_MESSAGE entities NOT
+    // sent by us (so outbound mail doesn't show as "unread") AND
+    // with no read receipt for self_id.
+    let mut rows: Vec<(i128, Id, Option<Id>, String)> = Vec::new();
+    for id in find!(
+        e: Id,
+        pattern!(&mail_space, [{ ?e @ metadata::tag: (KIND_MAIL_MESSAGE) }])
+    ) {
+        // Skip our outbound (where mail::from == self_id).
+        let from: Option<Id> =
+            find!(r: Id, pattern!(&mail_space, [{ id @ mail::from: ?r }])).next();
+        if from == Some(self_id) {
+            continue;
+        }
+        // Skip spam-tagged.
+        let is_spam = find!(t: Id, pattern!(&mail_space, [{ id @ metadata::tag: ?t }]))
+            .any(|t| t == KIND_SPAM);
+        if is_spam {
+            continue;
+        }
+        // Skip if already read by us.
+        let read_exists = find!(
+            r: Id,
+            pattern!(&mail_space, [{
+                ?r @
+                    metadata::tag: (KIND_READ_ID),
+                    local::about_message: (id),
+                    local::reader: (self_id),
+            }])
+        )
+        .next()
+        .is_some();
+        if read_exists {
+            continue;
+        }
+
+        let sent_at_iv: Option<IntervalValue> = find!(
+            t: IntervalValue,
+            pattern!(&mail_space, [{ id @ mail::sent_at: ?t }])
+        )
+        .next();
+        let Some(iv) = sent_at_iv else { continue };
+        let sent_at_key = interval_key(iv);
+
+        let subject_h: Option<TextHandle> =
+            find!(h: TextHandle, pattern!(&mail_space, [{ id @ mail::subject: ?h }])).next();
+        let subject = subject_h.and_then(|h| read_text(&mut mws, h).ok()).unwrap_or_default();
+
+        rows.push((sent_at_key, id, from, subject));
+    }
+    // Newest first.
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+
+    println!("Mail (unread for {user}):");
+    if rows.is_empty() {
+        println!("- None");
+    } else {
+        for (sent_at_key, id, from_id, subject) in rows.into_iter().take(message_limit) {
+            let from_email = from_id
+                .and_then(|rid| {
+                    find!(
+                        e: String,
+                        pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])
+                    )
+                    .next()
+                })
+                .unwrap_or_else(|| "?".into());
+            let age = format_age(now_key, sent_at_key);
+            println!("- [{}] {} {} — {}", fmt_id(id), age, from_email, subject);
+        }
+    }
+    Ok(())
+}
+
 fn task_title(
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     space: &TribleSet,
@@ -392,6 +533,9 @@ fn cmd_show(
         }
 
         drop(local_ws);
+
+        // ── Mail (unread inbox for the address in $MAIL_USER) ────
+        render_unread_mail(repo, relations_branch_id, message_limit, now_key)?;
 
         let mut compass_ws = repo
             .pull(compass_branch_id)

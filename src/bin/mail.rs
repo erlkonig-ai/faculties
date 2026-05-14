@@ -22,6 +22,7 @@ use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::files::{file, KIND_FILE};
+use faculties::schemas::local_messages::{local as read_attrs, KIND_READ_ID};
 use faculties::schemas::mail::{mail, KIND_MESSAGE, KIND_SPAM};
 use faculties::schemas::relations::{relations as rel_attrs, KIND_PERSON_ID};
 use hifitime::Epoch;
@@ -108,6 +109,14 @@ enum Command {
         /// Show everything (spam + ham).
         #[arg(long)]
         all: bool,
+        /// Show only unread messages (no read-receipt by us).
+        #[arg(long)]
+        unread: bool,
+    },
+    /// Mark a message as read (a no-op if already marked).
+    Read {
+        /// Full 32-char hex entity id.
+        message: String,
     },
     /// Messages received or sent today (local TZ).
     Today,
@@ -290,6 +299,81 @@ fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, h: TextHandle) -> O
 fn read_bytes(ws: &mut Workspace<Pile<valueschemas::Blake3>>, h: FileHandle) -> Option<Vec<u8>> {
     let blob: Blob<blobschemas::FileBytes> = ws.get(h).ok()?;
     Some(blob.bytes.to_vec())
+}
+
+// ── read tracking ─────────────────────────────────────────────────────────
+//
+// Re-uses the KIND_READ_ID + about_message/reader/read_at schema from
+// `local_messages` — those attributes are generic message-read-receipt
+// shapes (the module name is historical from the faculty that
+// introduced them; the IDs themselves are cross-faculty).
+
+/// Find a relations entry whose `email` attribute matches the
+/// provided address (case-folded). Used to resolve "the local
+/// agent's identity" — i.e. who we are when marking messages read.
+fn find_self_persona(relations_space: &TribleSet, email: &str) -> Option<Id> {
+    let needle = email.trim().to_ascii_lowercase();
+    find!(
+        (id: Id, e: String),
+        pattern!(relations_space, [{
+            ?id @
+                metadata::tag: (KIND_PERSON_ID),
+                rel_attrs::email: ?e,
+        }])
+    )
+    .find_map(|(id, e)| {
+        if e.to_ascii_lowercase() == needle {
+            Some(id)
+        } else {
+            None
+        }
+    })
+}
+
+/// Returns true if `reader_id` has marked `message_id` as read.
+fn is_read(mail_space: &TribleSet, message_id: Id, reader_id: Id) -> bool {
+    find!(
+        r: Id,
+        pattern!(mail_space, [{
+            ?r @
+                metadata::tag: (KIND_READ_ID),
+                read_attrs::about_message: (message_id),
+                read_attrs::reader: (reader_id),
+        }])
+    )
+    .next()
+    .is_some()
+}
+
+/// Mint a read-receipt entity if one doesn't already exist for
+/// `(message_id, reader_id)`. Idempotent.
+fn mark_read_if_unread(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    mail_branch_id: Id,
+    message_id: Id,
+    reader_id: Id,
+) -> Result<bool> {
+    let mut ws = repo
+        .pull(mail_branch_id)
+        .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
+    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    if is_read(&space, message_id, reader_id) {
+        return Ok(false);
+    }
+    let read_id = ufoid();
+    let now = instant_interval(now_epoch());
+    let mut change = TribleSet::new();
+    change += entity! { &read_id @
+        metadata::tag: &KIND_READ_ID,
+        metadata::created_at: now,
+        read_attrs::about_message: &message_id,
+        read_attrs::reader: &reader_id,
+        read_attrs::read_at: now,
+    };
+    ws.commit(change, "mail: mark read");
+    repo.push(&mut ws)
+        .map_err(|e| anyhow::anyhow!("push read receipt: {e:?}"))?;
+    Ok(true)
 }
 
 // ── address handling ──────────────────────────────────────────────────────
@@ -1120,6 +1204,7 @@ fn collect_messages(
     window: Option<(Epoch, Epoch)>,
     spam_only: bool,
     include_spam: bool,
+    unread_only: Option<Id>,
 ) -> Vec<Row> {
     let mut out = Vec::new();
     let ids: Vec<Id> = find!(
@@ -1150,6 +1235,11 @@ fn collect_messages(
         }
         if !spam_only && !include_spam && is_spam {
             continue;
+        }
+        if let Some(reader_id) = unread_only {
+            if is_read(space, id, reader_id) {
+                continue;
+            }
         }
         let subject_h: Option<TextHandle> = find!(
             h: TextHandle,
@@ -1218,6 +1308,7 @@ fn cmd_list(
     to: Option<String>,
     spam_only: bool,
     all: bool,
+    unread_only: bool,
 ) -> Result<()> {
     let window = match (from.as_deref(), to.as_deref()) {
         (None, None) => None,
@@ -1244,7 +1335,21 @@ fn cmd_list(
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
         let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
-        let rows = collect_messages(&mut mws, &mail_space, &rel_space, window, spam_only, all);
+        let reader_filter = if unread_only {
+            let config = load_config()?;
+            find_self_persona(&rel_space, &config.user)
+        } else {
+            None
+        };
+        let rows = collect_messages(
+            &mut mws,
+            &mail_space,
+            &rel_space,
+            window,
+            spam_only,
+            all,
+            reader_filter,
+        );
         print_rows(&rows);
         Ok(())
     })
@@ -1291,7 +1396,7 @@ fn cmd_today(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result
             .pull(relations_branch_id)
             .map_err(|err| anyhow::anyhow!("pull relations: {err:?}"))?;
         let rel_space = rws.checkout(..).map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
-        let rows = collect_messages(&mut mws, &mail_space, &rel_space, Some((s, e)), false, false);
+        let rows = collect_messages(&mut mws, &mail_space, &rel_space, Some((s, e)), false, false, None);
         print_rows(&rows);
         Ok(())
     })
@@ -1308,7 +1413,7 @@ fn cmd_week(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result<
             .pull(relations_branch_id)
             .map_err(|err| anyhow::anyhow!("pull relations: {err:?}"))?;
         let rel_space = rws.checkout(..).map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
-        let rows = collect_messages(&mut mws, &mail_space, &rel_space, Some((s, e)), false, false);
+        let rows = collect_messages(&mut mws, &mail_space, &rel_space, Some((s, e)), false, false, None);
         print_rows(&rows);
         Ok(())
     })
@@ -1391,6 +1496,55 @@ fn cmd_show(
         println!("  ----");
         for line in body.lines() {
             println!("  {line}");
+        }
+        Ok(())
+    })?;
+    // Auto-mark on show (opening = reading, mirrors what mail clients do).
+    // Idempotent: if a read receipt already exists for this message + the
+    // local agent, mark_read_if_unread is a no-op. Quietly skip if we
+    // can't resolve the local agent's relations entry (no MAIL_USER set
+    // yet, or no auto-registered Toby entry — the user can still mark
+    // explicitly with `mail read <id>` later).
+    if let Ok(config) = load_config() {
+        let _ = with_repo(pile, |repo| {
+            let mut rws = repo
+                .pull(relations_branch_id)
+                .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+            let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            if let Some(self_id) = find_self_persona(&rel_space, &config.user) {
+                mark_read_if_unread(repo, mail_branch_id, id, self_id)?;
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+fn cmd_read(
+    pile: &Path,
+    mail_branch_id: Id,
+    relations_branch_id: Id,
+    message: String,
+) -> Result<()> {
+    let id = parse_full_id(&message)?;
+    let config = load_config()?;
+    with_repo(pile, |repo| {
+        let mut rws = repo
+            .pull(relations_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let self_id = find_self_persona(&rel_space, &config.user).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no relations entry for {} — send or receive at least one message first \
+                 so the auto-registration mints your entry",
+                config.user
+            )
+        })?;
+        let now_new = mark_read_if_unread(repo, mail_branch_id, id, self_id)?;
+        if now_new {
+            println!("Marked {} as read.", fmt_id(id));
+        } else {
+            println!("{} was already read.", fmt_id(id));
         }
         Ok(())
     })
@@ -1626,9 +1780,17 @@ fn main() -> Result<()> {
             message,
             body,
         ),
-        Command::List { from, to, spam, all } => {
-            cmd_list(&cli.pile, mail_branch, relations_branch, from, to, spam, all)
-        }
+        Command::List { from, to, spam, all, unread } => cmd_list(
+            &cli.pile,
+            mail_branch,
+            relations_branch,
+            from,
+            to,
+            spam,
+            all,
+            unread,
+        ),
+        Command::Read { message } => cmd_read(&cli.pile, mail_branch, relations_branch, message),
         Command::Today => cmd_today(&cli.pile, mail_branch, relations_branch),
         Command::Week => cmd_week(&cli.pile, mail_branch, relations_branch),
         Command::Thread { message } => {
