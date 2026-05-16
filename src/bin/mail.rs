@@ -346,7 +346,7 @@ fn find_self_persona(relations_space: &TribleSet, email: &str) -> Option<Id> {
         (id: Id, e: String),
         pattern!(relations_space, [{
             ?id @
-                metadata::tag: (KIND_PERSON_ID),
+                metadata::tag: KIND_PERSON_ID,
                 rel_attrs::email: ?e,
         }])
     )
@@ -365,9 +365,9 @@ fn is_read(mail_space: &TribleSet, message_id: Id, reader_id: Id) -> bool {
         r: Id,
         pattern!(mail_space, [{
             ?r @
-                metadata::tag: (KIND_READ_ID),
-                read_attrs::about_message: (message_id),
-                read_attrs::reader: (reader_id),
+                metadata::tag: KIND_READ_ID,
+                read_attrs::about_message: message_id,
+                read_attrs::reader: reader_id,
         }])
     )
     .next()
@@ -456,7 +456,7 @@ fn find_relation_by_email(space: &TribleSet, email: &str) -> Option<Id> {
         (id: Id, e: String),
         pattern!(space, [{
             ?id @
-                metadata::tag: (KIND_PERSON_ID),
+                metadata::tag: KIND_PERSON_ID,
                 rel_attrs::email: ?e,
         }])
     )
@@ -1292,8 +1292,8 @@ fn find_linked_decision(decide_space: &TribleSet, draft_id: Id) -> Option<Id> {
         d: Id,
         pattern!(decide_space, [{
             ?d @
-                metadata::tag: (KIND_DECISION),
-                decide_attrs::about: (draft_id),
+                metadata::tag: KIND_DECISION,
+                decide_attrs::about: draft_id,
         }])
     )
     .next()
@@ -1562,16 +1562,16 @@ fn cmd_discard(
             let pros = find!(
                 p: Id,
                 pattern!(&space, [{
-                    ?p @ metadata::tag: (faculties::schemas::decide::KIND_PRO),
-                    faculties::schemas::decide::factor::about_decision: (decision_id),
+                    ?p @ metadata::tag: faculties::schemas::decide::KIND_PRO,
+                    faculties::schemas::decide::factor::about_decision: decision_id,
                 }])
             )
             .count();
             let cons = find!(
                 c: Id,
                 pattern!(&space, [{
-                    ?c @ metadata::tag: (faculties::schemas::decide::KIND_CON),
-                    faculties::schemas::decide::factor::about_decision: (decision_id),
+                    ?c @ metadata::tag: faculties::schemas::decide::KIND_CON,
+                    faculties::schemas::decide::factor::about_decision: decision_id,
                 }])
             )
             .count();
@@ -1626,7 +1626,7 @@ fn cmd_outbox(
         // Drafts not yet sent: KIND_DRAFT tag, NOT KIND_MESSAGE.
         let drafts: Vec<Id> = find!(
             d: Id,
-            pattern!(&mail_space, [{ ?d @ metadata::tag: (KIND_DRAFT) }])
+            pattern!(&mail_space, [{ ?d @ metadata::tag: KIND_DRAFT }])
         )
         .filter(|d| {
             !find!(t: Id, pattern!(&mail_space, [{ d @ metadata::tag: ?t }]))
@@ -1708,7 +1708,7 @@ fn collect_messages(
     let mut out = Vec::new();
     let ids: Vec<Id> = find!(
         e: Id,
-        pattern!(space, [{ ?e @ metadata::tag: (KIND_MESSAGE) }])
+        pattern!(space, [{ ?e @ metadata::tag: KIND_MESSAGE }])
     )
     .collect();
     for id in ids {
@@ -2082,10 +2082,10 @@ fn cmd_thread(
                 queue.push(parent);
             }
             // Descendants: anyone whose in_reply_to or references points at cur.
-            for child in find!(c: Id, pattern!(&space, [{ ?c @ mail::in_reply_to: (cur) }])) {
+            for child in find!(c: Id, pattern!(&space, [{ ?c @ mail::in_reply_to: cur }])) {
                 queue.push(child);
             }
-            for child in find!(c: Id, pattern!(&space, [{ ?c @ mail::references: (cur) }])) {
+            for child in find!(c: Id, pattern!(&space, [{ ?c @ mail::references: cur }])) {
                 queue.push(child);
             }
         }
@@ -2154,7 +2154,7 @@ fn cmd_search(
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
         let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let ids: Vec<Id> =
-            find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: (KIND_MESSAGE) }])).collect();
+            find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: KIND_MESSAGE }])).collect();
         let mut matches: Vec<Row> = Vec::new();
         for id in ids {
             let subject = find!(h: TextHandle, pattern!(&space, [{ id @ mail::subject: ?h }]))
@@ -2210,12 +2210,12 @@ fn cmd_resolve(pile: &Path, mail_branch_id: Id, prefix: String) -> Result<()> {
         let mut matches: HashSet<Id> = HashSet::new();
         // Resolve over both messages and drafts — they share the
         // entity-id namespace and the user often wants either.
-        for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: (KIND_MESSAGE) }])) {
+        for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: KIND_MESSAGE }])) {
             if fmt_id(id).starts_with(&needle) {
                 matches.insert(id);
             }
         }
-        for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: (KIND_DRAFT) }])) {
+        for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: KIND_DRAFT }])) {
             if fmt_id(id).starts_with(&needle) {
                 matches.insert(id);
             }

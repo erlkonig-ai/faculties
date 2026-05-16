@@ -186,8 +186,8 @@ fn count_factors(space: &TribleSet, decision_id: Id, factor_kind: Id) -> usize {
         f: Id,
         pattern!(space, [{
             ?f @
-                metadata::tag: (factor_kind),
-                factor::about_decision: (decision_id),
+                metadata::tag: factor_kind,
+                factor::about_decision: decision_id,
         }])
     )
     .count()
@@ -335,7 +335,7 @@ fn cmd_factor(
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let exists = find!(
             d: Id,
-            pattern!(&space, [{ ?d @ metadata::tag: (KIND_DECISION) }])
+            pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
         )
         .any(|d| d == decision_id);
         if !exists {
@@ -391,7 +391,7 @@ fn cmd_resolve(
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let exists = find!(
             d: Id,
-            pattern!(&space, [{ ?d @ metadata::tag: (KIND_DECISION) }])
+            pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
         )
         .any(|d| d == decision_id);
         if !exists {
@@ -447,7 +447,7 @@ fn collect_decisions(
 ) -> Vec<DecisionRow> {
     let ids: Vec<Id> = find!(
         d: Id,
-        pattern!(space, [{ ?d @ metadata::tag: (KIND_DECISION) }])
+        pattern!(space, [{ ?d @ metadata::tag: KIND_DECISION }])
     )
     .collect();
     let mut rows: Vec<DecisionRow> = ids
@@ -578,14 +578,14 @@ fn cmd_show(pile: &Path, branch_id: Id, decision_hex: String) -> Result<()> {
         let pros: Vec<Id> = find!(
             p: Id,
             pattern!(&space, [{
-                ?p @ metadata::tag: (KIND_PRO), factor::about_decision: (decision_id)
+                ?p @ metadata::tag: KIND_PRO, factor::about_decision: decision_id
             }])
         )
         .collect();
         let cons: Vec<Id> = find!(
             c: Id,
             pattern!(&space, [{
-                ?c @ metadata::tag: (KIND_CON), factor::about_decision: (decision_id)
+                ?c @ metadata::tag: KIND_CON, factor::about_decision: decision_id
             }])
         )
         .collect();
@@ -644,7 +644,7 @@ fn cmd_resolve_id(pile: &Path, branch_id: Id, prefix: String) -> Result<()> {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let matches: Vec<Id> = find!(
             d: Id,
-            pattern!(&space, [{ ?d @ metadata::tag: (KIND_DECISION) }])
+            pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
         )
         .filter(|d| fmt_id(*d).starts_with(&needle))
         .collect();

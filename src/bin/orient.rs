@@ -290,7 +290,7 @@ fn render_unread_mail(
     let mut rows: Vec<(i128, Id, Option<Id>, String)> = Vec::new();
     for id in find!(
         e: Id,
-        pattern!(&mail_space, [{ ?e @ metadata::tag: (KIND_MAIL_MESSAGE) }])
+        pattern!(&mail_space, [{ ?e @ metadata::tag: KIND_MAIL_MESSAGE }])
     ) {
         // Skip our outbound (where mail::from == self_id).
         let from: Option<Id> =
@@ -309,9 +309,9 @@ fn render_unread_mail(
             r: Id,
             pattern!(&mail_space, [{
                 ?r @
-                    metadata::tag: (KIND_READ_ID),
-                    local::about_message: (id),
-                    local::reader: (self_id),
+                    metadata::tag: KIND_READ_ID,
+                    local::about_message: id,
+                    local::reader: self_id,
             }])
         )
         .next()

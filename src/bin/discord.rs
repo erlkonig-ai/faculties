@@ -50,7 +50,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::blobencodings::{self, LongString};
-use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use faculties::schemas::archive::archive;

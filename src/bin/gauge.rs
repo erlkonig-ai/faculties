@@ -440,7 +440,7 @@ fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
     println!();
 
     println!("Flagged sources ({}):", flagged.len());
-    for (frag, (title, tags)) in &flagged {
+    for (_frag, (title, tags)) in &flagged {
         let short: String = title.chars().take(55).collect();
         println!("  [{tags}] {short}", tags = tags.join(", "));
     }

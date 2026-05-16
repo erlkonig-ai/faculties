@@ -28,7 +28,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle};
+use triblespace::prelude::inlineencodings::{GenId, Handle};
 use triblespace::prelude::*;
 
 pub const DEFAULT_BRANCH: &str = "discord";

@@ -6,7 +6,6 @@ use faculties::schemas::patience::{DEFAULT_BRANCH, KIND_TIMEOUT_EXTENSION_ID, ex
 use hifitime::Epoch;
 use humantime::parse_duration;
 use rand_core::OsRng;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use triblespace::core::metadata;

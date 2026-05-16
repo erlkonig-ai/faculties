@@ -5,7 +5,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, ShortString};
+use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
 use triblespace::prelude::*;
 
 pub const CONFIG_BRANCH_ID: Id = id_hex!("6069A136254E1B87E4C0D2E0295DB382");

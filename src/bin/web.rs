@@ -18,7 +18,7 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

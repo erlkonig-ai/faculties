@@ -24,7 +24,7 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
 /// Author entity used by the teams faculty when writing its own log entries.

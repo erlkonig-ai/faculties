@@ -12,7 +12,7 @@ use tracing::info_span;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 #[path = "importers/archive_import_chatgpt.rs"]
@@ -36,22 +36,17 @@ mod common {
     use rand_core::OsRng;
     use rayon::ThreadPoolBuilder;
     use rayon::prelude::*;
-    use std::fs;
+    
     use tracing::info_span;
     use triblespace::core::id::ExclusiveId;
     pub use triblespace::core::metadata;
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::{Repository, Workspace};
     use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
-    use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
+    use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
     use triblespace::prelude::*;
 
-    pub use faculties::schemas::archive::{self as archive_schema, RawBytes, archive, import_schema};
-
-    pub use faculties::schemas::archive::archive::{
-        kind_attachment, kind_author, kind_message,
-    };
-    pub use faculties::schemas::archive::import_schema::{import_metadata, kind_conversation};
+    pub use faculties::schemas::archive::{self as archive_schema, archive, import_schema};
 
     pub type Repo = Repository<Pile>;
     pub type Ws = Workspace<Pile>;

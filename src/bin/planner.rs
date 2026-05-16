@@ -295,14 +295,14 @@ fn resolve_branch(
 fn all_event_ids(space: &TribleSet) -> Vec<Id> {
     let mut ids: Vec<Id> = find!(
         e: Id,
-        pattern!(space, [{ ?e @ metadata::tag: (KIND_EVENT_ID) }])
+        pattern!(space, [{ ?e @ metadata::tag: KIND_EVENT_ID }])
     )
     .collect();
     ids.sort();
     ids
 }
 
-fn event_summary(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
+fn event_summary(_ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
     find!(s: String, pattern!(space, [{ id @ event::summary: ?s }]))
         .next()
         .unwrap_or_else(|| "(untitled)".to_string())
@@ -640,7 +640,7 @@ fn print_occurrences(occs: &[Occurrence]) {
 
 fn cmd_list(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     from: Option<String>,
     to: Option<String>,
@@ -669,7 +669,7 @@ fn cmd_list(
     })
 }
 
-fn cmd_today(pile: &Path, branch_name: &str, branch_id: Id) -> Result<()> {
+fn cmd_today(pile: &Path, _branch_name: &str, branch_id: Id) -> Result<()> {
     let now = chrono::Local::now();
     let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
     let end = start + chrono::Duration::days(1);
@@ -688,7 +688,7 @@ fn cmd_today(pile: &Path, branch_name: &str, branch_id: Id) -> Result<()> {
     })
 }
 
-fn cmd_week(pile: &Path, branch_name: &str, branch_id: Id) -> Result<()> {
+fn cmd_week(pile: &Path, _branch_name: &str, branch_id: Id) -> Result<()> {
     let now = chrono::Local::now();
     let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
     let end = start + chrono::Duration::days(7);
@@ -707,7 +707,7 @@ fn cmd_week(pile: &Path, branch_name: &str, branch_id: Id) -> Result<()> {
     })
 }
 
-fn cmd_next(pile: &Path, branch_name: &str, branch_id: Id) -> Result<()> {
+fn cmd_next(pile: &Path, _branch_name: &str, branch_id: Id) -> Result<()> {
     let now = now_epoch();
     let far = Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0);
 
@@ -728,7 +728,7 @@ fn cmd_next(pile: &Path, branch_name: &str, branch_id: Id) -> Result<()> {
 
 fn cmd_note(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     id: String,
     text: String,
@@ -764,7 +764,7 @@ fn cmd_note(
 
 fn cmd_show(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     id: String,
 ) -> Result<()> {
@@ -808,9 +808,9 @@ fn cmd_show(
             (created: IntervalValue, n: Id),
             pattern!(&space, [{
                 ?n @
-                    metadata::tag: (KIND_NOTE_ID),
+                    metadata::tag: KIND_NOTE_ID,
                     metadata::created_at: ?created,
-                    note::note_about: (event_ref),
+                    note::note_about: event_ref,
             }])
         )
         .collect();
@@ -839,7 +839,7 @@ fn cmd_show(
 
 fn cmd_cancel(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     id: String,
 ) -> Result<()> {
@@ -864,7 +864,7 @@ fn cmd_cancel(
 
 fn cmd_resolve(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     prefix: String,
 ) -> Result<()> {
@@ -884,7 +884,7 @@ fn cmd_resolve(
 
 fn cmd_ingest(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     files: Vec<PathBuf>,
 ) -> Result<()> {
@@ -907,7 +907,7 @@ fn cmd_ingest(
         // blob per known event.
         let uid_handles: Vec<(Id, TextHandle)> = find!(
             (e: Id, h: TextHandle),
-            pattern!(&space, [{ ?e @ metadata::tag: (KIND_EVENT_ID), event::ical_uid: ?h }])
+            pattern!(&space, [{ ?e @ metadata::tag: KIND_EVENT_ID, event::ical_uid: ?h }])
         )
         .collect();
         let mut existing_uids: HashSet<String> = HashSet::new();

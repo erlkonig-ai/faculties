@@ -7,7 +7,7 @@
 use triblespace::macros::id_hex;
 pub use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
 /// A unified archive projection for externally sourced conversations.

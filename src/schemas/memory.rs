@@ -6,7 +6,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
 pub const DEFAULT_MEMORY_BRANCH: &str = "memory";

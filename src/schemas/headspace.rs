@@ -7,7 +7,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, Handle, U256BE};
 use triblespace::prelude::*;
 
 pub const DEFAULT_MODEL: &str = "gpt-oss:120b";

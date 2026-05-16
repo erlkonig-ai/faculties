@@ -20,7 +20,7 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 #[derive(Parser, Debug)]

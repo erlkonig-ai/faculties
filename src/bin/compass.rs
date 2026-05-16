@@ -3,9 +3,8 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::compass::{
-    DEFAULT_STATUSES, KIND_DEPRIORITIZE_ID, KIND_DEPRIORITIZE_LABEL, KIND_GOAL_ID,
-    KIND_GOAL_LABEL, KIND_NOTE_ID, KIND_NOTE_LABEL, KIND_PRIORITIZE_ID, KIND_PRIORITIZE_LABEL,
-    KIND_SPECS, KIND_STATUS_ID, KIND_STATUS_LABEL, board,
+    DEFAULT_STATUSES, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
+    KIND_SPECS, KIND_STATUS_ID, board,
 };
 use hifitime::Epoch;
 use rand_core::OsRng;
