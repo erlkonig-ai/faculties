@@ -133,7 +133,7 @@ fn import_codex_records(
         let raw_tree_start = Instant::now();
         println!("codex phase raw-tree: {}", path.display());
         let raw_payload = serde_json::to_string(&raw_records).context("serialize codex jsonl")?;
-        let mut importer = JsonTreeImporter::<_, triblespace::prelude::inlineencodings::Blake3>::new(
+        let mut importer = JsonTreeImporter::<_>::new(
             repo.storage_mut(),
             None,
         );

@@ -36,7 +36,7 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
 use triblespace::core::inline::encodings::hash::{Blake3, Handle};
-use triblespace::core::inline::{TryToInline, Value};
+use triblespace::core::inline::{TryToInline, Inline};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{RawBytes, LongString};
 use triblespace::prelude::View;

@@ -21,7 +21,7 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-type CommitHandle = Inline<inlineencodings::Handle<inlineencodings::Blake3, SimpleArchive>>;
+type CommitHandle = Inline<inlineencodings::Handle<SimpleArchive>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 fn interval_key(interval: IntervalValue) -> i128 {
@@ -650,17 +650,17 @@ fn load_checkpoint_heads(
     };
 
     Ok(Some(WatchedHeads {
-        local: load_optional_commit_head(&space, checkpoint_id, orient_state::local_head),
-        compass: load_optional_commit_head(&space, checkpoint_id, orient_state::compass_head),
-        relations: load_optional_commit_head(&space, checkpoint_id, orient_state::relations_head),
-        config: load_optional_commit_head(&space, checkpoint_id, orient_state::config_head),
+        local: load_optional_commit_head(&space, checkpoint_id, &orient_state::local_head),
+        compass: load_optional_commit_head(&space, checkpoint_id, &orient_state::compass_head),
+        relations: load_optional_commit_head(&space, checkpoint_id, &orient_state::relations_head),
+        config: load_optional_commit_head(&space, checkpoint_id, &orient_state::config_head),
     }))
 }
 
 fn load_optional_commit_head(
     space: &TribleSet,
     checkpoint_id: Id,
-    attr: Attribute<inlineencodings::Handle<blobencodings::SimpleArchive>>,
+    attr: &Attribute<inlineencodings::Handle<blobencodings::SimpleArchive>>,
 ) -> Option<CommitHandle> {
     find!(
         value: CommitHandle,

@@ -314,7 +314,7 @@ fn collect_commit_events(
         return;
     };
     for raw in set.iter() {
-        let handle: CommitHandleValue = Value::new(*raw);
+        let handle: CommitHandleValue = Inline::new(*raw);
         let Ok(meta) = ws.get::<TribleSet, SimpleArchive>(handle) else {
             continue;
         };

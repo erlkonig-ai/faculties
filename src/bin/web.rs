@@ -254,13 +254,13 @@ fn load_config_snapshot(pile_path: &Path) -> Result<ConfigSnapshot> {
                             &mut ws,
                             &space,
                             config_id,
-                            config_schema::tavily_api_key,
+                            &config_schema::tavily_api_key,
                         )?,
                         exa_api_key: load_string_attr(
                             &mut ws,
                             &space,
                             config_id,
-                            config_schema::exa_api_key,
+                            &config_schema::exa_api_key,
                         )?,
                     }
                 }
@@ -314,7 +314,7 @@ fn load_string_attr(
     ws: &mut Workspace<Pile>,
     space: &TribleSet,
     entity: Id,
-    attr: Attribute<Handle<LongString>>,
+    attr: &Attribute<Handle<LongString>>,
 ) -> Result<Option<String>>
 {
     let handle = match find!(

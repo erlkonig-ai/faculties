@@ -670,8 +670,12 @@ fn extract_references(
                 let eid = ExclusiveId::force_ref(&source_vid);
                 edges += entity! { eid @ wiki::links_to: &target };
                 if !type_prefix.is_empty() {
-                    let type_name = &type_prefix[..type_prefix.len() - 1];
-                    let attr = triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from_name(type_name);
+                    let type_name = type_prefix[..type_prefix.len() - 1].to_owned();
+                    let name_handle = type_name.to_blob().get_handle();
+                    let attr = triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from(entity! {
+                        metadata::name: name_handle,
+                        metadata::value_encoding: <inlineencodings::GenId as triblespace::core::metadata::MetaDescribe>::id(),
+                    });
                     let eid = ExclusiveId::force_ref(&source_vid);
                     edges += entity! { eid @ attr: &target };
                 }
@@ -2213,13 +2217,24 @@ fn cmd_list(
         .filter_map(|name| find_tag_by_name(&space, &mut ws, &name.trim().to_lowercase()))
         .collect();
     // Derive attribute IDs for typed backlink filters.
+    // Helper closure: derive a GenId-valued attribute from its name via
+    // the entity-core mechanism. The hex id is hashed from the
+    // `(metadata::name, metadata::value_encoding)` pair so the same name
+    // + schema produces the same attribute id deterministically.
+    let attr_from_name = |name: &str| -> triblespace::core::attribute::Attribute<inlineencodings::GenId> {
+        let name_handle = name.to_owned().to_blob().get_handle();
+        triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from(entity! {
+            metadata::name: name_handle,
+            metadata::value_encoding: <inlineencodings::GenId as triblespace::core::metadata::MetaDescribe>::id(),
+        })
+    };
     let with_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<inlineencodings::GenId>)> =
         with_backlink_type.iter()
-            .map(|name| (name.clone(), triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from_name(name)))
+            .map(|name| (name.clone(), attr_from_name(name)))
             .collect();
     let without_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<inlineencodings::GenId>)> =
         without_backlink_type.iter()
-            .map(|name| (name.clone(), triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from_name(name)))
+            .map(|name| (name.clone(), attr_from_name(name)))
             .collect();
     let has_backlink_filter = !with_bl_ids.is_empty() || !without_bl_ids.is_empty()
         || !with_bl_type_attrs.is_empty() || !without_bl_type_attrs.is_empty();

@@ -599,7 +599,7 @@ fn load_latest_config(
         ws,
         catalog,
         config_id,
-        playground_config::model_reasoning_effort,
+        &playground_config::model_reasoning_effort,
     )? {
         config.model.reasoning_effort = Some(effort);
     }
@@ -635,7 +635,7 @@ fn load_latest_config(
     if let Some(tokens) = load_u256_attr(
         catalog,
         config_id,
-        playground_config::model_context_window_tokens,
+        &playground_config::model_context_window_tokens,
     )
     .and_then(u256be_to_u64)
     {
@@ -650,7 +650,7 @@ fn load_latest_config(
     if let Some(tokens) = load_u256_attr(
         catalog,
         config_id,
-        playground_config::model_context_safety_margin_tokens,
+        &playground_config::model_context_safety_margin_tokens,
     )
     .and_then(u256be_to_u64)
     {
@@ -659,7 +659,7 @@ fn load_latest_config(
     if let Some(chars) = load_u256_attr(
         catalog,
         config_id,
-        playground_config::model_chars_per_token,
+        &playground_config::model_chars_per_token,
     )
     .and_then(u256be_to_u64)
     {
@@ -714,7 +714,7 @@ fn load_latest_model_profile(
         ws,
         catalog,
         entry_id,
-        playground_config::model_reasoning_effort,
+        &playground_config::model_reasoning_effort,
     )? {
         mc.reasoning_effort = Some(effort);
     }
@@ -729,7 +729,7 @@ fn load_latest_model_profile(
     if let Some(tokens) = load_u256_attr(
         catalog,
         entry_id,
-        playground_config::model_context_window_tokens,
+        &playground_config::model_context_window_tokens,
     )
     .and_then(u256be_to_u64)
     {
@@ -744,7 +744,7 @@ fn load_latest_model_profile(
     if let Some(tokens) = load_u256_attr(
         catalog,
         entry_id,
-        playground_config::model_context_safety_margin_tokens,
+        &playground_config::model_context_safety_margin_tokens,
     )
     .and_then(u256be_to_u64)
     {
@@ -753,7 +753,7 @@ fn load_latest_model_profile(
     if let Some(chars) = load_u256_attr(
         catalog,
         entry_id,
-        playground_config::model_chars_per_token,
+        &playground_config::model_chars_per_token,
     )
     .and_then(u256be_to_u64)
     {

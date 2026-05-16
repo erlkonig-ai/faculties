@@ -242,7 +242,7 @@ fn hash_prefix(input: &str) -> String {
     hasher.update(input.as_bytes());
     let digest = hasher.finalize();
     let mut out = String::with_capacity(16);
-    for byte in digest.as_bytes().iter().take(8) {
+    for byte in digest.iter().take(8) {
         use std::fmt::Write as _;
         let _ = write!(&mut out, "{byte:02x}");
     }

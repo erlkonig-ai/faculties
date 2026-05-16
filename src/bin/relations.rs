@@ -242,7 +242,7 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
         let name_handle = "person"
             .to_owned()
             .to_blob()
-            .get_handle::<inlineencodings::Blake3>();
+            .get_handle();
         change += entity! { ExclusiveId::force_ref(&KIND_PERSON_ID) @ metadata::name: name_handle };
     }
     Ok(change)

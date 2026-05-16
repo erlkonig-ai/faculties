@@ -906,10 +906,10 @@ fn latest_token_state(catalog: &TribleSet) -> Option<TokenState> {
                 created_at_key: created_key,
                 expires_at_key: expires_key,
                 access_token,
-                refresh_token: find_optional_handle(catalog, token_id, teams::refresh_token),
-                scope: find_optional_handle(catalog, token_id, teams::scope),
-                tenant: find_optional_handle(catalog, token_id, teams::tenant),
-                client_id: find_optional_handle(catalog, token_id, teams::client_id),
+                refresh_token: find_optional_handle(catalog, token_id, &teams::refresh_token),
+                scope: find_optional_handle(catalog, token_id, &teams::scope),
+                tenant: find_optional_handle(catalog, token_id, &teams::tenant),
+                client_id: find_optional_handle(catalog, token_id, &teams::client_id),
             });
         }
     }
@@ -938,10 +938,10 @@ fn latest_config_state(catalog: &TribleSet) -> Option<ConfigState> {
             best = Some(ConfigState {
                 config_id,
                 created_at_key: created_key,
-                tenant: find_optional_handle(catalog, config_id, teams::tenant),
-                client_id: find_optional_handle(catalog, config_id, teams::client_id),
-                client_secret: find_optional_handle(catalog, config_id, teams::client_secret),
-                user_id: find_optional_handle(catalog, config_id, teams::user_id),
+                tenant: find_optional_handle(catalog, config_id, &teams::tenant),
+                client_id: find_optional_handle(catalog, config_id, &teams::client_id),
+                client_secret: find_optional_handle(catalog, config_id, &teams::client_secret),
+                user_id: find_optional_handle(catalog, config_id, &teams::user_id),
             });
         }
     }
@@ -951,7 +951,7 @@ fn latest_config_state(catalog: &TribleSet) -> Option<ConfigState> {
 fn find_optional_handle(
     catalog: &TribleSet,
     entity: Id,
-    attribute: Attribute<Handle<LongString>>,
+    attribute: &Attribute<Handle<LongString>>,
 ) -> Option<Inline<Handle<LongString>>> {
     find!(
         (handle: Inline<Handle<LongString>>),
@@ -965,7 +965,7 @@ fn find_optional_handle(
 fn find_optional_value<S: InlineEncoding>(
     catalog: &TribleSet,
     entity: Id,
-    attribute: Attribute<S>,
+    attribute: &Attribute<S>,
 ) -> Option<Inline<S>> {
     find!(
         (value: Inline<S>),
@@ -2013,15 +2013,15 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                 chat_id,
                 created_at,
                 created_at_key: interval_key(created_at),
-                source_id: find_optional_handle(&catalog, attachment_id, archive::attachment_source_id),
+                source_id: find_optional_handle(&catalog, attachment_id, &archive::attachment_source_id),
                 source_pointer: find_optional_handle(
                     &catalog,
                     attachment_id,
-                    archive::attachment_source_pointer,
+                    &archive::attachment_source_pointer,
                 ),
-                name: find_optional_handle(&catalog, attachment_id, archive::attachment_name),
-                mime: find_optional_value(&catalog, attachment_id, archive::attachment_mime),
-                size: find_optional_value(&catalog, attachment_id, archive::attachment_size_bytes),
+                name: find_optional_handle(&catalog, attachment_id, &archive::attachment_name),
+                mime: find_optional_value(&catalog, attachment_id, &archive::attachment_mime),
+                size: find_optional_value(&catalog, attachment_id, &archive::attachment_size_bytes),
             });
         }
 
@@ -2369,8 +2369,8 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
                 chat_id,
                 source_id,
                 data_handle,
-                name: find_optional_handle(&catalog, attachment_id, archive::attachment_name),
-                mime: find_optional_value(&catalog, attachment_id, archive::attachment_mime),
+                name: find_optional_handle(&catalog, attachment_id, &archive::attachment_name),
+                mime: find_optional_value(&catalog, attachment_id, &archive::attachment_mime),
             });
         }
 
@@ -3029,7 +3029,7 @@ fn ensure_author(
 
     if missing_author_kind || author_name.is_some() {
         *change += entity! { ExclusiveId::force_ref(&author_id) @
-            metadata::tag?: missing_author_kind.then_some(archive::kind_author),
+            metadata::tag?: missing_author_kind.then_some(&archive::kind_author),
             archive::author_name?: author_name,
         };
     }

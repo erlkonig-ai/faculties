@@ -428,7 +428,7 @@ fn find_branch_ids_by_name(
     let name_handle = branch_name
         .to_owned()
         .to_blob()
-        .get_handle::<inlineencodings::Blake3>();
+        .get_handle();
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let iter = pile
         .branches()
@@ -1204,7 +1204,7 @@ fn collect_recent_model_failures(state: &ModelChatState, recent: usize) -> Vec<M
 }
 
 fn verify_commit_chain(
-    reader: &triblespace::core::repo::pile::PileReader<inlineencodings::Blake3>,
+    reader: &triblespace::core::repo::pile::PileReader,
     start: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
 ) -> ChainReport {
     let head_hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
