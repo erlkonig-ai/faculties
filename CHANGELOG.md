@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.14.3 — 2026-05-16
+
+- **Pick up `triblespace 0.40.2` + `GORBIE 0.14.2`.** Both
+  bumps carry the same change end-to-end: the TLS roots that
+  iroh's discovery layer trusts now come from the OS trust
+  store (via `rustls-platform-verifier`) instead of the
+  compiled-in Mozilla `webpki-roots` bundle. The previous
+  webpki-roots default silently broke iroh's relay HTTPS
+  probes and pkarr publish/lookup in corporate-proxy /
+  sandbox environments that present a custom CA at egress —
+  every probe returned `invalid peer certificate:
+  UnknownIssuer` and discovery never got off the ground.
+
+  Practical effect for sandboxed `faculties` users: the
+  precompiled binaries produced from this tag's `release.yml`
+  workflow can now reach iroh's public infrastructure from
+  inside the Anthropic web sandbox (and similar
+  TLS-intercepting environments). Normal environments are
+  unaffected — the OS trust store already contains the
+  Mozilla roots.
+
+  Cargo.lock pins updated via
+  `cargo update -p triblespace -p GORBIE`. Source unchanged.
+
 ## 0.14.0 — 2026-05-07
 
 - **Bump `triblespace` 0.37 → 0.38, `GORBIE` 0.13 → 0.13.2.**
