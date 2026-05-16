@@ -236,7 +236,7 @@ fn parse_gemini_file(path: &std::path::Path) -> Result<Vec<MessageRecord>> {
 }
 
 fn hash_prefix(input: &str) -> String {
-    use triblespace::core::value::schemas::hash::Blake3 as Blake3Hasher;
+    use triblespace::core::inline::encodings::hash::Blake3 as Blake3Hasher;
 
     let mut hasher = Blake3Hasher::new();
     hasher.update(input.as_bytes());

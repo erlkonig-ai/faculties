@@ -139,7 +139,7 @@ fn import_claude_code_records(
         let raw_tree_start = Instant::now();
         let raw_payload =
             serde_json::to_string(&raw_records).context("serialize claude-code jsonl")?;
-        let mut importer = JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
+        let mut importer = JsonTreeImporter::<_, triblespace::prelude::inlineencodings::Blake3>::new(
             repo.storage_mut(),
             None,
         );

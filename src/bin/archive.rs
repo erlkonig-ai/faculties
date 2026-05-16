@@ -11,8 +11,8 @@ use hifitime::Epoch;
 use tracing::info_span;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 #[path = "importers/archive_import_chatgpt.rs"]
@@ -42,20 +42,20 @@ mod common {
     pub use triblespace::core::metadata;
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::{Repository, Workspace};
-    use triblespace::prelude::blobschemas::{LongString, SimpleArchive};
-    use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval};
+    use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
+    use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
     use triblespace::prelude::*;
 
-    pub use faculties::schemas::archive::{self as archive_schema, FileBytes, archive, import_schema};
+    pub use faculties::schemas::archive::{self as archive_schema, RawBytes, archive, import_schema};
 
     pub use faculties::schemas::archive::archive::{
         kind_attachment, kind_author, kind_message,
     };
     pub use faculties::schemas::archive::import_schema::{import_metadata, kind_conversation};
 
-    pub type Repo = Repository<Pile<Blake3>>;
-    pub type Ws = Workspace<Pile<Blake3>>;
-    pub type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
+    pub type Repo = Repository<Pile>;
+    pub type Ws = Workspace<Pile>;
+    pub type CommitHandle = Inline<Handle<SimpleArchive>>;
 
     fn acquire_or_force(id: Id) -> ExclusiveId {
         id.acquire().unwrap_or_else(|| ExclusiveId::force(id))
@@ -116,7 +116,7 @@ mod common {
         _branch_name: &str,
     ) -> Result<(Repo, Id)> {
         let mut pile =
-            Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
+            Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
         if let Err(err) = pile.restore() {
             let _ = pile.close();
             return Err(anyhow!("restore pile: {err:?}"));
@@ -152,7 +152,7 @@ mod common {
     }
 
     fn open_repo(pile_path: &Path) -> Result<Repo> {
-        let mut pile = Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
+        let mut pile = Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
         if let Err(err) = pile.restore() {
             // Avoid Drop warnings on early errors.
             let _ = pile.close();
@@ -249,8 +249,8 @@ mod common {
         }
     }
 
-    pub fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-        (epoch, epoch).try_to_value().unwrap()
+    pub fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
+        (epoch, epoch).try_to_inline().unwrap()
     }
 
     pub fn ensure_author(
@@ -289,7 +289,7 @@ mod common {
         target_name: &str,
     ) -> Result<Option<Id>> {
         for (author_id, name_handle) in find!(
-            (author: Id, author_name: Value<Handle<Blake3, LongString>>),
+            (author: Id, author_name: Inline<Handle<LongString>>),
             pattern!(catalog, [{
                 ?author @
                 metadata::tag: archive::kind_author,
@@ -307,9 +307,9 @@ mod common {
     fn author_role_handle(
         catalog: &TribleSet,
         author_id: Id,
-    ) -> Option<Value<Handle<Blake3, LongString>>> {
+    ) -> Option<Inline<Handle<LongString>>> {
         for (author, role) in find!(
-            (author: Id, role: Value<Handle<Blake3, LongString>>),
+            (author: Id, role: Inline<Handle<LongString>>),
             pattern!(catalog, [{ ?author @ archive::author_role: ?role }])
         ) {
             if author == author_id {
@@ -614,20 +614,20 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
     });
 }
 
-fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _upper): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
+    let (lower, _upper): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
 fn load_longstring(
     ws: &mut common::Ws,
-    handle: Value<Handle<Blake3, LongString>>,
+    handle: Inline<Handle<LongString>>,
 ) -> Result<String> {
     let view: View<str> = ws.get(handle).context("read longstring")?;
     Ok(view.to_string())
 }
 
-fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
+fn u256be_to_u64(value: Inline<U256BE>) -> Option<u64> {
     let raw = value.raw;
     if raw[..24].iter().any(|byte| *byte != 0) {
         return None;
@@ -638,7 +638,7 @@ fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
 
 fn author_name(ws: &mut common::Ws, catalog: &TribleSet, author_id: Id) -> Result<String> {
     let Some(handle) = find!(
-        (handle: Value<Handle<Blake3, LongString>>),
+        (handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{ author_id @ common::archive::author_name: ?handle }])
     )
     .into_iter()
@@ -651,7 +651,7 @@ fn author_name(ws: &mut common::Ws, catalog: &TribleSet, author_id: Id) -> Resul
 
 fn author_role(ws: &mut common::Ws, catalog: &TribleSet, author_id: Id) -> Result<Option<String>> {
     let Some(handle) = find!(
-        (handle: Value<Handle<Blake3, LongString>>),
+        (handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{ author_id @ common::archive::author_role: ?handle }])
     )
     .into_iter()
@@ -701,8 +701,8 @@ fn message_attachments(
 
     // Batch-query each attribute across ALL attachments at once (7 queries total
     // instead of 7*N).
-    let source_ids: HashMap<Id, Value<Handle<Blake3, LongString>>> = find!(
-        (att: Id, handle: Value<Handle<Blake3, LongString>>),
+    let source_ids: HashMap<Id, Inline<Handle<LongString>>> = find!(
+        (att: Id, handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{
             message_id @ common::archive::attachment: ?att,
         }, {
@@ -712,8 +712,8 @@ fn message_attachments(
     .into_iter()
     .collect();
 
-    let names: HashMap<Id, Value<Handle<Blake3, LongString>>> = find!(
-        (att: Id, handle: Value<Handle<Blake3, LongString>>),
+    let names: HashMap<Id, Inline<Handle<LongString>>> = find!(
+        (att: Id, handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{
             message_id @ common::archive::attachment: ?att,
         }, {
@@ -734,8 +734,8 @@ fn message_attachments(
     .into_iter()
     .collect();
 
-    let sizes: HashMap<Id, Value<U256BE>> = find!(
-        (att: Id, size: Value<U256BE>),
+    let sizes: HashMap<Id, Inline<U256BE>> = find!(
+        (att: Id, size: Inline<U256BE>),
         pattern!(catalog, [{
             message_id @ common::archive::attachment: ?att,
         }, {
@@ -745,8 +745,8 @@ fn message_attachments(
     .into_iter()
     .collect();
 
-    let widths: HashMap<Id, Value<U256BE>> = find!(
-        (att: Id, width: Value<U256BE>),
+    let widths: HashMap<Id, Inline<U256BE>> = find!(
+        (att: Id, width: Inline<U256BE>),
         pattern!(catalog, [{
             message_id @ common::archive::attachment: ?att,
         }, {
@@ -756,8 +756,8 @@ fn message_attachments(
     .into_iter()
     .collect();
 
-    let heights: HashMap<Id, Value<U256BE>> = find!(
-        (att: Id, height: Value<U256BE>),
+    let heights: HashMap<Id, Inline<U256BE>> = find!(
+        (att: Id, height: Inline<U256BE>),
         pattern!(catalog, [{
             message_id @ common::archive::attachment: ?att,
         }, {
@@ -849,15 +849,15 @@ fn message_record(
     Id,
     String,
     Option<String>,
-    Value<NsTAIInterval>,
-    Value<Handle<Blake3, LongString>>,
+    Inline<NsTAIInterval>,
+    Inline<Handle<LongString>>,
     Option<Id>,
 )> {
     let Some((author_id, content_handle, created_at)) = find!(
         (
             author: Id,
-            content: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
+            content: Inline<Handle<LongString>>,
+            created_at: Inline<NsTAIInterval>
         ),
         pattern!(catalog, [{
             message_id @
@@ -954,8 +954,8 @@ fn main() -> Result<()> {
                     (
                         message: Id,
                         author: Id,
-                        content: Value<Handle<Blake3, LongString>>,
-                        created_at: Value<NsTAIInterval>
+                        content: Inline<Handle<LongString>>,
+                        created_at: Inline<NsTAIInterval>
                     ),
                     pattern!(&catalog, [{
                         ?message @
@@ -981,7 +981,7 @@ fn main() -> Result<()> {
                     let name = author_name(&mut ws, &catalog, author_id)?;
                     let role = author_role(&mut ws, &catalog, author_id)?;
                     let content = load_longstring(&mut ws, content_handle)?;
-                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_value().unwrap();
+                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
                     let role = role.as_deref().unwrap_or("");
                     println!(
                         "{} {} {} {}",
@@ -1001,7 +1001,7 @@ fn main() -> Result<()> {
                 let (message_id, name, role, created_at, content_handle, reply_to) =
                     message_record(&mut ws, &catalog, message_id)?;
                 let content = load_longstring(&mut ws, content_handle)?;
-                let (lower, _upper): (Epoch, Epoch) = created_at.try_from_value().unwrap();
+                let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
                 let content_type = message_content_type(&catalog, message_id);
                 let attachments = message_attachments(&mut ws, &catalog, message_id)?;
 
@@ -1083,7 +1083,7 @@ fn main() -> Result<()> {
                     let (message_id, name, role, created_at, content_handle, _reply_to) =
                         message_record(&mut ws, &catalog, message_id)?;
                     let content = load_longstring(&mut ws, content_handle)?;
-                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_value().unwrap();
+                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
                     let role = role.as_deref().unwrap_or("");
                     println!(
                         "{} {} {} {}",
@@ -1115,8 +1115,8 @@ fn main() -> Result<()> {
                     (
                         message: Id,
                         author: Id,
-                        content: Value<Handle<Blake3, LongString>>,
-                        created_at: Value<NsTAIInterval>
+                        content: Inline<Handle<LongString>>,
+                        created_at: Inline<NsTAIInterval>
                     ),
                     pattern!(&catalog, [{
                         ?message @
@@ -1148,7 +1148,7 @@ fn main() -> Result<()> {
                 {
                     let name = author_name(&mut ws, &catalog, author_id)?;
                     let role = author_role(&mut ws, &catalog, author_id)?;
-                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_value().unwrap();
+                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
                     let role = role.as_deref().unwrap_or("");
                     println!(
                         "{} {} {} {}",
@@ -1171,7 +1171,7 @@ fn main() -> Result<()> {
                     (
                         conversation: Id,
                         format: String,
-                        source_conversation_id: Value<Handle<Blake3, LongString>>
+                        source_conversation_id: Inline<Handle<LongString>>
                     ),
                     pattern!(&catalog, [{
                         ?conversation @

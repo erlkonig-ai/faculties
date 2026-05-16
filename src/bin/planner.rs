@@ -23,8 +23,8 @@ use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
 
-type IntervalValue = Value<valueschemas::NsTAIInterval>;
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
+type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 const STATUS_CONFIRMED: &str = "CONFIRMED";
 const STATUS_TENTATIVE: &str = "TENTATIVE";
@@ -152,11 +152,11 @@ fn chrono_to_epoch(dt: DateTime<Utc>) -> Epoch {
 }
 
 fn make_interval(start: Epoch, end: Epoch) -> IntervalValue {
-    (start, end).try_to_value().unwrap()
+    (start, end).try_to_inline().unwrap()
 }
 
 fn unpack_interval(iv: IntervalValue) -> (Epoch, Epoch) {
-    iv.try_from_value().unwrap()
+    iv.try_from_inline().unwrap()
 }
 
 /// Parse an ISO 8601 string into a UTC datetime, treating date-only
@@ -248,8 +248,8 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         let _ = pile.close();
@@ -262,7 +262,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
@@ -279,7 +279,7 @@ fn with_repo<T>(
 }
 
 fn resolve_branch(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     branch_name: &str,
     branch_id_hex: Option<&str>,
 ) -> Result<Id> {
@@ -302,7 +302,7 @@ fn all_event_ids(space: &TribleSet) -> Vec<Id> {
     ids
 }
 
-fn event_summary(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> String {
+fn event_summary(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
     find!(s: String, pattern!(space, [{ id @ event::summary: ?s }]))
         .next()
         .unwrap_or_else(|| "(untitled)".to_string())
@@ -327,7 +327,7 @@ fn event_location(space: &TribleSet, id: Id) -> Option<String> {
 }
 
 fn event_ical_uid(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     id: Id,
 ) -> Option<String> {
@@ -339,8 +339,8 @@ fn event_description_handle(space: &TribleSet, id: Id) -> Option<TextHandle> {
     find!(h: TextHandle, pattern!(space, [{ id @ event::description: ?h }])).next()
 }
 
-fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, blobschemas::LongString>(h)
+fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
+    ws.get::<View<str>, blobencodings::LongString>(h)
         .ok()
         .map(|view| view.to_string())
 }
@@ -416,7 +416,7 @@ fn occurrences_in_window(
 
 // ── kind entity (planner branch) ──────────────────────────────────────────
 
-fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
+fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let existing: HashSet<Id> = find!(
         (kind: Id),
@@ -503,7 +503,7 @@ fn cmd_add(
 
         let event_id = ufoid();
         let event_ref = event_id.id;
-        let now = (now_epoch(), now_epoch()).try_to_value().unwrap();
+        let now = (now_epoch(), now_epoch()).try_to_inline().unwrap();
 
         let status_str = status.as_deref().map(str::to_uppercase).unwrap_or_else(|| STATUS_CONFIRMED.to_string());
         let transp_str = transp.as_deref().map(str::to_uppercase).unwrap_or_else(|| TRANSP_OPAQUE.to_string());
@@ -562,7 +562,7 @@ struct Occurrence {
 }
 
 fn collect_occurrences(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     window: (Epoch, Epoch),
     show_cancelled: bool,
@@ -743,7 +743,7 @@ fn cmd_note(
 
         let note_id = ufoid();
         let text_handle = ws.put(body);
-        let now = (now_epoch(), now_epoch()).try_to_value().unwrap();
+        let now = (now_epoch(), now_epoch()).try_to_inline().unwrap();
 
         let mut change = TribleSet::new();
         change += ensure_kind_entities(&mut ws)?;
@@ -935,7 +935,7 @@ fn cmd_ingest(
                         }
                     }
                     let event_id = ufoid();
-                    let now = (now_epoch(), now_epoch()).try_to_value().unwrap();
+                    let now = (now_epoch(), now_epoch()).try_to_inline().unwrap();
                     let interval = make_interval(
                         chrono_to_epoch(ievt.dtstart),
                         chrono_to_epoch(ievt.dtend),

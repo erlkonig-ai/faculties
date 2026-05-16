@@ -1,6 +1,6 @@
 //! Shared pile state for faculty widgets.
 //!
-//! A single `StorageState` holds an open `Repository<Pile<Blake3>>` and
+//! A single `StorageState` holds an open `Repository<Pile>` and
 //! renders the top-bar pile-path selector / error banner. Widgets pull a
 //! fresh [`Workspace`] each frame via [`StorageState::workspace`]; if the
 //! callsite mutates the workspace, it pushes back with
@@ -30,19 +30,19 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BranchStore, Repository, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::Value;
+use triblespace::core::inline::encodings::hash::{Blake3, Handle};
+use triblespace::core::inline::Inline;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobschemas::LongString;
+use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
-type TextHandle = Value<Handle<Blake3, LongString>>;
+type TextHandle = Inline<Handle<LongString>>;
 
 /// Shared open pile + repository. Workspaces are pulled fresh per call.
 pub struct StorageState {
     /// Open repository. `None` when the last open attempt failed; see
     /// [`StorageState::error`] for the message.
-    repo: Option<Repository<Pile<Blake3>>>,
+    repo: Option<Repository<Pile>>,
     /// Canonical path the pile was opened from.
     pile_path: PathBuf,
     /// Editable text buffer for the top-bar path field.
@@ -105,7 +105,7 @@ impl StorageState {
             let _ = repo.close();
         }
         self.error = None;
-        let mut pile = match Pile::<Blake3>::open(&self.pile_path) {
+        let mut pile = match Pile::open(&self.pile_path) {
             Ok(p) => p,
             Err(e) => {
                 self.error = Some(format!("open pile: {e:?}"));
@@ -135,7 +135,7 @@ impl StorageState {
     /// Pull a fresh workspace for `branch`. `None` if no repo is open or
     /// the branch is missing. Each call is a fresh pull — workspaces are
     /// NOT cached across frames.
-    pub fn workspace(&mut self, branch: &str) -> Option<Workspace<Pile<Blake3>>> {
+    pub fn workspace(&mut self, branch: &str) -> Option<Workspace<Pile>> {
         self.ensure_open();
         let repo = self.repo.as_mut()?;
         let bid = find_branch(repo, branch)?;
@@ -153,7 +153,7 @@ impl StorageState {
     /// on `base_head == head`), so callers can invoke this
     /// unconditionally. On CAS failure / storage error, stores a toast.
     /// Uses `Repository::push` which handles merge-retry internally.
-    pub fn push(&mut self, ws: &mut Workspace<Pile<Blake3>>) {
+    pub fn push(&mut self, ws: &mut Workspace<Pile>) {
         self.ensure_open();
         let Some(repo) = self.repo.as_mut() else {
             return;
@@ -367,7 +367,7 @@ fn render_banner(ctx: &mut CardCtx<'_>, icon: &str, msg: &str, color: egui::Colo
 
 /// Walk a repository's branches and return the id of the branch named
 /// `name`, or `None` if no such branch exists.
-pub(crate) fn find_branch(repo: &mut Repository<Pile<Blake3>>, name: &str) -> Option<Id> {
+pub(crate) fn find_branch(repo: &mut Repository<Pile>, name: &str) -> Option<Id> {
     let reader = repo.storage_mut().reader().ok()?;
     for item in repo.storage_mut().branches().ok()? {
         let bid = item.ok()?;

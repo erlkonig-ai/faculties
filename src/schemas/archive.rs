@@ -5,9 +5,9 @@
 //! that wants to read archived conversations or import provenance from a pile.
 
 use triblespace::macros::id_hex;
-pub use triblespace::prelude::blobschemas::FileBytes;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString, U256BE};
+pub use triblespace::prelude::blobencodings::RawBytes;
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
 /// A unified archive projection for externally sourced conversations.
@@ -27,22 +27,22 @@ pub mod archive {
         /// — every messaging faculty (teams, discord, any future
         /// Slack / Matrix / etc.) writes the same attribute.
         "76ED22B5BBB68EC6418DE2B6234EA5FB" as pub edited_at: NsTAIInterval;
-        "E63EE961ABDB1D1BEC0789FDAFFB9501" as pub author_name: Handle<Blake3, LongString>;
-        "2D15150501ACCD9DFD96CB4BF19D1883" as pub author_role: Handle<Blake3, LongString>;
-        "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<Blake3, LongString>;
-        "1F127324384335D12ECFE0CB84840925" as pub author_provider: Handle<Blake3, LongString>;
-        "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
+        "E63EE961ABDB1D1BEC0789FDAFFB9501" as pub author_name: Handle<LongString>;
+        "2D15150501ACCD9DFD96CB4BF19D1883" as pub author_role: Handle<LongString>;
+        "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<LongString>;
+        "1F127324384335D12ECFE0CB84840925" as pub author_provider: Handle<LongString>;
+        "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<LongString>;
         "D8A469EAC2518D1A85692E0BEBF20D6C" as pub content_type: ShortString;
         "8334E282F24A4C7779C8899191B29E00" as pub attachment: GenId;
 
-        "C9132D7400892F65B637BCBE92E230FB" as pub attachment_source_id: Handle<Blake3, LongString>;
-        "A8F6CF04A9B2391A26F04BC84B77217D" as pub attachment_source_pointer: Handle<Blake3, LongString>;
-        "9ADD88D3FFD9E4F91E0DC08126D9180A" as pub attachment_name: Handle<Blake3, LongString>;
+        "C9132D7400892F65B637BCBE92E230FB" as pub attachment_source_id: Handle<LongString>;
+        "A8F6CF04A9B2391A26F04BC84B77217D" as pub attachment_source_pointer: Handle<LongString>;
+        "9ADD88D3FFD9E4F91E0DC08126D9180A" as pub attachment_name: Handle<LongString>;
         "EEFDB32D37B7B2834D99ACCF159B6507" as pub attachment_mime: ShortString;
         "D233E7BE0E973B09BD51E768E528ACA5" as pub attachment_size_bytes: U256BE;
         "5937E1072AF2F8E493321811B483C57B" as pub attachment_width_px: U256BE;
         "B252F4F77929E54FF8472027B7603EE9" as pub attachment_height_px: U256BE;
-        "B0D18159D6035C576AE6B5D871AB4D63" as pub attachment_data: Handle<Blake3, FileBytes>;
+        "B0D18159D6035C576AE6B5D871AB4D63" as pub attachment_data: Handle<RawBytes>;
     }
 
     /// Tag for message payloads.
@@ -63,11 +63,11 @@ pub mod import_schema {
         "891508CAD6E1430B221ADA937EFBD982" as pub conversation: GenId;
         "E997DCAAF43BAA04790FCB0FA0FBFE3A" as pub source_format: ShortString;
         "973FB59D3452D3A8276172F8E3272324" as pub source_raw_root: GenId;
-        "87B587A3906056038FD767F4225274F9" as pub source_conversation_id: Handle<Blake3, LongString>;
-        "1B2A09FF44D2A5736FA320AB255026C1" as pub source_message_id: Handle<Blake3, LongString>;
-        "AA3CF220F15CCF724276F1251AFE053B" as pub source_author: Handle<Blake3, LongString>;
-        "B4C084B61FB46A932BFCA75B8BC621FA" as pub source_role: Handle<Blake3, LongString>;
-        "220DA5084D6261B5420922EADC064A5A" as pub source_parent_id: Handle<Blake3, LongString>;
+        "87B587A3906056038FD767F4225274F9" as pub source_conversation_id: Handle<LongString>;
+        "1B2A09FF44D2A5736FA320AB255026C1" as pub source_message_id: Handle<LongString>;
+        "AA3CF220F15CCF724276F1251AFE053B" as pub source_author: Handle<LongString>;
+        "B4C084B61FB46A932BFCA75B8BC621FA" as pub source_role: Handle<LongString>;
+        "220DA5084D6261B5420922EADC064A5A" as pub source_parent_id: Handle<LongString>;
         "D59247F3AADD3DE8E23B01E8B7406020" as pub source_created_at: NsTAIInterval;
         /// Conversation → message edge (repeated).
         "06DB96427C8EA6FC982D44E018AB0831" as pub message: GenId;

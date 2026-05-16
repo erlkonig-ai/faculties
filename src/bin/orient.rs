@@ -14,18 +14,18 @@ use hifitime::Epoch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
-type CommitHandle = Value<valueschemas::Handle<valueschemas::Blake3, SimpleArchive>>;
-type IntervalValue = Value<valueschemas::NsTAIInterval>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type CommitHandle = Inline<inlineencodings::Handle<inlineencodings::Blake3, SimpleArchive>>;
+type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (i128, i128) = interval.try_from_value().unwrap();
+    let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
     lower
 }
 
@@ -114,8 +114,8 @@ fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
-    (epoch, epoch).try_to_value().unwrap()
+fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
+    (epoch, epoch).try_to_inline().unwrap()
 }
 
 fn format_age(now_key: i128, past_key: i128) -> String {
@@ -137,7 +137,7 @@ fn fmt_id(id: Id) -> String {
 }
 
 fn person_label(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     person_id: Id,
 ) -> String {
@@ -147,9 +147,9 @@ fn person_label(
         .unwrap_or_else(|| fmt_id(person_id))
 }
 
-fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
+fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
     let view: View<str> = ws
-        .get::<View<str>, blobschemas::LongString>(handle)
+        .get::<View<str>, blobencodings::LongString>(handle)
         .map_err(|e| anyhow!("load longstring: {e:?}"))?;
     Ok(view.to_string())
 }
@@ -157,7 +157,7 @@ fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle)
 /// Load messages without resolving body blobs — sorted newest first.
 fn load_message_ids(space: &TribleSet) -> Vec<MessageRow> {
     let mut messages: Vec<MessageRow> = find!(
-        (message_id: Id, from: Id, to: Id, created_at: Value<valueschemas::NsTAIInterval>),
+        (message_id: Id, from: Id, to: Id, created_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(space, [{
             ?message_id @
             metadata::tag: &KIND_MESSAGE_ID,
@@ -178,7 +178,7 @@ fn load_message_ids(space: &TribleSet) -> Vec<MessageRow> {
 }
 
 fn resolve_message_body(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     msg_id: Id,
 ) -> String {
@@ -195,7 +195,7 @@ fn load_reads(space: &TribleSet) -> HashMap<(Id, Id), i128> {
             read_id: Id,
             message_id: Id,
             reader_id: Id,
-            read_at: Value<valueschemas::NsTAIInterval>
+            read_at: Inline<inlineencodings::NsTAIInterval>
         ),
         pattern!(&space, [{
             ?read_id @
@@ -246,7 +246,7 @@ fn find_mail_self(relations_space: &TribleSet) -> Option<(String, Id)> {
 /// of the `mail` branch or `MAIL_USER` env var as a graceful "skip"
 /// rather than an error — orient is a snapshot, not a config tool.
 fn render_unread_mail(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     relations_branch_id: Id,
     message_limit: usize,
     now_key: i128,
@@ -359,7 +359,7 @@ fn render_unread_mail(
 }
 
 fn task_title(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     task_id: Id,
 ) -> String {
@@ -395,7 +395,7 @@ fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, Interva
 }
 
 fn load_config_identity(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
 ) -> Result<ConfigIdentity> {
     let Some(_config_head) = repo
         .storage_mut()
@@ -411,9 +411,9 @@ fn load_config_identity(
         .checkout(..)
         .map_err(|e| anyhow!("checkout config: {e:?}"))?;
 
-    let mut latest: Option<(Id, Value<valueschemas::NsTAIInterval>)> = None;
+    let mut latest: Option<(Id, Inline<inlineencodings::NsTAIInterval>)> = None;
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
+        (config_id: Id, updated_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
             metadata::tag: &CONFIG_KIND_ID,
@@ -599,7 +599,7 @@ fn cmd_show(
 }
 
 fn load_watched_heads(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     local_branch_id: Id,
     compass_branch_id: Id,
     relations_branch_id: Id,
@@ -613,7 +613,7 @@ fn load_watched_heads(
 }
 
 fn load_checkpoint_heads(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     orient_state_branch_id: Id,
 ) -> Result<Option<WatchedHeads>> {
     let Some(_head) = repo
@@ -632,7 +632,7 @@ fn load_checkpoint_heads(
 
     let mut latest: Option<(Id, i128)> = None;
     for (checkpoint_id, at) in find!(
-        (checkpoint_id: Id, at: Value<valueschemas::NsTAIInterval>),
+        (checkpoint_id: Id, at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?checkpoint_id @
             metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
@@ -660,7 +660,7 @@ fn load_checkpoint_heads(
 fn load_optional_commit_head(
     space: &TribleSet,
     checkpoint_id: Id,
-    attr: Attribute<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>,
+    attr: Attribute<inlineencodings::Handle<blobencodings::SimpleArchive>>,
 ) -> Option<CommitHandle> {
     find!(
         value: CommitHandle,
@@ -670,7 +670,7 @@ fn load_optional_commit_head(
 }
 
 fn save_checkpoint_heads(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     orient_state_branch_id: Id,
     heads: &WatchedHeads,
 ) -> Result<()> {
@@ -696,7 +696,7 @@ fn save_checkpoint_heads(
 }
 
 fn branch_head_by_id(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     branch_id: Id,
 ) -> Result<Option<CommitHandle>> {
     repo.storage_mut()
@@ -899,8 +899,8 @@ fn render_tags(tags: &[String]) -> String {
     )
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         // Avoid Drop warnings on early errors.
@@ -914,7 +914,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);

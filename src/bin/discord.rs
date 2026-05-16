@@ -49,8 +49,8 @@ use serde_json::{Value as JsonValue, json};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::prelude::blobschemas::{self, LongString};
-use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval};
+use triblespace::prelude::blobencodings::{self, LongString};
+use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use faculties::schemas::archive::archive;
@@ -219,13 +219,13 @@ fn build_config(cli: &Cli) -> Result<DiscordConfig> {
     })
 }
 
-fn open_pile(path: &PathBuf) -> Result<Pile<Blake3>> {
+fn open_pile(path: &PathBuf) -> Result<Pile> {
     Pile::open(path).with_context(|| format!("open pile {}", path.display()))
 }
 
 fn with_repo<T>(
     pile_path: &PathBuf,
-    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let pile = open_pile(pile_path)?;
     let repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
@@ -233,9 +233,9 @@ fn with_repo<T>(
     with_repo_close(repo, f)
 }
 
-fn with_repo_close<T, F>(repo: Repository<Pile<Blake3>>, f: F) -> Result<T>
+fn with_repo_close<T, F>(repo: Repository<Pile>, f: F) -> Result<T>
 where
-    F: FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+    F: FnOnce(&mut Repository<Pile>) -> Result<T>,
 {
     let mut repo = repo;
     let result = f(&mut repo);
@@ -326,7 +326,7 @@ fn load_bot_token(config: &DiscordConfig) -> Result<String> {
         // most one by construction (kind_token is intrinsic-id'd
         // from just the tag).
         for (_tok, handle) in find!(
-            (tok: Id, handle: Value<Handle<Blake3, LongString>>),
+            (tok: Id, handle: Inline<Handle<LongString>>),
             pattern!(&catalog, [{
                 ?tok @
                 metadata::tag: discord::kind_token,
@@ -392,10 +392,10 @@ struct IncomingMessage {
     author_external_id: String,
     author_display_name: String,
     content: String,
-    created_at: Value<NsTAIInterval>,
+    created_at: Inline<NsTAIInterval>,
     /// Present only on edited messages. Re-ingesting an edited
     /// message updates this attribute on the existing entity.
-    edited_at: Option<Value<NsTAIInterval>>,
+    edited_at: Option<Inline<NsTAIInterval>>,
     reply_to_external_id: Option<String>,
     attachments: Vec<AttachmentSource>,
 }
@@ -662,7 +662,7 @@ fn print_history(config: &DiscordConfig, options: &ReadOptions) -> Result<()> {
         // filter is off.
         let mut channel_externals: HashMap<Id, String> = HashMap::new();
         for (ch_id, ext_handle) in find!(
-            (channel: Id, ext: Value<Handle<Blake3, LongString>>),
+            (channel: Id, ext: Inline<Handle<LongString>>),
             pattern!(&catalog, [{
                 ?channel @
                 metadata::tag: discord::kind_channel,
@@ -680,9 +680,9 @@ fn print_history(config: &DiscordConfig, options: &ReadOptions) -> Result<()> {
         for (msg, content, author_id, created_at, ch) in find!(
             (
                 message: Id,
-                content: Value<Handle<Blake3, LongString>>,
+                content: Inline<Handle<LongString>>,
                 author: Id,
-                created_at: Value<NsTAIInterval>,
+                created_at: Inline<NsTAIInterval>,
                 channel: Id,
             ),
             pattern!(&catalog, [{
@@ -716,8 +716,8 @@ fn print_history(config: &DiscordConfig, options: &ReadOptions) -> Result<()> {
             });
         }
 
-        let edited: std::collections::HashMap<Id, Value<NsTAIInterval>> = find!(
-            (message: Id, edited: Value<NsTAIInterval>),
+        let edited: std::collections::HashMap<Id, Inline<NsTAIInterval>> = find!(
+            (message: Id, edited: Inline<NsTAIInterval>),
             pattern!(&catalog, [{
                 ?message @
                 metadata::tag: archive::kind_message,
@@ -733,7 +733,7 @@ fn print_history(config: &DiscordConfig, options: &ReadOptions) -> Result<()> {
         // Resolve author display names in one pass.
         let mut author_names: HashMap<Id, String> = HashMap::new();
         for (author, name_handle) in find!(
-            (author: Id, name: Value<Handle<Blake3, LongString>>),
+            (author: Id, name: Inline<Handle<LongString>>),
             pattern!(&catalog, [{
                 ?author @
                 metadata::tag: archive::kind_author,
@@ -795,11 +795,11 @@ fn print_history(config: &DiscordConfig, options: &ReadOptions) -> Result<()> {
 struct HistoryRow {
     message_id: Id,
     channel_id: Id,
-    content: Value<Handle<Blake3, LongString>>,
+    content: Inline<Handle<LongString>>,
     author_id: Id,
-    created_at: Value<NsTAIInterval>,
+    created_at: Inline<NsTAIInterval>,
     created_at_key: i128,
-    edited_at: Option<Value<NsTAIInterval>>,
+    edited_at: Option<Inline<NsTAIInterval>>,
 }
 
 fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result<Vec<IncomingMessage>> {
@@ -900,8 +900,8 @@ fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result
 }
 
 fn build_ingest_change(
-    ws: &mut Workspace<Pile<Blake3>>,
-    files_ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
+    files_ws: &mut Workspace<Pile>,
     _catalog: &TribleSet,
     messages: Vec<IncomingMessage>,
     config: &DiscordConfig,
@@ -1042,7 +1042,7 @@ fn build_ingest_change(
                 .clone()
                 .or(fetched_type)
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            let content_handle = files_ws.put::<blobschemas::FileBytes, _>(bytes);
+            let content_handle = files_ws.put::<blobencodings::RawBytes, _>(bytes);
             let name_handle = files_ws.put(source.filename.clone());
 
             files_change += entity! { ExclusiveId::force_ref(&attachment_id) @
@@ -1080,7 +1080,7 @@ fn load_channel_cursor(config: &DiscordConfig, channel_external_id: &str) -> Res
             .ok_or_else(|| anyhow!("cursor id rooted"))?;
 
         for (_cur, handle) in find!(
-            (cur: Id, handle: Value<Handle<Blake3, LongString>>),
+            (cur: Id, handle: Inline<Handle<LongString>>),
             pattern!(&catalog, [{
                 ?cur @
                 metadata::tag: discord::kind_cursor,
@@ -1289,7 +1289,7 @@ fn compare_snowflakes(a: &str, b: &str) -> std::cmp::Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
-fn parse_iso8601(value: &str) -> Result<Value<NsTAIInterval>> {
+fn parse_iso8601(value: &str) -> Result<Inline<NsTAIInterval>> {
     // Discord timestamps look like `2026-04-22T09:12:34.567000+00:00`.
     // hifitime's Epoch::from_gregorian_str handles RFC3339.
     let epoch = Epoch::from_gregorian_str(value)
@@ -1301,17 +1301,17 @@ fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or(Epoch::from_gregorian_tai_at_midnight(2026, 1, 1))
 }
 
-fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-    (epoch, epoch).try_to_value().unwrap()
+fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
+    (epoch, epoch).try_to_inline().unwrap()
 }
 
-fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
-fn format_interval(interval: Value<NsTAIInterval>) -> String {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn format_interval(interval: Inline<NsTAIInterval>) -> String {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_gregorian_str(TimeScale::UTC)
 }
 

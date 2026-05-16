@@ -17,7 +17,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
 
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 #[derive(Parser)]
 #[command(name = "compass", about = "A small TribleSpace kanban faculty")]
@@ -109,23 +109,23 @@ enum Command {
 
 /// Query helpers that operate directly on the checked-out TribleSet + workspace.
 
-type IntervalValue = Value<valueschemas::NsTAIInterval>;
+type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
 fn epoch_interval(epoch: Epoch) -> IntervalValue {
-    (epoch, epoch).try_to_value().unwrap()
+    (epoch, epoch).try_to_inline().unwrap()
 }
 
 fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (i128, i128) = interval.try_from_value().unwrap();
+    let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
     lower
 }
 
 fn format_interval(interval: IntervalValue) -> String {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     format!("{}", lower)
 }
 
@@ -192,8 +192,8 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         // Avoid Drop warnings on early errors.
@@ -211,7 +211,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
@@ -227,7 +227,7 @@ fn with_repo<T>(
     result
 }
 
-fn task_title(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, task_id: Id) -> String {
+fn task_title(ws: &mut Workspace<Pile>, space: &TribleSet, task_id: Id) -> String {
     find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
         .next()
         .and_then(|h| read_text(ws, h).ok())
@@ -273,9 +273,9 @@ fn all_goal_ids(space: &TribleSet) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])).collect()
 }
 
-fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
+fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
     let view: View<str> = ws
-        .get::<View<str>, blobschemas::LongString>(handle)
+        .get::<View<str>, blobencodings::LongString>(handle)
         .map_err(|e| anyhow::anyhow!("load longstring: {e:?}"))?;
     Ok(view.to_string())
 }
@@ -356,8 +356,8 @@ fn is_ancestor(space: &TribleSet, from: Id, to: Id) -> bool {
     from == to || exists!(
         (_start: Id, _end: Id),
         and!(
-            _start.is(from.to_value()),
-            _end.is(to.to_value()),
+            _start.is(from.to_inline()),
+            _end.is(to.to_inline()),
             path!(space, _start board::parent+ _end)
         )
     )
@@ -435,7 +435,7 @@ fn priority_ranks(task_ids: &[Id], edges: &HashSet<(Id, Id)>) -> HashMap<Id, usi
 }
 
 fn render_board(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     status_filter: &[String],
     tag_filter: &[String],
@@ -634,7 +634,7 @@ fn order_rows(rows: Vec<TaskRow>, priority_edges: &HashSet<(Id, Id)>) -> Vec<(Ta
     ordered
 }
 
-fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
+fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
@@ -653,7 +653,7 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Resul
         let name_handle = label
             .to_owned()
             .to_blob()
-            .get_handle::<valueschemas::Blake3>();
+            .get_handle::<inlineencodings::Blake3>();
         change += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_handle };
     }
     Ok(change)

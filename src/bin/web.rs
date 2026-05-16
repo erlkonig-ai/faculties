@@ -17,8 +17,8 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,9 +287,9 @@ fn resolve_branch_id(cli: &Cli) -> Result<Id> {
 }
 
 fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
-    let mut latest: Option<(Id, Value<NsTAIInterval>)> = None;
+    let mut latest: Option<(Id, Inline<NsTAIInterval>)> = None;
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        (config_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(space, [{
             ?config_id @
             metadata::tag: CONFIG_KIND_ID,
@@ -305,20 +305,20 @@ fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
     Ok(latest.map(|(id, _)| id))
 }
 
-fn interval_key(value: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = value.try_from_value().unwrap();
+fn interval_key(value: Inline<NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = value.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
 fn load_string_attr(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     entity: Id,
-    attr: Attribute<Handle<Blake3, LongString>>,
+    attr: Attribute<Handle<LongString>>,
 ) -> Result<Option<String>>
 {
     let handle = match find!(
-        (handle: Value<Handle<Blake3, LongString>>),
+        (handle: Inline<Handle<LongString>>),
         pattern!(space, [{ entity @ attr: ?handle }])
     )
     .into_iter()
@@ -454,7 +454,7 @@ fn store_fetch(cli: &Cli, branch_id: Id, provider: Provider, url: &str, content:
     })
 }
 
-fn push_workspace(repo: &mut Repository<Pile<Blake3>>, ws: &mut Workspace<Pile<Blake3>>) -> Result<()> {
+fn push_workspace(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>) -> Result<()> {
     while let Some(mut conflict) = repo.try_push(ws).map_err(|e| anyhow!("push: {e:?}"))? {
         conflict
             .merge(ws)
@@ -468,8 +468,8 @@ fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-    (epoch, epoch).try_to_value().unwrap()
+fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
+    (epoch, epoch).try_to_inline().unwrap()
 }
 
 // --- Tavily ---
@@ -645,8 +645,8 @@ fn exa_contents(client: &Client, api_key: &str, url: &str, max_characters: usize
 
 // --- Pile helpers ---
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
-    let mut pile = Pile::<Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore().map_err(|e| anyhow!("restore pile {}: {e:?}", path.display())) {
         // Avoid Drop warnings on early errors.
@@ -661,7 +661,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);

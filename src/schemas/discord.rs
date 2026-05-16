@@ -27,8 +27,8 @@
 //! so edits update the existing entity rather than spawning a new one.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle};
 use triblespace::prelude::*;
 
 pub const DEFAULT_BRANCH: &str = "discord";
@@ -45,27 +45,27 @@ pub mod discord {
         /// External Discord snowflake for a guild (server). Stored
         /// as a string — Discord ids are u64 but the REST API
         /// ships them as strings to survive JavaScript clients.
-        "9E8EC81F5C14805CCFD4930A4B877138" as pub guild_id: Handle<Blake3, LongString>;
+        "9E8EC81F5C14805CCFD4930A4B877138" as pub guild_id: Handle<LongString>;
         /// External Discord snowflake for a channel.
-        "7C943A11E09C922989CAFE22B92E9A51" as pub channel_id: Handle<Blake3, LongString>;
+        "7C943A11E09C922989CAFE22B92E9A51" as pub channel_id: Handle<LongString>;
         /// External Discord snowflake for a message.
-        "758C42164B566C2AFECBCD7129163A34" as pub message_id: Handle<Blake3, LongString>;
+        "758C42164B566C2AFECBCD7129163A34" as pub message_id: Handle<LongString>;
         /// External Discord snowflake for a user.
-        "2A74F35C6720A0C60BF43D30DF272F85" as pub user_id: Handle<Blake3, LongString>;
+        "2A74F35C6720A0C60BF43D30DF272F85" as pub user_id: Handle<LongString>;
         /// Full Discord JSON body of a message. Stored raw so
         /// future code can derive additional fields without
         /// re-fetching.
-        "5B9DCF6170CD775FC5DA22C8DB96599D" as pub message_raw: Handle<Blake3, LongString>;
+        "5B9DCF6170CD775FC5DA22C8DB96599D" as pub message_raw: Handle<LongString>;
         /// Bot token (passed to the REST API as `Authorization:
         /// Bot <token>`). One token per bot identity; a caller
         /// who operates multiple bots would tag the token entity
         /// with a different `kind` or a user-scoped id.
-        "E20FEC3E1714D5EDC556936AE1C0F463" as pub bot_token: Handle<Blake3, LongString>;
+        "E20FEC3E1714D5EDC556936AE1C0F463" as pub bot_token: Handle<LongString>;
         /// Per-channel pagination cursor — the snowflake of the
         /// newest message we ingested. Next sync fetches
         /// `?after=<cursor>`. Stored as a LongString handle for
         /// consistency with the other snowflake attributes.
-        "3C510E125ACE09DC9B297D533C0F13B7" as pub cursor_last_message_id: Handle<Blake3, LongString>;
+        "3C510E125ACE09DC9B297D533C0F13B7" as pub cursor_last_message_id: Handle<LongString>;
     }
 
     /// Root id for describing the Discord protocol in metadata.

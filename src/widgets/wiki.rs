@@ -35,20 +35,20 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::{TryToValue, Value};
+use triblespace::core::inline::encodings::hash::{Blake3, Handle};
+use triblespace::core::inline::{TryToInline, Value};
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobschemas::{FileBytes, LongString};
+use triblespace::prelude::blobencodings::{RawBytes, LongString};
 use triblespace::prelude::View;
 
 use crate::schemas::files::{file, KIND_FILE};
 use crate::schemas::wiki::{attrs as wiki, KIND_VERSION_ID, TAG_ARCHIVED_ID};
 
 /// Handle to a long-string blob living in a pile.
-type TextHandle = Value<Handle<Blake3, LongString>>;
+type TextHandle = Inline<Handle<LongString>>;
 
 /// Handle to a file-bytes blob living in a pile.
-type FileHandle = Value<Handle<Blake3, FileBytes>>;
+type FileHandle = Inline<Handle<RawBytes>>;
 
 /// Format an Id as a lowercase hex string.
 fn fmt_id(id: Id) -> String {
@@ -78,8 +78,8 @@ impl WikiLive {
     /// Refresh cached fact spaces from the provided workspaces. Pulls
     /// fresh `TribleSet`s via `checkout(..)`.
     fn refresh(
-        wiki_ws: &mut Workspace<Pile<Blake3>>,
-        files_ws: Option<&mut Workspace<Pile<Blake3>>>,
+        wiki_ws: &mut Workspace<Pile>,
+        files_ws: Option<&mut Workspace<Pile>>,
     ) -> Self {
         let wiki_space = wiki_ws
             .checkout(..)
@@ -113,7 +113,7 @@ impl WikiLive {
         }
     }
 
-    fn text(&self, ws: &mut Workspace<Pile<Blake3>>, h: TextHandle) -> String {
+    fn text(&self, ws: &mut Workspace<Pile>, h: TextHandle) -> String {
         ws.get::<View<str>, LongString>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
@@ -124,7 +124,7 @@ impl WikiLive {
 
     fn file_text(
         &self,
-        files_ws: Option<&mut Workspace<Pile<Blake3>>>,
+        files_ws: Option<&mut Workspace<Pile>>,
         h: TextHandle,
     ) -> String {
         files_ws
@@ -206,14 +206,14 @@ impl WikiLive {
         .map(|(vid, _)| vid)
     }
 
-    fn title(&self, wiki_ws: &mut Workspace<Pile<Blake3>>, vid: Id) -> String {
+    fn title(&self, wiki_ws: &mut Workspace<Pile>, vid: Id) -> String {
         find!(h: TextHandle, pattern!(&self.wiki_space, [{ vid @ wiki::title: ?h }]))
             .next()
             .map(|h| self.text(wiki_ws, h))
             .unwrap_or_default()
     }
 
-    fn content(&self, wiki_ws: &mut Workspace<Pile<Blake3>>, vid: Id) -> String {
+    fn content(&self, wiki_ws: &mut Workspace<Pile>, vid: Id) -> String {
         find!(h: TextHandle, pattern!(&self.wiki_space, [{ vid @ wiki::content: ?h }]))
             .next()
             .map(|h| self.text(wiki_ws, h))
@@ -239,7 +239,7 @@ impl WikiLive {
     }
 
     /// Latest non-archived (fragment_id, version_id) pairs sorted by title.
-    fn fragments_sorted(&self, wiki_ws: &mut Workspace<Pile<Blake3>>) -> Vec<(Id, Id)> {
+    fn fragments_sorted(&self, wiki_ws: &mut Workspace<Pile>) -> Vec<(Id, Id)> {
         let mut latest: BTreeMap<Id, (Id, i128)> = BTreeMap::new();
         for (vid, frag, ts) in find!(
             (vid: Id, frag: Id, ts: (i128, i128)),
@@ -278,7 +278,7 @@ impl WikiLive {
     /// the blob handle and a file name (or "file" if none is known).
     fn resolve_file(
         &self,
-        files_ws: Option<&mut Workspace<Pile<Blake3>>>,
+        files_ws: Option<&mut Workspace<Pile>>,
         hex: &str,
     ) -> Option<(FileHandle, String)> {
         let (entity_id, handle) = if hex.len() == 32 {
@@ -293,8 +293,8 @@ impl WikiLive {
             (eid, h)
         } else if hex.len() == 64 {
             let hash_str = format!("blake3:{hex}");
-            let hash_value: Value<triblespace::core::value::schemas::hash::Hash<Blake3>> =
-                hash_str.as_str().try_to_value().ok()?;
+            let hash_value: Inline<triblespace::core::inline::encodings::hash::Hash<Blake3>> =
+                hash_str.as_str().try_to_inline().ok()?;
             let content_handle: FileHandle = hash_value.into();
             let eid = find!(
                 eid: Id,
@@ -322,7 +322,7 @@ impl WikiLive {
     /// Resolve `files:<hex>`, write the blob to `$TMPDIR/liora-files/<name>`,
     /// and fire `open` on it. Logs errors to stderr rather than surfacing
     /// them through the UI (this is a best-effort side channel).
-    fn open_file(&self, files_ws: Option<&mut Workspace<Pile<Blake3>>>, hex: &str) {
+    fn open_file(&self, files_ws: Option<&mut Workspace<Pile>>, hex: &str) {
         let Some(ws) = files_ws else {
             eprintln!("[files] no files workspace available");
             return;
@@ -335,7 +335,7 @@ impl WikiLive {
         };
 
         let result = (|| -> Result<std::path::PathBuf, String> {
-            let blob: Blob<FileBytes> = ws.get(handle).map_err(|e| format!("get blob: {e:?}"))?;
+            let blob: Blob<RawBytes> = ws.get(handle).map_err(|e| format!("get blob: {e:?}"))?;
             let tmp_dir = std::env::temp_dir().join("liora-files");
             std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir: {e}"))?;
             let path = tmp_dir.join(&name);
@@ -588,7 +588,7 @@ struct GraphNode {
 }
 
 impl WikiGraph {
-    fn from_wiki(live: &WikiLive, wiki_ws: &mut Workspace<Pile<Blake3>>) -> Self {
+    fn from_wiki(live: &WikiLive, wiki_ws: &mut Workspace<Pile>) -> Self {
         let fragments = live.fragments_sorted(wiki_ws);
         let mut frag_to_idx = BTreeMap::new();
         let mut nodes = Vec::new();
@@ -877,7 +877,11 @@ impl WikiGraph {
     /// Paint the force-directed graph. Returns both the clicked node
     /// (if any) and the viewport rect so callers can overlay
     /// additional widgets (search bar, etc.) inside it.
-    fn show(&self, ui: &mut egui::Ui) -> (Option<Id>, egui::Rect) {
+    fn show(
+        &self,
+        ui: &mut egui::Ui,
+        search: &mut GORBIE::search::SearchSession,
+    ) -> (Option<Id>, egui::Rect) {
         // Bounded viewport height. Inside the notebook's auto_shrink
         // ScrollArea `ui.available_height()` is f32::INFINITY, and
         // allocating a vec2(x, INF) rect here doesn't just swallow
@@ -977,6 +981,8 @@ impl WikiGraph {
         let node_radius = 6.0 * zoom.max(0.3);
         let edge_color = ui.visuals().weak_text_color();
         let node_fill = GORBIE::themes::ral(5005);
+        let node_match_fill = GORBIE::themes::ral(1003);
+        let needle_lower = search.query().to_lowercase();
         let node_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
         let label_color = ui.visuals().text_color();
         let font_id = egui::TextStyle::Small.resolve(ui.style());
@@ -1012,6 +1018,22 @@ impl WikiGraph {
             egui::Color32::from_rgba_unmultiplied(r, g, b, 220)
         };
         for node in &self.nodes {
+            // Search-active and the node's title matches? Report to
+            // the search session BEFORE the visibility check, so
+            // off-screen matches still bump the global `n / total`
+            // counter. We use `frag_id.with("graph_node")` as the
+            // match id to avoid colliding with text-level matches for
+            // the same fragment (e.g. wiki:id in a meta row).
+            let is_match = !needle_lower.is_empty()
+                && node.label.to_lowercase().contains(&needle_lower);
+            let _match_info = if is_match {
+                let frag_bytes: &[u8] = node.frag_id.as_ref();
+                let id = egui::Id::new(("wiki_graph_node", frag_bytes));
+                Some(search.report(id))
+            } else {
+                None
+            };
+
             let pos = to_screen(node.pos);
             if !rect.expand(20.0).contains(pos) {
                 continue;
@@ -1021,7 +1043,11 @@ impl WikiGraph {
             // size, hub fragments grow logarithmically. Caps at 3×.
             let deg_scale = (1.0 + (node.degree as f32 + 1.0).ln() * 0.4).min(3.0);
             let r = node_radius * deg_scale;
-            painter.circle(pos, r, node_fill, node_stroke);
+            // Matching nodes paint in RAL 1003 (signal yellow) — same
+            // color GORBIE uses for word-level search underlines, so
+            // the graph and the floats highlight in lock-step.
+            let fill = if is_match { node_match_fill } else { node_fill };
+            painter.circle(pos, r, fill, node_stroke);
             if show_labels {
                 // Measure the label first so we know whether it fits
                 // on the right. If painting to the right of the node
@@ -1204,8 +1230,8 @@ impl WikiViewer {
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        wiki_ws: &mut Workspace<Pile<Blake3>>,
-        mut files_ws: Option<&mut Workspace<Pile<Blake3>>>,
+        wiki_ws: &mut Workspace<Pile>,
+        mut files_ws: Option<&mut Workspace<Pile>>,
     ) {
         ctx.section("Wiki", |ctx| {
         // Refresh cached spaces if the wiki head has advanced since the
@@ -1283,7 +1309,9 @@ impl WikiViewer {
             // section width without the grid cell's edge padding —
             // visually the force-directed view becomes edge-to-edge
             // like the timeline viewport.
-            let (clicked_node, graph_rect) = graph.show(ctx.ui_mut());
+            let mut search = ctx.search();
+            let (clicked_node, graph_rect) =
+                graph.show(ctx.ui_mut(), &mut search);
             if let Some(frag_id) = clicked_node {
                 if !self.open_pages.iter().any(|p| p.frag_id == frag_id) {
                     self.open_pages.push(OpenPage {
@@ -1307,7 +1335,7 @@ impl WikiViewer {
                 let bar_top = graph_rect.top() + module;
                 let bar_left = graph_rect.left() + module;
                 let bar_width = (graph_rect.width() * 0.5).clamp(240.0, 420.0);
-                let bar_height = 26.0;
+                let bar_height = 3.0 * module;
                 let bar_rect = egui::Rect::from_min_size(
                     egui::pos2(bar_left, bar_top),
                     egui::vec2(bar_width, bar_height),
@@ -1328,13 +1356,7 @@ impl WikiViewer {
                                     if ui
                                         .add_enabled(
                                             go_enabled,
-                                            egui::Button::new(
-                                                egui::RichText::new("GO")
-                                                    .small()
-                                                    .monospace()
-                                                    .strong(),
-                                            )
-                                            .min_size(egui::vec2(44.0, 22.0)),
+                                            GORBIE::widgets::Button::new("GO"),
                                         )
                                         .on_hover_text(
                                             "Open fragment by hex prefix or title (Enter)",
@@ -1450,7 +1472,6 @@ impl WikiViewer {
         }
 
         // ── floating wiki page cards ─────────────────────────────────
-        let padding = GORBIE::cards::DEFAULT_CARD_PADDING;
         let open_snapshot: Vec<(Id, Option<Id>)> = self
             .open_pages
             .iter()
@@ -1475,85 +1496,110 @@ impl WikiViewer {
 
             ctx.push_id(frag_key, |ctx| {
                 let resp = ctx.float(|ctx| {
-                    ctx.with_padding(padding, |ctx| {
+                    ctx.grid(|g| {
                         if vid.is_none() {
-                            ctx.add(
-                                egui::Label::new(
-                                    egui::RichText::new("Link target not found").heading(),
-                                )
-                                .wrap(),
-                            );
-                            ctx.label(
-                                egui::RichText::new(format!("wiki:{frag_id:x}"))
-                                    .monospace()
-                                    .small()
-                                    .color(frag_color(frag_id)),
-                            );
-                            ctx.separator();
-                            ctx.label(
-                                "This link points to an ID that doesn't exist in the wiki. \
-                                 The target may have been deleted, or the link may contain a typo.",
-                            );
+                            g.full(|ctx| {
+                                ctx.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("Link target not found").heading(),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                            g.full(|ctx| {
+                                ctx.label(
+                                    egui::RichText::new(format!("wiki:{frag_id:x}"))
+                                        .monospace()
+                                        .small()
+                                        .color(frag_color(frag_id)),
+                                );
+                            });
+                            g.full(|ctx| { ctx.separator(); });
+                            g.full(|ctx| {
+                                ctx.label(
+                                    "This link points to an ID that doesn't exist in the wiki. \
+                                     The target may have been deleted, or the link may contain a typo.",
+                                );
+                            });
                             return;
                         }
                         let frag_col = frag_color(frag_id);
+
                         // Heading row: identity-colored dot swatch + title.
-                        ctx.ui_mut().horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            let (dot_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(10.0, 10.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().circle_filled(
-                                dot_rect.center(),
-                                5.0,
-                                frag_col,
-                            );
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(&title).heading())
-                                    .wrap(),
-                            );
+                        g.full(|ctx| {
+                            ctx.ui_mut().horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let (dot_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(10.0, 10.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(
+                                    dot_rect.center(),
+                                    5.0,
+                                    frag_col,
+                                );
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(&title).heading())
+                                        .wrap(),
+                                );
+                            });
                         });
 
-                        // Compact meta row: wiki:<frag_id> · version badge
-                        // · inline prev/next/latest controls when history
-                        // > 1. Replaces the three-line header + separate
-                        // version grid with a single tight row.
-                        ctx.ui_mut().horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(
-                                egui::RichText::new(format!("wiki:{frag_id:x}"))
-                                    .monospace()
-                                    .small()
-                                    .color(frag_col),
-                            );
-                            if n_versions > 1 {
-                                let vi = current_idx.unwrap_or(0);
-                                // Subtle dot separator between id and
-                                // version chip.
-                                ui.label(
-                                    egui::RichText::new("·")
-                                        .small()
-                                        .color(egui::Color32::from_rgb(0x8a, 0x8a, 0x8a)),
-                                );
-                                let ver_label = if pinned.is_some() {
-                                    format!("v{}/{}", n_versions - vi, n_versions)
-                                } else {
-                                    format!("v{} · LATEST", n_versions)
-                                };
-                                ui.label(
-                                    egui::RichText::new(ver_label)
+                        // Meta row: multi-cell grid split. (DIAGNOSTIC)
+                        if n_versions <= 1 {
+                            g.full(|ctx| {
+                                ctx.label(
+                                    egui::RichText::new(format!("wiki:{frag_id:x}"))
                                         .monospace()
                                         .small()
-                                        .strong(),
+                                        .color(frag_col),
                                 );
-                                // Back to older version. Disabled at
-                                // the tail of history.
-                                let back_enabled = vi + 1 < n_versions;
-                                if ui
+                            });
+                        } else {
+                            let vi = current_idx.unwrap_or(0);
+                            let at_latest = pinned.is_none();
+                            let back_enabled = vi + 1 < n_versions;
+                            let fwd_enabled = vi > 0 || pinned.is_some();
+                            let ver_label = if pinned.is_some() {
+                                format!("v{}/{}", n_versions - vi, n_versions)
+                            } else {
+                                format!("v{} · LATEST", n_versions)
+                            };
+
+                            g.place(6, |ctx| {
+                                ctx.label(
+                                    egui::RichText::new(format!("wiki:{frag_id:x}"))
+                                        .monospace()
+                                        .small()
+                                        .color(frag_col),
+                                );
+                            });
+                            g.place(3, |ctx| {
+                                // Right-align so the label sits flush against
+                                // the ◀ button across just one gutter, with
+                                // vertical centering against the taller
+                                // button cells in the same row. The grid's
+                                // frame-delayed row sizing bounds the cell
+                                // height to the row's actual height, so the
+                                // `Center` cross-align doesn't drift.
+                                ctx.ui_mut().with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(ver_label)
+                                                .monospace()
+                                                .small()
+                                                .strong(),
+                                        );
+                                    },
+                                );
+                            });
+                            g.place(1, |ctx| {
+                                if ctx
+                                    .ui_mut()
                                     .add_enabled(
                                         back_enabled,
-                                        egui::Button::new("◀").small(),
+                                        GORBIE::widgets::Button::new("◀").columns(1),
                                     )
                                     .on_hover_text("Older version")
                                     .clicked()
@@ -1561,13 +1607,13 @@ impl WikiViewer {
                                     version_nav =
                                         Some((frag_id, Some(history[vi + 1])));
                                 }
-                                // Forward to newer version (or jump to
-                                // latest when pinned to an old one).
-                                let fwd_enabled = vi > 0 || pinned.is_some();
-                                if ui
+                            });
+                            g.place(1, |ctx| {
+                                if ctx
+                                    .ui_mut()
                                     .add_enabled(
                                         fwd_enabled,
-                                        egui::Button::new("▶").small(),
+                                        GORBIE::widgets::Button::new("▶").columns(1),
                                     )
                                     .on_hover_text("Newer version")
                                     .clicked()
@@ -1579,26 +1625,31 @@ impl WikiViewer {
                                         version_nav = Some((frag_id, None));
                                     }
                                 }
-                                // Jump to latest (only meaningful when
-                                // we're pinned to an older version).
-                                if pinned.is_some()
-                                    && ui
-                                        .add(egui::Button::new("↻").small())
-                                        .on_hover_text("Jump to latest")
-                                        .clicked()
+                            });
+                            g.place(1, |ctx| {
+                                if ctx
+                                    .ui_mut()
+                                    .add_enabled(
+                                        !at_latest,
+                                        GORBIE::widgets::Button::new("↻").columns(1),
+                                    )
+                                    .on_hover_text("Jump to latest")
+                                    .clicked()
                                 {
                                     version_nav = Some((frag_id, None));
                                 }
+                            });
+                        }
+
+                        g.full(|ctx| { ctx.separator(); });
+
+                        g.full(|ctx| {
+                            match render_wiki_content(ctx, &content) {
+                                Some(LinkClick::Wiki(id)) => to_open_from_link.push(id),
+                                Some(LinkClick::File(hex)) => to_open_file.push(hex),
+                                None => {}
                             }
                         });
-
-                        ctx.separator();
-
-                        match render_wiki_content(ctx, &content) {
-                            Some(LinkClick::Wiki(id)) => to_open_from_link.push(id),
-                            Some(LinkClick::File(hex)) => to_open_file.push(hex),
-                            None => {}
-                        }
                     });
                 });
                 if resp.closed {

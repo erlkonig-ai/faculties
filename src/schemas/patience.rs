@@ -12,10 +12,10 @@ pub mod exec_schema {
     use super::*;
 
     attributes! {
-        "AA2F34973589295FA70B538D92CD30F8" as kind: valueschemas::GenId;
-        "C4C3870642CAB5F55E7E575B1A62E640" as about_request: valueschemas::GenId;
-        "442A275ABC6834231FC65A4B89773ECD" as worker: valueschemas::GenId;
-        "7FFF32386EBB2AE92094B7D88DE2743D" as timeout_ms: valueschemas::U256BE;
-        "D8910A14B31096DF94DE9E807B87645F" as requested_at: valueschemas::NsTAIInterval;
+        "AA2F34973589295FA70B538D92CD30F8" as kind: inlineencodings::GenId;
+        "C4C3870642CAB5F55E7E575B1A62E640" as about_request: inlineencodings::GenId;
+        "442A275ABC6834231FC65A4B89773ECD" as worker: inlineencodings::GenId;
+        "7FFF32386EBB2AE92094B7D88DE2743D" as timeout_ms: inlineencodings::U256BE;
+        "D8910A14B31096DF94DE9E807B87645F" as requested_at: inlineencodings::NsTAIInterval;
     }
 }

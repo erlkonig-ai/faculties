@@ -11,7 +11,7 @@ use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 #[derive(Parser)]
 #[command(name = "relations", about = "Relationship/contacts faculty")]
@@ -192,15 +192,15 @@ fn resolve_person_id(space: &TribleSet, raw: &str) -> Result<Id> {
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
+fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
     let view: View<str> = ws
         .get(handle)
         .map_err(|e| anyhow!("load longstring: {e:?}"))?;
     Ok(view.to_string())
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         // Avoid Drop warnings on early errors.
@@ -215,7 +215,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
@@ -229,7 +229,7 @@ fn with_repo<T>(
     result
 }
 
-fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
+fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
     let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
     let existing: HashMap<Id, TextHandle> = find!(
         (kind: Id, name: TextHandle),
@@ -242,7 +242,7 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Resul
         let name_handle = "person"
             .to_owned()
             .to_blob()
-            .get_handle::<valueschemas::Blake3>();
+            .get_handle::<inlineencodings::Blake3>();
         change += entity! { ExclusiveId::force_ref(&KIND_PERSON_ID) @ metadata::name: name_handle };
     }
     Ok(change)
@@ -250,22 +250,22 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Resul
 
 // ── on-demand person queries ─────────────────────────────────────────
 
-fn person_label(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+fn person_label(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ metadata::name: ?h }]))
         .next().and_then(|h| read_text(ws, h).ok())
 }
 
-fn person_first_name(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+fn person_first_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ relations::first_name: ?h }]))
         .next().and_then(|h| read_text(ws, h).ok())
 }
 
-fn person_last_name(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+fn person_last_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ relations::last_name: ?h }]))
         .next().and_then(|h| read_text(ws, h).ok())
 }
 
-fn person_display_name(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+fn person_display_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ relations::display_name: ?h }]))
         .next().and_then(|h| read_text(ws, h).ok())
 }
@@ -274,7 +274,7 @@ fn person_affinity(space: &TribleSet, id: Id) -> Option<String> {
     find!(v: String, pattern!(space, [{ id @ relations::affinity: ?v }])).next()
 }
 
-fn person_note(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+fn person_note(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ metadata::description: ?h }]))
         .next().and_then(|h| read_text(ws, h).ok())
 }

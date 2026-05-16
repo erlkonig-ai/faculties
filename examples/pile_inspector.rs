@@ -17,7 +17,7 @@ use faculties::widgets::{
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
-use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::core::inline::encodings::hash::Blake3;
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -54,14 +54,14 @@ fn main(nb: &mut NotebookCtx) {
             let mut st = storage.read_mut(ctx);
             // Pull a fresh workspace per source each frame.
             let branch_names: &[&str] = &["compass", "local-messages", "wiki"];
-            let mut pulled: Vec<(&str, Workspace<Pile<Blake3>>)> =
+            let mut pulled: Vec<(&str, Workspace<Pile>)> =
                 Vec::with_capacity(branch_names.len());
             for name in branch_names {
                 if let Some(ws) = st.workspace(name) {
                     pulled.push((*name, ws));
                 }
             }
-            let mut slots: Vec<(&str, &mut Workspace<Pile<Blake3>>)> =
+            let mut slots: Vec<(&str, &mut Workspace<Pile>)> =
                 pulled.iter_mut().map(|(n, ws)| (*n, ws)).collect();
             tl.render(ctx, slots.as_mut_slice());
         },

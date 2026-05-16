@@ -22,8 +22,8 @@ use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
 
-type IntervalValue = Value<valueschemas::NsTAIInterval>;
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
+type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 // ── CLI ───────────────────────────────────────────────────────────────────
 
@@ -113,11 +113,11 @@ fn now_epoch() -> Epoch {
 }
 
 fn instant_interval(at: Epoch) -> IntervalValue {
-    (at, at).try_to_value().unwrap()
+    (at, at).try_to_inline().unwrap()
 }
 
 fn unpack_interval(iv: IntervalValue) -> (Epoch, Epoch) {
-    iv.try_from_value().unwrap()
+    iv.try_from_inline().unwrap()
 }
 
 fn fmt_id(id: Id) -> String {
@@ -143,8 +143,8 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         let _ = pile.close();
@@ -157,7 +157,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
@@ -173,8 +173,8 @@ fn with_repo<T>(
     result
 }
 
-fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, blobschemas::LongString>(h)
+fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
+    ws.get::<View<str>, blobencodings::LongString>(h)
         .ok()
         .map(|view| view.to_string())
 }
@@ -197,7 +197,7 @@ fn count_factors(space: &TribleSet, decision_id: Id, factor_kind: Id) -> usize {
 /// non-empty `decide::outcome`. We treat absence-of-either as
 /// "still open."
 fn is_resolved(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     decision_id: Id,
 ) -> bool {
@@ -219,7 +219,7 @@ fn is_resolved(
 }
 
 fn decision_title(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     decision_id: Id,
 ) -> String {
@@ -243,7 +243,7 @@ fn decision_created_at(space: &TribleSet, decision_id: Id) -> Option<Epoch> {
 
 // ── kind entities ─────────────────────────────────────────────────────────
 
-fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
+fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let existing: HashSet<Id> = find!(
         (k: Id),
@@ -442,7 +442,7 @@ struct DecisionRow {
 }
 
 fn collect_decisions(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
 ) -> Vec<DecisionRow> {
     let ids: Vec<Id> = find!(

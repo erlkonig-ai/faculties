@@ -14,7 +14,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::Workspace;
 use triblespace::prelude::*;
 
-type Repo = Repository<Pile<valueschemas::Blake3>>;
+type Repo = Repository<Pile>;
 type Lower = i128;
 
 // ── CLI ─────────────────────────────────────────────────────────────────
@@ -135,11 +135,11 @@ fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
 
 fn tag_name(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     tag_id: Id,
 ) -> String {
     let results: Vec<_> = find!(
-        h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
+        h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
         pattern!(space, [{ &tag_id @ metadata::name: ?h }])
     )
     .collect();
@@ -154,7 +154,7 @@ fn tag_name(
 
 // ── commands ────────────────────────────────────────────────────────────
 
-fn cmd_health(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<()> {
+fn cmd_health(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
     let latest = latest_versions(space);
     let total = latest.len();
 
@@ -252,7 +252,7 @@ fn cmd_health(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>)
     Ok(())
 }
 
-fn cmd_tags(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<()> {
+fn cmd_tags(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
     let latest = latest_versions(space);
     let mut tag_counts: HashMap<String, usize> = HashMap::new();
 
@@ -276,7 +276,7 @@ fn cmd_tags(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -
     Ok(())
 }
 
-fn cmd_quality(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<()> {
+fn cmd_quality(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
     let latest = latest_versions(space);
     let mut published_frags = Vec::new();
     let mut refuted_frags = Vec::new();
@@ -287,7 +287,7 @@ fn cmd_quality(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>
 
         // Get title
         let title: String = find!(
-            h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
+            h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
             pattern!(space, [{ vid @ wiki::title: ?h }])
         )
         .next()
@@ -335,7 +335,7 @@ fn cmd_quality(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>
 
 fn cmd_hubs(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     top: usize,
 ) -> Result<()> {
     let latest = latest_versions(space);
@@ -375,7 +375,7 @@ fn cmd_hubs(
         // Try title from the fragment's latest version, or from the ID directly
         let lookup_vid = frag_to_vid.get(&id).copied().unwrap_or(id);
         let title: String = find!(
-            h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
+            h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
             pattern!(space, [{ &lookup_vid @ wiki::title: ?h }])
         )
         .next()
@@ -393,7 +393,7 @@ fn cmd_hubs(
     Ok(())
 }
 
-fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<()> {
+fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
     let latest = latest_versions(space);
 
     // Find all audit-warned and refuted fragment IDs
@@ -406,7 +406,7 @@ fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -
             .any(|t| t == "refuted" || t == "audit-warning")
         {
             let title: String = find!(
-                h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
+                h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
                 pattern!(space, [{ vid @ wiki::title: ?h }])
             )
             .next()
@@ -470,7 +470,7 @@ fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -
 
         if !cited_flagged.is_empty() {
             let title: String = find!(
-                h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
+                h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
                 pattern!(space, [{ vid @ wiki::title: ?h }])
             )
             .next()
@@ -504,7 +504,7 @@ fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -
 
 fn cmd_orphans(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     top: usize,
     ids_only: bool,
 ) -> Result<()> {
@@ -520,7 +520,7 @@ fn cmd_orphans(
 
         if links.is_empty() {
             let title: String = find!(
-                h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
+                h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
                 pattern!(space, [{ vid @ wiki::title: ?h }])
             )
             .next()
@@ -578,7 +578,7 @@ fn cmd_orphans(
     Ok(())
 }
 
-fn cmd_drift(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<()> {
+fn cmd_drift(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
     let latest = latest_versions(space);
 
     // Bucket fragments by date (YYYY-MM)

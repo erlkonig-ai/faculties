@@ -38,53 +38,53 @@ pub mod event {
         // particular). Self-created events synthesise a UID like
         // `<entity-id>@triblespace`.
         "E9BA10B4508134CAB1B2A2831D0A0553" as ical_uid:
-            valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+            inlineencodings::Handle<blobencodings::LongString>;
         // Short title — fits the column width of `planner list`
         // and `orient` views without truncation.
-        "8E91381379F0567B9E318E253A1D19E6" as summary: valueschemas::ShortString;
+        "8E91381379F0567B9E318E253A1D19E6" as summary: inlineencodings::ShortString;
         // Long-form description / agenda / minutes — stored as a
         // blob handle so multi-paragraph descriptions don't
         // bloat the trible store.
         "8A9ADE8F45D85B74F97712C33967A830" as description:
-            valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+            inlineencodings::Handle<blobencodings::LongString>;
         // The event's time window: NsTAIInterval (inclusive bounds,
         // 32 bytes, range-scannable via byte-lex order). For
         // instantaneous events use start == end. For all-day
         // events use [00:00 UTC, 24:00 UTC] of the named day(s).
-        "6D17851364D9A5BA06B71606A49CDFEC" as time: valueschemas::NsTAIInterval;
+        "6D17851364D9A5BA06B71606A49CDFEC" as time: inlineencodings::NsTAIInterval;
         // Raw RFC 5545 RRULE string (e.g.
         // `FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=20271231T235959Z`).
         // Materialised by the `rrule` crate at query time — we
         // store the rule, never the expanded occurrence set.
-        "5D8D78E60807B241039E69A49DE8C4E8" as rrule: valueschemas::ShortString;
+        "5D8D78E60807B241039E69A49DE8C4E8" as rrule: inlineencodings::ShortString;
         // RDATE: extra one-off occurrence dates outside the RRULE
         // pattern. Repeated.
-        "15EBFFA245CF255F2550C8670A544D58" as rdate: valueschemas::NsTAIInterval;
+        "15EBFFA245CF255F2550C8670A544D58" as rdate: inlineencodings::NsTAIInterval;
         // EXDATE: occurrence dates excluded from the RRULE
         // expansion. Repeated.
-        "38E77BDD78C7C3C86B2C7EC48CF5CC1E" as exdate: valueschemas::NsTAIInterval;
+        "38E77BDD78C7C3C86B2C7EC48CF5CC1E" as exdate: inlineencodings::NsTAIInterval;
         // Free-text location (RFC 5545's LOCATION property) —
         // physical room, video-call URL, etc.
-        "A487B9784985D0E285A5CC9C6B053B94" as location: valueschemas::ShortString;
+        "A487B9784985D0E285A5CC9C6B053B94" as location: inlineencodings::ShortString;
         // RFC 5545 STATUS — one of `TENTATIVE` / `CONFIRMED` /
         // `CANCELLED`. Cancelled events stay in the pile (history
         // is append-only) but are filtered out of "today" /
         // "week" views by default.
-        "BDE09DF9E0DF0A0738727348037EFA84" as status: valueschemas::ShortString;
+        "BDE09DF9E0DF0A0738727348037EFA84" as status: inlineencodings::ShortString;
         // RFC 5545 TRANSP — `OPAQUE` (blocks the time slot;
         // counts toward "busy") or `TRANSPARENT` (informational,
         // doesn't block — e.g. a deadline reminder). Defaults to
         // `OPAQUE` since "occupies a time slot" is the use case.
-        "48AB5C7B026CAFDA33A5FD2699C90C2F" as transp: valueschemas::ShortString;
+        "48AB5C7B026CAFDA33A5FD2699C90C2F" as transp: inlineencodings::ShortString;
         // ATTENDEE: pointer to a `relations` entry. Repeated.
-        "B67EF51577844872CB2D1A11B85399B0" as attendee: valueschemas::GenId;
+        "B67EF51577844872CB2D1A11B85399B0" as attendee: inlineencodings::GenId;
         // ORGANIZER: pointer to a single `relations` entry.
-        "662F53293011B3C0F2A0790D6A5F01FA" as organizer: valueschemas::GenId;
+        "662F53293011B3C0F2A0790D6A5F01FA" as organizer: inlineencodings::GenId;
         // RFC 5545 SEQUENCE — revision counter incremented each
         // time the event is edited. iCal clients use this to
         // resolve which copy of an event is newest when multiple
         // are received.
-        "FCE0827D74722DCF89E4AD87F866936D" as sequence: valueschemas::U256BE;
+        "FCE0827D74722DCF89E4AD87F866936D" as sequence: inlineencodings::U256BE;
     }
 }
 
@@ -95,8 +95,8 @@ pub mod event {
 pub mod note {
     use super::*;
     attributes! {
-        "A7971D096F0FE50C896338802A8A3B1A" as note_about: valueschemas::GenId;
+        "A7971D096F0FE50C896338802A8A3B1A" as note_about: inlineencodings::GenId;
         "4DFEEF75B29536E5F77DFFC54D7B5130" as note_text:
-            valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+            inlineencodings::Handle<blobencodings::LongString>;
     }
 }

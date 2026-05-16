@@ -17,7 +17,7 @@ use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 fn normalize_label(label: &str) -> Result<String> {
     let trimmed = label.trim();
@@ -113,12 +113,12 @@ fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
-    (epoch, epoch).try_to_value().unwrap()
+fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
+    (epoch, epoch).try_to_inline().unwrap()
 }
 
-fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
@@ -161,9 +161,9 @@ fn fmt_id(id: Id) -> String {
 }
 
 fn load_relations(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     relations_branch_id: Id,
-) -> Result<(TribleSet, Workspace<Pile<valueschemas::Blake3>>)> {
+) -> Result<(TribleSet, Workspace<Pile>)> {
     if repo
         .storage_mut()
         .head(relations_branch_id)
@@ -232,7 +232,7 @@ fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
 }
 
 fn person_label(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     person_id: Id,
 ) -> String {
@@ -242,8 +242,8 @@ fn person_label(
         .unwrap_or_else(|| fmt_id(person_id))
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         // Avoid Drop warnings on early errors.
@@ -258,7 +258,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
@@ -274,7 +274,7 @@ fn with_repo<T>(
     result
 }
 
-fn ensure_metadata(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
+fn ensure_metadata(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
@@ -294,7 +294,7 @@ fn ensure_metadata(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Tri
             let name_handle = label
                 .to_owned()
                 .to_blob()
-                .get_handle::<valueschemas::Blake3>();
+                .get_handle::<inlineencodings::Blake3>();
             change += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_handle };
             existing_kinds.insert(id);
         }
@@ -332,7 +332,7 @@ fn resolve_message_id(space: &TribleSet, prefix: &str) -> Result<Id> {
     }
 }
 
-fn load_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
+fn load_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
     let view: View<str> = ws.get(handle).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     Ok(view.as_ref().to_string())
 }
@@ -446,7 +446,7 @@ fn cmd_list(
                 from: Id,
                 to: Id,
                 body: TextHandle,
-                created_at: Value<valueschemas::NsTAIInterval>
+                created_at: Inline<inlineencodings::NsTAIInterval>
             ),
             pattern!(&space, [{
                 ?message_id @
@@ -473,7 +473,7 @@ fn cmd_list(
                 read_id: Id,
                 message_id: Id,
                 reader_id: Id,
-                read_at: Value<valueschemas::NsTAIInterval>
+                read_at: Inline<inlineencodings::NsTAIInterval>
             ),
             pattern!(&space, [{
                 ?read_id @

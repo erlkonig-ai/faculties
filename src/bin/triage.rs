@@ -21,7 +21,7 @@ use triblespace::core::repo::{BlobStoreMeta, PullError, PushResult, Repository, 
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 #[derive(Parser)]
 #[command(
@@ -287,8 +287,8 @@ fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
@@ -360,7 +360,7 @@ fn format_tai_ns(ns: i128) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
 }
 
-fn u256be_to_u64(value: Value<valueschemas::U256BE>) -> Option<u64> {
+fn u256be_to_u64(value: Inline<inlineencodings::U256BE>) -> Option<u64> {
     let raw = value.raw;
     if raw[..24].iter().any(|byte| *byte != 0) {
         return None;
@@ -369,15 +369,15 @@ fn u256be_to_u64(value: Value<valueschemas::U256BE>) -> Option<u64> {
     Some(u64::from_be_bytes(bytes))
 }
 
-fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
+fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
     let view: View<str> = ws
-        .get::<View<str>, blobschemas::LongString>(handle)
+        .get::<View<str>, blobencodings::LongString>(handle)
         .map_err(|e| anyhow!("load longstring: {e:?}"))?;
     Ok(view.to_string())
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         // Avoid Drop warnings on early errors.
@@ -389,10 +389,10 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 }
 
 fn pull_workspace(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     branch_id: Id,
     context: &str,
-) -> Result<Workspace<Pile<valueschemas::Blake3>>> {
+) -> Result<Workspace<Pile>> {
     match repo.pull(branch_id) {
         Ok(ws) => Ok(ws),
         Err(err) => {
@@ -422,13 +422,13 @@ fn pull_corrupt_valid_length<B: std::error::Error>(
 }
 
 fn find_branch_ids_by_name(
-    pile: &mut Pile<valueschemas::Blake3>,
+    pile: &mut Pile,
     branch_name: &str,
 ) -> Result<Vec<Id>> {
     let name_handle = branch_name
         .to_owned()
         .to_blob()
-        .get_handle::<valueschemas::Blake3>();
+        .get_handle::<inlineencodings::Blake3>();
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let iter = pile
         .branches()
@@ -472,8 +472,8 @@ fn find_branch_ids_by_name(
 }
 
 fn push_workspace(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
 ) -> Result<()> {
     while let Some(mut conflict) = repo
         .try_push(ws)
@@ -489,7 +489,7 @@ fn push_workspace(
 
 /// Use ensure_branch to resolve a named branch, creating it if absent.
 fn ensure_branch_id(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     name: &str,
 ) -> Result<Id> {
     repo.ensure_branch(name, None)
@@ -499,7 +499,7 @@ fn ensure_branch_id(
 /// Resolve target branch: explicit --branch-id wins, then config branch_id,
 /// then ensure_branch by name as last resort.
 fn resolve_target_branch(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     cli: &Cli,
 ) -> Result<Id> {
     ensure_branch_id(repo, &cli.branch)
@@ -507,7 +507,7 @@ fn resolve_target_branch(
 
 /// Load lightweight config snapshot (persona_id + updated_at) from the config branch.
 fn load_latest_config(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
 ) -> Result<Option<ConfigSnapshot>> {
     let branch_id = ensure_branch_id(repo, "config")?;
     let mut ws = pull_workspace(repo, branch_id, "pull config workspace")?;
@@ -517,7 +517,7 @@ fn load_latest_config(
 
     let mut latest: Option<(Id, i128)> = None;
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
+        (config_id: Id, updated_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
             metadata::updated_at: ?updated_at,
@@ -550,13 +550,13 @@ fn load_latest_config(
 }
 
 fn collect_exec_state(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
 ) -> Result<ExecState> {
     let mut state = ExecState::default();
 
     for (request_id, handle, requested_at) in find!(
-        (request_id: Id, handle: TextHandle, requested_at: Value<valueschemas::NsTAIInterval>),
+        (request_id: Id, handle: TextHandle, requested_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?request_id @
             metadata::tag: &KIND_EXEC_REQUEST_ID,
@@ -575,7 +575,7 @@ fn collect_exec_state(
     }
 
     for (about_request, started_at) in find!(
-        (about_request: Id, started_at: Value<valueschemas::NsTAIInterval>),
+        (about_request: Id, started_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             _?event_id @
             metadata::tag: &KIND_EXEC_IN_PROGRESS_ID,
@@ -591,7 +591,7 @@ fn collect_exec_state(
 
     let mut result_map: HashMap<Id, ExecResultRow> = HashMap::new();
     for (result_id, about_request, finished_at) in find!(
-        (result_id: Id, about_request: Id, finished_at: Value<valueschemas::NsTAIInterval>),
+        (result_id: Id, about_request: Id, finished_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?result_id @
             metadata::tag: &KIND_EXEC_RESULT_ID,
@@ -613,7 +613,7 @@ fn collect_exec_state(
     }
 
     for (result_id, value) in find!(
-        (result_id: Id, value: Value<valueschemas::U256BE>),
+        (result_id: Id, value: Inline<inlineencodings::U256BE>),
         pattern!(&space, [{ ?result_id @ exec::exit_code: ?value }])
     ) {
         if let Some(entry) = result_map.get_mut(&result_id) {
@@ -644,13 +644,13 @@ fn collect_exec_state(
 }
 
 fn collect_model_chat_state(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
 ) -> Result<ModelChatState> {
     let mut state = ModelChatState::default();
 
     for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
+        (request_id: Id, requested_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?request_id @
             metadata::tag: &KIND_MODEL_REQUEST_ID,
@@ -663,7 +663,7 @@ fn collect_model_chat_state(
     }
 
     for (about_request, started_at) in find!(
-        (about_request: Id, started_at: Value<valueschemas::NsTAIInterval>),
+        (about_request: Id, started_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             _?event_id @
             metadata::tag: &KIND_MODEL_IN_PROGRESS_ID,
@@ -679,7 +679,7 @@ fn collect_model_chat_state(
 
     let mut result_map: HashMap<Id, ModelResultRow> = HashMap::new();
     for (result_id, about_request, finished_at) in find!(
-        (result_id: Id, about_request: Id, finished_at: Value<valueschemas::NsTAIInterval>),
+        (result_id: Id, about_request: Id, finished_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?result_id @
             metadata::tag: &KIND_MODEL_RESULT_ID,
@@ -711,7 +711,7 @@ fn collect_model_chat_state(
 }
 
 fn collect_reason_state(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
 ) -> Result<Vec<ReasonEventRow>> {
     let mut rows: HashMap<Id, ReasonEventRow> = HashMap::new();
@@ -732,7 +732,7 @@ fn collect_reason_state(
     }
 
     for (reason_id, created_at) in find!(
-        (reason_id: Id, created_at: Value<valueschemas::NsTAIInterval>),
+        (reason_id: Id, created_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{ ?reason_id @ metadata::created_at: ?created_at }])
     ) {
         if let Some(row) = rows.get_mut(&reason_id) {
@@ -938,7 +938,7 @@ fn pattern_is_failure(pattern: &PatternSummary) -> bool {
 }
 
 fn load_relation_terms(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
 ) -> Result<Vec<String>> {
     let branch_id = ensure_branch_id(repo, "relations")?;
     let mut ws = repo
@@ -987,7 +987,7 @@ fn extract_unknown_person_label(text: &str) -> Option<String> {
 }
 
 fn count_unread_local_messages(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     reader_id: Id,
 ) -> Result<Option<usize>> {
     let branch_id = ensure_branch_id(repo, "local-messages")?;
@@ -1031,7 +1031,7 @@ fn count_unread_local_messages(
 }
 
 fn cmd_scan(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     cli: &Cli,
     recent: usize,
     loop_min: usize,
@@ -1204,15 +1204,15 @@ fn collect_recent_model_failures(state: &ModelChatState, recent: usize) -> Vec<M
 }
 
 fn verify_commit_chain(
-    reader: &triblespace::core::repo::pile::PileReader<valueschemas::Blake3>,
-    start: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>,
+    reader: &triblespace::core::repo::pile::PileReader<inlineencodings::Blake3>,
+    start: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
 ) -> ChainReport {
-    let head_hash: Value<valueschemas::Hash<valueschemas::Blake3>> =
-        valueschemas::Handle::to_hash(start);
-    let commit_head: String = head_hash.from_value();
+    let head_hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
+        inlineencodings::Handle::to_hash(start);
+    let commit_head: String = head_hash.from_inline();
 
     let mut queue: VecDeque<(
-        Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>,
+        Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
         usize,
     )> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -1220,9 +1220,9 @@ fn verify_commit_chain(
 
     let mut checked_commits = 0usize;
     while let Some((commit, depth)) = queue.pop_front() {
-        let commit_hash_value: Value<valueschemas::Hash<valueschemas::Blake3>> =
-            valueschemas::Handle::to_hash(commit);
-        let commit_hash: String = commit_hash_value.from_value();
+        let commit_hash_value: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
+            inlineencodings::Handle::to_hash(commit);
+        let commit_hash: String = commit_hash_value.from_inline();
         if !visited.insert(commit_hash.clone()) {
             continue;
         }
@@ -1275,7 +1275,7 @@ fn verify_commit_chain(
             if trible.a() == &REPO_CONTENT_ATTR {
                 saw_content_attr = true;
                 let content = *trible
-                    .v::<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>();
+                    .v::<inlineencodings::Handle<blobencodings::SimpleArchive>>();
                 match reader.metadata(content) {
                     Ok(Some(_)) => {}
                     Ok(None) => missing_content_ref = true,
@@ -1294,7 +1294,7 @@ fn verify_commit_chain(
             } else if trible.a() == &REPO_PARENT_ATTR {
                 parents.push(
                     *trible.v::<
-                        valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>,
+                        inlineencodings::Handle<blobencodings::SimpleArchive>,
                     >(),
                 );
             }
@@ -1329,7 +1329,7 @@ fn verify_commit_chain(
     }
 }
 
-fn cmd_chain(repo: &mut Repository<Pile<valueschemas::Blake3>>, cli: &Cli) -> Result<()> {
+fn cmd_chain(repo: &mut Repository<Pile>, cli: &Cli) -> Result<()> {
     let branch_id = resolve_target_branch(repo, cli)?;
     let Some(branch_meta_handle) = repo
         .storage_mut()
@@ -1352,14 +1352,14 @@ fn cmd_chain(repo: &mut Repository<Pile<valueschemas::Blake3>>, cli: &Cli) -> Re
     for trible in branch_meta.iter() {
         if trible.a() == &metadata::name.id() {
             let handle =
-                *trible.v::<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>();
+                *trible.v::<inlineencodings::Handle<blobencodings::LongString>>();
             if let Ok(view) = reader.get::<View<str>, _>(handle) {
                 branch_name = Some(view.as_ref().to_string());
             }
         } else if trible.a() == &REPO_HEAD_ATTR {
             commit_head = Some(
                 *trible
-                    .v::<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>(),
+                    .v::<inlineencodings::Handle<blobencodings::SimpleArchive>>(),
             );
         }
     }
@@ -1397,7 +1397,7 @@ fn cmd_chain(repo: &mut Repository<Pile<valueschemas::Blake3>>, cli: &Cli) -> Re
 }
 
 fn cmd_loops(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     cli: &Cli,
     recent: usize,
     min_repeat: usize,
@@ -1572,7 +1572,7 @@ fn build_timeline_rows(
 }
 
 fn cmd_timeline(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     cli: &Cli,
     recent: usize,
 ) -> Result<()> {
@@ -1635,7 +1635,7 @@ fn insert_canonical_branch(
     }
 }
 
-fn delete_branch(repo: &mut Repository<Pile<valueschemas::Blake3>>, branch_id: Id) -> Result<()> {
+fn delete_branch(repo: &mut Repository<Pile>, branch_id: Id) -> Result<()> {
     let mut expected = repo
         .storage_mut()
         .head(branch_id)
@@ -1663,7 +1663,7 @@ fn delete_branch(repo: &mut Repository<Pile<valueschemas::Blake3>>, branch_id: I
 }
 
 fn repair_named_duplicates(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     branch_name: &str,
     canonical_id: Id,
     dry_run: bool,
@@ -1771,7 +1771,7 @@ const KNOWN_BRANCH_NAMES: &[&str] = &[
 ];
 
 fn cmd_repair_branch_duplicates(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     cli: &Cli,
     dry_run: bool,
 ) -> Result<()> {
@@ -1862,7 +1862,7 @@ fn cmd_repair_branch_duplicates(
 }
 
 fn collect_context_chunks(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
 ) -> Result<Vec<ContextChunkRow>> {
     let mut chunks: HashMap<Id, ContextChunkRow> = HashMap::new();
@@ -1892,7 +1892,7 @@ fn collect_context_chunks(
     }
 
     for (chunk_id, value) in find!(
-        (chunk_id: Id, value: Value<valueschemas::NsTAIInterval>),
+        (chunk_id: Id, value: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{ ?chunk_id @ metadata::created_at: ?value }])
     ) {
         if let Some(row) = chunks.get_mut(&chunk_id) {
@@ -1901,7 +1901,7 @@ fn collect_context_chunks(
     }
 
     for (chunk_id, value) in find!(
-        (chunk_id: Id, value: Value<valueschemas::NsTAIInterval>),
+        (chunk_id: Id, value: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{ ?chunk_id @ context::start_at: ?value }])
     ) {
         if let Some(row) = chunks.get_mut(&chunk_id) {
@@ -1910,7 +1910,7 @@ fn collect_context_chunks(
     }
 
     for (chunk_id, value) in find!(
-        (chunk_id: Id, value: Value<valueschemas::NsTAIInterval>),
+        (chunk_id: Id, value: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{ ?chunk_id @ context::end_at: ?value }])
     ) {
         if let Some(row) = chunks.get_mut(&chunk_id) {
@@ -1951,7 +1951,7 @@ fn find_root_chunks(chunks: &[ContextChunkRow]) -> Vec<usize> {
 }
 
 fn load_budget_from_config(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
 ) -> Result<Option<BudgetInfo>> {
     let branch_id = ensure_branch_id(repo, "config")?;
     let mut ws = pull_workspace(repo, branch_id, "pull config for budget")?;
@@ -1960,7 +1960,7 @@ fn load_budget_from_config(
     // Find latest config
     let mut latest_config: Option<(Id, i128)> = None;
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
+        (config_id: Id, updated_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
             metadata::updated_at: ?updated_at,
@@ -2006,25 +2006,25 @@ fn load_budget_from_config(
     let mut chars_per_token: u64 = 4;
 
     if let Some(value) = find!(
-        value: Value<valueschemas::U256BE>,
+        value: Inline<inlineencodings::U256BE>,
         pattern!(&space, [{ profile_id @ config::model_context_window_tokens: ?value }])
     ).next() {
         context_window = u256be_to_u64(value).unwrap_or(0);
     }
     if let Some(value) = find!(
-        value: Value<valueschemas::U256BE>,
+        value: Inline<inlineencodings::U256BE>,
         pattern!(&space, [{ profile_id @ config::model_max_output_tokens: ?value }])
     ).next() {
         max_output = u256be_to_u64(value).unwrap_or(0);
     }
     if let Some(value) = find!(
-        value: Value<valueschemas::U256BE>,
+        value: Inline<inlineencodings::U256BE>,
         pattern!(&space, [{ profile_id @ config::model_context_safety_margin_tokens: ?value }])
     ).next() {
         safety_margin = u256be_to_u64(value).unwrap_or(0);
     }
     if let Some(value) = find!(
-        value: Value<valueschemas::U256BE>,
+        value: Inline<inlineencodings::U256BE>,
         pattern!(&space, [{ profile_id @ config::model_chars_per_token: ?value }])
     ).next() {
         chars_per_token = u256be_to_u64(value).unwrap_or(4).max(1);
@@ -2045,7 +2045,7 @@ fn load_budget_from_config(
 }
 
 fn load_turn_context(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     exec_branch_id: Id,
     turn_offset: usize,
 ) -> Result<Option<(Id, String, Vec<ChatMessage>)>> {
@@ -2055,7 +2055,7 @@ fn load_turn_context(
     // Collect exec requests with timestamps
     let mut requests: Vec<(Id, i128, Option<String>)> = Vec::new();
     for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
+        (request_id: Id, requested_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?request_id @
             metadata::tag: &KIND_EXEC_REQUEST_ID,
@@ -2146,7 +2146,7 @@ fn load_turn_context(
 }
 
 fn cmd_cover(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     cli: &Cli,
     full: bool,
     tree: bool,
@@ -2294,7 +2294,7 @@ fn cmd_cover(
 }
 
 fn cmd_chunk(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     _cli: &Cli,
     id_prefix_str: &str,
 ) -> Result<()> {
@@ -2390,7 +2390,7 @@ fn cmd_chunk(
 }
 
 fn cmd_turn(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     cli: &Cli,
     turn_offset: usize,
     full: bool,
@@ -2402,7 +2402,7 @@ fn cmd_turn(
     // Collect exec requests with timestamps
     let mut requests: Vec<(Id, i128, Option<String>)> = Vec::new();
     for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
+        (request_id: Id, requested_at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
             ?request_id @
             metadata::tag: &KIND_EXEC_REQUEST_ID,
@@ -2465,13 +2465,13 @@ fn cmd_turn(
         let mut error_text: Option<String> = None;
 
         if let Some(value) = find!(
-            value: Value<valueschemas::U256BE>,
+            value: Inline<inlineencodings::U256BE>,
             pattern!(&space, [{ rid @ exec::exit_code: ?value }])
         ).next() {
             exit_code = u256be_to_u64(value).map(|n| n as i64);
         }
         if let Some(value) = find!(
-            value: Value<valueschemas::NsTAIInterval>,
+            value: Inline<inlineencodings::NsTAIInterval>,
             pattern!(&space, [{ rid @ metadata::finished_at: ?value }])
         ).next() {
             finished_at = Some(interval_key(value));
@@ -2567,27 +2567,27 @@ fn cmd_turn(
             ).next().map(|h| read_text(&mut ws, h)).transpose()?;
 
             let model_finished: Option<i128> = find!(
-                value: Value<valueschemas::NsTAIInterval>,
+                value: Inline<inlineencodings::NsTAIInterval>,
                 pattern!(&space, [{ &mid @ metadata::finished_at: ?value }])
             ).next().map(interval_key);
 
             let input_tokens: Option<u64> = find!(
-                value: Value<valueschemas::U256BE>,
+                value: Inline<inlineencodings::U256BE>,
                 pattern!(&space, [{ &mid @ model_chat::input_tokens: ?value }])
             ).next().and_then(u256be_to_u64);
 
             let output_tokens: Option<u64> = find!(
-                value: Value<valueschemas::U256BE>,
+                value: Inline<inlineencodings::U256BE>,
                 pattern!(&space, [{ &mid @ model_chat::output_tokens: ?value }])
             ).next().and_then(u256be_to_u64);
 
             let cache_creation_tokens: Option<u64> = find!(
-                value: Value<valueschemas::U256BE>,
+                value: Inline<inlineencodings::U256BE>,
                 pattern!(&space, [{ &mid @ model_chat::cache_creation_input_tokens: ?value }])
             ).next().and_then(u256be_to_u64);
 
             let cache_read_tokens: Option<u64> = find!(
-                value: Value<valueschemas::U256BE>,
+                value: Inline<inlineencodings::U256BE>,
                 pattern!(&space, [{ &mid @ model_chat::cache_read_input_tokens: ?value }])
             ).next().and_then(u256be_to_u64);
 
@@ -2677,7 +2677,7 @@ fn cmd_turn(
 }
 
 fn cmd_context(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     cli: &Cli,
     turn: usize,
     full: bool,

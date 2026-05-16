@@ -15,7 +15,7 @@
 //! - Adding notes to an expanded goal
 //! - Parent/child indentation with a collapse toggle per subtree
 //! - Priority arrows: `board::higher` / `board::lower` edges rendered as
-//!   `> over <id_prefix>` badges on the card
+//!   `> over <id_str>` badges on the card
 //! - Tag chips colored via `GORBIE::themes::colorhash::ral_categorical`.
 //!
 //! ```ignore
@@ -28,16 +28,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
-use triblespace::core::id::{ufoid, ExclusiveId, Id};
+use GORBIE::widgets::ChoiceToggle;
+use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::{TryToValue, Value};
-use triblespace::macros::{entity, find, pattern};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::NsTAIInterval;
+use triblespace::core::inline::encodings::hash::{Blake3, Handle};
+use triblespace::core::inline::Inline;
+use triblespace::macros::{find, pattern};
+use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
 use crate::schemas::compass::{
@@ -46,9 +46,7 @@ use crate::schemas::compass::{
 };
 
 /// Handle to a long-string blob (titles, notes).
-type TextHandle = Value<Handle<Blake3, LongString>>;
-/// Interval value (TAI ns lower/upper) used for `metadata::created_at`.
-type IntervalValue = Value<NsTAIInterval>;
+type TextHandle = Inline<Handle<LongString>>;
 
 // ── ID / time helpers ────────────────────────────────────────────────
 
@@ -56,27 +54,10 @@ fn fmt_id_full(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn id_prefix(id: Id) -> String {
-    let s = fmt_id_full(id);
-    if s.len() > 8 {
-        s[..8].to_string()
-    } else {
-        s
-    }
-}
-
 fn now_tai_ns() -> i128 {
     hifitime::Epoch::now()
         .map(|e| e.to_tai_duration().total_nanoseconds())
         .unwrap_or(0)
-}
-
-fn now_epoch() -> hifitime::Epoch {
-    hifitime::Epoch::now().unwrap_or_else(|_| hifitime::Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-fn epoch_interval(epoch: hifitime::Epoch) -> IntervalValue {
-    (epoch, epoch).try_to_value().unwrap()
 }
 
 fn format_age(now_key: i128, maybe_key: Option<i128>) -> String {
@@ -125,24 +106,30 @@ fn color_muted(ui: &egui::Ui) -> egui::Color32 {
     }
 }
 
-/// Lane / container background — slightly offset from the notebook
-/// panel fill so the lane reads as a distinct region.
-fn color_frame(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0x29, 0x32, 0x36) // RAL 7016 (dark)
-    } else {
-        egui::Color32::from_rgb(0xec, 0xec, 0xec) // near-white grey
-    }
-}
-
-/// Goal-card background — slightly lighter/darker than the lane so
-/// cards pop out of the lane backdrop.
-fn card_bg(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0x33, 0x3b, 0x40)
-    } else {
-        egui::Color32::from_rgb(0xfa, 0xfa, 0xfa)
-    }
+/// "Paper" frame recipe — matches GORBIE's float-card chrome
+/// (`floating.rs::draw_card_chrome`): theme `window_fill` + thin
+/// outline + hard offset shadow + sharp corners. Static-content
+/// surfaces (lanes, goal cards, note bubbles) use this so they
+/// read as paper sheets rather than backlit LCD blocks. Dynamic /
+/// input widgets (count chips, +ADD button, status indicator,
+/// edit fields) keep their existing styling.
+fn paper_frame(ui: &egui::Ui, shadow_offset: i8) -> egui::Frame {
+    let v = ui.visuals();
+    let outline = v.widgets.noninteractive.bg_stroke.color;
+    // Semi-transparent black shadow reads as a darker tint on both
+    // light and dark panels; matches the float-chrome look without
+    // hard-coding a value that disappears in dark mode.
+    let shadow_color = egui::Color32::from_black_alpha(48);
+    egui::Frame::NONE
+        .fill(v.window_fill)
+        .stroke(egui::Stroke::new(1.0, outline))
+        .shadow(egui::epaint::Shadow {
+            offset: [shadow_offset, shadow_offset],
+            blur: 0,
+            spread: 0,
+            color: shadow_color,
+        })
+        .corner_radius(egui::CornerRadius::ZERO)
 }
 
 fn status_color(status: &str) -> egui::Color32 {
@@ -162,6 +149,7 @@ fn tag_color(tag: &str) -> egui::Color32 {
     colorhash::ral_categorical(tag.as_bytes())
 }
 
+
 /// Truncate `s` at char boundary to `max` chars, appending `…` if cut.
 /// Char-aware so multibyte sequences don't panic on slice.
 fn truncate_inline(s: &str, max: usize) -> String {
@@ -170,31 +158,6 @@ fn truncate_inline(s: &str, max: usize) -> String {
     }
     let take: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{take}…")
-}
-
-// ── Row structs ──────────────────────────────────────────────────────
-
-#[derive(Clone, Debug)]
-struct GoalRow {
-    id: Id,
-    id_prefix: String,
-    title: String,
-    tags: Vec<String>,
-    status: String,
-    /// TAI ns of the latest status assignment (sort key within a column).
-    status_at: Option<i128>,
-    /// TAI ns of the goal's own creation (fallback sort key).
-    created_at: Option<i128>,
-    note_count: usize,
-    parent: Option<Id>,
-    /// Goals this one is prioritized over (`board::higher=self, board::lower=x`).
-    higher_over: Vec<Id>,
-}
-
-impl GoalRow {
-    fn sort_key(&self) -> i128 {
-        self.status_at.or(self.created_at).unwrap_or(i128::MIN)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -214,7 +177,7 @@ struct CompassLive {
 }
 
 impl CompassLive {
-    fn refresh(ws: &mut Workspace<Pile<Blake3>>) -> Self {
+    fn refresh(ws: &mut Workspace<Pile>) -> Self {
         let space = ws
             .checkout(..)
             .map(|co| co.into_facts())
@@ -228,7 +191,7 @@ impl CompassLive {
         }
     }
 
-    fn text(&self, ws: &mut Workspace<Pile<Blake3>>, h: TextHandle) -> String {
+    fn text(&self, ws: &mut Workspace<Pile>, h: TextHandle) -> String {
         ws.get::<View<str>, LongString>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
@@ -237,139 +200,8 @@ impl CompassLive {
             .unwrap_or_default()
     }
 
-    /// Collect every goal with derived current status, tags, note count,
-    /// parent, and outgoing priority edges (higher_over).
-    fn goals(&self, ws: &mut Workspace<Pile<Blake3>>) -> Vec<GoalRow> {
-        let mut by_id: HashMap<Id, GoalRow> = HashMap::new();
-
-        // Title + created_at.
-        let title_rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
-            (gid: Id, title: TextHandle, ts: (i128, i128)),
-            pattern!(&self.space, [{
-                ?gid @
-                metadata::tag: &KIND_GOAL_ID,
-                compass::title: ?title,
-                metadata::created_at: ?ts,
-            }])
-        )
-        .collect();
-
-        for (gid, title_handle, ts) in title_rows {
-            if by_id.contains_key(&gid) {
-                continue;
-            }
-            let title = self.text(ws, title_handle);
-            by_id.insert(
-                gid,
-                GoalRow {
-                    id: gid,
-                    id_prefix: id_prefix(gid),
-                    title,
-                    tags: Vec::new(),
-                    status: "todo".to_string(),
-                    status_at: None,
-                    created_at: Some(ts.0),
-                    note_count: 0,
-                    parent: None,
-                    higher_over: Vec::new(),
-                },
-            );
-        }
-
-        // Tags.
-        for (gid, tag) in find!(
-            (gid: Id, tag: String),
-            pattern!(&self.space, [{
-                ?gid @
-                metadata::tag: &KIND_GOAL_ID,
-                compass::tag: ?tag,
-            }])
-        ) {
-            if let Some(row) = by_id.get_mut(&gid) {
-                row.tags.push(tag);
-            }
-        }
-
-        // Parents.
-        for (gid, parent) in find!(
-            (gid: Id, parent: Id),
-            pattern!(&self.space, [{
-                ?gid @
-                metadata::tag: &KIND_GOAL_ID,
-                compass::parent: ?parent,
-            }])
-        ) {
-            if let Some(row) = by_id.get_mut(&gid) {
-                row.parent = Some(parent);
-            }
-        }
-
-        // Latest status per goal.
-        for (gid, status, ts) in find!(
-            (gid: Id, status: String, ts: (i128, i128)),
-            pattern!(&self.space, [{
-                _?event @
-                metadata::tag: &KIND_STATUS_ID,
-                compass::task: ?gid,
-                compass::status: ?status,
-                metadata::created_at: ?ts,
-            }])
-        ) {
-            if let Some(row) = by_id.get_mut(&gid) {
-                let replace = match row.status_at {
-                    None => true,
-                    Some(prev) => ts.0 > prev,
-                };
-                if replace {
-                    row.status = status;
-                    row.status_at = Some(ts.0);
-                }
-            }
-        }
-
-        // Note counts.
-        for gid in find!(
-            gid: Id,
-            pattern!(&self.space, [{
-                _?event @
-                metadata::tag: &KIND_NOTE_ID,
-                compass::task: ?gid,
-            }])
-        ) {
-            if let Some(row) = by_id.get_mut(&gid) {
-                row.note_count += 1;
-            }
-        }
-
-        // Priority edges: higher > lower. We don't track deprioritize
-        // events in the widget — the faculty CLI remains the canonical
-        // way to remove relationships — so this is a best-effort view.
-        for (higher, lower) in find!(
-            (higher: Id, lower: Id),
-            pattern!(&self.space, [{
-                _?event @
-                metadata::tag: &KIND_PRIORITIZE_ID,
-                compass::higher: ?higher,
-                compass::lower: ?lower,
-            }])
-        ) {
-            if let Some(row) = by_id.get_mut(&higher) {
-                if !row.higher_over.contains(&lower) {
-                    row.higher_over.push(lower);
-                }
-            }
-        }
-
-        for row in by_id.values_mut() {
-            row.tags.sort();
-            row.tags.dedup();
-        }
-
-        by_id.into_values().collect()
-    }
-
     /// Notes on a specific goal, sorted newest-first.
-    fn notes_for(&self, ws: &mut Workspace<Pile<Blake3>>, goal_id: Id) -> Vec<NoteRow> {
+    fn notes_for(&self, ws: &mut Workspace<Pile>, goal_id: Id) -> Vec<NoteRow> {
         let raw: Vec<(TextHandle, (i128, i128))> = find!(
             (note_handle: TextHandle, ts: (i128, i128)),
             pattern!(&self.space, [{
@@ -393,112 +225,39 @@ impl CompassLive {
         notes
     }
 
-    // ── Write operations (mirror faculty CLI fact shapes) ─────────────
-    // The host pushes the workspace after render; see StorageState.
-
-    fn add_goal(
-        ws: &mut Workspace<Pile<Blake3>>,
-        title: String,
-        status: String,
-        parent: Option<Id>,
-        tags: Vec<String>,
-    ) -> Id {
-        let task_id: ExclusiveId = ufoid();
-        let task_ref: Id = task_id.id;
-        let now = epoch_interval(now_epoch());
-        let title_handle = ws.put::<LongString, _>(title);
-
-        let mut change = TribleSet::new();
-        change += entity! { &task_id @
-            metadata::tag: &KIND_GOAL_ID,
-            compass::title: title_handle,
-            metadata::created_at: now,
-            compass::parent?: parent.as_ref(),
-            compass::tag*: tags.iter().map(|t| t.as_str()),
-        };
-        let status_id: ExclusiveId = ufoid();
-        change += entity! { &status_id @
-            metadata::tag: &KIND_STATUS_ID,
-            compass::task: &task_ref,
-            compass::status: status.as_str(),
-            metadata::created_at: now,
-        };
-
-        ws.commit(change, "add goal");
-        task_ref
-    }
-
-    fn move_status(ws: &mut Workspace<Pile<Blake3>>, task_id: Id, status: String) {
-        let now = epoch_interval(now_epoch());
-        let status_id: ExclusiveId = ufoid();
-        let mut change = TribleSet::new();
-        change += entity! { &status_id @
-            metadata::tag: &KIND_STATUS_ID,
-            compass::task: &task_id,
-            compass::status: status.as_str(),
-            metadata::created_at: now,
-        };
-        ws.commit(change, "move goal");
-    }
-
-    fn add_note(ws: &mut Workspace<Pile<Blake3>>, task_id: Id, body: String) {
-        let now = epoch_interval(now_epoch());
-        let note_id: ExclusiveId = ufoid();
-        let body_handle = ws.put::<LongString, _>(body);
-        let mut change = TribleSet::new();
-        change += entity! { &note_id @
-            metadata::tag: &KIND_NOTE_ID,
-            compass::task: &task_id,
-            compass::note: body_handle,
-            metadata::created_at: now,
-        };
-        ws.commit(change, "add goal note");
-    }
 }
 
 // ── Tree layout ──────────────────────────────────────────────────────
 
-/// Depth-first walk through parent/child forest, yielding (row, depth).
-/// Rows that have a parent outside this subset are treated as roots.
-fn order_rows(rows: Vec<GoalRow>) -> Vec<(GoalRow, usize)> {
-    let mut by_id: HashMap<Id, GoalRow> = HashMap::new();
-    for row in rows {
-        by_id.insert(row.id, row);
-    }
-    let ids: HashSet<Id> = by_id.keys().copied().collect();
+/// Depth-first walk through the parent/child forest induced by a
+/// goal's `compass::parent` edges, restricted to the lane's id set.
+/// Goals whose parent isn't in the lane are treated as roots; the
+/// caller has already sorted the lane in display order so the
+/// children-by-parent buckets inherit that order.
+fn order_rows(lane_ids: Vec<Id>, space: &TribleSet) -> Vec<(Id, usize)> {
+    let ids: HashSet<Id> = lane_ids.iter().copied().collect();
     let mut children: HashMap<Id, Vec<Id>> = HashMap::new();
-    let mut roots = Vec::new();
+    let mut has_visible_parent: HashSet<Id> = HashSet::new();
 
-    for (id, row) in &by_id {
-        if let Some(parent) = row.parent {
+    // Iterate the lane in caller-given order so that pushing into
+    // `children` and the root set preserves that ordering.
+    for &gid in &lane_ids {
+        let parent = find!(
+            (parent: Id),
+            pattern!(space, [{
+                gid @
+                metadata::tag: &KIND_GOAL_ID,
+                compass::parent: ?parent,
+            }])
+        )
+        .next()
+        .map(|(p,)| p);
+        if let Some(parent) = parent {
             if ids.contains(&parent) {
-                children.entry(parent).or_default().push(*id);
-                continue;
+                children.entry(parent).or_default().push(gid);
+                has_visible_parent.insert(gid);
             }
         }
-        roots.push(*id);
-    }
-
-    let sort_ids = |items: &mut Vec<Id>, by_id: &HashMap<Id, GoalRow>| {
-        items.sort_by(|a, b| {
-            let a_row = by_id.get(a);
-            let b_row = by_id.get(b);
-            let a_key = a_row.map(|r| r.sort_key()).unwrap_or(i128::MIN);
-            let b_key = b_row.map(|r| r.sort_key()).unwrap_or(i128::MIN);
-            b_key
-                .cmp(&a_key)
-                .then_with(|| {
-                    let at = a_row.map(|r| r.title.as_str()).unwrap_or("");
-                    let bt = b_row.map(|r| r.title.as_str()).unwrap_or("");
-                    at.to_lowercase().cmp(&bt.to_lowercase())
-                })
-                .then_with(|| a.cmp(b))
-        });
-    };
-
-    sort_ids(&mut roots, &by_id);
-    for kids in children.values_mut() {
-        sort_ids(kids, &by_id);
     }
 
     let mut ordered = Vec::new();
@@ -507,47 +266,150 @@ fn order_rows(rows: Vec<GoalRow>) -> Vec<(GoalRow, usize)> {
     fn walk(
         id: Id,
         depth: usize,
-        by_id: &HashMap<Id, GoalRow>,
         children: &HashMap<Id, Vec<Id>>,
         visited: &mut HashSet<Id>,
-        out: &mut Vec<(GoalRow, usize)>,
+        out: &mut Vec<(Id, usize)>,
     ) {
         if !visited.insert(id) {
             return;
         }
-        let Some(row) = by_id.get(&id) else {
-            return;
-        };
-        out.push((row.clone(), depth));
+        out.push((id, depth));
         if let Some(kids) = children.get(&id) {
             for kid in kids {
-                walk(*kid, depth + 1, by_id, children, visited, out);
+                walk(*kid, depth + 1, children, visited, out);
             }
         }
     }
 
-    for root in roots {
-        walk(root, 0, &by_id, &children, &mut visited, &mut ordered);
+    for id in &lane_ids {
+        if !has_visible_parent.contains(id) {
+            walk(*id, 0, &children, &mut visited, &mut ordered);
+        }
     }
-    // Any unvisited (e.g. parent-cycle) nodes get a depth-0 fallback.
-    let leftovers: Vec<Id> = by_id.keys().copied().filter(|id| !visited.contains(id)).collect();
-    for id in leftovers {
-        walk(id, 0, &by_id, &children, &mut visited, &mut ordered);
+    // Any unvisited (e.g. parent cycle) goals get a depth-0 fallback.
+    for id in &lane_ids {
+        if !visited.contains(id) {
+            walk(*id, 0, &children, &mut visited, &mut ordered);
+        }
     }
     ordered
 }
 
-// ── Compose form state ───────────────────────────────────────────────
+/// True if the goal matches the (lowercased) search needle in any of:
+/// its full hex id, its title body, or any of its tags. Substring match;
+/// case-insensitive (caller lowercases). Each piece is a per-goal query
+/// — single-digit µs each per JP's measurement.
+fn goal_matches_search(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile>,
+    goal_id: Id,
+    needle: &str,
+) -> bool {
+    if fmt_id_full(goal_id).contains(needle) {
+        return true;
+    }
+    if let Some((handle,)) = find!(
+        (t: TextHandle),
+        pattern!(space, [{
+            goal_id @
+            metadata::tag: &KIND_GOAL_ID,
+            compass::title: ?t,
+        }])
+    )
+    .next()
+    {
+        if let Ok(v) = ws.get::<View<str>, LongString>(handle) {
+            if v.as_ref().to_lowercase().contains(needle) {
+                return true;
+            }
+        }
+    }
+    for (tag,) in find!(
+        (tag: String),
+        pattern!(space, [{
+            goal_id @
+            metadata::tag: &KIND_GOAL_ID,
+            compass::tag: ?tag,
+        }])
+    ) {
+        if tag.to_lowercase().contains(needle) {
+            return true;
+        }
+    }
+    false
+}
 
-/// Inline "+ Add" form bound to a specific column (status).
-#[derive(Default)]
-struct ComposeForm {
-    open: bool,
-    title: String,
-    tags: String,
-    /// Hex-prefix for a parent goal; resolved against `goals` when
-    /// submitting (ambiguous or unknown = none).
-    parent_prefix: String,
+/// Shape the input goal set into a render stream according to the
+/// active axis. The renderer is agnostic to the axis — it just iterates
+/// `RenderItem`s and dispatches on the variant.
+fn produce_items(
+    axis: SortAxis,
+    goals: Vec<(Id, String, i128)>,
+    space: &TribleSet,
+) -> Vec<RenderItem> {
+    let mut sorted = goals;
+    // Most-recently-changed first across all axes; this is the
+    // baseline order before any axis-specific re-shape.
+    sorted.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    match axis {
+        SortAxis::Status => {
+            // Cluster by status — DEFAULT_STATUSES first, extras
+            // alphabetical. Within each lane keep the global sort_at
+            // order, then run the parent forest so children sit under
+            // visible parents.
+            let mut by_status: BTreeMap<String, Vec<(Id, i128)>> = BTreeMap::new();
+            for (id, status, sort_at) in sorted {
+                by_status.entry(status).or_default().push((id, sort_at));
+            }
+            let mut columns: Vec<String> =
+                DEFAULT_STATUSES.iter().map(|s| s.to_string()).collect();
+            let mut extras: Vec<String> = by_status
+                .keys()
+                .filter(|s| !DEFAULT_STATUSES.contains(&s.as_str()))
+                .cloned()
+                .collect();
+            extras.sort();
+            columns.extend(extras);
+
+            let mut items = Vec::new();
+            for status in columns {
+                let lane = by_status.remove(&status).unwrap_or_default();
+                let ids: Vec<Id> = lane.into_iter().map(|(id, _)| id).collect();
+                for (id, depth) in order_rows(ids, space) {
+                    items.push(RenderItem {
+                        id,
+                        status: status.clone(),
+                        depth,
+                    });
+                }
+            }
+            items
+        }
+        SortAxis::Age => sorted
+            .into_iter()
+            .map(|(id, status, _)| RenderItem {
+                id,
+                status,
+                depth: 0,
+            })
+            .collect(),
+        SortAxis::Parent => {
+            let id_status: HashMap<Id, String> =
+                sorted.iter().map(|(id, s, _)| (*id, s.clone())).collect();
+            let ids: Vec<Id> = sorted.into_iter().map(|(id, _, _)| id).collect();
+            order_rows(ids, space)
+                .into_iter()
+                .map(|(id, depth)| {
+                    let status = id_status
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| "todo".to_string());
+                    RenderItem { id, status, depth }
+                })
+                .collect()
+        }
+    }
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -563,18 +425,37 @@ struct ComposeForm {
 /// // Inside a GORBIE card, with `compass_ws`:
 /// board.render(ctx, compass_ws);
 /// ```
+/// Axis the user picks to organise the goal list. Switching the axis
+/// re-shapes the rendered stream but doesn't touch the underlying data —
+/// status (per-card colored stripe) is shown regardless.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SortAxis {
+    /// Group into status sections, tree-walked within each section.
+    #[default]
+    Status,
+    /// Flat list, most-recently-changed first.
+    Age,
+    /// Global parent/child forest, root-first DFS.
+    Parent,
+}
+
+/// One element of the rendered goal stream. The axis chooses which
+/// items to emit and in which order; cards carry their own status
+/// (per-card colored stripe), so no header item is needed.
+struct RenderItem {
+    id: Id,
+    status: String,
+    depth: usize,
+}
+
 pub struct CompassBoard {
     /// Rebuilt when the workspace's head advances.
     live: Option<CompassLive>,
     expanded_goal: Option<Id>,
     /// Goals whose children should be hidden (parent-node collapsed).
     collapsed: HashSet<Id>,
-    compose: HashMap<String, ComposeForm>,
-    /// Per-goal inline note-input buffer.
-    note_inputs: HashMap<Id, String>,
-    /// Goal whose status-move menu is currently open.
-    status_menu: Option<Id>,
-    column_height: f32,
+    /// Active sort/group axis (user-selectable).
+    axis: SortAxis,
 }
 
 impl Default for CompassBoard {
@@ -583,10 +464,7 @@ impl Default for CompassBoard {
             live: None,
             expanded_goal: None,
             collapsed: HashSet::new(),
-            compose: HashMap::new(),
-            note_inputs: HashMap::new(),
-            status_menu: None,
-            column_height: 500.0,
+            axis: SortAxis::default(),
         }
     }
 }
@@ -597,15 +475,9 @@ impl CompassBoard {
         Self::default()
     }
 
-    /// Override the per-column scroll-area height (pixels). Default 500.
-    pub fn with_column_height(mut self, height: f32) -> Self {
-        self.column_height = height.max(120.0);
-        self
-    }
-
     /// Render the board into a GORBIE card context. `ws` must point at
     /// the compass branch.
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile<Blake3>>) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         // Refresh cached state if the workspace head has advanced.
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
@@ -617,46 +489,79 @@ impl CompassBoard {
         }
         let live = self.live.as_ref().expect("refreshed above");
 
-        let mut goals = live.goals(ws);
-        // Global sort used when a goal has no parent context.
-        goals.sort_by(|a, b| {
-            b.sort_key()
-                .cmp(&a.sort_key())
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-
-        // Fill tree-ordered (row, depth) vectors per-status.
-        let mut by_status: BTreeMap<String, Vec<GoalRow>> = BTreeMap::new();
-        for g in goals.clone() {
-            by_status.entry(g.status.clone()).or_default().push(g);
+        // Top-level query: latest status per goal, then enumerate every
+        // goal as (id, effective_status, sort_at). No row struct — the
+        // renderer reads what it needs from the tribleset inline.
+        let space = &live.space;
+        let mut latest_status: HashMap<Id, (String, i128)> = HashMap::new();
+        for (gid, status, ts) in find!(
+            (gid: Id, status: String, ts: (i128, i128)),
+            pattern!(space, [{
+                _?event @
+                metadata::tag: &KIND_STATUS_ID,
+                compass::task: ?gid,
+                compass::status: ?status,
+                metadata::created_at: ?ts,
+            }])
+        ) {
+            match latest_status.get_mut(&gid) {
+                Some(slot) if slot.1 < ts.0 => *slot = (status, ts.0),
+                Some(_) => {}
+                None => {
+                    latest_status.insert(gid, (status, ts.0));
+                }
+            }
         }
 
-        let mut columns: Vec<String> = DEFAULT_STATUSES.iter().map(|s| s.to_string()).collect();
-        let mut extras: Vec<String> = by_status
-            .keys()
-            .filter(|s| !DEFAULT_STATUSES.contains(&s.as_str()))
-            .cloned()
-            .collect();
-        extras.sort();
-        columns.extend(extras);
+        let mut goals: Vec<(Id, String, i128)> = Vec::new();
+        for (gid, _t, created) in find!(
+            (gid: Id, _t: TextHandle, created: (i128, i128)),
+            pattern!(space, [{
+                ?gid @
+                metadata::tag: &KIND_GOAL_ID,
+                compass::title: ?_t,
+                metadata::created_at: ?created,
+            }])
+        ) {
+            let (status, sort_at) = match latest_status.get(&gid) {
+                Some((s, t)) => (s.clone(), *t),
+                None => ("todo".to_string(), created.0),
+            };
+            goals.push((gid, status, sort_at));
+        }
 
-        // Pre-compute a global id→title lookup (used for "> over <prefix>"
-        // badges when the target isn't in the same column).
-        let title_by_id: HashMap<Id, String> = goals
-            .iter()
-            .map(|g| (g.id, g.title.clone()))
-            .collect();
+        // Per-status counts for the section header chips.
+        let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, status, _) in &goals {
+            *status_counts.entry(status.clone()).or_insert(0) += 1;
+        }
 
-        // Per-column tree-ordered rows.
-        let column_data: Vec<(String, Vec<(GoalRow, usize)>)> = columns
-            .into_iter()
-            .map(|s| {
-                let rows = by_status.remove(&s).unwrap_or_default();
-                let ordered = order_rows(rows);
-                (s, ordered)
-            })
-            .collect();
+        let axis = self.axis;
+        let items = produce_items(axis, goals, space);
+        let total_goals: usize = items.len();
+
+        // Compute the per-card collapsed-ancestors set once over the
+        // global item stream — a Card whose any depth-ancestor is in
+        // `self.collapsed` is hidden. Tree boundaries between status
+        // groups are implicit: when a lane resets to depth 0 the path
+        // pops to empty before pushing.
+        let ancestors_collapsed: HashSet<Id> = {
+            let mut hidden: HashSet<Id> = HashSet::new();
+            let mut path: Vec<(Id, usize)> = Vec::new();
+            for item in &items {
+                while path.last().map(|(_, d)| *d >= item.depth).unwrap_or(false) {
+                    path.pop();
+                }
+                let parent_hidden = path
+                    .iter()
+                    .any(|(pid, _)| hidden.contains(pid) || self.collapsed.contains(pid));
+                if parent_hidden {
+                    hidden.insert(item.id);
+                }
+                path.push((item.id, item.depth));
+            }
+            hidden
+        };
 
         // Resolve expanded goal's notes (if any).
         let expanded = self.expanded_goal;
@@ -665,28 +570,20 @@ impl CompassBoard {
             (gid, notes)
         });
 
-        // Pull scalars out of `self` before the closure so we don't end up
-        // with conflicting borrows.
-        let column_height = self.column_height;
-        let total_goals: usize = column_data.iter().map(|(_, r)| r.len()).sum();
-
-        // Write intents collected during render (applied after the UI closure
-        // so we don't re-enter `self` while holding egui state).
-        let mut add_intent: Option<AddIntent> = None;
-        let mut move_intent: Option<(Id, String)> = None;
-        let mut note_intent: Option<(Id, String)> = None;
-
         // Mutable handles to self state we need inside the closure.
+        // The viewer is read-only — view state (expansion, collapse,
+        // axis selection) is the only thing that mutates.
         let expanded_goal = &mut self.expanded_goal;
         let collapsed = &mut self.collapsed;
-        let compose = &mut self.compose;
-        let note_inputs = &mut self.note_inputs;
-        let status_menu = &mut self.status_menu;
+        let axis_ref = &mut self.axis;
+        // Borrow the live tribleset so renderers can run on-the-spot
+        // queries instead of reading hydrated row fields.
+        let space = &live.space;
 
         ctx.section("Compass", |ctx| {
             // Header: total + per-status breakdown as small colored
-            // chips. Same statuses appear as column headers below, so
-            // the summary is a mini-legend too.
+            // chips. The chips are a mini-legend for the colored
+            // accent stripes on each card.
             let ui = ctx.ui_mut();
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -702,19 +599,15 @@ impl CompassBoard {
                         .small()
                         .color(color_muted(ui)),
                 );
-                for (status, rows) in &column_data {
-                    if rows.is_empty() {
+                for (status, count) in &status_counts {
+                    if *count == 0 {
                         continue;
                     }
                     let (dot, _) = ui.allocate_exact_size(
                         egui::vec2(8.0, 8.0),
                         egui::Sense::hover(),
                     );
-                    ui.painter().circle_filled(
-                        dot.center(),
-                        3.5,
-                        status_color(status),
-                    );
+                    ui.painter().circle_filled(dot.center(), 3.5, status_color(status));
                     ui.label(
                         egui::RichText::new(status.to_uppercase())
                             .monospace()
@@ -722,7 +615,7 @@ impl CompassBoard {
                             .small(),
                     );
                     ui.label(
-                        egui::RichText::new(rows.len().to_string())
+                        egui::RichText::new(count.to_string())
                             .monospace()
                             .small()
                             .color(color_muted(ui)),
@@ -730,423 +623,125 @@ impl CompassBoard {
                 }
             });
 
-            if total_goals == 0 && column_data.iter().all(|(s, _)| !compose.contains_key(s)) {
+            // Toolbar row: axis selector (segmented selector with a lit
+            // active segment) + global +ADD button. Status grouping is
+            // implicit via the per-card stripes; adding a goal is one
+            // global action with status chosen inside the form.
+            ctx.horizontal(|ctx| {
+                let ui = ctx.ui_mut();
+                ui.label(
+                    egui::RichText::new("GROUP")
+                        .small()
+                        .monospace()
+                        .strong()
+                        .color(color_muted(ui)),
+                );
+                ui.add(
+                    ChoiceToggle::new(axis_ref)
+                        .choice(SortAxis::Status, "BY STATUS")
+                        .choice(SortAxis::Age, "BY AGE")
+                        .choice(SortAxis::Parent, "BY PARENT"),
+                );
+            });
+
+            // Notebook-wide search — opt-in. `ctx.search()` makes the
+            // global search bar appear and lets us report matches back
+            // so the bar can show counts + drive prev/next navigation.
+            let mut search = ctx.search();
+            let needle = search.query().to_lowercase();
+            let search_active = !needle.is_empty();
+
+            if total_goals == 0 {
                 render_empty_state(
                     ctx.ui_mut(),
                     "\u{1f9ed}",
                     "No goals yet",
-                    Some("Click + ADD in a column below to start tracking work."),
+                    Some("Add goals via `compass add` on the CLI."),
                 );
             }
 
-            // Vertically-stacked swim lanes: each status gets a full-
-            // width lane, stacked top-to-bottom. Replaces the earlier
-            // side-by-side kanban columns — lets card titles/tags
-            // breathe on wide screens and uses the notebook's
-            // natural vertical scroll instead of a nested horizontal
-            // scroller.
-            const LANE_GAP: f32 = 10.0;
-            let ui = ctx.ui_mut();
-            // Card-rect collection for the priority-edge overlay.
+            // Card grid — one card per row (full 12-column width ≈
+            // 744 px). Cards have the room to breathe; depth still
+            // visualized by the internal dep-line gutter and the
+            // content shift.
             let mut card_rects: HashMap<Id, egui::Rect> = HashMap::new();
-            let lane_width = ui.available_width();
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = LANE_GAP;
-                for (status, rows) in &column_data {
-                    let form = compose.entry(status.clone()).or_default();
-                    render_column(
-                        ui,
-                        status,
-                        rows,
-                        lane_width,
-                        column_height,
-                        expanded_goal,
-                        expanded_notes.as_ref(),
-                        collapsed,
-                        note_inputs,
-                        status_menu,
-                        form,
-                        &title_by_id,
-                        &mut card_rects,
-                        &mut add_intent,
-                        &mut move_intent,
-                        &mut note_intent,
-                    );
+            ctx.grid(|g| {
+                for item in &items {
+                    if ancestors_collapsed.contains(&item.id) {
+                        continue;
+                    }
+                    let match_info = if search_active {
+                        if !goal_matches_search(space, ws, item.id, &needle) {
+                            continue;
+                        }
+                        Some(search.report(egui::Id::new(("compass_match", item.id))))
+                    } else {
+                        None
+                    };
+                    let id = item.id;
+                    let status_str = item.status.as_str();
+                    let depth = item.depth;
+                    g.full(|cell_ctx| {
+                        render_goal_card(
+                            cell_ctx.ui_mut(),
+                            id,
+                            status_str,
+                            depth,
+                            space,
+                            ws,
+                            expanded_goal,
+                            expanded_notes.as_ref(),
+                            collapsed,
+                            &mut card_rects,
+                            &needle,
+                        );
+                        if let Some(info) = match_info {
+                            if info.should_scroll_to {
+                                if let Some(rect) = card_rects.get(&id) {
+                                    cell_ctx
+                                        .ui_mut()
+                                        .scroll_to_rect(*rect, Some(egui::Align::Center));
+                                }
+                            }
+                        }
+                    });
                 }
             });
 
-            // Priority-edge overlay — same tinting as before, but
-            // now edges typically run top-to-bottom between lanes
-            // instead of across the horizontal kanban.
-            let painter = ui.painter();
-            for row in column_data.iter().flat_map(|(_, rs)| rs) {
-                let (src_row, _depth) = row;
-                let Some(from_rect) = card_rects.get(&src_row.id) else {
+            // Priority-edge overlay — iterate cards in the item stream.
+            let painter = ctx.ui_mut().painter().clone();
+            for item in &items {
+                let Some(from_rect) = card_rects.get(&item.id) else {
                     continue;
                 };
-                let base = status_color(&src_row.status);
+                let base = status_color(&item.status);
                 let edge_color = egui::Color32::from_rgba_unmultiplied(
                     base.r(),
                     base.g(),
                     base.b(),
                     200,
                 );
-                for lower in &src_row.higher_over {
-                    let Some(to_rect) = card_rects.get(lower) else {
+                let higher_id = item.id;
+                for (lower,) in find!(
+                    (lower: Id),
+                    pattern!(space, [{
+                        _?event @
+                        metadata::tag: &KIND_PRIORITIZE_ID,
+                        compass::higher: higher_id,
+                        compass::lower: ?lower,
+                    }])
+                ) {
+                    let Some(to_rect) = card_rects.get(&lower) else {
                         continue;
                     };
-                    draw_priority_edge(painter, *from_rect, *to_rect, edge_color);
+                    draw_priority_edge(&painter, *from_rect, *to_rect, edge_color);
                 }
             }
         });
 
-        // Apply writes after the UI closure. Each helper does a
-        // `ws.commit(..)`; the host pushes between frames via
-        // `StorageState::push` when the workspace head advanced.
-        if let Some(intent) = add_intent {
-            let status = intent.status.clone();
-            let _ = CompassLive::add_goal(ws, intent.title, status.clone(), intent.parent, intent.tags);
-            if let Some(form) = self.compose.get_mut(&status) {
-                form.open = false;
-                form.title.clear();
-                form.tags.clear();
-                form.parent_prefix.clear();
-            }
-            // Drop cached state so the next frame re-queries off the new head.
-            self.live = None;
-        }
-        if let Some((id, status)) = move_intent {
-            CompassLive::move_status(ws, id, status);
-            self.status_menu = None;
-            self.live = None;
-        }
-        if let Some((id, body)) = note_intent {
-            let body_trimmed = body.trim();
-            if !body_trimmed.is_empty() {
-                CompassLive::add_note(ws, id, body_trimmed.to_string());
-                if let Some(buf) = self.note_inputs.get_mut(&id) {
-                    buf.clear();
-                }
-                self.live = None;
-            }
-        }
+        // Read-only viewer: no writes to apply post-render.
+        let _ = ws; // suppress unused-warning while ws stays in the signature
     }
-}
-
-// ── Write intents ────────────────────────────────────────────────────
-
-struct AddIntent {
-    title: String,
-    status: String,
-    parent: Option<Id>,
-    tags: Vec<String>,
-}
-
-// ── Column rendering ─────────────────────────────────────────────────
-
-#[allow(clippy::too_many_arguments)]
-fn render_column(
-    ui: &mut egui::Ui,
-    status: &str,
-    rows: &[(GoalRow, usize)],
-    width: f32,
-    height: f32,
-    expanded_goal: &mut Option<Id>,
-    expanded_notes: Option<&(Id, Vec<NoteRow>)>,
-    collapsed: &mut HashSet<Id>,
-    note_inputs: &mut HashMap<Id, String>,
-    status_menu: &mut Option<Id>,
-    form: &mut ComposeForm,
-    title_by_id: &HashMap<Id, String>,
-    card_rects: &mut HashMap<Id, egui::Rect>,
-    add_intent: &mut Option<AddIntent>,
-    move_intent: &mut Option<(Id, String)>,
-    note_intent: &mut Option<(Id, String)>,
-) {
-    let status_col = status_color(status);
-    let frame_response = egui::Frame::NONE
-        .fill(color_frame(ui))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin {
-            left: 12,  // extra left padding for the accent stripe
-            right: 8,
-            top: 8,
-            bottom: 8,
-        })
-        .show(ui, |ui| {
-            // Claim the full available inside-Frame width. Using the
-            // outer `width` here would exceed `available_width()` by
-            // the Frame's inner_margin (left+right = 20 px) — which
-            // pushed the lane that much past the notebook column and
-            // caused the "stuff overflows" impression on every
-            // relayout. `available_width()` respects the margin.
-            let _ = width; // kept in the signature for the caller's math
-            ui.set_width(ui.available_width());
-            ui.set_min_height(height);
-            ui.vertical(|ui| {
-
-            // Column header: STATUS label + count chip on the left,
-            // +ADD / × toggle on the right. Count sits in a muted
-            // playbook-style chip instead of "(N)" parentheses so the
-            // status name stays prominent and the count reads as a
-            // metadata badge.
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(
-                    egui::RichText::new(status.to_uppercase())
-                        .monospace()
-                        .strong()
-                        .color(status_col),
-                );
-                render_chip(ui, &rows.len().to_string(), color_muted(ui));
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let (label, hint) = if form.open {
-                            ("×", "Close compose form")
-                        } else {
-                            ("+ ADD", "New goal in this column")
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(label)
-                                        .small()
-                                        .monospace()
-                                        .strong(),
-                                ),
-                            )
-                            .on_hover_text(hint)
-                            .clicked()
-                        {
-                            form.open = !form.open;
-                        }
-                    },
-                );
-            });
-            ui.add_space(4.0);
-
-            // Inline compose form.
-            if form.open {
-                render_compose_form(ui, status, form, add_intent);
-                ui.add_space(6.0);
-            }
-
-            // Collect set of visible IDs for filtering children of collapsed parents.
-            let ancestors_collapsed: HashSet<Id> = {
-                // An ID is "hidden" if any of its ancestors (inside this
-                // column, among the tree-ordered rows) is in `collapsed`.
-                let mut hidden: HashSet<Id> = HashSet::new();
-                // Walk tree-ordered list; since depth is non-decreasing when
-                // walking into a subtree, we can track the active path.
-                let mut path: Vec<(Id, usize)> = Vec::new();
-                for (row, depth) in rows {
-                    while path.last().map(|(_, d)| *d >= *depth).unwrap_or(false) {
-                        path.pop();
-                    }
-                    let parent_hidden = path.iter().any(|(pid, _)| {
-                        hidden.contains(pid) || collapsed.contains(pid)
-                    });
-                    if parent_hidden {
-                        hidden.insert(row.id);
-                    }
-                    path.push((row.id, *depth));
-                }
-                hidden
-            };
-
-            egui::ScrollArea::vertical()
-                .id_salt(("compass_column", status))
-                .max_height(height)
-                .auto_shrink([false, false])
-                // Disable drag-to-scroll — it registers a content-wide
-                // `Sense::drag()` that collides with nested click-senses
-                // on cards/triangles and trips an `unwrap()` in egui's
-                // hit_test under some layouts (egui 0.33.x / 0.34.x).
-                .scroll_source(egui::scroll_area::ScrollSource {
-                    scroll_bar: true,
-                    drag: false,
-                    mouse_wheel: true,
-                })
-                .show(ui, |ui| {
-                    if rows.is_empty() && !form.open {
-                        // Subtle centered placeholder for an empty
-                        // column. Matches the muted monospace style
-                        // used elsewhere (keeps the column compact —
-                        // a full empty-state with icon would be
-                        // heavy at 240px wide).
-                        ui.add_space(8.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "NO {} GOALS",
-                                    status.to_uppercase()
-                                ))
-                                .monospace()
-                                .small()
-                                .color(color_muted(ui)),
-                            );
-                        });
-                        ui.add_space(8.0);
-                        return;
-                    }
-                    for (row, depth) in rows {
-                        if ancestors_collapsed.contains(&row.id) {
-                            continue;
-                        }
-                        render_goal_card(
-                            ui,
-                            row,
-                            *depth,
-                            expanded_goal,
-                            expanded_notes,
-                            collapsed,
-                            note_inputs,
-                            status_menu,
-                            title_by_id,
-                            card_rects,
-                            move_intent,
-                            note_intent,
-                        );
-                        ui.add_space(6.0);
-                    }
-                });
-            });
-        });
-
-    // Kanban-style left accent stripe in the status color. Painted on top
-    // of the frame after layout so we know the exact rect.
-    let frame_rect = frame_response.response.rect;
-    let accent = egui::Rect::from_min_size(
-        frame_rect.min,
-        egui::vec2(4.0, frame_rect.height()),
-    );
-    ui.painter().rect_filled(
-        accent,
-        egui::CornerRadius {
-            nw: 6,
-            sw: 6,
-            ne: 0,
-            se: 0,
-        },
-        status_col,
-    );
-}
-
-fn render_compose_form(
-    ui: &mut egui::Ui,
-    status: &str,
-    form: &mut ComposeForm,
-    add_intent: &mut Option<AddIntent>,
-) {
-    egui::Frame::NONE
-        .fill(card_bg(ui))
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            // Header: "NEW GOAL →" muted + status keyword in its status color.
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(
-                    egui::RichText::new("NEW GOAL \u{2192}")
-                        .small()
-                        .monospace()
-                        .strong()
-                        .color(color_muted(ui)),
-                );
-                ui.label(
-                    egui::RichText::new(status.to_uppercase())
-                        .small()
-                        .monospace()
-                        .strong()
-                        .color(status_color(status)),
-                );
-            });
-            ui.add_space(2.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut form.title)
-                    .hint_text("title")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut form.tags)
-                    .hint_text("tags (space-separated)")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut form.parent_prefix)
-                    .hint_text("parent id prefix (optional)")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let submit_enabled = !form.title.trim().is_empty() && add_intent.is_none();
-                // CREATE button tinted with the column's status color
-                // — reinforces "this goal will land in this column" at
-                // submit time.
-                let fill = status_color(status);
-                let text = colorhash::text_color_on(fill);
-                if ui
-                    .add_enabled(
-                        submit_enabled,
-                        egui::Button::new(
-                            egui::RichText::new("CREATE")
-                                .small()
-                                .monospace()
-                                .strong()
-                                .color(text),
-                        )
-                        .fill(fill),
-                    )
-                    .clicked()
-                {
-                    let parent = resolve_prefix_hack(&form.parent_prefix);
-                    let tags: Vec<String> = form
-                        .tags
-                        .split_whitespace()
-                        .map(|s| s.trim_start_matches('#').to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    *add_intent = Some(AddIntent {
-                        title: form.title.trim().to_string(),
-                        status: status.to_string(),
-                        parent,
-                        tags,
-                    });
-                }
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("CANCEL")
-                            .small()
-                            .monospace()
-                            .color(color_muted(ui)),
-                    ))
-                    .clicked()
-                {
-                    form.open = false;
-                    form.title.clear();
-                    form.tags.clear();
-                    form.parent_prefix.clear();
-                }
-            });
-        });
-}
-
-/// Resolve a hex prefix to a full Id. This widget can't access the live
-/// connection at form-render time (it'd re-enter the mutex), so we only
-/// accept a full 32-char hex id. Shorter prefixes silently yield `None`.
-/// Callers who need prefix resolution should copy the full id from the
-/// board into the field — which is easy because the id_prefix is always
-/// shown on cards.
-fn resolve_prefix_hack(prefix: &str) -> Option<Id> {
-    let trimmed = prefix.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Only accept full 32-char hex — shorter prefixes are ambiguous and
-    // we'd need another mutex re-entry to resolve them.
-    Id::from_hex(trimmed)
 }
 
 // ── Card rendering ───────────────────────────────────────────────────
@@ -1154,17 +749,17 @@ fn resolve_prefix_hack(prefix: &str) -> Option<Id> {
 #[allow(clippy::too_many_arguments)]
 fn render_goal_card(
     ui: &mut egui::Ui,
-    row: &GoalRow,
+    goal_id: Id,
+    status: &str,
     depth: usize,
+    space: &TribleSet,
+    ws: &mut Workspace<Pile>,
     expanded_goal: &mut Option<Id>,
     expanded_notes: Option<&(Id, Vec<NoteRow>)>,
     collapsed: &mut HashSet<Id>,
-    note_inputs: &mut HashMap<Id, String>,
-    status_menu: &mut Option<Id>,
-    title_by_id: &HashMap<Id, String>,
     card_rects: &mut HashMap<Id, egui::Rect>,
-    move_intent: &mut Option<(Id, String)>,
-    note_intent: &mut Option<(Id, String)>,
+    // Lowercased search needle ("" = no search).
+    search_needle: &str,
 ) {
     const DEP_LINE_STEP: f32 = 6.0;
     const DEP_LINE_BASE: f32 = 8.0;
@@ -1174,26 +769,35 @@ fn render_goal_card(
     } else {
         (dep_lines as f32 * DEP_LINE_STEP) + DEP_LINE_BASE
     };
+    let id_str = fmt_id_full(goal_id);
 
-    let is_expanded = *expanded_goal == Some(row.id);
-    let is_collapsed = collapsed.contains(&row.id);
+    let is_expanded = *expanded_goal == Some(goal_id);
+    let is_collapsed = collapsed.contains(&goal_id);
 
-    let card_response = egui::Frame::NONE
-        .fill(card_bg(ui))
-        .corner_radius(egui::CornerRadius::same(4))
+    // Depth indentation: the card frame itself shifts right by
+    // `dep_indent`, narrowing the card and exposing a gutter on the
+    // left of the cell for the dep-lines. Safe under the one-card-
+    // per-row grid layout (no neighbouring cell to bleed into).
+    let card_response = paper_frame(ui, 3)
         .outer_margin(egui::Margin {
             left: dep_indent as i8,
             right: 0,
             top: 0,
             bottom: 0,
         })
-        .inner_margin(egui::Margin::symmetric(8, 6))
+        .inner_margin(egui::Margin {
+            left: 26,
+            right: 8,
+            top: 6,
+            bottom: 6,
+        })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
-            // Row 1: status chip · title · collapse triangle · short id.
+            // Row 1: title · collapse triangle · short id. Status used
+            // to be a chip here but the per-card accent stripe already
+            // carries that info — keeping both was redundant.
             ui.horizontal(|ui| {
-                render_status_chip(ui, &row.status, status_color(&row.status));
                 // Collapse-subtree triangle, only shown when there are
                 // visible children (we don't know here without the tree
                 // snapshot, so show it always at depth=0 or higher — the
@@ -1209,16 +813,36 @@ fn render_goal_card(
                     .clicked()
                 {
                     if is_collapsed {
-                        collapsed.remove(&row.id);
+                        collapsed.remove(&goal_id);
                     } else {
-                        collapsed.insert(row.id);
+                        collapsed.insert(goal_id);
                     }
                 }
 
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&row.title).monospace())
-                        .wrap_mode(egui::TextWrapMode::Wrap),
-                );
+                if let Some((handle,)) = find!(
+                    (t: TextHandle),
+                    pattern!(space, [{
+                        goal_id @
+                        metadata::tag: &KIND_GOAL_ID,
+                        compass::title: ?t,
+                    }])
+                )
+                .next()
+                {
+                    if let Ok(v) = ws.get::<View<str>, LongString>(handle) {
+                        let base = egui::TextFormat {
+                            font_id: egui::TextStyle::Monospace.resolve(ui.style()),
+                            color: ui.visuals().text_color(),
+                            ..Default::default()
+                        };
+                        let job = GORBIE::search::highlight_match(
+                            v.as_ref(),
+                            search_needle,
+                            base,
+                        );
+                        ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
+                    }
+                }
             });
 
             // Row 2: id prefix · optional parent pointer (left) · note
@@ -1226,10 +850,19 @@ fn render_goal_card(
             // it reads like a metadata badge, not a continuation of the
             // id string.
             ui.horizontal(|ui| {
-                let id_text = if let Some(parent) = row.parent {
-                    format!("^{} {}", id_prefix(parent), row.id_prefix)
-                } else {
-                    row.id_prefix.clone()
+                let parent_id = find!(
+                    (parent: Id),
+                    pattern!(space, [{
+                        goal_id @
+                        metadata::tag: &KIND_GOAL_ID,
+                        compass::parent: ?parent,
+                    }])
+                )
+                .next()
+                .map(|(p,)| p);
+                let id_text = match parent_id {
+                    Some(parent) => format!("^{} {}", fmt_id_full(parent), id_str),
+                    None => id_str.clone(),
                 };
                 ui.label(
                     egui::RichText::new(id_text)
@@ -1237,124 +870,92 @@ fn render_goal_card(
                         .small()
                         .color(color_muted(ui)),
                 );
-                if row.note_count > 0 {
+                let note_count = find!(
+                    (event: Id),
+                    pattern!(space, [{
+                        ?event @
+                        metadata::tag: &KIND_NOTE_ID,
+                        compass::task: goal_id,
+                    }])
+                )
+                .count();
+                if note_count > 0 {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            render_chip(
-                                ui,
-                                &format!("{}n", row.note_count),
-                                color_muted(ui),
-                            );
+                            render_chip(ui, &format!("{note_count}n"), color_muted(ui));
                         },
                     );
                 }
             });
 
-            // Row 3: priority edges + tags. Tags and priority badges
-            // share a tight horizontal_wrapped row — long names get
-            // truncated so a single chip can't overflow the column.
-            let has_prio = !row.higher_over.is_empty();
-            if has_prio || !row.tags.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                    for lower in &row.higher_over {
-                        let target_label = title_by_id
-                            .get(lower)
-                            .map(|t| truncate_inline(t, 16))
-                            .unwrap_or_else(|| id_prefix(*lower));
-                        render_chip(
-                            ui,
-                            &format!("▲ {target_label}"),
-                            egui::Color32::from_rgb(0x55, 0x3f, 0x7f),
-                        );
-                    }
-                    for tag in &row.tags {
-                        let tag_label = truncate_inline(tag, 18);
-                        render_chip(ui, &format!("#{tag_label}"), tag_color(tag));
-                    }
-                });
-            }
+            // Row 3: priority edges + tags. Queried directly from the
+            // tribleset rather than read from a hydrated row struct —
+            // long names get truncated so a single chip can't overflow
+            // the column. The wrapped block is unconditional; if both
+            // queries are empty it's a near-zero-height no-op.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for (lower,) in find!(
+                    (lower: Id),
+                    pattern!(space, [{
+                        _?event @
+                        metadata::tag: &KIND_PRIORITIZE_ID,
+                        compass::higher: goal_id,
+                        compass::lower: ?lower,
+                    }])
+                ) {
+                    let target_label = find!(
+                        (t: TextHandle),
+                        pattern!(space, [{
+                            lower @
+                            metadata::tag: &KIND_GOAL_ID,
+                            compass::title: ?t,
+                        }])
+                    )
+                    .next()
+                    .and_then(|(h,)| ws.get::<View<str>, LongString>(h).ok())
+                    .map(|v| truncate_inline(v.as_ref(), 16))
+                    .unwrap_or_else(|| fmt_id_full(lower));
+                    render_chip(
+                        ui,
+                        &format!("▲ {target_label}"),
+                        egui::Color32::from_rgb(0x55, 0x3f, 0x7f),
+                    );
+                }
+                for (tag,) in find!(
+                    (tag: String),
+                    pattern!(space, [{
+                        goal_id @
+                        metadata::tag: &KIND_GOAL_ID,
+                        compass::tag: ?tag,
+                    }])
+                ) {
+                    let tag_label = truncate_inline(&tag, 18);
+                    render_chip(ui, &format!("#{tag_label}"), tag_color(&tag));
+                }
+            });
         })
         .response;
 
-    // Whole card is clickable to toggle note expansion.
-    let click_id = ui.make_persistent_id(("compass_goal", row.id));
+    // Whole card is clickable to toggle note expansion (view state).
+    let click_id = ui.make_persistent_id(("compass_goal", goal_id));
     let response = ui.interact(card_response.rect, click_id, egui::Sense::click());
-    // PointingHand cursor + hover tooltip so the interaction model is
-    // discoverable. The card looks like a card; without this it
-    // doesn't look clickable.
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        response
-            .clone()
-            .on_hover_text("Click to expand · Shift+click or right-click to move");
+        response.clone().on_hover_text("Click to expand notes");
     }
     if response.clicked() {
-        if *expanded_goal == Some(row.id) {
+        if *expanded_goal == Some(goal_id) {
             *expanded_goal = None;
         } else {
-            *expanded_goal = Some(row.id);
+            *expanded_goal = Some(goal_id);
         }
-    }
-    let secondary = response.secondary_clicked();
-    if secondary || response.hovered() && ui.input(|i| i.modifiers.shift && i.pointer.any_click()) {
-        *status_menu = Some(row.id);
-    }
-
-    // Status-menu popup (opens next to the card).
-    if *status_menu == Some(row.id) {
-        egui::Window::new(format!("move_menu_{}", row.id_prefix))
-            .title_bar(false)
-            .resizable(false)
-            .fixed_pos(card_response.rect.right_top())
-            .show(ui.ctx(), |ui| {
-                ui.label(
-                    egui::RichText::new("MOVE TO")
-                        .small()
-                        .monospace()
-                        .strong()
-                        .color(color_muted(ui)),
-                );
-                for status in DEFAULT_STATUSES {
-                    if status == row.status {
-                        continue;
-                    }
-                    let fill = status_color(status);
-                    let text = colorhash::text_color_on(fill);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(status.to_uppercase())
-                                    .small()
-                                    .monospace()
-                                    .strong()
-                                    .color(text),
-                            )
-                            .fill(fill),
-                        )
-                        .clicked()
-                    {
-                        *move_intent = Some((row.id, status.to_string()));
-                    }
-                }
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("CANCEL")
-                            .small()
-                            .monospace()
-                            .color(color_muted(ui)),
-                    ))
-                    .clicked()
-                {
-                    *status_menu = None;
-                }
-            });
     }
 
     if is_expanded {
         let notes: &[NoteRow] = expanded_notes
-            .filter(|(gid, _)| *gid == row.id)
+            .filter(|(gid, _)| *gid == goal_id)
             .map(|(_, n)| n.as_slice())
             .unwrap_or(&[]);
         egui::Frame::NONE
@@ -1368,39 +969,6 @@ fn render_goal_card(
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-
-                // Move-status row (inline, as an alternative to the popup).
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.label(
-                        egui::RichText::new("MOVE TO")
-                            .small()
-                            .monospace()
-                            .strong()
-                            .color(color_muted(ui)),
-                    );
-                    for status in DEFAULT_STATUSES {
-                        if status == row.status {
-                            continue;
-                        }
-                        let fill = status_color(status);
-                        let text = colorhash::text_color_on(fill);
-                        if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new(status.to_uppercase())
-                                    .small()
-                                    .monospace()
-                                    .strong()
-                                    .color(text),
-                            ).fill(fill))
-                            .clicked()
-                        {
-                            *move_intent = Some((row.id, status.to_string()));
-                        }
-                    }
-                });
-
-                ui.separator();
 
                 // Notes — rendered as their own small framed cards
                 // with an age-chip header and a thin left-accent in
@@ -1419,11 +987,9 @@ fn render_goal_card(
                     });
                     ui.add_space(4.0);
                 } else {
-                    let status_col = status_color(&row.status);
+                    let status_col = status_color(status);
                     for note in notes {
-                        let note_resp = egui::Frame::NONE
-                            .fill(card_bg(ui))
-                            .corner_radius(egui::CornerRadius::same(3))
+                        let note_resp = paper_frame(ui, 2)
                             .inner_margin(egui::Margin {
                                 left: 8,
                                 right: 6,
@@ -1460,41 +1026,84 @@ fn render_goal_card(
                         ui.add_space(3.0);
                     }
                 }
-
-                ui.separator();
-
-                // + Note inline form.
-                let buf = note_inputs.entry(row.id).or_default();
-                ui.add(
-                    egui::TextEdit::multiline(buf)
-                        .hint_text("new note…")
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.horizontal(|ui| {
-                    let submit_enabled =
-                        !buf.trim().is_empty() && note_intent.is_none();
-                    if ui
-                        .add_enabled(submit_enabled, egui::Button::new("+ Note"))
-                        .clicked()
-                    {
-                        *note_intent = Some((row.id, buf.clone()));
-                    }
-                });
             });
         ui.add_space(4.0);
     }
 
-    // Draw dependency gutter lines to the left of the card.
-    let rect = card_response.rect;
-    card_rects.insert(row.id, rect);
+    // Dependency gutter lines, one per visible ancestor, each drawn
+    // at the ancestor's rendered left edge so the lines visually
+    // anchor the indented child back to the column where its
+    // ancestors live.
+    // `card_response.rect` is the OUTER rect (includes outer_margin
+    // padding). The visible frame is shifted right by `dep_indent`.
+    // For dep-line positioning the outer rect's left edge IS the
+    // un-indented column origin we want to anchor lines to.
+    let outer_rect = card_response.rect;
+    let frame_rect = egui::Rect::from_min_max(
+        egui::pos2(outer_rect.left() + dep_indent, outer_rect.top()),
+        outer_rect.max,
+    );
+    card_rects.insert(goal_id, frame_rect);
     let painter = ui.painter();
     let stroke = egui::Stroke::new(1.2, color_muted(ui));
+    // Dep-lines anchor to the un-indented column (= outer_rect.left);
+    // clamp to clip-edge so they don't fall outside the visible area.
+    let column_left = outer_rect
+        .left()
+        .max(painter.clip_rect().left() + stroke.width * 0.5);
     for idx in 0..dep_lines {
-        let x = rect.left() - dep_indent + 4.0 + (idx as f32 * DEP_LINE_STEP);
-        let y1 = rect.top() + 0.5;
-        let y2 = rect.bottom() - 0.5;
+        let ancestor_indent = if idx == 0 {
+            0.0
+        } else {
+            (idx as f32 * DEP_LINE_STEP) + DEP_LINE_BASE
+        };
+        let x = column_left + ancestor_indent;
+        let y1 = frame_rect.top() + 0.5;
+        let y2 = frame_rect.bottom() - 0.5;
         painter.line_segment([egui::pos2(x, y1), egui::pos2(x, y2)], stroke);
+    }
+
+    // Per-card colored accent stripe on the left edge — wide enough
+    // for the rotated status name to read cleanly. Insets by the
+    // paper-frame's 1px outline stroke so the stroke draws around the
+    // stripe (instead of being painted over). Replaces the old
+    // per-lane stripe so each card carries its own status mark and
+    // the renderer can drop status grouping entirely under non-Status
+    // axes.
+    const STRIPE_WIDTH: f32 = 18.0;
+    const STROKE_INSET: f32 = 1.0;
+    let stripe_color = status_color(status);
+    // Stripe anchors to the VISIBLE FRAME (`frame_rect`), not the
+    // outer rect — otherwise depth>0 cards would render the stripe
+    // off in the outer_margin gutter region instead of attached to
+    // the card.
+    let stripe_rect = egui::Rect::from_min_size(
+        frame_rect.min + egui::vec2(STROKE_INSET, STROKE_INSET),
+        egui::vec2(STRIPE_WIDTH, frame_rect.height() - 2.0 * STROKE_INSET),
+    );
+    painter.rect_filled(stripe_rect, egui::CornerRadius::ZERO, stripe_color);
+    // Status name on the stripe, rotated 90° clockwise so it reads
+    // top-to-bottom. Skipped when the card's too short to fit the
+    // glyphs (avoids text overflowing into the card body).
+    let stripe_font = egui::FontId::monospace(9.0);
+    let stripe_text_color = colorhash::text_color_on(stripe_color);
+    let galley =
+        painter.layout_no_wrap(status.to_uppercase(), stripe_font, stripe_text_color);
+    if galley.size().x + 6.0 <= frame_rect.height() {
+        // egui's `TextShape::angle` rotates the galley around `pos`.
+        // For angle = +π/2 (vertices x ↦ -y, y ↦ x in screen-space),
+        // the rotated text extends LEFT and DOWN from `pos`. So `pos`
+        // needs to sit at the right edge of where the text should
+        // appear in the stripe. Center horizontally by placing `pos`
+        // at `stripe_left + (stripe_width + galley_height) / 2`.
+        let gh = galley.size().y;
+        let pos = egui::pos2(
+            frame_rect.left() + STROKE_INSET + (STRIPE_WIDTH + gh) * 0.5,
+            frame_rect.top() + STROKE_INSET + 5.0,
+        );
+        let mut text_shape = egui::epaint::TextShape::new(pos, galley, stripe_text_color);
+        text_shape.angle = std::f32::consts::FRAC_PI_2;
+        painter.add(text_shape);
     }
 }
 
@@ -1583,32 +1192,25 @@ fn render_empty_state(ui: &mut egui::Ui, glyph: &str, headline: &str, hint: Opti
 }
 
 fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
-    let text = colorhash::text_color_on(fill);
-    egui::Frame::NONE
-        .fill(fill)
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(6, 1))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(label).small().color(text));
-        });
+    // Bypass `egui::Frame::show` + `ui.label` here because both pad
+    // their content to `ui.spacing.interact_size.y` (default ≈ 18 px),
+    // which makes the chip far taller than the text it contains.
+    // Painting directly off the small text metric keeps the chip just
+    // tall enough for its glyphs.
+    let text_color = colorhash::text_color_on(fill);
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, text_color);
+    const PAD_X: f32 = 5.0;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + PAD_X * 2.0, galley.size().y),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
+    painter.galley(
+        egui::pos2(rect.left() + PAD_X, rect.top()),
+        galley,
+        text_color,
+    );
 }
 
-/// Same as [`render_chip`] but with the playbook's "label" styling:
-/// monospace + strong + uppercase. Used for status pills where the
-/// label is a short keyword (`todo`, `doing`, `blocked`, `done`).
-fn render_status_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
-    let text = colorhash::text_color_on(fill);
-    egui::Frame::NONE
-        .fill(fill)
-        .corner_radius(egui::CornerRadius::same(3))
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(label.to_uppercase())
-                    .small()
-                    .monospace()
-                    .strong()
-                    .color(text),
-            );
-        });
-}

@@ -19,8 +19,8 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 #[derive(Parser, Debug)]
@@ -373,18 +373,18 @@ fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-    (epoch, epoch).try_to_value().unwrap()
+fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
+    (epoch, epoch).try_to_inline().unwrap()
 }
 
-fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
 fn push_workspace(
-    repo: &mut Repository<Pile<Blake3>>,
-    ws: &mut Workspace<Pile<Blake3>>,
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
 ) -> Result<()> {
     while let Some(mut conflict) = repo
         .try_push(ws)
@@ -398,12 +398,12 @@ fn push_workspace(
     Ok(())
 }
 
-fn close_repo(repo: Repository<Pile<Blake3>>) -> Result<()> {
+fn close_repo(repo: Repository<Pile>) -> Result<()> {
     repo.into_storage().close().context("close pile")
 }
 
-fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile<Blake3>>, Id)> {
-    let mut pile = Pile::<Blake3>::open(pile_path).context("open pile")?;
+fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile>, Id)> {
+    let mut pile = Pile::open(pile_path).context("open pile")?;
     if let Err(err) = pile.restore().context("restore pile") {
         let close_res = pile.close().context("close pile after restore failure");
         if let Err(close_err) = close_res {
@@ -478,7 +478,7 @@ fn list_model_profiles(pile_path: &Path) -> Result<Vec<ModelProfileSummary>> {
 
         let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
         for (entry_id, profile_id, updated_at) in find!(
-            (entry_id: Id, profile_id: Id, updated_at: Value<NsTAIInterval>),
+            (entry_id: Id, profile_id: Id, updated_at: Inline<NsTAIInterval>),
             pattern!(&catalog, [{
                 ?entry_id @
                 metadata::tag: KIND_MODEL_PROFILE_ID,
@@ -499,7 +499,7 @@ fn list_model_profiles(pile_path: &Path) -> Result<Vec<ModelProfileSummary>> {
 
         let mut profiles = Vec::new();
         for (profile_id, (entry_id, _updated_key)) in latest {
-            let name = load_string_attr(&mut ws, &catalog, entry_id, metadata::name)?
+            let name = load_string_attr(&mut ws, &catalog, entry_id, &metadata::name)?
                 .unwrap_or_else(|| format!("profile-{profile_id:x}"));
             profiles.push(ModelProfileSummary {
                 id: profile_id,
@@ -541,14 +541,14 @@ fn load_model_profile(pile_path: &Path, profile_id: Id) -> Result<Option<(ModelC
 }
 
 fn load_latest_config(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     pile_path: &Path,
 ) -> Result<Option<Config>> {
     let mut latest: Option<(Id, i128)> = None;
 
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        (config_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?config_id @
             metadata::tag: KIND_CONFIG_ID,
@@ -570,29 +570,29 @@ fn load_latest_config(
     let mut config = default_config(pile_path.to_path_buf());
 
     if let Some(prompt) =
-        load_string_attr(ws, catalog, config_id, playground_config::system_prompt)?
+        load_string_attr(ws, catalog, config_id, &playground_config::system_prompt)?
     {
         config.system_prompt = prompt;
     }
-    if let Some(branch) = load_string_attr(ws, catalog, config_id, playground_config::branch)? {
+    if let Some(branch) = load_string_attr(ws, catalog, config_id, &playground_config::branch)? {
         config.branch = branch;
     }
-    if let Some(author) = load_string_attr(ws, catalog, config_id, playground_config::author)? {
+    if let Some(author) = load_string_attr(ws, catalog, config_id, &playground_config::author)? {
         config.author = author;
     }
-    if let Some(role) = load_string_attr(ws, catalog, config_id, playground_config::author_role)? {
+    if let Some(role) = load_string_attr(ws, catalog, config_id, &playground_config::author_role)? {
         config.author_role = role;
     }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::persona_id) {
+    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::persona_id) {
         config.persona_id = Some(id);
     }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::active_model_profile_id) {
+    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::active_model_profile_id) {
         config.model_profile_id = Some(id);
     }
-    if let Some(model) = load_string_attr(ws, catalog, config_id, playground_config::model_name)? {
+    if let Some(model) = load_string_attr(ws, catalog, config_id, &playground_config::model_name)? {
         config.model.model = model;
     }
-    if let Some(url) = load_string_attr(ws, catalog, config_id, playground_config::model_base_url)? {
+    if let Some(url) = load_string_attr(ws, catalog, config_id, &playground_config::model_base_url)? {
         config.model.base_url = url;
     }
     if let Some(effort) = load_string_attr(
@@ -603,32 +603,32 @@ fn load_latest_config(
     )? {
         config.model.reasoning_effort = Some(effort);
     }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::model_api_key)? {
+    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::model_api_key)? {
         config.model.api_key = Some(key);
     }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::tavily_api_key)?
+    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::tavily_api_key)?
     {
         config.tavily_api_key = Some(key);
     }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::exa_api_key)? {
+    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::exa_api_key)? {
         config.exa_api_key = Some(key);
     }
     if let Some(cwd) =
-        load_string_attr(ws, catalog, config_id, playground_config::exec_default_cwd)?
+        load_string_attr(ws, catalog, config_id, &playground_config::exec_default_cwd)?
     {
         config.exec.default_cwd = Some(PathBuf::from(cwd));
     }
 
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::exec_sandbox_profile) {
+    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::exec_sandbox_profile) {
         config.exec.sandbox_profile = Some(id);
     }
     if let Some(poll_ms) =
-        load_u256_attr(catalog, config_id, playground_config::poll_ms).and_then(u256be_to_u64)
+        load_u256_attr(catalog, config_id, &playground_config::poll_ms).and_then(u256be_to_u64)
     {
         config.poll_ms = poll_ms;
     }
     if let Some(stream) =
-        load_u256_attr(catalog, config_id, playground_config::model_stream).and_then(u256be_to_u64)
+        load_u256_attr(catalog, config_id, &playground_config::model_stream).and_then(u256be_to_u64)
     {
         config.model.stream = stream != 0;
     }
@@ -642,7 +642,7 @@ fn load_latest_config(
         config.model.context_window_tokens = tokens;
     }
     if let Some(tokens) =
-        load_u256_attr(catalog, config_id, playground_config::model_max_output_tokens)
+        load_u256_attr(catalog, config_id, &playground_config::model_max_output_tokens)
             .and_then(u256be_to_u64)
     {
         config.model.max_output_tokens = tokens;
@@ -676,14 +676,14 @@ fn load_latest_config(
 }
 
 fn load_latest_model_profile(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     profile_id: Id,
 ) -> Result<Option<(ModelConfig, String)>> {
     let mut latest: Option<(Id, i128)> = None;
 
     for (entry_id, updated_at) in find!(
-        (entry_id: Id, updated_at: Value<NsTAIInterval>),
+        (entry_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?entry_id @
             metadata::tag: KIND_MODEL_PROFILE_ID,
@@ -704,10 +704,10 @@ fn load_latest_model_profile(
     };
 
     let mut mc = ModelConfig::default();
-    if let Some(model) = load_string_attr(ws, catalog, entry_id, playground_config::model_name)? {
+    if let Some(model) = load_string_attr(ws, catalog, entry_id, &playground_config::model_name)? {
         mc.model = model;
     }
-    if let Some(url) = load_string_attr(ws, catalog, entry_id, playground_config::model_base_url)? {
+    if let Some(url) = load_string_attr(ws, catalog, entry_id, &playground_config::model_base_url)? {
         mc.base_url = url;
     }
     if let Some(effort) = load_string_attr(
@@ -718,11 +718,11 @@ fn load_latest_model_profile(
     )? {
         mc.reasoning_effort = Some(effort);
     }
-    if let Some(key) = load_string_attr(ws, catalog, entry_id, playground_config::model_api_key)? {
+    if let Some(key) = load_string_attr(ws, catalog, entry_id, &playground_config::model_api_key)? {
         mc.api_key = Some(key);
     }
     if let Some(stream) =
-        load_u256_attr(catalog, entry_id, playground_config::model_stream).and_then(u256be_to_u64)
+        load_u256_attr(catalog, entry_id, &playground_config::model_stream).and_then(u256be_to_u64)
     {
         mc.stream = stream != 0;
     }
@@ -736,7 +736,7 @@ fn load_latest_model_profile(
         mc.context_window_tokens = tokens;
     }
     if let Some(tokens) =
-        load_u256_attr(catalog, entry_id, playground_config::model_max_output_tokens)
+        load_u256_attr(catalog, entry_id, &playground_config::model_max_output_tokens)
             .and_then(u256be_to_u64)
     {
         mc.max_output_tokens = tokens;
@@ -759,12 +759,12 @@ fn load_latest_model_profile(
     {
         mc.chars_per_token = chars;
     }
-    let name = load_string_attr(ws, catalog, entry_id, metadata::name)?
+    let name = load_string_attr(ws, catalog, entry_id, &metadata::name)?
         .unwrap_or_else(|| format!("profile-{profile_id:x}"));
     Ok(Some((mc, name)))
 }
 
-fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()> {
+fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let now = epoch_interval(now_epoch());
     let config_id = ufoid();
     let profile_id = config
@@ -775,7 +775,7 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
     let branch = ws.put(config.branch.clone());
     let author = ws.put(config.author.clone());
     let author_role = ws.put(config.author_role.clone());
-    let poll_ms: Value<U256BE> = config.poll_ms.to_value();
+    let poll_ms: Inline<U256BE> = config.poll_ms.to_inline();
 
     let mut change = TribleSet::new();
     change += entity! { &config_id @
@@ -812,12 +812,12 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
     let profile_name = ws.put(config.model_profile_name.clone());
     let model_name_handle = ws.put(config.model.model.clone());
     let model_base_url = ws.put(config.model.base_url.clone());
-    let model_stream: Value<U256BE> = if config.model.stream { 1u64 } else { 0u64 }.to_value();
-    let model_context_window_tokens: Value<U256BE> = config.model.context_window_tokens.to_value();
-    let model_max_output_tokens: Value<U256BE> = config.model.max_output_tokens.to_value();
-    let model_context_safety_margin_tokens: Value<U256BE> =
-        config.model.context_safety_margin_tokens.to_value();
-    let model_chars_per_token: Value<U256BE> = config.model.chars_per_token.to_value();
+    let model_stream: Inline<U256BE> = if config.model.stream { 1u64 } else { 0u64 }.to_inline();
+    let model_context_window_tokens: Inline<U256BE> = config.model.context_window_tokens.to_inline();
+    let model_max_output_tokens: Inline<U256BE> = config.model.max_output_tokens.to_inline();
+    let model_context_safety_margin_tokens: Inline<U256BE> =
+        config.model.context_safety_margin_tokens.to_inline();
+    let model_chars_per_token: Inline<U256BE> = config.model.chars_per_token.to_inline();
 
     change += entity! { &profile_entry_id @
         metadata::tag: KIND_MODEL_PROFILE_ID,
@@ -847,13 +847,13 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
 }
 
 fn load_string_attr(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     entity_id: Id,
-    attr: Attribute<Handle<Blake3, LongString>>,
+    attr: &Attribute<Handle<LongString>>,
 ) -> Result<Option<String>> {
     let mut handles = find!(
-        (handle: Value<Handle<Blake3, LongString>>),
+        (handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{ entity_id @ attr: ?handle }])
     );
 
@@ -871,7 +871,7 @@ fn load_string_attr(
     Ok(Some(view.as_ref().to_string()))
 }
 
-fn load_id_attr(catalog: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> Option<Id> {
+fn load_id_attr(catalog: &TribleSet, entity_id: Id, attr: &Attribute<GenId>) -> Option<Id> {
     find!(
         value: Id,
         pattern!(catalog, [{ entity_id @ attr: ?value }])
@@ -882,16 +882,16 @@ fn load_id_attr(catalog: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> O
 fn load_u256_attr(
     catalog: &TribleSet,
     entity_id: Id,
-    attr: Attribute<U256BE>,
-) -> Option<Value<U256BE>> {
+    attr: &Attribute<U256BE>,
+) -> Option<Inline<U256BE>> {
     find!(
-        value: Value<U256BE>,
+        value: Inline<U256BE>,
         pattern!(catalog, [{ entity_id @ attr: ?value }])
     )
     .next()
 }
 
-fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
+fn u256be_to_u64(value: Inline<U256BE>) -> Option<u64> {
     let raw = value.raw;
     if raw[..24].iter().any(|byte| *byte != 0) {
         return None;

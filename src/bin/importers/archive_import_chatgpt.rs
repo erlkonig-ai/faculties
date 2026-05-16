@@ -139,7 +139,7 @@ fn import_chatgpt_parsed_file(
         let (raw_root, raw_fragment) = {
             let raw_tree_start = Instant::now();
             let mut raw_importer =
-                JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
+                JsonTreeImporter::<_, triblespace::prelude::inlineencodings::Blake3>::new(
                     repo.storage_mut(),
                     None,
                 );
@@ -665,15 +665,15 @@ fn attachment_data_handle(
     catalog: &TribleSet,
     attachment_id: Id,
 ) -> Option<
-    Value<
-        triblespace::prelude::valueschemas::Handle<
-            triblespace::prelude::valueschemas::Blake3,
-            common::archive_schema::FileBytes,
+    Inline<
+        triblespace::prelude::inlineencodings::Handle<
+            triblespace::prelude::inlineencodings::Blake3,
+            common::archive_schema::RawBytes,
         >,
     >,
 > {
     find!(
-        (handle: Value<triblespace::prelude::valueschemas::Handle<triblespace::prelude::valueschemas::Blake3, common::archive_schema::FileBytes>>),
+        (handle: Inline<triblespace::prelude::inlineencodings::Handle<triblespace::prelude::inlineencodings::Blake3, common::archive_schema::RawBytes>>),
         pattern!(catalog, [{ attachment_id @ common::archive::attachment_data: ?handle }])
     )
     .into_iter()

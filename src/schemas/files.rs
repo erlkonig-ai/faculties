@@ -21,21 +21,21 @@ pub mod file {
     use super::*;
     attributes! {
         // file leaf: content blob
-        "C1E3A12230595280F22ABEB8733D082C" as content: valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>;
+        "C1E3A12230595280F22ABEB8733D082C" as content: inlineencodings::Handle<blobencodings::RawBytes>;
         // file/directory: name (filename or dirname)
-        "AA6AB6F5E68F3A9D95681251C2B9DAFA" as name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "AA6AB6F5E68F3A9D95681251C2B9DAFA" as name: inlineencodings::Handle<blobencodings::LongString>;
         // file leaf: MIME type
-        "BFE2C88ECD13D56F80967C343FC072EE" as mime: valueschemas::ShortString;
+        "BFE2C88ECD13D56F80967C343FC072EE" as mime: inlineencodings::ShortString;
         // import: timestamp
-        "3765160CC1A96BE38302B344718E4C49" as imported_at: valueschemas::NsTAIInterval;
+        "3765160CC1A96BE38302B344718E4C49" as imported_at: inlineencodings::NsTAIInterval;
         // TODO: migrate to metadata::tag (GenId) — should use canonical tag
         // entities with metadata::name, not inline ShortString. See wiki.rs TagIndex.
-        "CDA941A27F86A7551779CF9524DE1D0F" as tag: valueschemas::ShortString;
+        "CDA941A27F86A7551779CF9524DE1D0F" as tag: inlineencodings::ShortString;
         // directory: children (multi-valued, files or subdirectories)
-        "0AC1D962B6E8170FDD73AE3743E16578" as children: valueschemas::GenId;
+        "0AC1D962B6E8170FDD73AE3743E16578" as children: inlineencodings::GenId;
         // import: root directory or file entity
-        "7B36A7A304C26C5504EA54F5723FA135" as root: valueschemas::GenId;
+        "7B36A7A304C26C5504EA54F5723FA135" as root: inlineencodings::GenId;
         // import: original filesystem path
-        "E4B24BB9F469CEC6FD12926C56514E9F" as source_path: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "E4B24BB9F469CEC6FD12926C56514E9F" as source_path: inlineencodings::Handle<blobencodings::LongString>;
     }
 }

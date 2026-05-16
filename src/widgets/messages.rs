@@ -1,88 +1,61 @@
-//! Full-featured GORBIE-embeddable local-messages panel.
+//! Read-only GORBIE-embeddable local-messages panel.
 //!
 //! Renders the append-only direct messages kept on a pile's
-//! `local-messages` branch as a chronological chat log: oldest at the
-//! top, newest at the bottom. When constructed with a current user via
-//! [`MessagesPanel::with_user`], the panel also supports composing new
-//! messages and automatically committing read-receipts for inbound
-//! messages addressed to that user.
+//! `local-messages` branch as a chronological feed: oldest at the top,
+//! newest at the bottom. Each message lays out as a sharp-cornered
+//! paper-card bubble — sender + recipient chips, body text (with
+//! search-match underlines when a notebook-wide search is active),
+//! optional read receipts, and a short id footer.
 //!
-//! The widget holds UI + cached-query state only; the host supplies the
-//! local-messages workspace (required) and an optional `relations`
+//! The widget holds UI + cached-query state only; the host supplies
+//! the local-messages workspace (required) and an optional `relations`
 //! workspace at render time.
 //!
 //! Identity display is resolved against the relations branch (if
-//! supplied): `alias → first_name last_name → display_name → 8-char hex
-//! prefix`. If relations is absent the widget quietly degrades to the
-//! hex-prefix view. Per-person color chips use
+//! supplied): `alias → first_name last_name → display_name → 8-char
+//! hex prefix`. If relations is absent the widget quietly degrades to
+//! the hex-prefix view. Per-person color chips use
 //! `GORBIE::themes::colorhash::ral_categorical` keyed on the user id
 //! bytes.
 //!
 //! ```ignore
-//! // Read-only (anonymous):
 //! let mut panel = MessagesPanel::default();
-//! panel.render(ctx, messages_ws, Some(relations_ws));
-//!
-//! // Interactive (composes + marks read as `me`):
-//! let mut panel = MessagesPanel::with_user(me)
-//!     .with_default_recipient(peer);
 //! panel.render(ctx, messages_ws, Some(relations_ws));
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
-use triblespace::core::id::{ufoid, ExclusiveId, Id};
+use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::{TryToValue, Value};
-use triblespace::macros::{entity, find, pattern};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::NsTAIInterval;
+use triblespace::core::inline::encodings::hash::{Blake3, Handle};
+use triblespace::core::inline::Inline;
+use triblespace::macros::{find, pattern};
+use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
 use crate::schemas::local_messages::{local, KIND_MESSAGE_ID, KIND_READ_ID};
 use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
 
 /// Handle to a long-string blob (message bodies).
-type TextHandle = Value<Handle<Blake3, LongString>>;
-/// Interval value (TAI ns lower/upper) used for `metadata::created_at`.
-type IntervalValue = Value<NsTAIInterval>;
+type TextHandle = Inline<Handle<LongString>>;
 
 // ── ID / time helpers ────────────────────────────────────────────────
 
-fn fmt_id_full(id: Id) -> String {
+/// Full hex of an Id — used as a fallback label when no friendly name
+/// is resolvable from the relations branch.
+fn id_hex(id: Id) -> String {
     format!("{id:x}")
-}
-
-/// First 8 hex chars of an Id — fallback label when no friendly name is
-/// resolvable from the relations branch.
-fn id_prefix(id: Id) -> String {
-    let s = fmt_id_full(id);
-    if s.len() > 8 {
-        s[..8].to_string()
-    } else {
-        s
-    }
 }
 
 fn now_tai_ns() -> i128 {
     hifitime::Epoch::now()
         .map(|e| e.to_tai_duration().total_nanoseconds())
         .unwrap_or(0)
-}
-
-fn now_epoch() -> hifitime::Epoch {
-    hifitime::Epoch::now()
-        .unwrap_or_else(|_| hifitime::Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-fn epoch_interval(epoch: hifitime::Epoch) -> IntervalValue {
-    (epoch, epoch).try_to_value().unwrap()
 }
 
 fn format_age(now_key: i128, maybe_key: Option<i128>) -> String {
@@ -130,25 +103,12 @@ fn color_frame(ui: &egui::Ui) -> egui::Color32 {
     }
 }
 
-fn color_bubble(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0x33, 0x3b, 0x40)
-    } else {
-        egui::Color32::from_rgb(0xfa, 0xfa, 0xfa)
-    }
-}
-
 fn color_muted(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
         egui::Color32::from_rgb(0x9a, 0x9a, 0x9a)
     } else {
         egui::Color32::from_rgb(0x6a, 0x6a, 0x6a)
     }
-}
-
-fn color_accent() -> egui::Color32 {
-    // RAL 6032 signal green — matches playground `color_local_msg`.
-    egui::Color32::from_rgb(0x23, 0x7f, 0x52)
 }
 
 fn color_read() -> egui::Color32 {
@@ -211,7 +171,7 @@ impl Person {
                 return d.clone();
             }
         }
-        id_prefix(fallback_id)
+        id_hex(fallback_id)
     }
 }
 
@@ -231,8 +191,8 @@ impl MessagesLive {
     /// Refresh cached fact spaces + people map from the provided
     /// workspaces.
     fn refresh(
-        ws: &mut Workspace<Pile<Blake3>>,
-        relations_ws: Option<&mut Workspace<Pile<Blake3>>>,
+        ws: &mut Workspace<Pile>,
+        relations_ws: Option<&mut Workspace<Pile>>,
     ) -> Self {
         let space = ws
             .checkout(..)
@@ -267,7 +227,7 @@ impl MessagesLive {
         }
     }
 
-    fn text(&self, ws: &mut Workspace<Pile<Blake3>>, h: TextHandle) -> String {
+    fn text(&self, ws: &mut Workspace<Pile>, h: TextHandle) -> String {
         ws.get::<View<str>, LongString>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
@@ -280,24 +240,13 @@ impl MessagesLive {
     fn display_name(&self, id: Id) -> String {
         match self.people.get(&id) {
             Some(p) => p.display(id),
-            None => id_prefix(id),
+            None => id_hex(id),
         }
-    }
-
-    /// Known people, sorted by display name, for the recipient picker.
-    fn people_sorted(&self) -> Vec<(Id, String)> {
-        let mut out: Vec<(Id, String)> = self
-            .people
-            .iter()
-            .map(|(id, p)| (*id, p.display(*id)))
-            .collect();
-        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-        out
     }
 
     /// Collect every message with its from/to/body/created_at and fold
     /// in the read-receipt events that target it.
-    fn messages(&self, ws: &mut Workspace<Pile<Blake3>>) -> Vec<MessageRow> {
+    fn messages(&self, ws: &mut Workspace<Pile>) -> Vec<MessageRow> {
         let mut by_id: HashMap<Id, MessageRow> = HashMap::new();
 
         let rows: Vec<(Id, Id, Id, TextHandle, (i128, i128))> = find!(
@@ -368,46 +317,12 @@ impl MessagesLive {
         by_id.into_values().collect()
     }
 
-    // ── Write operations (mirror faculty CLI fact shapes) ─────────────
-    // The host pushes the workspace after render; see StorageState.
-
-    fn send_message(ws: &mut Workspace<Pile<Blake3>>, from: Id, to: Id, body: String) -> Id {
-        let msg_id: ExclusiveId = ufoid();
-        let msg_ref: Id = msg_id.id;
-        let now = epoch_interval(now_epoch());
-        let body_handle = ws.put::<LongString, _>(body);
-
-        let mut change = TribleSet::new();
-        change += entity! { &msg_id @
-            metadata::tag: &KIND_MESSAGE_ID,
-            local::from: &from,
-            local::to: &to,
-            local::body: body_handle,
-            metadata::created_at: now,
-        };
-
-        ws.commit(change, "local message");
-        msg_ref
-    }
-
-    fn mark_read(ws: &mut Workspace<Pile<Blake3>>, message_id: Id, reader: Id) {
-        let now = epoch_interval(now_epoch());
-        let read_id: ExclusiveId = ufoid();
-        let mut change = TribleSet::new();
-        change += entity! { &read_id @
-            metadata::tag: &KIND_READ_ID,
-            local::about_message: &message_id,
-            local::reader: &reader,
-            local::read_at: now,
-        };
-        ws.commit(change, "local message read");
-    }
 }
 
 /// Build the people map by scanning the relations fact space.
 fn build_people(
     relations_space: &TribleSet,
-    relations_ws: &mut Workspace<Pile<Blake3>>,
+    relations_ws: &mut Workspace<Pile>,
 ) -> HashMap<Id, Person> {
     let mut people: HashMap<Id, Person> = HashMap::new();
 
@@ -434,7 +349,7 @@ fn build_people(
         }
     }
 
-    let relations_text = |ws: &mut Workspace<Pile<Blake3>>, h: TextHandle| -> Option<String> {
+    let relations_text = |ws: &mut Workspace<Pile>, h: TextHandle| -> Option<String> {
         ws.get::<View<str>, LongString>(h).ok().map(|v| {
             let s: &str = v.as_ref();
             s.to_string()
@@ -497,84 +412,26 @@ fn build_people(
 ///
 /// See the module docs for construction examples.
 pub struct MessagesPanel {
-    /// Current user (sender of composed messages, reader for receipts).
-    /// `None` = read-only panel; compose UI hidden, no receipts.
-    me: Option<Id>,
-    /// Preset recipient for composed messages. If `None`, the compose
-    /// UI shows a picker populated from the relations branch.
-    default_recipient: Option<Id>,
     /// Rebuilt when the messages / relations head changes.
     live: Option<MessagesLive>,
-
-    viewport_height: f32,
-    /// Composer text buffer.
-    compose_draft: String,
-    /// User-selected recipient (overrides `default_recipient` when set).
-    compose_recipient: Option<Id>,
-    /// Message count observed during the last render, used to detect
-    /// arrivals and auto-scroll.
-    last_message_count: usize,
-    /// True when we want to snap the scroll to the bottom on this render.
-    scroll_to_bottom: bool,
-    /// True when the user has scrolled up from the bottom; suppresses
-    /// auto-scroll and shows a "new messages below" indicator instead.
-    user_scrolled_up: bool,
-    /// Number of messages received since the user scrolled up (cleared
-    /// when they return to the bottom).
-    pending_new: usize,
-    /// Read-receipts we've already committed this session, keyed by
-    /// message id. Avoids flooding the pile with duplicate receipts.
-    read_sent: HashSet<Id>,
-    /// Tracks the first render so we can scroll to the bottom (newest)
-    /// on initial paint.
-    first_render: bool,
 }
 
 impl Default for MessagesPanel {
     fn default() -> Self {
-        Self {
-            me: None,
-            default_recipient: None,
-            live: None,
-            viewport_height: 500.0,
-            compose_draft: String::new(),
-            compose_recipient: None,
-            last_message_count: 0,
-            scroll_to_bottom: false,
-            user_scrolled_up: false,
-            pending_new: 0,
-            read_sent: HashSet::new(),
-            first_render: true,
-        }
+        Self { live: None }
     }
 }
 
 impl MessagesPanel {
-    /// Read-only panel (anonymous — shows names but no compose UI,
-    /// no read-receipts).
+    /// New read-only panel.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Interactive panel — composer is active, and inbound messages
-    /// addressed to `me` get auto-acknowledged with a read-receipt
-    /// (once per message per session).
-    pub fn with_user(me: Id) -> Self {
-        let mut s = Self::default();
-        s.me = Some(me);
-        s
-    }
-
-    /// Address the next composed message to a specific recipient. If
-    /// unset, the compose UI shows a recipient picker.
-    pub fn with_default_recipient(mut self, to: Id) -> Self {
-        self.default_recipient = Some(to);
-        self
-    }
-
-    /// Override the scroll-area height (pixels). Default 500.
-    pub fn with_height(mut self, height: f32) -> Self {
-        self.viewport_height = height.max(120.0);
+    /// Backwards-compatibility shim: the panel no longer has an
+    /// internal scroll area (the notebook's own scroll handles
+    /// overflow), so a configured height is a no-op.
+    pub fn with_height(self, _height: f32) -> Self {
         self
     }
 
@@ -584,8 +441,8 @@ impl MessagesPanel {
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile<Blake3>>,
-        mut relations_ws: Option<&mut Workspace<Pile<Blake3>>>,
+        ws: &mut Workspace<Pile>,
+        mut relations_ws: Option<&mut Workspace<Pile>>,
     ) {
         // Refresh cached state if any head advanced.
         let head = ws.head();
@@ -623,478 +480,185 @@ impl MessagesPanel {
                     names.entry(*r).or_insert_with(|| live.display_name(*r));
                 }
             }
-            if let Some(me) = self.me {
-                names.entry(me).or_insert_with(|| live.display_name(me));
-            }
-            if let Some(def) = self.default_recipient {
-                names
-                    .entry(def)
-                    .or_insert_with(|| live.display_name(def));
-            }
-            if let Some(sel) = self.compose_recipient {
-                names
-                    .entry(sel)
-                    .or_insert_with(|| live.display_name(sel));
-            }
-
-            let people_for_picker: Vec<(Id, String)> =
-                if self.me.is_some() && self.default_recipient.is_none() {
-                    live.people_sorted()
-                } else {
-                    Vec::new()
-                };
-
-            // Detect arrivals (fires on first paint too, but we'll
-            // overwrite user_scrolled_up below).
-            let total = messages.len();
-            let grew = total > self.last_message_count;
-            let arrivals = total.saturating_sub(self.last_message_count);
-            self.last_message_count = total;
-
-            if self.first_render {
-                self.scroll_to_bottom = true;
-                self.first_render = false;
-            } else if grew {
-                if self.user_scrolled_up {
-                    self.pending_new += arrivals;
-                } else {
-                    self.scroll_to_bottom = true;
-                }
-            }
 
             let now = now_tai_ns();
-            let viewport_height = self.viewport_height;
+            let count = messages.len();
+            let latest_age = messages
+                .iter()
+                .filter_map(|m| m.created_at)
+                .max()
+                .map(|k| format_age_key(now, k));
 
-            // Mark-read scan: any inbound message not yet read by `me`
-            // gets a receipt (throttled via `read_sent`).
-            let mut to_mark_read: Vec<Id> = Vec::new();
-            if let Some(me) = self.me {
-                for m in &messages {
-                    if m.to != me {
-                        continue;
-                    }
-                    if self.read_sent.contains(&m.id) {
-                        continue;
-                    }
-                    if m.reads.iter().any(|(r, _)| *r == me) {
-                        // Already acked by us in a previous session.
-                        self.read_sent.insert(m.id);
-                        continue;
-                    }
-                    to_mark_read.push(m.id);
-                }
-            }
+            // Open a notebook-wide search session — makes the bar
+            // appear in the top-right and lets us filter messages by
+            // body / from-name / to-name substring.
+            let mut search = ctx.search();
+            let needle = search.query().to_lowercase();
+            let search_active = !needle.is_empty();
 
-            // Header row: message count + "me" chip so the user can
-            // confirm which identity they're composing from at a
-            // glance. Right side shows age of most recent message as
-            // an at-a-glance recency indicator. Matches the compass /
-            // timeline header style.
-            {
-                let me_opt = self.me;
-                let me_name_opt = me_opt
-                    .map(|id| names.get(&id).cloned().unwrap_or_else(|| id_prefix(id)));
-                let count = messages.len();
-                let latest_age = messages
-                    .iter()
-                    .filter_map(|m| m.created_at)
-                    .max()
-                    .map(|k| format_age_key(now, k));
-                let ui = ctx.ui_mut();
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label(
-                        egui::RichText::new(format!("{count} MESSAGES"))
-                            .monospace()
-                            .strong()
-                            .small()
-                            .color(color_muted(ui)),
-                    );
-                    if let (Some(me_id), Some(me_name)) = (me_opt, me_name_opt) {
+            ctx.grid(|g| {
+                // Header row: count on the left, "LAST <age>" right.
+                g.full(|ctx| {
+                    let ui = ctx.ui_mut();
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
                         ui.label(
-                            egui::RichText::new("\u{00b7} AS")
-                                .small()
+                            egui::RichText::new(format!("{count} MESSAGES"))
                                 .monospace()
+                                .strong()
+                                .small()
                                 .color(color_muted(ui)),
                         );
-                        render_chip(ui, &me_name, person_color(me_id));
-                    } else {
-                        ui.label(
-                            egui::RichText::new("\u{00b7} READ-ONLY")
-                                .small()
-                                .monospace()
-                                .color(color_muted(ui)),
-                        );
-                    }
-                    if let Some(age) = latest_age {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "LAST {}",
-                                        age.to_uppercase()
-                                    ))
-                                    .monospace()
-                                    .small()
-                                    .strong()
-                                    .color(color_muted(ui)),
-                                );
-                            },
-                        );
-                    }
+                        if let Some(age) = latest_age.as_ref() {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "LAST {}",
+                                            age.to_uppercase()
+                                        ))
+                                        .monospace()
+                                        .small()
+                                        .strong()
+                                        .color(color_muted(ui)),
+                                    );
+                                },
+                            );
+                        }
+                    });
                 });
-            }
 
-            let mut send_intent: Option<(Id, String)> = None;
-            ctx.grid(|g| g.full(|ctx| {
-            let ui = ctx.ui_mut();
-            if messages.is_empty() && self.me.is_none() {
-                render_messages_empty_state(ui, "No messages yet.", None);
-                return;
-            }
-
-            let scroll_to_bottom = std::mem::take(&mut self.scroll_to_bottom);
-            let pending_new = self.pending_new;
-            let user_scrolled_up = &mut self.user_scrolled_up;
-            let pending_new_slot = &mut self.pending_new;
-
-            let mut scroll = egui::ScrollArea::vertical()
-                .id_salt(("messages_panel", "root"))
-                .max_height(viewport_height)
-                .auto_shrink([false, false])
-                // Disable drag-to-scroll — see note on compass.rs; prevents
-                // an egui hit_test unwrap panic when clickable message cards
-                // overlap the drag-sense the scroll area would otherwise
-                // register.
-                .scroll_source(egui::scroll_area::ScrollSource {
-                    scroll_bar: true,
-                    drag: false,
-                    mouse_wheel: true,
-                });
-            if scroll_to_bottom {
-                scroll = scroll.vertical_scroll_offset(f32::MAX);
-            }
-            let out = scroll.show(ui, |ui| {
-                ui.set_width(ui.available_width());
                 if messages.is_empty() {
-                    render_messages_empty_state(
-                        ui,
-                        "No messages yet.",
-                        Some("Type below to start the conversation."),
-                    );
+                    g.full(|ctx| {
+                        render_messages_empty_state(
+                            ctx.ui_mut(),
+                            "No messages yet.",
+                            None,
+                        );
+                    });
+                    return;
                 }
+
+                // One grid cell per message; the notebook's own scroll
+                // area handles overflow. No nested ScrollArea + no
+                // arrival/stickiness state machine — the viewer is
+                // read-only, so the user just scrolls the notebook.
                 for msg in &messages {
-                    render_message(ui, msg, now, &names, self.me);
-                    ui.add_space(6.0);
+                    if search_active && !message_matches_search(msg, &names, &needle) {
+                        continue;
+                    }
+                    let match_info = if search_active {
+                        Some(search.report(egui::Id::new(("messages_match", msg.id))))
+                    } else {
+                        None
+                    };
+                    let is_focused =
+                        match_info.as_ref().map_or(false, |i| i.is_focused);
+                    g.full(|ctx| {
+                        let ui = ctx.ui_mut();
+                        let pre_y = ui.cursor().min.y;
+                        render_message(ui, msg, now, &names, &needle, is_focused);
+                        if let Some(info) = match_info {
+                            if info.should_scroll_to {
+                                let post_y = ui.cursor().min.y;
+                                let msg_rect = egui::Rect::from_min_max(
+                                    egui::pos2(ui.min_rect().left(), pre_y),
+                                    egui::pos2(ui.min_rect().right(), post_y),
+                                );
+                                ui.scroll_to_rect(
+                                    msg_rect,
+                                    Some(egui::Align::Center),
+                                );
+                            }
+                        }
+                    });
                 }
             });
 
-            // Stickiness detection: if content is taller than viewport
-            // and the scroll offset is within a small epsilon of the
-            // bottom, we consider the user "at the bottom"; any scroll
-            // above that = `user_scrolled_up`.
-            let state = out.state;
-            let content_h = out.content_size.y;
-            let viewport_h = out.inner_rect.height();
-            if content_h > viewport_h + 1.0 {
-                let max_offset = content_h - viewport_h;
-                let at_bottom = state.offset.y >= max_offset - 4.0;
-                if at_bottom {
-                    *user_scrolled_up = false;
-                    *pending_new_slot = 0;
-                } else if !scroll_to_bottom {
-                    *user_scrolled_up = true;
-                }
-            } else {
-                *user_scrolled_up = false;
-                *pending_new_slot = 0;
-            }
-
-            // "N new messages below" indicator. Clicking jumps to bottom.
-            if *user_scrolled_up && pending_new > 0 {
-                let resp = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new(format!("▼ {pending_new} new"))
-                            .small()
-                            .color(colorhash::text_color_on(color_accent())),
-                    )
-                    .fill(color_accent()),
-                );
-                if resp.clicked() {
-                    self.scroll_to_bottom = true;
-                    *user_scrolled_up = false;
-                    *pending_new_slot = 0;
-                }
-            }
-
-            // Compose UI.
-            if let Some(me) = self.me {
-                ui.separator();
-                render_composer(
-                    ui,
-                    me,
-                    self.default_recipient,
-                    &mut self.compose_recipient,
-                    &people_for_picker,
-                    &names,
-                    &mut self.compose_draft,
-                    &mut send_intent,
-                );
-            }
-            }));
-
-            // Apply writes after UI closure. Each helper does a
-            // `ws.commit(..)`; the host pushes between frames via
-            // `StorageState::push` when the workspace head advanced.
-            let mut did_write = false;
-            for mid in to_mark_read {
-                if let Some(me) = self.me {
-                    MessagesLive::mark_read(ws, mid, me);
-                    self.read_sent.insert(mid);
-                    did_write = true;
-                }
-            }
-
-            if let Some((to, body)) = send_intent {
-                let trimmed = body.trim();
-                if !trimmed.is_empty() {
-                    if let Some(me) = self.me {
-                        MessagesLive::send_message(ws, me, to, trimmed.to_string());
-                        self.compose_draft.clear();
-                        // Auto-scroll on our own send regardless of
-                        // whether we were scrolled up.
-                        self.scroll_to_bottom = true;
-                        self.user_scrolled_up = false;
-                        self.pending_new = 0;
-                        did_write = true;
-                    }
-                }
-            }
-
-            if did_write {
-                // Drop cached state so the next frame re-queries off the new head.
-                self.live = None;
-            }
+            // Read-only viewer — no writes to apply post-render.
+            let _ = ws;
         });
     }
 }
 
-// ── Composer ────────────────────────────────────────────────────────
-
-#[allow(clippy::too_many_arguments)]
-fn render_composer(
-    ui: &mut egui::Ui,
-    me: Id,
-    default_recipient: Option<Id>,
-    compose_recipient: &mut Option<Id>,
-    people: &[(Id, String)],
-    names: &HashMap<Id, String>,
-    draft: &mut String,
-    send_intent: &mut Option<(Id, String)>,
-) {
-    let recipient = default_recipient.or(*compose_recipient);
-
-    // Header row: me → recipient chips (or picker).
-    ui.horizontal(|ui| {
-        let me_name = names.get(&me).cloned().unwrap_or_else(|| id_prefix(me));
-        render_chip(ui, &me_name, person_color(me));
-        ui.label(
-            egui::RichText::new("\u{2192}")
-                .monospace()
-                .small()
-                .color(color_muted(ui)),
-        );
-        if let Some(to) = default_recipient {
-            let to_name = names.get(&to).cloned().unwrap_or_else(|| id_prefix(to));
-            render_chip(ui, &to_name, person_color(to));
-        } else {
-            // Recipient picker. A small color-swatch dot shows the
-            // chosen recipient's person-color to echo the chip style
-            // used everywhere else.
-            if let Some(pid) = *compose_recipient {
-                let (dot_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(8.0, 8.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter().circle_filled(
-                    dot_rect.center(),
-                    4.0,
-                    person_color(pid),
-                );
-            }
-            let selected_text = match *compose_recipient {
-                Some(id) => names
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| id_prefix(id)),
-                None => "TO · CHOOSE RECIPIENT".to_string(),
-            };
-            egui::ComboBox::from_id_salt(("messages_recipient_picker",))
-                .selected_text(selected_text)
-                .show_ui(ui, |ui| {
-                    for (pid, name) in people {
-                        if *pid == me {
-                            continue;
-                        }
-                        let is_sel = *compose_recipient == Some(*pid);
-                        // Prefix each entry with a person-color dot;
-                        // name wears the person's color so the picker
-                        // row matches the chip style everywhere else.
-                        ui.horizontal(|ui| {
-                            let (dot, _) = ui.allocate_exact_size(
-                                egui::vec2(8.0, 8.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().circle_filled(
-                                dot.center(),
-                                4.0,
-                                person_color(*pid),
-                            );
-                            if ui
-                                .selectable_label(
-                                    is_sel,
-                                    egui::RichText::new(format!(
-                                        "{name} · {}",
-                                        id_prefix(*pid)
-                                    ))
-                                    .color(person_color(*pid)),
-                                )
-                                .clicked()
-                            {
-                                *compose_recipient = Some(*pid);
-                            }
-                        });
-                    }
-                    if people.is_empty() {
-                        ui.small("(no people in relations branch)");
-                    }
-                });
-        }
-    });
-
-    ui.add_space(2.0);
-
-    let accent = color_accent();
-    egui::Frame::NONE
-        .stroke(egui::Stroke::new(1.0, color_muted(ui)))
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::same(4))
-        .show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(draft)
-                    .hint_text("Type a message…")
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY),
-            );
-        });
-
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        let can_send = recipient.is_some() && !draft.trim().is_empty();
-        let send_label = match recipient {
-            Some(to) => {
-                let name = names.get(&to).cloned().unwrap_or_else(|| id_prefix(to));
-                format!("SEND \u{2192} {}", name.to_uppercase())
-            }
-            None => "SEND".to_string(),
-        };
-        if ui
-            .add_enabled(
-                can_send,
-                egui::Button::new(
-                    egui::RichText::new(send_label)
-                        .small()
-                        .monospace()
-                        .strong()
-                        .color(colorhash::text_color_on(accent)),
-                )
-                .fill(accent),
-            )
-            .clicked()
-        {
-            if let Some(to) = recipient {
-                *send_intent = Some((to, draft.clone()));
-            }
-        }
-        if ui
-            .add(egui::Button::new(
-                egui::RichText::new("CLEAR")
-                    .small()
-                    .monospace()
-                    .color(color_muted(ui)),
-            ))
-            .clicked()
-        {
-            draft.clear();
-        }
-    });
-}
-
 // ── Row rendering ────────────────────────────────────────────────────
+
+/// True if the message's body, sender display name, or recipient
+/// display name contains the (lowercased) needle.
+fn message_matches_search(
+    msg: &MessageRow,
+    names: &HashMap<Id, String>,
+    needle: &str,
+) -> bool {
+    if msg.body.to_lowercase().contains(needle) {
+        return true;
+    }
+    for id in [msg.from, msg.to] {
+        if let Some(name) = names.get(&id) {
+            if name.to_lowercase().contains(needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 fn render_message(
     ui: &mut egui::Ui,
     msg: &MessageRow,
     now: i128,
     names: &HashMap<Id, String>,
-    me: Option<Id>,
+    // Lowercased search needle ("" = no search).
+    search_needle: &str,
+    // True when this bubble is the bar's currently-focused match;
+    // makes every needle occurrence inside render with the double
+    // underline (same emphasis the typst widget uses).
+    focused: bool,
 ) {
-    let from_is_me = me == Some(msg.from);
-    let bubble_fill = if from_is_me {
-        // Tint our own messages toward the accent.
-        egui::Color32::from_rgb(0x2b, 0x44, 0x3b)
-    } else {
-        color_bubble(ui)
-    };
+    let bubble_fill = ui.visuals().window_fill;
+    let from_color = person_color(msg.from);
+    let to_color = person_color(msg.to);
+    // Sender/recipient stripes flank the bubble (compass-card idiom).
+    // Width 18 fits a 9-pt monospace name rotated 90°. Inner content
+    // is inset on both sides to leave room.
+    const STRIPE_WIDTH: f32 = 18.0;
+    const STRIPE_GAP: f32 = 8.0;
+    const STROKE_INSET: f32 = 1.0;
 
-    // Cap bubble width so the alignment is visible and bubbles don't
-    // stretch full-pane. Outbound messages float right; inbound float
-    // left — classic chat layout.
-    let avail = ui.available_width();
-    let bubble_max = (avail * 0.78).max(200.0);
-    let alignment = if from_is_me {
-        egui::Layout::right_to_left(egui::Align::Min)
-    } else {
-        egui::Layout::left_to_right(egui::Align::Min)
+    ui.vertical(|ui| {
+    let inner_margin = egui::Margin {
+        left: (STROKE_INSET + STRIPE_WIDTH + STRIPE_GAP) as i8,
+        right: (STROKE_INSET + STRIPE_WIDTH + STRIPE_GAP) as i8,
+        top: 6,
+        bottom: 6,
     };
-    // Asymmetric bubble corners — classic chat visual idiom. The
-    // "tail" corner (top-right for outbound / top-left for inbound)
-    // stays sharp (2px) so the bubble points back toward the sender;
-    // the remaining three corners keep the full 6px rounding.
-    let corners = if from_is_me {
-        egui::CornerRadius { nw: 6, ne: 2, sw: 6, se: 6 }
-    } else {
-        egui::CornerRadius { nw: 2, ne: 6, sw: 6, se: 6 }
-    };
-    ui.with_layout(alignment, |ui| {
-    egui::Frame::NONE
+    let frame_resp = egui::Frame::NONE
         .fill(bubble_fill)
-        .stroke(egui::Stroke::new(1.0, color_frame(ui)))
-        .corner_radius(corners)
-        .inner_margin(egui::Margin::symmetric(10, 6))
+        .stroke(egui::Stroke::new(STROKE_INSET, color_frame(ui)))
+        // Hard offset shadow + sharp corners: same paper-card idiom
+        // compass goals use, giving the bubble physical "lift" instead
+        // of a backlit LCD look.
+        .shadow(egui::epaint::Shadow {
+            offset: [2, 2],
+            blur: 0,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(48),
+        })
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(inner_margin)
         .show(ui, |ui| {
-            ui.set_max_width(bubble_max);
-
-            // Header row: from → to, plus age.
-            ui.horizontal(|ui| {
-                let from_name = names
-                    .get(&msg.from)
-                    .cloned()
-                    .unwrap_or_else(|| id_prefix(msg.from));
-                let to_name = names
-                    .get(&msg.to)
-                    .cloned()
-                    .unwrap_or_else(|| id_prefix(msg.to));
-                render_chip(ui, &from_name, person_color(msg.from));
-                ui.label(
-                    egui::RichText::new("\u{2192}")
-                        .monospace()
-                        .small()
-                        .color(color_muted(ui)),
-                );
-                render_chip(ui, &to_name, person_color(msg.to));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Header row: just the age, right-aligned. Sender/recipient
+            // are conveyed via the colored side stripes painted after
+            // the Frame returns — no need for in-header chips.
+            //
+            // `Align::Min` on the cross-axis (top) so the layout
+            // doesn't try to fill the cell's available_rect.height —
+            // with frame-delayed cell sizing, that fill would feed
+            // back into next frame's larger cell, growing forever.
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Min),
+                |ui| {
                     let (age, hover) = match msg.created_at {
                         Some(k) => {
                             (format_age_key(now, k), Some(format_timestamp_key(k)))
@@ -1110,15 +674,25 @@ fn render_message(
                     if let Some(h) = hover {
                         resp.on_hover_text(h);
                     }
-                });
-            });
+                },
+            );
 
             ui.add_space(2.0);
 
-            // Body.
-            ui.add(
-                egui::Label::new(egui::RichText::new(&msg.body))
-                    .wrap_mode(egui::TextWrapMode::Wrap),
+            // Body. When a search is active, occurrences of the needle
+            // are underlined inline; the bar's focused match gets a
+            // second underline overlay via `highlight_label`.
+            let base = egui::TextFormat {
+                font_id: egui::TextStyle::Body.resolve(ui.style()),
+                color: ui.visuals().text_color(),
+                ..Default::default()
+            };
+            GORBIE::search::highlight_label(
+                ui,
+                &msg.body,
+                search_needle,
+                base,
+                focused,
             );
 
             // Read receipts — compact "✓✓ NameA · NameB · 2h" line in
@@ -1146,7 +720,7 @@ fn render_message(
                         let name = names
                             .get(reader)
                             .cloned()
-                            .unwrap_or_else(|| id_prefix(*reader));
+                            .unwrap_or_else(|| id_hex(*reader));
                         // Tint each reader name with its own person
                         // color so the reader list matches the
                         // sender/recipient chips above.
@@ -1180,14 +754,120 @@ fn render_message(
             // Short id footer.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(id_prefix(msg.id))
+                    egui::RichText::new(id_hex(msg.id))
                         .monospace()
                         .small()
                         .color(color_muted(ui)),
                 );
             });
         });
+
+    // ── Sender / recipient stripes (compass-card idiom) ─────────────
+    //
+    // After the Frame has measured + painted, lay two colored stripes
+    // along the bubble's left and right edges (inset by the stroke so
+    // the 1px outline draws around them). Each stripe carries the
+    // person's monospace name rotated 90° — sender top-down on the
+    // left, recipient bottom-up on the right — so the bubble reads
+    // like an envelope: FROM ➝ TO without any in-body chips eating
+    // the header.
+    let outer = frame_resp.response.rect;
+    let from_name = names
+        .get(&msg.from)
+        .cloned()
+        .unwrap_or_else(|| id_hex(msg.from));
+    let to_name = names
+        .get(&msg.to)
+        .cloned()
+        .unwrap_or_else(|| id_hex(msg.to));
+    paint_party_stripe(
+        ui.painter(),
+        outer,
+        StripeSide::Left,
+        from_color,
+        &from_name.to_uppercase(),
+    );
+    paint_party_stripe(
+        ui.painter(),
+        outer,
+        StripeSide::Right,
+        to_color,
+        &to_name.to_uppercase(),
+    );
     });
+}
+
+#[derive(Clone, Copy)]
+enum StripeSide {
+    Left,
+    Right,
+}
+
+/// Paint a compass-style colored stripe along one vertical edge of
+/// `outer`, with `label` rendered as monospace rotated 90°. The text
+/// is skipped when the stripe is too short to hold the glyphs (avoids
+/// overflowing into the bubble body on one-line messages).
+fn paint_party_stripe(
+    painter: &egui::Painter,
+    outer: egui::Rect,
+    side: StripeSide,
+    color: egui::Color32,
+    label: &str,
+) {
+    const STRIPE_WIDTH: f32 = 18.0;
+    const STROKE_INSET: f32 = 1.0;
+    let stripe_min = match side {
+        StripeSide::Left => outer.min + egui::vec2(STROKE_INSET, STROKE_INSET),
+        StripeSide::Right => egui::pos2(
+            outer.right() - STROKE_INSET - STRIPE_WIDTH,
+            outer.top() + STROKE_INSET,
+        ),
+    };
+    let stripe_rect = egui::Rect::from_min_size(
+        stripe_min,
+        egui::vec2(STRIPE_WIDTH, outer.height() - 2.0 * STROKE_INSET),
+    );
+    painter.rect_filled(stripe_rect, egui::CornerRadius::ZERO, color);
+
+    let font = egui::FontId::monospace(9.0);
+    let text_color = colorhash::text_color_on(color);
+    let galley = painter.layout_no_wrap(label.to_string(), font, text_color);
+    // Need height for the glyphs + a little breathing room.
+    if galley.size().x + 6.0 > stripe_rect.height() {
+        return;
+    }
+    let gh = galley.size().y;
+    let mut text_shape = match side {
+        StripeSide::Left => {
+            // 90° clockwise rotation: text reads top-to-bottom. egui's
+            // `TextShape::angle = +π/2` rotates around `pos` such that
+            // the galley extends LEFT and DOWN from `pos`. So `pos`
+            // sits on the right edge of where the text should appear.
+            let pos = egui::pos2(
+                stripe_rect.left() + (STRIPE_WIDTH + gh) * 0.5,
+                stripe_rect.top() + 5.0,
+            );
+            let mut s = egui::epaint::TextShape::new(pos, galley, text_color);
+            s.angle = std::f32::consts::FRAC_PI_2;
+            s
+        }
+        StripeSide::Right => {
+            // 90° counter-clockwise (bottom-to-top read) so the
+            // recipient name visually faces the sender across the
+            // bubble. `angle = -π/2` rotates around `pos` such that
+            // the galley extends RIGHT and UP — so `pos` sits at the
+            // left edge of where the rotated text should appear.
+            let pos = egui::pos2(
+                stripe_rect.left() + (STRIPE_WIDTH - gh) * 0.5,
+                stripe_rect.bottom() - 5.0,
+            );
+            let mut s = egui::epaint::TextShape::new(pos, galley, text_color);
+            s.angle = -std::f32::consts::FRAC_PI_2;
+            s
+        }
+    };
+    text_shape.fallback_color = text_color;
+    painter.add(text_shape);
 }
 
 /// Centered empty-state block with an envelope glyph, a headline
@@ -1221,13 +901,3 @@ fn render_messages_empty_state(ui: &mut egui::Ui, headline: &str, hint: Option<&
     ui.add_space(24.0);
 }
 
-fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
-    let text = colorhash::text_color_on(fill);
-    egui::Frame::NONE
-        .fill(fill)
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(6, 1))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(label).small().color(text));
-        });
-}

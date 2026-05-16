@@ -37,20 +37,20 @@ const TAG_SPECS: [(Id, &str); 9] = [
     (TAG_ARCHIVED_ID, "archived"),
 ];
 
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 // ── wiki attributes ────────────────────────────────────────────────────────
 mod wiki {
     use super::*;
     attributes! {
-        "EBFC56D50B748E38A14F5FC768F1B9C1" as fragment: valueschemas::GenId;
-        "6DBBE746B7DD7A4793CA098AB882F553" as content: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "78BABEF1792531A2E51A372D96FE5F3E" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "DEAFB7E307DF72389AD95A850F24BAA5" as links_to: valueschemas::GenId;
+        "EBFC56D50B748E38A14F5FC768F1B9C1" as fragment: inlineencodings::GenId;
+        "6DBBE746B7DD7A4793CA098AB882F553" as content: inlineencodings::Handle<blobencodings::LongString>;
+        "78BABEF1792531A2E51A372D96FE5F3E" as title: inlineencodings::Handle<blobencodings::LongString>;
+        "DEAFB7E307DF72389AD95A850F24BAA5" as links_to: inlineencodings::GenId;
         // Content-hash reference: `files:<64-char-blake3>` points to file bytes directly.
-        "C61CA2F2A70103FD79E97C2F88B854D8" as references_file_content: valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>;
+        "C61CA2F2A70103FD79E97C2F88B854D8" as references_file_content: inlineencodings::Handle<blobencodings::RawBytes>;
         // File-entity reference: `files:<32-char-id>` points to a file entity with metadata.
-        "C98FE0EF9151F196D8F7D816ABBBCC49" as references_file: valueschemas::GenId;
+        "C98FE0EF9151F196D8F7D816ABBBCC49" as references_file: inlineencodings::GenId;
     }
 }
 
@@ -269,7 +269,7 @@ enum TagCommand {
 }
 
 /// Resolve a tag ID to its name, or format as hex if unnamed.
-fn tag_name(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, id: Id) -> String {
+fn tag_name(space: &TribleSet, ws: &mut Workspace<Pile>, id: Id) -> String {
     find!(h: TextHandle, pattern!(space, [{ id @ metadata::name: ?h }]))
         .next()
         .and_then(|h| ws.get::<View<str>, _>(h).ok())
@@ -278,7 +278,7 @@ fn tag_name(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, i
 }
 
 /// Format a list of tag IDs as a bracketed, comma-separated string of names.
-fn format_tags(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, tags: &[Id]) -> String {
+fn format_tags(space: &TribleSet, ws: &mut Workspace<Pile>, tags: &[Id]) -> String {
     let names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
     if names.is_empty() { String::new() } else { format!(" [{}]", names.join(", ")) }
 }
@@ -286,7 +286,7 @@ fn format_tags(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>
 /// Find a tag ID by name, or mint a new one if it doesn't exist.
 fn resolve_tag(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     name: &str,
     change: &mut TribleSet,
 ) -> Id {
@@ -312,7 +312,7 @@ fn resolve_tag(
 /// Resolve a list of tag names to IDs, minting unknown ones.
 fn resolve_tags(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     names: &[String],
     change: &mut TribleSet,
 ) -> Vec<Id> {
@@ -323,7 +323,7 @@ fn resolve_tags(
 }
 
 /// Find a tag ID by name (returns None if not found).
-fn find_tag_by_name(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, name: &str) -> Option<Id> {
+fn find_tag_by_name(space: &TribleSet, ws: &mut Workspace<Pile>, name: &str) -> Option<Id> {
     for (id, handle) in find!(
         (id: Id, h: TextHandle),
         pattern!(space, [{ ?id @ metadata::name: ?h }])
@@ -391,7 +391,7 @@ fn version_history_of(space: &TribleSet, fragment_id: Id) -> Vec<Id> {
 /// Read title string for a version entity.
 fn read_title(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     vid: Id,
 ) -> Option<String> {
     let (h,) = find!(
@@ -488,8 +488,8 @@ fn resolve_prefix(space: &TribleSet, input: &str) -> Result<Id> {
     // Also check if the prefix matches a fragment ID (stored as a value, not entity).
     // Fragment IDs are in the value position of wiki::fragment, so we need a separate scan.
     // Use the value range constraint for this.
-    let frag_min_val: Value<valueschemas::GenId> = min.to_value();
-    let frag_max_val: Value<valueschemas::GenId> = max.to_value();
+    let frag_min_val: Inline<inlineencodings::GenId> = min.to_inline();
+    let frag_max_val: Inline<inlineencodings::GenId> = max.to_inline();
     for (frag,) in find!(
         (frag: Id),
         and!(
@@ -520,8 +520,8 @@ fn resolve_fragment_prefix(space: &TribleSet, input: &str) -> Result<Id> {
             .ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}'"));
     }
     let (min, max) = prefix_to_range(&trimmed)?;
-    let frag_min_val: Value<valueschemas::GenId> = min.to_value();
-    let frag_max_val: Value<valueschemas::GenId> = max.to_value();
+    let frag_min_val: Inline<inlineencodings::GenId> = min.to_inline();
+    let frag_max_val: Inline<inlineencodings::GenId> = max.to_inline();
     let mut matches: Vec<Id> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (frag,) in find!(
@@ -567,7 +567,7 @@ fn to_fragment(space: &TribleSet, id: Id) -> Result<Id> {
 /// Human-readable label for a link target (version or fragment).
 fn link_label(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: Id,
 ) -> String {
     if is_version(space, id) {
@@ -585,11 +585,11 @@ fn link_label(
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
-use triblespace::core::value::schemas::time::Lower;
+use triblespace::core::inline::encodings::time::Lower;
 
-fn now_tai() -> Value<valueschemas::NsTAIInterval> {
+fn now_tai() -> Inline<inlineencodings::NsTAIInterval> {
     let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
-    (now, now).try_to_value().expect("TAI interval")
+    (now, now).try_to_inline().expect("TAI interval")
 }
 
 /// Build a map of fragment → (latest_version_id, timestamp) in one pass.
@@ -671,7 +671,7 @@ fn extract_references(
                 edges += entity! { eid @ wiki::links_to: &target };
                 if !type_prefix.is_empty() {
                     let type_name = &type_prefix[..type_prefix.len() - 1];
-                    let attr = triblespace::core::attribute::Attribute::<valueschemas::GenId>::from_name(type_name);
+                    let attr = triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from_name(type_name);
                     let eid = ExclusiveId::force_ref(&source_vid);
                     edges += entity! { eid @ attr: &target };
                 }
@@ -687,11 +687,11 @@ fn extract_references(
                 edges += entity! { eid @ wiki::references_file: &target };
             }
             ("files", 64) => {
-                let Ok(hash) = valueschemas::Hash::<valueschemas::Blake3>::from_hex(&hex) else {
+                let Ok(hash) = inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(&hex) else {
                     continue;
                 };
-                let handle: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>> =
-                    valueschemas::Handle::from_hash(hash);
+                let handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>> =
+                    inlineencodings::Handle::from_hash(hash);
                 let eid = ExclusiveId::force_ref(&source_vid);
                 edges += entity! { eid @ wiki::references_file_content: handle };
             }
@@ -709,12 +709,12 @@ fn is_fragment(space: &TribleSet, id: Id) -> bool {
     ).next().is_some()
 }
 
-type Repo = Repository<Pile<valueschemas::Blake3>>;
+type Repo = Repository<Pile>;
 
 /// Ensure all built-in tag/kind IDs have metadata::name entries.
 fn ensure_tag_vocabulary(
     repo: &mut Repo,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
 ) -> Result<()> {
     let space = ws
         .checkout(..)
@@ -1173,7 +1173,7 @@ fn validate_wiki_links(content: &str, space: &TribleSet) -> Result<()> {
 
 fn commit_version(
     repo: &mut Repo,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     mut change: TribleSet,
     fragment_id: Id,
     title: &str,
@@ -1234,7 +1234,7 @@ fn commit_version(
 /// Returns (outgoing targets, incoming sources, external references).
 fn find_links(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: Id,
 ) -> Result<(Vec<Id>, Vec<Id>, Vec<(String, String)>)> {
     // Determine the version to read outgoing links from.
@@ -1308,14 +1308,14 @@ fn find_links(
         external.push(("files".to_string(), format!("{:x}", target)));
     }
     for (handle,) in find!(
-        (h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>>),
+        (h: Inline<inlineencodings::Handle<blobencodings::RawBytes>>),
         pattern!(space, [{ vid @ wiki::references_file_content: ?h }])
     ) {
-        let hash: Value<valueschemas::Hash<valueschemas::Blake3>> =
-            valueschemas::Handle::to_hash(handle);
+        let hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
+            inlineencodings::Handle::to_hash(handle);
         external.push((
             "files".to_string(),
-            valueschemas::Hash::<valueschemas::Blake3>::to_hex(&hash),
+            inlineencodings::Hash::<inlineencodings::Blake3>::to_hex(&hash),
         ));
     }
     external.sort();
@@ -2213,13 +2213,13 @@ fn cmd_list(
         .filter_map(|name| find_tag_by_name(&space, &mut ws, &name.trim().to_lowercase()))
         .collect();
     // Derive attribute IDs for typed backlink filters.
-    let with_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<valueschemas::GenId>)> =
+    let with_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<inlineencodings::GenId>)> =
         with_backlink_type.iter()
-            .map(|name| (name.clone(), triblespace::core::attribute::Attribute::<valueschemas::GenId>::from_name(name)))
+            .map(|name| (name.clone(), triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from_name(name)))
             .collect();
-    let without_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<valueschemas::GenId>)> =
+    let without_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<inlineencodings::GenId>)> =
         without_backlink_type.iter()
-            .map(|name| (name.clone(), triblespace::core::attribute::Attribute::<valueschemas::GenId>::from_name(name)))
+            .map(|name| (name.clone(), triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from_name(name)))
             .collect();
     let has_backlink_filter = !with_bl_ids.is_empty() || !without_bl_ids.is_empty()
         || !with_bl_type_attrs.is_empty() || !without_bl_type_attrs.is_empty();
@@ -2288,7 +2288,7 @@ fn cmd_list(
             // derived-attribute edge of the given type pointing to *any* version
             // of this fragment (or to the fragment id itself)? Same single-pattern
             // trick — target constrained to the sorted target slice.
-            let check_type_target = |attr: &triblespace::core::attribute::Attribute<valueschemas::GenId>| -> bool {
+            let check_type_target = |attr: &triblespace::core::attribute::Attribute<inlineencodings::GenId>| -> bool {
                 find!(
                     src: Id,
                     temp!((target),
@@ -2722,7 +2722,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let pile = Pile::<valueschemas::Blake3>::open(&cli.pile)
+    let pile = Pile::open(&cli.pile)
         .map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
     let signing_key = SigningKey::generate(&mut OsRng);
     let mut repo = Repository::new(pile, signing_key, TribleSet::new())

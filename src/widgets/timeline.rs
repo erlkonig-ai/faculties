@@ -50,10 +50,10 @@ use triblespace::core::repo::{
     ancestors, CommitHandle, CommitSelector, CommitSet, Workspace,
 };
 use triblespace::core::trible::TribleSet;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::Value;
+use triblespace::core::inline::encodings::hash::{Blake3, Handle};
+use triblespace::core::inline::Inline;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobschemas::{LongString, SimpleArchive};
+use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
 use triblespace::prelude::View;
 
 use crate::schemas::compass::{
@@ -63,9 +63,9 @@ use crate::schemas::local_messages::{local as local_attrs, KIND_MESSAGE_ID};
 use crate::schemas::wiki::{attrs as wiki_attrs, KIND_VERSION_ID};
 
 /// Handle to a long-string blob (branch names, titles, bodies, notes).
-type TextHandle = Value<Handle<Blake3, LongString>>;
+type TextHandle = Inline<Handle<LongString>>;
 /// A commit blob handle (SimpleArchive of its metadata tribles).
-type CommitHandleValue = Value<Handle<Blake3, SimpleArchive>>;
+type CommitHandleValue = Inline<Handle<SimpleArchive>>;
 
 // ── Rendering constants ──────────────────────────────────────────────
 
@@ -112,9 +112,8 @@ fn now_key() -> i128 {
 }
 
 /// First 8 hex chars of an Id — compact label for pills / hover.
-fn id_prefix(id: Id) -> String {
-    let s = format!("{id:x}");
-    if s.len() > 8 { s[..8].to_string() } else { s }
+fn id_hex(id: Id) -> String {
+    format!("{id:x}")
 }
 
 /// Truncate `s` to fit in `max_px` at `char_px` per char, appending
@@ -268,7 +267,7 @@ impl MultiLive {
     /// Rebuild events from the provided workspaces.
     fn refresh(
         sources: &[TimelineSource],
-        workspaces: &mut [(&str, &mut Workspace<Pile<Blake3>>)],
+        workspaces: &mut [(&str, &mut Workspace<Pile>)],
     ) -> Self {
         let mut out: Vec<Event> = Vec::new();
         let mut heads: Vec<Option<CommitHandle>> = Vec::with_capacity(sources.len());
@@ -305,7 +304,7 @@ impl MultiLive {
 /// design and carry no author-time bits.
 fn collect_commit_events(
     idx: usize,
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     out: &mut Vec<Event>,
 ) {
     let Some(head) = ws.head() else {
@@ -330,7 +329,7 @@ fn collect_commit_events(
                 kind: SourceKind::Commits,
                 entity_id: cid,
                 ts_ns: ts.0,
-                summary: id_prefix(cid),
+                summary: id_hex(cid),
                 status: None,
                 from_to: None,
             });
@@ -338,7 +337,7 @@ fn collect_commit_events(
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile<Blake3>>, h: TextHandle) -> String {
+fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> String {
     ws.get::<View<str>, LongString>(h)
         .map(|v| {
             let s: &str = v.as_ref();
@@ -351,7 +350,7 @@ fn read_text(ws: &mut Workspace<Pile<Blake3>>, h: TextHandle) -> String {
 /// created" and "note" events so quiet boards still show up.
 fn collect_compass_events(
     idx: usize,
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     out: &mut Vec<Event>,
 ) {
     let space = match ws.checkout(..) {
@@ -405,7 +404,7 @@ fn collect_compass_events(
         let title = title_by_goal
             .get(&gid)
             .cloned()
-            .unwrap_or_else(|| id_prefix(gid));
+            .unwrap_or_else(|| id_hex(gid));
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::Compass,
@@ -434,7 +433,7 @@ fn collect_compass_events(
         let title = title_by_goal
             .get(&gid)
             .cloned()
-            .unwrap_or_else(|| id_prefix(gid));
+            .unwrap_or_else(|| id_hex(gid));
         let summary = if body.is_empty() {
             preview(&title, 80)
         } else {
@@ -455,7 +454,7 @@ fn collect_compass_events(
 /// Emit a LocalMessages event per message.
 fn collect_local_events(
     idx: usize,
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     out: &mut Vec<Event>,
 ) {
     let space = match ws.checkout(..) {
@@ -488,7 +487,7 @@ fn collect_local_events(
             ts_ns: ts.0,
             summary: preview(&body, 80),
             status: None,
-            from_to: Some(format!("{} → {}", id_prefix(from), id_prefix(to))),
+            from_to: Some(format!("{} → {}", id_hex(from), id_hex(to))),
         });
     }
 }
@@ -496,7 +495,7 @@ fn collect_local_events(
 /// Emit a Wiki event per fragment-version.
 fn collect_wiki_events(
     idx: usize,
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     out: &mut Vec<Event>,
 ) {
     let space = match ws.checkout(..) {
@@ -605,7 +604,7 @@ impl BranchTimeline {
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        workspaces: &mut [(&str, &mut Workspace<Pile<Blake3>>)],
+        workspaces: &mut [(&str, &mut Workspace<Pile>)],
     ) {
         let now = now_key();
         if self.first_render {

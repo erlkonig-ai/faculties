@@ -51,8 +51,8 @@ fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
-    (epoch, epoch).try_to_value().unwrap()
+fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
+    (epoch, epoch).try_to_inline().unwrap()
 }
 
 fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
@@ -83,8 +83,8 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         let _ = pile.close();
@@ -98,7 +98,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
@@ -113,7 +113,7 @@ fn with_repo<T>(
 }
 
 fn resolve_branch_id(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     explicit_hex: Option<&str>,
     branch_name: &str,
 ) -> Result<Id> {

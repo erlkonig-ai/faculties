@@ -5,8 +5,8 @@
 //! that wants to read memory chunks from a pile.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
 pub const DEFAULT_MEMORY_BRANCH: &str = "memory";
@@ -23,7 +23,7 @@ pub mod archive_schema {
     use super::*;
     attributes! {
         "838CC157FFDD37C6AC7CC5A472E43ADB" as author: GenId;
-        "E63EE961ABDB1D1BEC0789FDAFFB9501" as author_name: Handle<Blake3, LongString>;
+        "E63EE961ABDB1D1BEC0789FDAFFB9501" as author_name: Handle<LongString>;
     }
 }
 
@@ -31,14 +31,14 @@ pub mod archive_import_schema {
     use super::*;
     attributes! {
         "E997DCAAF43BAA04790FCB0FA0FBFE3A" as source_format: ShortString;
-        "87B587A3906056038FD767F4225274F9" as source_conversation_id: Handle<Blake3, LongString>;
+        "87B587A3906056038FD767F4225274F9" as source_conversation_id: Handle<LongString>;
     }
 }
 
 pub mod ctx {
     use super::*;
     attributes! {
-        "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: Handle<Blake3, LongString>;
+        "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: Handle<LongString>;
         "502F7D33822A90366F0F0ADA0556177F" as start_at: NsTAIInterval;
         "DF84E872EB68FBFCA63D760F27FD8A6F" as end_at: NsTAIInterval;
         "9B83D68AECD6888AA9CE95E754494768" as child: GenId;

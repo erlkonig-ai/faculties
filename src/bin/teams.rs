@@ -23,8 +23,8 @@ use triblespace::core::blob::Bytes;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
 /// Author entity used by the teams faculty when writing its own log entries.
@@ -40,7 +40,7 @@ const TEAMS_BACKFILL_AUTHOR_ID: Id = id_hex!("64A9492F3B2368A0DAB5FAF3277132C2")
 #[allow(dead_code)]
 const TEAMS_UNKNOWN_AUTHOR_ID: Id = id_hex!("04217F0E5F75F57B8A7CBFD824D5FF31");
 
-use faculties::schemas::archive::{FileBytes, archive};
+use faculties::schemas::archive::{RawBytes, archive};
 use faculties::schemas::teams::{
     DEFAULT_BRANCH, DEFAULT_DELTA_URL, DEFAULT_LOG_BRANCH, FILES_BRANCH_NAME, file_schema, teams,
 };
@@ -424,7 +424,7 @@ fn main() -> Result<()> {
 
 fn with_repo<T>(
     pile_path: &PathBuf,
-    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let pile = open_pile(pile_path)?;
     let repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
@@ -488,9 +488,9 @@ fn default_scopes() -> String {
     .join(" ")
 }
 
-fn with_repo_close<T, F>(repo: Repository<Pile<Blake3>>, f: F) -> Result<T>
+fn with_repo_close<T, F>(repo: Repository<Pile>, f: F) -> Result<T>
 where
-    F: FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+    F: FnOnce(&mut Repository<Pile>) -> Result<T>,
 {
     let mut repo = repo;
     let result = f(&mut repo);
@@ -750,28 +750,28 @@ struct TokenState {
     token_id: Id,
     created_at_key: i128,
     expires_at_key: i128,
-    access_token: Value<Handle<Blake3, LongString>>,
-    refresh_token: Option<Value<Handle<Blake3, LongString>>>,
-    scope: Option<Value<Handle<Blake3, LongString>>>,
-    tenant: Option<Value<Handle<Blake3, LongString>>>,
-    client_id: Option<Value<Handle<Blake3, LongString>>>,
+    access_token: Inline<Handle<LongString>>,
+    refresh_token: Option<Inline<Handle<LongString>>>,
+    scope: Option<Inline<Handle<LongString>>>,
+    tenant: Option<Inline<Handle<LongString>>>,
+    client_id: Option<Inline<Handle<LongString>>>,
 }
 
 #[derive(Debug, Clone)]
 struct ConfigState {
     config_id: Id,
     created_at_key: i128,
-    tenant: Option<Value<Handle<Blake3, LongString>>>,
-    client_id: Option<Value<Handle<Blake3, LongString>>>,
-    client_secret: Option<Value<Handle<Blake3, LongString>>>,
-    user_id: Option<Value<Handle<Blake3, LongString>>>,
+    tenant: Option<Inline<Handle<LongString>>>,
+    client_id: Option<Inline<Handle<LongString>>>,
+    client_secret: Option<Inline<Handle<LongString>>>,
+    user_id: Option<Inline<Handle<LongString>>>,
 }
 
 #[derive(Debug, Clone)]
 struct TokenData {
     access_token: String,
     refresh_token: Option<String>,
-    expires_at: Value<NsTAIInterval>,
+    expires_at: Inline<NsTAIInterval>,
     token_type: Option<String>,
     scope: Option<String>,
     tenant: String,
@@ -879,9 +879,9 @@ fn latest_token_state(catalog: &TribleSet) -> Option<TokenState> {
     for (token_id, access_token, expires_at, created_at) in find!(
         (
             token: Id,
-            access: Value<Handle<Blake3, LongString>>,
-            expires_at: Value<NsTAIInterval>,
-            created_at: Value<NsTAIInterval>
+            access: Inline<Handle<LongString>>,
+            expires_at: Inline<NsTAIInterval>,
+            created_at: Inline<NsTAIInterval>
         ),
         pattern!(catalog, [{
             ?token @
@@ -919,7 +919,7 @@ fn latest_token_state(catalog: &TribleSet) -> Option<TokenState> {
 fn latest_config_state(catalog: &TribleSet) -> Option<ConfigState> {
     let mut best: Option<ConfigState> = None;
     for (config_id, created_at) in find!(
-        (config: Id, created_at: Value<NsTAIInterval>),
+        (config: Id, created_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?config @
             metadata::tag: teams::kind_config,
@@ -951,10 +951,10 @@ fn latest_config_state(catalog: &TribleSet) -> Option<ConfigState> {
 fn find_optional_handle(
     catalog: &TribleSet,
     entity: Id,
-    attribute: Attribute<Handle<Blake3, LongString>>,
-) -> Option<Value<Handle<Blake3, LongString>>> {
+    attribute: Attribute<Handle<LongString>>,
+) -> Option<Inline<Handle<LongString>>> {
     find!(
-        (handle: Value<Handle<Blake3, LongString>>),
+        (handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{ entity @ attribute: ?handle }])
     )
     .into_iter()
@@ -962,13 +962,13 @@ fn find_optional_handle(
     .map(|(handle,)| handle)
 }
 
-fn find_optional_value<S: ValueSchema>(
+fn find_optional_value<S: InlineEncoding>(
     catalog: &TribleSet,
     entity: Id,
     attribute: Attribute<S>,
-) -> Option<Value<S>> {
+) -> Option<Inline<S>> {
     find!(
-        (value: Value<S>),
+        (value: Inline<S>),
         pattern!(catalog, [{ entity @ attribute: ?value }])
     )
     .into_iter()
@@ -977,12 +977,12 @@ fn find_optional_value<S: ValueSchema>(
 }
 
 fn load_chat_map(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
 ) -> Result<HashMap<Id, String>> {
     let mut map = HashMap::new();
     for (chat_id, handle) in find!(
-        (chat: Id, chat_id: Value<Handle<Blake3, LongString>>),
+        (chat: Id, chat_id: Inline<Handle<LongString>>),
         pattern!(catalog, [{
             ?chat @ teams::chat_id: ?chat_id,
         }])
@@ -994,12 +994,12 @@ fn load_chat_map(
 }
 
 fn load_message_external_map(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
 ) -> Result<HashMap<Id, String>> {
     let mut map = HashMap::new();
     for (message_id, handle) in find!(
-        (message: Id, message_id: Value<Handle<Blake3, LongString>>),
+        (message: Id, message_id: Inline<Handle<LongString>>),
         pattern!(catalog, [{
             ?message @ teams::message_id: ?message_id,
         }])
@@ -1011,12 +1011,12 @@ fn load_message_external_map(
 }
 
 fn load_author_map(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
 ) -> Result<HashMap<Id, String>> {
     let mut map = HashMap::new();
     for (author_id, handle) in find!(
-        (author: Id, name: Value<Handle<Blake3, LongString>>),
+        (author: Id, name: Inline<Handle<LongString>>),
         pattern!(catalog, [{
             ?author @ archive::author_name: ?name,
         }])
@@ -1028,7 +1028,7 @@ fn load_author_map(
 }
 
 fn store_token_in_repo(
-    repo: &mut Repository<Pile<Blake3>>,
+    repo: &mut Repository<Pile>,
     branch_id: Id,
     token: &TokenData,
 ) -> Result<()> {
@@ -1056,7 +1056,7 @@ fn store_config_in_pile(config: &TeamsBridgeConfig, data: &TeamsConfigData) -> R
 }
 
 fn build_token_change(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     token: &TokenData,
 ) -> Result<TribleSet> {
@@ -1096,7 +1096,7 @@ fn build_token_change(
 }
 
 fn store_config_in_repo(
-    repo: &mut Repository<Pile<Blake3>>,
+    repo: &mut Repository<Pile>,
     branch_id: Id,
     data: &TeamsConfigData,
 ) -> Result<()> {
@@ -1112,7 +1112,7 @@ fn store_config_in_repo(
 }
 
 fn build_config_change(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     data: &TeamsConfigData,
 ) -> Result<TribleSet> {
@@ -1143,8 +1143,8 @@ fn build_config_change(
 }
 
 fn load_longstring(
-    ws: &mut Workspace<Pile<Blake3>>,
-    handle: Value<Handle<Blake3, LongString>>,
+    ws: &mut Workspace<Pile>,
+    handle: Inline<Handle<LongString>>,
 ) -> Result<String> {
     let view: View<str> = map_err_debug(ws.get(handle), "load longstring")?;
     Ok(view.to_string())
@@ -1744,9 +1744,9 @@ struct ReadMessage {
     message_id: Id,
     chat_id: Id,
     author_id: Id,
-    created_at: Value<NsTAIInterval>,
+    created_at: Inline<NsTAIInterval>,
     created_at_key: i128,
-    content: Value<Handle<Blake3, LongString>>,
+    content: Inline<Handle<LongString>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1780,9 +1780,9 @@ struct AttachmentExportCandidate {
     message_id: Id,
     chat_id: Id,
     source_id: String,
-    data_handle: Value<Handle<Blake3, FileBytes>>,
-    name: Option<Value<Handle<Blake3, LongString>>>,
-    mime: Option<Value<ShortString>>,
+    data_handle: Inline<Handle<RawBytes>>,
+    name: Option<Inline<Handle<LongString>>>,
+    mime: Option<Inline<ShortString>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1790,13 +1790,13 @@ struct AttachmentRow {
     attachment_id: Id,
     message_id: Id,
     chat_id: Id,
-    created_at: Value<NsTAIInterval>,
+    created_at: Inline<NsTAIInterval>,
     created_at_key: i128,
-    source_id: Option<Value<Handle<Blake3, LongString>>>,
-    source_pointer: Option<Value<Handle<Blake3, LongString>>>,
-    name: Option<Value<Handle<Blake3, LongString>>>,
-    mime: Option<Value<ShortString>>,
-    size: Option<Value<U256BE>>,
+    source_id: Option<Inline<Handle<LongString>>>,
+    source_pointer: Option<Inline<Handle<LongString>>>,
+    name: Option<Inline<Handle<LongString>>>,
+    mime: Option<Inline<ShortString>>,
+    size: Option<Inline<U256BE>>,
 }
 
 fn read_messages(config: TeamsBridgeConfig, options: ReadOptions) -> Result<()> {
@@ -1833,9 +1833,9 @@ fn read_messages(config: TeamsBridgeConfig, options: ReadOptions) -> Result<()> 
         for (message_id, content, author_id, created_at, chat_id) in find!(
             (
                 message: Id,
-                content: Value<Handle<Blake3, LongString>>,
+                content: Inline<Handle<LongString>>,
                 author: Id,
-                created_at: Value<NsTAIInterval>,
+                created_at: Inline<NsTAIInterval>,
                 chat: Id
             ),
             pattern!(&catalog, [{
@@ -1910,7 +1910,7 @@ struct IncomingMessage {
     author_external_id: Option<String>,
     author_display_name: Option<String>,
     content: String,
-    created_at: Value<NsTAIInterval>,
+    created_at: Inline<NsTAIInterval>,
     created_at_key: i128,
     attachments: Vec<AttachmentSource>,
 }
@@ -1924,7 +1924,7 @@ struct AttachmentSource {
     content_bytes: Option<Vec<u8>>,
 }
 
-fn open_pile(path: &PathBuf) -> Result<Pile<Blake3>> {
+fn open_pile(path: &PathBuf) -> Result<Pile> {
     let mut pile = Pile::open(path).with_context(|| format!("open pile {}", path.display()))?;
     if let Err(err) = pile.restore().context("restore pile") {
         // Avoid Drop warnings on early errors.
@@ -1987,7 +1987,7 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
             (
                 message: Id,
                 attachment: Id,
-                created_at: Value<NsTAIInterval>,
+                created_at: Inline<NsTAIInterval>,
                 chat: Id
             ),
             pattern!(&catalog, [{
@@ -2062,7 +2062,7 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                 .name
                 .map(|handle| load_longstring(&mut ws, handle))
                 .transpose()?;
-            let mime = row.mime.map(|value| String::try_from_value(&value).unwrap());
+            let mime = row.mime.map(|value| String::try_from_inline(&value).unwrap());
             let size = row.size.and_then(u256_to_u128).map(|value| value.to_string());
             let timestamp = format_interval(row.created_at);
 
@@ -2144,8 +2144,8 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
             (
                 message: Id,
                 chat: Id,
-                created_at: Value<NsTAIInterval>,
-                content: Value<Handle<Blake3, LongString>>
+                created_at: Inline<NsTAIInterval>,
+                content: Inline<Handle<LongString>>
             ),
             pattern!(&catalog, [{
                 ?message @
@@ -2162,7 +2162,7 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
 
         let mut raw_map = HashMap::new();
         for (message_id, raw) in find!(
-            (message: Id, raw: Value<Handle<Blake3, LongString>>),
+            (message: Id, raw: Inline<Handle<LongString>>),
             pattern!(&catalog, [{ ?message @ teams::message_raw: ?raw }])
         ) {
             raw_map.insert(message_id, raw);
@@ -2341,8 +2341,8 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
                 message: Id,
                 attachment: Id,
                 chat: Id,
-                source_id: Value<Handle<Blake3, LongString>>,
-                data: Value<Handle<Blake3, FileBytes>>
+                source_id: Inline<Handle<LongString>>,
+                data: Inline<Handle<RawBytes>>
             ),
             pattern!(&catalog, [
                 { ?message @ archive::attachment: ?attachment, teams::chat: ?chat },
@@ -2426,7 +2426,7 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
         }
 
         let bytes: Bytes =
-            map_err_debug(ws.get::<Bytes, FileBytes>(candidate.data_handle), "load attachment bytes")?;
+            map_err_debug(ws.get::<Bytes, RawBytes>(candidate.data_handle), "load attachment bytes")?;
         fs::write(&path, bytes.as_ref())
             .with_context(|| format!("write attachment {}", path.display()))?;
         println!("{}", path.display());
@@ -2438,7 +2438,7 @@ fn open_repo_for_branch_id(
     path: &PathBuf,
     branch_id: Id,
     branch_name: &str,
-) -> Result<(Repository<Pile<Blake3>>, Id)> {
+) -> Result<(Repository<Pile>, Id)> {
     let mut pile = open_pile(path)?;
     if pile
         .head(branch_id)
@@ -2461,12 +2461,12 @@ struct CursorState {
 }
 
 fn load_cursor_from_space(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
 ) -> Result<Option<CursorState>> {
-    let mut best: Option<(i128, Id, Value<Handle<Blake3, LongString>>)> = None;
+    let mut best: Option<(i128, Id, Inline<Handle<LongString>>)> = None;
     for (cursor_id, delta_link, created_at) in find!(
-        (cursor: Id, delta_link: Value<Handle<Blake3, LongString>>, created_at: Value<NsTAIInterval>),
+        (cursor: Id, delta_link: Inline<Handle<LongString>>, created_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?cursor @
             metadata::tag: teams::kind_cursor,
@@ -2500,7 +2500,7 @@ fn load_cursor_from_space(
 }
 
 fn build_cursor_change(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     current: Option<&CursorState>,
     new_cursor: Option<String>,
@@ -2781,7 +2781,7 @@ impl CatalogIndex {
         .collect::<HashSet<_>>();
 
         let author_name_set = find!(
-            (author: Id, name: Value<Handle<Blake3, LongString>>),
+            (author: Id, name: Inline<Handle<LongString>>),
             pattern!(catalog, [{ ?author @ archive::author_name: ?name }])
         )
         .into_iter()
@@ -2789,7 +2789,7 @@ impl CatalogIndex {
         .collect::<HashSet<_>>();
 
         let message_raw_set = find!(
-            (message: Id, raw: Value<Handle<Blake3, LongString>>),
+            (message: Id, raw: Inline<Handle<LongString>>),
             pattern!(catalog, [{ ?message @ teams::message_raw: ?raw }])
         )
         .into_iter()
@@ -2805,7 +2805,7 @@ impl CatalogIndex {
         .collect::<HashSet<_>>();
 
         let message_content_set = find!(
-            (message: Id, content: Value<Handle<Blake3, LongString>>),
+            (message: Id, content: Inline<Handle<LongString>>),
             pattern!(catalog, [{ ?message @ archive::content: ?content }])
         )
         .into_iter()
@@ -2813,7 +2813,7 @@ impl CatalogIndex {
         .collect::<HashSet<_>>();
 
         let message_created_at_set = find!(
-            (message: Id, created_at: Value<NsTAIInterval>),
+            (message: Id, created_at: Inline<NsTAIInterval>),
             pattern!(catalog, [{ ?message @ metadata::created_at: ?created_at }])
         )
         .into_iter()
@@ -2822,7 +2822,7 @@ impl CatalogIndex {
 
         let mut last_message_by_chat: HashMap<Id, (i128, Id)> = HashMap::new();
         for (message_id, chat_id, created_at) in find!(
-            (message: Id, chat: Id, created_at: Value<NsTAIInterval>),
+            (message: Id, chat: Id, created_at: Inline<NsTAIInterval>),
             pattern!(catalog, [{
                 ?message @
                 metadata::tag: archive::kind_message,
@@ -2862,7 +2862,7 @@ impl CatalogIndex {
 }
 
 fn build_ingest_change(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     index: &CatalogIndex,
     incoming: Vec<IncomingMessage>,
@@ -3001,7 +3001,7 @@ fn build_ingest_change(
 }
 
 fn ensure_author(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     change: &mut TribleSet,
     index: &CatalogIndex,
     author_external_id: &str,
@@ -3038,7 +3038,7 @@ fn ensure_author(
 }
 
 fn ensure_attachments(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     change: &mut TribleSet,
     files_change: &mut TribleSet,
     index: &CatalogIndex,
@@ -3104,15 +3104,15 @@ fn ensure_attachments(
         };
 
         // Store as a file entity on the files branch.
-        let content_handle: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>> =
-            ws.put::<blobschemas::FileBytes, _>(bytes);
+        let content_handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>> =
+            ws.put::<blobencodings::RawBytes, _>(bytes);
         let name_str = source
             .name
             .as_deref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .unwrap_or("attachment");
-        let name_handle: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>> =
+        let name_handle: Inline<inlineencodings::Handle<blobencodings::LongString>> =
             ws.put(name_str.to_owned());
         let mime = content_type.as_deref().unwrap_or("application/octet-stream");
 
@@ -3147,7 +3147,7 @@ fn fetch_attachment_bytes(token: &str, url: &str) -> Result<(Vec<u8>, Option<Str
     Ok((bytes.to_vec(), content_type))
 }
 
-fn shortstring_value(value: Option<&str>) -> Option<Value<ShortString>> {
+fn shortstring_value(value: Option<&str>) -> Option<Inline<ShortString>> {
     let value = value?.trim();
     if value.is_empty() {
         return None;
@@ -3160,7 +3160,7 @@ fn shortstring_value(value: Option<&str>) -> Option<Value<ShortString>> {
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed.to_value())
+        Some(trimmed.to_inline())
     }
 }
 
@@ -3202,8 +3202,8 @@ fn sanitize_filename(value: &str) -> String {
     out
 }
 
-fn infer_extension(mime: Option<&Value<ShortString>>) -> Option<&'static str> {
-    let mut mime = String::try_from_value(mime?).ok()?;
+fn infer_extension(mime: Option<&Inline<ShortString>>) -> Option<&'static str> {
+    let mut mime = String::try_from_inline(mime?).ok()?;
     mime.make_ascii_lowercase();
     let mime = mime.split(';').next().unwrap_or("").trim();
     match mime {
@@ -3239,17 +3239,17 @@ fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-    (epoch, epoch).try_to_value().unwrap()
+fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
+    (epoch, epoch).try_to_inline().unwrap()
 }
 
-fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
-fn format_interval(interval: Value<NsTAIInterval>) -> String {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn format_interval(interval: Inline<NsTAIInterval>) -> String {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_gregorian_str(TimeScale::UTC)
 }
 
@@ -3417,7 +3417,7 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
 
 
 
-fn u256_to_u128(value: Value<U256BE>) -> Option<u128> {
+fn u256_to_u128(value: Inline<U256BE>) -> Option<u128> {
     let raw = value.raw;
     if raw[..16].iter().any(|&b| b != 0) {
         return None;

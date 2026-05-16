@@ -51,7 +51,7 @@ pub mod decide {
         // a mail draft, a compass goal, a wiki fragment, an arbitrary
         // topic. Downstream faculties find their linked decision by
         // pattern-matching on this attribute pointing at their entity.
-        "CCB764C79C22F45F11141912C50695D0" as about: valueschemas::GenId;
+        "CCB764C79C22F45F11141912C50695D0" as about: inlineencodings::GenId;
 
         // Free-form resolution text — what was decided and why, in the
         // resolver's own words. Set at resolution time alongside
@@ -60,7 +60,7 @@ pub mod decide {
         // finished_at is set; faculties gating on resolution check
         // both.
         "384E8074DB17FFE12FAFFB4344A6D196" as outcome:
-            valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+            inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 
@@ -72,6 +72,6 @@ pub mod factor {
         // Required pointer to the parent decision entity. Factors
         // without a parent decision are orphans (and queries always
         // join on this attribute, so orphans are silently excluded).
-        "D4B3A79837BB2D9E7DA985FFA4C2FEB2" as about_decision: valueschemas::GenId;
+        "D4B3A79837BB2D9E7DA985FFA4C2FEB2" as about_decision: inlineencodings::GenId;
     }
 }

@@ -15,8 +15,8 @@ use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
 
 // ── type aliases ─────────────────────────────────────────────────────────
-type FileHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>>;
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
+type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 #[derive(Parser)]
@@ -126,13 +126,13 @@ enum Command {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-fn now_tai() -> Value<valueschemas::NsTAIInterval> {
+fn now_tai() -> Inline<inlineencodings::NsTAIInterval> {
     let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
-    (now, now).try_to_value().expect("valid TAI interval")
+    (now, now).try_to_inline().expect("valid TAI interval")
 }
 
-fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().expect("valid TAI interval");
+fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().expect("valid TAI interval");
     lower.to_tai_duration().total_nanoseconds()
 }
 
@@ -150,9 +150,9 @@ fn fmt_id(id: Id) -> String {
 }
 
 fn handle_hex(h: FileHandle) -> String {
-    let hash: Value<valueschemas::Hash<valueschemas::Blake3>> =
-        valueschemas::Handle::to_hash(h);
-    valueschemas::Hash::<valueschemas::Blake3>::to_hex(&hash)
+    let hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
+        inlineencodings::Handle::to_hash(h);
+    inlineencodings::Hash::<inlineencodings::Blake3>::to_hex(&hash)
 }
 
 fn infer_mime(path: &Path) -> &'static str {
@@ -203,7 +203,7 @@ fn human_size(bytes: u64) -> String {
 
 fn read_name(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     eid: Id,
 ) -> Option<String> {
     let (h,) = find!(
@@ -273,7 +273,7 @@ fn root_of(space: &TribleSet, id: Id) -> Option<Id> {
 
 fn imported_at_of(space: &TribleSet, eid: Id) -> Option<i128> {
     find!(
-        (ts: Value<valueschemas::NsTAIInterval>),
+        (ts: Inline<inlineencodings::NsTAIInterval>),
         pattern!(space, [{ eid @ file::imported_at: ?ts }])
     )
     .next()
@@ -282,7 +282,7 @@ fn imported_at_of(space: &TribleSet, eid: Id) -> Option<i128> {
 
 fn source_path_of(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     eid: Id,
 ) -> Option<String> {
     let (h,) = find!(
@@ -317,10 +317,10 @@ fn resolve_entity(space: &TribleSet, input: &str) -> Result<Id> {
         }
         64 => {
             // Content hash — find the file entity with this hash
-            let hash: Value<valueschemas::Hash<valueschemas::Blake3>> =
-                valueschemas::Hash::<valueschemas::Blake3>::from_hex(trimmed)
+            let hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
+                inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(trimmed)
                     .map_err(|_| anyhow::anyhow!("invalid 64-char hex hash '{trimmed}'"))?;
-            let handle: FileHandle = valueschemas::Handle::from_hash(hash);
+            let handle: FileHandle = inlineencodings::Handle::from_hash(hash);
             find!(
                 eid: Id,
                 pattern!(space, [{ ?eid @ file::content: &handle }])
@@ -337,8 +337,8 @@ fn resolve_entity(space: &TribleSet, input: &str) -> Result<Id> {
 
 // ── repo helpers ─────────────────────────────────────────────────────────
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         let _ = pile.close();
@@ -353,8 +353,8 @@ fn with_files<T>(
     pile: &Path,
     explicit_branch: Option<&str>,
     f: impl FnOnce(
-        &mut Repository<Pile<valueschemas::Blake3>>,
-        &mut Workspace<Pile<valueschemas::Blake3>>,
+        &mut Repository<Pile>,
+        &mut Workspace<Pile>,
     ) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
@@ -446,7 +446,7 @@ fn print_fs_tree(
 }
 
 fn build_tree(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     path: &Path,
     mime_override: Option<&str>,
     stats: &mut TreeStats,
@@ -458,7 +458,7 @@ fn build_tree(
         let bytes = fs::read(path)
             .with_context(|| format!("read {}", path.display()))?;
         stats.bytes += bytes.len() as u64;
-        let content_h: FileHandle = ws.put::<blobschemas::FileBytes, _>(bytes);
+        let content_h: FileHandle = ws.put::<blobencodings::RawBytes, _>(bytes);
         let name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("unnamed");
         let name_h: TextHandle = ws.put(name_str.to_string());
         let mime = mime_override.unwrap_or_else(|| infer_mime(path));
@@ -508,8 +508,8 @@ fn build_tree(
 // ── commands ─────────────────────────────────────────────────────────────
 
 fn cmd_add(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
     path: &Path,
     mime_override: Option<&str>,
     tags: &[String],
@@ -587,8 +587,8 @@ fn cmd_add(
 }
 
 fn cmd_fetch(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
     url: &str,
     mime_override: Option<&str>,
     name_override: Option<&str>,
@@ -656,7 +656,7 @@ fn cmd_fetch(
 }
 
 fn cmd_list(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     filter_tags: &[String],
     filter_mime: Option<&str>,
 ) -> Result<()> {
@@ -749,7 +749,7 @@ fn resolve_one_prefix(space: &TribleSet, needle: &str) -> Result<String, String>
 }
 
 fn cmd_resolve(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     input: &str,
 ) -> Result<()> {
     let space = ws
@@ -810,7 +810,7 @@ fn cmd_resolve(
 }
 
 fn cmd_show(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: &str,
 ) -> Result<()> {
     let space = ws
@@ -863,7 +863,7 @@ fn cmd_show(
 }
 
 fn cmd_get(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: &str,
     output: Option<&str>,
 ) -> Result<()> {
@@ -923,7 +923,7 @@ fn cmd_get(
 
 fn extract_tree(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: Id,
     dest: &Path,
     stats: &mut TreeStats,
@@ -952,8 +952,8 @@ fn extract_tree(
 }
 
 fn cmd_tag(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
     id: &str,
     tag_name: &str,
 ) -> Result<()> {
@@ -979,7 +979,7 @@ fn cmd_tag(
 }
 
 fn cmd_search(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     query: &str,
 ) -> Result<()> {
     let space = ws
@@ -1026,7 +1026,7 @@ fn cmd_search(
 }
 
 fn cmd_imports(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
 ) -> Result<()> {
     let space = ws
         .checkout(..)
@@ -1066,7 +1066,7 @@ fn cmd_imports(
 }
 
 fn cmd_tree(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: &str,
     max_depth: Option<usize>,
 ) -> Result<()> {
@@ -1088,7 +1088,7 @@ fn cmd_tree(
 
 fn print_tree(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: Id,
     prefix: &str,
     child_prefix: &str,
@@ -1142,7 +1142,7 @@ fn print_tree(
 }
 
 fn cmd_diff(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     left_id: &str,
     right_id: &str,
 ) -> Result<()> {
@@ -1196,7 +1196,7 @@ impl DiffStats {
 
 fn diff_tree(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     left: Id,
     right: Id,
     path: &str,
@@ -1278,7 +1278,7 @@ fn diff_tree(
 
 fn named_children(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: Id,
 ) -> BTreeMap<String, Id> {
     let mut map = BTreeMap::new();
@@ -1291,7 +1291,7 @@ fn named_children(
 
 fn file_size(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: Id,
 ) -> u64 {
     content_handle_of(space, id)
@@ -1302,7 +1302,7 @@ fn file_size(
 
 fn print_diff_added(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: Id,
     path: &str,
     stats: &mut DiffStats,
@@ -1324,7 +1324,7 @@ fn print_diff_added(
 
 fn print_diff_removed(
     space: &TribleSet,
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     id: Id,
     path: &str,
     stats: &mut DiffStats,

@@ -145,7 +145,7 @@ fn import_copilot_parsed_file(
     let raw_root = {
         let raw_tree_start = Instant::now();
         println!("copilot phase raw-tree: {}", path.display());
-        let mut importer = JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
+        let mut importer = JsonTreeImporter::<_, triblespace::prelude::inlineencodings::Blake3>::new(
             repo.storage_mut(),
             None,
         );

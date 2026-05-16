@@ -10,8 +10,8 @@ use rand_core::OsRng;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Handle};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, Handle};
 use triblespace::prelude::*;
 
 const DEFAULT_BRANCH: &str = "atlas";
@@ -169,15 +169,15 @@ fn cmd_show(pile: &Path, branch: &str, prefix: &str) -> Result<()> {
     })
 }
 
-fn collect_rows(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet) -> Result<Vec<MetaRow>> {
+fn collect_rows(ws: &mut Workspace<Pile>, space: &TribleSet) -> Result<Vec<MetaRow>> {
     let mut rows = Vec::new();
     for (id, handle) in find!(
-        (id: Id, handle: Value<Handle<Blake3, LongString>>),
+        (id: Id, handle: Inline<Handle<LongString>>),
         pattern!(space, [{ ?id @ metadata::name: ?handle }])
     ) {
         let name: View<str> = ws.get(handle).context("read name")?;
         let description = match find!(
-            (handle: Value<Handle<Blake3, LongString>>),
+            (handle: Inline<Handle<LongString>>),
             pattern!(space, [{ id @ metadata::description: ?handle }])
         )
         .into_iter()
@@ -190,7 +190,7 @@ fn collect_rows(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet) -> Result<V
             None => None,
         };
         let source_module_value = match find!(
-            (handle: Value<Handle<Blake3, LongString>>),
+            (handle: Inline<Handle<LongString>>),
             pattern!(space, [{ id @ metadata::source_module: ?handle }])
         )
         .into_iter()
@@ -258,9 +258,9 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn open_repo(pile_path: &Path) -> Result<Repository<Pile<Blake3>>> {
+fn open_repo(pile_path: &Path) -> Result<Repository<Pile>> {
     let mut pile =
-        Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
+        Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
     if let Err(err) = pile.restore() {
         let _ = pile.close();
         return Err(anyhow!("restore pile: {err:?}"));
@@ -273,7 +273,7 @@ fn open_repo(pile_path: &Path) -> Result<Repository<Pile<Blake3>>> {
 
 fn with_repo<T>(
     pile_path: &Path,
-    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile_path)?;
     let result = f(&mut repo);

@@ -33,17 +33,17 @@ pub mod board {
     use super::*;
 
     attributes! {
-        "EE18CEC15C18438A2FAB670E2E46E00C" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "EE18CEC15C18438A2FAB670E2E46E00C" as title: inlineencodings::Handle<blobencodings::LongString>;
         // TODO: migrate to metadata::tag (GenId) — tags should be entities with
         // their own ID + metadata::name, not inline strings. See wiki.rs TagIndex
         // for the correct pattern. This ShortString tag is a legacy design mistake.
-        "5FF4941DCC3F6C35E9B3FD57216F69ED" as tag: valueschemas::ShortString;
-        "9D2B6EBDA67E9BB6BE6215959D182041" as parent: valueschemas::GenId;
+        "5FF4941DCC3F6C35E9B3FD57216F69ED" as tag: inlineencodings::ShortString;
+        "9D2B6EBDA67E9BB6BE6215959D182041" as parent: inlineencodings::GenId;
 
-        "C1EAAA039DA7F486E4A54CC87D42E72C" as task: valueschemas::GenId;
-        "61C44E0F8A73443ED592A713151E99A4" as status: valueschemas::ShortString;
-        "47351DF00B3DDA96CB305157CD53D781" as note: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "B88842D9D00361A0F2728C478C79D75C" as higher: valueschemas::GenId;
-        "18F3446C9E9281A248D370A56395A3F0" as lower: valueschemas::GenId;
+        "C1EAAA039DA7F486E4A54CC87D42E72C" as task: inlineencodings::GenId;
+        "61C44E0F8A73443ED592A713151E99A4" as status: inlineencodings::ShortString;
+        "47351DF00B3DDA96CB305157CD53D781" as note: inlineencodings::Handle<blobencodings::LongString>;
+        "B88842D9D00361A0F2728C478C79D75C" as higher: inlineencodings::GenId;
+        "18F3446C9E9281A248D370A56395A3F0" as lower: inlineencodings::GenId;
     }
 }

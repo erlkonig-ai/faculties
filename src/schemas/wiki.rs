@@ -28,13 +28,13 @@ pub const TAG_SPECS: [(Id, &str); 9] = [
 pub mod attrs {
     use super::*;
     attributes! {
-        "EBFC56D50B748E38A14F5FC768F1B9C1" as fragment: valueschemas::GenId;
-        "6DBBE746B7DD7A4793CA098AB882F553" as content: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "78BABEF1792531A2E51A372D96FE5F3E" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "DEAFB7E307DF72389AD95A850F24BAA5" as links_to: valueschemas::GenId;
+        "EBFC56D50B748E38A14F5FC768F1B9C1" as fragment: inlineencodings::GenId;
+        "6DBBE746B7DD7A4793CA098AB882F553" as content: inlineencodings::Handle<blobencodings::LongString>;
+        "78BABEF1792531A2E51A372D96FE5F3E" as title: inlineencodings::Handle<blobencodings::LongString>;
+        "DEAFB7E307DF72389AD95A850F24BAA5" as links_to: inlineencodings::GenId;
         // Content-hash reference: `files:<64-char-blake3>` points to file bytes directly.
-        "C61CA2F2A70103FD79E97C2F88B854D8" as references_file_content: valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>;
+        "C61CA2F2A70103FD79E97C2F88B854D8" as references_file_content: inlineencodings::Handle<blobencodings::RawBytes>;
         // File-entity reference: `files:<32-char-id>` points to a file entity with metadata.
-        "C98FE0EF9151F196D8F7D816ABBBCC49" as references_file: valueschemas::GenId;
+        "C98FE0EF9151F196D8F7D816ABBBCC49" as references_file: inlineencodings::GenId;
     }
 }

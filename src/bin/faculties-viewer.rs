@@ -18,11 +18,12 @@
 use std::path::PathBuf;
 
 use faculties::widgets::{
-    BranchTimeline, CompassBoard, MessagesPanel, StorageState, TimelineSource, WikiViewer,
+    BranchTimeline, CompassBoard, DecidePanel, MailViewer, MessagesPanel, RelationsViewer,
+    StorageState, TimelineSource, WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
-use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::core::inline::encodings::hash::Blake3;
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -58,14 +59,14 @@ fn main(nb: &mut NotebookCtx) {
         move |ctx, tl| {
             let mut st = storage.read_mut(ctx);
             let branch_names: &[&str] = &["compass", "local-messages", "wiki"];
-            let mut pulled: Vec<(&str, Workspace<Pile<Blake3>>)> =
+            let mut pulled: Vec<(&str, Workspace<Pile>)> =
                 Vec::with_capacity(branch_names.len());
             for name in branch_names {
                 if let Some(ws) = st.workspace(name) {
                     pulled.push((*name, ws));
                 }
             }
-            let mut slots: Vec<(&str, &mut Workspace<Pile<Blake3>>)> =
+            let mut slots: Vec<(&str, &mut Workspace<Pile>)> =
                 pulled.iter_mut().map(|(n, ws)| (*n, ws)).collect();
             tl.render(ctx, slots.as_mut_slice());
         },
@@ -86,11 +87,33 @@ fn main(nb: &mut NotebookCtx) {
         st.push(&mut ws);
     });
 
+    nb.state("decide", DecidePanel::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("decide") else { return };
+        panel.render(ctx, &mut ws);
+        st.push(&mut ws);
+    });
+
+    nb.state("mail", MailViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("mail") else { return };
+        let mut relations = st.workspace("relations");
+        panel.render(ctx, &mut ws, relations.as_mut());
+        st.push(&mut ws);
+    });
+
     nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
         let Some(mut ws) = st.workspace("local-messages") else { return };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
+        st.push(&mut ws);
+    });
+
+    nb.state("relations", RelationsViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("relations") else { return };
+        panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 }

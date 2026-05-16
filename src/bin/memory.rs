@@ -14,8 +14,8 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -44,16 +44,16 @@ struct Cli {
 // ── on-demand chunk queries ───────────────────────────────────────────
 // Chunks are queried directly from the TribleSet — no pre-materialization.
 
-fn chunk_summary_handle(space: &TribleSet, id: Id) -> Option<Value<Handle<Blake3, LongString>>> {
-    find!(h: Value<Handle<Blake3, LongString>>, pattern!(space, [{ id @ ctx::summary: ?h }])).next()
+fn chunk_summary_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<LongString>>> {
+    find!(h: Inline<Handle<LongString>>, pattern!(space, [{ id @ ctx::summary: ?h }])).next()
 }
 
-fn chunk_start_at(space: &TribleSet, id: Id) -> Option<Value<NsTAIInterval>> {
-    find!(v: Value<NsTAIInterval>, pattern!(space, [{ id @ ctx::start_at: ?v }])).next()
+fn chunk_start_at(space: &TribleSet, id: Id) -> Option<Inline<NsTAIInterval>> {
+    find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ ctx::start_at: ?v }])).next()
 }
 
-fn chunk_end_at(space: &TribleSet, id: Id) -> Option<Value<NsTAIInterval>> {
-    find!(v: Value<NsTAIInterval>, pattern!(space, [{ id @ ctx::end_at: ?v }])).next()
+fn chunk_end_at(space: &TribleSet, id: Id) -> Option<Inline<NsTAIInterval>> {
+    find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ ctx::end_at: ?v }])).next()
 }
 
 fn chunk_children(space: &TribleSet, id: Id) -> Vec<Id> {
@@ -124,13 +124,13 @@ fn parse_time_range(s: &str) -> Result<(Epoch, Epoch)> {
     Ok((from, to))
 }
 
-fn epoch_from_interval(interval: Value<NsTAIInterval>) -> Epoch {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn epoch_from_interval(interval: Inline<NsTAIInterval>) -> Epoch {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower
 }
 
-fn epoch_end_from_interval(interval: Value<NsTAIInterval>) -> Epoch {
-    let (_, upper): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn epoch_end_from_interval(interval: Inline<NsTAIInterval>) -> Epoch {
+    let (_, upper): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     upper
 }
 
@@ -288,10 +288,10 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
 
         // Resolve memory: references against memory branch chunks.
         let mut child_ids: Vec<Id> = Vec::new();
-        let mut children_start: Option<Value<NsTAIInterval>> = None;
-        let mut children_end: Option<Value<NsTAIInterval>> = None;
-        let mut about_exec: Option<(Id, Value<NsTAIInterval>)> = None;
-        let mut about_archive: Option<(Id, Value<NsTAIInterval>)> = None;
+        let mut children_start: Option<Inline<NsTAIInterval>> = None;
+        let mut children_end: Option<Inline<NsTAIInterval>> = None;
+        let mut about_exec: Option<(Id, Inline<NsTAIInterval>)> = None;
+        let mut about_archive: Option<(Id, Inline<NsTAIInterval>)> = None;
 
         if !memory_refs.is_empty() {
             let ctx_catalog = {
@@ -359,8 +359,8 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         let (start_at, end_at) = if let (Some(s), Some(e)) = (children_start, children_end) {
             (s, e)
         } else if let Some((range_start, range_end)) = explicit_range {
-            let start_val: Value<NsTAIInterval> = (range_start, range_start).try_to_value().unwrap();
-            let end_val: Value<NsTAIInterval> = (range_end, range_end).try_to_value().unwrap();
+            let start_val: Inline<NsTAIInterval> = (range_start, range_start).try_to_inline().unwrap();
+            let end_val: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
             (start_val, end_val)
         } else if let Some((_, time)) = about_exec {
             (time, time)
@@ -369,7 +369,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         } else {
             let now = Epoch::now()
                 .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-            let t: Value<NsTAIInterval> = (now, now).try_to_value().unwrap();
+            let t: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
             (t, t)
         };
 
@@ -382,7 +382,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         let chunk_id = ufoid();
         let now = Epoch::now()
             .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-        let created_at: Value<NsTAIInterval> = (now, now).try_to_value().unwrap();
+        let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
 
         let mut change = TribleSet::new();
         change += entity! { &chunk_id @
@@ -490,8 +490,8 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
 }
 
 fn print_archive_meta(
-    repo: &mut Repository<Pile<Blake3>>,
-    ws: &mut Workspace<Pile<Blake3>>,
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
     archive_msg_id: Id,
 ) -> Result<()> {
     let archive_branch_id = match repo.ensure_branch(DEFAULT_ARCHIVE_BRANCH, None) {
@@ -518,7 +518,7 @@ fn print_archive_meta(
     ).next() {
         // Try to resolve author name.
         let author_name: Option<String> = find!(
-            (name: Value<Handle<Blake3, LongString>>),
+            (name: Inline<Handle<LongString>>),
             pattern!(&archive_catalog, [{
                 archive_msg_id @
                 archive_schema::author_name: ?name,
@@ -545,7 +545,7 @@ fn print_archive_meta(
 
     // Source conversation id.
     if let Some((conv_handle,)) = find!(
-        (conv: Value<Handle<Blake3, LongString>>),
+        (conv: Inline<Handle<LongString>>),
         pattern!(&archive_catalog, [{
             archive_msg_id @
             archive_import_schema::source_conversation_id: ?conv,
@@ -635,13 +635,13 @@ fn find_exec_by_time_range(
     catalog: &TribleSet,
     query_start: Epoch,
     query_end: Epoch,
-) -> Option<(Id, Value<NsTAIInterval>)> {
+) -> Option<(Id, Inline<NsTAIInterval>)> {
     let qs = query_start.to_tai_duration().total_nanoseconds();
     let qe = query_end.to_tai_duration().total_nanoseconds();
-    let mut best: Option<(Id, Value<NsTAIInterval>, i128)> = None;
+    let mut best: Option<(Id, Inline<NsTAIInterval>, i128)> = None;
 
     for (result_id, finished_at) in find!(
-        (result_id: Id, finished_at: Value<NsTAIInterval>),
+        (result_id: Id, finished_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?result_id @
             metadata::tag: &KIND_EXEC_RESULT,
@@ -666,13 +666,13 @@ fn find_archive_by_time_range(
     catalog: &TribleSet,
     query_start: Epoch,
     query_end: Epoch,
-) -> Option<(Id, Value<NsTAIInterval>)> {
+) -> Option<(Id, Inline<NsTAIInterval>)> {
     let qs = query_start.to_tai_duration().total_nanoseconds();
     let qe = query_end.to_tai_duration().total_nanoseconds();
-    let mut best: Option<(Id, Value<NsTAIInterval>, i128)> = None;
+    let mut best: Option<(Id, Inline<NsTAIInterval>, i128)> = None;
 
     for (msg_id, created_at) in find!(
-        (msg_id: Id, created_at: Value<NsTAIInterval>),
+        (msg_id: Id, created_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?msg_id @
             metadata::tag: &KIND_ARCHIVE_MESSAGE,
@@ -696,7 +696,7 @@ fn find_archive_by_time_range(
 // ---------------------------------------------------------------------------
 
 
-fn print_chunk(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet, chunk_id: Id) -> Result<()> {
+fn print_chunk(ws: &mut Workspace<Pile>, space: &TribleSet, chunk_id: Id) -> Result<()> {
     let handle = chunk_summary_handle(space, chunk_id)
         .ok_or_else(|| anyhow!("chunk {:x} has no summary", chunk_id))?;
     let summary: View<str> = ws.get(handle).context("read chunk summary")?;
@@ -737,7 +737,7 @@ fn resolve_chunk_id(space: &TribleSet, raw: &str) -> Result<Id> {
     bail!("no chunk id matches prefix '{prefix}'")
 }
 
-fn print_turn_facets(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet, raw: &str) -> Result<()> {
+fn print_turn_facets(ws: &mut Workspace<Pile>, space: &TribleSet, raw: &str) -> Result<()> {
     let prefix = normalize_prefix(raw)?;
     let mut turn_matches = Vec::new();
     for chunk_id in all_chunk_ids(space) {
@@ -824,14 +824,14 @@ fn parse_optional_hex_id(raw: Option<&str>) -> Result<Option<Id>> {
     Ok(Some(id))
 }
 
-fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
     let mut pile =
-        Pile::<Blake3>::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+        Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         let _ = pile.close();
         return Err(anyhow!("restore pile {}: {err:?}", path.display()));
@@ -842,7 +842,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);

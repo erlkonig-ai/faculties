@@ -42,9 +42,9 @@ use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
 
-type IntervalValue = Value<valueschemas::NsTAIInterval>;
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
-type FileHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>>;
+type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 
 const DEFAULT_FROM_NAME: &str = "Toby Trible";
 
@@ -227,15 +227,15 @@ fn chrono_to_epoch(dt: DateTime<Utc>) -> Epoch {
 }
 
 fn instant_interval(at: Epoch) -> IntervalValue {
-    (at, at).try_to_value().unwrap()
+    (at, at).try_to_inline().unwrap()
 }
 
 fn make_interval(start: Epoch, end: Epoch) -> IntervalValue {
-    (start, end).try_to_value().unwrap()
+    (start, end).try_to_inline().unwrap()
 }
 
 fn unpack_interval(iv: IntervalValue) -> (Epoch, Epoch) {
-    iv.try_from_value().unwrap()
+    iv.try_from_inline().unwrap()
 }
 
 /// Deterministic entity id derived from a Message-Id string.
@@ -289,8 +289,8 @@ fn parse_iso8601(input: &str) -> Result<DateTime<Utc>> {
 // chrono TimeZone re-export for the parse helper above.
 use chrono::TimeZone;
 
-fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    let mut pile = Pile::<valueschemas::Blake3>::open(path)
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
         .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         let _ = pile.close();
@@ -303,7 +303,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
 fn with_repo<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
@@ -319,14 +319,14 @@ fn with_repo<T>(
     result
 }
 
-fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, blobschemas::LongString>(h)
+fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
+    ws.get::<View<str>, blobencodings::LongString>(h)
         .ok()
         .map(|view| view.to_string())
 }
 
-fn read_bytes(ws: &mut Workspace<Pile<valueschemas::Blake3>>, h: FileHandle) -> Option<Vec<u8>> {
-    let blob: Blob<blobschemas::FileBytes> = ws.get(h).ok()?;
+fn read_bytes(ws: &mut Workspace<Pile>, h: FileHandle) -> Option<Vec<u8>> {
+    let blob: Blob<blobencodings::RawBytes> = ws.get(h).ok()?;
     Some(blob.bytes.to_vec())
 }
 
@@ -377,7 +377,7 @@ fn is_read(mail_space: &TribleSet, message_id: Id, reader_id: Id) -> bool {
 /// Mint a read-receipt entity if one doesn't already exist for
 /// `(message_id, reader_id)`. Idempotent.
 fn mark_read_if_unread(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     mail_branch_id: Id,
     message_id: Id,
     reader_id: Id,
@@ -475,7 +475,7 @@ fn find_relation_by_email(space: &TribleSet, email: &str) -> Option<Id> {
 /// minimal — promotion to "verified" happens by manually editing the
 /// relations entry (adding display_name, affinity, etc.).
 fn resolve_or_register(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     addr: &Address,
     change: &mut TribleSet,
@@ -515,7 +515,7 @@ fn resolve_or_register(
 
 // ── kind entities ─────────────────────────────────────────────────────────
 
-fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
+fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let existing: HashSet<Id> = find!(
         (kind: Id),
@@ -811,7 +811,7 @@ fn cmd_fetch(
 /// `mail::raw` / `mail::sent_at` attrs are skipped (those become
 /// known at send time).
 fn ingest_message(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     mail_branch_id: Id,
     files_branch_id: Id,
     relations_branch_id: Id,
@@ -822,7 +822,7 @@ fn ingest_message(
 }
 
 fn persist_message(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     mail_branch_id: Id,
     files_branch_id: Id,
     relations_branch_id: Id,
@@ -879,7 +879,7 @@ fn persist_message(
         for att in &parsed.attachments {
             let file_id = ufoid();
             let file_ref = file_id.id;
-            let blob: Blob<blobschemas::FileBytes> = att.bytes.clone().to_blob();
+            let blob: Blob<blobencodings::RawBytes> = att.bytes.clone().to_blob();
             let content_handle: FileHandle = ws.put(blob);
             let name_handle: TextHandle = ws.put(att.filename.clone());
             let source_handle: TextHandle = ws.put(provenance.clone());
@@ -949,7 +949,7 @@ fn persist_message(
         // both — they get added by `mark_sent` after SMTP.
         if !as_draft {
             let sent_at_iv = instant_interval(parsed.sent_at);
-            let raw_blob: Blob<blobschemas::FileBytes> = parsed.raw.clone().to_blob();
+            let raw_blob: Blob<blobencodings::RawBytes> = parsed.raw.clone().to_blob();
             let raw_handle: FileHandle = ws.put(raw_blob);
             change += entity! { ExclusiveId::force_ref(&entity_id) @
                 mail::sent_at: sent_at_iv,
@@ -977,7 +977,7 @@ fn persist_message(
 /// to an existing draft entity. The draft entity id stays the
 /// same; this is just additional facts about it.
 fn mark_sent(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     mail_branch_id: Id,
     draft_id: Id,
     raw_bytes: Vec<u8>,
@@ -986,7 +986,7 @@ fn mark_sent(
     let mut ws = repo
         .pull(mail_branch_id)
         .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-    let raw_blob: Blob<blobschemas::FileBytes> = raw_bytes.to_blob();
+    let raw_blob: Blob<blobencodings::RawBytes> = raw_bytes.to_blob();
     let raw_handle: FileHandle = ws.put(raw_blob);
     let sent_iv = instant_interval(sent_at);
     let change = entity! { ExclusiveId::force_ref(&draft_id) @
@@ -1003,7 +1003,7 @@ fn mark_sent(
 /// Mint a decision in the decide branch linked to the given draft
 /// via `decide::about`. Returns the decision's entity id.
 fn mint_linked_decision(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     decide_branch_id: Id,
     draft_id: Id,
     title: String,
@@ -1172,11 +1172,17 @@ fn cmd_reply(
                 pattern!(&space, [{ parent_id @ mail::from: ?r }])
             )
             .next();
+            // Relations entries live on the relations branch — pull
+            // that workspace separately rather than re-checking out
+            // the mail branch (where the entry doesn't exist).
             let from_email: Option<String> = match from_relation {
                 Some(rid) => {
-                    let rel_space = ws
+                    let mut rws = repo
+                        .pull(relations_branch_id)
+                        .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+                    let rel_space = rws
                         .checkout(..)
-                        .map_err(|e| anyhow::anyhow!("checkout for relations: {e:?}"))?;
+                        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
                     find!(
                         e: String,
                         pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])
@@ -1295,7 +1301,7 @@ fn find_linked_decision(decide_space: &TribleSet, draft_id: Id) -> Option<Id> {
 
 /// True iff the decision has both finished_at AND a non-empty outcome.
 fn decision_is_resolved(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     decision_id: Id,
 ) -> bool {
@@ -1691,7 +1697,7 @@ struct Row {
 }
 
 fn collect_messages(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile>,
     space: &TribleSet,
     relations_space: &TribleSet,
     window: Option<(Epoch, Epoch)>,
@@ -2229,7 +2235,7 @@ fn cmd_resolve(pile: &Path, mail_branch_id: Id, prefix: String) -> Result<()> {
 // ── main ──────────────────────────────────────────────────────────────────
 
 fn resolve_branch(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    repo: &mut Repository<Pile>,
     branch_name: &str,
 ) -> Result<Id> {
     repo.ensure_branch(branch_name, None)
