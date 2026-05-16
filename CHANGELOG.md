@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.14.5 — 2026-05-17
+
+- **Bump `triblespace` 0.41.0 → 0.41.1.** Picks up the
+  `EndpointTicket`-everywhere release in `triblespace-net` —
+  the `Peer` API now accepts `impl Into<EndpointAddr>` on
+  all peer-dialing methods, `trible pile net identity`
+  prints an EndpointTicket, `trible pile net sync` prints a
+  rich ticket at startup, and `trible pile net pull <REMOTE>`
+  / `pile net sync --peers <STR>` accept tickets in addition
+  to bare hex pubkeys.
+
+  Practical effect for sandboxed `faculties` users: the
+  precompiled `trible` CLI bundled in this release's
+  tarballs can now dial peers directly via an EndpointTicket
+  pasted into `--peers` (or as the `<REMOTE>` arg to pull),
+  skipping iroh discovery entirely. That's the unblock for
+  the Anthropic web sandbox where iroh-canary 503s the
+  discovery probes (shared egress IP rate limiting).
+
+  Source unchanged from 0.14.4.
+
 ## 0.14.4 — 2026-05-16
 
 - **Bump `triblespace` 0.40 → 0.41, `GORBIE` 0.14.2 → 0.14.3.**
