@@ -1,6 +1,6 @@
 [package]
 name = "faculties"
-version = "0.14.9"
+version = "0.14.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "An office suite for AI agents: kanban, wiki, files, messaging, and a GORBIE-backed viewer — all persisted in a TribleSpace pile."
@@ -74,6 +74,6 @@ typst = "0.14"              # wiki
 typst-syntax = "0.14"       # wiki
 
 # Widgets-only (optional): GORBIE viewer stack.
-GORBIE = { version = "0.14", default-features = false, features = ["typst", "markdown"], optional = true }
+GORBIE = { version = "0.15", default-features = false, features = ["typst", "markdown"], optional = true }
 egui = { version = "0.34", optional = true }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu", "std"], optional = true }
