@@ -1,6 +1,6 @@
 [package]
 name = "faculties"
-version = "0.14.7"
+version = "0.14.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "An office suite for AI agents: kanban, wiki, files, messaging, and a GORBIE-backed viewer — all persisted in a TribleSpace pile."

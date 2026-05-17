@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.14.8 — 2026-05-17
+
+- **Bump `triblespace` 0.41.3 → 0.41.4.** Two follow-on fixes
+  surfaced by the first end-to-end sandbox-to-laptop sync:
+  - **Trailing-dot leak through `ep.addr()`** — 0.14.7
+    stripped dots from the outbound RelayMap but iroh's own
+    `Endpoint::addr()` could still report the dotted form
+    in our tickets. Outbound tickets are now dot-free; the
+    `parse_peers` and `pile net pull <REMOTE>` paths also
+    normalise inbound tickets so peers running unpatched
+    builds get cleaned up at the receiving end.
+  - **Connection reuse in `fetch_reachable`** — previously
+    a BFS over a remote pile opened one ~600ms-auth
+    connection per blob and per CHILDREN call, blowing the
+    `pull_branch` 30s deadline on anything larger than ~30
+    blobs. Now uses a single authed connection across the
+    whole walk.
+
+  Faculties source unchanged.
+
 ## 0.14.7 — 2026-05-17
 
 - **Bump `triblespace` 0.41.2 → 0.41.3.** Picks up the
