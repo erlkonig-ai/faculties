@@ -1,6 +1,6 @@
 [package]
 name = "faculties"
-version = "0.14.14"
+version = "0.15.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "An office suite for AI agents: kanban, wiki, files, messaging, and a GORBIE-backed viewer — all persisted in a TribleSpace pile."
@@ -43,7 +43,7 @@ clap = { version = "4.5.4", features = ["derive", "env"] }
 ed25519-dalek = "2.1.1"
 hifitime = "4.2.3"
 rand_core = "0.6.4"
-triblespace = { version = "0.42" }
+triblespace = { version = "0.43" }
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).
 anybytes = "0.20"           # files
