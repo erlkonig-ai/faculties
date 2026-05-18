@@ -329,7 +329,7 @@ fn collect_commit_events(
                 kind: SourceKind::Commits,
                 entity_id: cid,
                 ts_ns: ts.0,
-                summary: id_hex(cid),
+                summary: "commit".to_string(),
                 status: None,
                 from_to: None,
             });
@@ -404,7 +404,7 @@ fn collect_compass_events(
         let title = title_by_goal
             .get(&gid)
             .cloned()
-            .unwrap_or_else(|| id_hex(gid));
+            .unwrap_or_else(|| "(untitled)".to_string());
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::Compass,
@@ -433,7 +433,7 @@ fn collect_compass_events(
         let title = title_by_goal
             .get(&gid)
             .cloned()
-            .unwrap_or_else(|| id_hex(gid));
+            .unwrap_or_else(|| "(untitled)".to_string());
         let summary = if body.is_empty() {
             preview(&title, 80)
         } else {
@@ -1059,16 +1059,10 @@ impl BranchTimeline {
                     );
                     text_x = pill.right() + 6.0;
                 }
-                if let Some(fromto) = &ev.from_to {
-                    painter.text(
-                        egui::pos2(text_x, y),
-                        egui::Align2::LEFT_CENTER,
-                        fromto,
-                        egui::FontId::monospace(9.0),
-                        muted,
-                    );
-                    text_x += (fromto.len() as f32 * 6.5).min(140.0);
-                }
+                // `from_to` is intentionally not painted on the chip
+                // strip — those are bare IDs and would dominate the
+                // visible row. The full sender/recipient line is
+                // surfaced in the hover tooltip instead.
 
                 // Summary text — char-truncated to fit the available
                 // chip width with a trailing "…". Cleaner than a hard
@@ -1165,6 +1159,19 @@ impl BranchTimeline {
                                 }
                                 tip.separator();
                                 tip.add(egui::Label::new(summary).wrap());
+                                // Full canonical id at the bottom — the
+                                // chip strip itself omits ids to keep the
+                                // top-level view readable, so the hover
+                                // surface is where they live.
+                                tip.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(id_hex(ev.entity_id))
+                                            .monospace()
+                                            .small()
+                                            .weak(),
+                                    )
+                                    .wrap(),
+                                );
                             });
                     }
                 }

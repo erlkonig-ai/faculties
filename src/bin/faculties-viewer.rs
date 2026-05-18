@@ -18,8 +18,8 @@
 use std::path::PathBuf;
 
 use faculties::widgets::{
-    BranchTimeline, CompassBoard, DecidePanel, MailViewer, MessagesPanel, RelationsViewer,
-    StorageState, TimelineSource, WikiViewer,
+    BranchTimeline, CompassBoard, DecidePanel, MailViewer, MessagesPanel, PlannerViewer,
+    RelationsViewer, StorageState, TimelineSource, WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
@@ -97,6 +97,14 @@ fn main(nb: &mut NotebookCtx) {
     nb.state("mail", MailViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
         let Some(mut ws) = st.workspace("mail") else { return };
+        let mut relations = st.workspace("relations");
+        panel.render(ctx, &mut ws, relations.as_mut());
+        st.push(&mut ws);
+    });
+
+    nb.state("planner", PlannerViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("planner") else { return };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);

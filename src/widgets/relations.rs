@@ -1,6 +1,6 @@
 //! Read-only GORBIE-embeddable viewer for the `relations` faculty.
 //!
-//! Each person renders as a half-width card with two flush sections: a
+//! Each person renders as a full-width card with two flush sections: a
 //! colored header carrying the canonical identity (alias/name on top,
 //! full id underneath, both in contrast text on the person's hashed
 //! colour) and a paper body carrying the human-readable info (full
@@ -331,8 +331,8 @@ impl RelationsViewer {
                     return;
                 }
 
-                // Two-per-row layout via `g.half`. People are sorted
-                // by alias / name lowercase so the grid reads as an
+                // One-per-row layout via `g.full`. People are sorted
+                // by alias / name lowercase so the list reads as an
                 // alphabetic directory.
                 for person in &live.people {
                     if search_active && !person_matches_search(person, &needle) {
@@ -345,7 +345,7 @@ impl RelationsViewer {
                     };
                     let is_focused =
                         match_info.as_ref().map_or(false, |i| i.is_focused);
-                    g.half(|ctx| {
+                    g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
                         render_person(ui, person, &needle, is_focused);
@@ -420,6 +420,10 @@ fn render_person(
         .corner_radius(egui::CornerRadius::ZERO)
         .inner_margin(egui::Margin::ZERO)
         .show(ui, |ui| {
+            // Frame::show sizes the frame to its content — without this
+            // the card would shrink to fit the widest text run instead
+            // of spanning the grid cell.
+            ui.set_min_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
 
             // ── Header: name + id on the person's color ──
@@ -499,7 +503,7 @@ fn render_person(
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                             for aff in &person.affinities {
-                                render_tag_chip(ui, aff, accent);
+                                render_tag_chip(ui, aff);
                             }
                         });
                     }
@@ -507,10 +511,15 @@ fn render_person(
         });
 }
 
-fn render_tag_chip(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {
-    let text = colorhash::text_color_on(accent);
+/// Each affinity tag gets its own colour hashed from the label, so
+/// e.g. `teammate` is the same hue on every person but distinct from
+/// `operator`, and the row of chips actually conveys information
+/// instead of echoing the header.
+fn render_tag_chip(ui: &mut egui::Ui, label: &str) {
+    let fill = colorhash::ral_categorical(label.as_bytes());
+    let text = colorhash::text_color_on(fill);
     egui::Frame::NONE
-        .fill(accent)
+        .fill(fill)
         .corner_radius(egui::CornerRadius::ZERO)
         .inner_margin(egui::Margin::symmetric(5, 1))
         .show(ui, |ui| {
