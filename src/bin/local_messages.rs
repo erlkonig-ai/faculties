@@ -186,31 +186,15 @@ fn load_relations(
 }
 
 fn resolve_normalized_person_matches(relations_space: &TribleSet, key: &str) -> Vec<Id> {
-    let mut matches = HashSet::new();
-
-    for (person_id,) in find!(
-        (person_id: Id),
-        pattern!(&relations_space, [{
-            ?person_id @
-            metadata::tag: &KIND_PERSON_ID,
-            relations_schema::label_norm: key,
-        }])
-    ) {
-        matches.insert(person_id);
-    }
-
-    for (person_id,) in find!(
-        (person_id: Id),
-        pattern!(&relations_space, [{
-            ?person_id @
-            metadata::tag: &KIND_PERSON_ID,
-            relations_schema::alias_norm: key,
-        }])
-    ) {
-        matches.insert(person_id);
-    }
-
-    matches.into_iter().collect()
+    find!(
+        person_id: Id,
+        pattern!(relations_space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
+    )
+    .filter(|&person_id| {
+        exists!(pattern!(relations_space, [{ person_id @ relations_schema::label_norm: key }]))
+            || exists!(pattern!(relations_space, [{ person_id @ relations_schema::alias_norm: key }]))
+    })
+    .collect()
 }
 
 fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {

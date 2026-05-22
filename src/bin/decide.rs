@@ -101,7 +101,7 @@ enum Command {
         decision: String,
     },
     /// Resolve a hex prefix to a full 32-char decision id.
-    Resolve_id {
+    ResolveId {
         prefix: String,
     },
 }
@@ -710,6 +710,6 @@ fn main() -> Result<()> {
         }
         Command::List { all, forced } => cmd_list(&cli.pile, branch_id, all, forced),
         Command::Show { decision } => cmd_show(&cli.pile, branch_id, decision),
-        Command::Resolve_id { prefix } => cmd_resolve_id(&cli.pile, branch_id, prefix),
+        Command::ResolveId { prefix } => cmd_resolve_id(&cli.pile, branch_id, prefix),
     }
 }

@@ -14,7 +14,6 @@ use triblespace::core::metadata;
 use triblespace::core::repo::Workspace;
 use triblespace::prelude::*;
 
-type Repo = Repository<Pile>;
 type Lower = i128;
 
 // ── CLI ─────────────────────────────────────────────────────────────────

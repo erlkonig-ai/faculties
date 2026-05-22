@@ -296,28 +296,15 @@ fn all_person_ids(space: &TribleSet) -> Vec<Id> {
 }
 
 fn find_people_by_lookup_key(space: &TribleSet, key: &str) -> HashSet<Id> {
-    let mut matches = HashSet::new();
-    for (person_id,) in find!(
-        (person_id: Id),
-        pattern!(&space, [{
-            ?person_id @
-            metadata::tag: &KIND_PERSON_ID,
-            relations::label_norm: key,
-        }])
-    ) {
-        matches.insert(person_id);
-    }
-    for (person_id,) in find!(
-        (person_id: Id),
-        pattern!(&space, [{
-            ?person_id @
-            metadata::tag: &KIND_PERSON_ID,
-            relations::alias_norm: key,
-        }])
-    ) {
-        matches.insert(person_id);
-    }
-    matches
+    find!(
+        person_id: Id,
+        pattern!(space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
+    )
+    .filter(|&person_id| {
+        exists!(pattern!(space, [{ person_id @ relations::label_norm: key }]))
+            || exists!(pattern!(space, [{ person_id @ relations::alias_norm: key }]))
+    })
+    .collect()
 }
 
 fn cmd_add(

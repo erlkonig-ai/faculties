@@ -230,10 +230,6 @@ fn instant_interval(at: Epoch) -> IntervalValue {
     (at, at).try_to_inline().unwrap()
 }
 
-fn make_interval(start: Epoch, end: Epoch) -> IntervalValue {
-    (start, end).try_to_inline().unwrap()
-}
-
 fn unpack_interval(iv: IntervalValue) -> (Epoch, Epoch) {
     iv.try_from_inline().unwrap()
 }
@@ -328,11 +324,6 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
     ws.get::<View<str>, blobencodings::LongString>(h)
         .ok()
         .map(|view| view.to_string())
-}
-
-fn read_bytes(ws: &mut Workspace<Pile>, h: FileHandle) -> Option<Vec<u8>> {
-    let blob: Blob<blobencodings::RawBytes> = ws.get(h).ok()?;
-    Some(blob.bytes.to_vec())
 }
 
 // ── read tracking ─────────────────────────────────────────────────────────
@@ -1119,13 +1110,6 @@ fn cmd_draft(
     Ok(())
 }
 
-fn format_address_for_lettre(addr: &Address) -> Result<String> {
-    Ok(match &addr.name {
-        Some(name) if !name.is_empty() => format!("{} <{}>", name, addr.email),
-        _ => addr.email.clone(),
-    })
-}
-
 fn send_via_smtp(config: &MailConfig, message: &Message) -> Result<()> {
     let creds = Credentials::new(config.user.clone(), config.pass.clone());
     let mailer = SmtpTransport::relay(&config.smtp_host)
@@ -1151,7 +1135,7 @@ fn cmd_reply(
     let body_text = load_value_or_file(&body, "reply body")?;
 
     // Pull parent's properties for thread headers.
-    let (parent_id, parent_msg_id, parent_subject, parent_from, parent_references) =
+    let (_parent_id, parent_msg_id, parent_subject, parent_from, parent_references) =
         with_repo(pile, |repo| {
             let mut ws = repo
                 .pull(mail_branch_id)

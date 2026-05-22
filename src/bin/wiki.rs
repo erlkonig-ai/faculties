@@ -705,12 +705,8 @@ fn extract_references(
     edges
 }
 
-/// Check whether an ID is a known fragment (has at least one version pointing to it).
 fn is_fragment(space: &TribleSet, id: Id) -> bool {
-    find!(
-        (vid: Id),
-        pattern!(space, [{ ?vid @ wiki::fragment: id }])
-    ).next().is_some()
+    exists!(pattern!(space, [{ _?vid @ wiki::fragment: id }]))
 }
 
 type Repo = Repository<Pile>;

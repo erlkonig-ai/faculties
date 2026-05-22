@@ -33,6 +33,7 @@ const TEAMS_LOG_AUTHOR_ID: Id = id_hex!("5E9B01A9D7C9BB6D765F8C96A83D2E60");
 /// Author entity used for attachment backfill rows (there is no real author
 /// for these; the attachments-only backfill is a faculty action, not a user
 /// message). Singleton.
+#[allow(dead_code)]
 const TEAMS_BACKFILL_AUTHOR_ID: Id = id_hex!("64A9492F3B2368A0DAB5FAF3277132C2");
 /// Fallback author id used when Teams delivers a message with no `from.user.id`.
 /// Mapping every anonymous message to the same id keeps the graph small and
@@ -3145,38 +3146,6 @@ fn fetch_attachment_bytes(token: &str, url: &str) -> Result<(Vec<u8>, Option<Str
         .map(|value| value.to_string());
     let bytes = resp.bytes().context("read attachment bytes")?;
     Ok((bytes.to_vec(), content_type))
-}
-
-fn shortstring_value(value: Option<&str>) -> Option<Inline<ShortString>> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let value = value.split(';').next().unwrap_or(value).trim();
-    if value.is_empty() {
-        return None;
-    }
-    let trimmed = truncate_utf8(value, 32);
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_inline())
-    }
-}
-
-fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut len = 0;
-    for ch in value.chars() {
-        let ch_len = ch.len_utf8();
-        if len + ch_len > max_bytes {
-            break;
-        }
-        len += ch_len;
-    }
-    &value[..len]
 }
 
 fn sanitize_filename(value: &str) -> String {

@@ -284,56 +284,29 @@ fn render_unread_mail(
         .map_err(|e| anyhow!("pull mail: {e:?}"))?;
     let mail_space = mws.checkout(..).map_err(|e| anyhow!("checkout mail: {e:?}"))?;
 
-    // Collect candidate messages: KIND_MAIL_MESSAGE entities NOT
-    // sent by us (so outbound mail doesn't show as "unread") AND
-    // with no read receipt for self_id.
-    let mut rows: Vec<(i128, Id, Option<Id>, String)> = Vec::new();
-    for id in find!(
-        e: Id,
-        pattern!(&mail_space, [{ ?e @ metadata::tag: KIND_MAIL_MESSAGE }])
-    ) {
-        // Skip our outbound (where mail::from == self_id).
-        let from: Option<Id> =
-            find!(r: Id, pattern!(&mail_space, [{ id @ mail::from: ?r }])).next();
-        if from == Some(self_id) {
-            continue;
-        }
-        // Skip spam-tagged.
-        let is_spam = find!(t: Id, pattern!(&mail_space, [{ id @ metadata::tag: ?t }]))
-            .any(|t| t == KIND_SPAM);
-        if is_spam {
-            continue;
-        }
-        // Skip if already read by us.
-        let read_exists = find!(
-            r: Id,
-            pattern!(&mail_space, [{
-                ?r @
-                    metadata::tag: KIND_READ_ID,
-                    local::about_message: id,
-                    local::reader: self_id,
-            }])
-        )
-        .next()
-        .is_some();
-        if read_exists {
-            continue;
-        }
-
-        let sent_at_iv: Option<IntervalValue> = find!(
-            t: IntervalValue,
-            pattern!(&mail_space, [{ id @ mail::sent_at: ?t }])
-        )
-        .next();
-        let Some(iv) = sent_at_iv else { continue };
-        let sent_at_key = interval_key(iv);
-
-        let subject_h: Option<TextHandle> =
-            find!(h: TextHandle, pattern!(&mail_space, [{ id @ mail::subject: ?h }])).next();
-        let subject = subject_h.and_then(|h| read_text(&mut mws, h).ok()).unwrap_or_default();
-
-        rows.push((sent_at_key, id, from, subject));
-    }
+    let mut rows: Vec<(i128, Id, Option<Id>, String)> = find!(
+        (id: Id, from: Id, sent_at: IntervalValue, subject_h: TextHandle),
+        pattern!(&mail_space, [{
+            ?id @
+            metadata::tag: KIND_MAIL_MESSAGE,
+            mail::from: ?from,
+            mail::sent_at: ?sent_at,
+            mail::subject: ?subject_h,
+        }])
+    )
+    .filter(|&(_, from, _, _)| from != self_id)
+    .filter(|&(id, _, _, _)| !exists!(pattern!(&mail_space, [{ id @ metadata::tag: &KIND_SPAM }])))
+    .filter(|&(id, _, _, _)| !exists!(pattern!(&mail_space, [{
+        _?r @
+        metadata::tag: KIND_READ_ID,
+        local::about_message: id,
+        local::reader: self_id,
+    }])))
+    .map(|(id, from, sent_at, subject_h)| {
+        let subject = read_text(&mut mws, subject_h).unwrap_or_default();
+        (interval_key(sent_at), id, Some(from), subject)
+    })
+    .collect();
     // Newest first.
     rows.sort_by(|a, b| b.0.cmp(&a.0));
 
