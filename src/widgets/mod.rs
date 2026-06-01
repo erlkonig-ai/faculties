@@ -4,6 +4,7 @@
 
 pub mod compass;
 pub mod decide;
+pub mod headspace;
 pub mod mail;
 pub mod messages;
 pub mod planner;
@@ -14,6 +15,7 @@ pub mod wiki;
 
 pub use compass::CompassBoard;
 pub use decide::DecidePanel;
+pub use headspace::HeadspaceViewer;
 pub use mail::MailViewer;
 pub use messages::MessagesPanel;
 pub use planner::PlannerViewer;

@@ -729,6 +729,30 @@ fn render_week_grid(
         );
     }
 
+    // "Now" line — a 1.5-px RAL 1003 horizontal across today's
+    // column at the current wall-clock hour. Skipped when today
+    // isn't in the visible week or when the current time is
+    // outside the rendered hour rail.
+    if today >= monday && today < monday + ChronoDuration::days(7) {
+        let now = Utc::now();
+        let now_hour_f = now.hour() as f32 + now.minute() as f32 / 60.0;
+        if now_hour_f >= HOUR_START as f32 && now_hour_f <= HOUR_END as f32 {
+            let day_index = (today - monday).num_days() as u32;
+            let col_left = day_grid_left + (day_index as f32) * day_col_width;
+            let y = hour_grid_top + (now_hour_f - HOUR_START as f32) * PX_PER_HOUR;
+            // Small left tick + horizontal line. The tick reads as
+            // a clock-hand anchor without dominating the column.
+            painter.circle_filled(egui::pos2(col_left + 3.0, y), 2.5, color_today());
+            painter.line_segment(
+                [
+                    egui::pos2(col_left + 3.0, y),
+                    egui::pos2(col_left + day_col_width - 1.0, y),
+                ],
+                egui::Stroke::new(1.5, color_today()),
+            );
+        }
+    }
+
     // Event blocks.
     let week_end = monday + ChronoDuration::days(7);
     for event in &live.events {
@@ -955,6 +979,11 @@ fn render_event_card(ui: &mut egui::Ui, event: &EventRow, live: &PlannerLive) {
                     bottom: 6,
                 })
                 .show(ui, |ui| {
+                    // Force header to span the card width so the
+                    // accent fill paints edge-to-edge. Without it the
+                    // Frame would size to its content and leave the
+                    // right side of the card uncoloured.
+                    ui.set_min_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 2.0;
 
                     ui.horizontal(|ui| {

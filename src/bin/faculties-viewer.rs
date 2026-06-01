@@ -18,8 +18,8 @@
 use std::path::PathBuf;
 
 use faculties::widgets::{
-    BranchTimeline, CompassBoard, DecidePanel, MailViewer, MessagesPanel, PlannerViewer,
-    RelationsViewer, StorageState, TimelineSource, WikiViewer,
+    BranchTimeline, CompassBoard, DecidePanel, HeadspaceViewer, MailViewer, MessagesPanel,
+    PlannerViewer, RelationsViewer, StorageState, TimelineSource, WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
@@ -50,6 +50,13 @@ fn main(nb: &mut NotebookCtx) {
 
     let storage = nb.state("storage", StorageState::new(path), |ctx, st| {
         st.top_bar(ctx);
+    });
+
+    nb.state("headspace", HeadspaceViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("config") else { return };
+        panel.render(ctx, &mut ws);
+        st.push(&mut ws);
     });
 
     nb.state(

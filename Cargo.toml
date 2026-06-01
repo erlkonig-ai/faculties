@@ -36,6 +36,14 @@ name = "planner-capture"
 path = "src/bin/planner-capture.rs"
 required-features = ["widgets"]
 
+# Same idea for the headspace widget — minimal capture target that
+# skips the wiki widget's GPU init so headless captures of the
+# agent-config card don't get truncated.
+[[bin]]
+name = "headspace-capture"
+path = "src/bin/headspace-capture.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
