@@ -2,6 +2,7 @@
 //!
 //! Only available behind the `widgets` feature flag.
 
+pub mod atlas;
 pub mod compass;
 pub mod decide;
 pub mod files;
@@ -17,6 +18,7 @@ pub mod timeline;
 pub mod triage;
 pub mod wiki;
 
+pub use atlas::AtlasViewer;
 pub use compass::CompassBoard;
 pub use decide::DecidePanel;
 pub use files::FilesViewer;

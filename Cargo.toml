@@ -74,6 +74,12 @@ name = "triage-capture"
 path = "src/bin/triage-capture.rs"
 required-features = ["widgets"]
 
+# Atlas schema-catalog browser.
+[[bin]]
+name = "atlas-capture"
+path = "src/bin/atlas-capture.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.

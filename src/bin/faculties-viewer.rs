@@ -18,9 +18,9 @@
 use std::path::PathBuf;
 
 use faculties::widgets::{
-    BranchTimeline, CompassBoard, DecidePanel, FilesViewer, GaugeViewer, HeadspaceViewer,
-    MailViewer, MemoryViewer, MessagesPanel, PlannerViewer, RelationsViewer, StorageState,
-    TimelineSource, TriageViewer, WikiViewer,
+    AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, FilesViewer, GaugeViewer,
+    HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer, RelationsViewer,
+    StorageState, TimelineSource, TriageViewer, WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
@@ -169,6 +169,13 @@ fn main(nb: &mut NotebookCtx) {
     nb.state("triage", TriageViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
         let Some(mut ws) = st.workspace("cognition") else { return };
+        panel.render(ctx, &mut ws);
+        st.push(&mut ws);
+    });
+
+    nb.state("atlas", AtlasViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("atlas") else { return };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
