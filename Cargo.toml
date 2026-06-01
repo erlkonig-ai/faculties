@@ -62,6 +62,12 @@ name = "messages-capture"
 path = "src/bin/messages-capture.rs"
 required-features = ["widgets"]
 
+# Files import-history viewer.
+[[bin]]
+name = "files-capture"
+path = "src/bin/files-capture.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.

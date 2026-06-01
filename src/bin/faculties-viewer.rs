@@ -18,9 +18,9 @@
 use std::path::PathBuf;
 
 use faculties::widgets::{
-    BranchTimeline, CompassBoard, DecidePanel, GaugeViewer, HeadspaceViewer, MailViewer,
-    MemoryViewer, MessagesPanel, PlannerViewer, RelationsViewer, StorageState, TimelineSource,
-    WikiViewer,
+    BranchTimeline, CompassBoard, DecidePanel, FilesViewer, GaugeViewer, HeadspaceViewer,
+    MailViewer, MemoryViewer, MessagesPanel, PlannerViewer, RelationsViewer, StorageState,
+    TimelineSource, WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
@@ -155,6 +155,13 @@ fn main(nb: &mut NotebookCtx) {
         // `cognition` for piles seeded before memory split out.
         let ws = st.workspace("memory").or_else(|| st.workspace("cognition"));
         let Some(mut ws) = ws else { return };
+        panel.render(ctx, &mut ws);
+        st.push(&mut ws);
+    });
+
+    nb.state("files", FilesViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("files") else { return };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
