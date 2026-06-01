@@ -4,6 +4,7 @@
 
 pub mod compass;
 pub mod decide;
+pub mod gauge;
 pub mod headspace;
 pub mod mail;
 pub mod memory;
@@ -16,6 +17,7 @@ pub mod wiki;
 
 pub use compass::CompassBoard;
 pub use decide::DecidePanel;
+pub use gauge::GaugeViewer;
 pub use headspace::HeadspaceViewer;
 pub use mail::MailViewer;
 pub use memory::MemoryViewer;

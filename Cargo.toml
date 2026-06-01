@@ -50,6 +50,12 @@ name = "memory-capture"
 path = "src/bin/memory-capture.rs"
 required-features = ["widgets"]
 
+# Gauge research-health dashboard.
+[[bin]]
+name = "gauge-capture"
+path = "src/bin/gauge-capture.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.

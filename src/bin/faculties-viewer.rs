@@ -18,8 +18,9 @@
 use std::path::PathBuf;
 
 use faculties::widgets::{
-    BranchTimeline, CompassBoard, DecidePanel, HeadspaceViewer, MailViewer, MemoryViewer,
-    MessagesPanel, PlannerViewer, RelationsViewer, StorageState, TimelineSource, WikiViewer,
+    BranchTimeline, CompassBoard, DecidePanel, GaugeViewer, HeadspaceViewer, MailViewer,
+    MemoryViewer, MessagesPanel, PlannerViewer, RelationsViewer, StorageState, TimelineSource,
+    WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
@@ -87,6 +88,13 @@ fn main(nb: &mut NotebookCtx) {
             tl.render(ctx, slots.as_mut_slice());
         },
     );
+
+    nb.state("gauge", GaugeViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("wiki") else { return };
+        panel.render(ctx, &mut ws);
+        st.push(&mut ws);
+    });
 
     nb.state("wiki", WikiViewer::default(), move |ctx, wiki| {
         let mut st = storage.read_mut(ctx);
