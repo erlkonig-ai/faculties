@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.19.0 — 2026-06-03
+
+- **Bump `triblespace` 0.44 → 0.45 and `GORBIE` 0.16 → 0.17.**
+  Picks up the PATCH `LocalLeaf` archive-leaf elimination in
+  triblespace 0.45 (~47% memory savings on `SimpleArchive` ingest,
+  archive ingest now at parity with or faster than the heap path
+  at every scale tested), the `team revoke` removal (eviction is
+  per-issuer non-renewal via `team retract`), and the GORBIE
+  web-export proc macro for static-bundle notebook builds.
+- **Widget batch.** New `atlas` (schema-catalog browser),
+  `triage` (agent-activity diagnostic dashboard), `files` widget
+  (import-history view), `gauge` (research-health dashboard),
+  `memory` widget (recent-chunks viewer), `headspace`,
+  `planner` (with now-line / full-width header polish),
+  `discord` and `teams` widgets, plus `reason` and `archive`
+  rendering in the timeline.
+- **New `messages-capture` bin** for ingesting message streams.
+
 ## 0.18.0 — 2026-06-01
 
 - **Loose-couple memory chunk provenance.** `memory create` no longer
