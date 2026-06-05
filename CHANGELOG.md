@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.20.0 — 2026-06-05
+
+- **Bump `triblespace` 0.45 → 0.46 and `GORBIE` 0.17 → 0.18.**
+  Picks up the new `PinSnapshot` type and `PinStore::pin_snapshot()`
+  trait method in triblespace-core (cheap O(refcount-bump)
+  snapshot of the pin → head map via the Pile's internal PATCH),
+  the snapshot-first publish ordering in triblespace-net (closes
+  a race where a peer dialing in after a gossip hit a stale
+  serving snapshot and got "out of scope" denials), and the
+  OP_DELIVER_CAP swarm-fetch + dialer-equals-issuer verify path.
+  No faculty-side code changes required.
+
 ## 0.19.0 — 2026-06-03
 
 - **Bump `triblespace` 0.44 → 0.45 and `GORBIE` 0.16 → 0.17.**
