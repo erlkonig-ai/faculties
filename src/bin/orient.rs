@@ -6,8 +6,8 @@ use chrono::{
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
 use faculties::schemas::orient::{
-    CONFIG_BRANCH_ID, CONFIG_KIND_ID, KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_ORIENT_CHECKPOINT_ID,
-    KIND_READ_ID, KIND_STATUS_ID, board, config_schema, local, orient_state,
+    KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_ORIENT_CHECKPOINT_ID,
+    KIND_READ_ID, KIND_STATUS_ID, board, local, orient_state,
 };
 use faculties::schemas::relations::relations as rel_attrs;
 use hifitime::Epoch;
@@ -102,17 +102,11 @@ struct MessageRow {
     created_at: i128,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ConfigIdentity {
-    persona_id: Option<Id>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WatchedHeads {
     local: Option<CommitHandle>,
     compass: Option<CommitHandle>,
     relations: Option<CommitHandle>,
-    config: Option<CommitHandle>,
 }
 
 fn now_epoch() -> Epoch {
@@ -372,52 +366,6 @@ fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, Interva
     .max_by(|a, b| interval_key(a.1).cmp(&interval_key(b.1)))
 }
 
-fn load_config_identity(
-    repo: &mut Repository<Pile>,
-) -> Result<ConfigIdentity> {
-    let Some(_config_head) = repo
-        .storage_mut()
-        .head(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("config branch head: {e:?}"))?
-    else {
-        return Ok(ConfigIdentity::default());
-    };
-    let mut ws = repo
-        .pull(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout config: {e:?}"))?;
-
-    let mut latest: Option<(Id, Inline<inlineencodings::NsTAIInterval>)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::tag: &CONFIG_KIND_ID,
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest {
-            Some((_, current)) if interval_key(current) >= key => {}
-            _ => latest = Some((config_id, updated_at)),
-        }
-    }
-
-    let Some((config_id, _)) = latest else {
-        return Ok(ConfigIdentity::default());
-    };
-
-    let persona_id = find!(
-        value: Id,
-        pattern!(&space, [{ config_id @ config_schema::persona_id: ?value }])
-    )
-    .next();
-
-    Ok(ConfigIdentity { persona_id })
-}
-
 /// Resolve a persona given as 32-char hex id or a relations label/alias
 /// (matched against the pre-normalized `label_norm` / `alias_norm` fields,
 /// same semantics as `local_messages`).
@@ -451,7 +399,6 @@ fn cmd_show(
     todo_limit: usize,
 ) -> Result<()> {
     with_repo(pile, |repo| {
-        let config_identity = load_config_identity(repo)?;
         let compass_branch_id = repo
             .ensure_branch("compass", None)
             .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
@@ -482,8 +429,9 @@ fn cmd_show(
 
         let now_key = interval_key(epoch_interval(now_epoch()));
 
-        // Per-process persona (flag / $PERSONA) wins over pile config:
-        // multiple agents share one pile but must not share one identity.
+        // Persona is strictly per-process (flag / $PERSONA): multiple
+        // agents share one pile but must not share one identity, so there
+        // is deliberately no pile-level fallback.
         let effective_persona = match persona {
             Some(input) => {
                 let mut relations_ws = repo
@@ -494,7 +442,7 @@ fn cmd_show(
                     .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
                 Some(resolve_persona(&relations_space, input)?)
             }
-            None => config_identity.persona_id,
+            None => None,
         };
 
         println!("Orient");
@@ -546,7 +494,7 @@ fn cmd_show(
             None => {
                 println!("Local messages:");
                 println!(
-                    "- Unavailable: no persona (pass --persona <label-or-hex>, set $PERSONA, or `playground config set persona-id <hex-id>`)"
+                    "- Unavailable: no persona (pass --persona <label-or-hex> or set $PERSONA)"
                 );
             }
         }
@@ -627,7 +575,6 @@ fn load_watched_heads(
         local: branch_head_by_id(repo, local_branch_id)?,
         compass: branch_head_by_id(repo, compass_branch_id)?,
         relations: branch_head_by_id(repo, relations_branch_id)?,
-        config: branch_head_by_id(repo, CONFIG_BRANCH_ID)?,
     })
 }
 
@@ -672,7 +619,6 @@ fn load_checkpoint_heads(
         local: load_optional_commit_head(&space, checkpoint_id, &orient_state::local_head),
         compass: load_optional_commit_head(&space, checkpoint_id, &orient_state::compass_head),
         relations: load_optional_commit_head(&space, checkpoint_id, &orient_state::relations_head),
-        config: load_optional_commit_head(&space, checkpoint_id, &orient_state::config_head),
     }))
 }
 
@@ -705,7 +651,6 @@ fn save_checkpoint_heads(
         orient_state::local_head?: heads.local,
         orient_state::compass_head?: heads.compass,
         orient_state::relations_head?: heads.relations,
-        orient_state::config_head?: heads.config,
     };
 
     ws.commit(change, "orient checkpoint");
