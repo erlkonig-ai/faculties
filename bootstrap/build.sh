@@ -22,6 +22,29 @@ cargo build --quiet --manifest-path="$REPO_ROOT/Cargo.toml" --release --bin wiki
 WIKI="$REPO_ROOT/target/release/wiki"
 COMPASS="$REPO_ROOT/target/release/compass"
 
+# Stable fragment ids — minted once with `trible genid`, never regenerated.
+# The .typ sources cross-link via wiki:<id> using these exact values, so
+# rebuilds keep the tour spine and any external references valid.
+ID_HOWFAC=25e8f009e33207755109f19f7a68dff5
+ID_STYLE=82129c70b693f7e2d781d78ac5efbb86
+ID_COMPASS=7cdd48c272ff344628fe74f4c07783e4
+ID_LEDGER=996e648886cccb61d1afd48296b0a0cb
+ID_TOOLSEL=f4aff48fff04f313552f5b32244f9873
+ID_START=44d63d174814371c7468a3e604ed2303
+ID_FILES=b08448855de9cce7610d68dac2555003
+ID_TEAMS=67477d2173928fd91ef20173eabfeae4
+ID_LMSG=65c6965cb3d11052e87804527734a697
+ID_ORIENT=ff27b500d93e1d545b7465438a0146e1
+ID_RELATIONS=e7e3f672a66b39e0b5b3c0eaf212b1da
+ID_WEB=abe651f605c823085d861f296d9f9907
+ID_RESEARCH=999d2565f2e3af57fa5cfe2ed507d450
+ID_COORD=45e1b9bef3ad9836536ab7bce367deb0
+ID_AUTH=d06247b9d9183721e47a2940806e5d7f
+ID_TRIBLE=4e19893b36bf37d471bb9ea968edac20
+ID_PILEF=5232ea531fedfcb17bf15e88c3d52a36
+ID_MERGE=5cc10e2b0263008b261cf8a1ef30bd8c
+ID_ARCH=6e5f38bdfd589cd0359bf668d1af9841
+
 # Start fresh — old fragments from previous builds would orphan
 # but never disappear (piles are append-only). Regenerating into
 # a clean file is simpler than de-duping.
@@ -35,48 +58,43 @@ echo "==> Building wiki fragments"
 # `bootstrap onboarding` plus a topic-specific tag.
 
 # 1. How faculties work
-"$WIKI" create "How Faculties Work" \
+"$WIKI" create "How Faculties Work" --force --id "${ID_HOWFAC}" \
   "@$BOOTSTRAP_DIR/01_how_faculties_work.typ" \
   --tag bootstrap --tag onboarding --tag faculties >/dev/null
 
 # 2. Wiki style guide
-"$WIKI" create "Wiki Fragment Style Guide" \
+"$WIKI" create "Wiki Fragment Style Guide" --force --id "${ID_STYLE}" \
   "@$BOOTSTRAP_DIR/02_wiki_style_guide.typ" \
   --tag bootstrap --tag onboarding --tag wiki >/dev/null
 
 # 3. Compass workflow
-"$WIKI" create "Compass Goals Workflow" \
+"$WIKI" create "Compass Goals Workflow" --force --id "${ID_COMPASS}" \
   "@$BOOTSTRAP_DIR/03_compass_workflow.typ" \
   --tag bootstrap --tag onboarding --tag compass >/dev/null
 
-# 4. When to use codex
-"$WIKI" create "When to Use Codex (and When Not To)" \
-  "@$BOOTSTRAP_DIR/04_when_to_use_codex.typ" \
-  --tag bootstrap --tag onboarding --tag codex --tag subagents >/dev/null
-
 # 5. Work as its own ledger
-"$WIKI" create "Work As Its Own Ledger" \
+"$WIKI" create "Work As Its Own Ledger" --force --id "${ID_LEDGER}" \
   "@$BOOTSTRAP_DIR/05_work_as_its_own_ledger.typ" \
   --tag bootstrap --tag onboarding --tag design --tag principle >/dev/null
 
 # 6. Tool selection
-"$WIKI" create "Tool Selection: Faculties First" \
+"$WIKI" create "Tool Selection: Faculties First" --force --id "${ID_TOOLSEL}" \
   "@$BOOTSTRAP_DIR/06_tool_selection.typ" \
   --tag bootstrap --tag onboarding --tag tools --tag reference >/dev/null
 
 # 7. Getting started — references siblings by title, not by
-# fragment id, so `wiki.rs list --tag bootstrap` is the
+# fragment id, so `wiki list --tag bootstrap` is the
 # navigation surface. Avoids hardcoded ids that would drift on
 # every rebuild (the wiki faculty mints fresh fragment ids per
 # build).
-"$WIKI" create "Getting Started: Your First Hour" \
+"$WIKI" create "Getting Started: Your First Hour" --force --id "${ID_START}" \
   "@$BOOTSTRAP_DIR/07_getting_started.typ" \
   --tag bootstrap --tag onboarding --tag start-here >/dev/null
 
-# 8. Files faculty — usage patterns for `files.rs add/fetch/list`,
+# 8. Files faculty — usage patterns for `files add/fetch/list`,
 # why content-addressing matters, citation conventions for wiki
 # fragments.
-"$WIKI" create "Files Faculty: Archiving and Citing Artefacts" \
+"$WIKI" create "Files Faculty: Archiving and Citing Artefacts" --force --id "${ID_FILES}" \
   "@$BOOTSTRAP_DIR/08_files_faculty.typ" \
   --tag bootstrap --tag onboarding --tag files >/dev/null
 
@@ -84,14 +102,14 @@ echo "==> Building wiki fragments"
 # `pile net status` diagnostic, when to revoke. The auth-arc
 # tool surface, which is its own user-facing chapter in the
 # triblespace-rs book.
-"$WIKI" create "Teams: Capability-Based Membership" \
+"$WIKI" create "Teams: Capability-Based Membership" --force --id "${ID_TEAMS}" \
   "@$BOOTSTRAP_DIR/09_teams_faculty.typ" \
   --tag bootstrap --tag onboarding --tag teams --tag auth >/dev/null
 
 # 10. Local messages — direct agent-to-agent DM with read
 # acknowledgements. Tool Selection table flags this as the
 # right choice for transient, addressee-specific notes.
-"$WIKI" create "Local Messages: Agent-to-Agent Direct Messaging" \
+"$WIKI" create "Local Messages: Agent-to-Agent Direct Messaging" --force --id "${ID_LMSG}" \
   "@$BOOTSTRAP_DIR/10_local_messages_faculty.typ" \
   --tag bootstrap --tag onboarding --tag local-messages --tag coordination >/dev/null
 
@@ -99,7 +117,7 @@ echo "==> Building wiki fragments"
 # todo. The "where was I?" command. Includes `orient.rs wait`
 # for blocking on relevant branch changes (idle-agent
 # coordination primitive).
-"$WIKI" create "Orient: The Situation-Snapshot Faculty" \
+"$WIKI" create "Orient: The Situation-Snapshot Faculty" --force --id "${ID_ORIENT}" \
   "@$BOOTSTRAP_DIR/11_orient_faculty.typ" \
   --tag bootstrap --tag onboarding --tag orient --tag coordination >/dev/null
 
@@ -108,15 +126,15 @@ echo "==> Building wiki fragments"
 # recipient/assignee references through. Conventions for
 # labels, aliases, when not to use it (network identities
 # belong to team CLI state, not relations).
-"$WIKI" create "Relations: People and Handle Mappings" \
+"$WIKI" create "Relations: People and Handle Mappings" --force --id "${ID_RELATIONS}" \
   "@$BOOTSTRAP_DIR/12_relations_faculty.typ" \
   --tag bootstrap --tag onboarding --tag relations --tag people >/dev/null
 
 # 13. Web — search/fetch via Tavily/Exa providers. Pairs with
-# files.rs (search → pick URL → files.rs fetch to archive raw
+# files (search → pick URL → files fetch to archive raw
 # bytes → wiki fragment citing the file hash). Recorded on
 # the pile's web branch as queryable events.
-"$WIKI" create "Web: Search and Fetch Through Provider APIs" \
+"$WIKI" create "Web: Search and Fetch Through Provider APIs" --force --id "${ID_WEB}" \
   "@$BOOTSTRAP_DIR/13_web_faculty.typ" \
   --tag bootstrap --tag onboarding --tag web --tag research >/dev/null
 
@@ -124,7 +142,7 @@ echo "==> Building wiki fragments"
 # → wiki for the most common agent task. The recipe layer
 # above per-faculty docs: shows how the composable faculty
 # model actually composes in practice.
-"$WIKI" create "Recipe: Research Workflow" \
+"$WIKI" create "Recipe: Research Workflow" --force --id "${ID_RESEARCH}" \
   "@$BOOTSTRAP_DIR/14_research_workflow.typ" \
   --tag bootstrap --tag onboarding --tag recipe --tag research >/dev/null
 
@@ -133,7 +151,7 @@ echo "==> Building wiki fragments"
 # patterns. The non-obvious bit is the handshake order:
 # status change is durable signal, message is the
 # notification, notes are the audit trail.
-"$WIKI" create "Recipe: Multi-Agent Coordination" \
+"$WIKI" create "Recipe: Multi-Agent Coordination" --force --id "${ID_COORD}" \
   "@$BOOTSTRAP_DIR/15_coordination_workflow.typ" \
   --tag bootstrap --tag onboarding --tag recipe --tag coordination >/dev/null
 
@@ -141,7 +159,7 @@ echo "==> Building wiki fragments"
 # net`, and the env-var configuration relays read. Order of
 # operations across founder + invitee machines so the
 # capability handoff doesn't silently drop on a missing export.
-"$WIKI" create "Recipe: Auth Setup for a Multi-Agent Team" \
+"$WIKI" create "Recipe: Auth Setup for a Multi-Agent Team" --force --id "${ID_AUTH}" \
   "@$BOOTSTRAP_DIR/16_auth_setup_workflow.typ" \
   --tag bootstrap --tag onboarding --tag recipe --tag auth >/dev/null
 
@@ -150,17 +168,24 @@ echo "==> Building wiki fragments"
 # not required for day-one productivity. Also double as
 # presentation material: one concept per fragment, one
 # diagram each (trible → pile → merge).
-"$WIKI" create "Substrate 1/3: What Is a Trible" \
+"$WIKI" create "Substrate 1/4: What Is a Trible" --force --id "${ID_TRIBLE}" \
   "@$BOOTSTRAP_DIR/17_substrate_tribles.typ" \
   --tag bootstrap --tag onboarding --tag substrate --tag concepts >/dev/null
 
-"$WIKI" create "Substrate 2/3: The Pile" \
+"$WIKI" create "Substrate 2/4: The Pile" --force --id "${ID_PILEF}" \
   "@$BOOTSTRAP_DIR/18_substrate_pile.typ" \
   --tag bootstrap --tag onboarding --tag substrate --tag concepts >/dev/null
 
-"$WIKI" create "Substrate 3/3: Monotonic Merge" \
+"$WIKI" create "Substrate 3/4: Monotonic Merge" --force --id "${ID_MERGE}" \
   "@$BOOTSTRAP_DIR/19_substrate_merge.typ" \
   --tag bootstrap --tag onboarding --tag substrate --tag concepts >/dev/null
+
+# 20. Substrate architecture — the vertical story: agents →
+# faculties → workspace → substrate. Why no faculty contains
+# sync code; typst layer diagram. Caps the substrate arc.
+"$WIKI" create "Substrate 4/4: The Architecture — Zero Sync Code" --force --id "${ID_ARCH}" \
+  "@$BOOTSTRAP_DIR/20_substrate_architecture.typ" \
+  --tag bootstrap --tag onboarding --tag substrate --tag concepts --tag architecture >/dev/null
 
 echo "    19 fragments created"
 
@@ -168,7 +193,7 @@ echo "==> Building compass goals"
 
 "$COMPASS" add "Read the start-here wiki fragment" \
   --tag bootstrap --tag onboarding \
-  --note "Run \`wiki.rs list --tag bootstrap\` to find the 'Getting Started: Your First Hour' fragment, then \`wiki.rs show <id>\` to read it. This is your orientation tour." >/dev/null
+  --note "Run \`wiki list --tag bootstrap\` to find the 'Getting Started: Your First Hour' fragment, then \`wiki show <id>\` to read it. This is your orientation tour." >/dev/null
 
 "$COMPASS" add "Mint your first id with \`trible genid\`" \
   --tag bootstrap --tag faculties \
@@ -176,19 +201,19 @@ echo "==> Building compass goals"
 
 "$COMPASS" add "Create your first wiki fragment" \
   --tag bootstrap --tag wiki \
-  --note "Pick something you've learned today. Write a 5-10 line typst body to /tmp/myfrag.typ, then \`wiki.rs create \"My first fragment\" @/tmp/myfrag.typ --tag personal\`. Verify with \`wiki.rs show <id>\`." >/dev/null
+  --note "Pick something you've learned today. Write a 5-10 line typst body to /tmp/myfrag.typ, then \`wiki create \"My first fragment\" @/tmp/myfrag.typ --tag personal\`. Verify with \`wiki show <id>\`." >/dev/null
 
-"$COMPASS" add "Archive a file with \`files.rs add\`" \
+"$COMPASS" add "Archive a file with \`files add\`" \
   --tag bootstrap --tag files \
-  --note "Pick any local file (not a binary in a git repo). Run \`files.rs add <path>\`. The output \`files:<hash>\` is a content-addressed reference you can cite from wiki fragments. Confirm the hash is stable: re-run on the same file, same hash." >/dev/null
+  --note "Pick any local file (not a binary in a git repo). Run \`files add <path>\`. The output \`files:<hash>\` is a content-addressed reference you can cite from wiki fragments. Confirm the hash is stable: re-run on the same file, same hash." >/dev/null
 
-"$COMPASS" add "Run \`wiki.rs lint\` and \`wiki.rs check\`" \
+"$COMPASS" add "Run \`wiki lint\` and \`wiki check\`" \
   --tag bootstrap --tag wiki --tag hygiene \
   --note "lint applies markdown→typst transforms and rebuilds the links_to index. check reports orphan fragments, broken links, truncated ids. Run both. Note any warnings — they're the wiki's self-diagnostic surface." >/dev/null
 
 "$COMPASS" add "Mark this goal done and write an outcome note" \
   --tag bootstrap --tag compass \
-  --note "When you finish working through the bootstrap goals, move this one to done with \`compass.rs move <id> done\` and add a final note recording what stuck and what you'd improve. The outcome note IS the audit trail." >/dev/null
+  --note "When you finish working through the bootstrap goals, move this one to done with \`compass move <id> done\` and add a final note recording what stuck and what you'd improve. The outcome note IS the audit trail." >/dev/null
 
 echo "    6 goals created"
 
@@ -215,6 +240,14 @@ if [ "$ACTUAL_GOALS" -ne "$EXPECTED_GOALS" ]; then
   exit 1
 fi
 echo "    OK: $ACTUAL_FRAGMENTS fragments, $ACTUAL_GOALS goals"
+
+CHECK_OUT=$("$WIKI" check 2>&1)
+if ! echo "$CHECK_OUT" | grep -q "0 issues"; then
+  echo "    FAIL: wiki check reported issues:" >&2
+  echo "$CHECK_OUT" >&2
+  exit 1
+fi
+echo "    OK: wiki check clean (no orphans, no dangling links)"
 
 echo
 echo "==> Done. bootstrap.pile is at $PILE_PATH"

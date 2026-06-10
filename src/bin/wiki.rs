@@ -79,9 +79,16 @@ enum Command {
         /// Tags (by name). Unknown tags are minted automatically.
         #[arg(long)]
         tag: Vec<String>,
-        /// Allow links to fragment IDs (instead of requiring version IDs)
+        /// Allow links to fragment IDs (instead of requiring version IDs),
+        /// including targets that don't exist yet (`wiki check` reports
+        /// any still dangling)
         #[arg(long)]
         force: bool,
+        /// Use a pre-minted fragment id (32-char hex from `trible genid`)
+        /// instead of generating one. Keeps ids stable across regeneration
+        /// of build-artifact piles like bootstrap.pile.
+        #[arg(long)]
+        id: Option<String>,
     },
     /// Create a new version of an existing fragment
     Edit {
@@ -1135,7 +1142,13 @@ fn validate_typst(content: &str) -> Result<()> {
 /// fragment or version. Rejects truncated links (hex != 32 chars) and links
 /// to IDs that don't exist in the current wiki space. This prevents
 /// hallucinated IDs and stale references from being committed.
-fn validate_wiki_links(content: &str, space: &TribleSet) -> Result<()> {
+///
+/// With `allow_dangling` (the `--force` path), links to well-formed but
+/// not-yet-existing targets are downgraded to warnings — needed when a
+/// build script writes a cyclic link graph (e.g. bootstrap.pile, where
+/// the hub and the tour spine forward-reference fragments created later).
+/// `wiki check` still reports anything left dangling afterwards.
+fn validate_wiki_links(content: &str, space: &TribleSet, allow_dangling: bool) -> Result<()> {
     use regex::Regex;
     let re = Regex::new(r"wiki:([0-9a-fA-F]+)").unwrap();
 
@@ -1160,7 +1173,11 @@ fn validate_wiki_links(content: &str, space: &TribleSet) -> Result<()> {
             continue;
         };
         if !known_frags.contains(&id) && !known_versions.contains(&id) {
-            errors.push(format!("broken link wiki:{hex} (target does not exist)"));
+            if allow_dangling {
+                eprintln!("warning: dangling link wiki:{hex} (target does not exist yet)");
+            } else {
+                errors.push(format!("broken link wiki:{hex} (target does not exist)"));
+            }
         }
     }
 
@@ -1642,7 +1659,7 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
                 error_count += 1;
                 continue;
             }
-            if let Err(e) = validate_wiki_links(&fixed, &space) {
+            if let Err(e) = validate_wiki_links(&fixed, &space, false) {
                 eprintln!("LINT_LINK_ERROR {:x} — {title}: {e}", frag_id);
                 error_count += 1;
                 continue;
@@ -1854,6 +1871,7 @@ fn cmd_create(
     content: String,
     tags: Vec<String>,
     force: bool,
+    id: Option<String>,
 ) -> Result<()> {
     let title = load_value_or_file(&title, "title")?;
     let content = load_value_or_file(&content, "content")?;
@@ -1867,9 +1885,23 @@ fn cmd_create(
     // Lint-fix then validate typst compilation and link targets.
     let content = lint_fix(&content, &space);
     validate_typst(&content)?;
-    validate_wiki_links(&content, &space)?;
+    validate_wiki_links(&content, &space, force)?;
 
-    let fragment_id = genid().id;
+    let fragment_id = match id {
+        Some(hex) => {
+            if hex.len() != 32 {
+                bail!("--id must be 32 hex chars (got {})", hex.len());
+            }
+            let Some(id) = Id::from_hex(&hex) else {
+                bail!("--id is not valid hex: {hex}");
+            };
+            if latest_version_of(&space, id).is_some() {
+                bail!("fragment {id} already exists — use `wiki edit`");
+            }
+            id
+        }
+        None => genid().id,
+    };
     let content_handle = ws.put(content);
     let vid = commit_version(
         repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki create", force,
@@ -1919,7 +1951,7 @@ fn cmd_edit(
             // Lint-fix then validate typst compilation and link targets.
             let fixed = lint_fix(text, &space);
             validate_typst(&fixed)?;
-            validate_wiki_links(&fixed, &space)?;
+            validate_wiki_links(&fixed, &space, force)?;
             ws.put(fixed)
         }
         None => content_handle_of(&space, prev_vid)
@@ -2757,8 +2789,8 @@ fn main() -> Result<()> {
     };
 
     let result = match command {
-        Command::Create { title, content, tag, force } => {
-            cmd_create(&mut repo, branch_id, title, content, tag, force)
+        Command::Create { title, content, tag, force, id } => {
+            cmd_create(&mut repo, branch_id, title, content, tag, force, id)
         }
         Command::Edit {
             id,

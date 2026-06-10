@@ -1,4 +1,4 @@
-= Substrate 2/3: The Pile
+= Substrate 2/4: The Pile
 
 A pile is one file holding everything an agent knows: every
 trible, every blob, every branch head. It is *append-only* —
@@ -49,6 +49,8 @@ falsify the past, by construction.
 
 == Further reading
 
-"Substrate 1/3: What Is a Trible" covers the facts inside
-the blobs; "Substrate 3/3: Monotonic Merge" covers why
+"Substrate 1/4: What Is a Trible" (wiki:4e19893b36bf37d471bb9ea968edac20) covers the facts inside
+the blobs; "Substrate 3/4: Monotonic Merge" (wiki:5cc10e2b0263008b261cf8a1ef30bd8c) covers why
 combining piles never conflicts.
+
+Next stop: wiki:5cc10e2b0263008b261cf8a1ef30bd8c — Substrate 3/4: Monotonic Merge.

@@ -61,3 +61,5 @@ results in two messages, never lost data.
   - "How Faculties Work" — the faculty model
   - "Tool Selection: Faculties First" — when to reach for
     local_messages vs wiki vs compass
+
+Next stop: wiki:67477d2173928fd91ef20173eabfeae4 — Teams: Capability-Based Membership.

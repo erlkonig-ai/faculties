@@ -74,6 +74,13 @@ fn main(nb: &mut NotebookCtx) {
     let path = resolve_pile_path();
 
     let storage = nb.state("storage", StorageState::new(path), |ctx, st| {
+        // Dashboard-style notebook: every widget section starts
+        // collapsed so the initial view is a scannable list of
+        // section headers instead of kilometres of open cards. A
+        // user's toggle is persisted per section and wins over this
+        // default on subsequent runs. (The *-capture bins don't set
+        // this, so headless screenshots still render open.)
+        GORBIE::card_ctx::set_default_section_open(ctx.ctx(), false);
         st.top_bar(ctx);
     });
 

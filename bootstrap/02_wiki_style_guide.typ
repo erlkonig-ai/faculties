@@ -43,3 +43,5 @@ it everywhere.
   - Status of in-flight work — that goes in compass goals.
   - Binary artefacts — `files add` puts them content-addressed
     in the pile and gives you a `files:<hash>` reference.
+
+Next stop: wiki:b08448855de9cce7610d68dac2555003 — Files Faculty: Archiving and Citing Artefacts.

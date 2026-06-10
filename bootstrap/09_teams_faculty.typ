@@ -84,3 +84,5 @@ refresh — no restart.
   - Library: `triblespace_core::repo::capability` (with
     runnable doctests on every primary public fn)
   - Protocol: `triblespace_net::host::serve_stream`
+
+Next stop: wiki:e7e3f672a66b39e0b5b3c0eaf212b1da — Relations: People and Handle Mappings.

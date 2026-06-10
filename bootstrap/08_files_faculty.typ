@@ -71,3 +71,5 @@ Mezard 2009 (`files:<hash>`) section 4.
 GORBIE renders this as a clickable link that opens the
 archived PDF in a viewer. The `files:<hash>` form is also
 greppable from a terminal, which beats hex-only handles.
+
+Next stop: wiki:ff27b500d93e1d545b7465438a0146e1 — Orient: The Situation-Snapshot Faculty.

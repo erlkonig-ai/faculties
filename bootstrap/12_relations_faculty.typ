@@ -68,3 +68,5 @@ relations registry.
   - "Compass Goals Workflow" — goals can be assigned to a
     relations label (some compass workflows use this for
     multi-agent kanban)
+
+Next stop: wiki:abe651f605c823085d861f296d9f9907 — Web: Search and Fetch Through Provider APIs.

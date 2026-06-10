@@ -120,3 +120,5 @@ trible team revoke \
     synced; that one runs them through their first hand-off)
   - The `triblespace-rs/book/src/capability-auth.md` chapter
     has the complete protocol-level reference
+
+Next stop: wiki:44d63d174814371c7468a3e604ed2303 — Getting Started: Your First Hour (tour complete).

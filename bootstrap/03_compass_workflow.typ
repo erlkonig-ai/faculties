@@ -56,3 +56,5 @@ conversation is the executor.
     pick up later, including in a future session.
   - Pure scratch state ("what was I about to do") — that's the
     conversation itself.
+
+Next stop: wiki:82129c70b693f7e2d781d78ac5efbb86 — Wiki Fragment Style Guide.

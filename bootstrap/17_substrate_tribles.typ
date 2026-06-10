@@ -1,4 +1,4 @@
-= Substrate 1/3: What Is a Trible
+= Substrate 1/4: What Is a Trible
 
 Everything the faculties store — goals, fragments, messages,
 files — decomposes into *tribles*: fixed-width, content-
@@ -52,6 +52,7 @@ separate lifetimes. This is what makes append-only storage
 
 == Further reading
 
-Sibling fragments "Substrate 2/3: The Pile" and "Substrate
-3/3: Monotonic Merge" build on this. The full data-model
+Sibling fragments "Substrate 2/4: The Pile" (wiki:5232ea531fedfcb17bf15e88c3d52a36) and "Substrate 3/4: Monotonic Merge" (wiki:5cc10e2b0263008b261cf8a1ef30bd8c) build on this. The full data-model
 reference lives in the `triblespace-rs` book.
+
+Next stop: wiki:5232ea531fedfcb17bf15e88c3d52a36 — Substrate 2/4: The Pile.
