@@ -560,7 +560,25 @@ fn cmd_show(
         }
 
         drop(compass_ws);
-        save_checkpoint_heads(repo, orient_state_branch_id, &current_heads)?;
+        let persona_view = match effective_persona {
+            Some(persona_id) => Some((
+                persona_id,
+                load_watched_view(
+                    repo,
+                    persona_id,
+                    local_branch_id,
+                    compass_branch_id,
+                    relations_branch_id,
+                )?,
+            )),
+            None => None,
+        };
+        save_checkpoint_heads(
+            repo,
+            orient_state_branch_id,
+            &current_heads,
+            persona_view.as_ref().map(|(pid, view)| (*pid, view)),
+        )?;
         Ok(())
     })
 }
@@ -576,6 +594,74 @@ fn load_watched_heads(
         compass: branch_head_by_id(repo, compass_branch_id)?,
         relations: branch_head_by_id(repo, relations_branch_id)?,
     })
+}
+
+/// The persona-relevant view of the watched branches: what counts as
+/// NEWS for one zooid. Raw branch movement that doesn't change this
+/// view — the persona's own acks and sends, another persona's reads —
+/// is not news and must not wake the persona's watcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchedView {
+    unread: std::collections::BTreeSet<Id>,
+    goals_view: String,
+    relations: Option<CommitHandle>,
+}
+
+fn load_watched_view(
+    repo: &mut Repository<Pile>,
+    persona_id: Id,
+    local_branch_id: Id,
+    compass_branch_id: Id,
+    relations_branch_id: Id,
+) -> Result<WatchedView> {
+    let mut local_ws = repo
+        .pull(local_branch_id)
+        .map_err(|e| anyhow!("pull local workspace: {e:?}"))?;
+    let local_space = local_ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout local: {e:?}"))?;
+    let reads = load_reads(&local_space);
+    let unread: std::collections::BTreeSet<Id> = load_message_ids(&local_space)
+        .into_iter()
+        .filter(|msg| msg.to == persona_id && !reads.contains_key(&(msg.id, persona_id)))
+        .map(|msg| msg.id)
+        .collect();
+
+    let mut compass_ws = repo
+        .pull(compass_branch_id)
+        .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
+    let compass_space = compass_ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
+    let mut goal_lines: Vec<String> =
+        find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
+            .map(|id| {
+                let status = task_latest_status(&compass_space, id)
+                    .map(|(status, _)| status)
+                    .unwrap_or_default();
+                format!("{:x}:{status}", id)
+            })
+            .collect();
+    goal_lines.sort();
+    let goals_view = goal_lines.join("\n");
+
+    let relations = branch_head_by_id(repo, relations_branch_id)?;
+
+    Ok(WatchedView {
+        unread,
+        goals_view,
+        relations,
+    })
+}
+
+/// Is there news in `new` relative to `old`? Unread is growth-only:
+/// a message leaving the unread set (the persona acked it) is not
+/// news, a message arriving is. Goals and relations wake on any
+/// change.
+fn view_has_news(old: &WatchedView, new: &WatchedView) -> bool {
+    new.unread.difference(&old.unread).next().is_some()
+        || old.goals_view != new.goals_view
+        || old.relations != new.relations
 }
 
 fn load_checkpoint_heads(
@@ -634,10 +720,75 @@ fn load_optional_commit_head(
     .next()
 }
 
+/// Latest checkpoint VIEW saved by this persona, if any. Old-style
+/// checkpoints (no persona attribute) never match — each zooid's
+/// watch state is its own.
+fn load_checkpoint_view(
+    repo: &mut Repository<Pile>,
+    orient_state_branch_id: Id,
+    persona_id: Id,
+) -> Result<Option<WatchedView>> {
+    let Some(_head) = repo
+        .storage_mut()
+        .head(orient_state_branch_id)
+        .map_err(|e| anyhow!("orient state branch head: {e:?}"))?
+    else {
+        return Ok(None);
+    };
+    let mut ws = repo
+        .pull(orient_state_branch_id)
+        .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout orient state: {e:?}"))?;
+
+    let mut latest: Option<(Id, i128)> = None;
+    for (checkpoint_id, at) in find!(
+        (checkpoint_id: Id, at: Inline<inlineencodings::NsTAIInterval>),
+        pattern!(&space, [{
+            ?checkpoint_id @
+            metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
+            orient_state::persona: &persona_id,
+            orient_state::at: ?at,
+        }])
+    ) {
+        let key = interval_key(at);
+        if latest.is_none_or(|(_, current)| key > current) {
+            latest = Some((checkpoint_id, key));
+        }
+    }
+    let Some((checkpoint_id, _)) = latest else {
+        return Ok(None);
+    };
+
+    let unread: std::collections::BTreeSet<Id> = find!(
+        msg: Id,
+        pattern!(&space, [{ checkpoint_id @ orient_state::unread_msg: ?msg }])
+    )
+    .collect();
+    let goals_view = find!(
+        h: TextHandle,
+        pattern!(&space, [{ checkpoint_id @ orient_state::goals_view: ?h }])
+    )
+    .next()
+    .map(|h| read_text(&mut ws, h))
+    .transpose()?
+    .unwrap_or_default();
+    let relations =
+        load_optional_commit_head(&space, checkpoint_id, &orient_state::relations_head);
+
+    Ok(Some(WatchedView {
+        unread,
+        goals_view,
+        relations,
+    }))
+}
+
 fn save_checkpoint_heads(
     repo: &mut Repository<Pile>,
     orient_state_branch_id: Id,
     heads: &WatchedHeads,
+    persona_view: Option<(Id, &WatchedView)>,
 ) -> Result<()> {
     let mut ws = repo
         .pull(orient_state_branch_id)
@@ -645,13 +796,22 @@ fn save_checkpoint_heads(
 
     let checkpoint_id = ufoid();
     let now = epoch_interval(now_epoch());
-    let change = entity! { &checkpoint_id @
+    let mut change = TribleSet::new();
+    change += entity! { &checkpoint_id @
         metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
         orient_state::at: now,
         orient_state::local_head?: heads.local,
         orient_state::compass_head?: heads.compass,
         orient_state::relations_head?: heads.relations,
     };
+    if let Some((persona_id, view)) = persona_view {
+        let goals_handle = ws.put(view.goals_view.clone());
+        change += entity! { &checkpoint_id @
+            orient_state::persona: &persona_id,
+            orient_state::goals_view: goals_handle,
+            orient_state::unread_msg*: view.unread.iter(),
+        };
+    }
 
     ws.commit(change, "orient checkpoint");
     repo.push(&mut ws)
@@ -797,19 +957,54 @@ fn cmd_wait(
             .ensure_branch("orient-state", None)
             .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
 
-        let mut detected_change_before_wait = false;
-        let baseline = load_watched_heads(
+        let mut baseline_heads = load_watched_heads(
             repo,
             local_branch_id,
             compass_branch_id,
             relations_branch_id,
         )?;
-        if let Some(last_seen) = load_checkpoint_heads(repo, orient_state_branch_id)? {
-            if baseline != last_seen {
-                detected_change_before_wait = true;
-                return Ok((detected_change_before_wait, true));
+
+        // With a persona, the wake condition is NEWS for that persona
+        // (a new unread message, a goals change) — not raw branch
+        // movement, which would fire on the persona's own acks/sends.
+        let persona_id = match persona {
+            Some(input) => {
+                let mut relations_ws = repo
+                    .pull(relations_branch_id)
+                    .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
+                let relations_space = relations_ws
+                    .checkout(..)
+                    .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+                Some(resolve_persona(&relations_space, input)?)
             }
-        }
+            None => None,
+        };
+
+        let mut baseline_view = match persona_id {
+            Some(pid) => {
+                let view = load_watched_view(
+                    repo,
+                    pid,
+                    local_branch_id,
+                    compass_branch_id,
+                    relations_branch_id,
+                )?;
+                if let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, pid)? {
+                    if view_has_news(&seen, &view) {
+                        return Ok((true, true));
+                    }
+                }
+                Some(view)
+            }
+            None => {
+                if let Some(last_seen) = load_checkpoint_heads(repo, orient_state_branch_id)? {
+                    if baseline_heads != last_seen {
+                        return Ok((true, true));
+                    }
+                }
+                None
+            }
+        };
 
         let poll = Duration::from_millis(poll_ms.max(1));
         let start = Instant::now();
@@ -817,18 +1012,37 @@ fn cmd_wait(
         loop {
             if let Some(timeout) = timeout {
                 if start.elapsed() >= timeout {
-                    return Ok((detected_change_before_wait, false));
+                    return Ok((false, false));
                 }
             }
             std::thread::sleep(poll);
-            let current = load_watched_heads(
+            let current_heads = load_watched_heads(
                 repo,
                 local_branch_id,
                 compass_branch_id,
                 relations_branch_id,
             )?;
-            if current != baseline {
-                return Ok((detected_change_before_wait, true));
+            if current_heads == baseline_heads {
+                continue;
+            }
+            match (persona_id, baseline_view.as_mut()) {
+                (Some(pid), Some(view)) => {
+                    let current_view = load_watched_view(
+                        repo,
+                        pid,
+                        local_branch_id,
+                        compass_branch_id,
+                        relations_branch_id,
+                    )?;
+                    if view_has_news(view, &current_view) {
+                        return Ok((false, true));
+                    }
+                    // Movement without news (own ack/send, another
+                    // persona's traffic) — absorb it and keep waiting.
+                    baseline_heads = current_heads;
+                    *view = current_view;
+                }
+                _ => return Ok((false, true)),
             }
         }
     })?;
