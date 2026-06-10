@@ -34,6 +34,7 @@ use hifitime::Epoch;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
+use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
@@ -42,12 +43,13 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::View;
 
 use crate::schemas::files::{file as file_attrs, KIND_IMPORT};
 
 type TextHandle = Inline<Handle<LongString>>;
+type FileHandle = Inline<Handle<RawBytes>>;
 
 /// Cap on the number of import cards rendered. Older imports remain
 /// in the pile; the `files imports` CLI is the right tool for long
@@ -108,6 +110,11 @@ struct FilesLive {
     cached_head: Option<CommitHandle>,
     imports: Vec<ImportRow>,
     total: usize,
+    /// Retained fact space so click-time actions (opening a card's
+    /// root file/directory) can resolve names/content/children
+    /// without a re-checkout. TribleSet is six PATCH root pointers —
+    /// keeping it is cheap.
+    space: TribleSet,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
@@ -230,6 +237,7 @@ impl FilesLive {
             cached_head,
             imports,
             total,
+            space,
         }
     }
 }
@@ -333,6 +341,13 @@ impl FilesViewer {
             self.live = Some(FilesLive::refresh(ws));
         }
 
+        // Click-time action: open the import's root file/directory.
+        // The card's OPEN button only sets this request; the actual
+        // blob extraction happens after the section closure ends, when
+        // the immutable `live` borrow has been released and we can use
+        // `ws` for blob reads again.
+        let mut open_root: Option<Id> = None;
+
         ctx.section("Files", |ctx| {
             let Some(live) = self.live.as_ref() else { return };
 
@@ -396,17 +411,113 @@ impl FilesViewer {
 
                 for import in &live.imports {
                     g.full(|ctx| {
-                        render_import_card(ctx.ui_mut(), import, now);
+                        render_import_card(ctx.ui_mut(), import, now, &mut open_root);
                     });
                 }
             });
         });
+
+        if let Some(root) = open_root {
+            if let Some(live) = self.live.as_ref() {
+                open_entity(ws, &live.space, root);
+            }
+        }
     }
+}
+
+/// Extract `entity_id` (a file or directory) from the pile into
+/// `$TMPDIR/liora-files/` and fire the platform `open` command on the
+/// result — same flow the wiki widget uses for `files:` links, but
+/// extended to handle directory roots by recursing through
+/// `file::children`. Best-effort: errors log to stderr.
+fn open_entity(ws: &mut Workspace<Pile>, space: &TribleSet, entity_id: Id) {
+    let tmp_dir = std::env::temp_dir().join("liora-files");
+    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+        eprintln!("[files] mkdir {}: {e}", tmp_dir.display());
+        return;
+    }
+    match extract_tree(ws, space, entity_id, &tmp_dir, 0) {
+        Ok(path) => {
+            eprintln!("[files] opening: {}", path.display());
+            let _ = std::process::Command::new("open").arg(&path).spawn();
+        }
+        Err(e) => eprintln!("[files] extract: {e}"),
+    }
+}
+
+/// Recursively materialise a file/directory entity under `dest`.
+/// Files write their content blob to `dest/<name>`; directories
+/// create `dest/<name>/` and recurse through their `children`.
+/// Returns the path of the materialised entry. Depth-capped at 32
+/// as a cycle guard — the files faculty never writes cyclic trees,
+/// but a corrupted pile shouldn't be able to hang the viewer.
+fn extract_tree(
+    ws: &mut Workspace<Pile>,
+    space: &TribleSet,
+    entity_id: Id,
+    dest: &std::path::Path,
+    depth: u32,
+) -> Result<std::path::PathBuf, String> {
+    if depth > 32 {
+        return Err(format!("max depth exceeded at {}", id_hex(entity_id)));
+    }
+
+    let name = find!(
+        h: TextHandle,
+        pattern!(space, [{ entity_id @ file_attrs::name: ?h }])
+    )
+    .next()
+    .and_then(|h| read_text(ws, h))
+    .unwrap_or_else(|| short_hex_name(entity_id));
+
+    // File leaf: has a content blob.
+    if let Some(content) = find!(
+        h: FileHandle,
+        pattern!(space, [{ entity_id @ file_attrs::content: ?h }])
+    )
+    .next()
+    {
+        let blob: Blob<RawBytes> = ws
+            .get(content)
+            .map_err(|e| format!("get blob for {name}: {e:?}"))?;
+        let path = dest.join(&name);
+        std::fs::write(&path, &*blob.bytes).map_err(|e| format!("write {name}: {e}"))?;
+        return Ok(path);
+    }
+
+    // Directory: create and recurse. An entity with neither content
+    // nor children still materialises as an empty directory — that's
+    // the honest representation of what's in the pile.
+    let dir = dest.join(&name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {name}: {e}"))?;
+    let children: Vec<Id> = find!(
+        c: Id,
+        pattern!(space, [{ entity_id @ file_attrs::children: ?c }])
+    )
+    .collect();
+    for child in children {
+        // Best-effort per child: one unreadable blob shouldn't kill
+        // the rest of the tree.
+        if let Err(e) = extract_tree(ws, space, child, &dir, depth + 1) {
+            eprintln!("[files] skipping child: {e}");
+        }
+    }
+    Ok(dir)
+}
+
+fn short_hex_name(id: Id) -> String {
+    let s = format!("{id:x}");
+    s.chars().take(8).collect()
 }
 
 // ── Import card ──────────────────────────────────────────────────────
 
-fn render_import_card(ui: &mut egui::Ui, row: &ImportRow, now: DateTime<Utc>) {
+fn render_import_card(
+    ui: &mut egui::Ui,
+    row: &ImportRow,
+    now: DateTime<Utc>,
+    open_root: &mut Option<Id>,
+) {
     let bubble_fill = ui.visuals().window_fill;
     let accent = import_color(row.id);
     let text_on_accent = colorhash::text_color_on(accent);
@@ -472,6 +583,32 @@ fn render_import_card(ui: &mut egui::Ui, row: &ImportRow, now: DateTime<Utc>) {
                                     .small()
                                     .strong()
                                     .color(text_on_accent),
+                            );
+                        }
+
+                        // OPEN — extracts the import's root file or
+                        // directory tree to $TMPDIR/liora-files/ and
+                        // fires the platform opener, mirroring the
+                        // wiki widget's files:-link behaviour.
+                        // `Align::Min` cross-axis: Center would feed
+                        // the frame-delayed cell-sizing loop.
+                        if row.root.is_some() {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Min),
+                                |ui| {
+                                    let btn = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new("OPEN \u{2197}") // ↗
+                                                .monospace()
+                                                .small()
+                                                .strong(),
+                                        )
+                                        .min_size(egui::vec2(56.0, 18.0)),
+                                    );
+                                    if btn.clicked() {
+                                        *open_root = row.root;
+                                    }
+                                },
                             );
                         }
                     });
