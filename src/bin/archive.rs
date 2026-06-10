@@ -266,16 +266,30 @@ mod common {
             return Ok((author_id, change));
         }
 
-        let author_id = ufoid();
+        // Identity = kind + name, content-derived via entity!'s intrinsic
+        // rooting: the same author name mints the same id in every pile and
+        // every run, so re-imports and cross-pile merges converge instead of
+        // forking (same mechanism as wiki's deterministic version/tag ids).
+        // Role is volatile metadata and merges onto the id afterwards; the
+        // per-message ground truth lives in import_schema::source_role anyway.
         let name_handle = ws.put(name.to_owned());
-        let role_handle = (!role.is_empty()).then(|| ws.put(role.to_owned()));
-        let mut change = TribleSet::new();
-        change += entity! { &author_id @
+        let author_fragment = entity! { _ @
             metadata::tag: archive::kind_author,
             archive::author_name: name_handle,
-            archive::author_role?: role_handle,
         };
-        Ok((*author_id, change))
+        let author_id = author_fragment
+            .root()
+            .expect("entity! must export a single root id");
+        let mut change = TribleSet::new();
+        change += author_fragment;
+        if !role.is_empty() {
+            let role_handle = ws.put(role.to_owned());
+            let author_entity = acquire_or_force(author_id);
+            change += entity! { &author_entity @
+                archive::author_role: role_handle,
+            };
+        }
+        Ok((author_id, change))
     }
 
     fn find_author_by_name(

@@ -188,17 +188,26 @@ fn import_codex_records(
 
     for (index, (conversation_id, mut convo_messages)) in by_conversation.into_iter().enumerate() {
         convo_messages.sort_by_key(|m| m.order);
+        // Identity = format + source conversation id only; the raw root is
+        // export-dependent and merges on afterwards (see chatgpt importer).
         let conversation_fragment = entity! { _ @
             common::metadata::tag: common::import_schema::kind_conversation,
             common::import_schema::source_format: "codex",
             common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
-            common::import_schema::source_raw_root: raw_root,
         };
         let conversation_id = conversation_fragment
             .root()
             .expect("entity! must export a single root id");
 
         change += conversation_fragment;
+        {
+            let conversation_entity = conversation_id
+                .acquire()
+                .expect("entity! root ids should be acquired in current thread");
+            change += entity! { &conversation_entity @
+                common::import_schema::source_raw_root: raw_root,
+            };
+        }
 
         let mut previous: Option<(Id, String)> = None;
         for message in convo_messages {

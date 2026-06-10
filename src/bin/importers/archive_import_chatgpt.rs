@@ -181,11 +181,15 @@ fn import_chatgpt_parsed_file(
             .and_then(JsonValue::as_object)
             .ok_or_else(|| anyhow!("conversation {convo_id} missing mapping"))?;
 
+        // Identity = format + source conversation id only. The raw JSON root
+        // varies between overlapping exports (a re-exported conversation with
+        // new messages has different raw bytes); keeping it out of the
+        // intrinsic root makes re-imports converge on the same conversation
+        // entity instead of forking a duplicate message cascade.
         let conversation_fragment = entity! { _ @
             common::metadata::tag: common::import_schema::kind_conversation,
             common::import_schema::source_format: "chatgpt",
             common::import_schema::source_conversation_id: ws.put(convo_id.to_string()),
-            common::import_schema::source_raw_root: raw_root,
         };
         let conversation_id = conversation_fragment
             .root()
@@ -193,6 +197,16 @@ fn import_chatgpt_parsed_file(
 
         let mut change = TribleSet::new();
         change += conversation_fragment;
+        // Raw provenance is a non-identity attribute: each export's raw root
+        // accumulates on the same conversation (monotone g-set).
+        {
+            let conversation_entity = conversation_id
+                .acquire()
+                .expect("entity! root ids should be acquired in current thread");
+            change += entity! { &conversation_entity @
+                common::import_schema::source_raw_root: raw_root,
+            };
+        }
         let mut author_cache: HashMap<String, Id> = HashMap::new();
 
         let mut node_to_message = HashMap::new();
