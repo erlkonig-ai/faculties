@@ -98,6 +98,17 @@ fragments by id and title. The set covers two shapes:
     team` + `pile net` for bootstrapping capability auth
     across two machines so the relay accepts both peers
 
+*Substrate concepts* — the in-depth "why does this work"
+layer. Not needed for day-one productivity; read when you
+want to understand what's underneath the faculties:
+
+  - "Substrate 1/3: What Is a Trible" — 64-byte
+    content-addressable facts
+  - "Substrate 2/3: The Pile" — one append-only file,
+    nothing ever deleted
+  - "Substrate 3/3: Monotonic Merge" — why N peers sync
+    without conflicts, by construction
+
 Read the foundations in any order; each stands alone. Tool
 Selection is the densest if you want a single-page reference.
 For "where was I?" at session start, run `orient show`

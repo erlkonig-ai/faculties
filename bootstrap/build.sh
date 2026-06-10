@@ -145,7 +145,24 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/16_auth_setup_workflow.typ" \
   --tag bootstrap --tag onboarding --tag recipe --tag auth >/dev/null
 
-echo "    16 fragments created"
+# 17-19. Substrate concepts — the in-depth "why does this
+# work" layer behind the workflow fragments. Read on demand,
+# not required for day-one productivity. Also double as
+# presentation material: one concept per fragment, one
+# diagram each (trible → pile → merge).
+"$WIKI" create "Substrate 1/3: What Is a Trible" \
+  "@$BOOTSTRAP_DIR/17_substrate_tribles.typ" \
+  --tag bootstrap --tag onboarding --tag substrate --tag concepts >/dev/null
+
+"$WIKI" create "Substrate 2/3: The Pile" \
+  "@$BOOTSTRAP_DIR/18_substrate_pile.typ" \
+  --tag bootstrap --tag onboarding --tag substrate --tag concepts >/dev/null
+
+"$WIKI" create "Substrate 3/3: Monotonic Merge" \
+  "@$BOOTSTRAP_DIR/19_substrate_merge.typ" \
+  --tag bootstrap --tag onboarding --tag substrate --tag concepts >/dev/null
+
+echo "    19 fragments created"
 
 echo "==> Building compass goals"
 
@@ -183,7 +200,7 @@ echo "    6 goals created"
 echo
 echo "==> Sanity check"
 # Bump these when adding/removing entries above.
-EXPECTED_FRAGMENTS=16
+EXPECTED_FRAGMENTS=19
 EXPECTED_GOALS=6
 ACTUAL_FRAGMENTS=$("$WIKI" list --tag bootstrap 2>/dev/null \
   | grep -cE "^[0-9a-f]" || echo 0)
