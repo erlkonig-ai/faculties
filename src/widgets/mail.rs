@@ -101,9 +101,13 @@ struct MailRow {
 }
 
 impl MailRow {
+    /// Raw chronological key: the sent timestamp, with missing dates
+    /// mapped to `i128::MIN` so they sort as "oldest". Callers wrap
+    /// in `std::cmp::Reverse` for newest-first ordering. (The earlier
+    /// version negated the value, which overflows on `i128::MIN` —
+    /// a panic in debug builds the moment a mail has no sent_at.)
     fn sort_key(&self) -> i128 {
-        // Newest first — negate, missing dates sink to the bottom.
-        -(self.sent_at.unwrap_or(i128::MIN))
+        self.sent_at.unwrap_or(i128::MIN)
     }
 }
 
@@ -394,7 +398,8 @@ fn collect_mails(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<MailRow> {
     }
 
     let mut mails: Vec<MailRow> = by_id.into_values().collect();
-    mails.sort_by_key(|m| m.sort_key());
+    // Newest first; missing dates (MIN key) sink to the bottom.
+    mails.sort_by_key(|m| std::cmp::Reverse(m.sort_key()));
     mails
 }
 
@@ -416,10 +421,10 @@ fn flatten_threaded(mails: &[MailRow]) -> Vec<(usize, &MailRow)> {
         }
     }
     // Roots: newest-first (same as the flat-list order).
-    roots.sort_by_key(|&i| mails[i].sort_key());
-    // Children: oldest-first inside each parent.
+    roots.sort_by_key(|&i| std::cmp::Reverse(mails[i].sort_key()));
+    // Children: oldest-first inside each parent (conversation flow).
     for kids in children.values_mut() {
-        kids.sort_by_key(|&i| -mails[i].sort_key());
+        kids.sort_by_key(|&i| mails[i].sort_key());
     }
 
     let mut out: Vec<(usize, &MailRow)> = Vec::with_capacity(mails.len());

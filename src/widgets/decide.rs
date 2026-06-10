@@ -122,9 +122,12 @@ impl DecisionRow {
         }
     }
 
+    /// Raw chronological key: created timestamp, missing → `i128::MIN`
+    /// ("oldest"). Sorted with `Reverse` for newest-first — negating
+    /// would overflow on `i128::MIN` (debug-build panic when a decision
+    /// has no created_at).
     fn sort_key(&self) -> i128 {
-        // Newest first — negate, treat missing as far-old.
-        -(self.created_at.unwrap_or(i128::MIN))
+        self.created_at.unwrap_or(i128::MIN)
     }
 }
 
@@ -277,7 +280,8 @@ impl DecideLive {
         }
 
         let mut decisions: Vec<DecisionRow> = decisions.into_values().collect();
-        decisions.sort_by_key(|d| d.sort_key());
+        // Newest first; undated decisions (MIN key) sink to the bottom.
+        decisions.sort_by_key(|d| std::cmp::Reverse(d.sort_key()));
 
         DecideLive {
             cached_head,
