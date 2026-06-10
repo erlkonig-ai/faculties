@@ -8,7 +8,8 @@
 //! ```sh
 //! cargo install faculties --features widgets
 //! faculties-viewer ./self.pile
-//! # or set PILE=./self.pile in the environment
+//! # or set PILE=./self.pile in the environment;
+//! # --pile <path> overrides both, like every other faculty
 //! ```
 //!
 //! This mirrors `examples/pile_inspector.rs`; the example is kept as
@@ -29,13 +30,21 @@ use GORBIE::notebook;
 use GORBIE::prelude::*;
 
 fn resolve_pile_path() -> PathBuf {
-    // Prefer PILE env over positional arg so headless flags
-    // (`--headless`, `--out-dir <path>`, etc., consumed by the
-    // #[notebook] macro) don't collide with the pile-path slot.
-    // Positional arg falls back to the first non-flag token, so
-    // `faculties-viewer ./foo.pile --headless` still works.
-    std::env::var("PILE")
-        .ok()
+    // Precedence: --pile > PILE env > positional > ./self.pile.
+    // Explicit --pile matches the clap faculties (flag beats env).
+    // The positional slot stays weakest because #[notebook] flags
+    // (`--out-dir <path>`, etc.) put path-shaped values in argv
+    // that the bare token scan below would misread.
+    let mut argv = std::env::args().skip(1);
+    let mut flagged = None;
+    while let Some(a) = argv.next() {
+        if a == "--pile" {
+            flagged = argv.next();
+            break;
+        }
+    }
+    flagged
+        .or_else(|| std::env::var("PILE").ok())
         .or_else(|| {
             std::env::args()
                 .skip(1)
