@@ -67,6 +67,9 @@ jobs:
           stage="faculties-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "$stage"
           cp LICENSE-MIT LICENSE-APACHE README.md "$stage/" || true
+          # Onboarding wiki fragments + starter goals; seed with
+          # `cat bootstrap.pile >> ./self.pile` after unpacking.
+          cp bootstrap.pile "$stage/"
           # All faculty binaries (extension-less; .exe suffix on windows
           # if we ever add it). The widgets-only viewer is gated by a
           # feature so it's not built by default in this workflow.
