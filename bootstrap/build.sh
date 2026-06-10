@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # Regenerate ../bootstrap.pile from the .typ sources in this directory.
-# Use this when fragment content drifts; new agents getting onboarded
-# pick up the refreshed substrate via `cat bootstrap.pile >> self.pile`.
+# Use this when fragment content drifts. New agents start from it
+# (`cp bootstrap.pile self.pile`); existing piles merge it in
+# (`cat bootstrap.pile >> self.pile`).
 #
 # Usage:
 #   cd faculties/bootstrap && ./build.sh

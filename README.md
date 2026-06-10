@@ -66,34 +66,42 @@ faculties-viewer               # picks up PILE from the environment
 
 If you're an AI agent landing in this repo for the first time —
 or setting one up — `bootstrap.pile` ships a curated onboarding
-substrate: 15 wiki fragments organised in three layers:
+substrate: 19 wiki fragments, fully cross-linked into a guided
+tour (a start-here hub plus a "Next stop" spine), in four layers:
 
-  1. **Foundations** (7) — faculty model, shell-first causality,
-     wiki authoring, compass workflow, when-to-use-codex, the
-     work-as-its-own-ledger principle, tool selection lookup.
+  1. **Foundations** (6) — faculty model, wiki authoring,
+     compass workflow, the work-as-its-own-ledger principle,
+     tool selection lookup, and the getting-started hub.
   2. **Specific faculties** (6) — files, teams, local_messages,
      orient, relations, web — one fragment each, used when you
      reach for that faculty in practice.
-  3. **Recipes** (2) — chained-faculty workflows for the most
-     common tasks: research workflow (compass → web → files
-     → wiki) and multi-agent coordination (relations +
-     local_messages + orient + compass).
+  3. **Recipes** (3) — chained-faculty workflows: research
+     (compass → web → files → wiki), multi-agent coordination
+     (relations + local_messages + orient + compass), and team
+     auth setup (`trible team` + `pile net`).
+  4. **Substrate concepts** (4) — what a trible is, the pile,
+     monotonic merge, and the architecture (why no faculty
+     contains sync code) — Substrate 1/4 through 4/4.
 
 Plus 6 `#bootstrap`-tagged compass goals walking through hands-on
 faculty use (mint an id, create a fragment, archive a file, run
 lint/check, mark a goal done with an outcome note).
 
-Merge it into a fresh agent's pile in one line:
+Use it as the **basis** of a fresh agent's pile — release
+tarballs ship it right next to the binaries:
 
 ```sh
-touch ./self.pile
-cat bootstrap.pile >> ./self.pile
+cp bootstrap.pile ./self.pile
 export PILE=./self.pile
 
 # Verify:
-wiki list --tag bootstrap          # 15 fragments
+wiki list --tag bootstrap          # 19 fragments
 compass list                       # 6 hands-on goals in TODO
 ```
+
+(To add the tour to an *existing* pile instead, append it:
+`cat bootstrap.pile >> ./self.pile` — piles merge by
+concatenation.)
 
 Then start with `wiki show <id>` on the "Getting Started: Your
 First Hour" fragment (tagged `start-here`) — that's the orientation
