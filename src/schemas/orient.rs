@@ -49,6 +49,8 @@ pub mod board {
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as task: inlineencodings::GenId;
         "61C44E0F8A73443ED592A713151E99A4" as status: inlineencodings::ShortString;
+        // Acting persona on a status event (see schemas::compass::board::by).
+        "34718CDC13D0E3D8750DB58105390AB3" as by: inlineencodings::GenId;
     }
 }
 

@@ -42,6 +42,11 @@ pub mod board {
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as task: inlineencodings::GenId;
         "61C44E0F8A73443ED592A713151E99A4" as status: inlineencodings::ShortString;
+        // Acting persona (relations person id) on a status event.
+        // Optional — written when $PERSONA / --persona is set, so the
+        // audit trail records WHO moved a goal and watchers can absorb
+        // their own edits.
+        "34718CDC13D0E3D8750DB58105390AB3" as by: inlineencodings::GenId;
         "47351DF00B3DDA96CB305157CD53D781" as note: inlineencodings::Handle<blobencodings::LongString>;
         "B88842D9D00361A0F2728C478C79D75C" as higher: inlineencodings::GenId;
         "18F3446C9E9281A248D370A56395A3F0" as lower: inlineencodings::GenId;

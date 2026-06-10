@@ -633,13 +633,36 @@ fn load_watched_view(
     let compass_space = compass_ws
         .checkout(..)
         .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
+    // One line per goal: "id:status:author" (author = persona hex on
+    // the latest status event, empty when unattributed). The author
+    // lets view_news absorb the persona's own goal edits.
     let mut goal_lines: Vec<String> =
         find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
             .map(|id| {
-                let status = task_latest_status(&compass_space, id)
-                    .map(|(status, _)| status)
-                    .unwrap_or_default();
-                format!("{:x}:{status}", id)
+                let latest = find!(
+                    (evt: Id, status: String, at: IntervalValue),
+                    pattern!(&compass_space, [{
+                        ?evt @
+                        metadata::tag: &KIND_STATUS_ID,
+                        board::task: &id,
+                        board::status: ?status,
+                        metadata::created_at: ?at,
+                    }])
+                )
+                .max_by(|a, b| interval_key(a.2).cmp(&interval_key(b.2)));
+                match latest {
+                    Some((evt, status, _)) => {
+                        let by = find!(
+                            by: Id,
+                            pattern!(&compass_space, [{ evt @ board::by: ?by }])
+                        )
+                        .next()
+                        .map(fmt_id)
+                        .unwrap_or_default();
+                        format!("{:x}:{status}:{by}", id)
+                    }
+                    None => format!("{:x}::", id),
+                }
             })
             .collect();
     goal_lines.sort();
@@ -674,25 +697,33 @@ fn load_watched_view(
 /// contact-editing burst wakes at most once). Goals wake on any
 /// id:status change — and the reason line names the goal, so the
 /// woken agent doesn't have to diff 1700 goals by hand.
-fn view_news(old: &WatchedView, new: &WatchedView) -> Vec<String> {
+fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String> {
     let mut reasons = Vec::new();
     for msg in new.unread.difference(&old.unread) {
         reasons.push(format!("new message [{}]", fmt_id(*msg)));
     }
-    let parse = |view: &str| -> HashMap<String, String> {
+    // Goal lines are "id:status:author" (older checkpoints lack the
+    // author field — parsed as unattributed). A change whose latest
+    // status event the persona itself authored is not news.
+    let me = fmt_id(persona_id);
+    let parse = |view: &str| -> HashMap<String, (String, String)> {
         view.lines()
             .filter_map(|line| {
-                line.split_once(':')
-                    .map(|(id, status)| (id.to_owned(), status.to_owned()))
+                let mut parts = line.splitn(3, ':');
+                let id = parts.next()?.to_owned();
+                let status = parts.next().unwrap_or("").to_owned();
+                let by = parts.next().unwrap_or("").to_owned();
+                Some((id, (status, by)))
             })
             .collect()
     };
     let old_goals = parse(&old.goals_view);
     let new_goals = parse(&new.goals_view);
-    for (id, status) in &new_goals {
+    for (id, (status, by)) in &new_goals {
+        let own_edit = *by == me;
         match old_goals.get(id) {
-            None => reasons.push(format!("new goal [{id}] ({status})")),
-            Some(prev) if prev != status => {
+            None if !own_edit => reasons.push(format!("new goal [{id}] ({status})")),
+            Some((prev, _)) if prev != status && !own_edit => {
                 reasons.push(format!("goal [{id}]: {prev} → {status}"))
             }
             _ => {}
@@ -1039,7 +1070,7 @@ fn cmd_wait(
                     relations_branch_id,
                 )?;
                 if let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, pid)? {
-                    let reasons = view_news(&seen, &view);
+                    let reasons = view_news(&seen, &view, pid);
                     if !reasons.is_empty() {
                         for reason in &reasons {
                             println!("News: {reason}");
@@ -1087,7 +1118,7 @@ fn cmd_wait(
                         compass_branch_id,
                         relations_branch_id,
                     )?;
-                    let reasons = view_news(view, &current_view);
+                    let reasons = view_news(view, &current_view, pid);
                     if !reasons.is_empty() {
                         for reason in &reasons {
                             println!("News: {reason}");

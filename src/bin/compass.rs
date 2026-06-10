@@ -6,6 +6,7 @@ use faculties::schemas::compass::{
     DEFAULT_STATUSES, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
     KIND_SPECS, KIND_STATUS_ID, board,
 };
+use faculties::schemas::relations::relations as rel_attrs;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +31,11 @@ struct Cli {
     /// Branch id for the board (hex). Overrides config.
     #[arg(long)]
     branch_id: Option<String>,
+    /// Acting persona (relations label or 32-char hex id). When set,
+    /// status events record who made them — the audit trail gains the
+    /// actor, and `orient wait` watchers can absorb their own edits.
+    #[arg(long, env = "PERSONA")]
+    persona: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -628,6 +634,39 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
     Ok(change)
 }
 
+/// Resolve the acting persona (relations label or 32-char hex id) —
+/// same semantics as `orient` / `local_messages`.
+fn resolve_persona_id(repo: &mut Repository<Pile>, input: &str) -> Result<Id> {
+    let trimmed = input.trim();
+    if let Some(id) = Id::from_hex(trimmed) {
+        return Ok(id);
+    }
+    let relations_branch_id = repo
+        .ensure_branch("relations", None)
+        .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
+    let mut ws = repo
+        .pull(relations_branch_id)
+        .map_err(|e| anyhow::anyhow!("pull relations workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+    let key = trimmed.to_ascii_lowercase();
+    let matches: Vec<Id> = find!(
+        person_id: Id,
+        pattern!(&space, [{ ?person_id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID }])
+    )
+    .filter(|&person_id| {
+        exists!(pattern!(&space, [{ person_id @ rel_attrs::label_norm: key.as_str() }]))
+            || exists!(pattern!(&space, [{ person_id @ rel_attrs::alias_norm: key.as_str() }]))
+    })
+    .collect();
+    match matches.len() {
+        0 => bail!("unknown persona label '{trimmed}' (no relations entry; try the hex id)"),
+        1 => Ok(matches[0]),
+        _ => bail!("multiple relations entries match persona label '{trimmed}'"),
+    }
+}
+
 fn cmd_add(
     pile: &Path,
     _branch_name: &str,
@@ -637,6 +676,7 @@ fn cmd_add(
     parent: Option<String>,
     tags: Vec<String>,
     note: Option<String>,
+    persona: Option<&str>,
 ) -> Result<()> {
     let status = normalize_status(status);
     let tags: Vec<String> = tags.into_iter().map(|t| t.trim().to_string()).collect();
@@ -646,6 +686,7 @@ fn cmd_add(
     }
 
     let task_ref = with_repo(pile, |repo| {
+        let by_id = persona.map(|p| resolve_persona_id(repo, p)).transpose()?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -676,6 +717,7 @@ fn cmd_add(
             metadata::tag: &KIND_STATUS_ID,
             board::task: &task_ref,
             board::status: status.as_str(),
+            board::by?: by_id.as_ref(),
             metadata::created_at: now,
         };
 
@@ -727,11 +769,13 @@ fn cmd_move(
     branch_id: Id,
     id: String,
     status: String,
+    persona: Option<&str>,
 ) -> Result<()> {
     let status = normalize_status(status);
     validate_short("status", &status)?;
 
     let resolved = with_repo(pile, |repo| {
+        let by_id = persona.map(|p| resolve_persona_id(repo, p)).transpose()?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -746,6 +790,7 @@ fn cmd_move(
             metadata::tag: &KIND_STATUS_ID,
             board::task: &task_id,
             board::status: status.as_str(),
+            board::by?: by_id.as_ref(),
             metadata::created_at: now,
         };
 
@@ -1034,10 +1079,13 @@ fn main() -> Result<()> {
                 parent,
                 tag,
                 note,
+                cli.persona.as_deref(),
             )
         }
         Command::List { status, tag, all } => cmd_list(&cli.pile, &cli.branch, branch_id, status, tag, all),
-        Command::Move { id, status } => cmd_move(&cli.pile, &cli.branch, branch_id, id, status),
+        Command::Move { id, status } => {
+            cmd_move(&cli.pile, &cli.branch, branch_id, id, status, cli.persona.as_deref())
+        }
         Command::Note { id, note } => {
             let note = load_value_or_file(&note, "goal note")?;
             cmd_note(&cli.pile, &cli.branch, branch_id, id, note)
