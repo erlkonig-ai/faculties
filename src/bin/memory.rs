@@ -459,92 +459,73 @@ fn key_to_epoch(key: i128) -> Epoch {
     Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(key))
 }
 
-/// `memory consolidate [<level>] start <ts> | stop | <ts> <summary...>`
+/// `memory consolidate start <ts> | stop | <ts> <summary...>`
 ///
 /// The consolidation edge is where the next chunk opens. `<ts> <summary>`
 /// writes a chunk spanning [edge, ts] and advances the edge to ts — the
 /// boundary is chosen in hindsight (you pass the timestamp where the shift
 /// happened, typically copied from replay output; the shift-signaling
 /// message becomes the next chunk's opening).
-///
-/// LEVELS: an optional leading label (any word that isn't a timestamp or
-/// start/stop; e.g. `arc`, `era`) keeps an INDEPENDENT edge per altitude.
-/// Summarization is one multi-level pass (JP's design): all edges advance
-/// through the same lived reading, so a leaf, an arc, and an era can each
-/// close at their own felt boundary from the same whole vantage — fine near,
-/// coarse far, exactly the shape the cover reads back. Writing-time vantage
-/// and reading-time structure are isomorphic on purpose. Default level is
-/// the leaf edge ("consolidate-edge"); labels are free-form, not a schema.
 fn cmd_consolidate(pile_path: &Path, args: &[String]) -> Result<()> {
     let persona = comb_persona()?;
     if args.is_empty() {
         bail!(
-            "usage: memory consolidate [<level>] start <YYYY-MM-DDTHH:MM:SS>\n\
-             \x20      memory consolidate [<level>] stop\n\
-             \x20      memory consolidate [<level>] <YYYY-MM-DDTHH:MM:SS> <summary...>"
+            "usage: memory consolidate start <YYYY-MM-DDTHH:MM:SS>\n\
+             \x20      memory consolidate stop\n\
+             \x20      memory consolidate <YYYY-MM-DDTHH:MM:SS> <summary...>"
         );
-    }
-    // An optional level label precedes the action: a token that is not
-    // "start"/"stop" and not parseable as a timestamp.
-    let (stream, rest): (String, &[String]) = {
-        let first = args[0].as_str();
-        let is_action = first == "start" || first == "stop";
-        let is_ts = parse_tai_timestamp(first).is_ok();
-        if !is_action && !is_ts {
-            (format!("{CONSOLIDATE_STREAM}:{first}"), &args[1..])
-        } else {
-            (CONSOLIDATE_STREAM.to_string(), args)
-        }
-    };
-    let level_label = stream
-        .strip_prefix(&format!("{CONSOLIDATE_STREAM}:"))
-        .unwrap_or("leaf");
-    if rest.is_empty() {
-        bail!("usage: memory consolidate [<level>] start <ts> | stop | <ts> <summary...>");
     }
     with_repo(pile_path, |repo| {
         let (comb_branch, catalog) = comb_catalog(repo)?;
-        match rest[0].as_str() {
+        match args[0].as_str() {
             "start" => {
-                let Some(raw) = rest.get(1) else {
-                    bail!("usage: memory consolidate [<level>] start <YYYY-MM-DDTHH:MM:SS>");
+                let Some(raw) = args.get(1) else {
+                    bail!("usage: memory consolidate start <YYYY-MM-DDTHH:MM:SS>");
                 };
                 let edge = parse_tai_timestamp(raw)?;
-                comb_advance(repo, comb_branch, &stream, &persona, Some(edge), None)?;
-                println!("{level_label} edge set to {raw} (persona {persona})");
+                comb_advance(repo, comb_branch, CONSOLIDATE_STREAM, &persona, Some(edge), None)?;
+                println!("consolidation edge set to {raw} (persona {persona})");
                 Ok(())
             }
             "stop" => {
-                comb_advance(repo, comb_branch, &stream, &persona, None, None)?;
-                println!("{level_label} consolidation stopped (persona {persona})");
+                comb_advance(repo, comb_branch, CONSOLIDATE_STREAM, &persona, None, None)?;
+                println!("consolidation stopped (persona {persona})");
                 Ok(())
             }
             _ => {
-                let until = parse_tai_timestamp(&rest[0])?;
-                let summary = rest[1..].join(" ");
+                let until = parse_tai_timestamp(&args[0])?;
+                let summary = args[1..].join(" ");
                 if summary.is_empty() {
-                    bail!("summary required: memory consolidate [<level>] <ts> <summary...>");
+                    bail!("summary required: memory consolidate <ts> <summary...>");
                 }
-                let Some((Some(edge_key), _)) = comb::latest(&catalog, &stream, &persona)
+                let Some((Some(edge_key), _)) =
+                    comb::latest(&catalog, CONSOLIDATE_STREAM, &persona)
                 else {
                     bail!(
-                        "no open {level_label} edge for persona {persona}: \
-                         use `memory consolidate {level_label} start <ts>`"
+                        "no open consolidation edge for persona {persona}: \
+                         use `memory consolidate start <ts>`"
                     );
                 };
                 let edge = key_to_epoch(edge_key);
                 if until.to_tai_duration().total_nanoseconds() <= edge_key {
                     bail!(
-                        "consolidate target {} is not after the open {level_label} edge {}",
-                        rest[0],
+                        "consolidate target {} is not after the open edge {}",
+                        args[0],
                         fmt_epoch(edge)
                     );
                 }
                 let chunk_id = create_chunk(repo, &summary, (edge, until))?;
-                comb_advance(repo, comb_branch, &stream, &persona, Some(until), None)?;
+                comb_advance(
+                    repo,
+                    comb_branch,
+                    CONSOLIDATE_STREAM,
+                    &persona,
+                    Some(until),
+                    None,
+                )?;
                 println!("range: {}", format_time_range(edge, until));
                 println!("id: {chunk_id:x}");
-                println!("{level_label} edge → {}", rest[0]);
+                println!("edge → {}", args[0]);
                 Ok(())
             }
         }
