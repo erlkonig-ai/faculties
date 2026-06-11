@@ -1919,7 +1919,7 @@ fn collect_context_chunks(
 
     for (parent_id, child_id) in find!(
         (parent_id: Id, child_id: Id),
-        pattern!(&space, [{ ?parent_id @ context::child: ?child_id }])
+        pattern!(&space, [{ ?parent_id @ context::reference: ?child_id }])
     ) {
         if let Some(row) = chunks.get_mut(&parent_id) {
             row.children.push(child_id);

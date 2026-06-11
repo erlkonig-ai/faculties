@@ -195,11 +195,11 @@ impl MemoryLive {
             }
         }
 
-        // Child count — multi-valued `child` attribute, one row per
+        // Reference count — multi-valued `reference` attribute (renamed from `child`), one row per
         // edge. We just need the count for the badge.
         for (id, _child) in find!(
             (id: Id, c: Id),
-            pattern!(&space, [{ ?id @ memctx::child: ?c }])
+            pattern!(&space, [{ ?id @ memctx::reference: ?c }])
         ) {
             if let Some(row) = by_id.get_mut(&id) {
                 row.child_count += 1;

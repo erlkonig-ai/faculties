@@ -59,12 +59,15 @@ fn chunk_end_at(space: &TribleSet, id: Id) -> Option<Inline<NsTAIInterval>> {
     find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ ctx::end_at: ?v }])).next()
 }
 
-fn chunk_children(space: &TribleSet, id: Id) -> Vec<Id> {
+/// Outgoing references of a chunk: ctx::reference facts (renamed from the
+/// legacy `child` attribute — same id, so old tree edges read as references)
+/// plus the ancient left/right binary-tree remnants.
+fn chunk_references(space: &TribleSet, id: Id) -> Vec<Id> {
     let mut children: Vec<Id> = Vec::new();
-    children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::child: ?c }])));
+    children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::reference: ?c }])));
     children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::left: ?c }])));
     children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::right: ?c }])));
-    // Sort children by their start_at time.
+    // Sort referenced chunks by their start_at time.
     let superseded = superseded_ids(space);
     children.retain(|child_id| !superseded.contains(child_id));
     children.sort_by_key(|child_id| {
@@ -289,7 +292,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
              References in prose: (memory:<from>..<to>) is a soft temporal\n\
              address, resolved by range query at read time, no fact minted.\n\
              [why it matters](memory:<hex>) is a hard reference to an exact\n\
-             chunk, extracted into a queryable ctx::references fact. Neither\n\
+             chunk, extracted into a queryable ctx::reference fact. Neither\n\
              affects the span or the hierarchy: containment relates chunks,\n\
              and the explicit range argument always wins."
         );
@@ -314,7 +317,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         bail!("summary text is required: memory create [<from>..<to>] <summary...>");
     }
 
-    // Hard references: [context](memory:<hex>) → ctx::references facts.
+    // Hard references: [context](memory:<hex>) → ctx::reference facts.
     // Resolved against the catalog so a dangling hard ref fails at write
     // time (that is the point of the hard form). No span or tree effect.
     let hard_refs = scan_hard_references(&summary_text);
@@ -372,7 +375,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             metadata::created_at: created_at,
             ctx::start_at: start_at,
             ctx::end_at: end_at,
-            ctx::references*: reference_ids.iter(),
+            ctx::reference*: reference_ids.iter(),
         };
 
         ws.commit(change, "memory create");
@@ -541,28 +544,34 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
         }
         println!("id: {:x}", chunk_id);
 
-        let children = chunk_children(&space, chunk_id);
-        if !children.is_empty() {
-            let child_ranges: Vec<String> = children
+        // References, both directions. Outgoing includes legacy left/right
+        // remnants and is supersede-filtered + time-sorted; shown with the
+        // target's span (the address the prose would use) and id.
+        let outgoing = chunk_references(&space, chunk_id);
+        if !outgoing.is_empty() {
+            let refs: Vec<String> = outgoing
                 .iter()
-                .filter_map(|cid| {
-                    let s = chunk_start_at(&space, *cid)?;
-                    let e = chunk_end_at(&space, *cid)?;
-                    Some(format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)))
+                .map(|cid| {
+                    match (chunk_start_at(&space, *cid), chunk_end_at(&space, *cid)) {
+                        (Some(s), Some(e)) => format!(
+                            "{} ({:x})",
+                            format_time_range(
+                                epoch_from_interval(s),
+                                epoch_end_from_interval(e)
+                            ),
+                            cid
+                        ),
+                        _ => format!("{cid:x}"),
+                    }
                 })
                 .collect();
-            println!("children: {}", child_ranges.join(", "));
+            println!("references: {}", refs.join(", "));
         }
-
-        // Hard references, both directions.
-        let outgoing: Vec<Id> =
-            find!(t: Id, pattern!(&space, [{ chunk_id @ ctx::references: ?t }])).collect();
-        if !outgoing.is_empty() {
-            let ids: Vec<String> = outgoing.iter().map(|t| format!("{t:x}")).collect();
-            println!("references: {}", ids.join(", "));
-        }
+        let superseded_set = superseded_ids(&space);
         let incoming: Vec<Id> =
-            find!(s: Id, pattern!(&space, [{ ?s @ ctx::references: chunk_id }])).collect();
+            find!(s: Id, pattern!(&space, [{ ?s @ ctx::reference: chunk_id }]))
+                .filter(|s| !superseded_set.contains(s))
+                .collect();
         if !incoming.is_empty() {
             let ids: Vec<String> = incoming.iter().map(|s| format!("{s:x}")).collect();
             println!("referenced_by: {}", ids.join(", "));
@@ -665,7 +674,7 @@ fn print_archive_meta(
 //
 // - HARD: `[why this matters here](memory:<hex>)` — a contextualised
 //   cross-reference to an exact chunk. Extracted at create into a
-//   ctx::references fact: queryable in both directions, pinned forever,
+//   ctx::reference fact: queryable in both directions, pinned forever,
 //   zero span effect, zero tree role. The bracket text carries the
 //   explanation; a bare reference without context is bad style.
 //

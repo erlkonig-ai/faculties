@@ -103,7 +103,7 @@ pub mod context {
         "DF84E872EB68FBFCA63D760F27FD8A6F" as end_at: inlineencodings::NsTAIInterval;
         "CB97C36A32DEC70E0D1149E7C5D88588" as left: inlineencodings::GenId;
         "087D07E3D9D94F0C4E96813C7BC5E74C" as right: inlineencodings::GenId;
-        "9B83D68AECD6888AA9CE95E754494768" as child: inlineencodings::GenId;
+        "9B83D68AECD6888AA9CE95E754494768" as reference: inlineencodings::GenId; // renamed from `child` (same id): annotation, not tree structure
         "316834CC6B0EA6F073BF5362D67AC530" as about_exec_result: inlineencodings::GenId;
     }
 }

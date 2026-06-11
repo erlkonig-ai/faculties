@@ -41,7 +41,19 @@ pub mod ctx {
         "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: Handle<LongString>;
         "502F7D33822A90366F0F0ADA0556177F" as start_at: NsTAIInterval;
         "DF84E872EB68FBFCA63D760F27FD8A6F" as end_at: NsTAIInterval;
-        "9B83D68AECD6888AA9CE95E754494768" as child: GenId;
+        /// Contextualised cross-reference to another chunk, extracted from
+        /// `[why this matters here](memory:<hex>)` at create. Annotation, not
+        /// structure: no span effect, no tree role — hierarchy is temporal
+        /// subsumption. Soft references use `(memory:<from>..<to>)` (an
+        /// address resolved at read time; no fact minted).
+        ///
+        /// RENAMED from `child` (2026-06-12), same id on purpose: the old
+        /// design minted these edges from the same inline-reference notation
+        /// and additionally treated them as tree structure (cover splitting,
+        /// children-union spans). The structural role is retired; legacy
+        /// edges in any pile reinterpret as what they always semantically
+        /// were — contextualised references.
+        "9B83D68AECD6888AA9CE95E754494768" as reference: GenId;
         "CB97C36A32DEC70E0D1149E7C5D88588" as left: GenId;
         "087D07E3D9D94F0C4E96813C7BC5E74C" as right: GenId;
         "316834CC6B0EA6F073BF5362D67AC530" as about_exec_result: GenId;
@@ -52,12 +64,5 @@ pub mod ctx {
         /// periphery principle). Mis-created chunks stay in history but leave
         /// every view.
         "0381735B64BFE71EA0341B95EA42C984" as supersedes: GenId;
-        /// Hard cross-reference to another chunk, extracted from contextualised
-        /// inline notation `[why this matters here](memory:<hex>)` at create.
-        /// Annotation, not structure: no span effect, no tree role — hierarchy
-        /// is temporal subsumption. Soft references use `(memory:<from>..<to>)`
-        /// (an address resolved at read time; no fact minted). Hard refs pin an
-        /// exact chunk forever — "no way to get them confused or wrong".
-        "A0947F0FD899506B62B2C1DA63BACC05" as references: GenId;
     }
 }
