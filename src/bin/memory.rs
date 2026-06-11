@@ -286,10 +286,12 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
              Create a memory chunk and store it in the pile.\n\
              An optional time range as the first argument grounds the\n\
              memory in that period. Without it, defaults to now.\n\
-             Reference other moments in prose as (memory:<from>..<to>) —\n\
-             that is notation for a temporal address, resolved by range\n\
-             query at read time. It creates no structure: containment\n\
-             relates chunks, and the explicit range argument always wins."
+             References in prose: (memory:<from>..<to>) is a soft temporal\n\
+             address, resolved by range query at read time, no fact minted.\n\
+             [why it matters](memory:<hex>) is a hard reference to an exact\n\
+             chunk, extracted into a queryable ctx::references fact. Neither\n\
+             affects the span or the hierarchy: containment relates chunks,\n\
+             and the explicit range argument always wins."
         );
     }
 
@@ -312,20 +314,35 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         bail!("summary text is required: memory create [<from>..<to>] <summary...>");
     }
 
+    // Hard references: [context](memory:<hex>) → ctx::references facts.
+    // Resolved against the catalog so a dangling hard ref fails at write
+    // time (that is the point of the hard form). No span or tree effect.
+    let hard_refs = scan_hard_references(&summary_text);
+
     with_repo(pile_path, |repo| {
         let branch_id = repo
             .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
             .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
 
+        let mut reference_ids: Vec<Id> = Vec::new();
+        if !hard_refs.is_empty() {
+            let catalog = {
+                let mut ws = repo
+                    .pull(branch_id)
+                    .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+                ws.checkout(..).context("checkout memory branch")?
+            };
+            for hex in &hard_refs {
+                let target = resolve_chunk_id(&catalog, hex)
+                    .map_err(|e| anyhow!("hard reference (memory:{hex}): {e}"))?;
+                reference_ids.push(target);
+            }
+        }
+
         // Time span: explicit range or now. Loose coupling throughout —
         // provenance is recovered by time-range query at read-time (see the
         // `provenance` subcommand), and chunk-to-chunk relation is temporal
         // containment (a finer chunk inside a coarser span is its refinement).
-        // (memory:<from>..<to>) in summary prose is pure notation for a
-        // temporal address — resolved at read time, never creating edges or
-        // overriding the explicit range. Historical note: create used to mint
-        // ctx::child edges from such references and let their union override
-        // the typed range; both behaviors are gone (addresses are not links).
         let (start_at, end_at) = if let Some((range_start, range_end)) = explicit_range {
             let start_val: Inline<NsTAIInterval> = (range_start, range_start).try_to_inline().unwrap();
             let end_val: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
@@ -355,6 +372,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             metadata::created_at: created_at,
             ctx::start_at: start_at,
             ctx::end_at: end_at,
+            ctx::references*: reference_ids.iter(),
         };
 
         ws.commit(change, "memory create");
@@ -536,6 +554,20 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
             println!("children: {}", child_ranges.join(", "));
         }
 
+        // Hard references, both directions.
+        let outgoing: Vec<Id> =
+            find!(t: Id, pattern!(&space, [{ chunk_id @ ctx::references: ?t }])).collect();
+        if !outgoing.is_empty() {
+            let ids: Vec<String> = outgoing.iter().map(|t| format!("{t:x}")).collect();
+            println!("references: {}", ids.join(", "));
+        }
+        let incoming: Vec<Id> =
+            find!(s: Id, pattern!(&space, [{ ?s @ ctx::references: chunk_id }])).collect();
+        if !incoming.is_empty() {
+            let ids: Vec<String> = incoming.iter().map(|s| format!("{s:x}")).collect();
+            println!("referenced_by: {}", ids.join(", "));
+        }
+
         if let Some(exec_id) = chunk_about_exec_result(&space, chunk_id) {
             println!("about_exec_result: {exec_id:x}");
         }
@@ -623,13 +655,44 @@ fn print_archive_meta(
 // reference notation
 // ---------------------------------------------------------------------------
 //
-// `(memory:<from>..<to>)` in summary prose is NOTATION for a temporal
-// address: human-readable, machine-recognizable, resolved by range query at
-// read time (a viewer can make these spans navigable). It is deliberately
-// NOT parsed at write time — addresses are not links. create() once minted
-// ctx::child edges from these references and let their union override the
-// typed range; that machinery is gone (it silently turned prose into
-// structure, and structure into wrong spans).
+// Two reference forms live in summary prose (settled design, restored after
+// the 2026-06-12 over-steer; see the practice fragment in the wiki):
+//
+// - SOFT: `(memory:<from>..<to>)` — a temporal address. Human-readable,
+//   machine-recognizable, resolved by range query at read time against
+//   whatever the best chunk then is. Deliberately NOT parsed at write time;
+//   no fact is minted. Addresses are not links.
+//
+// - HARD: `[why this matters here](memory:<hex>)` — a contextualised
+//   cross-reference to an exact chunk. Extracted at create into a
+//   ctx::references fact: queryable in both directions, pinned forever,
+//   zero span effect, zero tree role. The bracket text carries the
+//   explanation; a bare reference without context is bad style.
+//
+// Hierarchy is temporal subsumption only. create() once minted ctx::child
+// edges from references and let their union OVERRIDE the typed range; that
+// conflation of reference with structure is gone for good.
+
+/// Extract hard references `[text](memory:<hex>)` from summary prose.
+/// Returns the hex values; range-form references are soft and stay unparsed.
+fn scan_hard_references(text: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("](memory:") {
+        let after = &rest[start + 9..];
+        if let Some(end) = after.find(')') {
+            let value = after[..end].trim();
+            if !value.is_empty()
+                && !value.contains("..")
+                && value.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                refs.push(value.to_string());
+            }
+        }
+        rest = &rest[start + 9..];
+    }
+    refs
+}
 
 /// Extract `[text](faculty:<hex>)` markdown link references from text.
 /// Returns (faculty, raw_value) pairs for non-memory faculties.

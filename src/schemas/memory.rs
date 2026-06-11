@@ -52,5 +52,12 @@ pub mod ctx {
         /// periphery principle). Mis-created chunks stay in history but leave
         /// every view.
         "0381735B64BFE71EA0341B95EA42C984" as supersedes: GenId;
+        /// Hard cross-reference to another chunk, extracted from contextualised
+        /// inline notation `[why this matters here](memory:<hex>)` at create.
+        /// Annotation, not structure: no span effect, no tree role — hierarchy
+        /// is temporal subsumption. Soft references use `(memory:<from>..<to>)`
+        /// (an address resolved at read time; no fact minted). Hard refs pin an
+        /// exact chunk forever — "no way to get them confused or wrong".
+        "A0947F0FD899506B62B2C1DA63BACC05" as references: GenId;
     }
 }
