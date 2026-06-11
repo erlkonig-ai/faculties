@@ -26,7 +26,6 @@ use triblespace::prelude::*;
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
-             memory link <parent> <child>...  — add child edges to an existing chunk (retroactive deepening)\n  \
              memory respan <id> <from>..<to>  — correct a chunk's span (new chunk supersedes old; views exclude old)\n  \
              memory supersede <new> <old>     — mark an existing chunk as replacing another (old leaves all views)\n  \
              memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
@@ -219,9 +218,6 @@ fn main() -> Result<()> {
     if cli.ids.first().is_some_and(|value| value == "meta") {
         return cmd_meta(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
     }
-    if cli.ids.first().is_some_and(|value| value == "link") {
-        return cmd_link(&cli.pile, &cli.ids[1..]);
-    }
     if cli.ids.first().is_some_and(|value| value == "respan") {
         return cmd_respan(&cli.pile, &cli.ids[1..]);
     }
@@ -288,9 +284,12 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             "usage: memory create [<from>..<to>] <summary...>\n\
              \n\
              Create a memory chunk and store it in the pile.\n\
-             Scans summary for (memory:<range>) links to infer children.\n\
              An optional time range as the first argument grounds the\n\
-             memory in that period. Without it, defaults to now."
+             memory in that period. Without it, defaults to now.\n\
+             Reference other moments in prose as (memory:<from>..<to>) —\n\
+             that is notation for a temporal address, resolved by range\n\
+             query at read time. It creates no structure: containment\n\
+             relates chunks, and the explicit range argument always wins."
         );
     }
 
@@ -313,63 +312,21 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         bail!("summary text is required: memory create [<from>..<to>] <summary...>");
     }
 
-    // Scan summary for (memory:<range>) references.
-    let memory_refs = scan_memory_links(&summary_text);
-
     with_repo(pile_path, |repo| {
         let branch_id = repo
             .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
             .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
 
-        // Resolve memory: references against memory branch chunks.
-        let mut child_ids: Vec<Id> = Vec::new();
-        let mut children_start: Option<Inline<NsTAIInterval>> = None;
-        let mut children_end: Option<Inline<NsTAIInterval>> = None;
-
-        if !memory_refs.is_empty() {
-            let ctx_catalog = {
-                let mut ws = repo
-                    .pull(branch_id)
-                    .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-                ws.checkout(..).context("checkout memory branch")?
-            };
-            for link in &memory_refs {
-                let chunk_id = match link {
-                    MemoryLink::TimeRange(raw, start, end) => {
-                        find_chunk_by_time_range(&ctx_catalog, *start, *end)
-                            .ok_or_else(|| anyhow!("memory link (memory:{raw}) does not match any chunk"))?
-                    }
-                    MemoryLink::HexId(hex) => {
-                        resolve_chunk_id(&ctx_catalog, hex)
-                            .map_err(|e| anyhow!("memory link (memory:{hex}): {e}"))?
-                    }
-                };
-                child_ids.push(chunk_id);
-                // Track union time span of children.
-                if let Some(start_v) = chunk_start_at(&ctx_catalog, chunk_id) {
-                    match children_start {
-                        Some(prev) if interval_key(prev) <= interval_key(start_v) => {}
-                        _ => children_start = Some(start_v),
-                    }
-                }
-                if let Some(end_v) = chunk_end_at(&ctx_catalog, chunk_id) {
-                    match children_end {
-                        Some(prev) if interval_key(prev) >= interval_key(end_v) => {}
-                        _ => children_end = Some(end_v),
-                    }
-                }
-            }
-        }
-
-        // Infer time span. Loose coupling: chunks no longer attach about_exec_result /
-        // about_archive_message references at write-time. Provenance is recovered by
-        // time-range query against the cognition / archive branches at read-time (see
-        // the `provenance` subcommand). Re-importing archive data after a chunk was
-        // written automatically associates it with the chunk by overlapping range —
-        // no rewrite pass needed.
-        let (start_at, end_at) = if let (Some(s), Some(e)) = (children_start, children_end) {
-            (s, e)
-        } else if let Some((range_start, range_end)) = explicit_range {
+        // Time span: explicit range or now. Loose coupling throughout —
+        // provenance is recovered by time-range query at read-time (see the
+        // `provenance` subcommand), and chunk-to-chunk relation is temporal
+        // containment (a finer chunk inside a coarser span is its refinement).
+        // (memory:<from>..<to>) in summary prose is pure notation for a
+        // temporal address — resolved at read time, never creating edges or
+        // overriding the explicit range. Historical note: create used to mint
+        // ctx::child edges from such references and let their union override
+        // the typed range; both behaviors are gone (addresses are not links).
+        let (start_at, end_at) = if let Some((range_start, range_end)) = explicit_range {
             let start_val: Inline<NsTAIInterval> = (range_start, range_start).try_to_inline().unwrap();
             let end_val: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
             (start_val, end_val)
@@ -400,10 +357,6 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             ctx::end_at: end_at,
         };
 
-        for child_id in &child_ids {
-            change += entity! { &chunk_id @ ctx::child: *child_id };
-        }
-
         ws.commit(change, "memory create");
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push failed: {e:?}"))?;
@@ -414,70 +367,6 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         );
         println!("range: {range_str}");
         println!("id: {:x}", chunk_id.id);
-        Ok(())
-    })
-}
-
-// ---------------------------------------------------------------------------
-// link subcommand
-// ---------------------------------------------------------------------------
-
-/// Add child edges to an existing chunk. Supports retroactive deepening:
-/// finer episodic leaves written later nest under an already-existing parent,
-/// so the cover algorithm can split the parent into them. The parent's stored
-/// start_at/end_at are NOT widened — retroactive children are expected to lie
-/// inside the parent's span (deepening, not extension).
-fn cmd_link(pile_path: &Path, args: &[String]) -> Result<()> {
-    if args.len() < 2 {
-        bail!(
-            "usage: memory link <parent-id> <child-id>...\n\
-             \n\
-             Adds ctx::child edges from parent to each child (hex id prefixes).\n\
-             Use for retroactive deepening: nest finer episodic leaves under an\n\
-             existing parent chunk after the fact."
-        );
-    }
-
-    with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout memory branch")?;
-
-        let parent = resolve_chunk_id(&space, &args[0])
-            .map_err(|e| anyhow!("parent {}: {e}", args[0]))?;
-        let parent_entity = parent
-            .acquire()
-            .unwrap_or_else(|| triblespace::core::id::ExclusiveId::force(parent));
-
-        let existing = chunk_children(&space, parent);
-        let mut change = TribleSet::new();
-        let mut linked = 0usize;
-        for raw in &args[1..] {
-            let child = resolve_chunk_id(&space, raw)
-                .map_err(|e| anyhow!("child {raw}: {e}"))?;
-            if child == parent {
-                bail!("refusing to link {raw} to itself");
-            }
-            if existing.contains(&child) {
-                println!("already linked: {child:x}");
-                continue;
-            }
-            change += entity! { &parent_entity @ ctx::child: child };
-            linked += 1;
-        }
-
-        if change.is_empty() {
-            println!("nothing to do");
-            return Ok(());
-        }
-        ws.commit(change, "memory link");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push failed: {e:?}"))?;
-        println!("linked {linked} child(ren) under {parent:x}");
         Ok(())
     })
 }
@@ -731,44 +620,16 @@ fn print_archive_meta(
 }
 
 // ---------------------------------------------------------------------------
-// memory link scanning and time-range entity resolution
+// reference notation
 // ---------------------------------------------------------------------------
-
-/// A parsed memory link — either a time range or a hex ID prefix.
-enum MemoryLink {
-    TimeRange(String, Epoch, Epoch),
-    HexId(String),
-}
-
-/// Scan text for memory references in two formats:
-/// - `(memory:<value>)` — legacy parenthesized format
-/// - `[text](memory:<value>)` — markdown link format (preferred)
-/// Value can be a time range (`from..to`) or a hex ID prefix.
-fn scan_memory_links(text: &str) -> Vec<MemoryLink> {
-    let mut refs = Vec::new();
-    let mut remaining = text;
-
-    // Match both `](memory:` (markdown link) and `(memory:` (legacy).
-    // The markdown form `](memory:...)` is a superset — the `(memory:` scan
-    // catches both, since `](memory:` contains `(memory:`.
-    while let Some(start) = remaining.find("(memory:") {
-        let after = &remaining[start + 8..];
-        if let Some(end) = after.find(')') {
-            let value = after[..end].trim();
-            if value.contains("..") {
-                if let Ok((from, to)) = parse_time_range(value) {
-                    refs.push(MemoryLink::TimeRange(value.to_string(), from, to));
-                }
-            } else if !value.is_empty()
-                && value.chars().all(|c| c.is_ascii_hexdigit())
-            {
-                refs.push(MemoryLink::HexId(value.to_string()));
-            }
-        }
-        remaining = &remaining[start + 8..];
-    }
-    refs
-}
+//
+// `(memory:<from>..<to>)` in summary prose is NOTATION for a temporal
+// address: human-readable, machine-recognizable, resolved by range query at
+// read time (a viewer can make these spans navigable). It is deliberately
+// NOT parsed at write time — addresses are not links. create() once minted
+// ctx::child edges from these references and let their union override the
+// typed range; that machinery is gone (it silently turned prose into
+// structure, and structure into wrong spans).
 
 /// Extract `[text](faculty:<hex>)` markdown link references from text.
 /// Returns (faculty, raw_value) pairs for non-memory faculties.
