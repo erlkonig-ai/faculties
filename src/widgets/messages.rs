@@ -139,6 +139,11 @@ impl MessageRow {
     fn sort_key(&self) -> i128 {
         self.created_at.unwrap_or(i128::MIN)
     }
+
+    /// True when `id` has filed a read receipt for this message.
+    fn read_by(&self, id: Id) -> bool {
+        self.reads.iter().any(|(reader, _)| *reader == id)
+    }
 }
 
 /// Everything we know about a person for UI purposes.
@@ -148,6 +153,10 @@ struct Person {
     first_name: Option<String>,
     last_name: Option<String>,
     display_name: Option<String>,
+    /// True when the relations entry carries the `operator` affinity —
+    /// i.e. this is a human the agents work for, not another zooid.
+    /// Messages addressed to an operator form the "inbox" subset.
+    is_operator: bool,
 }
 
 impl Person {
@@ -401,6 +410,19 @@ fn build_people(
         }
     }
 
+    // Operator detection — the `operator` affinity marks humans the
+    // agents work for. Their inbound messages form the inbox subset.
+    for (pid, affinity) in find!(
+        (pid: Id, a: String),
+        pattern!(relations_space, [{ ?pid @ rel::affinity: ?a }])
+    ) {
+        if affinity.eq_ignore_ascii_case("operator") {
+            if let Some(p) = people.get_mut(&pid) {
+                p.is_operator = true;
+            }
+        }
+    }
+
     people
 }
 
@@ -411,14 +433,29 @@ fn build_people(
 /// read-receipts for inbound messages.
 ///
 /// See the module docs for construction examples.
+/// Which subset of the stream to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamFilter {
+    /// Everything — intra-zooid traffic included.
+    All,
+    /// Only messages addressed to an operator (a relations entry with
+    /// the `operator` affinity) — the human's inbox.
+    Inbox,
+}
+
 pub struct MessagesPanel {
     /// Rebuilt when the messages / relations head changes.
     live: Option<MessagesLive>,
+    /// Current stream filter — toggled via the ALL / INBOX chips.
+    filter: StreamFilter,
 }
 
 impl Default for MessagesPanel {
     fn default() -> Self {
-        Self { live: None }
+        Self {
+            live: None,
+            filter: StreamFilter::All,
+        }
     }
 }
 
@@ -458,6 +495,7 @@ impl MessagesPanel {
             ));
         }
 
+        let filter = &mut self.filter;
         ctx.section("Messages", |ctx| {
             let Some(live) = self.live.as_ref() else { return };
 
@@ -489,6 +527,26 @@ impl MessagesPanel {
                 .max()
                 .map(|k| format_age_key(now, k));
 
+            // Inbox stats: messages addressed to an operator (a human
+            // per the relations `operator` affinity); unread = the
+            // recipient hasn't filed a read receipt yet.
+            let is_inbox = |m: &MessageRow| {
+                live.people
+                    .get(&m.to)
+                    .map_or(false, |p| p.is_operator)
+            };
+            let inbox_total = messages.iter().filter(|m| is_inbox(m)).count();
+            let inbox_unread = messages
+                .iter()
+                .filter(|m| is_inbox(m) && !m.read_by(m.to))
+                .count();
+            // No operators in relations → no inbox notion; pin the
+            // filter back to ALL so the chip row doesn't strand the
+            // view on a permanently-empty subset.
+            if inbox_total == 0 {
+                *filter = StreamFilter::All;
+            }
+
             // Open a notebook-wide search session — makes the bar
             // appear in the top-right and lets us filter messages by
             // body / from-name / to-name substring.
@@ -497,18 +555,49 @@ impl MessagesPanel {
             let search_active = !needle.is_empty();
 
             ctx.grid(|g| {
-                // Header row: count on the left, "LAST <age>" right.
+                // Header row: filter chips + count on the left,
+                // "LAST <age>" right.
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(
-                            egui::RichText::new(format!("{count} MESSAGES"))
-                                .monospace()
-                                .strong()
-                                .small()
-                                .color(color_muted(ui)),
-                        );
+
+                        // Filter chips — only offered when an inbox
+                        // notion exists (some relations entry carries
+                        // the operator affinity and has mail).
+                        if inbox_total > 0 {
+                            let all_label = format!("ALL {count}");
+                            let inbox_label = if inbox_unread > 0 {
+                                format!(
+                                    "\u{1F4E5} INBOX {inbox_total} · {inbox_unread} NEW"
+                                )
+                            } else {
+                                format!("\u{1F4E5} INBOX {inbox_total}")
+                            };
+                            if render_filter_chip(
+                                ui,
+                                &all_label,
+                                *filter == StreamFilter::All,
+                            ) {
+                                *filter = StreamFilter::All;
+                            }
+                            if render_filter_chip(
+                                ui,
+                                &inbox_label,
+                                *filter == StreamFilter::Inbox,
+                            ) {
+                                *filter = StreamFilter::Inbox;
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!("{count} MESSAGES"))
+                                    .monospace()
+                                    .strong()
+                                    .small()
+                                    .color(color_muted(ui)),
+                            );
+                        }
+
                         if let Some(age) = latest_age.as_ref() {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -545,6 +634,10 @@ impl MessagesPanel {
                 // arrival/stickiness state machine — the viewer is
                 // read-only, so the user just scrolls the notebook.
                 for msg in &messages {
+                    let msg_is_inbox = is_inbox(msg);
+                    if *filter == StreamFilter::Inbox && !msg_is_inbox {
+                        continue;
+                    }
                     if search_active && !message_matches_search(msg, &names, &needle) {
                         continue;
                     }
@@ -555,10 +648,20 @@ impl MessagesPanel {
                     };
                     let is_focused =
                         match_info.as_ref().map_or(false, |i| i.is_focused);
+                    let inbox_unread_msg = msg_is_inbox && !msg.read_by(msg.to);
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
-                        render_message(ui, msg, now, &names, &needle, is_focused);
+                        render_message(
+                            ui,
+                            msg,
+                            now,
+                            &names,
+                            &needle,
+                            is_focused,
+                            msg_is_inbox,
+                            inbox_unread_msg,
+                        );
                         if let Some(info) = match_info {
                             if info.should_scroll_to {
                                 let post_y = ui.cursor().min.y;
@@ -604,6 +707,51 @@ fn message_matches_search(
     false
 }
 
+/// Toggle chip for the stream filter. Active chip fills with RAL 1003
+/// signal yellow; inactive renders on the frame colour. Returns true
+/// on click.
+fn render_filter_chip(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+    let (fill, text) = if active {
+        let fill = egui::Color32::from_rgb(0xf7, 0xba, 0x0b); // RAL 1003
+        (fill, colorhash::text_color_on(fill))
+    } else {
+        (color_frame(ui), color_muted(ui))
+    };
+    let resp = ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .monospace()
+                .small()
+                .strong()
+                .color(text),
+        )
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::ZERO)
+        .min_size(egui::vec2(0.0, 18.0)),
+    );
+    resp.clicked()
+}
+
+/// Small filled badge used for 📥 INBOX / NEW markers in the bubble
+/// header row.
+fn render_badge(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
+    let text = colorhash::text_color_on(fill);
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(label)
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(text),
+            );
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_message(
     ui: &mut egui::Ui,
     msg: &MessageRow,
@@ -615,6 +763,12 @@ fn render_message(
     // makes every needle occurrence inside render with the double
     // underline (same emphasis the typst widget uses).
     focused: bool,
+    // True when the recipient is an operator (human) — gets an 📥
+    // badge so operator-directed mail stands out in the ALL stream.
+    is_inbox: bool,
+    // True when an inbox message has no read receipt from its
+    // recipient yet — gets a NEW badge in RAL 1003.
+    is_unread: bool,
 ) {
     let bubble_fill = ui.visuals().window_fill;
     let from_color = person_color(msg.from);
@@ -674,6 +828,32 @@ fn render_message(
                     if let Some(h) = hover {
                         resp.on_hover_text(h);
                     }
+
+                    // Inbox badges flow in from the LEFT edge of this
+                    // right-to-left row, i.e. they render before the
+                    // age. NEW (RAL 1003) only while the operator
+                    // hasn't read-receipted; 📥 marks operator mail
+                    // permanently so it stands out in the ALL stream.
+                    ui.with_layout(
+                        egui::Layout::left_to_right(egui::Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if is_inbox {
+                                render_badge(
+                                    ui,
+                                    "\u{1F4E5} INBOX",
+                                    egui::Color32::from_rgb(0x23, 0x7f, 0x52), // RAL 6032
+                                );
+                            }
+                            if is_unread {
+                                render_badge(
+                                    ui,
+                                    "NEW",
+                                    egui::Color32::from_rgb(0xf7, 0xba, 0x0b), // RAL 1003
+                                );
+                            }
+                        },
+                    );
                 },
             );
 
