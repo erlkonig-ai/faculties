@@ -14,6 +14,10 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
+use faculties::schemas::archive::{KIND_SEARCH_INDEX, search_index};
+use triblespace_search::bm25::BM25Builder;
+use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
+use triblespace_search::tokens::hash_tokens;
 
 #[path = "importers/archive_import_chatgpt.rs"]
 mod archive_import_chatgpt;
@@ -376,16 +380,24 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
-    /// Search message content (substring match).
+    /// Search message content (BM25-ranked via the index; see `--exact`).
     Search {
-        #[arg(help = "Substring to search for. Use @path for file input or @- for stdin.")]
+        #[arg(help = "Query text. Use @path for file input or @- for stdin.")]
         text: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Use case-sensitive matching.
+        /// Use case-sensitive matching (implies --exact).
         #[arg(long)]
         case_sensitive: bool,
+        /// Exact substring scan over every message blob instead of the
+        /// BM25 index — slow at archive scale, but needs no index.
+        #[arg(long)]
+        exact: bool,
     },
+    /// Build (or refresh) the BM25 search index over message content.
+    /// Rebuild-and-replace: each run mints a fresh index entity; search
+    /// uses the latest.
+    Index,
     /// List imported conversations.
     Imports {
         format: Option<String>,
@@ -1515,8 +1527,100 @@ fn main() -> Result<()> {
                 text,
                 limit,
                 case_sensitive,
+                exact,
             } => {
                 let text = load_value_or_file(&text, "search text")?;
+                if !(exact || case_sensitive) {
+                    // BM25 path: ranked match via the latest index entity.
+                    let latest = find!(
+                        (h: Inline<Handle<SuccinctBM25Blob>>, at: Inline<NsTAIInterval>),
+                        pattern!(&catalog, [{
+                            _?e @
+                                common::metadata::tag: KIND_SEARCH_INDEX,
+                                search_index::index: ?h,
+                                search_index::indexed_at: ?at,
+                        }])
+                    )
+                    .max_by_key(|(_, at)| {
+                        let (lower, _): (i128, i128) = at.try_from_inline().unwrap();
+                        lower
+                    });
+                    let Some((handle, _at)) = latest else {
+                        bail!(
+                            "no search index on this pile yet — run `archive index` \
+                             first, or use --exact for a substring scan"
+                        );
+                    };
+                    let idx: SuccinctBM25Index =
+                        ws.get(handle).context("load search index")?;
+
+                    // One scored postings walk over the whole index —
+                    // never score per-doc (that re-walks postings per
+                    // match and goes quadratic on common terms).
+                    let mut rows: Vec<(Id, f32)> = idx
+                        .query_multi(&hash_tokens(&text))
+                        .into_iter()
+                        .filter_map(|(doc, score)| {
+                            let id: Id = doc.try_from_inline().ok()?;
+                            Some((id, score))
+                        })
+                        .collect();
+                    rows.sort_unstable_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    let live = find!(
+                        m: Id,
+                        pattern!(&catalog, [{
+                            ?m @ common::metadata::tag: common::archive::kind_message,
+                        }])
+                    )
+                    .count();
+                    if live > idx.doc_count() {
+                        eprintln!(
+                            "note: {} message(s) newer than the index — run `archive index` to refresh",
+                            live - idx.doc_count()
+                        );
+                    }
+
+                    for (message_id, score) in rows.into_iter().take(limit) {
+                        let Some((author_id, content_handle, created_at)) = find!(
+                            (
+                                author: Id,
+                                content: Inline<Handle<LongString>>,
+                                created_at: Inline<NsTAIInterval>
+                            ),
+                            pattern!(&catalog, [{
+                                message_id @
+                                    common::archive::author: ?author,
+                                    common::archive::content: ?content,
+                                    common::metadata::created_at: ?created_at,
+                            }])
+                        )
+                        .next() else {
+                            continue;
+                        };
+                        let content = load_longstring(&mut ws, content_handle)?;
+                        let name = author_name(&mut ws, &catalog, author_id)?;
+                        let role = author_role(&mut ws, &catalog, author_id)?;
+                        let (lower, _upper): (Epoch, Epoch) =
+                            created_at.try_from_inline().unwrap();
+                        let role = role.as_deref().unwrap_or("");
+                        println!(
+                            "{score:7.2} {} {} {} {}",
+                            &format!("{message_id:x}")[..8],
+                            lower,
+                            if role.is_empty() {
+                                name
+                            } else {
+                                format!("{name} ({role})")
+                            },
+                            snippet(&content, 120)
+                        );
+                    }
+                    return Ok(());
+                }
+
                 let needle = if case_sensitive {
                     text
                 } else {
@@ -1575,6 +1679,43 @@ fn main() -> Result<()> {
                         snippet(&content, 120)
                     );
                 }
+            }
+            Command::Index => {
+                let mut builder: BM25Builder = BM25Builder::new();
+                let mut count = 0usize;
+                for (message_id, content_handle) in find!(
+                    (message: Id, content: Inline<Handle<LongString>>),
+                    pattern!(&catalog, [{
+                        ?message @
+                            common::metadata::tag: common::archive::kind_message,
+                            common::archive::content: ?content,
+                    }])
+                ) {
+                    let content = load_longstring(&mut ws, content_handle)?;
+                    builder.insert(&message_id, hash_tokens(&content));
+                    count += 1;
+                    if count % 100_000 == 0 {
+                        eprintln!("  …{count} messages tokenized");
+                    }
+                }
+                eprintln!("building succinct index over {count} message(s)…");
+                let idx = builder.build();
+                let handle = ws.put(&idx);
+                let now = Epoch::now()
+                    .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+                let at: Inline<NsTAIInterval> = (now, now)
+                    .try_to_inline()
+                    .map_err(|e| anyhow!("encode timestamp: {e:?}"))?;
+                let mut change = TribleSet::new();
+                change += entity! { _ @
+                    common::metadata::tag: &KIND_SEARCH_INDEX,
+                    search_index::index: handle,
+                    search_index::indexed_at: at,
+                };
+                ws.commit(change, "archive index");
+                repo.push(&mut ws)
+                    .map_err(|e| anyhow!("push archive index: {e:?}"))?;
+                println!("indexed {count} message(s)");
             }
             Command::Imports { format, limit } => {
                 let format_filter = format.map(|s| s.to_lowercase());

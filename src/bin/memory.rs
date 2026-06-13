@@ -6,8 +6,12 @@ use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::memory::{
     DEFAULT_ARCHIVE_BRANCH, DEFAULT_COGNITION_BRANCH, DEFAULT_MEMORY_BRANCH, KIND_ARCHIVE_MESSAGE,
-    KIND_CHUNK_ID, KIND_EXEC_RESULT, archive_import_schema, archive_schema, comb, ctx,
+    KIND_CHUNK_ID, KIND_EXEC_RESULT, KIND_SEARCH_INDEX, archive_import_schema, archive_schema,
+    comb, ctx, search_index,
 };
+use triblespace_search::bm25::BM25Builder;
+use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
+use triblespace_search::tokens::hash_tokens;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use triblespace::core::metadata;
@@ -207,6 +211,141 @@ fn find_chunk_by_time_range(
     best_cover.map(|(id, _)| id).or(best_overlap.map(|(id, _)| id))
 }
 
+// ── BM25 search over chunk summaries ─────────────────────────────────
+// Index entities are rebuild-and-replace: `memory index` mints a fresh
+// (KIND_SEARCH_INDEX, blob handle, indexed_at) entity; `memory search`
+// reads the latest by timestamp. Superseded chunks are excluded at
+// build time, and again at query time in case the index is stale.
+
+fn now_interval() -> Result<Inline<NsTAIInterval>> {
+    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    (now, now)
+        .try_to_inline()
+        .map_err(|e| anyhow!("encode timestamp: {e:?}"))
+}
+
+/// Latest (handle, indexed_at) search-index entity, if any.
+fn latest_search_index(
+    space: &TribleSet,
+) -> Option<(Inline<Handle<SuccinctBM25Blob>>, Inline<NsTAIInterval>)> {
+    find!(
+        (h: Inline<Handle<SuccinctBM25Blob>>, at: Inline<NsTAIInterval>),
+        pattern!(space, [{
+            _?e @
+            metadata::tag: &KIND_SEARCH_INDEX,
+            search_index::index: ?h,
+            search_index::indexed_at: ?at,
+        }])
+    )
+    .max_by_key(|(_, at)| interval_key(*at))
+}
+
+fn cmd_index(pile_path: &Path) -> Result<()> {
+    with_repo(pile_path, |repo| {
+        let branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout memory branch")?;
+
+        let superseded = superseded_ids(&space);
+        let mut builder: BM25Builder = BM25Builder::new();
+        let mut indexed = 0usize;
+        for chunk in find!(id: Id, pattern!(&space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])) {
+            if superseded.contains(&chunk) {
+                continue;
+            }
+            let Some(handle) = chunk_summary_handle(&space, chunk) else {
+                continue;
+            };
+            let summary: View<str> = ws.get(handle).context("read chunk summary")?;
+            builder.insert(&chunk, hash_tokens(summary.as_ref()));
+            indexed += 1;
+        }
+        let idx = builder.build();
+        let handle = ws.put(&idx);
+        let at = now_interval()?;
+        let mut change = TribleSet::new();
+        change += entity! { _ @
+            metadata::tag: &KIND_SEARCH_INDEX,
+            search_index::index: handle,
+            search_index::indexed_at: at,
+        };
+        ws.commit(change, "memory index");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push failed: {e:?}"))?;
+        println!(
+            "indexed {indexed} chunk summaries ({} superseded excluded)",
+            superseded.len()
+        );
+        Ok(())
+    })
+}
+
+fn cmd_search(pile_path: &Path, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: memory search <query words...>");
+    }
+    let query = args.join(" ");
+    with_repo(pile_path, |repo| {
+        let branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout memory branch")?;
+
+        let Some((handle, _at)) = latest_search_index(&space) else {
+            bail!("no search index on this pile yet — run `memory index` first");
+        };
+        let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
+
+        let superseded = superseded_ids(&space);
+        // One scored postings walk over the whole index — never score
+        // per-doc (that re-walks postings per match and goes quadratic
+        // on common terms). The index only contains chunk docs by
+        // construction; superseded is re-filtered here in case chunks
+        // were superseded after the index was built.
+        let mut rows: Vec<(Id, f32)> = idx
+            .query_multi(&hash_tokens(&query))
+            .into_iter()
+            .filter_map(|(doc, score)| {
+                let id: Id = doc.try_from_inline().ok()?;
+                (!superseded.contains(&id)).then_some((id, score))
+            })
+            .collect();
+        rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Staleness hint: the index is rebuild-and-replace, so chunks
+        // written since the last `memory index` aren't searchable yet.
+        let live = find!(id: Id, pattern!(&space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }]))
+            .filter(|id| !superseded.contains(id))
+            .count();
+        if live > idx.doc_count() {
+            eprintln!(
+                "note: {} chunk(s) newer than the index — run `memory index` to refresh",
+                live - idx.doc_count()
+            );
+        }
+
+        if rows.is_empty() {
+            println!("no matches.");
+            return Ok(());
+        }
+        for (chunk, score) in rows.into_iter().take(10) {
+            let summary = chunk_summary_handle(&space, chunk)
+                .and_then(|h| ws.get::<View<str>, LongString>(h).ok())
+                .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
+                .unwrap_or_default();
+            println!("{score:6.2}  {chunk:x}  {summary}");
+        }
+        Ok(())
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.ids.is_empty() {
@@ -237,6 +376,12 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "replay") {
         return cmd_replay(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "index") {
+        return cmd_index(&cli.pile);
+    }
+    if cli.ids.first().is_some_and(|value| value == "search") {
+        return cmd_search(&cli.pile, &cli.ids[1..]);
     }
 
     let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref())?;

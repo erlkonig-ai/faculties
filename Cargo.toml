@@ -109,6 +109,7 @@ ed25519-dalek = "2.1.1"
 hifitime = "4.2.3"
 rand_core = "0.6.4"
 triblespace = { version = "0.46" }
+triblespace-search = { version = "0.46.4" }
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).
 anybytes = "0.20"           # files
@@ -142,6 +143,3 @@ typst-syntax = "0.14"       # wiki
 GORBIE = { version = "0.18.1", default-features = false, features = ["typst", "markdown"], optional = true }
 egui = { version = "0.34", optional = true }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu", "std"], optional = true }
-
-# TEMPORARY (validation only — remove before release): build against
-# the local GORBIE working copy for the is_headless / section-default API.

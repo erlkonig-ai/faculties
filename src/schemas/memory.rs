@@ -19,6 +19,21 @@ pub const KIND_EXEC_RESULT: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
 
 pub const KIND_ARCHIVE_MESSAGE: Id = id_hex!("1A0841C92BBDA0A26EA9A8252D6ECD9B");
 
+/// Tag for BM25 search-index entities on the memory branch. Each
+/// `memory index` run mints a fresh entity (kind + blob handle +
+/// indexed_at); readers take the latest by `indexed_at` — indexes are
+/// rebuild-and-replace, the history is just exhaust.
+pub const KIND_SEARCH_INDEX: Id = id_hex!("1C4A927F170DE0C99BD9723C164E17F9");
+
+pub mod search_index {
+    use super::*;
+    use triblespace_search::succinct::SuccinctBM25Blob;
+    attributes! {
+        "3BAF1837E1A1128042A0582CF6D71CE0" as index: Handle<SuccinctBM25Blob>;
+        "FD8C086B68F20AD04B2C70B9CE3C2BCC" as indexed_at: NsTAIInterval;
+    }
+}
+
 pub mod archive_schema {
     use super::*;
     attributes! {
