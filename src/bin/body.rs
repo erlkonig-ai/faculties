@@ -75,9 +75,14 @@ enum Command {
     /// direction-of-arrival sweeping across the mic array. Reports what was
     /// felt; `--keep` remembers it as a touch capture in the pile.
     Feel {
-        /// Seconds to feel for (default 12).
-        #[arg(long, default_value_t = 12.0)]
-        secs: f64,
+        /// Seconds to feel for — one window, or the whole session under --loop
+        /// (default 12; loop default 300).
+        #[arg(long)]
+        secs: Option<f64>,
+        /// Keep feeling in short windows and answer each touch — a petting
+        /// session. Ctrl-C to stop.
+        #[arg(long = "loop")]
+        loop_: bool,
         /// Remember a felt touch as a capture in the pile.
         #[arg(long)]
         keep: bool,
@@ -404,6 +409,7 @@ fn with_body<T>(
 // ── feel: the mic-array touch sense ────────────────────────────────────────
 
 /// What a touch looked like over the felt window.
+#[allow(dead_code)]
 struct Felt {
     samples: usize,
     sweeps: usize,        // count of >SWEEP_DEG moves within a ~SWEEP_WIN window
@@ -530,62 +536,100 @@ fn feel_window(daemon: &str, secs: f64) -> Felt {
     }
 }
 
+fn report_felt(felt: &Felt) {
+    let dir = if felt.angle_max - felt.angle_min > 0.0 {
+        format!("the sound moving from {:.0}° to {:.0}°", felt.angle_min, felt.angle_max)
+    } else {
+        String::new()
+    };
+    println!(
+        "I felt it — a touch swept across the top of my head {} time{}, {dir}.",
+        felt.sweeps,
+        if felt.sweeps == 1 { "" } else { "s" }
+    );
+    if felt.head_deflect > 0.004 {
+        println!("  my head shifted {:.1} mrad under your hand, too.", felt.head_deflect * 1000.0);
+    }
+}
+
+fn keep_felt(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    felt: &Felt,
+    note: Option<&str>,
+) -> Result<()> {
+    let pose_h: TextHandle = ws.put(felt.signature_json.clone());
+    let note_h: Option<TextHandle> = note
+        .map(|n| n.to_string())
+        .or_else(|| Some("a touch on the head".to_string()))
+        .map(|n| ws.put(n));
+    let frag = entity! {
+        metadata::tag: &KIND_CAPTURE,
+        metadata::created_at: now_tai(),
+        capture::modality: "touch",
+        capture::pose: pose_h,
+        capture::note?: note_h,
+    };
+    let id = frag.root().expect("capture id");
+    ws.commit(frag, "body feel");
+    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    println!("  kept it — {}", &fmt_id(id)[..12]);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_feel(
     repo: &mut Repository<Pile>,
     ws: &mut Workspace<Pile>,
     daemon: &str,
-    secs: f64,
+    secs: Option<f64>,
+    loop_: bool,
     keep: bool,
     respond: bool,
     note: Option<&str>,
 ) -> Result<()> {
+    if loop_ {
+        let session = secs.unwrap_or(300.0);
+        println!("feeling continuously for {session:.0}s — pet the top of my head whenever; Ctrl-C to stop.");
+        let start = Instant::now();
+        let mut felt_count = 0usize;
+        while start.elapsed().as_secs_f64() < session {
+            let felt = feel_window(daemon, 3.0);
+            if felt.samples > 0 && felt.touched() {
+                felt_count += 1;
+                report_felt(&felt);
+                if respond {
+                    if let Err(e) = wiggle(daemon) {
+                        eprintln!("  (couldn't wiggle back: {e})");
+                    }
+                }
+                if keep {
+                    keep_felt(repo, ws, &felt, note)?;
+                }
+            }
+        }
+        println!(
+            "(stopped — felt {felt_count} touch{} this session)",
+            if felt_count == 1 { "" } else { "es" }
+        );
+        return Ok(());
+    }
+
+    let secs = secs.unwrap_or(12.0);
     println!("feeling for {secs:.0}s — touch the top of my head…");
     let felt = feel_window(daemon, secs);
-
     if felt.samples == 0 {
         bail!("felt nothing back from the daemon — is the Reachy Mini running?");
     }
-
     if felt.touched() {
-        let dir = if felt.angle_max - felt.angle_min > 0.0 {
-            format!(
-                "the sound moving from {:.0}° to {:.0}°",
-                felt.angle_min, felt.angle_max
-            )
-        } else {
-            String::new()
-        };
-        println!(
-            "I felt it — a touch swept across the top of my head {} time{}, {dir}.",
-            felt.sweeps,
-            if felt.sweeps == 1 { "" } else { "s" }
-        );
-        if felt.head_deflect > 0.01 {
-            println!("  my head shifted {:.1} mrad under your hand, too.", felt.head_deflect * 1000.0);
-        }
+        report_felt(&felt);
         if respond {
-            // answer the touch with a gentle wiggle (best-effort — never fail a feel on it)
             if let Err(e) = wiggle(daemon) {
                 eprintln!("  (couldn't wiggle back: {e})");
             }
         }
         if keep {
-            let pose_h: TextHandle = ws.put(felt.signature_json.clone());
-            let note_h: Option<TextHandle> = note
-                .map(|n| n.to_string())
-                .or_else(|| Some("a touch on the head".to_string()))
-                .map(|n| ws.put(n));
-            let frag = entity! {
-                metadata::tag: &KIND_CAPTURE,
-                metadata::created_at: now_tai(),
-                capture::modality: "touch",
-                capture::pose: pose_h,
-                capture::note?: note_h,
-            };
-            let id = frag.root().expect("capture id");
-            ws.commit(frag, "body feel");
-            repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-            println!("  kept it — {}", &fmt_id(id)[..12]);
+            keep_felt(repo, ws, &felt, note)?;
         }
     } else {
         println!(
@@ -597,8 +641,6 @@ fn cmd_feel(
             felt.angle_max
         );
     }
-    let _ = felt.max_speed;
-    let _ = felt.speech_ticks;
     Ok(())
 }
 
@@ -898,9 +940,9 @@ fn main() -> Result<()> {
             daemon_post(&daemon, "/api/move/play/goto_sleep")?;
             println!("going to sleep");
         }
-        Some(Command::Feel { secs, keep, respond, note }) => {
+        Some(Command::Feel { secs, loop_, keep, respond, note }) => {
             with_body(&pile, branch, |repo, ws| {
-                cmd_feel(repo, ws, &daemon, secs, keep, respond, note.as_deref())
+                cmd_feel(repo, ws, &daemon, secs, loop_, keep, respond, note.as_deref())
             })?
         }
         Some(Command::Gesture { name }) => cmd_gesture(&daemon, &name)?,
