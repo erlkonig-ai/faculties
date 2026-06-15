@@ -114,6 +114,33 @@ enum Command {
     Wake,
     /// Gentle go-to-sleep motion (daemon-defined, bounded).
     Sleep,
+    /// Emit a RAW observation for a VLA loop as JSON: a native-resolution
+    /// frame + the 9-real state vector + the touch channel. No resize, no
+    /// normalize — the body stays dumb, the VLA owns preprocessing.
+    Observe {
+        /// Where to write the frame PNG (default a temp path).
+        #[arg(long)]
+        frame: Option<PathBuf>,
+        /// Skip the camera frame (state + touch only — fast).
+        #[arg(long)]
+        no_frame: bool,
+    },
+    /// Execute an ABSOLUTE pose target in raw SDK units — 9 reals
+    /// `x,y,z,roll,pitch,yaw,body_yaw,ant_l,ant_r` — as a single pose, or a
+    /// chunk (JSON array of 9-real arrays via @file / @-) streamed as waypoints.
+    Act {
+        /// "x,y,z,roll,pitch,yaw,body_yaw,ant_l,ant_r", or @file / @- for a chunk.
+        pose: String,
+        /// Seconds for a single smooth move (goto). Ignored when streaming a chunk.
+        #[arg(long, default_value_t = 0.5)]
+        duration: f64,
+        /// Seconds between chunk waypoints (set_target streaming).
+        #[arg(long, default_value_t = 0.04)]
+        dt: f64,
+        /// Single pose: snap immediately (set_target) instead of a smooth goto.
+        #[arg(long)]
+        now: bool,
+    },
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -256,6 +283,84 @@ fn cmd_gesture(daemon: &str, name: &str) -> Result<()> {
     }
     println!("{n}");
     Ok(())
+}
+
+/// Set an immediate absolute target (no interpolation) — the streaming
+/// primitive for a VLA action chunk. Head pose (x,y,z,roll,pitch,yaw),
+/// body yaw, antennas [l,r], all in raw SDK units. `None` leaves a channel.
+fn set_target(
+    daemon: &str,
+    head: Option<(f64, f64, f64, f64, f64, f64)>,
+    antennas: Option<[f64; 2]>,
+    body_yaw: Option<f64>,
+) -> Result<()> {
+    let mut req = serde_json::Map::new();
+    if let Some((x, y, z, roll, pitch, yaw)) = head {
+        req.insert(
+            "target_head_pose".into(),
+            serde_json::json!({"x":x,"y":y,"z":z,"roll":roll,"pitch":pitch,"yaw":yaw}),
+        );
+    }
+    if let Some(a) = antennas {
+        req.insert("target_antennas".into(), serde_json::json!(a));
+    }
+    if let Some(by) = body_yaw {
+        req.insert("target_body_yaw".into(), serde_json::json!(by));
+    }
+    daemon_post_json(daemon, "/api/move/set_target", &serde_json::Value::Object(req))
+}
+
+/// Grab one native-resolution camera frame to `out_png` via the embedded
+/// shim. Returns (width, height). The one Python island; never hangs `look`
+/// or `observe` (45s cap on cold WebRTC negotiation).
+fn grab_frame(python: &str, out_png: &Path) -> Result<(u64, u64)> {
+    let shim_path = std::env::temp_dir().join("body_frame.py");
+    std::fs::write(&shim_path, FRAME_SHIM).context("write frame shim")?;
+    let mut child = PCommand::new(python)
+        .arg(&shim_path)
+        .arg(out_png)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run frame shim with {python}"))?;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if child.try_wait().context("poll frame shim")?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("frame grab timed out after 45s (cold WebRTC negotiation stalled — retry)");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().context("collect frame shim output")?;
+    if !output.status.success() {
+        bail!("frame grab failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let dims = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(dims
+        .split_once('x')
+        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+        .unwrap_or((0, 0)))
+}
+
+/// Read the raw 9-real proprioceptive state vector
+/// [x,y,z,roll,pitch,yaw, body_yaw, ant_l, ant_r] in raw SDK units
+/// (REST gives head xyz in metres, angles in radians).
+fn read_state(daemon: &str) -> Result<[f64; 9]> {
+    let s = daemon_get(daemon, "/api/state/full")?;
+    let h = &s["head_pose"];
+    let g = |v: &serde_json::Value, k: &str| v[k].as_f64().unwrap_or(0.0);
+    let ant = s["antennas_position"].as_array().cloned().unwrap_or_default();
+    Ok([
+        g(h, "x"), g(h, "y"), g(h, "z"),
+        g(h, "roll"), g(h, "pitch"), g(h, "yaw"),
+        s["body_yaw"].as_f64().unwrap_or(0.0),
+        ant.first().and_then(|v| v.as_f64()).unwrap_or(0.0),
+        ant.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0),
+    ])
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
@@ -685,6 +790,93 @@ fn cmd_get(ws: &mut Workspace<Pile>, id: &str, output: Option<&str>) -> Result<(
     Ok(())
 }
 
+// ── VLA interface: raw observe / absolute act ──────────────────────────────
+
+fn cmd_observe(daemon: &str, python: &str, frame: Option<&Path>, no_frame: bool) -> Result<()> {
+    let state = read_state(daemon)?;
+    let touch = daemon_get(daemon, "/api/state/doa").ok();
+    let (frame_path, fw, fh) = if no_frame {
+        (None, 0u64, 0u64)
+    } else {
+        let p = frame
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::temp_dir().join("body_observe.png"));
+        let (w, h) = grab_frame(python, &p)?;
+        (Some(p), w, h)
+    };
+    let obs = serde_json::json!({
+        "t": format_time(interval_key(now_tai())),
+        "frame": frame_path.as_ref().map(|p| p.display().to_string()),
+        "frame_size": [fw, fh],
+        "state": state,
+        "state_layout": ["head_x_m","head_y_m","head_z_m","head_roll_rad","head_pitch_rad","head_yaw_rad","body_yaw_rad","antenna_l_rad","antenna_r_rad"],
+        "touch": touch.map(|d| serde_json::json!({
+            "doa_angle_rad": d["angle"].as_f64(),
+            "doa_speech": d["speech_detected"].as_bool(),
+        })),
+        "raw": true,
+        "note": "no resize/normalize — VLA owns preprocessing",
+    });
+    println!("{}", serde_json::to_string_pretty(&obs)?);
+    Ok(())
+}
+
+fn parse_pose(s: &str) -> Result<[f64; 9]> {
+    let v: Vec<f64> = s
+        .split(',')
+        .map(|x| x.trim().parse::<f64>())
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("bad pose number: {e}"))?;
+    if v.len() != 9 {
+        bail!(
+            "pose needs 9 reals (x,y,z,roll,pitch,yaw,body_yaw,ant_l,ant_r), got {}",
+            v.len()
+        );
+    }
+    Ok([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]])
+}
+
+fn cmd_act(daemon: &str, pose: &str, duration: f64, dt: f64, now: bool) -> Result<()> {
+    if let Some(spec) = pose.strip_prefix('@') {
+        let text = if spec == "-" {
+            use std::io::Read;
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        } else {
+            std::fs::read_to_string(spec).with_context(|| format!("read chunk {spec}"))?
+        };
+        let chunk: Vec<Vec<f64>> =
+            serde_json::from_str(&text).context("parse chunk JSON (array of 9-real arrays)")?;
+        let n = chunk.len();
+        for (i, row) in chunk.into_iter().enumerate() {
+            if row.len() != 9 {
+                bail!("chunk waypoint {i} needs 9 reals, got {}", row.len());
+            }
+            set_target(
+                daemon,
+                Some((row[0], row[1], row[2], row[3], row[4], row[5])),
+                Some([row[7], row[8]]),
+                Some(row[6]),
+            )?;
+            std::thread::sleep(Duration::from_secs_f64(dt));
+        }
+        println!("streamed {n} waypoints @ {dt:.3}s");
+    } else {
+        let p = parse_pose(pose)?;
+        let head = Some((p[0], p[1], p[2], p[3], p[4], p[5]));
+        let ant = Some([p[7], p[8]]);
+        if now {
+            set_target(daemon, head, ant, Some(p[6]))?;
+            println!("snapped to pose");
+        } else {
+            goto(daemon, head, ant, Some(p[6]), duration)?;
+            println!("moved to pose over {duration:.2}s");
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let pile = cli.pile.clone();
@@ -712,6 +904,12 @@ fn main() -> Result<()> {
             })?
         }
         Some(Command::Gesture { name }) => cmd_gesture(&daemon, &name)?,
+        Some(Command::Observe { frame, no_frame }) => {
+            cmd_observe(&daemon, &python, frame.as_deref(), no_frame)?
+        }
+        Some(Command::Act { pose, duration, dt, now }) => {
+            cmd_act(&daemon, &pose, duration, dt, now)?
+        }
         Some(Command::Look { note }) => {
             with_body(&pile, branch, |repo, ws| cmd_look(repo, ws, &daemon, &python, note.as_deref()))?
         }
