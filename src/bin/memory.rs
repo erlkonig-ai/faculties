@@ -163,9 +163,17 @@ fn epoch_end_from_interval(interval: Inline<NsTAIInterval>) -> Epoch {
     upper
 }
 
-/// Find the best chunk covering a query time range.
-/// Prefers: narrowest chunk that fully contains the query (most specific).
-/// Fallback: best partial overlap.
+/// Find the best chunk covering a query time range — the most *specific*
+/// summary, by overlap, at a scale matching the query.
+///
+/// Each overlapping chunk is scored `2*overlap - width = overlap - (width -
+/// overlap)`: it rewards covering the query and penalises span wasted outside
+/// it. A snug cover (width ≈ overlap ≈ query) wins; a vastly wider container
+/// (e.g. a whole-life root) scores deeply negative and only wins when the
+/// query itself is whole-life-scale; a sub-query moment scores below a cover
+/// that matches the query's width. This replaces a "narrowest strict
+/// container, else max raw overlap" rule that let an oversized root shadow
+/// every finer cover (raw overlap also favours wide chunks).
 fn find_chunk_by_time_range(
     space: &TribleSet,
     query_start: Epoch,
@@ -174,8 +182,7 @@ fn find_chunk_by_time_range(
     let query_start_ns = query_start.to_tai_duration().total_nanoseconds();
     let query_end_ns = query_end.to_tai_duration().total_nanoseconds();
 
-    let mut best_cover: Option<(Id, i128)> = None;
-    let mut best_overlap: Option<(Id, i128)> = None;
+    let mut best: Option<(Id, i128)> = None; // (id, specificity score)
 
     let superseded = superseded_ids(space);
     for chunk_id in all_chunk_ids(space) {
@@ -193,24 +200,18 @@ fn find_chunk_by_time_range(
             continue;
         }
 
-        if chunk_start <= query_start_ns && chunk_end >= query_end_ns {
-            let width = chunk_end - chunk_start;
-            match best_cover {
-                Some((_, prev_width)) if prev_width <= width => {}
-                _ => best_cover = Some((chunk_id, width)),
-            }
-        }
-
         let overlap_start = chunk_start.max(query_start_ns);
         let overlap_end = chunk_end.min(query_end_ns);
         let overlap = overlap_end.saturating_sub(overlap_start);
-        match best_overlap {
-            Some((_, prev_overlap)) if prev_overlap >= overlap => {}
-            _ => best_overlap = Some((chunk_id, overlap)),
+        let width = chunk_end - chunk_start;
+        let score = 2 * overlap - width;
+        match best {
+            Some((_, prev_score)) if prev_score >= score => {}
+            _ => best = Some((chunk_id, score)),
         }
     }
 
-    best_cover.map(|(id, _)| id).or(best_overlap.map(|(id, _)| id))
+    best.map(|(id, _)| id)
 }
 
 // ── BM25 search over chunk summaries ─────────────────────────────────
