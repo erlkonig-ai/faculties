@@ -27,6 +27,41 @@ pub const BODY_BRANCH_NAME: &str = "body";
 /// Tag for a deliberate capture (a frame, an audio clip, or a felt touch).
 pub const KIND_CAPTURE: Id = id_hex!("9C26C6EFD09EB2A401EF009FE9229E16");
 
+/// Tag for an utterance — the body *speaking* (efferent), the counterpart to
+/// KIND_CAPTURE's afferent perception. Carries the words, the channel, and the
+/// content-addressed audio (reusing `capture::frame`/`capture::mime`).
+pub const KIND_UTTERANCE: Id = id_hex!("B715BF1EEB1904393A7C31A0C1FFDF8C");
+
+pub mod utterance {
+    use super::*;
+    attributes! {
+        /// The words spoken.
+        "09792243FE6C424FD80D7EF7E48EBAEA" as pub text: Handle<LongString>;
+        /// Channel: "computer" (private) | "body" (aloud, through the speaker).
+        "33892D142FCB2ED2D40B9724847B3859" as pub channel: ShortString;
+    }
+}
+
+/// Tag for an INTENT — the being's reasoned instruction to itself: gemma's
+/// perceive+reason output, the language the VLA is conditioned on. Unlike the
+/// raw perception stream (ephemeral, periphery principle), intent is DELIBERATE
+/// and kept — it fires only on salience (a handful a minute, never per-frame),
+/// so the log is sparse and worth keeping: the being's auditable, replayable
+/// train of thought. The VLA reads the LATEST intent — coordinate-and-cursor on
+/// the canonical `metadata::created_at` (every kept entity carries it), no
+/// shared mutable state, monotonic.
+pub const KIND_INTENT: Id = id_hex!("285A12E316AD15C9A6EA45969AB85A5C");
+
+pub mod intent {
+    use super::*;
+    attributes! {
+        /// The language instruction gemma emits and the VLA acts on
+        /// ("someone's stroking your head — lean in, perk the antennas").
+        /// The time coordinate is the canonical `metadata::created_at`.
+        "C81A15C5C436CABC9328599858FA1B33" as pub text: Handle<LongString>;
+    }
+}
+
 pub mod capture {
     use super::*;
     attributes! {

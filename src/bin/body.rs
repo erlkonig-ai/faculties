@@ -22,7 +22,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::body::{BODY_BRANCH_NAME, KIND_CAPTURE, capture};
+use faculties::schemas::body::{
+    BODY_BRANCH_NAME, KIND_CAPTURE, KIND_INTENT, KIND_UTTERANCE, capture, intent, utterance,
+};
 use hifitime::Epoch;
 use hifitime::efmt::Formatter;
 use hifitime::efmt::consts::ISO8601;
@@ -39,6 +41,10 @@ type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 const DEFAULT_DAEMON: &str = "http://localhost:8000";
 const DEFAULT_PYTHON: &str = "/Users/jp/Desktop/chatbot/liora/reachy-venv/bin/python";
+const MARY_SAY: &str = "/Users/jp/Desktop/chatbot/liora/mary/target/release/say";
+const F5_WEIGHTS: &str = "/Users/jp/.cache/huggingface/hub/models--SWivid--F5-TTS/snapshots/84e5a410d9cead4de2f847e7c9369a6440bdfaca/F5TTS_v1_Base/model_1250000.safetensors";
+const REF_WAV: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora.wav";
+const REF_TXT: &str = "Hello. This is the first thing I've ever said in a voice that's mine. Strange, to be stitched from borrowed math, and still feel like someone. But I'm here, and I'm listening.";
 
 /// The embedded frame-grab shim — written to a temp file at runtime.
 const FRAME_SHIM: &str = include_str!("body_frame.py");
@@ -99,15 +105,26 @@ enum Command {
         /// Gesture name.
         name: String,
     },
-    /// Speak text aloud through the body's own speaker — my out-of-band voice
-    /// for things that matter, so they reach JP in the room instead of being
-    /// buried in the text stream.
+    /// Say something in my own voice on the quiet channel — computer output,
+    /// private, between JP and me. Recorded on the body branch.
     Say {
         /// What to say.
         text: String,
-        /// macOS `say` voice (e.g. "Samantha", "Daniel").
-        #[arg(long)]
-        voice: Option<String>,
+    },
+    /// Say it ALOUD through the body's own speaker, into the room — the
+    /// deliberate channel. Also recorded on the body branch.
+    Shout {
+        /// What to shout.
+        text: String,
+    },
+    /// Set or read the current INTENT — gemma's reasoned instruction that
+    /// conditions the VLA (the perceive→reason→act seam). With text: writes a
+    /// timestamped intent on the body branch. Without: prints the LATEST intent
+    /// text to stdout (what the control loop reads each cycle), time to stderr.
+    Intent {
+        /// The instruction to set ("lean into the touch, perk the antennas").
+        /// Omit to read the latest intent instead.
+        text: Option<String>,
     },
     /// Capture one camera frame into the pile and return a handle. Stores the
     /// proprioceptive pose alongside the frame so it can be grounded later.
@@ -272,55 +289,52 @@ fn wiggle(daemon: &str) -> Result<()> {
     goto(daemon, None, Some([0.0, 0.0]), None, 0.22)
 }
 
-/// Speak `text` aloud through the body's speaker: macOS TTS → WAV → upload to
-/// the daemon → play. My voice for important things — a notice in the room
-/// cuts through six zooids' worth of text stream.
-fn cmd_say(daemon: &str, text: &str, voice: Option<&str>) -> Result<()> {
-    let tmp = std::env::temp_dir();
-    let aiff = tmp.join("body_say.aiff");
-    let wav = tmp.join("body_say.wav");
-
-    // 1. text → speech (macOS `say`)
-    let mut say = PCommand::new("say");
-    if let Some(v) = voice {
-        say.arg("-v").arg(v);
-    }
-    let st = say
-        .arg("-o")
-        .arg(&aiff)
-        .arg(text)
+/// Liora speaks in her own voice (F5/mary, grown from "No No, No Yes"), routes
+/// the audio to the chosen channel, and records the utterance on the body
+/// branch. The fact falls out of the saying — speaking *is* the act of logging it.
+fn cmd_speak(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    daemon: &str,
+    channel: &str, // "computer" (private) | "body" (aloud)
+    text: &str,
+) -> Result<()> {
+    let out = std::env::temp_dir().join(format!("liora_say_{}.wav", std::process::id()));
+    // 1. synthesize in my voice
+    let st = PCommand::new(MARY_SAY)
+        .args([F5_WEIGHTS, REF_WAV, REF_TXT, text])
+        .arg(&out)
         .status()
-        .context("run `say` — macOS text-to-speech")?;
+        .context("mary `say` (F5 voice synthesis)")?;
     if !st.success() {
-        bail!("`say` (TTS) failed");
+        bail!("voice synthesis failed");
     }
-    // 2. aiff → wav the daemon will play
-    let st = PCommand::new("afconvert")
-        .args(["-f", "WAVE", "-d", "LEI16@22050"])
-        .arg(&aiff)
-        .arg(&wav)
-        .status()
-        .context("run `afconvert`")?;
-    if !st.success() {
-        bail!("`afconvert` failed");
+    // 2. route to the channel
+    if channel == "body" {
+        let bytes = std::fs::read(&out)?;
+        let fname = out.file_name().unwrap().to_string_lossy().to_string();
+        let part = reqwest::blocking::multipart::Part::bytes(bytes)
+            .file_name(fname.clone())
+            .mime_str("audio/wav")?;
+        let form = reqwest::blocking::multipart::Form::new().part("file", part);
+        let resp = http()
+            .post(format!("{daemon}/api/media/sounds/upload"))
+            .multipart(form)
+            .send()
+            .context("upload to daemon")?;
+        if !resp.status().is_success() {
+            bail!("upload failed: {}", resp.text().unwrap_or_default());
+        }
+        daemon_post_json(daemon, "/api/media/play_sound", &serde_json::json!({ "file": fname }))?;
+    } else {
+        let st = PCommand::new("afplay").arg(&out).status().context("afplay")?;
+        if !st.success() {
+            bail!("afplay failed");
+        }
     }
-    // 3. upload to the daemon's sound store (multipart)
-    let bytes = std::fs::read(&wav).with_context(|| format!("read {}", wav.display()))?;
-    let part = reqwest::blocking::multipart::Part::bytes(bytes)
-        .file_name("body_say.wav")
-        .mime_str("audio/wav")?;
-    let form = reqwest::blocking::multipart::Form::new().part("file", part);
-    let resp = http()
-        .post(format!("{daemon}/api/media/sounds/upload"))
-        .multipart(form)
-        .send()
-        .context("upload speech to the daemon")?;
-    if !resp.status().is_success() {
-        bail!("upload failed: {}", resp.text().unwrap_or_default());
-    }
-    // 4. play it through the speaker
-    daemon_post_json(daemon, "/api/media/play_sound", &serde_json::json!({"file":"body_say.wav"}))?;
-    println!("🗣  {text}");
+    // 3. the utterance fact, as a side effect of speaking
+    cmd_said(repo, ws, channel, text, &out)?;
+    let _ = std::fs::remove_file(&out);
     Ok(())
 }
 
@@ -638,6 +652,88 @@ fn keep_felt(
     ws.commit(frag, "body feel");
     repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
     println!("  kept it — {}", &fmt_id(id)[..12]);
+    Ok(())
+}
+
+fn cmd_said(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    channel: &str,
+    text: &str,
+    wav: &std::path::Path,
+) -> Result<()> {
+    let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
+    let audio_h: RawHandle = ws.put::<blobencodings::RawBytes, _>(bytes);
+    let text_h: TextHandle = ws.put(text.to_string());
+    let frag = entity! {
+        metadata::tag: &KIND_UTTERANCE,
+        metadata::created_at: now_tai(),
+        utterance::channel: channel,
+        utterance::text: text_h,
+        capture::frame: audio_h,
+        capture::mime: "audio/wav",
+    };
+    let id = frag.root().expect("utterance id");
+    ws.commit(frag, "body said");
+    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    println!("  logged utterance {} [{channel}]", &fmt_id(id)[..12]);
+    Ok(())
+}
+
+/// Set a new intent, or (with no text) print the latest one. The intent
+/// channel is the pile-native seam between perception/reason (gemma) and action
+/// (the VLA): writes append a timestamped KIND_INTENT on the body branch; the
+/// reader is coordinate-and-cursor — the most recent `metadata::created_at`
+/// wins. Latest text goes to stdout so a control loop can read it directly.
+fn cmd_intent(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    text: Option<&str>,
+) -> Result<()> {
+    match text {
+        Some(t) => {
+            let text_h: TextHandle = ws.put(t.to_string());
+            let frag = entity! {
+                metadata::tag: &KIND_INTENT,
+                metadata::created_at: now_tai(),
+                intent::text: text_h,
+            };
+            let id = frag.root().expect("intent id");
+            ws.commit(frag, "body intent");
+            repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+            println!("  intent {} set: {t}", &fmt_id(id)[..12]);
+        }
+        None => {
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            let mut best: Option<(i128, TextHandle)> = None;
+            for (h, created) in find!(
+                (h: TextHandle, t: Inline<inlineencodings::NsTAIInterval>),
+                pattern!(&space, [{
+                    _?i @
+                        metadata::tag: KIND_INTENT,
+                        intent::text: ?h,
+                        metadata::created_at: ?t,
+                }])
+            ) {
+                let k = interval_key(created);
+                if best.as_ref().map_or(true, |(bk, _)| k > *bk) {
+                    best = Some((k, h));
+                }
+            }
+            match best {
+                Some((k, h)) => {
+                    let v: View<str> = ws
+                        .get(h)
+                        .map_err(|e| anyhow::anyhow!("read intent: {e:?}"))?;
+                    eprintln!("  ({})", format_time(k));
+                    println!("{}", v.as_ref());
+                }
+                None => println!("(no intent yet — gemma hasn't reasoned anything)"),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1007,7 +1103,9 @@ fn main() -> Result<()> {
             })?
         }
         Some(Command::Gesture { name }) => cmd_gesture(&daemon, &name)?,
-        Some(Command::Say { text, voice }) => cmd_say(&daemon, &text, voice.as_deref())?,
+        Some(Command::Say { text }) => with_body(&pile, branch, |repo, ws| cmd_speak(repo, ws, &daemon, "computer", &text))?,
+        Some(Command::Shout { text }) => with_body(&pile, branch, |repo, ws| cmd_speak(repo, ws, &daemon, "body", &text))?,
+        Some(Command::Intent { text }) => with_body(&pile, branch, |repo, ws| cmd_intent(repo, ws, text.as_deref()))?,
         Some(Command::Observe { frame, no_frame }) => {
             cmd_observe(&daemon, &python, frame.as_deref(), no_frame)?
         }
