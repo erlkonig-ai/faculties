@@ -1,7 +1,7 @@
 //! Relations schema: people and their labels, aliases, contact info.
 //!
 //! Used by `relations.rs` (the faculty CLI) and by any faculty that
-//! needs to resolve a person by label or alias (e.g. `local_messages.rs`).
+//! needs to resolve a person by label or alias (e.g. `message.rs`).
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;

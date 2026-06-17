@@ -985,17 +985,17 @@ fn extract_unknown_person_label(text: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn count_unread_local_messages(
+fn count_unread_message(
     repo: &mut Repository<Pile>,
     reader_id: Id,
 ) -> Result<Option<usize>> {
-    let branch_id = ensure_branch_id(repo, "local-messages")?;
+    let branch_id = ensure_branch_id(repo, "message")?;
     let mut ws = repo
         .pull(branch_id)
-        .map_err(|e| anyhow!("pull local-messages workspace: {e:?}"))?;
+        .map_err(|e| anyhow!("pull message workspace: {e:?}"))?;
     let space = ws
         .checkout(..)
-        .map_err(|e| anyhow!("checkout local-messages workspace: {e:?}"))?;
+        .map_err(|e| anyhow!("checkout message workspace: {e:?}"))?;
 
     let mut incoming: HashSet<Id> = HashSet::new();
     for (message_id, to_id) in find!(
@@ -1057,7 +1057,7 @@ fn cmd_scan(
     let loop_report = build_loop_report(&exec_state, recent, loop_min);
 
     let unread_local = if let Some(persona_id) = config.as_ref().and_then(|cfg| cfg.persona_id) {
-        count_unread_local_messages(repo, persona_id)?
+        count_unread_message(repo, persona_id)?
     } else {
         None
     };
@@ -1155,12 +1155,12 @@ fn cmd_scan(
             let terms = load_relation_terms(repo)?;
             if let Some(case_variant) = find_case_variant(&terms, label.as_str()) {
                 println!(
-                    "- local_messages label mismatch: '{}' failed; try '{}' or add '{}' as alias in relations.",
+                    "- message label mismatch: '{}' failed; try '{}' or add '{}' as alias in relations.",
                     label, case_variant, label
                 );
             } else {
                 println!(
-                    "- local_messages unknown label '{}': add it to relations or use a known label/id.",
+                    "- message unknown label '{}': add it to relations or use a known label/id.",
                     label
                 );
             }
@@ -1761,7 +1761,7 @@ const KNOWN_BRANCH_NAMES: &[&str] = &[
     "compass",
     "config",
     "exec",
-    "local-messages",
+    "message",
     "media",
     "relations",
     "teams",

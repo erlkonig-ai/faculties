@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::local_messages::{
+use faculties::schemas::message::{
     DEFAULT_BRANCH, DEFAULT_RELATIONS_BRANCH, KIND_MESSAGE_ID, KIND_PERSON_ID, KIND_READ_ID,
     KIND_SPECS, local, relations_schema,
 };
@@ -47,7 +47,7 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 
 #[derive(Parser)]
 #[command(
-    name = "local-messages",
+    name = "message",
     about = "Local messaging faculty for the agent"
 )]
 struct Cli {
@@ -524,13 +524,13 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let local_messages_branch_id = with_repo(&cli.pile, |repo| {
+    let message_branch_id = with_repo(&cli.pile, |repo| {
         if let Some(hex) = cli.branch_id.as_deref() {
             return Id::from_hex(hex.trim())
                 .ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"));
         }
         repo.ensure_branch(&cli.branch, None)
-            .map_err(|e| anyhow::anyhow!("ensure local-messages branch: {e:?}"))
+            .map_err(|e| anyhow::anyhow!("ensure message branch: {e:?}"))
     })?;
     let relations_branch_id = with_repo(&cli.pile, |repo| {
         if let Some(hex) = cli.relations_branch_id.as_deref() {
@@ -546,7 +546,7 @@ fn main() -> Result<()> {
             let text = load_value_or_file(&text, "message text")?;
             cmd_send(
                 &cli.pile,
-                local_messages_branch_id,
+                message_branch_id,
                 relations_branch_id,
                 text,
                 from,
@@ -559,7 +559,7 @@ fn main() -> Result<()> {
             limit,
         } => cmd_list(
             &cli.pile,
-            local_messages_branch_id,
+            message_branch_id,
             relations_branch_id,
             reader,
             unread,
@@ -567,7 +567,7 @@ fn main() -> Result<()> {
         ),
         Command::Ack { id, by } => cmd_ack(
             &cli.pile,
-            local_messages_branch_id,
+            message_branch_id,
             relations_branch_id,
             id,
             by,

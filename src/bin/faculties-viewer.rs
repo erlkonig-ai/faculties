@@ -1,6 +1,6 @@
 //! GORBIE-backed viewer for a faculties pile.
 //!
-//! Composes the `wiki`, `compass`, `local-messages`, and activity-
+//! Composes the `wiki`, `compass`, `message`, and activity-
 //! timeline widgets against a single shared pile — the GUI
 //! counterpart to the CLI faculties in the repo root.
 //!
@@ -119,7 +119,7 @@ fn main(nb: &mut NotebookCtx) {
             // so e.g. an empty archive branch produces no archive
             // events without breaking the others.
             let branch_names: &[&str] =
-                &["compass", "local-messages", "wiki", "cognition", "archive"];
+                &["compass", "message", "wiki", "cognition", "archive"];
             let mut pulled: Vec<(&str, Workspace<Pile>)> =
                 Vec::with_capacity(branch_names.len());
             for name in branch_names {
@@ -180,7 +180,7 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("local-messages") else { return };
+        let Some(mut ws) = st.workspace("message") else { return };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);

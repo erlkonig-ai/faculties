@@ -1,14 +1,14 @@
-//! Read-only GORBIE-embeddable local-messages panel.
+//! Read-only GORBIE-embeddable message panel.
 //!
 //! Renders the append-only direct messages kept on a pile's
-//! `local-messages` branch as a chronological feed: oldest at the top,
+//! `message` branch as a chronological feed: oldest at the top,
 //! newest at the bottom. Each message lays out as a sharp-cornered
 //! paper-card bubble — sender + recipient chips, body text (with
 //! search-match underlines when a notebook-wide search is active),
 //! optional read receipts, and a short id footer.
 //!
 //! The widget holds UI + cached-query state only; the host supplies
-//! the local-messages workspace (required) and an optional `relations`
+//! the message workspace (required) and an optional `relations`
 //! workspace at render time.
 //!
 //! Identity display is resolved against the relations branch (if
@@ -38,7 +38,7 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
-use crate::schemas::local_messages::{local, KIND_MESSAGE_ID, KIND_READ_ID};
+use crate::schemas::message::{local, KIND_MESSAGE_ID, KIND_READ_ID};
 use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
 
 /// Handle to a long-string blob (message bodies).
@@ -187,7 +187,7 @@ impl Person {
 // ── Cached message query state ───────────────────────────────────────
 
 /// Cached fact spaces + head markers + resolved people map. Rebuilt
-/// whenever the local-messages head advances or the relations head
+/// whenever the message head advances or the relations head
 /// changes.
 struct MessagesLive {
     space: TribleSet,
@@ -428,7 +428,7 @@ fn build_people(
 
 // ── Widget ───────────────────────────────────────────────────────────
 
-/// GORBIE-embeddable local-messages panel with compose, relations
+/// GORBIE-embeddable message panel with compose, relations
 /// identity lookup, scroll-to-bottom on new messages, and automatic
 /// read-receipts for inbound messages.
 ///
@@ -472,7 +472,7 @@ impl MessagesPanel {
         self
     }
 
-    /// Render the panel. `ws` must point at the local-messages branch;
+    /// Render the panel. `ws` must point at the message branch;
     /// `relations_ws` is optional and, when provided, is used for
     /// friendly-name resolution.
     pub fn render(

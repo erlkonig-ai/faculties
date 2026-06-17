@@ -186,7 +186,7 @@ impl DiscordLive {
         }
 
         // Messages: archive::kind_message + discord::channel
-        // (filters out any local-messages-style entries that
+        // (filters out any message-style entries that
         // accidentally share the tag — discord branch shouldn't
         // have those, but the join is harmless and explicit).
         let msg_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(

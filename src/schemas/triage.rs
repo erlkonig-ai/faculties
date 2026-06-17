@@ -1,6 +1,6 @@
 //! Triage schema: doctor-style diagnostic attributes plus the kind markers
 //! and foreign attribute views the faculty reads when cross-referencing
-//! cognition, compass, local-messages, and relations branches.
+//! cognition, compass, message, and relations branches.
 //!
 //! Used by `triage.rs` (the faculty CLI). Most of these kind/attribute
 //! IDs are duplicated from the faculties that own them; triage keeps its

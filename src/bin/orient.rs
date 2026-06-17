@@ -38,7 +38,7 @@ struct Cli {
     /// Path to the pile file to use
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Persona identity for the local-messages inbox (relations label or
+    /// Persona identity for the message inbox (relations label or
     /// 32-char hex id). Per-process so multiple agents can share one pile
     /// under distinct identities.
     #[arg(long, env = "PERSONA")]
@@ -368,7 +368,7 @@ fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, Interva
 
 /// Resolve a persona given as 32-char hex id or a relations label/alias
 /// (matched against the pre-normalized `label_norm` / `alias_norm` fields,
-/// same semantics as `local_messages`).
+/// same semantics as `message`).
 fn resolve_persona(relations_space: &TribleSet, input: &str) -> Result<Id> {
     let trimmed = input.trim();
     if let Some(id) = Id::from_hex(trimmed) {
@@ -403,8 +403,8 @@ fn cmd_show(
             .ensure_branch("compass", None)
             .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
         let local_branch_id = repo
-            .ensure_branch("local-messages", None)
-            .map_err(|e| anyhow::anyhow!("ensure local-messages branch: {e:?}"))?;
+            .ensure_branch("message", None)
+            .map_err(|e| anyhow::anyhow!("ensure message branch: {e:?}"))?;
         let relations_branch_id = repo
             .ensure_branch("relations", None)
             .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
@@ -1073,8 +1073,8 @@ fn cmd_wait(
             .ensure_branch("compass", None)
             .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
         let local_branch_id = repo
-            .ensure_branch("local-messages", None)
-            .map_err(|e| anyhow::anyhow!("ensure local-messages branch: {e:?}"))?;
+            .ensure_branch("message", None)
+            .map_err(|e| anyhow::anyhow!("ensure message branch: {e:?}"))?;
         let relations_branch_id = repo
             .ensure_branch("relations", None)
             .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;

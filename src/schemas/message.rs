@@ -1,13 +1,13 @@
 //! Local messages schema: append-only direct messages between people,
 //! with read acknowledgements.
 //!
-//! Used by `local_messages.rs` (the faculty CLI) and by readers (e.g.
+//! Used by `message.rs` (the faculty CLI) and by readers (e.g.
 //! `orient.rs`) that need the same message/read attribute view.
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
-pub const DEFAULT_BRANCH: &str = "local-messages";
+pub const DEFAULT_BRANCH: &str = "message";
 pub const DEFAULT_RELATIONS_BRANCH: &str = "relations";
 
 pub const KIND_MESSAGE_LABEL: &str = "local_message";

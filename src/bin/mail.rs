@@ -25,7 +25,7 @@ use faculties::schemas::decide::{
     KIND_DECISION, decide as decide_attrs,
 };
 use faculties::schemas::files::{file, KIND_FILE};
-use faculties::schemas::local_messages::{local as read_attrs, KIND_READ_ID};
+use faculties::schemas::message::{local as read_attrs, KIND_READ_ID};
 use faculties::schemas::mail::{mail, KIND_DRAFT, KIND_MESSAGE, KIND_SPAM};
 use faculties::schemas::relations::{relations as rel_attrs, KIND_PERSON_ID};
 use hifitime::Epoch;
@@ -338,7 +338,7 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
 // ── read tracking ─────────────────────────────────────────────────────────
 //
 // Re-uses the KIND_READ_ID + about_message/reader/read_at schema from
-// `local_messages` — those attributes are generic message-read-receipt
+// `message` — those attributes are generic message-read-receipt
 // shapes (the module name is historical from the faculty that
 // introduced them; the IDs themselves are cross-faculty).
 

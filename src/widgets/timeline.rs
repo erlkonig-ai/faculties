@@ -22,7 +22,7 @@
 //! // Inside a GORBIE card:
 //! timeline.render(ctx, &mut [
 //!     ("compass", &mut compass_ws),
-//!     ("local-messages", &mut messages_ws),
+//!     ("message", &mut messages_ws),
 //!     ("wiki", &mut wiki_ws),
 //! ]);
 //! ```
@@ -60,7 +60,7 @@ use crate::schemas::compass::{
     board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use crate::schemas::archive::archive as archive_attrs;
-use crate::schemas::local_messages::{local as local_attrs, KIND_MESSAGE_ID};
+use crate::schemas::message::{local as local_attrs, KIND_MESSAGE_ID};
 use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
 use crate::schemas::wiki::{attrs as wiki_attrs, KIND_VERSION_ID};
 
@@ -480,7 +480,7 @@ fn collect_local_events(
     let space = match ws.checkout(..) {
         Ok(co) => co.into_facts(),
         Err(e) => {
-            eprintln!("[timeline] local-messages checkout: {e:?}");
+            eprintln!("[timeline] message checkout: {e:?}");
             return;
         }
     };
@@ -605,7 +605,7 @@ fn collect_archive_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Ev
     };
 
     // archive::archive::kind_message is the canonical tag id for an
-    // archived message payload — same value the local-messages
+    // archived message payload — same value the message
     // schema uses for KIND_MESSAGE_ID, since both faculties share
     // the protocol-agnostic "this is a message" marker.
     let rows: Vec<(Id, TextHandle, (i128, i128))> = find!(

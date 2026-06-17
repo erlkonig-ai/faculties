@@ -635,7 +635,7 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
 }
 
 /// Resolve the acting persona (relations label or 32-char hex id) —
-/// same semantics as `orient` / `local_messages`.
+/// same semantics as `orient` / `message`.
 fn resolve_persona_id(repo: &mut Repository<Pile>, input: &str) -> Result<Id> {
     let trimmed = input.trim();
     if let Some(id) = Id::from_hex(trimmed) {
