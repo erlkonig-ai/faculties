@@ -22,5 +22,13 @@ pub mod relations {
         "DC0916CB5F640984EFE359A33105CA9A" as display_name: inlineencodings::Handle<blobencodings::LongString>;
         "9B3329149D54CB9A8E8075E4AA862649" as teams_user_id: inlineencodings::ShortString;
         "B563A063474CBE62ED25A8D0E9A1853C" as email: inlineencodings::ShortString;
+        // Generic contact facts (enrich every person, any source — booth leads,
+        // mail senders, LinkedIn connections). LinkedIn-specific data stays in
+        // the linkedin faculty; these are first-class here.
+        "E3D486BD7C9C088D908DF1B9E1F4D925" as company: inlineencodings::Handle<blobencodings::LongString>;
+        "173B771D35FEE90B83F2731DD3C59EF8" as position: inlineencodings::Handle<blobencodings::LongString>;
+        "5A71C103E026FC1AC01E35EDAC274A5C" as profile_url: inlineencodings::Handle<blobencodings::LongString>;
+        // Provenance: where this person came from ("linkedin" | "mail" | "summit" | …).
+        "686FD344CD64C3F9C981C4028B1B6B9E" as source: inlineencodings::ShortString;
     }
 }
