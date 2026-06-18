@@ -34,7 +34,7 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::relations::{DEFAULT_BRANCH, KIND_PERSON_ID, relations};
 use rand_core::OsRng;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
@@ -69,7 +69,9 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Pull a snapshot from the LinkedIn DMA Member Data Portability API.
+    /// Pull connections from the LinkedIn DMA Member Data Portability API
+    /// straight into relations. The snapshot's home is the substrate, not a
+    /// JSON file — there is no intermediate dump.
     ///
     /// Token is a secret — pass via the LINKEDIN_TOKEN env var (preferred,
     /// not visible in `ps`) or --token. Never piled or committed.
@@ -83,13 +85,7 @@ enum Command {
         /// Linkedin-Version header — the app's PINNED product version.
         #[arg(long, default_value = "202312")]
         api_version: String,
-        /// Write the raw snapshot JSON here (default /tmp/linkedin_<DOMAIN>.json).
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// After pulling, ingest straight into relations (full automation).
-        #[arg(long)]
-        import: bool,
-        /// With --import, resolve and report but commit nothing.
+        /// Resolve and report but commit nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -116,7 +112,7 @@ enum Command {
 
 // ── snapshot record ─────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Serialize, Default, Clone)]
+#[derive(Deserialize, Default, Clone)]
 struct Conn {
     #[serde(rename = "First Name", default)]
     first: String,
@@ -490,33 +486,19 @@ fn fetch_snapshot(token: &str, domain: &str, api_version: &str) -> Result<Vec<Co
     Ok(rows)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_pull(
     pile: &Path,
     branch_id: Id,
     token: &str,
     domain: &str,
     api_version: &str,
-    out: Option<PathBuf>,
-    import: bool,
     dry_run: bool,
 ) -> Result<()> {
     println!("Pulling {domain} (Linkedin-Version {api_version})…");
     let conns = fetch_snapshot(token, domain, api_version)?;
     println!("Fetched {} {domain} record(s).", conns.len());
-
-    let out = out.unwrap_or_else(|| PathBuf::from(format!("/tmp/linkedin_{domain}.json")));
-    let json = serde_json::to_string_pretty(&conns).map_err(|e| anyhow!("serialize: {e}"))?;
-    std::fs::write(&out, json).map_err(|e| anyhow!("write {}: {e}", out.display()))?;
-    println!("Wrote snapshot → {}", out.display());
-
-    if import {
-        println!();
-        ingest(pile, branch_id, &conns, dry_run)?;
-    } else {
-        println!("(run `linkedin import {}` to ingest into relations)", out.display());
-    }
-    Ok(())
+    println!();
+    ingest(pile, branch_id, &conns, dry_run)
 }
 
 // ── review ──────────────────────────────────────────────────────────────────
@@ -695,16 +677,9 @@ fn main() -> Result<()> {
         Command::Import { snapshot, dry_run } => {
             cmd_import(&cli.pile, branch_id, &snapshot, dry_run)
         }
-        Command::Pull { token, domain, api_version, out, import, dry_run } => cmd_pull(
-            &cli.pile,
-            branch_id,
-            &token,
-            &domain,
-            &api_version,
-            out,
-            import,
-            dry_run,
-        ),
+        Command::Pull { token, domain, api_version, dry_run } => {
+            cmd_pull(&cli.pile, branch_id, &token, &domain, &api_version, dry_run)
+        }
         Command::Review { limit } => cmd_review(&cli.pile, branch_id, limit),
         Command::Resolve { id_a, id_b, same, distinct } => {
             cmd_resolve(&cli.pile, branch_id, &id_a, &id_b, same, distinct)
