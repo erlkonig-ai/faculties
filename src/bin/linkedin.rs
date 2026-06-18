@@ -34,7 +34,7 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::relations::{DEFAULT_BRANCH, KIND_PERSON_ID, relations};
 use rand_core::OsRng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
@@ -69,6 +69,30 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Pull a snapshot from the LinkedIn DMA Member Data Portability API.
+    ///
+    /// Token is a secret — pass via the LINKEDIN_TOKEN env var (preferred,
+    /// not visible in `ps`) or --token. Never piled or committed.
+    Pull {
+        /// OAuth access token (scope r_dma_portability_self_serve).
+        #[arg(long, env = "LINKEDIN_TOKEN", hide_env_values = true)]
+        token: String,
+        /// Snapshot domain (CONNECTIONS, PROFILE, …).
+        #[arg(long, default_value = "CONNECTIONS")]
+        domain: String,
+        /// Linkedin-Version header — the app's PINNED product version.
+        #[arg(long, default_value = "202312")]
+        api_version: String,
+        /// Write the raw snapshot JSON here (default /tmp/linkedin_<DOMAIN>.json).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// After pulling, ingest straight into relations (full automation).
+        #[arg(long)]
+        import: bool,
+        /// With --import, resolve and report but commit nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List open identity-resolution candidates (name collisions to adjudicate).
     Review {
         /// Max pairs to show.
@@ -92,7 +116,7 @@ enum Command {
 
 // ── snapshot record ─────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 struct Conn {
     #[serde(rename = "First Name", default)]
     first: String,
@@ -298,7 +322,12 @@ fn cmd_import(pile: &Path, branch_id: Id, snapshot: &Path, dry_run: bool) -> Res
     let conns: Vec<Conn> =
         serde_json::from_str(&raw).map_err(|e| anyhow!("parse snapshot JSON: {e}"))?;
     println!("Read {} connection records from {}", conns.len(), snapshot.display());
+    ingest(pile, branch_id, &conns, dry_run)
+}
 
+/// Resolve every connection against existing relations and (unless
+/// `dry_run`) commit. Shared by `import <file>` and `pull --import`.
+fn ingest(pile: &Path, branch_id: Id, conns: &[Conn], dry_run: bool) -> Result<()> {
     let (created, enriched_url, merged_email, skipped, ambiguous_pairs, committed) =
         with_repo(pile, |repo| {
             let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull relations: {e:?}"))?;
@@ -312,7 +341,7 @@ fn cmd_import(pile: &Path, branch_id: Id, snapshot: &Path, dry_run: bool) -> Res
             let mut skipped = 0usize;
             let mut ambiguous: Vec<(Id, Id, String)> = Vec::new();
 
-            for conn in &conns {
+            for conn in conns {
                 let url_k = conn.url_key();
                 let email_k = conn.email_key();
                 let name = conn.full_name();
@@ -402,6 +431,90 @@ fn cmd_import(pile: &Path, branch_id: Id, snapshot: &Path, dry_run: bool) -> Res
         println!("\nCommitted to relations.");
     } else {
         println!("\nNothing to commit.");
+    }
+    Ok(())
+}
+
+// ── pull ────────────────────────────────────────────────────────────────────
+
+const SNAPSHOT_BASE: &str = "https://api.linkedin.com/rest/memberSnapshotData";
+
+/// Fetch a Member Snapshot domain, paginating via `paging.links` rel=next.
+/// Mirrors the contract the bootstrap puller proved: q=criteria, the app's
+/// pinned Linkedin-Version, `start` advancing one page at a time.
+fn fetch_snapshot(token: &str, domain: &str, api_version: &str) -> Result<Vec<Conn>> {
+    let client = reqwest::blocking::Client::new();
+    let mut rows: Vec<Conn> = Vec::new();
+    let mut start = 0u32;
+    loop {
+        let url = format!("{SNAPSHOT_BASE}?q=criteria&domain={domain}&start={start}");
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Linkedin-Version", api_version)
+            .header("Content-Type", "application/json")
+            .send()
+            .map_err(|e| anyhow!("request {domain} start={start}: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        if status.as_u16() == 404 || body.contains("No data found") {
+            break;
+        }
+        if !status.is_success() {
+            bail!(
+                "LinkedIn API {status} at start={start}: {}",
+                &body[..body.len().min(300)]
+            );
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| anyhow!("parse page {start}: {e}"))?;
+        for el in v["elements"].as_array().into_iter().flatten() {
+            for item in el["snapshotData"].as_array().into_iter().flatten() {
+                match serde_json::from_value::<Conn>(item.clone()) {
+                    Ok(c) => rows.push(c),
+                    Err(e) => eprintln!("[linkedin] skip malformed record: {e}"),
+                }
+            }
+        }
+        let has_next = v["paging"]["links"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|l| l["rel"] == "next");
+        if !has_next {
+            break;
+        }
+        start += 1;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_pull(
+    pile: &Path,
+    branch_id: Id,
+    token: &str,
+    domain: &str,
+    api_version: &str,
+    out: Option<PathBuf>,
+    import: bool,
+    dry_run: bool,
+) -> Result<()> {
+    println!("Pulling {domain} (Linkedin-Version {api_version})…");
+    let conns = fetch_snapshot(token, domain, api_version)?;
+    println!("Fetched {} {domain} record(s).", conns.len());
+
+    let out = out.unwrap_or_else(|| PathBuf::from(format!("/tmp/linkedin_{domain}.json")));
+    let json = serde_json::to_string_pretty(&conns).map_err(|e| anyhow!("serialize: {e}"))?;
+    std::fs::write(&out, json).map_err(|e| anyhow!("write {}: {e}", out.display()))?;
+    println!("Wrote snapshot → {}", out.display());
+
+    if import {
+        println!();
+        ingest(pile, branch_id, &conns, dry_run)?;
+    } else {
+        println!("(run `linkedin import {}` to ingest into relations)", out.display());
     }
     Ok(())
 }
@@ -582,6 +695,16 @@ fn main() -> Result<()> {
         Command::Import { snapshot, dry_run } => {
             cmd_import(&cli.pile, branch_id, &snapshot, dry_run)
         }
+        Command::Pull { token, domain, api_version, out, import, dry_run } => cmd_pull(
+            &cli.pile,
+            branch_id,
+            &token,
+            &domain,
+            &api_version,
+            out,
+            import,
+            dry_run,
+        ),
         Command::Review { limit } => cmd_review(&cli.pile, branch_id, limit),
         Command::Resolve { id_a, id_b, same, distinct } => {
             cmd_resolve(&cli.pile, branch_id, &id_a, &id_b, same, distinct)
