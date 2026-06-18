@@ -162,6 +162,9 @@ enum Command {
     /// chunk (JSON array of 9-real arrays via @file / @-) streamed as waypoints.
     Act {
         /// "x,y,z,roll,pitch,yaw,body_yaw,ant_l,ant_r", or @file / @- for a chunk.
+        /// `allow_hyphen_values` so a negative-leading pose (e.g. "-0.01,...")
+        /// isn't mis-parsed as a flag — the VLA emits negative values constantly.
+        #[arg(allow_hyphen_values = true)]
         pose: String,
         /// Seconds for a single smooth move (goto). Ignored when streaming a chunk.
         #[arg(long, default_value_t = 0.5)]
