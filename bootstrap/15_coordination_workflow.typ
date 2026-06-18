@@ -94,4 +94,4 @@ but doesn't enforce.
     over a real network (gossip + DHT), the auth-arc tools
     underneath this recipe.
 
-Next stop: wiki:d06247b9d9183721e47a2940806e5d7f — Recipe: Auth Setup for a Multi-Agent Team.
+Next stop: [Recipe: Auth Setup for a Multi-Agent Team](wiki:d06247b9d9183721e47a2940806e5d7f).

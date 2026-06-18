@@ -75,4 +75,4 @@ viewer. Always cite with the `[label](files:<hash>)` form: a
 wiki warns you if you write one), and the label reads far
 better than a raw hash.
 
-Next stop: wiki:ff27b500d93e1d545b7465438a0146e1 — Orient: The Situation-Snapshot Faculty.
+Next stop: [Orient: The Situation-Snapshot Faculty](wiki:ff27b500d93e1d545b7465438a0146e1).

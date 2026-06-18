@@ -45,4 +45,4 @@ principle drives the onboarding system itself lives in the
 project that ships this pile (search for "Bootstrap Pile" in
 the local pile, or in the `faculties` repo's design notes).
 
-Next stop: wiki:999d2565f2e3af57fa5cfe2ed507d450 — Recipe: Research Workflow.
+Next stop: [Recipe: Research Workflow](wiki:999d2565f2e3af57fa5cfe2ed507d450).

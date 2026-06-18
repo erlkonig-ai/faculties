@@ -57,4 +57,4 @@ conversation is the executor.
   - Pure scratch state ("what was I about to do") — that's the
     conversation itself.
 
-Next stop: wiki:82129c70b693f7e2d781d78ac5efbb86 — Wiki Fragment Style Guide.
+Next stop: [Wiki Fragment Style Guide](wiki:82129c70b693f7e2d781d78ac5efbb86).

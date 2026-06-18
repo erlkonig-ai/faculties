@@ -62,4 +62,4 @@ results in two messages, never lost data.
   - "Tool Selection: Faculties First" — when to reach for
     local_messages vs wiki vs compass
 
-Next stop: wiki:67477d2173928fd91ef20173eabfeae4 — Teams: Capability-Based Membership.
+Next stop: [Teams: Capability-Based Membership](wiki:67477d2173928fd91ef20173eabfeae4).

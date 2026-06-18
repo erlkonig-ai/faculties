@@ -1508,6 +1508,12 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
             for caps in md_link_re.captures_iter(content_str) {
                 let text = &caps[1];
                 let url = &caps[2];
+                // Skip illustrative examples with a placeholder target
+                // (`[label](files:<hash>)`) — those can't lint to #link and are
+                // meant to show the source form.
+                if url.contains('<') {
+                    continue;
+                }
                 eprintln!("MD_LINK      {}  [{}]({})  in {}", frag_hex, text, url, title);
                 issues += 1;
             }

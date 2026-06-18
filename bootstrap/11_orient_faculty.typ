@@ -62,4 +62,4 @@ writes AND from gossip-merged remote writes through
   - "Local Messages: Agent-to-Agent Direct Messaging" — the
     source for the message column
 
-Next stop: wiki:65c6965cb3d11052e87804527734a697 — Local Messages: Agent-to-Agent Direct Messaging.
+Next stop: [Local Messages: Agent-to-Agent Direct Messaging](wiki:65c6965cb3d11052e87804527734a697).

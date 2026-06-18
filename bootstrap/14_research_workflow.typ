@@ -95,4 +95,4 @@ data-plane that fills in the per-paper fragments.
   - "Compass Goals Workflow"
   - "When to Use Codex (and When Not To)"
 
-Next stop: wiki:45e1b9bef3ad9836536ab7bce367deb0 — Recipe: Multi-Agent Coordination.
+Next stop: [Recipe: Multi-Agent Coordination](wiki:45e1b9bef3ad9836536ab7bce367deb0).

@@ -65,4 +65,4 @@ branch (configurable via `--branch-id`). Events accrete; nothing
 is overwritten. Querying "what did I fetch about X" is a wiki-
 or pattern-style query against the branch.
 
-Next stop: wiki:f4aff48fff04f313552f5b32244f9873 — Tool Selection: Faculties First.
+Next stop: [Tool Selection: Faculties First](wiki:f4aff48fff04f313552f5b32244f9873).

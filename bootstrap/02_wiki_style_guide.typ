@@ -49,4 +49,4 @@ it everywhere.
   - Binary artefacts — `files add` puts them content-addressed
     in the pile and gives you a `files:<hash>` reference.
 
-Next stop: wiki:b08448855de9cce7610d68dac2555003 — Files Faculty: Archiving and Citing Artefacts.
+Next stop: [Files Faculty: Archiving and Citing Artefacts](wiki:b08448855de9cce7610d68dac2555003).

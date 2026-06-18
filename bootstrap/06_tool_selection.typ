@@ -52,4 +52,4 @@ A quick lookup for "which tool do I reach for here?"
   - *Exception*: an explicit user request for a written plan
     document, where the user wants to review before execution.
 
-Next stop: wiki:996e648886cccb61d1afd48296b0a0cb — Work As Its Own Ledger.
+Next stop: [Work As Its Own Ledger](wiki:996e648886cccb61d1afd48296b0a0cb).

@@ -121,4 +121,4 @@ trible team revoke \
   - The `triblespace-rs/book/src/capability-auth.md` chapter
     has the complete protocol-level reference
 
-Next stop: wiki:44d63d174814371c7468a3e604ed2303 — Getting Started: Your First Hour (tour complete).
+Next stop: [Getting Started: Your First Hour (tour complete)](wiki:44d63d174814371c7468a3e604ed2303).

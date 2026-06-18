@@ -69,4 +69,4 @@ relations registry.
     relations label (some compass workflows use this for
     multi-agent kanban)
 
-Next stop: wiki:abe651f605c823085d861f296d9f9907 — Web: Search and Fetch Through Provider APIs.
+Next stop: [Web: Search and Fetch Through Provider APIs](wiki:abe651f605c823085d861f296d9f9907).

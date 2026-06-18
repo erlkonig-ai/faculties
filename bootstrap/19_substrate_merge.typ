@@ -56,9 +56,9 @@ facts arrive.
 
 == Further reading
 
-"Substrate 1/4: What Is a Trible" (wiki:4e19893b36bf37d471bb9ea968edac20) and "Substrate 2/4: The Pile" (wiki:5232ea531fedfcb17bf15e88c3d52a36) cover the building blocks. The query-language chapter
+[Substrate 1/4: What Is a Trible](wiki:4e19893b36bf37d471bb9ea968edac20) and [Substrate 2/4: The Pile](wiki:5232ea531fedfcb17bf15e88c3d52a36) cover the building blocks. The query-language chapter
 of the `triblespace-rs` book covers monotone queries in
 depth; `trible team` covers capability-based membership for
 who may write which branch.
 
-Next stop: wiki:6e5f38bdfd589cd0359bf668d1af9841 — Substrate 4/4: The Architecture — Zero Sync Code.
+Next stop: [Substrate 4/4: The Architecture — Zero Sync Code](wiki:6e5f38bdfd589cd0359bf668d1af9841).
