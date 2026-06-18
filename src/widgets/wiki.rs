@@ -360,16 +360,35 @@ fn force_step_kernel(
     pos: &Array<f32>,
     vel: &mut Array<f32>,
     edges: &Array<u32>,
+    // Per-node degree (1.0 + incident edge count), used for the
+    // SYMMETRIC attraction weight below. Precomputed on the CPU so
+    // the kernel can look up the *other* endpoint's degree, not just
+    // its own.
+    degrees: &Array<f32>,
     node_count: u32,
     edge_count: u32,
     pos_out: &mut Array<f32>,
 ) {
     let i = ABSOLUTE_POS as u32;
     if i < node_count {
-        let repulsion = 200000.0f32;
-        let attraction = 0.3f32;
-        let damping = 0.75f32;
-        let max_force = 30.0f32;
+        // Calmer layout. `damping` is a velocity *retention* factor
+        // applied every step — at 0.75 a node kept 75% of its
+        // momentum, so attract/repel pairs orbited each other forever
+        // (the energy sink was too weak to ever let them settle).
+        // 0.45 bleeds momentum off fast, so orbital motion decays into
+        // a resting layout. This is the only lever that drains the
+        // *pairwise* orbital energy — the global anti-rotation pass
+        // only removes the whole cloud's average spin, not relative
+        // orbits between node pairs.
+        // `attraction` is the spring constant: 0.3 → 0.15 makes edges
+        // softer (less stiff), so connected nodes ease together rather
+        // than snapping taut and overshooting. `max_force` caps the
+        // per-step impulse — halved so a big push moves gently.
+        // Repulsion eased so the initial expansion is less explosive.
+        let repulsion = 140000.0f32;
+        let attraction = 0.15f32;
+        let damping = 0.45f32;
+        let max_force = 15.0f32;
         let gravity = 0.001f32;
 
         let ix = (i * 2) as usize;
@@ -393,30 +412,35 @@ fn force_step_kernel(
             }
         }
 
-        // Count degree to normalize attraction (high-degree nodes
-        // don't collapse into a ball).
-        let mut degree = 1.0f32;
-        for e in 0..edge_count {
-            let ea = edges[(e * 2) as usize];
-            let eb = edges[(e * 2 + 1) as usize];
-            if ea == i || eb == i {
-                degree += 1.0f32;
-            }
-        }
-        let norm_attraction = attraction / degree;
-
+        // Attraction with a SYMMETRIC degree weight. The old code
+        // scaled each endpoint's pull by 1/degree(self), so a hub
+        // linked to a leaf pulled the leaf hard (small leaf degree)
+        // but the leaf barely pulled the hub (large hub degree) —
+        // unequal magnitudes on the same edge, which violates
+        // Newton's 3rd law and continuously injects net linear AND
+        // angular momentum (the source of the never-ending spin/drift
+        // that damping could never overcome). The weight
+        // `attraction / sqrt(deg_i * deg_o)` is symmetric in the two
+        // endpoints, so both feel the same magnitude → equal and
+        // opposite → momentum is conserved and the layout can settle.
+        // It still relieves hubs (the anti-collapse benefit).
+        let deg_i = degrees[i as usize];
         for e in 0..edge_count {
             let ea = edges[(e * 2) as usize];
             let eb = edges[(e * 2 + 1) as usize];
             if ea == i {
+                let deg_o = degrees[eb as usize];
+                let w = attraction / (deg_i * deg_o).sqrt();
                 let bx = (eb * 2) as usize;
-                fx += (pos[bx] - px) * norm_attraction;
-                fy += (pos[bx + 1] - py) * norm_attraction;
+                fx += (pos[bx] - px) * w;
+                fy += (pos[bx + 1] - py) * w;
             }
             if eb == i {
+                let deg_o = degrees[ea as usize];
+                let w = attraction / (deg_i * deg_o).sqrt();
                 let ax = (ea * 2) as usize;
-                fx += (pos[ax] - px) * norm_attraction;
-                fy += (pos[ax + 1] - py) * norm_attraction;
+                fx += (pos[ax] - px) * w;
+                fy += (pos[ax + 1] - py) * w;
             }
         }
 
@@ -573,6 +597,8 @@ struct GpuForceState {
     pos_handle: cubecl::server::Handle,
     vel_handle: cubecl::server::Handle,
     edges_handle: cubecl::server::Handle,
+    /// Per-node degree (1.0 + incident edges), immutable across steps.
+    degrees_handle: cubecl::server::Handle,
     pos_out_handle: cubecl::server::Handle,
     node_count: u32,
     edge_count: u32,
@@ -677,12 +703,23 @@ impl WikiGraph {
             .flat_map(|&(a, b)| [a as u32, b as u32])
             .collect();
 
+        // Per-node degree for the symmetric attraction weight. Base of
+        // 1.0 (matches the old `degree` starting value) keeps isolated
+        // nodes at deg=1 and avoids a divide-by-zero in sqrt(deg*deg).
+        let degrees_flat: Vec<f32> =
+            nodes.iter().map(|nd| 1.0 + nd.degree as f32).collect();
+
         let pos_handle = client.create_from_slice(f32::as_bytes(&pos_flat));
         let vel_handle = client.create_from_slice(f32::as_bytes(&vel_flat));
         let edges_handle = if edges_flat.is_empty() {
             client.create_from_slice(u32::as_bytes(&[0u32; 2]))
         } else {
             client.create_from_slice(u32::as_bytes(&edges_flat))
+        };
+        let degrees_handle = if degrees_flat.is_empty() {
+            client.create_from_slice(f32::as_bytes(&[1.0f32]))
+        } else {
+            client.create_from_slice(f32::as_bytes(&degrees_flat))
         };
         let pos_out_handle = client.empty(n * 2 * std::mem::size_of::<f32>());
 
@@ -691,6 +728,7 @@ impl WikiGraph {
             pos_handle,
             vel_handle,
             edges_handle,
+            degrees_handle,
             pos_out_handle,
             node_count: n as u32,
             edge_count: edges.len() as u32,
@@ -716,6 +754,7 @@ impl WikiGraph {
                     gpu.edge_count.max(1) as usize * 2,
                     1,
                 ),
+                ArrayArg::from_raw_parts::<f32>(&gpu.degrees_handle, n, 1),
                 ScalarArg::new(gpu.node_count),
                 ScalarArg::new(gpu.edge_count),
                 ArrayArg::from_raw_parts::<f32>(&gpu.pos_out_handle, n * 2, 1),
@@ -768,36 +807,34 @@ impl WikiGraph {
         mean_vx /= n as f32;
         mean_vy /= n as f32;
 
-        // Two galilean corrections fed back to the GPU each frame:
+        // Corrections fed back to the GPU each frame:
         //
-        // - Translation: pin the centroid at the world origin
-        //   (positions ← positions − centroid) and zero net linear
-        //   momentum (velocities ← velocities − mean velocity). Net
-        //   forces from the kernel should sum to zero pair-wise
-        //   (repulsion + edge attraction obey Newton's 3rd), but any
-        //   numerical residue used to accumulate as drift until
-        //   damping ate it.
-        // - Rotation: subtract `omega × r` from positions and
-        //   velocities so net angular momentum is zero (same form
-        //   as before).
+        // - Position: pin the centroid at the world origin (positions
+        //   ← positions − centroid). Pure translation of the frame —
+        //   norm-preserving, never distorts the layout.
+        // - Velocity: remove the net linear (mean) and net angular
+        //   (omega × r) components. Both are momentum-removal that is
+        //   a no-op at rest (omega, mean → 0) and only bleeds off any
+        //   residual global drift/spin from initial conditions or
+        //   numerical noise during settling.
         //
-        // Both states are written back to the GPU; integrating from a
-        // de-driffed, de-rotated frame keeps the graph anchored
-        // visually instead of relying on the small-angle linear
-        // approximation to absorb drift cosmetically.
+        // We deliberately do NOT shear positions by `omega × r` any
+        // more. That was a small-angle approximation of a rotation —
+        // not norm-preserving — and it wrote into `node.pos`, which is
+        // also the baseline for next frame's velocity estimate, so it
+        // closed a feedback loop that could *sustain* rotation. With
+        // the attraction now momentum-conserving (symmetric weight)
+        // there is no torque source, so global angular momentum stays
+        // ~0 on its own and the velocity-only removal is all the
+        // insurance we need.
         let mut corrected_pos: Vec<f32> = Vec::with_capacity(n * 2);
         let mut corrected_vel: Vec<f32> = Vec::with_capacity(n * 2);
         for (i, node) in self.nodes.iter_mut().enumerate() {
             let dx = positions[i * 2] - cx;
             let dy = positions[i * 2 + 1] - cy;
-            // Position: centroid-relative + de-rotation.
-            let new_x = dx + omega * dy;
-            let new_y = dy - omega * dx;
-            node.pos = egui::vec2(new_x, new_y);
-            corrected_pos.push(new_x);
-            corrected_pos.push(new_y);
-            // Velocity: subtract mean linear velocity + tangential
-            // rotation.
+            node.pos = egui::vec2(dx, dy);
+            corrected_pos.push(dx);
+            corrected_pos.push(dy);
             corrected_vel.push(velocities[i * 2] - mean_vx + omega * dy);
             corrected_vel.push(velocities[i * 2 + 1] - mean_vy - omega * dx);
         }
