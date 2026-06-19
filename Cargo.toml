@@ -118,6 +118,7 @@ blake3 = "1"                # mail (deterministic entity id from Message-Id)
 chrono = { version = "0.4.39", features = ["clock"] }  # orient
 comemo = "0.5.1"            # wiki
 dirs = "5"                  # wiki
+dryoc = "0.8"               # secrets (libsodium-compatible pure-Rust crypto)
 hex = "0.4"                 # gauge
 humantime = "2.3.0"         # orient, patience
 ical = "0.11"               # planner
