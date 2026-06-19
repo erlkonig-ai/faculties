@@ -10,14 +10,19 @@
 //! current recipient set is enumerated from the grant tuples with the query
 //! engine — never stored, "work as its own ledger".
 //!
-//! Status: MVP slice. `identity init/list`, `grant`, `revoke`,
-//! `secret add/get/list`; non-concurrent retraction; transitive group
-//! membership (a group is any id used as both grant object and subject; the
-//! recipient set is `path!`'s closure over live grants). The concurrency-safe
-//! correctness layer (strong-removal + predecessor-validity + epoch finality,
-//! wiki 65a1835b) is NOT yet wired — do not run multi-admin removal flows
-//! against this until it is. Secret rotation is also still pending.
+//! Status: `identity init/list`, `scope create/list`, `grant` (issuer-required),
+//! `revoke`, `secret add/get/list/share`. Scopes are content-derived and rooted
+//! at their creator (`scope_id = Blake3(creator_pk, name)`); a grant is
+//! *effective* only if its issuer chains, through admin-grants, back to that
+//! root (the `effective_admins` fixpoint). Strong/transitive removal therefore
+//! falls out for free — retracting an admin drops everything that depended on
+//! it. Transitive group membership is `path!`'s closure over *effective* grants.
+//! STILL PENDING (the genuinely concurrent part): epoch finality + the
+//! two-branch duelling-admin tests (wiki 65a1835b / D02D6767) — single- or
+//! coordinated-writer multi-admin is safe; independent concurrent writers need
+//! the finality layer. Secret rotation / `(scope,name)` addressing also pending.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -88,9 +93,9 @@ mod schema {
 }
 
 use schema::{
-    KIND_GRANT, KIND_IDENTITY, KIND_SCOPE, KIND_SECRET, KIND_WRAP, grant_object, grant_relation,
-    grant_retracted_at, grant_subject, identity_lockbox, identity_sign_pk, reaches, scope_creator,
-    secret_body, secret_name, secret_scope, wrap_dek, wrap_recipient, wrap_secret,
+    KIND_GRANT, KIND_IDENTITY, KIND_SCOPE, KIND_SECRET, KIND_WRAP, grant_issuer, grant_object,
+    grant_relation, grant_retracted_at, grant_subject, identity_lockbox, identity_sign_pk, reaches,
+    scope_creator, secret_body, secret_name, secret_scope, wrap_dek, wrap_recipient, wrap_secret,
 };
 
 const DEFAULT_BRANCH: &str = "secrets";
@@ -257,13 +262,66 @@ fn grant_is_live(space: &TribleSet, grant: Id) -> bool {
 /// entity kind. We project live grants into an ephemeral object->subject edge
 /// set and let the engine's `path!` take the transitive closure — the edge set
 /// is never persisted (work as its own ledger: recipients are a derived view).
+/// The creator (implicit root admin) of a rooted scope, if any.
+fn scope_creator_of(space: &TribleSet, scope: Id) -> Option<Id> {
+    find!(
+        c: Id,
+        pattern!(space, [{ scope @ metadata::tag: KIND_SCOPE, scope_creator: ?c }])
+    )
+    .next()
+}
+
+/// Effective admins of a scope: the least fixpoint seeded by the scope's
+/// creator and grown through non-retracted admin-grants whose issuer is
+/// *already* an effective admin. An unrooted scope (no creator) has none —
+/// so none of its grants can be effective. This is the predecessor-only
+/// validity rule made constructive (wiki D02D6767 / 65a1835b).
+fn effective_admins(space: &TribleSet, scope: Id) -> HashSet<Id> {
+    let mut admins = HashSet::new();
+    match scope_creator_of(space, scope) {
+        Some(creator) => {
+            admins.insert(creator);
+        }
+        None => return admins,
+    }
+    let admin_grants: Vec<(Id, Id)> = find!(
+        (g: Id, iss: Id, subj: Id),
+        pattern!(space, [{ ?g @ metadata::tag: KIND_GRANT, grant_object: scope, grant_relation: "admin", grant_issuer: ?iss, grant_subject: ?subj }])
+    )
+    .filter(|(g, _, _)| grant_is_live(space, *g))
+    .map(|(_, iss, subj)| (iss, subj))
+    .collect();
+    loop {
+        let mut grew = false;
+        for (iss, subj) in &admin_grants {
+            if admins.contains(iss) && admins.insert(*subj) {
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    admins
+}
+
+/// A grant is *effective* iff it is not retracted AND its issuer is an
+/// effective admin of its object. (Issuerless grants never match the
+/// pattern, so they are inert.)
 fn recipients_of(space: &TribleSet, scope: Id) -> Vec<Id> {
+    let mut admin_cache: HashMap<Id, HashSet<Id>> = HashMap::new();
     let mut edges = TribleSet::new();
-    for (g, obj, subj) in find!(
-        (g: Id, o: Id, s: Id),
-        pattern!(space, [{ ?g @ metadata::tag: KIND_GRANT, grant_object: ?o, grant_subject: ?s }])
+    for (g, obj, subj, iss) in find!(
+        (g: Id, o: Id, s: Id, i: Id),
+        pattern!(space, [{ ?g @ metadata::tag: KIND_GRANT, grant_object: ?o, grant_subject: ?s, grant_issuer: ?i }])
     ) {
-        if grant_is_live(space, g) {
+        if !grant_is_live(space, g) {
+            continue;
+        }
+        let admins = admin_cache
+            .entry(obj)
+            .or_insert_with(|| effective_admins(space, obj));
+        if admins.contains(&iss) {
             edges += entity! { ExclusiveId::force_ref(&obj) @ reaches: &subj };
         }
     }
@@ -278,6 +336,11 @@ fn recipients_of(space: &TribleSet, scope: Id) -> Vec<Id> {
         exists!(pattern!(space, [{ lid @ identity_sign_pk: _?p }]))
     })
     .collect();
+    // The root admin (creator) is always a recipient of her own scope, even
+    // though she is never a grant *subject*.
+    if let Some(creator) = scope_creator_of(space, scope) {
+        out.push(creator);
+    }
     out.sort();
     out.dedup();
     out
@@ -313,7 +376,9 @@ enum Command {
         #[command(subcommand)]
         cmd: ScopeCmd,
     },
-    /// Grant a relation: (object, relation, subject).
+    /// Grant a relation: (object, relation, subject), issued by an admin.
+    /// The issuer (--as) must be an effective admin of the object; for a
+    /// fresh scope that means its creator.
     Grant {
         #[arg(long)]
         object: String,
@@ -322,7 +387,7 @@ enum Command {
         #[arg(long)]
         subject: String,
         #[arg(long)]
-        issuer: Option<String>,
+        r#as: String,
     },
     /// Revoke a subject's grants on a scope (sets the retraction cursor).
     /// Non-concurrent only; rotate affected secrets to exclude the subject.
@@ -558,7 +623,7 @@ fn cmd_grant(
     object: String,
     relation: String,
     subject: String,
-    issuer: Option<String>,
+    as_id: String,
 ) -> Result<()> {
     with_repo(pile, |repo| {
         let branch_id = repo
@@ -566,14 +631,27 @@ fn cmd_grant(
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        // object is a free scope id (any 32-char hex); subject/issuer are identities.
         let object_id = Id::from_hex(object.trim().to_ascii_uppercase().as_str())
             .ok_or_else(|| anyhow::anyhow!("--object must be a 32-char hex scope id"))?;
         let subject_id = resolve_kind_id(&space, KIND_IDENTITY, &subject)?;
-        let issuer_id = issuer
-            .as_deref()
-            .map(|i| resolve_kind_id(&space, KIND_IDENTITY, i))
-            .transpose()?;
+        let issuer_id = resolve_kind_id(&space, KIND_IDENTITY, &as_id)?;
+
+        // The issuer must be an effective admin of the object — otherwise this
+        // grant could never chain to the scope root and would be inert anyway.
+        let admins = effective_admins(&space, object_id);
+        if !admins.contains(&issuer_id) {
+            if scope_creator_of(&space, object_id).is_none() {
+                bail!(
+                    "scope {} is not rooted — run `scope create` first",
+                    fmt_id(object_id)
+                );
+            }
+            bail!(
+                "{} is not an effective admin of {}; only an admin can grant",
+                fmt_id(issuer_id),
+                fmt_id(object_id)
+            );
+        }
 
         let g = ufoid();
         let now = instant_interval(now_epoch());
@@ -584,16 +662,17 @@ fn cmd_grant(
             grant_object: &object_id,
             grant_relation: relation.as_str(),
             grant_subject: &subject_id,
-            schema::grant_issuer?: issuer_id.as_ref(),
+            grant_issuer: &issuer_id,
         };
         ws.commit(change, "secrets: grant");
         repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
         println!(
-            "grant {}  {} --{}--> {}",
+            "grant {}  {} --{}--> {}  (by {})",
             fmt_id(g.id),
             fmt_id(object_id),
             relation,
-            fmt_id(subject_id)
+            fmt_id(subject_id),
+            fmt_id(issuer_id)
         );
         Ok(())
     })
@@ -902,8 +981,8 @@ fn main() -> Result<()> {
             ScopeCmd::Create { name, r#as } => cmd_scope_create(&cli.pile, &cli.branch, name, r#as),
             ScopeCmd::List => cmd_scope_list(&cli.pile, &cli.branch),
         },
-        Command::Grant { object, relation, subject, issuer } => {
-            cmd_grant(&cli.pile, &cli.branch, object, relation, subject, issuer)
+        Command::Grant { object, relation, subject, r#as } => {
+            cmd_grant(&cli.pile, &cli.branch, object, relation, subject, r#as)
         }
         Command::Revoke { object, subject } => {
             cmd_revoke(&cli.pile, &cli.branch, object, subject)
@@ -957,6 +1036,46 @@ mod tests {
             .unseal_to_vec(&box_kp)
             .unwrap();
         assert_eq!(opened.as_slice(), msg);
+    }
+
+    #[test]
+    fn effective_admins_fixpoint_and_transitive_removal() {
+        // Pure TribleSet (no pile/blobs): exercises the validity fixpoint.
+        let sid = ufoid().id;
+        let (aid, bid, cid, did, eid) =
+            (ufoid().id, ufoid().id, ufoid().id, ufoid().id, ufoid().id);
+        let mut space = TribleSet::new();
+        // scope rooted at alice
+        space += entity! { ExclusiveId::force_ref(&sid) @
+            metadata::tag: &KIND_SCOPE, scope_creator: &aid };
+        let mut grant = |space: &mut TribleSet, iss: &Id, rel: &str, subj: &Id| -> Id {
+            let g = ufoid().id;
+            *space += entity! { ExclusiveId::force_ref(&g) @
+                metadata::tag: &KIND_GRANT,
+                grant_object: &sid,
+                grant_relation: rel,
+                grant_issuer: iss,
+                grant_subject: subj,
+            };
+            g
+        };
+        let g_bob = grant(&mut space, &aid, "admin", &bid); // alice -> admin -> bob
+        grant(&mut space, &bid, "admin", &cid); // bob -> admin -> carol (transitive)
+        grant(&mut space, &did, "admin", &eid); // dave (not admin) -> eve (inert)
+
+        let admins = effective_admins(&space, sid);
+        assert!(admins.contains(&aid) && admins.contains(&bid) && admins.contains(&cid));
+        assert!(!admins.contains(&eid), "dave isn't an admin, so eve must not be");
+        assert!(!admins.contains(&did));
+
+        // Transitive strong removal: retract bob's admin -> bob AND carol drop.
+        space += entity! { ExclusiveId::force_ref(&g_bob) @
+            grant_retracted_at: instant_interval(now_epoch()) };
+        let admins2 = effective_admins(&space, sid);
+        assert!(admins2.contains(&aid));
+        assert!(!admins2.contains(&bid), "bob's admin was retracted");
+        assert!(!admins2.contains(&cid), "carol's admin chained through bob -> gone");
+        assert_eq!(admins2.len(), 1);
     }
 
     #[test]
