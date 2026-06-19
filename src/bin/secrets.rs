@@ -505,6 +505,18 @@ enum SecretCmd {
         #[arg(long)]
         r#as: String,
     },
+    /// Rotate a secret: re-encrypt the current value under a fresh DEK sealed
+    /// only to the current recipients. Run as a reader; anyone revoked since the
+    /// last version loses forward access. This is how a removal actually takes
+    /// effect on existing secrets.
+    Rotate {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        r#as: String,
+    },
     /// Re-wrap a named secret's DEK to recipients added after it was created.
     /// Run as an existing recipient (needs LIORA_SECRETS_PW to unlock the DEK).
     Share {
@@ -815,6 +827,121 @@ fn cmd_revoke(pile: &Path, branch: &str, object: String, subject: String) -> Res
     })
 }
 
+/// Decrypt the latest-resolved secret `secret_id` as identity `me`: unlock me,
+/// unseal my wrap to the DEK, open the body. The single read/decrypt path
+/// shared by `get` and `rotate`.
+fn open_secret_value(
+    pw: &[u8],
+    ws: &mut Workspace<Pile>,
+    space: &TribleSet,
+    secret_id: Id,
+    me: Id,
+) -> Result<Vec<u8>> {
+    let (lock_h, my_pk_h): (BytesHandle, BytesHandle) = find!(
+        (l: BytesHandle, p: BytesHandle),
+        pattern!(space, [{ me @ identity_lockbox: ?l, identity_sign_pk: ?p }])
+    )
+    .next()
+    .ok_or_else(|| anyhow::anyhow!("identity {} not found", fmt_id(me)))?;
+    let lockbox = read_bytes(ws, lock_h).context("read lockbox")?;
+    let my_pk = read_bytes(ws, my_pk_h).context("read pk")?;
+    let my_sk = unlock_secret_key(pw, &lockbox)?;
+    let box_kp = box_keypair_from_ed25519(&my_sk, &my_pk)?;
+
+    let dek_h: BytesHandle = find!(
+        (w: Id, d: BytesHandle),
+        pattern!(space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: me, wrap_dek: ?d }])
+    )
+    .next()
+    .map(|(_, d)| d)
+    .ok_or_else(|| anyhow::anyhow!("no wrap for {} on this secret", fmt_id(me)))?;
+    let sealed = read_bytes(ws, dek_h).context("read wrap")?;
+    let dek_bytes = DryocBox::from_sealed_bytes(&sealed)
+        .map_err(|e| anyhow::anyhow!("parse wrap: {e:?}"))?
+        .unseal_to_vec(&box_kp)
+        .map_err(|_| anyhow::anyhow!("unseal failed (wrong key?)"))?;
+    let dek = Key::try_from(&dek_bytes[..]).context("dek")?;
+
+    let body_h: BytesHandle = find!(
+        h: BytesHandle,
+        pattern!(space, [{ secret_id @ secret_body: ?h }])
+    )
+    .next()
+    .ok_or_else(|| anyhow::anyhow!("secret body missing"))?;
+    let body_blob = read_bytes(ws, body_h).context("read body")?;
+    if body_blob.len() < 24 {
+        bail!("malformed body");
+    }
+    let nonce = Nonce::try_from(&body_blob[..24]).context("nonce")?;
+    DryocSecretBox::from_bytes(&body_blob[24..])
+        .map_err(|e| anyhow::anyhow!("parse body: {e:?}"))?
+        .decrypt_to_vec(&nonce, &dek)
+        .map_err(|_| anyhow::anyhow!("decrypt failed"))
+}
+
+/// Build the trible change for a fresh secret version of `(scope, name)`:
+/// a new DEK secretboxes the body, and the DEK is sealed to *every current*
+/// recipient (so a member removed since the last version is excluded). Returns
+/// (change, new secret id, recipient count). The single seal path shared by
+/// `add` and `rotate`; the caller commits.
+fn build_seal_change(
+    ws: &mut Workspace<Pile>,
+    space: &TribleSet,
+    scope_id: Id,
+    name: &str,
+    plaintext: &[u8],
+) -> Result<(TribleSet, Id, usize)> {
+    let recipients = recipients_of(space, scope_id);
+    if recipients.is_empty() {
+        bail!("scope {} has no live recipients; grant access first", fmt_id(scope_id));
+    }
+    let mut recipient_keys: Vec<(Id, BoxPublicKey)> = Vec::new();
+    for r in &recipients {
+        let rid = *r;
+        let pk_h: BytesHandle = find!(h: BytesHandle, pattern!(space, [{ rid @ identity_sign_pk: ?h }]))
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("recipient {} has no signing key", fmt_id(*r)))?;
+        let pk = read_bytes(ws, pk_h).ok_or_else(|| anyhow::anyhow!("read pk for {}", fmt_id(*r)))?;
+        recipient_keys.push((*r, box_pk_from_ed25519(&pk)?));
+    }
+
+    let dek = Key::gen();
+    let nonce = Nonce::gen();
+    let body = DryocSecretBox::encrypt_to_vecbox(plaintext, &nonce, &dek).to_vec();
+    let mut body_blob = Vec::with_capacity(nonce.len() + body.len());
+    body_blob.extend_from_slice(&nonce);
+    body_blob.extend_from_slice(&body);
+
+    let secret_id = ufoid();
+    let now = instant_interval(now_epoch());
+    let body_h = put_bytes(ws, body_blob);
+    let name_h = ws.put(name.to_string());
+    let mut change = TribleSet::new();
+    change += entity! { &secret_id @
+        metadata::tag: &KIND_SECRET,
+        metadata::created_at: now,
+        metadata::name: name_h,
+        secret_scope: &scope_id,
+        secret_name: name,
+        secret_body: body_h,
+    };
+    for (r, rx_pk) in &recipient_keys {
+        let sealed = DryocBox::seal_to_vecbox(&dek, rx_pk)
+            .map_err(|e| anyhow::anyhow!("seal to {}: {e:?}", fmt_id(*r)))?
+            .to_vec();
+        let dek_h = put_bytes(ws, sealed);
+        let w = ufoid();
+        change += entity! { &w @
+            metadata::tag: &KIND_WRAP,
+            metadata::created_at: now,
+            wrap_secret: &secret_id.id,
+            wrap_recipient: r,
+            wrap_dek: dek_h,
+        };
+    }
+    Ok((change, secret_id.id, recipient_keys.len()))
+}
+
 fn cmd_secret_add(
     pile: &Path,
     branch: &str,
@@ -830,69 +957,40 @@ fn cmd_secret_add(
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
-
-        let recipients = recipients_of(&space, scope_id);
-        if recipients.is_empty() {
-            bail!("scope {} has no live recipients; grant access first", fmt_id(scope_id));
-        }
-        // Read each recipient's signing pubkey, derive their X25519 key.
-        let mut recipient_keys: Vec<(Id, BoxPublicKey)> = Vec::new();
-        for r in &recipients {
-            let rid = *r;
-            let pk_h: BytesHandle = find!(
-                h: BytesHandle,
-                pattern!(&space, [{ rid @ identity_sign_pk: ?h }])
-            )
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("recipient {} has no signing key", fmt_id(*r)))?;
-            let pk = read_bytes(&mut ws, pk_h)
-                .ok_or_else(|| anyhow::anyhow!("read pk for {}", fmt_id(*r)))?;
-            recipient_keys.push((*r, box_pk_from_ed25519(&pk)?));
-        }
-
-        // Envelope: one body, one wrap per recipient.
-        let dek = Key::gen();
-        let nonce = Nonce::gen();
-        let body = DryocSecretBox::encrypt_to_vecbox(plaintext.as_slice(), &nonce, &dek).to_vec();
-        let mut body_blob = Vec::with_capacity(nonce.len() + body.len());
-        body_blob.extend_from_slice(&nonce);
-        body_blob.extend_from_slice(&body);
-
-        let secret_id = ufoid();
-        let now = instant_interval(now_epoch());
-        let body_h = put_bytes(&mut ws, body_blob);
-        let name_h = ws.put(name.clone());
-        let mut change = TribleSet::new();
-        change += entity! { &secret_id @
-            metadata::tag: &KIND_SECRET,
-            metadata::created_at: now,
-            metadata::name: name_h,
-            secret_scope: &scope_id,
-            secret_name: name.as_str(),
-            secret_body: body_h,
-        };
-        for (r, rx_pk) in &recipient_keys {
-            let sealed = DryocBox::seal_to_vecbox(&dek, rx_pk)
-                .map_err(|e| anyhow::anyhow!("seal to {}: {e:?}", fmt_id(*r)))?
-                .to_vec();
-            let dek_h = put_bytes(&mut ws, sealed);
-            let w = ufoid();
-            change += entity! { &w @
-                metadata::tag: &KIND_WRAP,
-                metadata::created_at: now,
-                wrap_secret: &secret_id.id,
-                wrap_recipient: r,
-                wrap_dek: dek_h,
-            };
-        }
+        let (change, secret_id, n) = build_seal_change(&mut ws, &space, scope_id, &name, &plaintext)?;
         ws.commit(change, "secrets: secret add");
         repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        println!(
-            "secret {} ({}) sealed to {} recipient(s)",
-            fmt_id(secret_id.id),
-            name,
-            recipient_keys.len()
-        );
+        println!("secret {} ({}) sealed to {} recipient(s)", fmt_id(secret_id), name, n);
+        Ok(())
+    })
+}
+
+fn cmd_secret_rotate(
+    pile: &Path,
+    branch: &str,
+    scope: String,
+    name: String,
+    as_id: String,
+) -> Result<()> {
+    let pw = password()?;
+    with_repo(pile, |repo| {
+        let branch_id = repo
+            .ensure_branch(branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
+        let current = latest_secret(&space, scope_id, &name)
+            .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
+        let me = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
+        // Decrypt the current value as an authorized reader, then re-seal a new
+        // version to the *current* recipient set — anyone revoked since the last
+        // version simply gets no wrap, so they lose forward access.
+        let plaintext = open_secret_value(&pw, &mut ws, &space, current, me)?;
+        let (change, secret_id, n) = build_seal_change(&mut ws, &space, scope_id, &name, &plaintext)?;
+        ws.commit(change, "secrets: secret rotate");
+        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        println!("rotated {} -> new version {} sealed to {} recipient(s)", name, fmt_id(secret_id), n);
         Ok(())
     })
 }
@@ -915,51 +1013,7 @@ fn cmd_secret_get(
         let secret_id = latest_secret(&space, scope_id, &name)
             .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
         let me = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
-
-        // Unlock my private key, derive my X25519 keypair.
-        let (lock_h, my_pk_h): (BytesHandle, BytesHandle) = find!(
-            (l: BytesHandle, p: BytesHandle),
-            pattern!(&space, [{ me @ identity_lockbox: ?l, identity_sign_pk: ?p }])
-        )
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("identity {} not found", fmt_id(me)))?;
-        let lockbox = read_bytes(&mut ws, lock_h).context("read lockbox")?;
-        let my_pk = read_bytes(&mut ws, my_pk_h).context("read pk")?;
-        let my_sk = unlock_secret_key(&pw, &lockbox)?;
-        let box_kp = box_keypair_from_ed25519(&my_sk, &my_pk)?;
-
-        // Find my wrap.
-        let dek_h: BytesHandle = find!(
-            (w: Id, d: BytesHandle),
-            pattern!(&space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: me, wrap_dek: ?d }])
-        )
-        .next()
-        .map(|(_, d)| d)
-        .ok_or_else(|| anyhow::anyhow!("no wrap for {} on this secret", fmt_id(me)))?;
-        let sealed = read_bytes(&mut ws, dek_h).context("read wrap")?;
-        let dek_bytes = DryocBox::from_sealed_bytes(&sealed)
-            .map_err(|e| anyhow::anyhow!("parse wrap: {e:?}"))?
-            .unseal_to_vec(&box_kp)
-            .map_err(|_| anyhow::anyhow!("unseal failed (wrong key?)"))?;
-        let dek = Key::try_from(&dek_bytes[..]).context("dek")?;
-
-        // Open the body.
-        let body_h: BytesHandle = find!(
-            h: BytesHandle,
-            pattern!(&space, [{ secret_id @ secret_body: ?h }])
-        )
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("secret body missing"))?;
-        let body_blob = read_bytes(&mut ws, body_h).context("read body")?;
-        if body_blob.len() < 24 {
-            bail!("malformed body");
-        }
-        let nonce = Nonce::try_from(&body_blob[..24]).context("nonce")?;
-        let plaintext = DryocSecretBox::from_bytes(&body_blob[24..])
-            .map_err(|e| anyhow::anyhow!("parse body: {e:?}"))?
-            .decrypt_to_vec(&nonce, &dek)
-            .map_err(|_| anyhow::anyhow!("decrypt failed"))?;
-        Ok(plaintext)
+        open_secret_value(&pw, &mut ws, &space, secret_id, me)
     })?;
     use std::io::Write;
     std::io::stdout().write_all(&out)?;
@@ -1119,6 +1173,9 @@ fn main() -> Result<()> {
             }
             SecretCmd::Get { scope, name, r#as } => {
                 cmd_secret_get(&cli.pile, &cli.branch, scope, name, r#as)
+            }
+            SecretCmd::Rotate { scope, name, r#as } => {
+                cmd_secret_rotate(&cli.pile, &cli.branch, scope, name, r#as)
             }
             SecretCmd::Share { scope, name, r#as } => {
                 cmd_secret_share(&cli.pile, &cli.branch, scope, name, r#as)
