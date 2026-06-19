@@ -262,6 +262,32 @@ fn grant_is_live(space: &TribleSet, grant: Id) -> bool {
 /// entity kind. We project live grants into an ephemeral object->subject edge
 /// set and let the engine's `path!` take the transitive closure — the edge set
 /// is never persisted (work as its own ledger: recipients are a derived view).
+fn interval_start(iv: IntervalValue) -> Epoch {
+    let (start, _end): (Epoch, Epoch) = iv.try_from_inline().unwrap();
+    start
+}
+
+/// The latest version of a secret named `name` within `scope` — `secret add`
+/// with an existing (scope, name) makes a new version; this picks the newest by
+/// creation time (latest-wins addressing = rotation).
+fn latest_secret(space: &TribleSet, scope: Id, name: &str) -> Option<Id> {
+    find!(
+        (s: Id, t: IntervalValue),
+        pattern!(space, [{ ?s @ metadata::tag: KIND_SECRET, secret_scope: scope, secret_name: name, metadata::created_at: ?t }])
+    )
+    .max_by_key(|(_, t)| interval_start(*t))
+    .map(|(s, _)| s)
+}
+
+/// Count versions of a (scope, name) secret.
+fn secret_versions(space: &TribleSet, scope: Id, name: &str) -> usize {
+    find!(
+        s: Id,
+        pattern!(space, [{ ?s @ metadata::tag: KIND_SECRET, secret_scope: scope, secret_name: name }])
+    )
+    .count()
+}
+
 /// The creator (implicit root admin) of a rooted scope, if any.
 fn scope_creator_of(space: &TribleSet, scope: Id) -> Option<Id> {
     find!(
@@ -439,20 +465,27 @@ enum SecretCmd {
         /// The secret value (or @file / @- for stdin).
         value: String,
     },
-    /// Get a secret as a given identity (needs LIORA_SECRETS_PW).
+    /// Get the latest version of a named secret, as a given identity
+    /// (needs LIORA_SECRETS_PW).
     Get {
-        secret: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        name: String,
         #[arg(long)]
         r#as: String,
     },
-    /// Re-wrap a secret's DEK to recipients added after it was created.
+    /// Re-wrap a named secret's DEK to recipients added after it was created.
     /// Run as an existing recipient (needs LIORA_SECRETS_PW to unlock the DEK).
     Share {
-        secret: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        name: String,
         #[arg(long)]
         r#as: String,
     },
-    /// List secrets.
+    /// List secrets (grouped by scope+name, newest version).
     List,
 }
 
@@ -728,8 +761,7 @@ fn cmd_secret_add(
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let scope_id = Id::from_hex(scope.trim().to_ascii_uppercase().as_str())
-            .ok_or_else(|| anyhow::anyhow!("--scope must be a 32-char hex scope id"))?;
+        let scope_id = resolve_kind_id(&space, KIND_SCOPE, &scope)?;
 
         let recipients = recipients_of(&space, scope_id);
         if recipients.is_empty() {
@@ -761,10 +793,12 @@ fn cmd_secret_add(
         let secret_id = ufoid();
         let now = instant_interval(now_epoch());
         let body_h = put_bytes(&mut ws, body_blob);
+        let name_h = ws.put(name.clone());
         let mut change = TribleSet::new();
         change += entity! { &secret_id @
             metadata::tag: &KIND_SECRET,
             metadata::created_at: now,
+            metadata::name: name_h,
             secret_scope: &scope_id,
             secret_name: name.as_str(),
             secret_body: body_h,
@@ -795,7 +829,13 @@ fn cmd_secret_add(
     })
 }
 
-fn cmd_secret_get(pile: &Path, branch: &str, secret: String, as_id: String) -> Result<()> {
+fn cmd_secret_get(
+    pile: &Path,
+    branch: &str,
+    scope: String,
+    name: String,
+    as_id: String,
+) -> Result<()> {
     let pw = password()?;
     let out = with_repo(pile, |repo| {
         let branch_id = repo
@@ -803,7 +843,9 @@ fn cmd_secret_get(pile: &Path, branch: &str, secret: String, as_id: String) -> R
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let secret_id = resolve_kind_id(&space, KIND_SECRET, &secret)?;
+        let scope_id = resolve_kind_id(&space, KIND_SCOPE, &scope)?;
+        let secret_id = latest_secret(&space, scope_id, &name)
+            .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
         let me = resolve_kind_id(&space, KIND_IDENTITY, &as_id)?;
 
         // Unlock my private key, derive my X25519 keypair.
@@ -856,7 +898,13 @@ fn cmd_secret_get(pile: &Path, branch: &str, secret: String, as_id: String) -> R
     Ok(())
 }
 
-fn cmd_secret_share(pile: &Path, branch: &str, secret: String, as_id: String) -> Result<()> {
+fn cmd_secret_share(
+    pile: &Path,
+    branch: &str,
+    scope: String,
+    name: String,
+    as_id: String,
+) -> Result<()> {
     let pw = password()?;
     with_repo(pile, |repo| {
         let branch_id = repo
@@ -864,7 +912,9 @@ fn cmd_secret_share(pile: &Path, branch: &str, secret: String, as_id: String) ->
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let secret_id = resolve_kind_id(&space, KIND_SECRET, &secret)?;
+        let scope_id = resolve_kind_id(&space, KIND_SCOPE, &scope)?;
+        let secret_id = latest_secret(&space, scope_id, &name)
+            .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
         let me = resolve_kind_id(&space, KIND_IDENTITY, &as_id)?;
 
         // Unlock my key and recover the DEK from my own wrap.
@@ -894,14 +944,8 @@ fn cmd_secret_share(pile: &Path, branch: &str, secret: String, as_id: String) ->
         let dek = Key::try_from(&dek_bytes[..]).context("dek")?;
 
         // Current recipients minus those who already hold a wrap.
-        let scope = find!(
-            sc: Id,
-            pattern!(&space, [{ secret_id @ secret_scope: ?sc }])
-        )
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("secret has no scope"))?;
-        let recipients = recipients_of(&space, scope);
-        let existing: std::collections::HashSet<Id> = find!(
+        let recipients = recipients_of(&space, scope_id);
+        let existing: HashSet<Id> = find!(
             (w: Id, r: Id),
             pattern!(&space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: ?r }])
         )
@@ -949,17 +993,30 @@ fn cmd_secret_list(pile: &Path, branch: &str) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let rows: Vec<(Id, Id)> = find!(
-            (s: Id, sc: Id),
-            pattern!(&space, [{ ?s @ metadata::tag: KIND_SECRET, secret_scope: ?sc }])
+        // Group versions by (scope, name); show the newest of each.
+        let rows: Vec<(Id, Id, TextHandle)> = find!(
+            (s: Id, sc: Id, n: TextHandle),
+            pattern!(&space, [{ ?s @ metadata::tag: KIND_SECRET, secret_scope: ?sc, metadata::name: ?n }])
         )
         .collect();
+        let mut seen: HashSet<(Id, String)> = HashSet::new();
         if rows.is_empty() {
             println!("(no secrets)");
         }
-        for (s, sc) in rows {
-            let n = recipients_of(&space, sc).len();
-            println!("{}  scope {}  ({} recipient(s))", fmt_id(s), fmt_id(sc), n);
+        for (_s, sc, n) in rows {
+            let name = read_text(&mut ws, n).unwrap_or_default();
+            if !seen.insert((sc, name.clone())) {
+                continue;
+            }
+            let versions = secret_versions(&space, sc, &name);
+            let recips = recipients_of(&space, sc).len();
+            println!(
+                "{}  scope {}  (v{}, {} recipient(s))",
+                name,
+                fmt_id(sc),
+                versions,
+                recips
+            );
         }
         Ok(())
     })
@@ -991,11 +1048,11 @@ fn main() -> Result<()> {
             SecretCmd::Add { scope, name, value } => {
                 cmd_secret_add(&cli.pile, &cli.branch, scope, name, value)
             }
-            SecretCmd::Get { secret, r#as } => {
-                cmd_secret_get(&cli.pile, &cli.branch, secret, r#as)
+            SecretCmd::Get { scope, name, r#as } => {
+                cmd_secret_get(&cli.pile, &cli.branch, scope, name, r#as)
             }
-            SecretCmd::Share { secret, r#as } => {
-                cmd_secret_share(&cli.pile, &cli.branch, secret, r#as)
+            SecretCmd::Share { scope, name, r#as } => {
+                cmd_secret_share(&cli.pile, &cli.branch, scope, name, r#as)
             }
             SecretCmd::List => cmd_secret_list(&cli.pile, &cli.branch),
         },
@@ -1036,6 +1093,30 @@ mod tests {
             .unseal_to_vec(&box_kp)
             .unwrap();
         assert_eq!(opened.as_slice(), msg);
+    }
+
+    #[test]
+    fn latest_secret_picks_newest_version() {
+        let scope = ufoid().id;
+        let mut space = TribleSet::new();
+        let mut add_version = |space: &mut TribleSet, year: i32| -> Id {
+            let s = ufoid().id;
+            let t = instant_interval(Epoch::from_gregorian_utc(year, 1, 1, 0, 0, 0, 0));
+            *space += entity! { ExclusiveId::force_ref(&s) @
+                metadata::tag: &KIND_SECRET,
+                secret_scope: &scope,
+                secret_name: "db",
+                metadata::created_at: t,
+            };
+            s
+        };
+        let _v1 = add_version(&mut space, 2020);
+        let v2 = add_version(&mut space, 2025);
+        let v3_older = add_version(&mut space, 2023);
+        assert_eq!(latest_secret(&space, scope, "db"), Some(v2), "2025 is newest");
+        assert_eq!(secret_versions(&space, scope, "db"), 3);
+        assert_eq!(latest_secret(&space, scope, "absent"), None);
+        let _ = v3_older;
     }
 
     #[test]
