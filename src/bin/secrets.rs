@@ -477,6 +477,11 @@ enum ScopeCmd {
     },
     /// List scopes (with root-derivation check).
     List,
+    /// Show who can currently access a scope (the audit view).
+    Members {
+        #[arg(long)]
+        scope: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -670,6 +675,46 @@ fn cmd_scope_list(pile: &Path, branch: &str) -> Result<()> {
                 .unwrap_or(false);
             let mark = if rooted { "✓ rooted" } else { "✗ MISMATCH" };
             println!("{}  {}  root {}  [{}]", fmt_id(s), name, fmt_id(c), mark);
+        }
+        Ok(())
+    })
+}
+
+/// An identity's nickname, or its short id if unnamed.
+fn identity_nick(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
+    find!(
+        n: TextHandle,
+        pattern!(space, [{ id @ metadata::tag: KIND_IDENTITY, metadata::name: ?n }])
+    )
+    .next()
+    .and_then(|n| read_text(ws, n))
+    .unwrap_or_else(|| fmt_id(id))
+}
+
+fn cmd_scope_members(pile: &Path, branch: &str, scope: String) -> Result<()> {
+    with_repo(pile, |repo| {
+        let branch_id = repo
+            .ensure_branch(branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
+        let creator = scope_creator_of(&space, scope_id);
+        let admins = effective_admins(&space, scope_id);
+        let recipients = recipients_of(&space, scope_id);
+        if recipients.is_empty() {
+            println!("(no members)");
+        }
+        for r in recipients {
+            let nick = identity_nick(&mut ws, &space, r);
+            let role = if creator == Some(r) {
+                "root admin"
+            } else if admins.contains(&r) {
+                "admin"
+            } else {
+                "member"
+            };
+            println!("{}  {}  [{}]", nick, fmt_id(r), role);
         }
         Ok(())
     })
@@ -1060,6 +1105,7 @@ fn main() -> Result<()> {
         Command::Scope { cmd } => match cmd {
             ScopeCmd::Create { name, r#as } => cmd_scope_create(&cli.pile, &cli.branch, name, r#as),
             ScopeCmd::List => cmd_scope_list(&cli.pile, &cli.branch),
+            ScopeCmd::Members { scope } => cmd_scope_members(&cli.pile, &cli.branch, scope),
         },
         Command::Grant { object, relation, subject, r#as } => {
             cmd_grant(&cli.pile, &cli.branch, object, relation, subject, r#as)
