@@ -75,18 +75,22 @@ mod schema {
         // Ephemeral edge, only ever asserted into an in-memory TribleSet for
         // `path!` transitive closure — never persisted. (minted 2026-06-19)
         "ABAF427C4F1CB01AA7091A9C38F0DA3A" as pub reaches: GenId;
+        // A scope is a content-derived entity: id = Blake3(creator_pk, name).
+        // The creator is the implicit root admin. (minted 2026-06-19)
+        "CE866212934742FF5B27DEF25E366E07" as pub scope_creator: GenId;
     }
 
     pub const KIND_IDENTITY: Id = id_hex!("0B870F06D1B502EBE1259C90234E8BA2");
     pub const KIND_GRANT: Id = id_hex!("BB95E8D2D7DC644B39396A1B6C10ECC6");
     pub const KIND_SECRET: Id = id_hex!("72B64C9F3644B8016B64820D7F3F23C1");
     pub const KIND_WRAP: Id = id_hex!("EB8549BAF679C5D11ECEDB416AAD76E3");
+    pub const KIND_SCOPE: Id = id_hex!("B2920B23494B9DBD4500158D84432325");
 }
 
 use schema::{
-    KIND_GRANT, KIND_IDENTITY, KIND_SECRET, KIND_WRAP, grant_object, grant_relation,
-    grant_retracted_at, grant_subject, identity_lockbox, identity_sign_pk, reaches, secret_body,
-    secret_name, secret_scope, wrap_dek, wrap_recipient, wrap_secret,
+    KIND_GRANT, KIND_IDENTITY, KIND_SCOPE, KIND_SECRET, KIND_WRAP, grant_object, grant_relation,
+    grant_retracted_at, grant_subject, identity_lockbox, identity_sign_pk, reaches, scope_creator,
+    secret_body, secret_name, secret_scope, wrap_dek, wrap_recipient, wrap_secret,
 };
 
 const DEFAULT_BRANCH: &str = "secrets";
@@ -140,6 +144,19 @@ fn unlock_secret_key(password: &[u8], lockbox: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow::anyhow!("parse lockbox: {e:?}"))?
         .decrypt_to_vec(&nonce, &key)
         .map_err(|_| anyhow::anyhow!("wrong password"))
+}
+
+/// Content-derive a scope id from its creator's signing key and a name.
+/// `id = Blake3("liora-secrets-scope-v1" ‖ creator_pk ‖ name)[..16]`. Both
+/// admins compute the same id independently, and the id commits to its
+/// creator — so the scope's *root admin* is intrinsic, not a spoofable grant.
+fn derive_scope_id(creator_pk: &[u8], name: &str) -> Id {
+    let mut h = blake3::Hasher::new();
+    h.update(b"liora-secrets-scope-v1");
+    h.update(creator_pk);
+    h.update(name.as_bytes());
+    let bytes: [u8; 16] = h.finalize().as_bytes()[..16].try_into().unwrap();
+    Id::new(bytes).expect("blake3 output is non-zero")
 }
 
 /// Derive the X25519 public key (for sealing) from an Ed25519 public key.
@@ -290,6 +307,12 @@ enum Command {
         #[command(subcommand)]
         cmd: IdentityCmd,
     },
+    /// Scope management. A scope is content-derived from its creator+name;
+    /// the creator is its implicit root admin.
+    Scope {
+        #[command(subcommand)]
+        cmd: ScopeCmd,
+    },
     /// Grant a relation: (object, relation, subject).
     Grant {
         #[arg(long)]
@@ -324,6 +347,19 @@ enum IdentityCmd {
         nickname: String,
     },
     /// List identities.
+    List,
+}
+
+#[derive(Subcommand)]
+enum ScopeCmd {
+    /// Create a scope rooted at an identity (the creator becomes root admin).
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        r#as: String,
+    },
+    /// List scopes (with root-derivation check).
     List,
 }
 
@@ -448,6 +484,69 @@ fn cmd_identity_list(pile: &Path, branch: &str) -> Result<()> {
         for (e, n) in rows {
             let nick = read_text(&mut ws, n).unwrap_or_default();
             println!("{}  {}", fmt_id(e), nick);
+        }
+        Ok(())
+    })
+}
+
+/// Read an identity's Ed25519 signing public key.
+fn read_sign_pk(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Result<Vec<u8>> {
+    let h: BytesHandle = find!(h: BytesHandle, pattern!(space, [{ id @ identity_sign_pk: ?h }]))
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("identity {} has no signing key", fmt_id(id)))?;
+    read_bytes(ws, h).ok_or_else(|| anyhow::anyhow!("read pk for {}", fmt_id(id)))
+}
+
+fn cmd_scope_create(pile: &Path, branch: &str, name: String, as_id: String) -> Result<()> {
+    with_repo(pile, |repo| {
+        let branch_id = repo
+            .ensure_branch(branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let creator = resolve_kind_id(&space, KIND_IDENTITY, &as_id)?;
+        let pk = read_sign_pk(&mut ws, &space, creator)?;
+        let scope_id = derive_scope_id(&pk, &name);
+
+        let now = instant_interval(now_epoch());
+        let name_h = ws.put(name.clone());
+        let mut change = TribleSet::new();
+        change += entity! { ExclusiveId::force_ref(&scope_id) @
+            metadata::tag: &KIND_SCOPE,
+            metadata::created_at: now,
+            metadata::name: name_h,
+            scope_creator: &creator,
+        };
+        ws.commit(change, "secrets: scope create");
+        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        println!("scope {} ({})  root admin: {}", fmt_id(scope_id), name, fmt_id(creator));
+        Ok(())
+    })
+}
+
+fn cmd_scope_list(pile: &Path, branch: &str) -> Result<()> {
+    with_repo(pile, |repo| {
+        let branch_id = repo
+            .ensure_branch(branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let rows: Vec<(Id, Id, TextHandle)> = find!(
+            (s: Id, c: Id, n: TextHandle),
+            pattern!(&space, [{ ?s @ metadata::tag: KIND_SCOPE, scope_creator: ?c, metadata::name: ?n }])
+        )
+        .collect();
+        if rows.is_empty() {
+            println!("(no scopes)");
+        }
+        for (s, c, n) in rows {
+            let name = read_text(&mut ws, n).unwrap_or_default();
+            // Self-validation: recompute the id from the stored creator+name.
+            let rooted = read_sign_pk(&mut ws, &space, c)
+                .map(|pk| derive_scope_id(&pk, &name) == s)
+                .unwrap_or(false);
+            let mark = if rooted { "✓ rooted" } else { "✗ MISMATCH" };
+            println!("{}  {}  root {}  [{}]", fmt_id(s), name, fmt_id(c), mark);
         }
         Ok(())
     })
@@ -799,6 +898,10 @@ fn main() -> Result<()> {
             IdentityCmd::Init { nickname } => cmd_identity_init(&cli.pile, &cli.branch, nickname),
             IdentityCmd::List => cmd_identity_list(&cli.pile, &cli.branch),
         },
+        Command::Scope { cmd } => match cmd {
+            ScopeCmd::Create { name, r#as } => cmd_scope_create(&cli.pile, &cli.branch, name, r#as),
+            ScopeCmd::List => cmd_scope_list(&cli.pile, &cli.branch),
+        },
         Command::Grant { object, relation, subject, issuer } => {
             cmd_grant(&cli.pile, &cli.branch, object, relation, subject, issuer)
         }
@@ -854,6 +957,20 @@ mod tests {
             .unseal_to_vec(&box_kp)
             .unwrap();
         assert_eq!(opened.as_slice(), msg);
+    }
+
+    #[test]
+    fn scope_id_is_deterministic_and_creator_bound() {
+        let a = SigningKeyPair::gen_with_defaults();
+        let b = SigningKeyPair::gen_with_defaults();
+        let pk_a = a.public_key.to_vec();
+        let pk_b = b.public_key.to_vec();
+        // same creator+name => same id (both admins derive it independently)
+        assert_eq!(derive_scope_id(&pk_a, "prod"), derive_scope_id(&pk_a, "prod"));
+        // different creator => different scope id (root is intrinsic, unspoofable)
+        assert_ne!(derive_scope_id(&pk_a, "prod"), derive_scope_id(&pk_b, "prod"));
+        // different name => different id
+        assert_ne!(derive_scope_id(&pk_a, "prod"), derive_scope_id(&pk_a, "staging"));
     }
 
     #[test]
