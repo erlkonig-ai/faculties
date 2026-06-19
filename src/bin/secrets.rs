@@ -262,13 +262,11 @@ struct Cli {
 enum Command {
     /// Self-test: envelope seal -> open round-trip (no pile).
     Selftest,
-    /// Create an identity (Ed25519 key, password-locked private key in the pile).
-    IdentityInit {
-        #[arg(long)]
-        nickname: String,
+    /// Identity management.
+    Identity {
+        #[command(subcommand)]
+        cmd: IdentityCmd,
     },
-    /// List identities.
-    IdentityList,
     /// Grant a relation: (object, relation, subject).
     Grant {
         #[arg(long)]
@@ -288,8 +286,28 @@ enum Command {
         #[arg(long)]
         subject: String,
     },
+    /// Secret management.
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityCmd {
+    /// Create an identity (Ed25519 key, password-locked private key in the pile).
+    Init {
+        #[arg(long)]
+        nickname: String,
+    },
+    /// List identities.
+    List,
+}
+
+#[derive(Subcommand)]
+enum SecretCmd {
     /// Add a secret to a scope, sealed to every live recipient.
-    SecretAdd {
+    Add {
         #[arg(long)]
         scope: String,
         #[arg(long)]
@@ -298,13 +316,13 @@ enum Command {
         value: String,
     },
     /// Get a secret as a given identity (needs LIORA_SECRETS_PW).
-    SecretGet {
+    Get {
         secret: String,
         #[arg(long)]
         r#as: String,
     },
     /// List secrets.
-    SecretList,
+    List,
 }
 
 fn load_value(raw: &str) -> Result<Vec<u8>> {
@@ -661,20 +679,24 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Selftest => cmd_selftest(),
-        Command::IdentityInit { nickname } => cmd_identity_init(&cli.pile, &cli.branch, nickname),
-        Command::IdentityList => cmd_identity_list(&cli.pile, &cli.branch),
+        Command::Identity { cmd } => match cmd {
+            IdentityCmd::Init { nickname } => cmd_identity_init(&cli.pile, &cli.branch, nickname),
+            IdentityCmd::List => cmd_identity_list(&cli.pile, &cli.branch),
+        },
         Command::Grant { object, relation, subject, issuer } => {
             cmd_grant(&cli.pile, &cli.branch, object, relation, subject, issuer)
         }
         Command::Revoke { object, subject } => {
             cmd_revoke(&cli.pile, &cli.branch, object, subject)
         }
-        Command::SecretAdd { scope, name, value } => {
-            cmd_secret_add(&cli.pile, &cli.branch, scope, name, value)
-        }
-        Command::SecretGet { secret, r#as } => {
-            cmd_secret_get(&cli.pile, &cli.branch, secret, r#as)
-        }
-        Command::SecretList => cmd_secret_list(&cli.pile, &cli.branch),
+        Command::Secret { cmd } => match cmd {
+            SecretCmd::Add { scope, name, value } => {
+                cmd_secret_add(&cli.pile, &cli.branch, scope, name, value)
+            }
+            SecretCmd::Get { secret, r#as } => {
+                cmd_secret_get(&cli.pile, &cli.branch, secret, r#as)
+            }
+            SecretCmd::List => cmd_secret_list(&cli.pile, &cli.branch),
+        },
     }
 }
