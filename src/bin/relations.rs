@@ -62,6 +62,9 @@ enum Command {
         /// Email address
         #[arg(long)]
         email: Option<String>,
+        /// Phone number
+        #[arg(long)]
+        phone: Option<String>,
         /// Company / organisation
         #[arg(long)]
         company: Option<String>,
@@ -110,6 +113,9 @@ enum Command {
         /// Email address
         #[arg(long)]
         email: Option<String>,
+        /// Phone number
+        #[arg(long)]
+        phone: Option<String>,
         /// Company / organisation
         #[arg(long)]
         company: Option<String>,
@@ -330,6 +336,10 @@ fn person_email(space: &TribleSet, id: Id) -> Option<String> {
     find!(v: String, pattern!(space, [{ id @ relations::email: ?v }])).next()
 }
 
+fn person_phone(space: &TribleSet, id: Id) -> Option<String> {
+    find!(v: String, pattern!(space, [{ id @ relations::phone: ?v }])).next()
+}
+
 fn person_aliases(space: &TribleSet, id: Id) -> Vec<String> {
     find!(v: String, pattern!(space, [{ id @ relations::alias: ?v }])).collect()
 }
@@ -405,6 +415,7 @@ fn cmd_add(
     aliases: Vec<String>,
     teams_user_id: Option<String>,
     email: Option<String>,
+    phone: Option<String>,
     company: Option<String>,
     position: Option<String>,
     source: Option<String>,
@@ -487,6 +498,9 @@ fn cmd_add(
         if let Some(s) = source.as_deref() {
             validate_short(s, "source")?;
         }
+        if let Some(p) = phone.as_deref() {
+            validate_short(p, "phone")?;
+        }
         let label_handle = ws.put(label.clone());
         let display_name_handle = display_name.map(|value| ws.put(value));
         let first_name_handle = first_name.map(|value| ws.put(value));
@@ -505,6 +519,7 @@ fn cmd_add(
             metadata::description?: note_handle,
             relations::teams_user_id?: teams_user_id,
             relations::email?: email,
+            relations::phone?: phone,
             relations::company?: company_handle,
             relations::position?: position_handle,
             relations::source?: source,
@@ -535,6 +550,7 @@ fn cmd_set(
     aliases: Vec<String>,
     teams_user_id: Option<String>,
     email: Option<String>,
+    phone: Option<String>,
     company: Option<String>,
     position: Option<String>,
     source: Option<String>,
@@ -545,6 +561,7 @@ fn cmd_set(
         (affinity.as_deref(), "affinity"),
         (teams_user_id.as_deref(), "teams-user-id"),
         (email.as_deref(), "email"),
+        (phone.as_deref(), "phone"),
         (source.as_deref(), "source"),
     ] {
         if let Some(v) = value {
@@ -604,6 +621,7 @@ fn cmd_set(
             || note_handle.is_some()
             || teams_user_id.is_some()
             || email.is_some()
+            || phone.is_some()
             || company_handle.is_some()
             || position_handle.is_some()
             || source.is_some()
@@ -620,6 +638,7 @@ fn cmd_set(
                 metadata::description?: note_handle,
                 relations::teams_user_id?: teams_user_id,
                 relations::email?: email,
+                relations::phone?: phone,
                 relations::company?: company_handle,
                 relations::position?: position_handle,
                 relations::source?: source,
@@ -710,6 +729,9 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
         if let Some(value) = person_email(&space, person_id) {
             println!("email: {value}");
         }
+        if let Some(value) = person_phone(&space, person_id) {
+            println!("phone: {value}");
+        }
         if let Some(value) = person_position(&mut ws, &space, person_id) {
             println!("position: {value}");
         }
@@ -775,6 +797,7 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            phone,
             company,
             position,
             source,
@@ -793,6 +816,7 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            phone,
             company,
             position,
             source,
@@ -809,6 +833,7 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            phone,
             company,
             position,
             source,
@@ -826,6 +851,7 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            phone,
             company,
             position,
             source,

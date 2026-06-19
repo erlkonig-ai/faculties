@@ -22,6 +22,7 @@ pub mod relations {
         "DC0916CB5F640984EFE359A33105CA9A" as display_name: inlineencodings::Handle<blobencodings::LongString>;
         "9B3329149D54CB9A8E8075E4AA862649" as teams_user_id: inlineencodings::ShortString;
         "B563A063474CBE62ED25A8D0E9A1853C" as email: inlineencodings::ShortString;
+        "9C2B10C740FCF7064A46F9B43D1FE278" as phone: inlineencodings::ShortString;
         // Generic contact facts (enrich every person, any source — booth leads,
         // mail senders, LinkedIn connections). LinkedIn-specific data stays in
         // the linkedin faculty; these are first-class here.
