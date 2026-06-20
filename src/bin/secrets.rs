@@ -1339,6 +1339,19 @@ mod tests {
     }
 
     #[test]
+    fn or_set_redundant_grant_survives_one_retraction() {
+        // bob is made admin by two independent grants; retracting one must not
+        // remove him (OR-set semantics — authority survives on any live path).
+        let (alice, bob) = (ufoid().id, ufoid().id);
+        let mut space = TribleSet::new();
+        let s = mk_scope(&mut space, &alice);
+        let g1 = mk_grant(&mut space, &s, &alice, "admin", &bob);
+        let _g2 = mk_grant(&mut space, &s, &alice, "admin", &bob);
+        retract(&mut space, &g1);
+        assert_eq!(effective_admins(&space, s), HashSet::from([alice, bob]));
+    }
+
+    #[test]
     fn effective_admins_fixpoint_and_transitive_removal() {
         // Pure TribleSet (no pile/blobs): exercises the validity fixpoint.
         let sid = ufoid().id;
