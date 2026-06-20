@@ -6,9 +6,10 @@
 //! range scans on `sent_at`, BM25 search over body/subject,
 //! thread walks via `in_reply_to+` and `references` graph edges).
 //!
-//! Mail entities use **deterministic ids derived from
-//! `blake3(Message-Id).first 16 bytes`** — `in_reply_to` and
-//! `references` GenIds point at predicted entity ids, so a
+//! Mail entities use **deterministic ids derived from the
+//! `Message-Id`** via `entity!`'s intrinsic derivation over the
+//! single `message_id` fact (see `entity_id_for_message`) —
+//! `in_reply_to` and `references` GenIds point at predicted entity ids, so a
 //! thread reference resolves whether or not the referenced
 //! message is in our pile yet. When that message arrives later
 //! (via a separate fetch, forward, or backup pull), its entity

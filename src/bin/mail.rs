@@ -38,6 +38,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use triblespace::core::blob::IntoBlob;
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
@@ -243,14 +244,19 @@ fn unpack_interval(iv: IntervalValue) -> (Epoch, Epoch) {
     iv.try_from_inline().unwrap()
 }
 
-/// Deterministic entity id derived from a Message-Id string.
-/// Same Message-Id always produces the same Id; cross-references
-/// (in_reply_to, references) point at predicted ids even when
-/// the referenced message isn't in our pile yet.
+/// Deterministic entity id derived from a Message-Id string, via `entity!`'s
+/// intrinsic derivation over the single `mail::message_id` fact — the same id
+/// the message entity gets when it materializes. Same Message-Id always
+/// produces the same Id, so `in_reply_to`/`references` point at predicted ids
+/// even when the referenced message isn't in our pile yet. (Uses the macro's
+/// derivation rather than a hand-rolled hash so the convergent-naming intent is
+/// expressed the canonical way — see the scope id in `secrets.rs`.)
 fn entity_id_for_message(message_id: &str) -> Id {
-    let hash = blake3::hash(message_id.trim().as_bytes());
-    let bytes: [u8; 16] = hash.as_bytes()[..16].try_into().unwrap();
-    Id::new(bytes).expect("blake3 output is non-zero")
+    entity! { _ @
+        mail::message_id: message_id.trim().to_string().to_blob().get_handle(),
+    }
+    .root()
+    .expect("entity! derives a root id")
 }
 
 fn fmt_id(id: Id) -> String {
@@ -2421,5 +2427,21 @@ fn main() -> Result<()> {
         Command::Show { message } => cmd_show(&cli.pile, mail_branch, relations_branch, message),
         Command::Search { query } => cmd_search(&cli.pile, mail_branch, relations_branch, query),
         Command::Resolve { prefix } => cmd_resolve(&cli.pile, mail_branch, prefix),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_entity_id_is_deterministic_and_message_id_bound() {
+        // The forward-reference contract: the id is a pure, stable function of
+        // the Message-Id, so a reference resolves to the same id the message
+        // materializes at. Whitespace is trimmed so header-quoted ids agree.
+        let a = entity_id_for_message("<abc@example.com>");
+        assert_eq!(a, entity_id_for_message("<abc@example.com>"), "deterministic");
+        assert_eq!(a, entity_id_for_message("  <abc@example.com>  "), "trim-invariant");
+        assert_ne!(a, entity_id_for_message("<other@example.com>"), "message-id-bound");
     }
 }
