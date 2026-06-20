@@ -633,10 +633,16 @@ fn load_watched_view(
     let relations_space = relations_ws
         .checkout(..)
         .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+    // Only zooid personas count toward the watched roster. A new colony
+    // member is news; bulk contact/lead imports (hundreds of KIND_PERSON
+    // entries from e.g. a LinkedIn pull) must NOT wake every watcher.
+    // Gate on affinity = "zooid".
     let roster: std::collections::BTreeSet<Id> = find!(
         person_id: Id,
         pattern!(&relations_space, [{
-            ?person_id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID
+            ?person_id @
+                metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID,
+                rel_attrs::affinity: "zooid",
         }])
     )
     .collect();
@@ -1058,6 +1064,57 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
     }
 }
 
+/// Print only the *novel* content behind the news — new messages (sender +
+/// body) and newly-arrived zooids — so a woken watcher gets what actually
+/// changed, not a full re-dump of the snapshot. The `News:` reason lines
+/// are printed by the caller; this fills in the detail worth reading.
+fn print_news_detail(
+    repo: &mut Repository<Pile>,
+    old: &WatchedView,
+    new: &WatchedView,
+    local_branch_id: Id,
+    relations_branch_id: Id,
+) -> Result<()> {
+    let new_msgs: Vec<Id> = new.unread.difference(&old.unread).copied().collect();
+    if !new_msgs.is_empty() {
+        let mut local_ws = repo
+            .pull(local_branch_id)
+            .map_err(|e| anyhow!("pull local: {e:?}"))?;
+        let local_space = local_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout local: {e:?}"))?;
+        let mut rel_ws = repo
+            .pull(relations_branch_id)
+            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+        let rel_space = rel_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+        let rows = load_message_ids(&local_space);
+        println!("\nNew messages:");
+        for id in &new_msgs {
+            if let Some(row) = rows.iter().find(|r| r.id == *id) {
+                let from = person_label(&mut rel_ws, &rel_space, row.from);
+                let body = resolve_message_body(&mut local_ws, &local_space, *id);
+                println!("- {from}: {body}");
+            }
+        }
+    }
+    let new_people: Vec<Id> = new.roster.difference(&old.roster).copied().collect();
+    if !new_people.is_empty() {
+        let mut rel_ws = repo
+            .pull(relations_branch_id)
+            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+        let rel_space = rel_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+        println!("\nNew zooid(s):");
+        for id in &new_people {
+            println!("- {}", person_label(&mut rel_ws, &rel_space, *id));
+        }
+    }
+    Ok(())
+}
+
 fn cmd_wait(
     pile: &Path,
     persona: Option<&str>,
@@ -1068,7 +1125,7 @@ fn cmd_wait(
     poll_ms: u64,
 ) -> Result<()> {
     let timeout = parse_wait_target(target.as_ref())?;
-    let (detected_change_before_wait, changed) = with_repo(pile, |repo| {
+    let (detected_change_before_wait, changed, news_printed) = with_repo(pile, |repo| {
         let compass_branch_id = repo
             .ensure_branch("compass", None)
             .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
@@ -1120,7 +1177,8 @@ fn cmd_wait(
                         for reason in &reasons {
                             println!("News: {reason}");
                         }
-                        return Ok((true, true));
+                        print_news_detail(repo, &seen, &view, local_branch_id, relations_branch_id)?;
+                        return Ok((true, true, true));
                     }
                 }
                 Some(view)
@@ -1128,7 +1186,7 @@ fn cmd_wait(
             None => {
                 if let Some(last_seen) = load_checkpoint_heads(repo, orient_state_branch_id)? {
                     if baseline_heads != last_seen {
-                        return Ok((true, true));
+                        return Ok((true, true, false));
                     }
                 }
                 None
@@ -1141,7 +1199,7 @@ fn cmd_wait(
         loop {
             if let Some(timeout) = timeout {
                 if start.elapsed() >= timeout {
-                    return Ok((false, false));
+                    return Ok((false, false, false));
                 }
             }
             std::thread::sleep(poll);
@@ -1168,17 +1226,23 @@ fn cmd_wait(
                         for reason in &reasons {
                             println!("News: {reason}");
                         }
-                        return Ok((false, true));
+                        print_news_detail(repo, &*view, &current_view, local_branch_id, relations_branch_id)?;
+                        return Ok((false, true, true));
                     }
                     // Movement without news (own ack/send, another
                     // persona's traffic) — absorb it and keep waiting.
                     baseline_heads = current_heads;
                     *view = current_view;
                 }
-                _ => return Ok((false, true)),
+                _ => return Ok((false, true, false)),
             }
         }
     })?;
+    if news_printed {
+        // Terse path: the News: reasons and the novel detail were already
+        // printed inside the wait loop — don't re-dump the full snapshot.
+        return Ok(());
+    }
     if detected_change_before_wait {
         println!("Detected branch changes since last orientation snapshot; returning immediately.");
     }
