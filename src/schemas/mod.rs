@@ -16,6 +16,7 @@ pub mod patience;
 pub mod planner;
 pub mod reason;
 pub mod relations;
+pub mod status;
 pub mod teams;
 pub mod triage;
 pub mod web;
