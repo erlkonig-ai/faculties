@@ -710,7 +710,9 @@ fn load_watched_view(
     let unread: std::collections::BTreeSet<Id> = message_rows
         .into_iter()
         .filter(|msg| {
-            (msg.to == persona_id || my_groups.contains(&msg.to))
+            // your own sends never wake you — including to a group you're in.
+            msg.from != persona_id
+                && (msg.to == persona_id || my_groups.contains(&msg.to))
                 && !reads.contains_key(&(msg.id, persona_id))
         })
         .map(|msg| msg.id)
