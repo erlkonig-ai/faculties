@@ -2,6 +2,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::schemas::embeddings;
 use faculties::schemas::files::{FILES_BRANCH_NAME, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, file};
 use hifitime::Epoch;
 use hifitime::efmt::Formatter;
@@ -10,12 +11,10 @@ use rand_core::OsRng;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
-use triblespace_search::hnsw::HNSWBuilder;
-use triblespace_search::schemas::{put_embedding, Embedding};
+use triblespace_search::schemas::Embedding;
 
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -1465,55 +1464,6 @@ fn read_embedding(ws: &mut Workspace<Pile>, h: EmbHandle) -> Result<Vec<f32>> {
     Ok(v.as_ref().to_vec())
 }
 
-/// Pure nearest-neighbour core: build a succinct HNSW over `pairs`
-/// (id, L2-normalized vector) and return every entry within `floor` cosine of
-/// `query`, ranked descending. cosine == dot since the vectors are unit-norm.
-///
-/// The query vector's *origin* is irrelevant here — it's the embedding of the
-/// query file (`files similar <id>`) or of a text string (`files similar
-/// --text`), the same shared multi-modal space either way. Self-match and tag
-/// filtering are the caller's job. No pile/workspace dependency, so it's unit
-/// testable with synthetic vectors.
-fn nearest(pairs: &[(Id, Vec<f32>)], query: &[f32], floor: f32) -> Result<Vec<(f32, Id)>> {
-    if pairs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let dim = query.len();
-    let mut store = MemoryBlobStore::new();
-    let mut builder = HNSWBuilder::new(dim).with_seed(42);
-    let mut by_handle: std::collections::HashMap<EmbHandle, (Id, Vec<f32>)> =
-        std::collections::HashMap::new();
-    for (eid, v) in pairs {
-        let lh = put_embedding(&mut store, v.clone())
-            .map_err(|e| anyhow::anyhow!("stage embedding: {e:?}"))?;
-        builder
-            .insert(lh, v.clone())
-            .map_err(|e| anyhow::anyhow!("hnsw insert: {e:?}"))?;
-        by_handle.insert(lh, (*eid, v.clone()));
-    }
-    let local_query = put_embedding(&mut store, query.to_vec())
-        .map_err(|e| anyhow::anyhow!("stage query: {e:?}"))?;
-    let idx = builder.build();
-    let reader = store
-        .reader()
-        .map_err(|e| anyhow::anyhow!("blob reader: {e:?}"))?;
-    let view = idx.attach(&reader);
-    let candidates = view
-        .candidates_above(local_query, floor)
-        .map_err(|e| anyhow::anyhow!("similarity search: {e:?}"))?;
-    let mut rows: Vec<(f32, Id)> = candidates
-        .into_iter()
-        .filter_map(|h| {
-            by_handle.get(&h).map(|(eid, v)| {
-                let cos: f32 = query.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-                (cos, *eid)
-            })
-        })
-        .collect();
-    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(rows)
-}
-
 /// Semantic nearest-neighbour search over image embeddings.
 ///
 /// Embeddings are persisted as exhaust of `add` (one `Handle<Embedding>` per
@@ -1574,7 +1524,7 @@ fn cmd_similar(
     for (eid, h) in &pairs {
         vec_pairs.push((*eid, read_embedding(ws, *h)?));
     }
-    let ranked = nearest(&vec_pairs, &query_vec, floor)?;
+    let ranked = embeddings::nearest(&vec_pairs, &query_vec, floor)?;
 
     // Drop self (file query only), apply the hybrid tag filter, truncate.
     let mut rows: Vec<(f32, Id)> = Vec::new();
@@ -1675,55 +1625,3 @@ fn main() -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// L2-normalize (mirrors `put_embedding`'s source normalization, which is
-    /// also what mary's LocalEmbedder does — so cosine == dot holds).
-    fn unit(mut v: Vec<f32>) -> Vec<f32> {
-        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if n > 0.0 {
-            for x in &mut v {
-                *x /= n;
-            }
-        }
-        v
-    }
-
-    // The search core, exercised with synthetic vectors — de-risks the whole
-    // faculties side independent of mary's embedder. Models the eventual real
-    // flow: query vector (from an image OR a text string) -> ranked file ids.
-    #[test]
-    fn nearest_ranks_by_cosine_and_respects_floor() {
-        let (a, b, c) = (
-            Id::new([1u8; 16]).unwrap(),
-            Id::new([2u8; 16]).unwrap(),
-            Id::new([3u8; 16]).unwrap(),
-        );
-        let pairs = vec![
-            (a, unit(vec![1.0, 0.0, 0.0, 0.0])), // near the query
-            (b, unit(vec![0.9, 0.4, 0.0, 0.0])), // a bit further
-            (c, unit(vec![0.0, 0.0, 1.0, 0.0])), // orthogonal
-        ];
-        let query = unit(vec![1.0, 0.1, 0.0, 0.0]);
-
-        let ranked = nearest(&pairs, &query, 0.0).unwrap();
-        assert_eq!(ranked.first().unwrap().1, a, "A is the nearest");
-        let order: Vec<Id> = ranked.iter().map(|(_, id)| *id).collect();
-        let pa = order.iter().position(|x| *x == a).unwrap();
-        let pb = order.iter().position(|x| *x == b).unwrap();
-        assert!(pa < pb, "A ranks above B");
-
-        // A high floor filters the orthogonal C (cos ≈ 0).
-        let high = nearest(&pairs, &query, 0.5).unwrap();
-        assert!(high.iter().all(|(cos, _)| *cos >= 0.5), "all results meet the floor");
-        assert!(!high.iter().any(|(_, id)| *id == c), "orthogonal C is below 0.5");
-    }
-
-    #[test]
-    fn nearest_empty_is_empty() {
-        let q = unit(vec![1.0, 0.0]);
-        assert!(nearest(&[], &q, 0.0).unwrap().is_empty());
-    }
-}

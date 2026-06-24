@@ -5,6 +5,7 @@ pub mod body;
 pub mod compass;
 pub mod decide;
 pub mod discord;
+pub mod embeddings;
 pub mod files;
 pub mod gauge;
 pub mod headspace;
