@@ -29,7 +29,7 @@ use faculties::schemas::message::{local as read_attrs, KIND_READ_ID};
 use faculties::schemas::mail::{mail, KIND_DRAFT, KIND_MESSAGE, KIND_SPAM};
 use faculties::schemas::relations::{relations as rel_attrs, KIND_PERSON_ID};
 use hifitime::Epoch;
-use lettre::message::{Mailbox, header};
+use lettre::message::{Mailbox, MultiPart, SinglePart, header};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use rand_core::OsRng;
@@ -104,6 +104,11 @@ enum Command {
         /// Relation hex prefix for BCC (repeatable).
         #[arg(long)]
         bcc: Vec<String>,
+        /// File to attach (repeatable). Stored in the files branch
+        /// first, then referenced from the draft so `mail send`
+        /// attaches it automatically.
+        #[arg(long)]
+        attach: Vec<PathBuf>,
     },
     /// Compose a reply as a draft. Pre-fills In-Reply-To and
     /// References from the parent's headers; rest of the flow
@@ -339,6 +344,36 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
     ws.get::<View<str>, blobencodings::LongString>(h)
         .ok()
         .map(|view| view.to_string())
+}
+
+/// Best-effort MIME type from a filename extension. Used both when
+/// storing an outbound attachment and when re-attaching it on send —
+/// derived from the name rather than the stored `file::mime`, which is
+/// capped at 32 bytes (and so truncates long types like the pptx one).
+fn mime_for_filename(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    match ext {
+        "pdf" => "application/pdf",
+        "pptx" => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        }
+        "ppt" => "application/vnd.ms-powerpoint",
+        "docx" => {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        }
+        "doc" => "application/msword",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "txt" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
 }
 
 // ── read tracking ─────────────────────────────────────────────────────────
@@ -1128,9 +1163,26 @@ fn cmd_draft(
     body: String,
     cc: Vec<String>,
     bcc: Vec<String>,
+    attach: Vec<PathBuf>,
 ) -> Result<()> {
     let body_text = load_value_or_file(&body, "body")?;
     let config = load_config()?;
+
+    // Read each attachment off disk and store it in the files branch
+    // (via persist_message below); the draft references them so that
+    // `mail send` re-reads and attaches them automatically.
+    let mut attachments: Vec<Attachment> = Vec::new();
+    for path in &attach {
+        let bytes = fs::read(path)
+            .with_context(|| format!("read attachment {}", path.display()))?;
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("attachment.bin")
+            .to_string();
+        let mime = mime_for_filename(&filename).to_string();
+        attachments.push(Attachment { filename, mime, bytes });
+    }
 
     let to_raw: Vec<String> = to
         .split(',')
@@ -1188,7 +1240,7 @@ fn cmd_draft(
             references: Vec::new(),
             is_spam: false,
             raw: Vec::new(), // ignored by persist_message when as_draft=true
-            attachments: Vec::new(),
+            attachments: std::mem::take(&mut attachments),
         };
 
         let draft_id = persist_message(
@@ -1416,6 +1468,7 @@ fn decision_is_resolved(
 fn cmd_send(
     pile: &Path,
     mail_branch_id: Id,
+    files_branch_id: Id,
     relations_branch_id: Id,
     decide_branch_id: Id,
     draft_hex: String,
@@ -1474,6 +1527,7 @@ fn cmd_send(
         bcc_emails: Vec<String>,
         in_reply_to_strings: Vec<String>,
         references_strings: Vec<String>,
+        attachment_ids: Vec<Id>,
     }
 
     let attrs: DraftAttrs = with_repo(pile, |repo| {
@@ -1544,6 +1598,9 @@ fn cmd_send(
         let in_reply_to_strings = resolve_msg_ids(irt_ids);
         let references_strings = resolve_msg_ids(ref_ids);
 
+        let attachment_ids: Vec<Id> =
+            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::attachment: ?r }])).collect();
+
         Ok(DraftAttrs {
             message_id,
             subject,
@@ -1553,7 +1610,36 @@ fn cmd_send(
             bcc_emails,
             in_reply_to_strings,
             references_strings,
+            attachment_ids,
         })
+    })?;
+
+    // Re-read each referenced attachment's bytes + filename from the
+    // files branch, so they can be re-attached to the outbound MIME.
+    let attachments: Vec<(String, Vec<u8>)> = with_repo(pile, |repo| {
+        let mut ws = repo
+            .pull(files_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull files: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout files: {e:?}"))?;
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        for &fid in &attrs.attachment_ids {
+            let content_h: Option<FileHandle> =
+                find!(h: FileHandle, pattern!(&space, [{ fid @ file::content: ?h }])).next();
+            let name_h: Option<TextHandle> =
+                find!(h: TextHandle, pattern!(&space, [{ fid @ file::name: ?h }])).next();
+            if let Some(ch) = content_h {
+                let bytes: anybytes::Bytes = ws
+                    .get::<anybytes::Bytes, _>(ch)
+                    .map_err(|e| anyhow::anyhow!("read attachment blob: {e:?}"))?;
+                let name = name_h
+                    .and_then(|h| read_text(&mut ws, h))
+                    .unwrap_or_else(|| "attachment.bin".into());
+                out.push((name, bytes.as_ref().to_vec()));
+            }
+        }
+        Ok(out)
     })?;
 
     // 3. Build RFC 5322 message and transmit.
@@ -1597,10 +1683,29 @@ fn cmd_send(
                 .join(" "),
         );
     }
-    let message = builder
-        .header(header::ContentType::TEXT_PLAIN)
-        .body(attrs.body.clone())
-        .context("build message")?;
+    let message = if attachments.is_empty() {
+        builder
+            .header(header::ContentType::TEXT_PLAIN)
+            .body(attrs.body.clone())
+            .context("build message")?
+    } else {
+        let mut multipart = MultiPart::mixed().singlepart(
+            SinglePart::builder()
+                .header(header::ContentType::TEXT_PLAIN)
+                .body(attrs.body.clone()),
+        );
+        for (name, bytes) in &attachments {
+            let ct = header::ContentType::parse(mime_for_filename(name)).unwrap_or_else(|_| {
+                header::ContentType::parse("application/octet-stream").unwrap()
+            });
+            multipart = multipart.singlepart(
+                lettre::message::Attachment::new(name.clone()).body(bytes.clone(), ct),
+            );
+        }
+        builder
+            .multipart(multipart)
+            .context("build multipart message")?
+    };
 
     send_via_smtp(&config, &message)?;
     let raw_bytes = message.formatted();
@@ -2057,14 +2162,20 @@ fn cmd_show(
         let from_email = from_relation.and_then(|rid| {
             find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
         });
-        let to_relations: Vec<Id> =
-            find!(r: Id, pattern!(&space, [{ id @ mail::to: ?r }])).collect();
-        let to_emails: Vec<String> = to_relations
-            .iter()
-            .filter_map(|rid| {
-                find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
-            })
-            .collect();
+        let emails_of = |attr_rel_ids: Vec<Id>| -> Vec<String> {
+            attr_rel_ids
+                .iter()
+                .filter_map(|rid| {
+                    find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
+                })
+                .collect()
+        };
+        let to_emails: Vec<String> =
+            emails_of(find!(r: Id, pattern!(&space, [{ id @ mail::to: ?r }])).collect());
+        let cc_emails: Vec<String> =
+            emails_of(find!(r: Id, pattern!(&space, [{ id @ mail::cc: ?r }])).collect());
+        let bcc_emails: Vec<String> =
+            emails_of(find!(r: Id, pattern!(&space, [{ id @ mail::bcc: ?r }])).collect());
         let body = find!(h: TextHandle, pattern!(&space, [{ id @ mail::body: ?h }]))
             .next()
             .and_then(|h| read_text(&mut mws, h))
@@ -2083,6 +2194,12 @@ fn cmd_show(
         }
         if !to_emails.is_empty() {
             println!("  to:         {}", to_emails.join(", "));
+        }
+        if !cc_emails.is_empty() {
+            println!("  cc:         {}", cc_emails.join(", "));
+        }
+        if !bcc_emails.is_empty() {
+            println!("  bcc:        {}", bcc_emails.join(", "));
         }
         if let Some(s) = sent_at {
             println!("  sent_at:    {}", epoch_to_chrono_utc(s).format("%Y-%m-%d %H:%M UTC"));
@@ -2372,7 +2489,7 @@ fn main() -> Result<()> {
 
     match cmd {
         Command::Fetch => cmd_fetch(&cli.pile, mail_branch, files_branch, relations_branch),
-        Command::Draft { to, subject, body, cc, bcc } => cmd_draft(
+        Command::Draft { to, subject, body, cc, bcc, attach } => cmd_draft(
             &cli.pile,
             mail_branch,
             files_branch,
@@ -2383,10 +2500,12 @@ fn main() -> Result<()> {
             body,
             cc,
             bcc,
+            attach,
         ),
         Command::Send { draft } => cmd_send(
             &cli.pile,
             mail_branch,
+            files_branch,
             relations_branch,
             decide_branch,
             draft,
