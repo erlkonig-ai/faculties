@@ -31,7 +31,7 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--about <query>] — antichain cover over ALL memories, coarse→fine to a token budget; --about biases detail toward memories relevant to <query> (needs `memory index`)\n  \
+             memory context [<budget>] [--about <query>] — antichain cover over ALL memories, coarse→fine to a token budget; --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`)\n  \
              memory search <query>           — lexical (BM25) search over chunk summaries (build/refresh with `memory index`)\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
              memory lens [<theme>]            — thematic lenses beside the spine: list them, or print a theme's narratives (create with `create --lens <theme>`)\n  \
@@ -1428,6 +1428,78 @@ fn context_chunk_cost(
 /// faculty is called by an already-running agent. So when even the coarsest cover
 /// overflows the budget, it ERRORS with instructions for raising a coarser apex
 /// rather than dropping memories: the caller is right there to fix it.
+/// Per-chunk relevance scores for `memory context --about`: SEMANTIC (nomic
+/// cosine over the stored shared-space embeddings) when they exist, else LEXICAL
+/// (BM25). Both are non-negative; the cover propagates subtree maxima over them,
+/// so a node is worth descending into iff some memory beneath it is relevant.
+/// Semantic is strictly better for a briefing-cover — it biases toward memories
+/// that MEAN the query, not ones that share its words — which is exactly what a
+/// subagent's `--about <goal>` briefing wants.
+fn about_relevance_scores(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile>,
+    query: &str,
+) -> Result<std::collections::HashMap<Id, f32>> {
+    #[cfg(feature = "local-embed")]
+    {
+        if let Some(scores) = semantic_about_scores(space, ws, query)? {
+            return Ok(scores);
+        }
+    }
+    // Lexical fallback (BM25) — used without `local-embed`, or before any
+    // `memory embed` has populated the semantic space.
+    let Some((handle, _)) = latest_search_index(space) else {
+        bail!(
+            "no relevance source for --about: build one with `memory embed` (semantic, preferred) \
+             or `memory index` (lexical BM25)"
+        );
+    };
+    let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
+    Ok(idx
+        .query_multi(&hash_tokens(query))
+        .into_iter()
+        .filter_map(|(doc, score)| {
+            let id: Id = doc.try_from_inline().ok()?;
+            Some((id, score))
+        })
+        .collect())
+}
+
+/// Semantic relevance via nomic: embed the query, cosine it against every stored
+/// chunk embedding. `None` if no chunk is embedded yet (caller falls back to
+/// BM25). Negative cosines clamp to 0 so "unrelated" is uniform and subtree-max
+/// stays meaningful (matching BM25's non-negative scores).
+#[cfg(feature = "local-embed")]
+fn semantic_about_scores(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile>,
+    query: &str,
+) -> Result<Option<std::collections::HashMap<Id, f32>>> {
+    let mut handles: Vec<(Id, Inline<Handle<Embedding768>>)> = Vec::new();
+    for chunk in all_chunk_ids(space) {
+        if let Some(h) = chunk_embedding_handle(space, chunk) {
+            handles.push((chunk, h));
+        }
+    }
+    if handles.is_empty() {
+        return Ok(None);
+    }
+    eprintln!("memory: loading nomic-embed-text for --about (once)…");
+    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
+        .map_err(|e| anyhow!("load nomic embedder: {e:?}"))?;
+    let qv = l2_normalize(
+        emb.embed_query(query)
+            .map_err(|e| anyhow!("embed query: {e:?}"))?,
+    );
+    let mut scores = std::collections::HashMap::new();
+    for (chunk, h) in handles {
+        let v: View<[f32]> = ws.get(h).map_err(|e| anyhow!("read embedding: {e:?}"))?;
+        let cos: f32 = qv.iter().zip(v.as_ref().iter()).map(|(a, b)| a * b).sum();
+        scores.insert(chunk, cos.max(0.0));
+    }
+    Ok(Some(scores))
+}
+
 fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
     let estimator = TokenEstimator::from_env();
 
@@ -1509,18 +1581,7 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
         // the BM25 index, then propagate each node's score up to a subtree maximum
         // (a node is worth descending into if ANY memory beneath it is relevant).
         let relevance: Vec<f32> = if let Some(query) = &about {
-            let Some((handle, _)) = latest_search_index(&space) else {
-                bail!("no search index yet — run `memory index` first (needed for --about)");
-            };
-            let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
-            let scores: std::collections::HashMap<Id, f32> = idx
-                .query_multi(&hash_tokens(query))
-                .into_iter()
-                .filter_map(|(doc, score)| {
-                    let id: Id = doc.try_from_inline().ok()?;
-                    Some((id, score))
-                })
-                .collect();
+            let scores = about_relevance_scores(&space, &mut ws, query)?;
             let mut r: Vec<f32> = (0..n)
                 .map(|i| *scores.get(&spans[i].2).unwrap_or(&0.0))
                 .collect();
