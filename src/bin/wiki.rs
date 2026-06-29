@@ -1,6 +1,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::schemas::embeddings::{self, Embedding768};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use itertools::Itertools;
@@ -202,6 +203,17 @@ enum Command {
         /// Include archived fragments
         #[arg(long)]
         all: bool,
+    },
+    /// Embed every current fragment into the shared nomic space (build step for
+    /// `wiki similar`; idempotent — only embeds fragments not yet embedded).
+    /// Needs `--features local-embed`.
+    Embed,
+    /// Semantic search: nearest fragments to a free-text query by MEANING in the
+    /// shared nomic space (build/refresh with `wiki embed`). The complement to
+    /// `wiki search` (lexical substring). Needs `--features local-embed`.
+    Similar {
+        /// Query text (matched by meaning, not keywords).
+        query: String,
     },
     /// Batch export/import all fragments (version-addressed for CAS safety)
     Batch {
@@ -2646,6 +2658,154 @@ fn collect_typ_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+// ── semantic embedding seam (nomic + shared HNSW, behind `local-embed`) ─────
+// The wiki end of one cross-faculty semantic search: fragment prose is embedded
+// into the SAME shared nomic-768 space as memory chunks and file images, so a
+// query here is directly comparable to a memory or an image elsewhere. `wiki
+// embed` is the build step (embed each current fragment's content once, store
+// the vector as exhaust on its latest version), `wiki similar` the query.
+// Complements `wiki search` (lexical substring) by matching MEANING.
+
+#[cfg(feature = "local-embed")]
+const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
+
+/// L2-normalize so dot-product == cosine downstream (the shared `nearest` core
+/// assumes unit vectors).
+#[cfg(feature = "local-embed")]
+fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 {
+        for x in &mut v {
+            *x /= n;
+        }
+    }
+    v
+}
+
+/// The stored shared-space embedding handle for a version, if embedded.
+#[cfg(feature = "local-embed")]
+fn version_embedding_handle(
+    space: &TribleSet,
+    vid: Id,
+) -> Option<Inline<inlineencodings::Handle<Embedding768>>> {
+    find!(
+        h: Inline<inlineencodings::Handle<Embedding768>>,
+        pattern!(space, [{ vid @ embeddings::attr::embedding: ?h }])
+    )
+    .next()
+}
+
+/// `wiki embed` — embed every current (non-archived) fragment that lacks a
+/// vector, storing it as exhaust on the latest version. Idempotent; re-running
+/// after `wiki edit` re-embeds only the new versions.
+#[cfg(feature = "local-embed")]
+fn cmd_embed(repo: &mut Repo, bid: Id) -> Result<()> {
+    eprintln!("wiki: loading nomic-embed-text (once)…");
+    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
+        .map_err(|e| anyhow::anyhow!("load nomic embedder: {e:?}"))?;
+
+    let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let latest = latest_versions(&space);
+
+    let mut todo: Vec<(Id, TextHandle)> = Vec::new();
+    for (_frag, &(vid, _)) in &latest {
+        if tags_of(&space, vid).contains(&TAG_ARCHIVED_ID) {
+            continue;
+        }
+        if version_embedding_handle(&space, vid).is_some() {
+            continue;
+        }
+        if let Some(ch) = content_handle_of(&space, vid) {
+            todo.push((vid, ch));
+        }
+    }
+    if todo.is_empty() {
+        println!("all current fragments already embedded.");
+        return Ok(());
+    }
+    let total = todo.len();
+    let mut change = TribleSet::new();
+    for (i, (vid, ch)) in todo.into_iter().enumerate() {
+        let content: View<str> = ws.get(ch).map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+        let v = l2_normalize(
+            emb.embed_document(content.as_ref())
+                .map_err(|e| anyhow::anyhow!("embed {vid:x}: {e:?}"))?,
+        );
+        let handle = ws.put::<Embedding768, _>(v);
+        change += entity! { ExclusiveId::force_ref(&vid) @ embeddings::attr::embedding: handle };
+        if (i + 1) % 25 == 0 || i + 1 == total {
+            eprintln!("  embedded {}/{total}", i + 1);
+        }
+    }
+    ws.commit(change, "wiki embed");
+    repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    println!("embedded {total} fragments into the shared nomic space.");
+    Ok(())
+}
+
+#[cfg(not(feature = "local-embed"))]
+fn cmd_embed(_repo: &mut Repo, _bid: Id) -> Result<()> {
+    bail!("`wiki embed` needs the local embedder — rebuild with `--features local-embed`");
+}
+
+/// `wiki similar <query>` — nearest fragments to a free-text query by meaning.
+#[cfg(feature = "local-embed")]
+fn cmd_similar(repo: &mut Repo, bid: Id, query: String) -> Result<()> {
+    eprintln!("wiki: loading nomic-embed-text (once)…");
+    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
+        .map_err(|e| anyhow::anyhow!("load nomic embedder: {e:?}"))?;
+    let qv = l2_normalize(
+        emb.embed_query(&query)
+            .map_err(|e| anyhow::anyhow!("embed query: {e:?}"))?,
+    );
+
+    let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let latest = latest_versions(&space);
+
+    let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
+    let mut vid_to_frag: HashMap<Id, Id> = HashMap::new();
+    let mut current = 0usize;
+    for (&frag, &(vid, _)) in &latest {
+        if tags_of(&space, vid).contains(&TAG_ARCHIVED_ID) {
+            continue;
+        }
+        current += 1;
+        if let Some(h) = version_embedding_handle(&space, vid) {
+            let v: View<[f32]> = ws.get(h).map_err(|e| anyhow::anyhow!("read embedding: {e:?}"))?;
+            pairs.push((vid, v.as_ref().to_vec()));
+            vid_to_frag.insert(vid, frag);
+        }
+    }
+    if pairs.is_empty() {
+        bail!("no fragment embeddings on this pile yet — run `wiki embed` first");
+    }
+    if pairs.len() < current {
+        eprintln!(
+            "note: {} current fragment(s) not yet embedded — run `wiki embed` to refresh",
+            current - pairs.len()
+        );
+    }
+
+    let ranked = embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow::anyhow!("nearest: {e:?}"))?;
+    if ranked.is_empty() {
+        println!("no matches.");
+        return Ok(());
+    }
+    for (cos, vid) in ranked.into_iter().take(10) {
+        let frag = vid_to_frag.get(&vid).copied().unwrap_or(vid);
+        let title = read_title(&space, &mut ws, vid).unwrap_or_default();
+        println!("{cos:6.3}  {}  {title}", format!("{:x}", frag));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "local-embed"))]
+fn cmd_similar(_repo: &mut Repo, _bid: Id, _query: String) -> Result<()> {
+    bail!("`wiki similar` needs the local embedder — rebuild with `--features local-embed`");
+}
+
 fn cmd_search(
     repo: &mut Repo,
     bid: Id,
@@ -2854,6 +3014,8 @@ fn main() -> Result<()> {
         Command::Search { query, context, all } => {
             cmd_search(&mut repo, branch_id, query, context, all)
         }
+        Command::Embed => cmd_embed(&mut repo, branch_id),
+        Command::Similar { query } => cmd_similar(&mut repo, branch_id, query),
         Command::Check { compile } => cmd_check(&mut repo, branch_id, compile),
         Command::Batch { action } => match action {
             BatchAction::Export { dir } => cmd_export_all(&mut repo, branch_id, dir),
