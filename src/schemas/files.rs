@@ -16,6 +16,12 @@ pub const FILES_BRANCH_NAME: &str = "files";
 pub const KIND_FILE: Id = id_hex!("1F9C9DCA69504452F318BA11E81D47D1");
 pub const KIND_DIRECTORY: Id = id_hex!("58CDFCBA4E4B91979766D50FB18777B5");
 pub const KIND_IMPORT: Id = id_hex!("89655D039A90634F09207BFEB5BE65AD");
+/// A rasterized PDF page — the retrieval unit for `application/pdf` in the
+/// nomic-mm7b space. A page entity carries `page::parent` (the file it came
+/// from), `page::index` (1-based page number), and an `embeddings::attr_mm7b`
+/// vector (the page image embedded). A PDF isn't an image, so the page is what
+/// `files similar --mm7b` actually ranks; a hit resolves back to "file X, page N".
+pub const KIND_PAGE: Id = id_hex!("2FD7176842BAB84DF000A094D2685552");
 
 // ── attributes ───────────────────────────────────────────────────────────
 pub mod file {
@@ -44,5 +50,18 @@ pub mod file {
         // dim-typed `Embedding768`); kept live until the nomic vision tower
         // lands, then a clean break (new attribute, no dimension clash).
         "433BE3AC7F95405872385898AD52FB73" as embedding: inlineencodings::Handle<Embedding>;
+    }
+}
+
+/// Rasterized-PDF-page attributes (see [`KIND_PAGE`]). A page entity is the
+/// retrieval unit for PDFs in the nomic-mm7b space; the embedding itself lives
+/// on the shared `embeddings::attr_mm7b::embedding`.
+pub mod page {
+    use super::*;
+    attributes! {
+        // page: the file entity this page was rasterized from
+        "2CA50D520D6784D9340851C36EDED209" as parent: inlineencodings::GenId;
+        // page: 1-based page number, decimal text (a display/identity label)
+        "1AACF2C318E912C3B74283FB127D3CFE" as index: inlineencodings::ShortString;
     }
 }

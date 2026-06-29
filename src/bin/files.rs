@@ -3,7 +3,9 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::embeddings;
-use faculties::schemas::files::{FILES_BRANCH_NAME, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, file};
+use faculties::schemas::files::{
+    FILES_BRANCH_NAME, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE, file, page,
+};
 use hifitime::Epoch;
 use hifitime::efmt::Formatter;
 use hifitime::efmt::consts::ISO8601_DATE;
@@ -133,15 +135,31 @@ enum Command {
         #[arg(long)]
         mm7b: bool,
     },
-    /// Embed every image file with nomic-embed-multimodal-7b (3584-d) and store
-    /// the vector on `attr_mm7b::embedding`. Idempotent: skips already-embedded
-    /// files unless `--force`. The 7b model loads once (~20s cold), then ~0.5-1s
-    /// per image. Needs `--features local-embed` and macOS (Metal). This is the
+    /// Embed image files (or, with `--pdf`, PDF *pages*) with
+    /// nomic-embed-multimodal-7b (3584-d) and store the vector on
+    /// `attr_mm7b::embedding`. Idempotent: skips already-embedded files/pages
+    /// unless `--force`. The 7b model loads once (~20s cold), then ~0.5-1s per
+    /// image. Needs `--features local-embed` and macOS (Metal). This is the
     /// index that powers `files similar --mm7b --text "…"` (text→image recall).
     Embed7b {
-        /// Re-embed even files that already carry a 7b embedding.
+        /// Re-embed even files/pages that already carry a 7b embedding.
         #[arg(long)]
         force: bool,
+        /// Embed `application/pdf` files instead of raster images: rasterize
+        /// each page (via `pdftoppm`) and embed it as a separate page entity,
+        /// so a hit points to "file X, page N". The big batch — combine with
+        /// `--limit`/`--max-pages` for incremental runs over a large corpus.
+        #[arg(long)]
+        pdf: bool,
+        /// (PDF mode) Rasterization resolution in DPI. Lower = faster + smaller.
+        #[arg(long, default_value_t = 150)]
+        dpi: u32,
+        /// (PDF mode) Process at most this many PDF files this run (0 = all).
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        /// (PDF mode) Embed at most this many pages per PDF (0 = all pages).
+        #[arg(long, default_value_t = 0)]
+        max_pages: usize,
     },
     /// List imports (snapshots)
     Imports,
@@ -263,6 +281,17 @@ fn read_mime(space: &TribleSet, eid: Id) -> Option<String> {
     find!(
         m: String,
         pattern!(space, [{ eid @ file::mime: ?m }])
+    )
+    .next()
+}
+
+/// If `eid` is a rasterized-PDF page entity, return its `(parent file id, page
+/// index label)`. Used by the 7b similarity display so a page hit reads back as
+/// "file X, page N" instead of a nameless entity.
+fn read_page(space: &TribleSet, eid: Id) -> Option<(Id, String)> {
+    find!(
+        (parent: Id, idx: String),
+        pattern!(space, [{ eid @ metadata::tag: &KIND_PAGE, page::parent: ?parent, page::index: ?idx }])
     )
     .next()
 }
@@ -1669,6 +1698,239 @@ fn cmd_embed7b(
     Ok(())
 }
 
+// ── PDF rasterization (page-level 7b embedding) ────────────────────────────
+// A PDF isn't an image — to put it in the nomic-mm7b space we rasterize each
+// page to a PNG and embed that. We shell out to `pdftoppm` (poppler): it is
+// already present on this machine, renders robustly to RGB, has no heavy
+// build-time C dependency (unlike `mupdf`) and no runtime dylib to vendor
+// (unlike `pdfium-render`, which needs `libpdfium`). The only cost is a runtime
+// dependency on `pdftoppm` being on PATH — checked up front with a clear bail.
+// nomic-embed-multimodal-7b is itself a *visual document* retrieval model
+// (ColPali-style, trained on page screenshots), so a rendered page is exactly
+// its native input — this is the path the model is strongest at.
+
+/// Render a PDF (raw bytes) to per-page PNGs via `pdftoppm`. Returns
+/// `(page_number, png_bytes)` sorted by page, 1-based. `max_pages == 0` renders
+/// all pages; otherwise only the first `max_pages`. Pure side-effect-free from
+/// the pile's view: writes to a private temp dir that is removed on return.
+fn render_pdf_pages(bytes: &[u8], dpi: u32, max_pages: usize) -> Result<Vec<(usize, Vec<u8>)>> {
+    use std::process::Command as PCommand;
+
+    if which_pdftoppm().is_none() {
+        bail!(
+            "`pdftoppm` not found on PATH — install poppler (e.g. `brew install poppler`) \
+             to rasterize PDFs for 7b embedding"
+        );
+    }
+
+    // Private temp dir under the system temp root; cleaned up before returning.
+    let dir = std::env::temp_dir().join(format!("files_pdf7b_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).with_context(|| format!("create temp dir {dir:?}"))?;
+    let in_pdf = dir.join("in.pdf");
+    fs::write(&in_pdf, bytes).with_context(|| format!("write temp pdf {in_pdf:?}"))?;
+    let prefix = dir.join("page");
+
+    let mut cmd = PCommand::new("pdftoppm");
+    cmd.arg("-png").arg("-r").arg(dpi.to_string());
+    if max_pages > 0 {
+        cmd.arg("-l").arg(max_pages.to_string());
+    }
+    cmd.arg(&in_pdf).arg(&prefix);
+    let out = cmd
+        .output()
+        .with_context(|| "spawn pdftoppm")?;
+    if !out.status.success() {
+        let _ = fs::remove_dir_all(&dir);
+        bail!(
+            "pdftoppm failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    // Collect page PNGs: pdftoppm names them `<prefix>-<n>.png`, n zero-padded
+    // to the page-count width. Parse the trailing number so order is numeric.
+    let mut pages: Vec<(usize, Vec<u8>)> = Vec::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("read temp dir {dir:?}"))? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("png") {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let num = stem.rsplit('-').next().and_then(|d| d.parse::<usize>().ok());
+        if let Some(n) = num {
+            let data = fs::read(&path).with_context(|| format!("read page {path:?}"))?;
+            pages.push((n, data));
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    pages.sort_by_key(|(n, _)| *n);
+    Ok(pages)
+}
+
+/// `which pdftoppm` without spawning a shell — returns the resolved path.
+fn which_pdftoppm() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join("pdftoppm");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Embed PDF *pages* into the 3584-d 7b space. Each page becomes a page entity
+/// (`KIND_PAGE`, `page::parent` → file, `page::index` → 1-based number) carrying
+/// the shared `embeddings::attr_mm7b::embedding`, so `files similar --mm7b`
+/// ranks pages and a hit resolves to "file X, page N". Idempotent: a file whose
+/// pages already exist is skipped unless `--force`; page entity ids are intrinsic
+/// (derived from parent+index), so re-runs merge rather than duplicate. Unique
+/// PDF bytes are rendered+embedded once and the per-page vectors fan out to every
+/// file entity that shares the content.
+fn cmd_embed7b_pdf(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    force: bool,
+    dpi: u32,
+    file_limit: usize,
+    max_pages: usize,
+) -> Result<()> {
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+
+    // Gather PDF file entities grouped by content hash (render once per unique
+    // bytes, fan pages out to every sibling file entity).
+    let mut groups: BTreeMap<String, (FileHandle, Vec<Id>)> = BTreeMap::new();
+    for (eid, h) in find!(
+        (eid: Id, h: FileHandle),
+        pattern!(&space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
+    ) {
+        if read_mime(&space, eid).as_deref() != Some("application/pdf") {
+            continue;
+        }
+        groups
+            .entry(handle_hex(h))
+            .or_insert_with(|| (h, Vec::new()))
+            .1
+            .push(eid);
+    }
+
+    if groups.is_empty() {
+        println!("(no PDF files to embed)");
+        return Ok(());
+    }
+
+    // A file entity is "done" if any page already references it as parent.
+    let has_pages = |eid: Id| -> bool {
+        exists!(
+            (p: Id),
+            pattern!(&space, [{ ?p @ metadata::tag: &KIND_PAGE, page::parent: eid }])
+        )
+    };
+
+    // Keep only groups with at least one file entity still needing work.
+    let mut pending: Vec<(String, FileHandle, Vec<Id>)> = groups
+        .into_iter()
+        .filter_map(|(hash, (h, eids))| {
+            let todo: Vec<Id> = if force {
+                eids
+            } else {
+                eids.into_iter().filter(|e| !has_pages(*e)).collect()
+            };
+            (!todo.is_empty()).then_some((hash, h, todo))
+        })
+        .collect();
+
+    if pending.is_empty() {
+        println!("All PDF files already have page embeddings (use --force to re-embed).");
+        return Ok(());
+    }
+    pending.sort_by(|a, b| a.0.cmp(&b.0));
+    if file_limit > 0 && pending.len() > file_limit {
+        pending.truncate(file_limit);
+    }
+    let pending_pdfs = pending.len();
+
+    let embedder = load_mm7b_opt()?;
+
+    let mut change = TribleSet::new();
+    let mut pdfs_done = 0usize;
+    let mut pages_embedded = 0usize;
+    let mut failed = 0usize;
+    for (hash, content, eids) in &pending {
+        let bytes: anybytes::Bytes = match ws.get::<anybytes::Bytes, _>(*content) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("  skip {hash}: read content failed: {e:?}");
+                failed += 1;
+                continue;
+            }
+        };
+        let pages = match render_pdf_pages(bytes.as_ref(), dpi, max_pages) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("  skip {hash}: render failed: {e:#}");
+                failed += 1;
+                continue;
+            }
+        };
+        if pages.is_empty() {
+            eprintln!("  skip {hash}: pdftoppm produced no pages");
+            failed += 1;
+            continue;
+        }
+        let mut this_pages = 0usize;
+        for (page_no, png) in &pages {
+            let v = match mm7b_embed_image(&embedder, png) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("  {hash} page {page_no}: embed failed: {e:#}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            let idx_label = page_no.to_string();
+            let handle: Mm7bHandle = ws.put::<embeddings::Embedding3584, _>(v);
+            for eid in eids {
+                // Intrinsic page id from (parent, index): stable across re-runs.
+                let page_id = entity! { _ @
+                    page::parent: *eid,
+                    page::index: idx_label.clone(),
+                }
+                .root()
+                .expect("entity! derives a root id");
+                change += entity! { ExclusiveId::force_ref(&page_id) @
+                    metadata::tag: &KIND_PAGE,
+                    page::parent: *eid,
+                    page::index: idx_label.clone(),
+                    embeddings::attr_mm7b::embedding: handle,
+                };
+            }
+            this_pages += 1;
+            pages_embedded += 1;
+        }
+        pdfs_done += 1;
+        eprintln!("  {hash}: {this_pages} pages → {} entities", this_pages * eids.len());
+    }
+
+    if change.is_empty() {
+        println!("Nothing to commit (PDFs {pdfs_done}, failed {failed}).");
+        return Ok(());
+    }
+
+    ws.commit(change, "files embed-7b --pdf");
+    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+
+    println!(
+        "7b-embedded {pages_embedded} pages across {pdfs_done} PDFs (of {pending_pdfs} pending){}",
+        if failed > 0 { format!(", {failed} failures") } else { String::new() },
+    );
+    Ok(())
+}
+
 /// Semantic nearest-neighbour search over image embeddings.
 ///
 /// Embeddings are persisted as exhaust of `add` (one `Handle<Embedding>` per
@@ -1852,18 +2114,23 @@ fn cmd_similar_mm7b(
     }
     println!("Similar to {label} (7b space, cos ≥ {floor}):");
     for (cos, eid) in &rows {
-        let name = read_name(&space, ws, *eid).unwrap_or_else(|| "?".into());
-        let mime = read_mime(&space, *eid).unwrap_or_else(|| "?".into());
-        let hash = content_handle_of(&space, *eid)
+        // A page hit resolves to its parent file (name/mime/hash) + page number.
+        let (display_eid, page_suffix) = match read_page(&space, *eid) {
+            Some((parent, idx)) => (parent, format!("  page {idx}")),
+            None => (*eid, String::new()),
+        };
+        let name = read_name(&space, ws, display_eid).unwrap_or_else(|| "?".into());
+        let mime = read_mime(&space, display_eid).unwrap_or_else(|| "?".into());
+        let hash = content_handle_of(&space, display_eid)
             .map(handle_hex)
             .unwrap_or_default();
-        let tags = tags_of(&space, *eid);
+        let tags = tags_of(&space, display_eid);
         let tagstr = if tags.is_empty() {
             String::new()
         } else {
             format!("  [{}]", tags.join(", "))
         };
-        println!("  {cos:.3}  {name}  ({mime})  {hash}{tagstr}");
+        println!("  {cos:.3}  {name}{page_suffix}  ({mime})  {hash}{tagstr}");
     }
     Ok(())
 }
@@ -1914,8 +2181,14 @@ fn main() -> Result<()> {
                 cmd_similar(ws, id.as_deref(), text.as_deref(), floor, limit, &tag, mm7b)
             })
         }
-        Command::Embed7b { force } => {
-            with_files(pile, branch, |repo, ws| cmd_embed7b(repo, ws, force))
+        Command::Embed7b { force, pdf, dpi, limit, max_pages } => {
+            with_files(pile, branch, |repo, ws| {
+                if pdf {
+                    cmd_embed7b_pdf(repo, ws, force, dpi, limit, max_pages)
+                } else {
+                    cmd_embed7b(repo, ws, force)
+                }
+            })
         }
         Command::Imports => {
             with_files(pile, branch, |_repo, ws| cmd_imports(ws))
