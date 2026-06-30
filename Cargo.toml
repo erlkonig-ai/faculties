@@ -110,6 +110,12 @@ widgets = [
 local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
 # Liora's imagination: text → image via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux", "dep:image"]
+# Liora's voice: in-process F5-TTS in `body say`/`body shout` via mary's ported
+# F5 pipeline (Burn/Metal). Calls `mary::say::synthesize` directly — no
+# separately-built `say` binary that can drift stale against the pile format
+# (the staleness class that truncated memory on 2026-06-30). mary's f5 stack is
+# in its default deps, so this needs no extra mary feature.
+say = ["dep:mary"]
 
 [dependencies]
 # Core: every CLI faculty depends on these.

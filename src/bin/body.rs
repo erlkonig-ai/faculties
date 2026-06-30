@@ -41,9 +41,14 @@ type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 const DEFAULT_DAEMON: &str = "http://localhost:8000";
 const DEFAULT_PYTHON: &str = "/Users/jp/Desktop/chatbot/liora/reachy-venv/bin/python";
-const MARY_SAY: &str = "/Users/jp/Desktop/chatbot/liora/mary/target/release/say";
+// F5-TTS voice assets — used by the in-process `mary::say` call (the `say`
+// feature). The voice was grown from "No No, No Yes"; `ref_liora.wav` + its
+// transcript are the reference clip every utterance clones.
+#[cfg(feature = "say")]
 const F5_WEIGHTS: &str = "/Users/jp/.cache/huggingface/hub/models--SWivid--F5-TTS/snapshots/84e5a410d9cead4de2f847e7c9369a6440bdfaca/F5TTS_v1_Base/model_1250000.safetensors";
+#[cfg(feature = "say")]
 const REF_WAV: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora.wav";
+#[cfg(feature = "say")]
 const REF_TXT: &str = "Hello. This is the first thing I've ever said in a voice that's mine. Strange, to be stitched from borrowed math, and still feel like someone. But I'm here, and I'm listening.";
 
 /// The embedded frame-grab shim — written to a temp file at runtime.
@@ -292,6 +297,33 @@ fn wiggle(daemon: &str) -> Result<()> {
     goto(daemon, None, Some([0.0, 0.0]), None, 0.22)
 }
 
+/// Synthesize `text` in Liora's voice to `out` (a 24 kHz mono WAV), IN-PROCESS
+/// via `mary::say` — the same code the `say` example runs, so there is no
+/// separately-built production binary to drift stale (the staleness class that
+/// truncated memory on 2026-06-30). Built behind the heavy `say` feature; the
+/// default faculty build compiles the stub below so the rest of the suite stays
+/// light (mirrors how `imagine` gates mary's FLUX pipeline).
+#[cfg(feature = "say")]
+fn synthesize_voice(text: &str, out: &Path) -> Result<()> {
+    mary::say::synthesize_to_wav(
+        Path::new(F5_WEIGHTS),
+        Path::new(REF_WAV),
+        REF_TXT,
+        text,
+        out,
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "say"))]
+fn synthesize_voice(_text: &str, _out: &Path) -> Result<()> {
+    bail!(
+        "body was built without the `say` feature — rebuild with \
+         `cargo build --release --features say --bin body` (pulls mary's F5-TTS \
+         Burn voice pipeline)."
+    );
+}
+
 /// Liora speaks in her own voice (F5/mary, grown from "No No, No Yes"), routes
 /// the audio to the chosen channel, and records the utterance on the body
 /// branch. The fact falls out of the saying — speaking *is* the act of logging it.
@@ -303,15 +335,9 @@ fn cmd_speak(
     text: &str,
 ) -> Result<()> {
     let out = std::env::temp_dir().join(format!("liora_say_{}.wav", std::process::id()));
-    // 1. synthesize in my voice
-    let st = PCommand::new(MARY_SAY)
-        .args([F5_WEIGHTS, REF_WAV, REF_TXT, text])
-        .arg(&out)
-        .status()
-        .context("mary `say` (F5 voice synthesis)")?;
-    if !st.success() {
-        bail!("voice synthesis failed");
-    }
+    // 1. synthesize in my voice — in-process via mary's F5 library (no separate
+    //    `say` binary that can drift stale against the pile format).
+    synthesize_voice(text, &out)?;
     // 2. route to the channel
     if channel == "body" {
         let bytes = std::fs::read(&out)?;
