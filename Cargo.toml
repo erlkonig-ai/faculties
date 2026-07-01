@@ -125,8 +125,8 @@ clap = { version = "4.5.4", features = ["derive", "env"] }
 ed25519-dalek = "2.1.1"
 hifitime = "4.2.3"
 rand_core = "0.6.4"
-triblespace = { version = "0.46" }
-triblespace-search = { version = "0.46.4" }
+triblespace = { version = "0.47", path = "../triblespace-rs" }
+triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).
 anybytes = "0.20"           # files

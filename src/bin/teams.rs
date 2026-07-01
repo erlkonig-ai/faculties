@@ -1927,10 +1927,17 @@ struct AttachmentSource {
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     let mut pile = Pile::open(path).with_context(|| format!("open pile {}", path.display()))?;
-    if let Err(err) = pile.restore().context("restore pile") {
+    if let Err(err) = pile.refresh() {
         // Avoid Drop warnings on early errors.
         let _ = pile.close();
-        return Err(err);
+        return Err(match err {
+            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
+                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
+                 could truncate newer data). Repair the torn tail explicitly with: trible pile restore {}",
+                path.display()
+            ),
+            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
+        });
     }
     Ok(pile)
 }

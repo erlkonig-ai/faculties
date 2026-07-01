@@ -119,9 +119,16 @@ mod common {
     ) -> Result<(Repo, Id)> {
         let mut pile =
             Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
-        if let Err(err) = pile.restore() {
+        if let Err(err) = pile.refresh() {
             let _ = pile.close();
-            return Err(anyhow!("restore pile: {err:?}"));
+            return Err(match err {
+                triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
+                    "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
+                     could truncate newer data). Repair the torn tail explicitly with: trible pile restore {}",
+                    pile_path.display()
+                ),
+                other => anyhow!("refresh pile {}: {other:?}", pile_path.display()),
+            });
         }
         let signing_key = SigningKey::generate(&mut OsRng);
         let repo = Repository::new(pile, signing_key, TribleSet::new())
@@ -155,10 +162,17 @@ mod common {
 
     fn open_repo(pile_path: &Path) -> Result<Repo> {
         let mut pile = Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
-        if let Err(err) = pile.restore() {
+        if let Err(err) = pile.refresh() {
             // Avoid Drop warnings on early errors.
             let _ = pile.close();
-            return Err(anyhow!("restore pile: {err:?}"));
+            return Err(match err {
+                triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
+                    "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
+                     could truncate newer data). Repair the torn tail explicitly with: trible pile restore {}",
+                    pile_path.display()
+                ),
+                other => anyhow!("refresh pile {}: {other:?}", pile_path.display()),
+            });
         }
         let signing_key = SigningKey::generate(&mut OsRng);
         Repository::new(pile, signing_key, TribleSet::new())

@@ -68,7 +68,17 @@ fn main() -> Result<()> {
     }
 
     let mut pile = Pile::open(&cli.pile)?;
-    pile.restore()?;
+    if let Err(err) = pile.refresh() {
+        let _ = pile.close();
+        return Err(match err {
+            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
+                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
+                 could truncate newer data). Repair the torn tail explicitly with: trible pile restore {}",
+                cli.pile.display()
+            ),
+            other => anyhow::anyhow!("refresh pile {}: {other:?}", cli.pile.display()),
+        });
+    }
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())?;
 
     let bid = if let Some(hex_str) = &cli.branch_id {

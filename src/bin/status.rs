@@ -105,9 +105,16 @@ fn format_age(now_key: i128, past_key: i128) -> String {
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
     let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.restore() {
+    if let Err(err) = pile.refresh() {
         let _ = pile.close();
-        return Err(anyhow!("restore pile {}: {err:?}", path.display()));
+        return Err(match err {
+            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
+                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
+                 could truncate newer data). Repair the torn tail explicitly with: trible pile restore {}",
+                path.display()
+            ),
+            other => anyhow!("refresh pile {}: {other:?}", path.display()),
+        });
     }
     let signing_key = SigningKey::generate(&mut OsRng);
     Repository::new(pile, signing_key, TribleSet::new())

@@ -404,12 +404,19 @@ fn close_repo(repo: Repository<Pile>) -> Result<()> {
 
 fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile>, Id)> {
     let mut pile = Pile::open(pile_path).context("open pile")?;
-    if let Err(err) = pile.restore().context("restore pile") {
-        let close_res = pile.close().context("close pile after restore failure");
+    if let Err(err) = pile.refresh() {
+        let close_res = pile.close().context("close pile after refresh failure");
         if let Err(close_err) = close_res {
             eprintln!("warning: failed to close pile cleanly: {close_err:#}");
         }
-        return Err(err);
+        return Err(match err {
+            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
+                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
+                 could truncate newer data). Repair the torn tail explicitly with: trible pile restore {}",
+                pile_path.display()
+            ),
+            other => anyhow!("refresh pile {}: {other:?}", pile_path.display()),
+        });
     }
 
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())

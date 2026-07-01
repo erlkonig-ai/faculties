@@ -112,9 +112,13 @@ impl StorageState {
                 return;
             }
         };
-        if let Err(err) = pile.restore() {
+        if let Err(err) = pile.refresh() {
             let _ = pile.close();
-            self.error = Some(format!("restore: {err:?}"));
+            self.error = Some(format!(
+                "pile corrupt ({err:?}): refusing to auto-repair (a stale binary could truncate \
+                 newer data). Repair a torn tail explicitly with: trible pile restore {}",
+                self.pile_path.display()
+            ));
             return;
         }
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
