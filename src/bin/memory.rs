@@ -32,7 +32,7 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--chars N] [--about <query>] — antichain cover over ALL memories, coarse→fine to a budget (default tokens; --chars N budgets by CHARACTERS instead); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`)\n  \
+             memory context [<budget>] [--tokens N] [--chars N] [--about <query>] — antichain cover over ALL memories, coarse→fine to a budget (default tokens; bare <budget> or --tokens N budgets by TOKENS, --chars N budgets by CHARACTERS instead); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`)\n  \
              memory density [<grain>]        — find where the hierarchy is BUSHY (many flat leaf-children under one span, no intermediate arc summary) vs balanced vs coarse; worst-first\n  \
              memory search <query>           — lexical (BM25) search over chunk summaries (build/refresh with `memory index`)\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
@@ -1724,6 +1724,10 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
     // can be cast with the slice of the past most relevant to its goal).
     let mut budget_tokens: usize = 20_000;
     let mut about: Option<String> = None;
+    // `--tokens N` names the token budget explicitly; when present it wins over
+    // the bare positional (which stays a backward-compatible fallback — it also
+    // means tokens). `--chars N` budgets by characters instead (see below).
+    let mut tokens_explicit = false;
     {
         let mut i = 0;
         while i < args.len() {
@@ -1733,6 +1737,17 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
                     about = Some(q);
                 }
                 break;
+            }
+            if args[i] == "--tokens" {
+                let raw = args.get(i + 1).ok_or_else(|| {
+                    anyhow!("--tokens needs a number, e.g. `memory context --tokens 60000`")
+                })?;
+                budget_tokens = raw.parse().map_err(|_| {
+                    anyhow!("--tokens expects a positive integer, got `{raw}`")
+                })?;
+                tokens_explicit = true;
+                i += 2;
+                continue;
             }
             if args[i] == "--chars" {
                 let raw = args.get(i + 1).ok_or_else(|| {
@@ -1757,8 +1772,10 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
                 i += 2;
                 continue;
             }
-            if let Ok(n) = args[i].parse::<usize>() {
-                budget_tokens = n;
+            if !tokens_explicit {
+                if let Ok(n) = args[i].parse::<usize>() {
+                    budget_tokens = n;
+                }
             }
             i += 1;
         }
