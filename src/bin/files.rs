@@ -545,13 +545,20 @@ impl<T: mary::embed::LocalEmbedder> ImageEmbedder for T {
     }
 }
 
-/// Load mary's CLIP-ViT-B v0 (warm; ~1-2s, ~600MB). Requires the model cached
-/// (`huggingface-cli download openai/clip-vit-base-patch32`). SigLIP so400m
-/// swaps in behind this same trait later.
+/// Load mary's CLIP-ViT-B v0 (warm; ~1-2s, ~600MB) from its durable pile
+/// (write it with mary's `embed_persist`; `CLIP_PILE` overrides the path —
+/// tokenizer.json stays a small HF-cache side-file). SigLIP so400m swaps in
+/// behind this same trait later.
 #[cfg(feature = "local-embed")]
 fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
-    let emb = mary::embed::load_clip_from_hf(
-        "openai/clip-vit-base-patch32",
+    const CLIP_MODEL: &str = "openai/clip-vit-base-patch32";
+    const DEFAULT_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/clip.pile";
+    let pile = std::env::var("CLIP_PILE").unwrap_or_else(|_| DEFAULT_PILE.to_string());
+    let tok = mary::embed::hf_cache_resolve(CLIP_MODEL, "tokenizer.json")
+        .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {CLIP_MODEL}"))?;
+    let emb = mary::embed::load_clip_from_pile(
+        Path::new(&pile),
+        &tok,
         mary::embed::default_device(),
     )?;
     Ok(Box::new(emb))

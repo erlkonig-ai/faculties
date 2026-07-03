@@ -2669,6 +2669,25 @@ fn collect_typ_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 #[cfg(feature = "local-embed")]
 const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
 
+/// Durable embedder pile — weights load from the pile only (write it with
+/// mary's `embed_persist`); `NOMIC_TEXT_PILE` overrides. tokenizer.json stays
+/// a small HF-cache side-file.
+#[cfg(feature = "local-embed")]
+const NOMIC_TEXT_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_text.pile";
+
+#[cfg(feature = "local-embed")]
+fn load_nomic_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
+    let pile = std::env::var("NOMIC_TEXT_PILE").unwrap_or_else(|_| NOMIC_TEXT_PILE.to_string());
+    let tok = mary::embed::hf_cache_resolve(NOMIC_TEXT_MODEL, "tokenizer.json")
+        .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {NOMIC_TEXT_MODEL}"))?;
+    mary::embed::load_nomic_text_from_pile(
+        std::path::Path::new(&pile),
+        &tok,
+        mary::embed::default_device(),
+    )
+    .map_err(|e| anyhow::anyhow!("load nomic text embedder from pile {pile}: {e:?}"))
+}
+
 /// L2-normalize so dot-product == cosine downstream (the shared `nearest` core
 /// assumes unit vectors).
 #[cfg(feature = "local-embed")]
@@ -2701,8 +2720,7 @@ fn version_embedding_handle(
 #[cfg(feature = "local-embed")]
 fn cmd_embed(repo: &mut Repo, bid: Id) -> Result<()> {
     eprintln!("wiki: loading nomic-embed-text (once)…");
-    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
-        .map_err(|e| anyhow::anyhow!("load nomic embedder: {e:?}"))?;
+    let emb = load_nomic_text_embedder()?;
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -2759,8 +2777,7 @@ fn cmd_embed(_repo: &mut Repo, _bid: Id) -> Result<()> {
 #[cfg(feature = "local-embed")]
 fn cmd_similar(repo: &mut Repo, bid: Id, query: String) -> Result<()> {
     eprintln!("wiki: loading nomic-embed-text (once)…");
-    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
-        .map_err(|e| anyhow::anyhow!("load nomic embedder: {e:?}"))?;
+    let emb = load_nomic_text_embedder()?;
     let qv = l2_normalize(
         emb.embed_query(&query)
             .map_err(|e| anyhow::anyhow!("embed query: {e:?}"))?,

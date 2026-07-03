@@ -413,6 +413,37 @@ fn cmd_search(pile_path: &Path, args: &[String]) -> Result<()> {
 #[cfg(feature = "local-embed")]
 const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
 
+/// Durable embedder piles — weights load from piles only (write them with
+/// mary's `embed_persist`); env vars override so the faculty isn't pinned to
+/// one machine's paths. tokenizer.json stays a small HF-cache side-file.
+#[cfg(feature = "local-embed")]
+const NOMIC_TEXT_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_text.pile";
+#[cfg(feature = "local-embed")]
+const NOMIC_VISION_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_vision.pile";
+
+#[cfg(feature = "local-embed")]
+fn load_nomic_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
+    let pile = std::env::var("NOMIC_TEXT_PILE").unwrap_or_else(|_| NOMIC_TEXT_PILE.to_string());
+    let tok = mary::embed::hf_cache_resolve(NOMIC_TEXT_MODEL, "tokenizer.json")
+        .ok_or_else(|| anyhow!("tokenizer.json not in HF cache for {NOMIC_TEXT_MODEL}"))?;
+    mary::embed::load_nomic_text_from_pile(
+        std::path::Path::new(&pile),
+        &tok,
+        mary::embed::default_device(),
+    )
+    .map_err(|e| anyhow!("load nomic text embedder from pile {pile}: {e:?}"))
+}
+
+#[cfg(feature = "local-embed")]
+fn load_nomic_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
+    let pile = std::env::var("NOMIC_VISION_PILE").unwrap_or_else(|_| NOMIC_VISION_PILE.to_string());
+    mary::embed::load_nomic_vision_from_pile(
+        std::path::Path::new(&pile),
+        mary::embed::default_device(),
+    )
+    .map_err(|e| anyhow!("load nomic vision embedder from pile {pile}: {e:?}"))
+}
+
 /// nomic-embed-vision-v1.5 — the image encoder co-embedded into the SAME 768-d
 /// space as nomic-text, so an image memory's vector is directly comparable to a
 /// text query's. Used by `memory embed` for wordless image chunks.
@@ -508,13 +539,7 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
                         Some(e) => e,
                         None => {
                             eprintln!("memory: loading nomic-embed-text (once)…");
-                            text_emb = Some(
-                                mary::embed::load_nomic_text_from_hf(
-                                    NOMIC_TEXT_MODEL,
-                                    mary::embed::default_device(),
-                                )
-                                .map_err(|e| anyhow!("load nomic text embedder: {e:?}"))?,
-                            );
+                            text_emb = Some(load_nomic_text_embedder()?);
                             text_emb.as_ref().unwrap()
                         }
                     };
@@ -530,13 +555,7 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
                         Some(e) => e,
                         None => {
                             eprintln!("memory: loading nomic-embed-vision (once)…");
-                            vision_emb = Some(
-                                mary::embed::load_nomic_vision_from_hf(
-                                    NOMIC_VISION_MODEL,
-                                    mary::embed::default_device(),
-                                )
-                                .map_err(|e| anyhow!("load nomic vision embedder: {e:?}"))?,
-                            );
+                            vision_emb = Some(load_nomic_vision_embedder()?);
                             vision_emb.as_ref().unwrap()
                         }
                     };
@@ -585,8 +604,7 @@ fn cmd_similar(pile_path: &Path, args: &[String]) -> Result<()> {
     }
     let query = args.join(" ");
     eprintln!("memory: loading nomic-embed-text (once)…");
-    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
-        .map_err(|e| anyhow!("load nomic embedder: {e:?}"))?;
+    let emb = load_nomic_text_embedder()?;
     let qv = l2_normalize(
         emb.embed_query(&query)
             .map_err(|e| anyhow!("embed query: {e:?}"))?,
@@ -1856,8 +1874,7 @@ fn semantic_about_scores(
         return Ok(None);
     }
     eprintln!("memory: loading nomic-embed-text for --about (once)…");
-    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
-        .map_err(|e| anyhow!("load nomic embedder: {e:?}"))?;
+    let emb = load_nomic_text_embedder()?;
     let qv = l2_normalize(
         emb.embed_query(query)
             .map_err(|e| anyhow!("embed query: {e:?}"))?,
@@ -1954,8 +1971,7 @@ fn semantic_eligibility_scores(
         return Ok(None);
     }
     eprintln!("memory: loading nomic-embed-text for --filter/--remove (once)…");
-    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
-        .map_err(|e| anyhow!("load nomic embedder: {e:?}"))?;
+    let emb = load_nomic_text_embedder()?;
     let qv = l2_normalize(
         emb.embed_query(query)
             .map_err(|e| anyhow!("embed query: {e:?}"))?,
