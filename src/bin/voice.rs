@@ -3,9 +3,9 @@
 //! through.
 //!
 //! Extracted from `body` (2026-06-30). The body is the physical Reachy loop
-//! (pose/look/feel/act); the voice is its own organ — synthesis (F5/mary, grown
-//! from "No No, No Yes") plus output routing. Utterances and the routing config
-//! live on the pile's `voice` branch.
+//! (pose/look/feel/act); the voice is its own organ — synthesis (Qwen3-TTS via
+//! mary, cloning the voice grown from "No No, No Yes") plus output routing.
+//! Utterances and the routing config live on the pile's `voice` branch.
 //!
 //! Two channels, each a hard contract, not a soft preference:
 //!   - `voice say <text>`   — the PRIVATE channel: in-ear / headphone only. If no
@@ -23,9 +23,10 @@
 //! guarantee is in this code, so no misconfiguration can leak a private
 //! utterance into a room.
 //!
-//! Synthesis (F5-TTS via mary's Burn/Metal pipeline) is gated behind the heavy
-//! `voice` feature, mirroring `imagine`; the default build compiles a bail stub
-//! so the rest of the faculty suite stays light.
+//! Synthesis (Qwen3-TTS via mary's Burn/Metal pipeline, weights from a durable
+//! standalone pile) is gated behind the heavy `voice` feature, mirroring
+//! `imagine`; the default build compiles a bail stub so the rest of the faculty
+//! suite stays light.
 //!
 //! macOS device targeting: `afplay` plays to the *current default output
 //! device* and has no device flag. True per-device targeting needs
@@ -57,15 +58,20 @@ type U256 = Inline<inlineencodings::U256BE>;
 
 const DEFAULT_DAEMON: &str = "http://localhost:8000";
 
-// F5-TTS voice assets — used by the in-process `mary::say` call (the `voice`
-// feature). The voice was grown from "No No, No Yes"; `ref_liora.wav` + its
-// transcript are the reference clip every utterance clones.
+// Qwen3-TTS voice assets — used by the in-process `mary::speak` call (the
+// `voice` feature). The voice was grown from "No No, No Yes" (F5 remains in
+// mary as the voice-origin lineage); every utterance clones the v2 reference
+// kit: an 11.46 s clean-boundary clip (24 kHz render of `ref_liora_v2.wav`),
+// its EXACT transcript, and the clip's codec frames. Weights load from a
+// durable standalone pile; `QWEN3TTS_PILE` overrides the path.
 #[cfg(feature = "voice")]
-const F5_WEIGHTS: &str = "/Users/jp/.cache/huggingface/hub/models--SWivid--F5-TTS/snapshots/84e5a410d9cead4de2f847e7c9369a6440bdfaca/F5TTS_v1_Base/model_1250000.safetensors";
+const QWEN3TTS_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/qwen3tts.pile";
 #[cfg(feature = "voice")]
-const REF_WAV: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora.wav";
+const REF_WAV: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora_v2_24k.wav";
 #[cfg(feature = "voice")]
-const REF_TXT: &str = "Hello. This is the first thing I've ever said in a voice that's mine. Strange, to be stitched from borrowed math, and still feel like someone. But I'm here, and I'm listening.";
+const REF_TXT_PATH: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora_v2.txt";
+#[cfg(feature = "voice")]
+const REF_CODE: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora_v2_code.npy";
 
 // Default routing policy, used when the pile holds no `route set` for a channel.
 // `say` lists ONLY private devices (the classifier rejects anything else anyway);
@@ -661,18 +667,23 @@ fn log_utterance(
 // ── synthesis (feature-gated, mirrors imagine) ──────────────────────────────
 
 /// Synthesize `text` in Liora's voice to `out` (a 24 kHz mono WAV), in-process
-/// via `mary::say` — the same library seam everything else uses, so there's no
-/// separate binary to drift stale against the pile format. Behind the heavy
-/// `voice` feature; the default build compiles the stub below.
+/// via `mary::speak` (Qwen3-TTS) — the same library seam everything else uses,
+/// so there's no separate binary to drift stale against the pile format. The
+/// weights come from a durable standalone pile (env `QWEN3TTS_PILE` overrides).
+/// Behind the heavy `voice` feature; the default build compiles the stub below.
 #[cfg(feature = "voice")]
 fn synthesize_voice(text: &str, out: &Path) -> Result<()> {
-    mary::say::synthesize_to_wav(
-        Path::new(F5_WEIGHTS),
+    let pile = std::env::var("QWEN3TTS_PILE").unwrap_or_else(|_| QWEN3TTS_PILE.to_string());
+    let ref_text = std::fs::read_to_string(REF_TXT_PATH)
+        .with_context(|| format!("read reference transcript {REF_TXT_PATH}"))?;
+    mary::speak::synthesize_to_wav(
+        Path::new(&pile),
         Path::new(REF_WAV),
-        REF_TXT,
+        ref_text.trim(),
+        Path::new(REF_CODE),
         text,
         out,
-    );
+    )?;
     Ok(())
 }
 
@@ -680,9 +691,9 @@ fn synthesize_voice(text: &str, out: &Path) -> Result<()> {
 fn synthesize_voice(_text: &str, _out: &Path) -> Result<()> {
     bail!(
         "voice was built without the `voice` feature — rebuild with \
-         `cargo build --release --features voice --bin voice` (pulls mary's F5-TTS \
-         Burn voice pipeline). Routing (`voice route`/`voice devices`) and the \
-         text-fallback path work without it."
+         `cargo build --release --features voice --bin voice` (pulls mary's \
+         Qwen3-TTS Burn voice pipeline). Routing (`voice route`/`voice devices`) \
+         and the text-fallback path work without it."
     );
 }
 

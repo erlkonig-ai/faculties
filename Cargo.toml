@@ -110,13 +110,13 @@ widgets = [
 local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
 # Liora's imagination: text → image via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux", "dep:image"]
-# Liora's voice: in-process F5-TTS in the `voice` faculty (`voice say`/`voice
-# shout`) via mary's ported F5 pipeline (Burn/Metal). Calls
-# `mary::say::synthesize` directly — no separately-built `say` binary that can
+# Liora's voice: in-process Qwen3-TTS in the `voice` faculty (`voice say`/
+# `voice shout`) via mary's ported Burn/Metal pipeline. Calls
+# `mary::speak::synthesize` directly — no separately-built binary that can
 # drift stale against the pile format (the staleness class that truncated memory
-# on 2026-06-30). mary's f5 stack is in its default deps, so this needs no extra
-# mary feature.
-voice = ["dep:mary"]
+# on 2026-06-30). Weights load from a durable standalone pile (QWEN3TTS_PILE);
+# mary/speak = qwen3tts port + the pile persist/load seam.
+voice = ["dep:mary", "mary/speak"]
 
 [dependencies]
 # Core: every CLI faculty depends on these.
