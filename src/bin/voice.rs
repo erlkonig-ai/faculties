@@ -23,13 +23,19 @@
 //! guarantee is in this code, so no misconfiguration can leak a private
 //! utterance into a room.
 //!
-//! Synthesis (Qwen3-TTS via mary's Burn/Metal pipeline, weights from a durable
-//! standalone pile) is gated behind the heavy `voice` feature, mirroring
-//! `imagine`; the default build compiles a bail stub so the rest of the faculty
-//! suite stays light.
+//! Synthesis (Qwen3-TTS via mary's Burn/Metal pipeline, weights zero-copy
+//! mmap-aliased from a durable standalone pile) is gated behind the heavy
+//! `voice` feature, mirroring `imagine`; the default build compiles a bail
+//! stub so the rest of the faculty suite stays light. There is ONE generation
+//! path — `mary::speak::synthesize_stream`, a live PCM-chunk iterator — and
+//! the channels differ only by SINK: local devices stream the chunks into
+//! `ffplay` as they are synthesized (first audio in seconds; afplay batch when
+//! ffplay is absent), while the Reachy speaker drains the same stream to a
+//! whole file (its daemon media API is upload+play; daemon-side streaming is a
+//! noted follow-up).
 //!
-//! macOS device targeting: `afplay` plays to the *current default output
-//! device* and has no device flag. True per-device targeting needs
+//! macOS device targeting: `afplay`/`ffplay` play to the *current default
+//! output device* and have no device flag. True per-device targeting needs
 //! `SwitchAudioSource` (brew: switchaudio-osx) to switch the default output
 //! around playback. When it's present we use it; when it's absent we degrade
 //! SAFELY: `say` plays only if the current default output is *itself* a private
@@ -318,6 +324,7 @@ fn connected_match<'a>(pat: &str, devices: &'a [AudioDevice]) -> Option<&'a Audi
 
 // ── playback primitives ────────────────────────────────────────────────────
 
+#[cfg(feature = "voice")]
 fn afplay(wav: &Path) -> Result<()> {
     let st = PCommand::new("afplay").arg(wav).status().context("afplay")?;
     if !st.success() {
@@ -327,6 +334,7 @@ fn afplay(wav: &Path) -> Result<()> {
 }
 
 /// Get the current default output device name (for save/restore around a switch).
+#[cfg(feature = "voice")]
 fn current_default_output(sw: &Path) -> Option<String> {
     let out = PCommand::new(sw).args(["-c", "-t", "output"]).output().ok()?;
     out.status
@@ -335,6 +343,7 @@ fn current_default_output(sw: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[cfg(feature = "voice")]
 fn set_default_output(sw: &Path, name: &str) -> Result<()> {
     let st = PCommand::new(sw)
         .args(["-t", "output", "-s", name])
@@ -346,33 +355,8 @@ fn set_default_output(sw: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Play `wav` on a SPECIFIC device by switching the default output to it,
-/// playing, then restoring the prior default. Requires SwitchAudioSource.
-fn play_targeted(sw: &Path, device: &str, wav: &Path) -> Result<()> {
-    let prior = current_default_output(sw);
-    set_default_output(sw, device)?;
-    let played = afplay(wav);
-    if let Some(prev) = prior {
-        let _ = set_default_output(sw, &prev); // best-effort restore
-    }
-    played
-}
-
-/// Play `wav` privately on `device`, which MUST be a private device. This is a
-/// dedicated, defensively-guarded entry point: it re-asserts the privacy class
-/// before doing anything, so even a future caller bug cannot route a non-private
-/// device through it. Requires SwitchAudioSource (the caller checked it).
-fn play_private_targeted(sw: &Path, device: &str, wav: &Path) -> Result<()> {
-    if classify(device) != DeviceClass::Private {
-        bail!(
-            "refusing to play a private utterance on non-private device '{device}' \
-             (privacy invariant)"
-        );
-    }
-    play_targeted(sw, device, wav)
-}
-
 /// Upload `wav` to the Reachy daemon and play it through the robot's speaker.
+#[cfg(feature = "voice")]
 fn play_on_reachy(daemon: &str, wav: &Path) -> Result<()> {
     let bytes = std::fs::read(wav)?;
     let fname = wav.file_name().unwrap().to_string_lossy().to_string();
@@ -505,29 +489,6 @@ fn route_shout(
         return Routed::Default(default.name.clone());
     }
     Routed::Text("no audible output device connected".into())
-}
-
-/// Perform a resolved playback. `text` is needed for the `Text` fallback.
-fn perform(routed: &Routed, wav: &Path, daemon: &str, sw: Option<&Path>, text: &str) -> Result<()> {
-    match routed {
-        Routed::Reachy => play_on_reachy(daemon, wav),
-        Routed::Targeted(device) => {
-            let sw = sw.context("SwitchAudioSource required for targeted playback")?;
-            // Privacy-safe: for `say` this device was proven private upstream; the
-            // dedicated guard re-checks. For `shout`, plain targeting is fine.
-            if classify(device) == DeviceClass::Private {
-                play_private_targeted(&sw, device, wav)
-            } else {
-                play_targeted(&sw, device, wav)
-            }
-        }
-        Routed::Default(_) => afplay(wav),
-        Routed::Text(_) => {
-            // Silent, on-screen, private. The utterance never becomes sound.
-            println!("{text}");
-            Ok(())
-        }
-    }
 }
 
 // ── pile plumbing ───────────────────────────────────────────────────────────
@@ -672,31 +633,188 @@ fn log_utterance(
     Ok(())
 }
 
-// ── synthesis (feature-gated, mirrors imagine) ──────────────────────────────
+// ── synthesis + sinks (feature-gated, mirrors imagine) ─────────────────────
+//
+// ONE generation path, TWO kinds of sink. Every playing channel synthesizes
+// through `mary::speak::synthesize_stream` — a live iterator of 24 kHz PCM
+// chunks (frames hit the codec the moment they are sampled). The sinks differ
+// only in how they drain it:
+//   - STREAMING sink (say/shout to a local device): chunks are piped into
+//     `ffplay` (raw s16le on stdin, playing to the DEFAULT output — the
+//     streaming sibling of afplay, same device semantics, so the routing and
+//     privacy model are untouched; SwitchAudioSource still does the
+//     targeting). First audio lands seconds after the call, not after the
+//     whole utterance. No ffplay ⇒ degrade to collect + afplay (batch).
+//   - BATCH sink (shout via the Reachy robot): the daemon's media API accepts
+//     whole files only (upload + play_sound), so the SAME stream is drained
+//     to a WAV first. Streaming into the daemon is a noted follow-up on the
+//     daemon side; this lane does not touch it.
+// Every sink also accumulates the full utterance, which `cmd_speak` logs on
+// the voice branch after completion — logging is unchanged.
 
-/// Synthesize `text` in Liora's voice to `out` (a 24 kHz mono WAV), in-process
-/// via `mary::speak` (Qwen3-TTS) — the same library seam everything else uses,
-/// so there's no separate binary to drift stale against the pile format. The
-/// weights come from a durable standalone pile (env `QWEN3TTS_PILE` overrides).
-/// Behind the heavy `voice` feature; the default build compiles the stub below.
+/// Synthesize `text` (streaming) and play it through the resolved route,
+/// writing the COMPLETE utterance to `out` for the log. Never called for the
+/// `Routed::Text` fallback (the caller short-circuits it — no GPU work for a
+/// silent utterance). Returns after playback settles; a playback failure is
+/// an `Err` but `out` is still written (the caller logs, then surfaces it).
 #[cfg(feature = "voice")]
-fn synthesize_voice(text: &str, out: &Path) -> Result<()> {
+fn speak_and_play(
+    routed: &Routed,
+    daemon: &str,
+    sw: Option<&Path>,
+    channel: &str,
+    text: &str,
+    out: &Path,
+) -> Result<()> {
+    let sr = mary::speak::SpeakStream::SAMPLE_RATE;
     let pile = std::env::var("QWEN3TTS_PILE").unwrap_or_else(|_| QWEN3TTS_PILE.to_string());
     let ref_text = std::fs::read_to_string(REF_TXT_PATH)
         .with_context(|| format!("read reference transcript {REF_TXT_PATH}"))?;
-    mary::speak::synthesize_to_wav(
+    let t_call = std::time::Instant::now();
+    let mut stream = mary::speak::synthesize_stream(
         Path::new(&pile),
         Path::new(REF_WAV),
         ref_text.trim(),
         Path::new(REF_CODE),
         text,
-        out,
     )?;
+
+    let mut samples: Vec<f32> = Vec::new();
+    let played: Result<()> = match routed {
+        // Whole-file sink: drain the same stream, upload after.
+        Routed::Reachy => {
+            for chunk in stream.by_ref() {
+                samples.extend_from_slice(&chunk);
+            }
+            Ok(())
+        }
+        Routed::Targeted(device) | Routed::Default(device) => {
+            // Defense in depth: on the private channel the router only emits
+            // private devices; re-assert before any sound (the streaming
+            // sibling of `play_private_targeted`'s guard).
+            if channel == CHANNEL_SAY && classify(device) != DeviceClass::Private {
+                bail!(
+                    "refusing to play a private utterance on non-private device '{device}' \
+                     (privacy invariant)"
+                );
+            }
+            // Targeted ⇒ switch the default output to the device around
+            // playback (ffplay and afplay both play to the default output).
+            let prior = match routed {
+                Routed::Targeted(_) => {
+                    let sw = sw.context("SwitchAudioSource required for targeted playback")?;
+                    let prior = current_default_output(sw);
+                    set_default_output(sw, device)?;
+                    prior
+                }
+                _ => None,
+            };
+            let result = stream_to_default_output(&mut stream, &mut samples, t_call, device, sr);
+            if let (Routed::Targeted(_), Some(sw), Some(prev)) = (routed, sw, prior.as_deref()) {
+                let _ = set_default_output(sw, prev); // best-effort restore
+            }
+            result
+        }
+        Routed::Text(_) => Ok(()), // handled by the caller; nothing to play
+    };
+
+    // Settle generation and persist the FULL utterance for the log — every
+    // sink, even after a playback hiccup (drain first: error paths may have
+    // stopped consuming early).
+    for chunk in stream.by_ref() {
+        samples.extend_from_slice(&chunk);
+    }
+    stream.finish()?; // synthesis failure propagates: nothing trustworthy to log
+    mary::models::f5::wav::write_pcm16_mono(out, &samples, sr);
+    played?;
+    if matches!(routed, Routed::Reachy) {
+        play_on_reachy(daemon, out)?;
+    }
     Ok(())
 }
 
+/// Drain `stream` into the current DEFAULT output via `ffplay` (raw s16le PCM
+/// on stdin) — chunks play as they are synthesized; prints the measured TTFA
+/// (call → first chunk handed to the audio pipe). Without ffplay, degrades to
+/// collect + `afplay` (batch, same generation path).
+#[cfg(feature = "voice")]
+fn stream_to_default_output(
+    stream: &mut mary::speak::SpeakStream,
+    samples: &mut Vec<f32>,
+    t_call: std::time::Instant,
+    device: &str,
+    sr: u32,
+) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let spawned = PCommand::new("ffplay")
+        .args(["-loglevel", "error", "-nodisp", "-autoexit", "-f", "s16le", "-ar"])
+        .arg(sr.to_string())
+        .args(["-ch_layout", "mono", "-i", "pipe:0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            let mut stdin = child.stdin.take().context("ffplay stdin")?;
+            let mut first = true;
+            let mut broken = false;
+            for chunk in stream.by_ref() {
+                samples.extend_from_slice(&chunk);
+                if broken {
+                    continue; // keep draining for the log
+                }
+                let bytes: Vec<u8> = chunk
+                    .iter()
+                    .flat_map(|&s| (((s.clamp(-1.0, 1.0)) * 32767.0) as i16).to_le_bytes())
+                    .collect();
+                if stdin.write_all(&bytes).is_err() {
+                    broken = true;
+                    continue;
+                }
+                if first {
+                    println!(
+                        "  [stream] TTFA {:.2}s → {device}",
+                        t_call.elapsed().as_secs_f32()
+                    );
+                    first = false;
+                }
+            }
+            drop(stdin); // EOF ⇒ ffplay drains its buffer and -autoexit's
+            let status = child.wait().context("wait for ffplay")?;
+            if broken || !status.success() {
+                bail!("streaming playback (ffplay) failed");
+            }
+            Ok(())
+        }
+        Err(_) => {
+            // No ffplay: batch over the same stream. (brew install ffmpeg
+            // enables streaming playback.)
+            for chunk in stream.by_ref() {
+                samples.extend_from_slice(&chunk);
+            }
+            let tmp =
+                std::env::temp_dir().join(format!("liora_voice_batch_{}.wav", std::process::id()));
+            mary::models::f5::wav::write_pcm16_mono(&tmp, samples, sr);
+            println!("  [stream] ffplay not found — played whole utterance via afplay");
+            let r = afplay(&tmp);
+            let _ = std::fs::remove_file(&tmp);
+            r
+        }
+    }
+}
+
 #[cfg(not(feature = "voice"))]
-fn synthesize_voice(_text: &str, _out: &Path) -> Result<()> {
+fn speak_and_play(
+    _routed: &Routed,
+    _daemon: &str,
+    _sw: Option<&Path>,
+    _channel: &str,
+    _text: &str,
+    _out: &Path,
+) -> Result<()> {
     bail!(
         "voice was built without the `voice` feature — rebuild with \
          `cargo build --release --features voice --bin voice` (pulls mary's \
@@ -740,9 +858,14 @@ fn cmd_speak(
         return log_utterance(repo, ws, channel, text, None);
     }
 
+    // ONE generation path (streaming synthesis), sink chosen by the route —
+    // see the synthesis section. `out` receives the complete utterance.
     let out = std::env::temp_dir().join(format!("liora_voice_{}.wav", std::process::id()));
-    synthesize_voice(text, &out)?;
-    let play = perform(&routed, &out, daemon, sw.as_deref(), text);
+    let play = speak_and_play(&routed, daemon, sw.as_deref(), channel, text, &out);
+    if !out.exists() {
+        // Synthesis itself failed — nothing to log, surface the error.
+        return play;
+    }
     // Log the utterance with its audio regardless of a playback hiccup, so the
     // fact survives; surface a playback error after.
     let log = log_utterance(repo, ws, channel, text, Some(&out));
