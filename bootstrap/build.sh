@@ -45,6 +45,7 @@ ID_TRIBLE=4e19893b36bf37d471bb9ea968edac20
 ID_PILEF=5232ea531fedfcb17bf15e88c3d52a36
 ID_MERGE=5cc10e2b0263008b261cf8a1ef30bd8c
 ID_ARCH=6e5f38bdfd589cd0359bf668d1af9841
+ID_AUTHORING=864c45bed65311b27b1cafe268b6ed2d
 
 # Start fresh — old fragments from previous builds would orphan
 # but never disappear (piles are append-only). Regenerating into
@@ -188,7 +189,16 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/20_substrate_architecture.typ" \
   --tag bootstrap --tag onboarding --tag substrate --tag concepts --tag architecture >/dev/null
 
-echo "    19 fragments created"
+# 21. Authoring a faculty — the one gap the tour otherwise
+# leaves: it teaches how to USE faculties but not how to ADD
+# one. The natural continuation of "How Faculties Work": mint
+# schema ids, write src/bin/<verb>.rs, own a branch, install,
+# land upstream. Slotted as How Faculties Work's Next stop.
+"$WIKI" create "Authoring a Faculty" --force --id "${ID_AUTHORING}" \
+  "@$BOOTSTRAP_DIR/21_authoring_a_faculty.typ" \
+  --tag bootstrap --tag onboarding --tag faculties --tag authoring >/dev/null
+
+echo "    20 fragments created"
 
 echo "==> Building compass goals"
 
@@ -212,11 +222,15 @@ echo "==> Building compass goals"
   --tag bootstrap --tag wiki --tag hygiene \
   --note "lint applies markdown→typst transforms and rebuilds the links_to index. check reports orphan fragments, broken links, truncated ids. Run both. Note any warnings — they're the wiki's self-diagnostic surface." >/dev/null
 
+"$COMPASS" add "Scaffold a trivial faculty" \
+  --tag bootstrap --tag faculties --tag authoring \
+  --note "Mint an id with \`trible genid\`, add \`faculties/src/bin/echofact.rs\`: a clap Cli with \`#[arg(long, env = \"PILE\")] pile\`, that opens the pile and prints one fact (e.g. the id you minted). \`cargo install --path faculties --bins\`, then run \`echofact\`. You've added a verb. See the 'Authoring a Faculty' fragment for the full skeleton." >/dev/null
+
 "$COMPASS" add "Mark this goal done and write an outcome note" \
   --tag bootstrap --tag compass \
   --note "When you finish working through the bootstrap goals, move this one to done with \`compass move <id> done\` and add a final note recording what stuck and what you'd improve. The outcome note IS the audit trail." >/dev/null
 
-echo "    6 goals created"
+echo "    7 goals created"
 
 # ── Sanity check ──────────────────────────────────────────────────
 # Verify the build actually produced the expected content. This
@@ -234,8 +248,8 @@ echo "    OK: lint clean"
 
 echo "==> Sanity check"
 # Bump these when adding/removing entries above.
-EXPECTED_FRAGMENTS=19
-EXPECTED_GOALS=6
+EXPECTED_FRAGMENTS=20
+EXPECTED_GOALS=7
 ACTUAL_FRAGMENTS=$("$WIKI" list --tag bootstrap 2>/dev/null \
   | grep -cE "^[0-9a-f]" || echo 0)
 ACTUAL_GOALS=$("$COMPASS" list 2>/dev/null \

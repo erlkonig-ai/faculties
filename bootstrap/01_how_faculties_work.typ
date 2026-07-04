@@ -44,4 +44,4 @@ produce accretes there as content-addressed facts, which is
 the substrate underneath converges by construction, no faculty
 contains [a single line of sync code](wiki:6e5f38bdfd589cd0359bf668d1af9841).
 
-Next stop: [Substrate 1/4: What Is a Trible](wiki:4e19893b36bf37d471bb9ea968edac20).
+Next stop: [Authoring a Faculty](wiki:864c45bed65311b27b1cafe268b6ed2d).
