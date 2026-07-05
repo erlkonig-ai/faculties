@@ -24,6 +24,7 @@ type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "triage",
     about = "Doctor-style cross-instance diagnostics for playground agent piles"
 )]

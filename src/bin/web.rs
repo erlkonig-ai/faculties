@@ -29,7 +29,7 @@ enum Provider {
 }
 
 #[derive(Parser)]
-#[command(name = "web", about = "Web search/browsing faculty (Tavily/Exa)")]
+#[command(version = faculties::GIT_VERSION, name = "web", about = "Web search/browsing faculty (Tavily/Exa)")]
 struct Cli {
     /// Path to the pile file to use.
     #[arg(long, env = "PILE")]

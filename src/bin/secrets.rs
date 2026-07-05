@@ -425,7 +425,7 @@ fn recipients_of(space: &TribleSet, scope: Id) -> Vec<Id> {
 // ── commands ──────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "secrets", about = "Encrypted secret store (pile-native 1Password replacement)")]
+#[command(version = faculties::GIT_VERSION, name = "secrets", about = "Encrypted secret store (pile-native 1Password replacement)")]
 struct Cli {
     /// Pile path (defaults to $PILE).
     #[arg(long, env = "PILE")]

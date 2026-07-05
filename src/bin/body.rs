@@ -46,6 +46,7 @@ const FRAME_SHIM: &str = include_str!("body_frame.py");
 // ── CLI ──────────────────────────────────────────────────────────────────
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "body",
     about = "The Reachy Mini body: perception in, action out, deliberate captures to the pile"
 )]

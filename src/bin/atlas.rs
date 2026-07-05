@@ -16,7 +16,7 @@ use triblespace::prelude::*;
 const DEFAULT_BRANCH: &str = "atlas";
 
 #[derive(Parser)]
-#[command(name = "atlas", about = "Schema metadata inspection faculty")]
+#[command(version = faculties::GIT_VERSION, name = "atlas", about = "Schema metadata inspection faculty")]
 struct Cli {
     /// Path to the pile file to use.
     #[arg(long, env = "PILE")]

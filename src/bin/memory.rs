@@ -28,6 +28,7 @@ use triblespace::prelude::*;
 
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "memory",
     about = "Show compacted context chunks (drill down by narrowing the time range).\n\n\
              Subcommands:\n  \

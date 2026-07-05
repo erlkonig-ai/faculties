@@ -49,7 +49,7 @@ use file_schema::KIND_FILE;
 use file_schema::file;
 
 #[derive(Parser)]
-#[command(name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
+#[command(version = faculties::GIT_VERSION, name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
 struct Cli {
     /// Path to the pile file to write into.
     #[arg(long, env = "PILE")]

@@ -25,6 +25,7 @@ use triblespace::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "headspace",
     bin_name = "headspace",
     about = "Manage active headspace (profile/model/reasoning)."

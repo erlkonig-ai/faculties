@@ -57,7 +57,7 @@ mod wiki {
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 #[derive(Parser)]
-#[command(name = "wiki", about = "A TribleSpace knowledge wiki faculty")]
+#[command(version = faculties::GIT_VERSION, name = "wiki", about = "A TribleSpace knowledge wiki faculty")]
 struct Cli {
     /// Path to the pile file
     #[arg(long, env = "PILE")]

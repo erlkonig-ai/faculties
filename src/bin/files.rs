@@ -29,7 +29,7 @@ type Mm7bHandle = Inline<inlineencodings::Handle<embeddings::Embedding3584>>;
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 #[derive(Parser)]
-#[command(name = "files", about = "Content-addressed file storage in a TribleSpace pile")]
+#[command(version = faculties::GIT_VERSION, name = "files", about = "Content-addressed file storage in a TribleSpace pile")]
 struct Cli {
     /// Path to the pile file
     #[arg(long, env = "PILE")]

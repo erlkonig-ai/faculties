@@ -19,6 +19,7 @@ type Lower = i128;
 // ── CLI ─────────────────────────────────────────────────────────────────
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "gauge",
     about = "Research quality gauge — reads wiki tag metadata"
 )]

@@ -35,7 +35,7 @@ const TRANSP_TRANSPARENT: &str = "TRANSPARENT";
 // ── CLI ───────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "planner", about = "Calendar / event-tracking faculty")]
+#[command(version = faculties::GIT_VERSION, name = "planner", about = "Calendar / event-tracking faculty")]
 struct Cli {
     /// Path to the pile file
     #[arg(long, env = "PILE")]

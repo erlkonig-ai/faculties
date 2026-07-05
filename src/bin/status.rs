@@ -32,7 +32,7 @@ type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 #[derive(Parser)]
-#[command(name = "status", about = "Per-window 'currently doing X' status")]
+#[command(version = faculties::GIT_VERSION, name = "status", about = "Per-window 'currently doing X' status")]
 struct Cli {
     /// Path to the pile file
     #[arg(long, env = "PILE")]

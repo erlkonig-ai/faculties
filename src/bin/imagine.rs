@@ -20,6 +20,7 @@ use clap::Parser;
 /// Generate an image from a text prompt with FLUX.2 (Klein/Dev).
 #[derive(Parser, Debug)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "imagine",
     about = "Liora's imagination: text → image via mary's FLUX.2 pipeline."
 )]

@@ -7,6 +7,15 @@
 //! that cross-reference, the playground dashboard, and any GORBIE notebook
 //! that embeds a faculty widget — uses the same attribute IDs.
 
+/// Crate version + baked git hash (see `build.rs`) — lets every installed
+/// binary answer the stale-binary/version-skew question via `--version`.
+pub const GIT_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("FACULTIES_GIT_VERSION"),
+    ")"
+);
+
 pub mod schemas;
 pub mod tokens;
 

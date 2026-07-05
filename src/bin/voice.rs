@@ -83,6 +83,7 @@ const DEFAULT_SHOUT_DEVICES: &[&str] =
 // ── CLI ──────────────────────────────────────────────────────────────────
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "voice",
     about = "Liora's voice: synthesis + privacy-aware output routing, on two channels."
 )]

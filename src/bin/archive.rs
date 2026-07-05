@@ -351,7 +351,7 @@ mod common {
 }
 
 #[derive(Parser)]
-#[command(name = "archive", about = "Query imported archives in TribleSpace")]
+#[command(version = faculties::GIT_VERSION, name = "archive", about = "Query imported archives in TribleSpace")]
 struct Cli {
     /// Path to the pile file to query.
     #[arg(long, env = "PILE")]

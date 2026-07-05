@@ -32,6 +32,7 @@ fn interval_key(interval: IntervalValue) -> i128 {
 
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "orient",
     about = "Orient the agent with recent messages and goals"
 )]

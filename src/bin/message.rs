@@ -48,6 +48,7 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "message",
     about = "Local messaging faculty for the agent"
 )]

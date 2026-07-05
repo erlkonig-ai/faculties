@@ -52,7 +52,7 @@ const DEFAULT_FROM_NAME: &str = "Toby Trible";
 // ── CLI ───────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "mail", about = "RFC 5322 email faculty")]
+#[command(version = faculties::GIT_VERSION, name = "mail", about = "RFC 5322 email faculty")]
 struct Cli {
     /// Path to the pile file
     #[arg(long, env = "PILE")]

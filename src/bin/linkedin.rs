@@ -47,7 +47,7 @@ type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "linkedin", about = "LinkedIn → relations import conduit")]
+#[command(version = faculties::GIT_VERSION, name = "linkedin", about = "LinkedIn → relations import conduit")]
 struct Cli {
     /// Path to the pile file
     #[arg(long, env = "PILE")]

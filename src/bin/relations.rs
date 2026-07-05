@@ -14,7 +14,7 @@ use triblespace::prelude::*;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 #[derive(Parser)]
-#[command(name = "relations", about = "Relationship/contacts faculty")]
+#[command(version = faculties::GIT_VERSION, name = "relations", about = "Relationship/contacts faculty")]
 struct Cli {
     /// Path to the pile file to use
     #[arg(long, env = "PILE")]

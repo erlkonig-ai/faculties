@@ -20,7 +20,7 @@ use triblespace::prelude::*;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 #[derive(Parser)]
-#[command(name = "compass", about = "A small TribleSpace kanban faculty")]
+#[command(version = faculties::GIT_VERSION, name = "compass", about = "A small TribleSpace kanban faculty")]
 struct Cli {
     /// Path to the pile file to use
     #[arg(long, env = "PILE")]

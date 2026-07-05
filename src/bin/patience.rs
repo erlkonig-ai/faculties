@@ -14,6 +14,7 @@ use triblespace::prelude::*;
 
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "patience",
     about = "Extend the active turn timeout and optionally run a command"
 )]

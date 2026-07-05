@@ -15,6 +15,7 @@ use triblespace::prelude::*;
 
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "reason",
     about = "Record explicit reasoning notes linked to the current execution turn"
 )]

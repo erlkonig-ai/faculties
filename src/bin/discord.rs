@@ -63,6 +63,7 @@ const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
 #[derive(Parser)]
 #[command(
+    version = faculties::GIT_VERSION,
     name = "discord",
     about = "Post to and ingest Discord channels into TribleSpace"
 )]

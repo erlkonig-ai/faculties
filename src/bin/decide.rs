@@ -28,7 +28,7 @@ type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 // ── CLI ───────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "decide", about = "Deliberation primitive — pros, cons, resolution")]
+#[command(version = faculties::GIT_VERSION, name = "decide", about = "Deliberation primitive — pros, cons, resolution")]
 struct Cli {
     #[arg(long, env = "PILE")]
     pile: PathBuf,

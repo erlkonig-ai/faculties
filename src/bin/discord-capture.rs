@@ -7,6 +7,17 @@ use GORBIE::notebook;
 use GORBIE::prelude::*;
 
 fn resolve_pile_path() -> PathBuf {
+    // Handled before anything else so `--version` works without a pile or a
+    // display. Prints crate version + baked git hash (the stale-binary question).
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "{} {} ({})",
+            env!("CARGO_BIN_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            env!("FACULTIES_GIT_VERSION"),
+        );
+        std::process::exit(0);
+    }
     std::env::var("PILE")
         .ok()
         .or_else(|| {
