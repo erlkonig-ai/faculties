@@ -132,6 +132,12 @@ impl MemoryLive {
 
         let mut by_id: HashMap<Id, ChunkRow> = HashMap::new();
 
+        // Retracted/superseded chunks must leave EVERY view, the board
+        // included — same exclusion the CLI read paths apply (tag-agnostic:
+        // anything something else supersedes is invisible).
+        let superseded: std::collections::HashSet<Id> =
+            find!(old: Id, pattern!(&space, [{ _ @ memctx::supersedes: ?old }])).collect();
+
         // Enumerate every chunk + its time-range bounds in one query.
         // start_at and end_at are NsTAIInterval values, projected as
         // hifitime Epoch tuples (start, end). For the bounds we only
@@ -145,6 +151,9 @@ impl MemoryLive {
                 memctx::end_at: ?e,
             }])
         ) {
+            if superseded.contains(&id) {
+                continue;
+            }
             by_id.insert(
                 id,
                 ChunkRow {

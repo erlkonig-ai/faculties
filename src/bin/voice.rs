@@ -215,6 +215,13 @@ impl DeviceClass {
 /// recognised as private is treated as public — fail-closed, never fail-open.
 fn classify(name: &str) -> DeviceClass {
     let n = name.to_lowercase();
+    // Room-speaker markers beat brand hints: a "Beats Pill" is a speaker even
+    // though "beats" reads as headphone-brand. Checked FIRST so a brand
+    // substring can never launder a speaker into Private (fail-closed).
+    const SPEAKER_MARKERS: &[&str] = &["pill", "speaker", "soundlink", "sonos", "homepod"];
+    if SPEAKER_MARKERS.iter().any(|h| n.contains(h)) {
+        return DeviceClass::Speaker;
+    }
     const PRIVATE_HINTS: &[&str] = &[
         "airpods", "headphone", "headset", "earbud", "earphone", "earpod", "ear pod",
         "in-ear", "beats", "buds", " wf-", " wh-", "powerbeats",
