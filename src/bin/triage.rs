@@ -384,7 +384,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         return Err(match err {
             ReadError::CorruptPile { valid_length } => anyhow!(
                 "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). Repair the torn tail explicitly with: trible pile restore {}",
+                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
                 path.display()
             ),
             other => anyhow!("refresh pile {}: {other:?}", path.display()),
@@ -408,7 +408,7 @@ fn pull_workspace(
             Err(anyhow!(
                 "{context}: pile corrupt at byte {valid_length}: refusing to auto-repair \
                  (a stale binary could truncate newer data). Repair the torn tail explicitly \
-                 with: trible pile restore <pile>"
+                 with: trible pile amputate <pile>"
             ))
         }
     }

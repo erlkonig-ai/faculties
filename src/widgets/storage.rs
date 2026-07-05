@@ -116,7 +116,7 @@ impl StorageState {
             let _ = pile.close();
             self.error = Some(format!(
                 "pile corrupt ({err:?}): refusing to auto-repair (a stale binary could truncate \
-                 newer data). Repair a torn tail explicitly with: trible pile restore {}",
+                 newer data). Repair a torn tail explicitly with: trible pile amputate {}",
                 self.pile_path.display()
             ));
             return;
@@ -172,7 +172,7 @@ impl StorageState {
         }
     }
 
-    /// Current error message (pile open / restore / refresh failure),
+    /// Current error message (pile open / refresh failure),
     /// if any.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()

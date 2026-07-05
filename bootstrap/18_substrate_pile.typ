@@ -38,8 +38,10 @@ falsify the past, by construction.
 
 == Consequences of append-only + content-addressing
 
-  - *Crash-safe*: a torn write is detected and skipped on
-    restore; everything before it is intact.
+  - *Crash-safe*: a torn write is detected on load and
+    reported loudly; everything before it is intact. Cutting
+    the torn tail off is a separate, explicit, destructive
+    step (`trible pile amputate`), never part of opening.
   - *Trivially mergeable*: `cat a.pile >> b.pile` is a
     legitimate first step of merging two piles — duplicate
     blobs collapse because identical content has identical
