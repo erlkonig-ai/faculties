@@ -1,5 +1,5 @@
 //! Minimal capture target for iterating on the planner widget in
-//! isolation. The full `faculties-viewer` pulls in the wiki widget
+//! isolation. The full `viewer` pulls in the wiki widget
 //! which initialises its own cubecl/wgpu GPU context — that collides
 //! with the headless wgpu renderer on some platforms and produces
 //! 2-pixel-tall stub PNGs for every card after wiki.

@@ -7,7 +7,7 @@
 //! Usage:
 //! ```sh
 //! cargo install faculties --features widgets
-//! faculties-viewer ./self.pile
+//! viewer ./self.pile
 //! # or set PILE=./self.pile in the environment; anything passed
 //! # on the command line (--pile <path> or positional) beats it
 //! ```
@@ -21,12 +21,11 @@ use std::path::PathBuf;
 use faculties::widgets::{
     AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
     GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
-    RelationsViewer, StatusViewer, StorageState, TeamsViewer, TimelineSource, TriageViewer,
-    WikiViewer,
+    RelationsViewer, ReviewPanel, StatusViewer, StorageState, TeamsViewer, TimelineSource,
+    TriageViewer, WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
-use triblespace::core::inline::encodings::hash::Blake3;
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -36,7 +35,8 @@ fn resolve_pile_path() -> PathBuf {
     // hash — the stale-binary question, answerable in one flag.
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!(
-            "faculties-viewer {} ({})",
+            "{} {} ({})",
+            env!("CARGO_BIN_NAME"),
             env!("CARGO_PKG_VERSION"),
             env!("FACULTIES_GIT_VERSION"),
         );
@@ -94,6 +94,16 @@ fn main(nb: &mut NotebookCtx) {
         // always render sections open.
         ctx.set_default_section_open(false);
         st.top_bar(ctx);
+    });
+
+    // Review bench near the top — the human's primary work surface.
+    // READ-ONLY (auditing posture): no pushes.
+    nb.state("review", ReviewPanel::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut compass) = st.workspace("compass") else { return };
+        let mut wiki = st.workspace("wiki");
+        let mut decide = st.workspace("decide");
+        panel.render(ctx, &mut compass, wiki.as_mut(), decide.as_mut());
     });
 
     nb.state("headspace", HeadspaceViewer::default(), move |ctx, panel| {

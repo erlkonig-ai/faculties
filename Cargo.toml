@@ -23,8 +23,8 @@ path = "src/lib.rs"
 
 # GORBIE-backed viewer binary. Requires the `widgets` feature.
 [[bin]]
-name = "faculties-viewer"
-path = "src/bin/faculties-viewer.rs"
+name = "viewer"
+path = "src/bin/viewer.rs"
 required-features = ["widgets"]
 
 # Minimal headless capture target for iterating on planner-widget

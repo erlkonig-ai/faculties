@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **`faculties-viewer` renamed to `viewer`.** Binary, `[[bin]]`
+  target, and docs all follow; `--version` now prints
+  `viewer X.Y.Z (<git hash>)`. No compat alias.
+- **viewer: Review section.** New `ReviewPanel` widget (registered
+  near the top of the notebook — the human's primary work surface)
+  renders every compass goal whose latest status is `review`: title,
+  tags, age, notes, wiki fragments referenced from note text (32-hex
+  regex extraction, v0 until a real link edge lands), each rendered
+  with full typst prose via the wiki widget's rendering path, plus
+  decide entries whose `decide::about` edge points at the goal, shown
+  as pros / cons / outcome. Strictly read-only.
+
 ## 0.20.2 — 2026-06-10
 
 - **Re-bundle `trible` CLI at 0.46.4** — publisher-first sync fix

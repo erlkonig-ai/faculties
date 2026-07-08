@@ -9,7 +9,7 @@ persist their state in a [TribleSpace](https://github.com/triblespace/triblespac
 pile — typically `./self.pile` — so the agent owns its own history
 across sessions.
 
-![faculties-viewer composing activity, wiki, compass, and messages widgets](preview.png)
+![viewer composing activity, wiki, compass, and messages widgets](preview.png)
 
 ## Getting started
 
@@ -37,7 +37,7 @@ Install all faculty CLIs (and the GUI viewer) onto `$PATH`:
 
 ```sh
 cargo install --git https://github.com/triblespace/faculties --bins
-cargo install --git https://github.com/triblespace/faculties --features widgets --bin faculties-viewer
+cargo install --git https://github.com/triblespace/faculties --features widgets --bin viewer
 ```
 
 Or from a local checkout:
@@ -46,7 +46,7 @@ Or from a local checkout:
 git clone https://github.com/triblespace/faculties
 cd faculties
 cargo install --path . --bins
-cargo install --path . --features widgets --bin faculties-viewer
+cargo install --path . --features widgets --bin viewer
 ```
 
 ### Use it
@@ -59,7 +59,7 @@ export PILE=./self.pile
 
 compass add "ship the demo" --status doing
 wiki create "Hello" "First *typst* fragment."
-faculties-viewer               # picks up PILE from the environment
+viewer               # picks up PILE from the environment
 ```
 
 ### For agent onboarding: the bootstrap pile
@@ -162,14 +162,14 @@ content-addressed blob store.
 
 ## GORBIE viewer
 
-The installed `faculties-viewer` binary composes all four widgets
+The installed `viewer` binary composes all four widgets
 (activity timeline, wiki graph, compass kanban, local-messages
 thread) against a single pile — see the screenshot above.
 
 From a checkout:
 
 ```sh
-cargo run --release --features widgets --bin faculties-viewer -- ./self.pile
+cargo run --release --features widgets --bin viewer -- ./self.pile
 ```
 
 Standalone per-widget demos (showing how to embed a single widget

@@ -1213,7 +1213,9 @@ impl WikiGraph {
 
 /// A clicked URL in a rendered typst fragment that the viewer should
 /// handle internally (rather than letting egui open it in a browser).
-enum LinkClick {
+/// `pub(crate)` so sibling widgets (the review bench) can reuse the
+/// same typst-render-and-intercept path instead of reimplementing it.
+pub(crate) enum LinkClick {
     /// `wiki:<hex>` link — `Id` is either a fragment or a version id.
     Wiki(Id),
     /// `files:<hex>` link — `String` is the 32/64-char hex payload.
@@ -1227,7 +1229,7 @@ enum LinkClick {
 /// output queue; we peek at the commands added during `ctx.typst(…)`,
 /// keep the non-matching ones (so e.g. `https:` links still open the
 /// browser), and pull out the `wiki:` / `files:` ones as `LinkClick`s.
-fn render_wiki_content(ctx: &mut CardCtx<'_>, content: &str) -> Option<LinkClick> {
+pub(crate) fn render_wiki_content(ctx: &mut CardCtx<'_>, content: &str) -> Option<LinkClick> {
     let cmd_count_before = ctx.ctx().output(|o| o.commands.len());
     ctx.typst(content);
 
