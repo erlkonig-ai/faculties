@@ -596,6 +596,45 @@ fn log_utterance(
     Ok(())
 }
 
+// ── adaptive prebuffer math (pure — unit-tested, no audio) ─────────────────
+
+/// Estimate an utterance's total audio duration from its character count,
+/// calibrated by the reference kit: assume the generated speech runs at the
+/// reference clip's chars-per-second. This is the same linear chars→duration
+/// model mary's batch F5 path uses to size its mel window
+/// (`say::synth_chunk`: `duration = ref_len / ref_chars * gen_chars`). It is
+/// an ESTIMATE — the underrun guard in `stream_to_device` catches the cases
+/// where reality runs longer.
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+fn estimate_audio_secs(gen_chars: usize, ref_secs: f32, ref_chars: usize) -> f32 {
+    if ref_chars == 0 {
+        return 0.0;
+    }
+    ref_secs * gen_chars as f32 / ref_chars as f32
+}
+
+/// How much audio (seconds) must be buffered before starting playback so
+/// synthesis at `production_rate` (audio-seconds produced per wall-second;
+/// < 1 is slower than realtime) stays ahead of the playhead for the REST of
+/// an utterance totalling `total_est_secs`.
+///
+/// Derivation: playback starting with `B` seconds buffered has consumed `t`
+/// seconds of audio by wall-time `t`, while production has `B + rate·t`
+/// ready. Their gap `B − t·(1 − rate)` shrinks linearly (for rate < 1) until
+/// production finishes at `t = (T − B)/rate`, so the binding constraint is
+/// at the END: `B ≥ T·(1 − rate)` keeps the buffer nonnegative throughout —
+/// the EXACT no-underrun bound, not a heuristic. The margin absorbs rate
+/// jitter and estimate error (it holds a `margin/rate` cushion at the worst
+/// point); the floor keeps the queue from starting starved even when there
+/// is no deficit at all.
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+fn prebuffer_target_secs(total_est_secs: f32, production_rate: f32) -> f32 {
+    const MARGIN_SECS: f32 = 0.5;
+    const FLOOR_SECS: f32 = 0.15;
+    let deficit = total_est_secs * (1.0 - production_rate).max(0.0);
+    (deficit + MARGIN_SECS).max(FLOOR_SECS)
+}
+
 // ── synthesis + sinks (feature-gated, mirrors imagine) ─────────────────────
 //
 // ONE generation path, TWO kinds of sink. Every playing channel synthesizes
@@ -604,11 +643,19 @@ fn log_utterance(
 // only in how they drain it:
 //   - STREAMING sink (say/shout to a local device): chunks are appended to a
 //     NATIVE in-process rodio sink opened by device NAME (cpal/CoreAudio).
-//     First audio lands after a ~150 ms prebuffer past the first chunk — no
-//     subprocess, no pipe probing (the ffplay era needed low-latency flags to
-//     get under ~15 s to first sample, and could fail SILENTLY with stderr
-//     nulled; both classes are dead — open errors surface, playback is
-//     verified, completion is reported).
+//     Playback starts behind an ADAPTIVE prebuffer: estimate the utterance
+//     duration from the text (reference-kit chars-per-second, the same
+//     linear model mary's batch path sizes its mel window with), measure the
+//     REAL production rate from the inter-chunk spacing, and hold playback
+//     until the buffer covers the predicted deficit (`prebuffer_target_secs`
+//     — the exact bound past which production stays ahead of the playhead).
+//     Synthesis at/above realtime starts on the second chunk; 2.1x-slower
+//     synthesis buffers ~half the utterance ONCE instead of stuttering
+//     through all of it (JP's live test, 2026-07-08). No subprocess, no pipe
+//     probing (the ffplay era needed low-latency flags to get under ~15 s to
+//     first sample, and could fail SILENTLY with stderr nulled; both classes
+//     are dead — open errors surface, playback is verified, completion is
+//     reported).
 //   - BATCH sink (shout via the Reachy robot): the daemon's media API accepts
 //     whole files only (upload + play_sound), so the SAME stream is drained
 //     to a WAV first. Streaming into the daemon is a noted follow-up on the
@@ -649,6 +696,16 @@ fn speak_and_play(
     let pile = std::env::var("QWEN3TTS_PILE").unwrap_or_else(|_| QWEN3TTS_PILE.to_string());
     let ref_text = std::fs::read_to_string(REF_TXT_PATH)
         .with_context(|| format!("read reference transcript {REF_TXT_PATH}"))?;
+    // Duration estimate for the adaptive prebuffer: the reference clip's
+    // chars-per-second applied to the generated text (see
+    // `estimate_audio_secs`). Read before t_call so TTFA stays a pure
+    // synthesis measurement.
+    let (ref_samples, ref_sr) = mary::models::f5::wav::read_pcm16_mono(Path::new(REF_WAV));
+    let est_secs = estimate_audio_secs(
+        text.chars().count(),
+        ref_samples.len() as f32 / ref_sr.max(1) as f32,
+        ref_text.trim().chars().count(),
+    );
     let t_call = std::time::Instant::now();
     let mut stream = mary::speak::synthesize_stream(
         Path::new(&pile),
@@ -668,7 +725,7 @@ fn speak_and_play(
             Ok(())
         }
         Routed::Devices(ladder) => {
-            stream_to_device(&mut stream, &mut samples, t_call, channel, ladder, sr)
+            stream_to_device(&mut stream, &mut samples, t_call, channel, ladder, sr, est_secs)
         }
         Routed::Text(_) => Ok(()), // handled by the caller; nothing to play
     };
@@ -696,16 +753,20 @@ fn speak_and_play(
 }
 
 /// Drain `stream` into the first device of `ladder` that OPENS, through the
-/// native in-process sink — chunks play as they are synthesized (after a
-/// ~150 ms prebuffer so the queue never starts starved); the rodio mixer
-/// resamples 24 kHz mono to whatever the device runs natively. Every failure
-/// is LOUD: an unopenable device prints why and falls to the next candidate
-/// (on the `say` channel each name is re-asserted PRIVATE first — a ladder
-/// can only fall to another private device); a queue that stops draining
-/// mid-play errors instead of hanging forever. Prints the measured TTFA
-/// (call → playback start) and a completion line naming the device that
-/// ACTUALLY played and how much audio was written to it.
+/// native in-process sink — chunks play as they are synthesized, behind an
+/// ADAPTIVE prebuffer sized to the measured synthesis speed (see the loop
+/// below and `prebuffer_target_secs`); the rodio mixer resamples 24 kHz mono
+/// to whatever the device runs natively. `est_secs` is the chars-calibrated
+/// duration estimate for the whole utterance. Every failure is LOUD: an
+/// unopenable device prints why and falls to the next candidate (on the
+/// `say` channel each name is re-asserted PRIVATE first — a ladder can only
+/// fall to another private device); a queue that stops draining mid-play
+/// errors instead of hanging forever. Prints the buffering decision when it
+/// holds playback back, the measured TTFA (call → playback start), and a
+/// completion line naming the device that ACTUALLY played and how much
+/// audio was written to it.
 #[cfg(feature = "voice")]
+#[allow(clippy::too_many_arguments)]
 fn stream_to_device(
     stream: &mut mary::speak::SpeakStream,
     samples: &mut Vec<f32>,
@@ -713,6 +774,7 @@ fn stream_to_device(
     channel: &str,
     ladder: &[String],
     sr: u32,
+    est_secs: f32,
 ) -> Result<()> {
     use rodio::buffer::SamplesBuffer;
     use std::num::NonZero;
@@ -747,25 +809,90 @@ fn stream_to_device(
     };
 
     let mono = NonZero::new(1).expect("1 is nonzero");
-    let rate = NonZero::new(sr).context("PCM sample rate must be nonzero")?;
+    let sr_nz = NonZero::new(sr).context("PCM sample rate must be nonzero")?;
+    let secs = |n: usize| n as f32 / sr as f32;
 
-    // Prebuffer ~150 ms before starting playback; after that, chunks play as
-    // they arrive from the model (starvation plays silence, then resumes).
-    let prebuffer = sr as usize * 150 / 1000;
+    // ── adaptive prebuffer ──
+    // Synthesis may be SLOWER than realtime (JP's live test: 2.1x-slower and
+    // a stutter every couple of seconds as rodio starved between chunks). No
+    // fixed prebuffer fixes that — any constant is wrong for some rate. So:
+    // measure the actual production rate from the inter-chunk spacing (chunk
+    // 1 is excluded from the measurement — it pays model load + prefill, not
+    // steady state) and hold playback until the buffer covers the predicted
+    // deficit for the WHOLE utterance (`prebuffer_target_secs`, the exact
+    // bound). At/above realtime the margin is met by the second chunk and
+    // playback starts almost immediately; well below it, the buffer fills
+    // ONCE up front instead of stuttering chunk-by-chunk to the end. The
+    // rate keeps being re-measured on every chunk; if reality still dips
+    // under the estimate mid-play, the underrun guard pauses ONCE and
+    // rebuffers the remaining deficit rather than stutter.
     player.pause();
     let mut appended = 0usize;
     let mut started = false;
+    let mut chunks = 0usize;
+    let mut measure_from = 0usize; // samples appended when chunk 1 landed
+    let mut t_first: Option<std::time::Instant> = None;
+    let mut prod_rate = 1.0f32; // audio-secs produced per wall-sec (measured)
+    let mut announced = false;
+    let mut rebuffer_from: Option<usize> = None; // underrun-guard pause point
     for chunk in stream.by_ref() {
+        // Underrun guard, checked BEFORE appending: playback started, the
+        // queue drained dry, and here comes another chunk — the buffer was
+        // sized short (rate dip, or the chars-estimate undershot). Pause and
+        // rebuffer the remaining deficit at the freshly measured rate.
+        if started && rebuffer_from.is_none() && player.empty() {
+            player.pause();
+            let target =
+                prebuffer_target_secs((est_secs - secs(appended)).max(0.0), prod_rate);
+            println!(
+                "  [stream] underrun at {:.1}s — rebuffering {:.1}s (synthesis at {:.2}x realtime)",
+                secs(appended),
+                target,
+                prod_rate
+            );
+            rebuffer_from = Some(appended);
+        }
         samples.extend_from_slice(&chunk);
         appended += chunk.len();
-        player.append(SamplesBuffer::new(mono, rate, chunk));
-        if !started && appended >= prebuffer {
-            player.play();
-            started = true;
-            println!(
-                "  [stream] TTFA {:.2}s → {device}",
-                t_call.elapsed().as_secs_f32()
-            );
+        player.append(SamplesBuffer::new(mono, sr_nz, chunk));
+        chunks += 1;
+        match t_first {
+            None => {
+                t_first = Some(std::time::Instant::now());
+                measure_from = appended;
+            }
+            // Steady-state production rate over everything since chunk 1.
+            Some(t0) => {
+                prod_rate = secs(appended - measure_from) / t0.elapsed().as_secs_f32().max(1e-3);
+            }
+        }
+        if !started && chunks >= 2 {
+            let target = prebuffer_target_secs(est_secs, prod_rate);
+            if secs(appended) >= target {
+                player.play();
+                started = true;
+                println!(
+                    "  [stream] TTFA {:.2}s → {device}",
+                    t_call.elapsed().as_secs_f32()
+                );
+            } else if !announced {
+                println!(
+                    "  [stream] buffering {:.1}s of ~{:.0}s (synthesis at {:.2}x realtime)",
+                    target, est_secs, prod_rate
+                );
+                announced = true;
+            }
+        }
+        if let Some(from) = rebuffer_from {
+            let target = prebuffer_target_secs((est_secs - secs(from)).max(0.0), prod_rate);
+            if secs(appended - from) >= target {
+                player.play();
+                rebuffer_from = None;
+                println!(
+                    "  [stream] resumed with {:.1}s rebuffered",
+                    secs(appended - from)
+                );
+            }
         }
     }
     if appended == 0 {
@@ -774,11 +901,15 @@ fn stream_to_device(
         bail!("no audio chunks arrived to play on '{device}'");
     }
     if !started {
-        player.play(); // utterance shorter than the prebuffer
+        // Stream ended before the target was met (short utterance, or a
+        // deficit larger than what remained): it is ALL buffered — play it.
+        player.play();
         println!(
             "  [stream] TTFA {:.2}s → {device}",
             t_call.elapsed().as_secs_f32()
         );
+    } else if rebuffer_from.is_some() {
+        player.play(); // stream ended mid-rebuffer: the rest is all here now
     }
 
     // Bounded drain: wait for the queue to empty, but never hang on a dead
@@ -1153,6 +1284,63 @@ mod tests {
             true,
         ));
         assert_eq!(l, vec!["MacBook Pro Speakers"]);
+    }
+
+    // ── adaptive prebuffer math ──
+
+    #[test]
+    fn estimate_scales_by_reference_chars_per_second() {
+        // Same char count as the reference → the reference's duration;
+        // double the chars → double the estimate.
+        assert!((estimate_audio_secs(240, 11.46, 240) - 11.46).abs() < 1e-4);
+        assert!((estimate_audio_secs(480, 11.46, 240) - 22.92).abs() < 1e-3);
+        // Degenerate reference: estimate 0 (the target floor still guards).
+        assert_eq!(estimate_audio_secs(100, 11.46, 0), 0.0);
+    }
+
+    #[test]
+    fn prebuffer_is_margin_only_when_synthesis_keeps_up() {
+        // At or above realtime there is no deficit — just the 0.5 s margin,
+        // met by the first ~0.64 s chunk: playback starts almost immediately
+        // regardless of how long the utterance is.
+        assert_eq!(prebuffer_target_secs(10.0, 1.0), 0.5);
+        assert_eq!(prebuffer_target_secs(10.0, 1.05), 0.5);
+        assert_eq!(prebuffer_target_secs(60.0, 2.0), 0.5);
+    }
+
+    #[test]
+    fn prebuffer_covers_the_deficit_when_synthesis_is_slow() {
+        // 1.4x-slower synthesis (rate ≈ 0.714): buffer ~29% of the utterance.
+        let t = prebuffer_target_secs(10.0, 1.0 / 1.4);
+        assert!((t - (10.0 * (1.0 - 1.0 / 1.4) + 0.5)).abs() < 1e-4);
+        // 2.1x-slower (the live stutter case, rate ≈ 0.476): ~half + margin.
+        let t = prebuffer_target_secs(10.0, 1.0 / 2.1);
+        assert!(t > 5.7 && t < 5.8, "got {t}");
+    }
+
+    #[test]
+    fn prebuffer_never_underruns_at_constant_rate() {
+        // Simulate: start playback once `prebuffer_target_secs` is met and
+        // check production stays ahead of the playhead to the end, over a
+        // grid of rates and utterance lengths (buffered capped at the whole
+        // utterance — a deficit larger than the text means play-after-drain,
+        // which trivially can't underrun).
+        for rate in [0.3f32, 1.0 / 2.1, 1.0 / 1.4, 0.9, 1.0, 1.5] {
+            for total in [1.0f32, 5.0, 12.0, 60.0] {
+                let b = prebuffer_target_secs(total, rate).min(total);
+                let mut t = 0.0f32;
+                while t <= total {
+                    let produced = (b + rate * t).min(total);
+                    let played = t.min(total);
+                    assert!(
+                        produced + 1e-3 >= played,
+                        "underrun: rate {rate}, total {total}, t {t}: \
+                         produced {produced} < played {played}"
+                    );
+                    t += 0.05;
+                }
+            }
+        }
     }
 
     #[test]
