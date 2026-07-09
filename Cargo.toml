@@ -148,6 +148,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
+rodio = { version = "0.22", default-features = false, features = ["playback"] }  # voice (NATIVE audio: cpal device enumeration always; in-process playback sink under `voice` — no afplay/ffplay/SwitchAudioSource subprocesses)
 rrule = "0.14"              # planner
 scraper = "0.23"            # archive
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web

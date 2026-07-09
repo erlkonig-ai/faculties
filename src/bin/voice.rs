@@ -28,19 +28,23 @@
 //! `voice` feature, mirroring `imagine`; the default build compiles a bail
 //! stub so the rest of the faculty suite stays light. There is ONE generation
 //! path — `mary::speak::synthesize_stream`, a live PCM-chunk iterator — and
-//! the channels differ only by SINK: local devices stream the chunks into
-//! `ffplay` as they are synthesized (first audio in seconds; afplay batch when
-//! ffplay is absent), while the Reachy speaker drains the same stream to a
-//! whole file (its daemon media API is upload+play; daemon-side streaming is a
-//! noted follow-up).
+//! the channels differ only by SINK: local devices play the chunks as they
+//! are synthesized through a NATIVE in-process audio sink (rodio/cpal — no
+//! ffplay/afplay/SwitchAudioSource subprocesses, no pipe-probing latency),
+//! while the Reachy speaker drains the same stream to a whole file (its
+//! daemon media API is upload+play; daemon-side streaming is a noted
+//! follow-up).
 //!
-//! macOS device targeting: `afplay`/`ffplay` play to the *current default
-//! output device* and have no device flag. True per-device targeting needs
-//! `SwitchAudioSource` (brew: switchaudio-osx) to switch the default output
-//! around playback. When it's present we use it; when it's absent we degrade
-//! SAFELY: `say` plays only if the current default output is *itself* a private
-//! device (otherwise text); `shout` plays through the default output. The
-//! say-privacy invariant holds in both modes.
+//! Device targeting: the native sink opens the routed output device BY NAME
+//! via cpal (CoreAudio), never touching the system default output — the
+//! SwitchAudioSource machinery and its whole fragility class (default-switch
+//! races, stale restores, a brew dependency) are gone, and so is the degraded
+//! no-targeting mode. Enumeration and playback share ONE namespace, so a name
+//! that routes is a name that plays. Opening the device is the verification:
+//! an absent/asleep/rejecting device errors LOUDLY and playback falls to the
+//! next device in the routing ladder (for `say`, only ever to another PRIVATE
+//! device — else the text fallback). The say-privacy invariant is enforced at
+//! resolution AND re-asserted per device name before any sound.
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -53,7 +57,6 @@ use hifitime::efmt::Formatter;
 use hifitime::efmt::consts::ISO8601;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
-use std::process::Command as PCommand;
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
@@ -254,105 +257,72 @@ impl AudioDevice {
     }
 }
 
-/// Enumerate connected audio OUTPUT devices via `system_profiler`. Output
-/// devices carry a `coreaudio_device_output` channel count; the current default
-/// output is flagged `coreaudio_default_audio_output_device == "spaudio_yes"`.
+/// Enumerate connected audio OUTPUT devices natively via cpal (CoreAudio on
+/// macOS) — the SAME namespace the playback sink opens devices from, so a
+/// name that routes here is a name `open_named_sink` can actually play on
+/// (the system_profiler/playback name-mismatch class can't exist).
 fn detect_output_devices() -> Result<Vec<AudioDevice>> {
-    let out = PCommand::new("system_profiler")
-        .args(["SPAudioDataType", "-json"])
-        .output()
-        .context("run system_profiler SPAudioDataType -json")?;
-    if !out.status.success() {
-        bail!(
-            "system_profiler failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).context("parse system_profiler JSON")?;
-    let items = v["SPAudioDataType"][0]["_items"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let host = rodio::cpal::default_host();
+    let default_name = host
+        .default_output_device()
+        .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
     let mut devices = Vec::new();
-    for item in items {
-        // Only output-capable devices matter for routing.
-        if item.get("coreaudio_device_output").is_none() {
-            continue;
-        }
-        let name = item["_name"].as_str().unwrap_or("").to_string();
+    for dev in host
+        .output_devices()
+        .context("enumerate audio output devices (cpal)")?
+    {
+        let Ok(desc) = dev.description() else { continue };
+        let name = desc.name().to_string();
         if name.is_empty() {
             continue;
         }
-        let is_default_output =
-            item.get("coreaudio_default_audio_output_device").and_then(|x| x.as_str())
-                == Some("spaudio_yes");
         devices.push(AudioDevice {
+            is_default_output: Some(&name) == default_name.as_ref(),
             name,
-            is_default_output,
         });
     }
     Ok(devices)
 }
 
-/// `SwitchAudioSource` (brew: switchaudio-osx), if installed — the only reliable
-/// way to target a SPECIFIC output device on macOS. `None` ⇒ degrade safely.
-fn switch_audio_bin() -> Option<PathBuf> {
-    for p in [
-        "/opt/homebrew/bin/SwitchAudioSource",
-        "/usr/local/bin/SwitchAudioSource",
-    ] {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-    // Fall back to PATH lookup.
-    let ok = PCommand::new("SwitchAudioSource")
-        .arg("-c")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    ok.then(|| PathBuf::from("SwitchAudioSource"))
-}
-
-/// First connected device whose name contains `pat` (case-insensitive).
-fn connected_match<'a>(pat: &str, devices: &'a [AudioDevice]) -> Option<&'a AudioDevice> {
+/// Connected devices whose name contains `pat` (case-insensitive), in
+/// enumeration order — a pattern can ladder several devices ("AirPods"
+/// matches the Max and the Pro; the router keeps them all as fallbacks).
+fn connected_matches<'a>(
+    pat: &str,
+    devices: &'a [AudioDevice],
+) -> impl Iterator<Item = &'a AudioDevice> {
     let needle = pat.to_lowercase();
-    devices.iter().find(|d| d.name.to_lowercase().contains(&needle))
+    devices
+        .iter()
+        .filter(move |d| d.name.to_lowercase().contains(&needle))
 }
 
 // ── playback primitives ────────────────────────────────────────────────────
 
+/// Open a native audio sink on the output device with EXACTLY this name (the
+/// namespace `detect_output_devices` enumerates). Opening is the
+/// verification: a device that is absent, asleep, or rejects a stream errors
+/// HERE, loudly — never a silent success against a dead route. The returned
+/// `MixerDeviceSink` owns the live cpal stream (keep it alive for the whole
+/// playback; dropping it stops the audio); cpal stream errors mid-play go to
+/// rodio's default callback, which prints to stderr — no diagnostic channel
+/// is ever nulled.
 #[cfg(feature = "voice")]
-fn afplay(wav: &Path) -> Result<()> {
-    let st = PCommand::new("afplay").arg(wav).status().context("afplay")?;
-    if !st.success() {
-        bail!("afplay exited with failure");
-    }
-    Ok(())
-}
-
-/// Get the current default output device name (for save/restore around a switch).
-#[cfg(feature = "voice")]
-fn current_default_output(sw: &Path) -> Option<String> {
-    let out = PCommand::new(sw).args(["-c", "-t", "output"]).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-#[cfg(feature = "voice")]
-fn set_default_output(sw: &Path, name: &str) -> Result<()> {
-    let st = PCommand::new(sw)
-        .args(["-t", "output", "-s", name])
-        .status()
-        .with_context(|| format!("SwitchAudioSource -s {name}"))?;
-    if !st.success() {
-        bail!("SwitchAudioSource failed to select '{name}'");
-    }
-    Ok(())
+fn open_named_sink(name: &str) -> Result<(rodio::MixerDeviceSink, rodio::Player)> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let host = rodio::cpal::default_host();
+    let device = host
+        .output_devices()
+        .context("enumerate audio output devices (cpal)")?
+        .find(|d| d.description().map(|desc| desc.name() == name).unwrap_or(false))
+        .with_context(|| format!("output device '{name}' not found (disconnected?)"))?;
+    let mut sink = rodio::DeviceSinkBuilder::from_device(device)
+        .and_then(|b| b.open_stream())
+        .map_err(|e| anyhow::anyhow!("open audio stream on '{name}': {e}"))?;
+    sink.log_on_drop(false); // we print our own completion line
+    let player = rodio::Player::connect_new(sink.mixer());
+    Ok((sink, player))
 }
 
 /// Upload `wav` to the Reachy daemon and play it through the robot's speaker.
@@ -395,12 +365,12 @@ fn reachy_reachable(daemon: &str) -> bool {
 
 /// The outcome of resolving a channel's routing against the live devices.
 enum Routed {
-    /// Play through the Reachy robot speaker (daemon).
+    /// Play through the Reachy robot speaker (daemon upload + play).
     Reachy,
-    /// Play on a specific device via SwitchAudioSource targeting.
-    Targeted(String),
-    /// Play through the current default output device (plain afplay).
-    Default(String),
+    /// Play through the native sink on the first OPENABLE device of this
+    /// non-empty ladder (candidates in priority order; a device that fails to
+    /// open falls loudly to the next). For `say` every entry is PRIVATE.
+    Devices(Vec<String>),
     /// Do NOT play — print the text instead (the `say` private fallback).
     Text(String),
 }
@@ -409,86 +379,75 @@ impl Routed {
     fn describe(&self) -> String {
         match self {
             Routed::Reachy => "Reachy speaker (daemon)".to_string(),
-            Routed::Targeted(d) => format!("{d} (SwitchAudioSource-targeted)"),
-            Routed::Default(d) => format!("{d} (default output)"),
+            Routed::Devices(ladder) => {
+                let (first, rest) = ladder.split_first().expect("ladder is never empty");
+                if rest.is_empty() {
+                    format!("{first} (native sink)")
+                } else {
+                    format!("{first} (native sink; fallbacks: {})", rest.join(" → "))
+                }
+            }
             Routed::Text(why) => format!("TEXT fallback — {why}"),
         }
     }
 }
 
 /// Resolve the PRIVATE `say` channel. This function bakes in the invariant:
-/// every branch that returns a playing `Routed` has proven the target is a
-/// PRIVATE device. The only non-private outcome is `Routed::Text` (silent,
-/// on-screen). There is deliberately NO branch that plays through a speaker.
-fn route_say(prefs: &[String], devices: &[AudioDevice], sw: Option<&Path>) -> Routed {
-    match sw {
-        // True targeting available: pick the highest-priority CONNECTED PRIVATE
-        // device from the policy and target it.
-        Some(_) => {
-            for pat in prefs {
-                if let Some(dev) = connected_match(pat, devices) {
-                    if dev.class() == DeviceClass::Private {
-                        return Routed::Targeted(dev.name.clone());
-                    }
-                    // matched a non-private device: skip it — never play here.
-                }
+/// the ladder it returns contains ONLY devices proven PRIVATE (the playback
+/// sink re-asserts each name before sound as defense in depth). The only
+/// non-private outcome is `Routed::Text` (silent, on-screen). There is
+/// deliberately NO branch that ladders a speaker — not even as a fallback.
+fn route_say(prefs: &[String], devices: &[AudioDevice]) -> Routed {
+    let mut ladder: Vec<String> = Vec::new();
+    for pat in prefs {
+        for dev in connected_matches(pat, devices) {
+            if dev.class() == DeviceClass::Private && !ladder.contains(&dev.name) {
+                ladder.push(dev.name.clone());
             }
-            Routed::Text("no connected private (in-ear/headphone) device".into())
+            // matched a non-private device: skip it — never play here.
         }
-        // No targeting tool: afplay can only reach the CURRENT DEFAULT OUTPUT.
-        // So we may play ONLY if that default is itself a private device that the
-        // policy allows. If the default is a speaker/Reachy, we must NOT play.
-        None => {
-            let Some(default) = devices.iter().find(|d| d.is_default_output) else {
-                return Routed::Text("no default output device".into());
-            };
-            if default.class() != DeviceClass::Private {
-                return Routed::Text(format!(
-                    "default output '{}' is {} (no SwitchAudioSource to redirect to a private device)",
-                    default.name,
-                    default.class().label()
-                ));
-            }
-            // Default IS private; honor the policy — only if it matches a say pref.
-            let allowed = prefs
-                .iter()
-                .any(|p| default.name.to_lowercase().contains(&p.to_lowercase()));
-            if !allowed {
-                return Routed::Text(format!(
-                    "default output '{}' is private but not in the say policy",
-                    default.name
-                ));
-            }
-            Routed::Default(default.name.clone())
-        }
+    }
+    if ladder.is_empty() {
+        Routed::Text("no connected private (in-ear/headphone) device".into())
+    } else {
+        Routed::Devices(ladder)
     }
 }
 
-/// Resolve the PUBLIC `shout` channel — broadcasting is the point, so it falls
-/// back freely to any audible device.
-fn route_shout(
-    prefs: &[String],
-    devices: &[AudioDevice],
-    sw: Option<&Path>,
-    daemon_up: bool,
-) -> Routed {
-    // Walk the policy; take the first connected match.
+/// Resolve the PUBLIC `shout` channel — broadcasting is the point, so it
+/// builds the whole audible ladder: every connected policy match in priority
+/// order, with the default output appended as the last resort. Reachy
+/// short-circuits when it is the FIRST connected match and the daemon is up
+/// (its sink is the whole-file daemon upload, not the streaming device sink);
+/// when the daemon is down it is skipped and the ladder keeps going.
+fn route_shout(prefs: &[String], devices: &[AudioDevice], daemon_up: bool) -> Routed {
+    let mut ladder: Vec<String> = Vec::new();
     for pat in prefs {
-        if let Some(dev) = connected_match(pat, devices) {
-            return match dev.class() {
-                DeviceClass::Reachy if daemon_up => Routed::Reachy,
-                // Reachy listed but daemon down → keep looking down the ladder.
+        for dev in connected_matches(pat, devices) {
+            match dev.class() {
+                DeviceClass::Reachy if daemon_up && ladder.is_empty() => return Routed::Reachy,
+                // Reachy below a local device (or daemon down): not a
+                // streaming-sink candidate — keep walking the ladder.
                 DeviceClass::Reachy => continue,
-                _ if sw.is_some() => Routed::Targeted(dev.name.clone()),
-                _ => Routed::Default(dev.name.clone()),
-            };
+                _ => {
+                    if !ladder.contains(&dev.name) {
+                        ladder.push(dev.name.clone());
+                    }
+                }
+            }
         }
     }
-    // Nothing in the policy is connected: just use the default output (audible).
+    // Last resort: the default output (audible), even if no policy entry matched.
     if let Some(default) = devices.iter().find(|d| d.is_default_output) {
-        return Routed::Default(default.name.clone());
+        if !ladder.contains(&default.name) {
+            ladder.push(default.name.clone());
+        }
     }
-    Routed::Text("no audible output device connected".into())
+    if ladder.is_empty() {
+        Routed::Text("no audible output device connected".into())
+    } else {
+        Routed::Devices(ladder)
+    }
 }
 
 // ── pile plumbing ───────────────────────────────────────────────────────────
@@ -643,12 +602,13 @@ fn log_utterance(
 // through `mary::speak::synthesize_stream` — a live iterator of 24 kHz PCM
 // chunks (frames hit the codec the moment they are sampled). The sinks differ
 // only in how they drain it:
-//   - STREAMING sink (say/shout to a local device): chunks are piped into
-//     `ffplay` (raw s16le on stdin, playing to the DEFAULT output — the
-//     streaming sibling of afplay, same device semantics, so the routing and
-//     privacy model are untouched; SwitchAudioSource still does the
-//     targeting). First audio lands seconds after the call, not after the
-//     whole utterance. No ffplay ⇒ degrade to collect + afplay (batch).
+//   - STREAMING sink (say/shout to a local device): chunks are appended to a
+//     NATIVE in-process rodio sink opened by device NAME (cpal/CoreAudio).
+//     First audio lands after a ~150 ms prebuffer past the first chunk — no
+//     subprocess, no pipe probing (the ffplay era needed low-latency flags to
+//     get under ~15 s to first sample, and could fail SILENTLY with stderr
+//     nulled; both classes are dead — open errors surface, playback is
+//     verified, completion is reported).
 //   - BATCH sink (shout via the Reachy robot): the daemon's media API accepts
 //     whole files only (upload + play_sound), so the SAME stream is drained
 //     to a WAV first. Streaming into the daemon is a noted follow-up on the
@@ -681,7 +641,6 @@ enum Spoken {
 fn speak_and_play(
     routed: &Routed,
     daemon: &str,
-    sw: Option<&Path>,
     channel: &str,
     text: &str,
     out: &Path,
@@ -708,32 +667,8 @@ fn speak_and_play(
             }
             Ok(())
         }
-        Routed::Targeted(device) | Routed::Default(device) => {
-            // Defense in depth: on the private channel the router only emits
-            // private devices; re-assert before any sound (the streaming
-            // sibling of `play_private_targeted`'s guard).
-            if channel == CHANNEL_SAY && classify(device) != DeviceClass::Private {
-                bail!(
-                    "refusing to play a private utterance on non-private device '{device}' \
-                     (privacy invariant)"
-                );
-            }
-            // Targeted ⇒ switch the default output to the device around
-            // playback (ffplay and afplay both play to the default output).
-            let prior = match routed {
-                Routed::Targeted(_) => {
-                    let sw = sw.context("SwitchAudioSource required for targeted playback")?;
-                    let prior = current_default_output(sw);
-                    set_default_output(sw, device)?;
-                    prior
-                }
-                _ => None,
-            };
-            let result = stream_to_default_output(&mut stream, &mut samples, t_call, device, sr);
-            if let (Routed::Targeted(_), Some(sw), Some(prev)) = (routed, sw, prior.as_deref()) {
-                let _ = set_default_output(sw, prev); // best-effort restore
-            }
-            result
+        Routed::Devices(ladder) => {
+            stream_to_device(&mut stream, &mut samples, t_call, channel, ladder, sr)
         }
         Routed::Text(_) => Ok(()), // handled by the caller; nothing to play
     };
@@ -760,84 +695,114 @@ fn speak_and_play(
     Ok(Spoken::Played)
 }
 
-/// Drain `stream` into the current DEFAULT output via `ffplay` (raw s16le PCM
-/// on stdin) — chunks play as they are synthesized; prints the measured TTFA
-/// (call → first chunk handed to the audio pipe). Without ffplay, degrades to
-/// collect + `afplay` (batch, same generation path).
+/// Drain `stream` into the first device of `ladder` that OPENS, through the
+/// native in-process sink — chunks play as they are synthesized (after a
+/// ~150 ms prebuffer so the queue never starts starved); the rodio mixer
+/// resamples 24 kHz mono to whatever the device runs natively. Every failure
+/// is LOUD: an unopenable device prints why and falls to the next candidate
+/// (on the `say` channel each name is re-asserted PRIVATE first — a ladder
+/// can only fall to another private device); a queue that stops draining
+/// mid-play errors instead of hanging forever. Prints the measured TTFA
+/// (call → playback start) and a completion line naming the device that
+/// ACTUALLY played and how much audio was written to it.
 #[cfg(feature = "voice")]
-fn stream_to_default_output(
+fn stream_to_device(
     stream: &mut mary::speak::SpeakStream,
     samples: &mut Vec<f32>,
     t_call: std::time::Instant,
-    device: &str,
+    channel: &str,
+    ladder: &[String],
     sr: u32,
 ) -> Result<()> {
-    use std::io::Write;
-    use std::process::Stdio;
+    use rodio::buffer::SamplesBuffer;
+    use std::num::NonZero;
 
-    let spawned = PCommand::new("ffplay")
-        .args(["-loglevel", "error", "-nodisp", "-autoexit", "-f", "s16le", "-ar"])
-        .arg(sr.to_string())
-        .args(["-ch_layout", "mono", "-i", "pipe:0"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match spawned {
-        Ok(mut child) => {
-            let mut stdin = child.stdin.take().context("ffplay stdin")?;
-            let mut first = true;
-            let mut broken = false;
-            for chunk in stream.by_ref() {
-                samples.extend_from_slice(&chunk);
-                if broken {
-                    continue; // keep draining for the log
-                }
-                let bytes: Vec<u8> = chunk
-                    .iter()
-                    .flat_map(|&s| (((s.clamp(-1.0, 1.0)) * 32767.0) as i16).to_le_bytes())
-                    .collect();
-                if stdin.write_all(&bytes).is_err() {
-                    broken = true;
-                    continue;
-                }
-                if first {
-                    println!(
-                        "  [stream] TTFA {:.2}s → {device}",
-                        t_call.elapsed().as_secs_f32()
-                    );
-                    first = false;
-                }
-            }
-            drop(stdin); // EOF ⇒ ffplay drains its buffer and -autoexit's
-            let status = child.wait().context("wait for ffplay")?;
-            if broken || !status.success() {
-                bail!("streaming playback (ffplay) failed");
-            }
-            Ok(())
+    // Walk the ladder: the first device that OPENS plays. Opening is the
+    // verification — absent/asleep/stream-rejecting devices error here and we
+    // say so before falling to the next (never a silent success).
+    let mut opened = None;
+    for name in ladder {
+        // Defense in depth: the say router only ladders private devices;
+        // re-assert the resolved NAME before any sound.
+        if channel == CHANNEL_SAY && classify(name) != DeviceClass::Private {
+            eprintln!(
+                "  [stream] refusing non-private device '{name}' on the say channel \
+                 (privacy invariant)"
+            );
+            continue;
         }
-        Err(_) => {
-            // No ffplay: batch over the same stream. (brew install ffmpeg
-            // enables streaming playback.)
-            for chunk in stream.by_ref() {
-                samples.extend_from_slice(&chunk);
+        match open_named_sink(name) {
+            Ok(sink) => {
+                opened = Some((sink, name.as_str()));
+                break;
             }
-            let tmp =
-                std::env::temp_dir().join(format!("liora_voice_batch_{}.wav", std::process::id()));
-            mary::models::f5::wav::write_pcm16_mono(&tmp, samples, sr);
-            println!("  [stream] ffplay not found — played whole utterance via afplay");
-            let r = afplay(&tmp);
-            let _ = std::fs::remove_file(&tmp);
-            r
+            Err(e) => eprintln!("  [stream] could not open '{name}': {e:#} — trying next device"),
         }
     }
+    let Some(((_device_sink, player), device)) = opened else {
+        bail!(
+            "no device in the routing ladder could be opened: {}",
+            ladder.join(" → ")
+        );
+    };
+
+    let mono = NonZero::new(1).expect("1 is nonzero");
+    let rate = NonZero::new(sr).context("PCM sample rate must be nonzero")?;
+
+    // Prebuffer ~150 ms before starting playback; after that, chunks play as
+    // they arrive from the model (starvation plays silence, then resumes).
+    let prebuffer = sr as usize * 150 / 1000;
+    player.pause();
+    let mut appended = 0usize;
+    let mut started = false;
+    for chunk in stream.by_ref() {
+        samples.extend_from_slice(&chunk);
+        appended += chunk.len();
+        player.append(SamplesBuffer::new(mono, rate, chunk));
+        if !started && appended >= prebuffer {
+            player.play();
+            started = true;
+            println!(
+                "  [stream] TTFA {:.2}s → {device}",
+                t_call.elapsed().as_secs_f32()
+            );
+        }
+    }
+    if appended == 0 {
+        // Zero chunks: nothing was ever audible. Say so (the stream's own
+        // error, if any, surfaces from `finish()` in the caller).
+        bail!("no audio chunks arrived to play on '{device}'");
+    }
+    if !started {
+        player.play(); // utterance shorter than the prebuffer
+        println!(
+            "  [stream] TTFA {:.2}s → {device}",
+            t_call.elapsed().as_secs_f32()
+        );
+    }
+
+    // Bounded drain: wait for the queue to empty, but never hang on a dead
+    // stream (a device dying mid-play stops consuming; sleeping forever would
+    // resurrect the silent-failure class).
+    let audio_secs = appended as f32 / sr as f32;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs_f32(audio_secs + 5.0);
+    while !player.empty() {
+        if std::time::Instant::now() > deadline {
+            bail!("playback stalled on '{device}' ({audio_secs:.1}s of audio never drained)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Let the device's own buffer (~50 ms) flush before the stream drops.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    println!("  [stream] played {audio_secs:.1}s on {device} ({appended} samples)");
+    Ok(())
 }
 
 #[cfg(not(feature = "voice"))]
 fn speak_and_play(
     _routed: &Routed,
     _daemon: &str,
-    _sw: Option<&Path>,
     _channel: &str,
     _text: &str,
     _out: &Path,
@@ -862,13 +827,12 @@ fn cmd_speak(
     dry_run: bool,
 ) -> Result<()> {
     let devices = detect_output_devices()?;
-    let sw = switch_audio_bin();
     let prefs = load_route(ws, channel)?;
 
     let routed = if channel == CHANNEL_SAY {
-        route_say(&prefs, &devices, sw.as_deref())
+        route_say(&prefs, &devices)
     } else {
-        route_shout(&prefs, &devices, sw.as_deref(), reachy_reachable(daemon))
+        route_shout(&prefs, &devices, reachy_reachable(daemon))
     };
 
     println!("[{channel}] → {}", routed.describe());
@@ -890,7 +854,7 @@ fn cmd_speak(
     // path is minted FRESH (unique name + O_EXCL) so a stale WAV left by a
     // dead run can never be logged under this utterance's text.
     let out = unique_voice_tmp()?;
-    match speak_and_play(&routed, daemon, sw.as_deref(), channel, text, &out) {
+    match speak_and_play(&routed, daemon, channel, text, &out) {
         // Synthesis failed mid-stream: no trustworthy audio, but the words
         // still happened — log them text-only with a failure marker so the
         // utterance survives on the pile, then surface the error.
@@ -915,6 +879,11 @@ fn cmd_speak(
             let log = log_utterance(repo, ws, channel, text, Some(&out), "voice spoke");
             let _ = std::fs::remove_file(&out);
             if let Spoken::PlaybackFailed(play_err) = outcome {
+                if channel == CHANNEL_SAY {
+                    // The whole private ladder failed to play: the words still
+                    // reach JP — on screen, never through a speaker.
+                    println!("{text}");
+                }
                 if let Err(log_err) = &log {
                     eprintln!("warning: could not log the utterance: {log_err:#}");
                 }
@@ -957,11 +926,9 @@ fn unique_voice_tmp() -> Result<PathBuf> {
 
 fn cmd_route(ws: &mut Workspace<Pile>, daemon: &str) -> Result<()> {
     let devices = detect_output_devices()?;
-    let sw = switch_audio_bin();
     let daemon_up = reachy_reachable(daemon);
 
-    println!("SwitchAudioSource: {}", if sw.is_some() { "present (per-device targeting)" } else { "ABSENT — degraded routing (see notes)" });
-    println!("Reachy daemon:     {}", if daemon_up { "reachable" } else { "down" });
+    println!("Reachy daemon: {}", if daemon_up { "reachable" } else { "down" });
     println!();
 
     println!("connected output devices:");
@@ -975,17 +942,11 @@ fn cmd_route(ws: &mut Workspace<Pile>, daemon: &str) -> Result<()> {
         let prefs = load_route(ws, channel)?;
         println!("{channel} policy (priority order): {}", prefs.join(" → "));
         let routed = if channel == CHANNEL_SAY {
-            route_say(&prefs, &devices, sw.as_deref())
+            route_say(&prefs, &devices)
         } else {
-            route_shout(&prefs, &devices, sw.as_deref(), daemon_up)
+            route_shout(&prefs, &devices, daemon_up)
         };
         println!("  would route to: {}", routed.describe());
-    }
-    if sw.is_none() {
-        println!();
-        println!("note: without SwitchAudioSource, `say` plays only when the DEFAULT");
-        println!("      output is itself a private device; otherwise it prints text.");
-        println!("      Install with: brew install switchaudio-osx");
     }
     Ok(())
 }
@@ -1056,4 +1017,150 @@ fn main() -> Result<()> {
         Some(Command::Devices) => cmd_devices()?,
     }
     Ok(())
+}
+
+// ── tests: device resolution + the privacy invariant (no audio is played) ──
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(name: &str, default: bool) -> AudioDevice {
+        AudioDevice {
+            name: name.to_string(),
+            is_default_output: default,
+        }
+    }
+
+    fn prefs(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn ladder(routed: Routed) -> Vec<String> {
+        match routed {
+            Routed::Devices(l) => l,
+            other => panic!("expected a device ladder, got: {}", other.describe()),
+        }
+    }
+
+    #[test]
+    fn classify_is_fail_closed() {
+        assert_eq!(classify("AirPods Max"), DeviceClass::Private);
+        assert_eq!(classify("Sony WH-1000XM5"), DeviceClass::Private);
+        assert_eq!(classify("Reachy Mini Audio"), DeviceClass::Reachy);
+        // Speaker markers beat brand hints: a Beats Pill is a room speaker.
+        assert_eq!(classify("Beats Pill"), DeviceClass::Speaker);
+        // Anything unrecognised is PUBLIC — never fail-open into Private.
+        assert_eq!(classify("Some Unknown Device"), DeviceClass::Speaker);
+        assert_eq!(classify("MacBook Pro Speakers"), DeviceClass::Speaker);
+    }
+
+    #[test]
+    fn say_ladders_all_private_matches_in_priority_order() {
+        let devices = [
+            dev("MacBook Pro Speakers", true),
+            dev("AirPods Max", false),
+            dev("AirPods Pro", false),
+        ];
+        // One pattern can ladder several devices (Max first: enumeration order).
+        let l = ladder(route_say(&prefs(&["AirPods"]), &devices));
+        assert_eq!(l, vec!["AirPods Max", "AirPods Pro"]);
+    }
+
+    #[test]
+    fn say_never_ladders_a_speaker_even_when_the_policy_lists_one() {
+        let devices = [
+            dev("MacBook Pro Speakers", true),
+            dev("AirPods Max", false),
+        ];
+        // A (mis)configured policy that puts a speaker FIRST cannot make it play:
+        // the ladder holds only the private device.
+        let l = ladder(route_say(
+            &prefs(&["MacBook Pro Speakers", "AirPods"]),
+            &devices,
+        ));
+        assert_eq!(l, vec!["AirPods Max"]);
+    }
+
+    #[test]
+    fn say_falls_to_text_when_no_private_device_connected() {
+        let devices = [
+            dev("MacBook Pro Speakers", true),
+            dev("Studio Display Speakers", false),
+            dev("Reachy Mini Audio", false),
+        ];
+        // Even a policy listing ONLY public devices yields TEXT, never sound.
+        assert!(matches!(
+            route_say(&prefs(&["MacBook", "Studio", "Reachy"]), &devices),
+            Routed::Text(_)
+        ));
+        assert!(matches!(
+            route_say(&prefs(&["AirPods"]), &devices),
+            Routed::Text(_)
+        ));
+    }
+
+    #[test]
+    fn shout_short_circuits_to_reachy_when_daemon_up() {
+        let devices = [
+            dev("MacBook Pro Speakers", true),
+            dev("Reachy Mini Audio", false),
+        ];
+        assert!(matches!(
+            route_shout(&prefs(&["Reachy", "MacBook"]), &devices, true),
+            Routed::Reachy
+        ));
+    }
+
+    #[test]
+    fn shout_skips_reachy_when_daemon_down_and_ladders_the_rest() {
+        let devices = [
+            dev("MacBook Pro Speakers", true),
+            dev("Reachy Mini Audio", false),
+            dev("Studio Display Speakers", false),
+        ];
+        let l = ladder(route_shout(
+            &prefs(&["Reachy", "Studio", "MacBook"]),
+            &devices,
+            false,
+        ));
+        assert_eq!(l, vec!["Studio Display Speakers", "MacBook Pro Speakers"]);
+    }
+
+    #[test]
+    fn shout_appends_default_output_as_last_resort() {
+        let devices = [
+            dev("MacBook Pro Speakers", true),
+            dev("Studio Display Speakers", false),
+        ];
+        // Policy matches nothing: fall to the default output alone.
+        let l = ladder(route_shout(&prefs(&["Reachy"]), &devices, false));
+        assert_eq!(l, vec!["MacBook Pro Speakers"]);
+        // Policy matches something: default output still appended as fallback.
+        let l = ladder(route_shout(&prefs(&["Studio"]), &devices, false));
+        assert_eq!(l, vec!["Studio Display Speakers", "MacBook Pro Speakers"]);
+    }
+
+    #[test]
+    fn shout_local_device_above_reachy_wins() {
+        let devices = [
+            dev("MacBook Pro Speakers", true),
+            dev("Reachy Mini Audio", false),
+        ];
+        // Reachy below a local match is not a streaming-sink candidate.
+        let l = ladder(route_shout(
+            &prefs(&["MacBook", "Reachy"]),
+            &devices,
+            true,
+        ));
+        assert_eq!(l, vec!["MacBook Pro Speakers"]);
+    }
+
+    #[test]
+    fn describe_names_the_ladder() {
+        let routed = Routed::Devices(vec!["AirPods Max".into(), "AirPods Pro".into()]);
+        assert_eq!(
+            routed.describe(),
+            "AirPods Max (native sink; fallbacks: AirPods Pro)"
+        );
+    }
 }
