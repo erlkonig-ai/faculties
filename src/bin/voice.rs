@@ -603,12 +603,16 @@ fn store_route(
 
 /// Record an utterance on the voice branch. The fact falls out of speaking —
 /// logging is a side effect of the act, not a separate obligation.
+/// `commit_msg` is the ledger line: "voice spoke" on the happy path, an
+/// explicit failure marker when there was no trustworthy audio to attach
+/// (synthesis died mid-stream) — the words never vanish from the pile.
 fn log_utterance(
     repo: &mut Repository<Pile>,
     ws: &mut Workspace<Pile>,
     channel: &str,
     text: &str,
     wav: Option<&Path>,
+    commit_msg: &str,
 ) -> Result<()> {
     let text_h: TextHandle = ws.put(text.to_string());
     let audio_h: Option<RawHandle> = match wav {
@@ -627,7 +631,7 @@ fn log_utterance(
         utterance::mime?: wav.map(|_| "audio/wav"),
     };
     let id = frag.root().expect("utterance id");
-    ws.commit(frag, "voice spoke");
+    ws.commit(frag, commit_msg);
     repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
     println!("  logged utterance {} [{channel}]", &fmt_id(id)[..12]);
     Ok(())
@@ -652,11 +656,27 @@ fn log_utterance(
 // Every sink also accumulates the full utterance, which `cmd_speak` logs on
 // the voice branch after completion — logging is unchanged.
 
+/// What `speak_and_play` accomplished. An `Err` from it means SYNTHESIS
+/// failed — `out` was NOT written and there is no trustworthy audio (the
+/// caller logs the words text-only, with a failure marker). `Ok` means the
+/// complete utterance was synthesized and written to `out`.
+// Without the `voice` feature the stub `speak_and_play` only ever bails, so
+// neither variant is constructed — the type still shapes `cmd_speak`'s match.
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+enum Spoken {
+    /// Synthesized, written to `out`, and played (or drained for the Reachy
+    /// upload) successfully.
+    Played,
+    /// The full utterance was synthesized and written to `out`, but playback
+    /// failed — the caller logs the audio, then surfaces this error.
+    PlaybackFailed(anyhow::Error),
+}
+
 /// Synthesize `text` (streaming) and play it through the resolved route,
 /// writing the COMPLETE utterance to `out` for the log. Never called for the
 /// `Routed::Text` fallback (the caller short-circuits it — no GPU work for a
-/// silent utterance). Returns after playback settles; a playback failure is
-/// an `Err` but `out` is still written (the caller logs, then surfaces it).
+/// silent utterance). Returns after playback settles; see [`Spoken`] for the
+/// synthesis-failure / playback-failure split.
 #[cfg(feature = "voice")]
 fn speak_and_play(
     routed: &Routed,
@@ -665,7 +685,7 @@ fn speak_and_play(
     channel: &str,
     text: &str,
     out: &Path,
-) -> Result<()> {
+) -> Result<Spoken> {
     let sr = mary::speak::SpeakStream::SAMPLE_RATE;
     let pile = std::env::var("QWEN3TTS_PILE").unwrap_or_else(|_| QWEN3TTS_PILE.to_string());
     let ref_text = std::fs::read_to_string(REF_TXT_PATH)
@@ -724,13 +744,20 @@ fn speak_and_play(
     for chunk in stream.by_ref() {
         samples.extend_from_slice(&chunk);
     }
-    stream.finish()?; // synthesis failure propagates: nothing trustworthy to log
+    // Synthesis failure = nothing trustworthy to attach as audio: `out` stays
+    // unwritten and the error propagates — the CALLER still logs the words
+    // (text + failure marker), so the utterance never vanishes from the pile.
+    stream.finish()?;
     mary::models::f5::wav::write_pcm16_mono(out, &samples, sr);
-    played?;
-    if matches!(routed, Routed::Reachy) {
-        play_on_reachy(daemon, out)?;
+    if let Err(e) = played {
+        return Ok(Spoken::PlaybackFailed(e));
     }
-    Ok(())
+    if matches!(routed, Routed::Reachy) {
+        if let Err(e) = play_on_reachy(daemon, out) {
+            return Ok(Spoken::PlaybackFailed(e));
+        }
+    }
+    Ok(Spoken::Played)
 }
 
 /// Drain `stream` into the current DEFAULT output via `ffplay` (raw s16le PCM
@@ -814,7 +841,7 @@ fn speak_and_play(
     _channel: &str,
     _text: &str,
     _out: &Path,
-) -> Result<()> {
+) -> Result<Spoken> {
     bail!(
         "voice was built without the `voice` feature — rebuild with \
          `cargo build --release --features voice --bin voice` (pulls mary's \
@@ -855,23 +882,77 @@ fn cmd_speak(
     if let Routed::Text(_) = routed {
         // Print the words (private, silent), log without audio.
         println!("{text}");
-        return log_utterance(repo, ws, channel, text, None);
+        return log_utterance(repo, ws, channel, text, None, "voice spoke");
     }
 
     // ONE generation path (streaming synthesis), sink chosen by the route —
-    // see the synthesis section. `out` receives the complete utterance.
-    let out = std::env::temp_dir().join(format!("liora_voice_{}.wav", std::process::id()));
-    let play = speak_and_play(&routed, daemon, sw.as_deref(), channel, text, &out);
-    if !out.exists() {
-        // Synthesis itself failed — nothing to log, surface the error.
-        return play;
+    // see the synthesis section. `out` receives the complete utterance; the
+    // path is minted FRESH (unique name + O_EXCL) so a stale WAV left by a
+    // dead run can never be logged under this utterance's text.
+    let out = unique_voice_tmp()?;
+    match speak_and_play(&routed, daemon, sw.as_deref(), channel, text, &out) {
+        // Synthesis failed mid-stream: no trustworthy audio, but the words
+        // still happened — log them text-only with a failure marker so the
+        // utterance survives on the pile, then surface the error.
+        Err(synth_err) => {
+            let _ = std::fs::remove_file(&out);
+            eprintln!("synthesis failed — logging the utterance text-only: {synth_err:#}");
+            if let Err(log_err) = log_utterance(
+                repo,
+                ws,
+                channel,
+                text,
+                None,
+                "voice spoke (synthesis FAILED mid-stream; text-only, no audio)",
+            ) {
+                eprintln!("warning: could not log the failed utterance: {log_err:#}");
+            }
+            Err(synth_err)
+        }
+        Ok(outcome) => {
+            // Log the utterance with its audio regardless of a playback
+            // hiccup, so the fact survives; surface a playback error after.
+            let log = log_utterance(repo, ws, channel, text, Some(&out), "voice spoke");
+            let _ = std::fs::remove_file(&out);
+            if let Spoken::PlaybackFailed(play_err) = outcome {
+                if let Err(log_err) = &log {
+                    eprintln!("warning: could not log the utterance: {log_err:#}");
+                }
+                return Err(play_err);
+            }
+            log
+        }
     }
-    // Log the utterance with its audio regardless of a playback hiccup, so the
-    // fact survives; surface a playback error after.
-    let log = log_utterance(repo, ws, channel, text, Some(&out));
-    let _ = std::fs::remove_file(&out);
-    play?;
-    log
+}
+
+/// Mint a FRESH, uniquely named temp WAV path (mkstemp-style: `create_new`
+/// O_EXCL + a random component). The pid-named scheme this replaces could
+/// collide with a STALE file from a dead run (pids recycle) and, combined
+/// with an existence check, log a previous run's audio under new text. A
+/// name nothing else can hold makes "the WAV exists" mean "written by THIS
+/// run" structurally.
+fn unique_voice_tmp() -> Result<PathBuf> {
+    use rand_core::RngCore;
+    for _ in 0..16 {
+        let mut r = [0u8; 8];
+        OsRng.fill_bytes(&mut r);
+        let path = std::env::temp_dir().join(format!(
+            "liora_voice_{}_{:016x}.wav",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("create temp wav {}", path.display()));
+            }
+        }
+    }
+    bail!(
+        "could not mint a unique temp wav in {}",
+        std::env::temp_dir().display()
+    );
 }
 
 fn cmd_route(ws: &mut Workspace<Pile>, daemon: &str) -> Result<()> {
