@@ -830,6 +830,20 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
+    // A help flag must never be minted as memory content — print usage and stop
+    // before any parsing, so `memory create --help` explains itself instead of
+    // storing the literal "--help" as a chunk.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "usage: memory create [--lens <theme>] [<from>..<to>] <summary...>\n\
+             \n\
+             Create a memory chunk and store it in the pile.\n\
+             An optional time range as the first argument grounds the memory in\n\
+             that period; without it, defaults to now. --lens <theme> files the\n\
+             chunk as a thematic memory kept out of the chronological spine."
+        );
+        return Ok(());
+    }
     if args.is_empty() {
         bail!(
             "usage: memory create [<from>..<to>] <summary...>\n\
