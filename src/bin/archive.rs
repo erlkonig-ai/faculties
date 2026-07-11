@@ -8,12 +8,17 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use hifitime::Epoch;
+use itertools::Itertools;
 use tracing::info_span;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
-use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-use triblespace::core::repo::index_home::IndexHome;
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::core::repo::index_home::{
+    clear_manifest, set_coverage, IndexHome, IndexKind, Manifest, SuccinctRollup,
+};
+use triblespace::core::repo::{
+    ancestors, commits_topological, difference, CommitSelector, PushResult,
+};
+use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 use triblespace_search::index_bm25::{query_across, Bm25Rollup};
@@ -36,21 +41,28 @@ mod common {
 
     use std::path::{Path, PathBuf};
 
-    use anyhow::{Context, Result, anyhow};
+    use anyhow::{Context, Result, anyhow, bail};
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
+    use itertools::Itertools;
     use rand_core::OsRng;
     use rayon::ThreadPoolBuilder;
     use rayon::prelude::*;
     
     use tracing::info_span;
+    use triblespace::core::blob::Blob;
     use triblespace::core::id::ExclusiveId;
     pub use triblespace::core::metadata;
+    use triblespace::core::repo::index_home::{
+        append_segment, set_coverage, IndexKind, Manifest, SuccinctRollup,
+    };
     use triblespace::core::repo::pile::Pile;
+    use triblespace::core::repo::CommitBatch;
     use triblespace::core::repo::{Repository, Workspace};
     use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
     use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
     use triblespace::prelude::*;
+    use triblespace_search::index_bm25::Bm25Rollup;
 
     pub use faculties::schemas::archive::{self as archive_schema, archive, import_schema};
     pub use faculties::schemas::memory::comb;
@@ -58,6 +70,30 @@ mod common {
     pub type Repo = Repository<Pile>;
     pub type Ws = Workspace<Pile>;
     pub type CommitHandle = Inline<Handle<SimpleArchive>>;
+
+    /// Bound the transient six-PATCH view used while freezing one physical
+    /// SuccinctArchive leaf. A larger source commit is still one *logical*
+    /// commit leaf; all of its physical shards land atomically before its
+    /// coverage certificate advances.
+    const INDEX_PHYSICAL_LEAF_TRIBLES: usize = 1 << 16;
+
+    pub(super) fn validate_physical_leaf_boundaries(bytes: &[u8]) -> Result<()> {
+        debug_assert_eq!(bytes.len() % 64, 0);
+        let trible_count = bytes.len() / 64;
+        for boundary in
+            (INDEX_PHYSICAL_LEAF_TRIBLES..trible_count).step_by(INDEX_PHYSICAL_LEAF_TRIBLES)
+        {
+            let previous = &bytes[(boundary - 1) * 64..boundary * 64];
+            let next = &bytes[boundary * 64..(boundary + 1) * 64];
+            if previous == next {
+                bail!("redundant trible across physical shard boundary {boundary}");
+            }
+            if previous > next {
+                bail!("noncanonical ordering across physical shard boundary {boundary}");
+            }
+        }
+        Ok(())
+    }
 
     fn acquire_or_force(id: Id) -> ExclusiveId {
         id.acquire().unwrap_or_else(|| ExclusiveId::force(id))
@@ -117,7 +153,126 @@ mod common {
         branch_id: Id,
         _branch_name: &str,
     ) -> Result<(Repo, Id)> {
-        Ok((open_repo(pile_path)?, branch_id))
+        let mut repo = open_repo(pile_path)?;
+        install_archive_index_hook(&mut repo, branch_id);
+        Ok((repo, branch_id))
+    }
+
+    fn install_archive_index_hook(repo: &mut Repo, archive_branch: Id) {
+        repo.on_commit(move |storage, pushed_branch, batch, head_meta| {
+            if pushed_branch != archive_branch {
+                return Ok(());
+            }
+            index_archive_batch(storage, batch, head_meta).map_err(|err| {
+                Box::new(std::io::Error::other(format!("{err:#}")))
+                    as Box<dyn std::error::Error + Send + Sync>
+            })
+        });
+    }
+
+    fn index_archive_batch(
+        storage: &mut Pile,
+        batch: &CommitBatch,
+        head_meta: &mut TribleSet,
+    ) -> Result<()> {
+        let succinct = SuccinctRollup::new();
+        let content_attr = archive::content.id();
+        let bm25_reader = storage
+            .reader()
+            .map_err(|err| anyhow!("open BM25 content reader: {err:?}"))?;
+        let bm25 = Bm25Rollup::new(bm25_reader, content_attr);
+
+        for kind in [succinct.kind_id(), bm25.kind_id()] {
+            let manifest = Manifest::from_tribles(head_meta, kind);
+            if !manifest.covers_head(batch.base_head) {
+                return Err(anyhow!(
+                    "archive index {kind:x} is stale at {:?}, expected base {:?}; run `archive index`",
+                    manifest.covered,
+                    batch.base_head
+                ));
+            }
+        }
+
+        for commit in &batch.commits {
+            index_archive_commit(storage, *commit, &succinct, &bm25, head_meta)?;
+        }
+
+        // Both recipes live in one hook scratch set, so these certificates
+        // and both manifests either land together in the branch CAS or not at
+        // all. Contentless merge commits still advance the certificates.
+        set_coverage(head_meta, succinct.kind_id(), vec![batch.new_head]);
+        set_coverage(head_meta, bm25.kind_id(), vec![batch.new_head]);
+        Ok(())
+    }
+
+    pub(super) fn index_archive_commit<R>(
+        storage: &mut Pile,
+        commit: CommitHandle,
+        succinct: &SuccinctRollup,
+        bm25: &Bm25Rollup<R>,
+        head_meta: &mut TribleSet,
+    ) -> Result<()>
+    where
+        R: triblespace::core::repo::BlobStoreGet,
+    {
+        let reader = storage
+            .reader()
+            .map_err(|err| anyhow!("open commit reader: {err:?}"))?;
+        let commit_meta: TribleSet = reader
+            .get(commit)
+            .map_err(|err| anyhow!("load commit {commit:?}: {err:?}"))?;
+        let content_handle = find!(
+            (content_handle: Inline<Handle<SimpleArchive>>),
+            pattern!(&commit_meta, [{ triblespace::core::repo::content: ?content_handle }])
+        )
+        .at_most_one()
+        .map_err(|_| anyhow!("commit {commit:?} has ambiguous content"))?
+        .map(|(handle,)| handle);
+        let Some(content_handle) = content_handle else {
+            return Ok(());
+        };
+        let source: Blob<SimpleArchive> = reader
+            .get(content_handle)
+            .map_err(|err| anyhow!("load content of commit {commit:?}: {err:?}"))?;
+        if source.bytes.len() % 64 != 0 {
+            return Err(anyhow!(
+                "commit {commit:?} has malformed SimpleArchive length"
+            ));
+        }
+
+        validate_physical_leaf_boundaries(&source.bytes)
+            .with_context(|| format!("commit {commit:?} has malformed SimpleArchive"))?;
+        let trible_count = source.bytes.len() / 64;
+        for start in (0..trible_count).step_by(INDEX_PHYSICAL_LEAF_TRIBLES) {
+            let end = (start + INDEX_PHYSICAL_LEAF_TRIBLES).min(trible_count);
+            let bytes = source.bytes.slice(start * 64..end * 64);
+            let chunk: TribleSet = Blob::<SimpleArchive>::new(bytes)
+                .try_from_blob()
+                .map_err(|err| anyhow!("decode commit {commit:?} shard: {err}"))?;
+
+            append_segment(storage, succinct, &chunk, head_meta)
+                .map_err(|err| anyhow!("append Succinct leaf for {commit:?}: {err}"))?;
+
+            let mut content = TribleSet::new();
+            for trible in chunk
+                .iter()
+                .filter(|trible| *trible.a() == archive::content.id())
+            {
+                let handle = *trible.v::<Handle<LongString>>();
+                let _: View<str> = reader.get(handle).map_err(|err| {
+                    anyhow!(
+                        "archive content {:?} in commit {commit:?} is unreadable: {err:?}",
+                        handle.raw
+                    )
+                })?;
+                content.insert(trible);
+            }
+            if !content.is_empty() {
+                append_segment(storage, bm25, &content, head_meta)
+                    .map_err(|err| anyhow!("append BM25 leaf for {commit:?}: {err}"))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn open_repo_for_read(
@@ -207,6 +362,12 @@ mod common {
                 .merge(ws)
                 .map_err(|e| anyhow!("merge workspace: {e:?}"))?;
             *ws = conflict;
+        }
+        for failure in repo.take_hook_errors() {
+            eprintln!(
+                "warning: archive commit landed but derived indexes remain stale on branch {:x}: {}",
+                failure.branch, failure.error
+            );
         }
         Ok(())
     }
@@ -353,6 +514,36 @@ mod common {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod index_leaf_tests {
+    use super::common::validate_physical_leaf_boundaries;
+
+    const LEAF_TRIBLES: usize = 1 << 16;
+
+    #[test]
+    fn physical_leaf_boundaries_preserve_global_canonical_order() {
+        let mut bytes = vec![0u8; (LEAF_TRIBLES + 1) * 64];
+        let previous = (LEAF_TRIBLES - 1) * 64;
+        let next = LEAF_TRIBLES * 64;
+
+        bytes[previous] = 1;
+        bytes[next] = 2;
+        validate_physical_leaf_boundaries(&bytes).unwrap();
+
+        bytes[next] = 1;
+        assert!(validate_physical_leaf_boundaries(&bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("redundant"));
+
+        bytes[next] = 0;
+        assert!(validate_physical_leaf_boundaries(&bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("noncanonical"));
     }
 }
 
@@ -1343,17 +1534,16 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-/// Resolve one author's display name from a content rollup (no
-/// checkout — a pattern query over the attached `SuccinctArchive` plus
-/// one blob get for the name string).
-fn author_name_from_rollup(
+/// Resolve one author's display name from a checkout-free trible index plus
+/// one blob get for the name string.
+fn author_name_from_index<P: TriblePattern>(
     ws: &mut common::Ws,
-    rollup: &SuccinctArchive<OrderedUniverse>,
+    index: &P,
     author_id: Id,
 ) -> Result<String> {
     let Some((handle,)) = find!(
         (handle: Inline<Handle<LongString>>),
-        pattern!(rollup, [{ author_id @ common::archive::author_name: ?handle }])
+        pattern!(index, [{ author_id @ common::archive::author_name: ?handle }])
     )
     .next() else {
         return Ok("<unknown>".to_string());
@@ -1361,15 +1551,15 @@ fn author_name_from_rollup(
     load_longstring(ws, handle)
 }
 
-/// Resolve one author's role from a content rollup, if present.
-fn author_role_from_rollup(
+/// Resolve one author's role from a checkout-free trible index, if present.
+fn author_role_from_index<P: TriblePattern>(
     ws: &mut common::Ws,
-    rollup: &SuccinctArchive<OrderedUniverse>,
+    index: &P,
     author_id: Id,
 ) -> Result<Option<String>> {
     let Some((handle,)) = find!(
         (handle: Inline<Handle<LongString>>),
-        pattern!(rollup, [{ author_id @ common::archive::author_role: ?handle }])
+        pattern!(index, [{ author_id @ common::archive::author_role: ?handle }])
     )
     .next() else {
         return Ok(None);
@@ -1380,12 +1570,11 @@ fn author_role_from_rollup(
 /// Search is dispatched standalone so the fast BM25 path never pays the
 /// full-branch `ws.checkout(..)` the other read commands do.
 ///
-/// Fast path (default / BM25): attach the branch-head BM25 index-home
-/// segments and rank via [`query_across`], then resolve each hit's
-/// author / content / timestamp by pattern-querying the branch's
-/// content rollup (a single `SuccinctArchive` blob, attached zero-copy)
-/// and one blob get per field — **no checkout materialises the branch**.
-/// Falls back to a clear error when the pile carries no segments yet.
+/// Fast path (default / BM25): attach the branch-head BM25 and Succinct
+/// index-home segments, require both coverage certificates to equal the source
+/// HEAD, rank via [`query_across`], then resolve each hit through the
+/// cross-segment Succinct union. No checkout or monolithic content rollup is
+/// involved.
 ///
 /// `--exact` / `--case_sensitive` keep the substring scan, which is
 /// inherently a full-content pass and still checks out the branch.
@@ -1404,9 +1593,32 @@ fn run_search_standalone(
             return exact_scan(&mut repo, branch_id, &text, limit, case_sensitive);
         }
 
-        // 1. Attach the BM25 segments named by the branch-head manifest.
-        //    (No checkout — one manifest read + a bounded number of
-        //    segment blob fetches.)
+        // Read the mutable branch pin exactly once. The source HEAD and both
+        // manifests below are therefore one consistent snapshot; attaching a
+        // manifest never races by rereading the pin.
+        let branch_meta_handle = repo
+            .storage_mut()
+            .head(branch_id)
+            .map_err(|e| anyhow!("read archive branch head: {e:?}"))?
+            .ok_or_else(|| anyhow!("archive branch is missing"))?;
+        let branch_reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow!("open branch metadata reader: {e:?}"))?;
+        let branch_meta: TribleSet = branch_reader
+            .get(branch_meta_handle)
+            .map_err(|e| anyhow!("load archive branch metadata: {e:?}"))?;
+        let source_head = find!(
+            (head: Inline<Handle<SimpleArchive>>),
+            pattern!(&branch_meta, [{ _?branch @ triblespace::core::repo::head: ?head }])
+        )
+        .at_most_one()
+        .map_err(|_| anyhow!("archive branch metadata has ambiguous source HEADs"))?
+        .map(|(head,)| head);
+
+        // Parse and validate both coverage certificates before touching any
+        // segment blob. A stale manifest may contain obsolete or missing
+        // handles; the useful diagnostic is the uncovered source gap.
         let content_attr = common::archive::content.id();
         let index_attach_start = Instant::now();
         let reader = repo
@@ -1414,9 +1626,40 @@ fn run_search_standalone(
             .reader()
             .map_err(|e| anyhow!("open pile reader: {e:?}"))?;
         let kind = Bm25Rollup::new(reader, content_attr);
+        let bm25_kind = kind.kind_id();
+        let bm25_manifest = Manifest::from_tribles(&branch_meta, bm25_kind);
+        if !bm25_manifest.covers_head(source_head) {
+            bail!(
+                "BM25 index {bm25_kind:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
+                bm25_manifest.covered,
+                source_head
+            );
+        }
+
+        let succinct_kind = SuccinctRollup::new();
+        let succinct_manifest = Manifest::from_tribles(&branch_meta, succinct_kind.kind_id());
+        if !succinct_manifest.covers_head(source_head) {
+            bail!(
+                "Succinct index {} is stale at {:?}, source HEAD is {:?}; run `archive index`",
+                SuccinctRollup::KIND_ID_HEX,
+                succinct_manifest.covered,
+                source_head
+            );
+        }
+        if bm25_manifest.segments.is_empty() {
+            bail!(
+                "no BM25 search segments on this pile yet — run `archive index` \
+                 first, or use --exact for a substring scan"
+            );
+        }
+        if succinct_manifest.segments.is_empty() {
+            bail!("no Succinct archive segments on this pile yet — run `archive index`");
+        }
+
+        // 1. Attach only the BM25 handles from the validated snapshot.
         let segments = {
             let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
-            home.attach_all()
+            home.attach_manifest(&bm25_manifest)
                 .map_err(|e| anyhow!("attach BM25 segments: {e}"))?
         };
         tracing::info!(
@@ -1424,12 +1667,6 @@ fn run_search_standalone(
             elapsed_ms = index_attach_start.elapsed().as_millis() as u64,
             "BM25 manifest and segments attached"
         );
-        if segments.is_empty() {
-            bail!(
-                "no BM25 search segments on this pile yet — run `archive index` \
-                 first, or use --exact for a substring scan"
-            );
-        }
 
         // 2. Rank across the segment union (per-segment BM25; best score wins).
         let bm25_start = Instant::now();
@@ -1443,28 +1680,6 @@ fn run_search_standalone(
         );
         drop(segments);
 
-        // 3. Resolve the current content-rollup handle before accepting an
-        //    empty result. A new archive commit invalidates this handle, so
-        //    its absence is the cheap stale-index guard. Loading/validating
-        //    the large blob itself is deferred until a hit needs display.
-        let rollup_start = Instant::now();
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let Some(rollup_handle) = ws
-            .rollup()
-            .map_err(|e| anyhow!("read branch rollup: {e:?}"))?
-        else {
-            bail!(
-                "no content rollup on this pile — run `archive index` to build \
-                 the checkout-free content index"
-            );
-        };
-        tracing::info!(
-            elapsed_ms = rollup_start.elapsed().as_millis() as u64,
-            "content rollup handle resolved"
-        );
-
         if limit == 0 || ranked.is_empty() {
             tracing::info!(
                 materialized = 0,
@@ -1474,16 +1689,22 @@ fn run_search_standalone(
             return Ok(());
         }
 
-        // Resolve each hit's fields via the content rollup — the
-        // checkout-free replacement for materialising the branch.
-        let rollup_load_start = Instant::now();
-        let rollup: SuccinctArchive<OrderedUniverse> = ws
-            .get(rollup_handle)
-            .map_err(|e| anyhow!("load content rollup: {e:?}"))?;
+        // 3. Only a query with results to materialise needs the Succinct LSM.
+        let succinct_attach_start = Instant::now();
+        let succinct_segments = {
+            let mut home = IndexHome::new(repo.storage_mut(), branch_id, succinct_kind);
+            home.attach_manifest(&succinct_manifest)
+                .map_err(|e| anyhow!("attach Succinct segments: {e}"))?
+        };
         tracing::info!(
-            elapsed_ms = rollup_load_start.elapsed().as_millis() as u64,
-            "content rollup attached"
+            segments = succinct_segments.len(),
+            elapsed_ms = succinct_attach_start.elapsed().as_millis() as u64,
+            "Succinct manifest and segments attached"
         );
+        let succinct = SuccinctRollup::union(&succinct_segments);
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace for blob reads: {e:?}"))?;
 
         let materialize_start = Instant::now();
         let mut materialized = 0usize;
@@ -1497,7 +1718,7 @@ fn run_search_standalone(
                     content: Inline<Handle<LongString>>,
                     created_at: Inline<NsTAIInterval>
                 ),
-                pattern!(&rollup, [{
+                pattern!(&succinct, [{
                     message_id @
                         common::archive::author: ?author,
                         common::archive::content: ?content,
@@ -1508,8 +1729,8 @@ fn run_search_standalone(
                 continue;
             };
             let content = load_longstring(&mut ws, content_handle)?;
-            let name = author_name_from_rollup(&mut ws, &rollup, author_id)?;
-            let role = author_role_from_rollup(&mut ws, &rollup, author_id)?;
+            let name = author_name_from_index(&mut ws, &succinct, author_id)?;
+            let role = author_role_from_index(&mut ws, &succinct, author_id)?;
             let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
             let role = role.as_deref().unwrap_or("");
             println!(
@@ -1616,69 +1837,212 @@ fn exact_scan(
     Ok(())
 }
 
-/// `archive index`, dispatched standalone. Refreshes two derived
-/// indexes on the archive branch, both maintained off the branch head
-/// rather than committed into history:
-///
-/// 1. The **content rollup** ([`Repository::compute_rollup`]) — a
-///    monolithic `SuccinctArchive` the search fast path queries to
-///    resolve matched messages without a checkout. Rebuild-and-replace
-///    (it resets the branch-head derived state).
-/// 2. The **BM25 index** as index-home LSMT segments
-///    ([`Bm25Rollup`] via [`IndexHome::update_index`]) instead of the
-///    old rebuild-and-replace-whole-index committed entity. The rollup
-///    is refreshed first (it rewrites the branch metadata, dropping any
-///    prior manifest), then a fresh BM25 segment is appended over the
-///    current messages, so repeated runs don't accumulate orphans.
+fn remove_legacy_rollup(set: &mut TribleSet) -> bool {
+    let mut old = TribleSet::new();
+    for trible in set
+        .iter()
+        .filter(|trible| *trible.a() == triblespace::core::repo::rollup.id())
+    {
+        old.insert(trible);
+    }
+    if old.is_empty() {
+        return false;
+    }
+    *set = set.difference(&old);
+    true
+}
+
+fn advance_coverage_frontier(
+    ws: &mut common::Ws,
+    frontier: &mut Vec<common::CommitHandle>,
+    commit: common::CommitHandle,
+) -> Result<()> {
+    let meta: TribleSet = ws
+        .get(commit)
+        .map_err(|err| anyhow!("load commit metadata {commit:?}: {err:?}"))?;
+    let parents: HashSet<[u8; 32]> = find!(
+        (parent: Inline<Handle<SimpleArchive>>),
+        pattern!(&meta, [{ triblespace::core::repo::parent: ?parent }])
+    )
+    .map(|(parent,)| parent.raw)
+    .collect();
+    frontier.retain(|tip| !parents.contains(&tip.raw));
+    frontier.push(commit);
+    frontier.sort_unstable_by_key(|tip| tip.raw);
+    frontier.dedup_by_key(|tip| tip.raw);
+    Ok(())
+}
+
+/// Build or repair the archive's two derived indexes by replaying source
+/// commits, never by checking out their union. Every source commit is one
+/// logical LSM leaf; large commit payloads are physically sharded under one
+/// atomic coverage advance. The frontier is checkpointed after each commit,
+/// making interruption and rerun idempotent.
 fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> Result<()> {
     let (mut repo, branch_id) = common::open_repo_for_write(pile_path, branch_id, branch_name)?;
     let res = (|| -> Result<()> {
-        // 1. Content rollup for checkout-free query-time resolution.
-        eprintln!("building content rollup (SuccinctArchive over the branch)…");
-        repo.compute_rollup(branch_id)
-            .map_err(|e| anyhow!("compute content rollup: {e:?}"))?;
-
-        // 2. Collect the message-content tribles to index (the rollup
-        //    just reset the branch-head derived state, so this builds a
-        //    single fresh BM25 segment).
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let catalog = ws.checkout(..).context("checkout workspace")?;
-        let mut delta = TribleSet::new();
-        let mut count = 0usize;
-        for (message_id, content_handle) in find!(
-            (message: Id, content: Inline<Handle<LongString>>),
-            pattern!(&catalog, [{
-                ?message @
-                    common::metadata::tag: common::archive::kind_message,
-                    common::archive::content: ?content,
-            }])
-        ) {
-            let entity = message_id.acquire().unwrap_or_else(|| {
-                triblespace::core::id::ExclusiveId::force(message_id)
-            });
-            delta += entity! { &entity @ common::archive::content: content_handle };
-            count += 1;
-            if count % 100_000 == 0 {
-                eprintln!("  …{count} messages collected");
-            }
-        }
-        drop(catalog);
-        drop(ws);
+        let target_head = ws
+            .head()
+            .ok_or_else(|| anyhow!("archive branch has no commits to index"))?;
 
-        eprintln!("building BM25 segment over {count} message(s)…");
-        let reader = repo
+        let mut branch_meta_handle = repo
+            .storage_mut()
+            .head(branch_id)
+            .map_err(|err| anyhow!("read archive branch head: {err:?}"))?
+            .ok_or_else(|| anyhow!("archive branch is missing"))?;
+        let branch_reader = repo
             .storage_mut()
             .reader()
-            .map_err(|e| anyhow!("open pile reader: {e:?}"))?;
-        let kind = Bm25Rollup::new(reader, common::archive::content.id());
-        {
-            let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
-            home.update_index(&delta)
-                .map_err(|e| anyhow!("append BM25 segment: {e}"))?;
+            .map_err(|err| anyhow!("open branch reader: {err:?}"))?;
+        let mut branch_meta: TribleSet = branch_reader
+            .get(branch_meta_handle)
+            .map_err(|err| anyhow!("load archive branch metadata: {err:?}"))?;
+
+        let succinct = SuccinctRollup::new();
+        let bm25_reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|err| anyhow!("open BM25 reader: {err:?}"))?;
+        let bm25 = Bm25Rollup::new(bm25_reader, common::archive::content.id());
+        let succinct_manifest = Manifest::from_tribles(&branch_meta, succinct.kind_id());
+        let bm25_manifest = Manifest::from_tribles(&branch_meta, bm25.kind_id());
+
+        let reachable = ancestors(target_head)
+            .select(&mut ws)
+            .context("walk archive commit DAG")?;
+        let same_frontier = succinct_manifest.covered == bm25_manifest.covered;
+        let frontier_is_reachable = succinct_manifest
+            .covered
+            .iter()
+            .all(|tip| reachable.get(&tip.raw).is_some());
+        // A pre-coverage manifest may already contain whole-corpus or
+        // repeatedly appended legacy segments. Empty coverage cannot certify
+        // those segments, so replaying on top would duplicate the corpus and
+        // then falsely bless it as current. Only a genuinely empty forest may
+        // bootstrap from an empty frontier.
+        let has_uncertified_segments = succinct_manifest.covered.is_empty()
+            && (!succinct_manifest.segments.is_empty() || !bm25_manifest.segments.is_empty());
+        let candidate_resume = same_frontier && frontier_is_reachable && !has_uncertified_segments;
+        let manifests_readable = if candidate_resume {
+            let succinct_result = {
+                let mut home = IndexHome::new(repo.storage_mut(), branch_id, succinct);
+                home.attach_manifest(&succinct_manifest)
+            };
+            let bm25_result = {
+                let mut home = IndexHome::new(repo.storage_mut(), branch_id, bm25.clone());
+                home.attach_manifest(&bm25_manifest)
+            };
+            match (succinct_result, bm25_result) {
+                (Ok(_), Ok(_)) => true,
+                (succinct_result, bm25_result) => {
+                    eprintln!(
+                        "discarding unreadable archive index manifests (Succinct: {}; BM25: {})",
+                        succinct_result
+                            .err()
+                            .map_or_else(|| "ok".to_owned(), |err| err.to_string()),
+                        bm25_result
+                            .err()
+                            .map_or_else(|| "ok".to_owned(), |err| err.to_string()),
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        let resume = candidate_resume && manifests_readable;
+
+        let mut frontier = if resume {
+            succinct_manifest.covered.clone()
+        } else {
+            clear_manifest(&mut branch_meta, succinct.kind_id());
+            clear_manifest(&mut branch_meta, bm25.kind_id());
+            Vec::new()
+        };
+        let removed_legacy = remove_legacy_rollup(&mut branch_meta);
+
+        let commits = if frontier.as_slice() == [target_head] {
+            Vec::new()
+        } else if frontier.is_empty() {
+            commits_topological(&mut ws, reachable.clone()).context("order archive commits")?
+        } else {
+            commits_topological(
+                &mut ws,
+                difference(reachable.clone(), ancestors(frontier.clone())),
+            )
+            .context("order uncovered archive commits")?
+        };
+
+        if commits.is_empty() && !removed_legacy && resume {
+            println!("archive indexes already cover HEAD ({target_head:?})");
+            return Ok(());
         }
-        println!("indexed {count} message(s); content rollup refreshed");
+
+        eprintln!(
+            "indexing {} uncovered commit(s) as logical LSM leaves…",
+            commits.len()
+        );
+        for (i, commit) in commits.iter().copied().enumerate() {
+            common::index_archive_commit(
+                repo.storage_mut(),
+                commit,
+                &succinct,
+                &bm25,
+                &mut branch_meta,
+            )?;
+            advance_coverage_frontier(&mut ws, &mut frontier, commit)?;
+            set_coverage(&mut branch_meta, succinct.kind_id(), frontier.clone());
+            set_coverage(&mut branch_meta, bm25.kind_id(), frontier.clone());
+
+            let new_meta: Inline<Handle<SimpleArchive>> = repo
+                .storage_mut()
+                .put(branch_meta.clone())
+                .map_err(|err| anyhow!("store index checkpoint: {err:?}"))?;
+            match repo
+                .storage_mut()
+                .update(branch_id, Some(branch_meta_handle), Some(new_meta))
+                .map_err(|err| anyhow!("publish index checkpoint: {err:?}"))?
+            {
+                PushResult::Success() => branch_meta_handle = new_meta,
+                PushResult::Conflict(_) => {
+                    bail!("archive branch changed during indexing; rerun to resume from coverage")
+                }
+            }
+            if (i + 1) % 100 == 0 || i + 1 == commits.len() {
+                eprintln!("  …{}/{} commits indexed", i + 1, commits.len());
+            }
+        }
+
+        // A migration that only removed the legacy monolith still needs one
+        // metadata CAS even when coverage was already current.
+        if commits.is_empty() && removed_legacy {
+            let new_meta: Inline<Handle<SimpleArchive>> = repo
+                .storage_mut()
+                .put(branch_meta.clone())
+                .map_err(|err| anyhow!("store migrated index metadata: {err:?}"))?;
+            match repo
+                .storage_mut()
+                .update(branch_id, Some(branch_meta_handle), Some(new_meta))
+                .map_err(|err| anyhow!("publish migrated index metadata: {err:?}"))?
+            {
+                PushResult::Success() => {}
+                PushResult::Conflict(_) => {
+                    bail!("archive branch changed during index migration; rerun")
+                }
+            }
+        }
+
+        if frontier.as_slice() != [target_head] {
+            bail!(
+                "index traversal ended at frontier {:?}, expected {:?}",
+                frontier,
+                target_head
+            );
+        }
+        println!("archive Succinct and BM25 indexes now cover HEAD");
         Ok(())
     })();
 
