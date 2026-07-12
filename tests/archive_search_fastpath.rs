@@ -3,18 +3,21 @@
 //! Builds a fresh temporary pile with a handful of synthetic archive
 //! messages, then drives the REAL `archive` binary:
 //!
-//! 1. `archive list` and `archive search` before `archive index` error rather
+//! 1. `archive list`, `archive show`, and `archive search` before `archive index` error rather
 //!    than checking out the raw archive.
 //! 2. `archive index` replays source commits into Succinct + BM25 LSM leaves.
 //! 3. `archive list --limit N` returns the newest N messages from the
 //!    Succinct union by k-way merging reverse `created_at` AVE cursors, with
 //!    bounded selection work and no source checkout.
-//! 4. `archive search <term>` returns exactly the messages whose content
+//! 4. `archive show <id>` resolves full and prefix IDs through the Succinct
+//!    union, materializes only the selected message graph, and preserves the
+//!    established output ordering.
+//! 5. `archive search <term>` returns exactly the messages whose content
 //!    contains `<term>`, BM25-ranked, with each hit's author + content
 //!    snippet resolved through the cross-segment Succinct union and per-hit
 //!    blob gets, with NO full `ws.checkout(..)` of the branch on the query
 //!    path.
-//! 5. Standalone and repeated Unicode symbols are regular indexed terms,
+//! 6. Standalone and repeated Unicode symbols are regular indexed terms,
 //!    not an accidental request for the archive-scale exact scan.
 //!
 //! The exact ranking equivalence to the old monolithic index is proven
@@ -75,6 +78,38 @@ fn run_archive(pile: &PathBuf, args: &[&str]) -> std::process::Output {
         .expect("run archive binary")
 }
 
+fn unique_prefix(target: Id, candidates: &[Id]) -> String {
+    let full = format!("{target:x}");
+    (1..32)
+        .map(|len| full[..len].to_owned())
+        .find(|prefix| {
+            candidates
+                .iter()
+                .filter(|candidate| format!("{candidate:x}").starts_with(prefix))
+                .count()
+                == 1
+        })
+        .expect("a full ID is unique")
+}
+
+fn message_ids_with_an_ambiguous_prefix(count: usize) -> Vec<Id> {
+    assert!(count >= 2);
+    let first = *rngid();
+    let first_hex = format!("{first:x}");
+    let mut ids = vec![first];
+    while ids.len() < count {
+        let candidate = *rngid();
+        if ids.contains(&candidate) {
+            continue;
+        }
+        if ids.len() == 1 && !format!("{candidate:x}").starts_with(&first_hex[..1]) {
+            continue;
+        }
+        ids.push(candidate);
+    }
+    ids
+}
+
 #[test]
 fn bm25_fast_path_resolves_content_without_checkout() {
     let path = temp_pile_path();
@@ -94,7 +129,10 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         ("symbol gamma 🔭", "message G"),
         ("symbol delta 🪐", "message H"),
     ];
-    let msg_ids: Vec<Id> = (0..docs.len()).map(|_| *fucid()).collect();
+    let msg_ids = message_ids_with_an_ambiguous_prefix(docs.len());
+    let show_parent = *fucid();
+    let show_attachments = [*fucid(), *fucid()];
+    let non_message_with_message_fields = *fucid();
     let branch_id;
     {
         std::fs::File::create(&path).expect("create empty pile file");
@@ -109,9 +147,11 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         // One author.
         let author = *fucid();
         let author_name = ws.put::<LongString, _>("Tester".to_owned());
+        let author_role = ws.put::<LongString, _>("user".to_owned());
         change += entity! { ExclusiveId::force_ref(&author) @
             metadata::tag: archive::kind_author,
             archive::author_name: author_name,
+            archive::author_role: author_role,
         };
 
         // Messages, one second apart so timestamps are distinct.
@@ -127,6 +167,46 @@ fn bm25_fast_path_resolves_content_without_checkout() {
                 metadata::created_at: created_at,
             };
         }
+
+        // Give the first message every optional field `show` renders. Two
+        // attachments exercise deterministic ID ordering and the
+        // name/source-id label fallback through the Succinct union.
+        change += entity! { ExclusiveId::force_ref(&msg_ids[0]) @
+            archive::reply_to: show_parent,
+            archive::content_type: "text",
+            archive::attachment: show_attachments[0],
+        };
+        change += entity! { ExclusiveId::force_ref(&msg_ids[0]) @
+            archive::attachment: show_attachments[1],
+        };
+        let attachment_name = ws.put::<LongString, _>("diagram.png".to_owned());
+        change += entity! { ExclusiveId::force_ref(&show_attachments[0]) @
+            metadata::tag: archive::kind_attachment,
+            archive::attachment_name: attachment_name,
+            archive::attachment_mime: "image/png",
+            archive::attachment_size_bytes: 123u64,
+            archive::attachment_width_px: 20u64,
+            archive::attachment_height_px: 10u64,
+        };
+        let attachment_source = ws.put::<LongString, _>("source-b".to_owned());
+        change += entity! { ExclusiveId::force_ref(&show_attachments[1]) @
+            metadata::tag: archive::kind_attachment,
+            archive::attachment_source_id: attachment_source,
+        };
+
+        // A full 32-char ID bypasses prefix candidate enumeration. Keep an
+        // entity with all required display fields but the wrong kind tag to
+        // prove the materialization query itself still enforces message kind.
+        let impostor_content = ws.put::<LongString, _>("not a message sentinel".to_owned());
+        let impostor_when = Epoch::from_gregorian_tai(2026, 1, 1, 0, 2, 0, 0);
+        let impostor_created_at: Inline<inlineencodings::NsTAIInterval> =
+            (impostor_when, impostor_when).try_to_inline().unwrap();
+        change += entity! { ExclusiveId::force_ref(&non_message_with_message_fields) @
+            metadata::tag: archive::kind_author,
+            archive::author: author,
+            archive::content: impostor_content,
+            metadata::created_at: impostor_created_at,
+        };
 
         // A newer timestamped non-message must not consume the result limit.
         // The AVE cursor intentionally sees it first, then the bound union
@@ -201,6 +281,19 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         "expected stale Succinct coverage hint, got: {stderr}"
     );
 
+    let first_message_id = format!("{:x}", msg_ids[0]);
+    let out = run_archive(&path, &["show", first_message_id.as_str()]);
+    assert!(
+        !out.status.success(),
+        "show before index must fail instead of checking out raw history; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Succinct index") && stderr.contains("stale"),
+        "expected stale Succinct coverage hint for show, got: {stderr}"
+    );
+
     let out = run_archive(&path, &["search", "beta"]);
     assert!(
         !out.status.success(),
@@ -224,6 +317,106 @@ fn bm25_fast_path_resolves_content_without_checkout() {
     assert!(
         stdout.contains("Succinct and BM25 indexes now cover HEAD"),
         "index summary: {stdout}"
+    );
+
+    // Show resolves both a full ID and a unique prefix through the certified
+    // Succinct union. Rendering order remains byte-for-byte compatible with
+    // the former raw-checkout path, including deterministic attachments.
+    let mut attachment_lines = [
+        (
+            show_attachments[0],
+            format!(
+                "  - {} diagram.png (image/png, 123b, 20x10px)",
+                &format!("{:x}", show_attachments[0])[..8]
+            ),
+        ),
+        (
+            show_attachments[1],
+            format!(
+                "  - {} source-b",
+                &format!("{:x}", show_attachments[1])[..8]
+            ),
+        ),
+    ];
+    attachment_lines.sort_by_key(|(id, _)| *id);
+    let show_when = Epoch::from_gregorian_tai(2026, 1, 1, 0, 0, 0, 0);
+    let expected_show = format!(
+        "id: {:x}\ncreated_at: {}\nauthor: Tester (user)\nreply_to: {:x}\ncontent_type: text\nattachments: 2\n{}\n{}\n\n{}\n",
+        msg_ids[0],
+        show_when,
+        show_parent,
+        attachment_lines[0].1,
+        attachment_lines[1].1,
+        docs[0].0,
+    );
+    let out = run_archive(&path, &["show", first_message_id.as_str()]);
+    assert!(
+        out.status.success(),
+        "full-ID show failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected_show);
+
+    let first_message_prefix = unique_prefix(msg_ids[0], &msg_ids);
+    let out = run_archive(&path, &["show", first_message_prefix.as_str()]);
+    assert!(
+        out.status.success(),
+        "prefix show failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected_show);
+
+    let first_hex = format!("{:x}", msg_ids[0]);
+    let ambiguous_prefix = (1..32)
+        .rev()
+        .map(|len| first_hex[..len].to_owned())
+        .find(|prefix| {
+            msg_ids
+                .iter()
+                .filter(|id| format!("{id:x}").starts_with(prefix))
+                .count()
+                > 1
+        })
+        .expect("fixture IDs deliberately share a prefix");
+    let out = run_archive(&path, &["show", ambiguous_prefix.as_str()]);
+    assert!(!out.status.success(), "ambiguous prefix must not pick a row");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("matches for prefix"),
+        "ambiguous-prefix diagnostic: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let impostor_id = format!("{non_message_with_message_fields:x}");
+    let out = run_archive(&path, &["show", impostor_id.as_str()]);
+    assert!(
+        !out.status.success(),
+        "a non-message with display-like fields must not masquerade as a message"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("missing required fields"),
+        "wrong-kind diagnostic: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_archive(
+        &path,
+        &["--trace", "show", first_message_prefix.as_str()],
+    );
+    assert!(
+        out.status.success(),
+        "traced show failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches("pile record refresh complete").count(),
+        1,
+        "show must open/refresh its pile once; trace:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("indexed-read branch resolution complete")
+            && !stdout.contains("command branch resolution complete"),
+        "show must use indexed standalone dispatch, never raw checkout dispatch; trace:\n{stdout}"
     );
 
     // List attaches the certified Succinct snapshot, keeps only the newest
@@ -272,7 +465,7 @@ fn bm25_fast_path_resolves_content_without_checkout() {
                 .iter()
                 .map(|segment| segment.doc_count())
                 .sum::<usize>(),
-            docs.len(),
+            docs.len() + 1,
             "legacy postings must not survive commit-native bootstrap"
         );
         repo.close().expect("close indexed repo");
@@ -491,6 +684,16 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         stderr.contains("Succinct index") && stderr.contains("stale"),
         "stale-list diagnostic missing; stderr={stderr}"
     );
+    let out = run_archive(&path, &["show", first_message_id.as_str()]);
+    assert!(
+        !out.status.success(),
+        "stale show must fail instead of returning old indexed or new raw data"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Succinct index") && stderr.contains("stale"),
+        "stale-show diagnostic missing; stderr={stderr}"
+    );
 
     // Repair walks only the uncovered commit, then the new message is
     // searchable through the two-segment unions.
@@ -596,6 +799,16 @@ fn bm25_fast_path_resolves_content_without_checkout() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("attach Succinct segments"),
         "missing-segment list diagnostic: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_archive(&path, &["show", first_message_id.as_str()]);
+    assert!(
+        !out.status.success(),
+        "show must not fall back to raw history when a certified segment is missing"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("attach Succinct segments"),
+        "missing-segment show diagnostic: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 

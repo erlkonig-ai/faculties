@@ -1075,7 +1075,11 @@ fn u256be_to_u64(value: Inline<U256BE>) -> Option<u64> {
     Some(u64::from_be_bytes(bytes))
 }
 
-fn author_name(ws: &mut common::Ws, catalog: &TribleSet, author_id: Id) -> Result<String> {
+fn author_name<P: TriblePattern>(
+    ws: &mut common::Ws,
+    catalog: &P,
+    author_id: Id,
+) -> Result<String> {
     let Some(handle) = find!(
         (handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{ author_id @ common::archive::author_name: ?handle }])
@@ -1088,7 +1092,11 @@ fn author_name(ws: &mut common::Ws, catalog: &TribleSet, author_id: Id) -> Resul
     load_longstring(ws, handle)
 }
 
-fn author_role(ws: &mut common::Ws, catalog: &TribleSet, author_id: Id) -> Result<Option<String>> {
+fn author_role<P: TriblePattern>(
+    ws: &mut common::Ws,
+    catalog: &P,
+    author_id: Id,
+) -> Result<Option<String>> {
     let Some(handle) = find!(
         (handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{ author_id @ common::archive::author_role: ?handle }])
@@ -1101,7 +1109,7 @@ fn author_role(ws: &mut common::Ws, catalog: &TribleSet, author_id: Id) -> Resul
     Ok(Some(load_longstring(ws, handle)?))
 }
 
-fn message_content_type(catalog: &TribleSet, message_id: Id) -> Option<String> {
+fn message_content_type<P: TriblePattern>(catalog: &P, message_id: Id) -> Option<String> {
     find!(
         (content_type: String),
         pattern!(catalog, [{ message_id @ common::archive::content_type: ?content_type }])
@@ -1123,9 +1131,9 @@ struct AttachmentRecord {
     has_data: bool,
 }
 
-fn message_attachments(
+fn message_attachments<P: TriblePattern>(
     ws: &mut common::Ws,
-    catalog: &TribleSet,
+    catalog: &P,
     message_id: Id,
 ) -> Result<Vec<AttachmentRecord>> {
     let mut attachments: Vec<Id> = find!(
@@ -1243,7 +1251,7 @@ fn message_attachments(
     Ok(out)
 }
 
-fn resolve_message_id(catalog: &TribleSet, prefix: &str) -> Result<Id> {
+fn resolve_message_id<P: TriblePattern>(catalog: &P, prefix: &str) -> Result<Id> {
     let candidates = find!(
         message: Id,
         pattern!(catalog, [{
@@ -1253,9 +1261,9 @@ fn resolve_message_id(catalog: &TribleSet, prefix: &str) -> Result<Id> {
     faculties::resolve_id_prefix(prefix, candidates)
 }
 
-fn message_record(
+fn message_record<P: TriblePattern>(
     ws: &mut common::Ws,
-    catalog: &TribleSet,
+    catalog: &P,
     message_id: Id,
 ) -> Result<(
     Id,
@@ -1273,6 +1281,7 @@ fn message_record(
         ),
         pattern!(catalog, [{
             message_id @
+                common::metadata::tag: common::archive::kind_message,
                 common::archive::author: ?author,
                 common::archive::content: ?content,
                 common::metadata::created_at: ?created_at,
@@ -1295,6 +1304,76 @@ fn message_record(
     let name = author_name(ws, catalog, author_id)?;
     let role = author_role(ws, catalog, author_id)?;
     Ok((message_id, name, role, created_at, content_handle, reply_to))
+}
+
+/// Materialize and print exactly one message from any queryable trible view.
+///
+/// The caller chooses the logical dataset (raw checkout or certified Succinct
+/// union). Only handles reachable from the selected message and its author or
+/// attachments are dereferenced here.
+fn print_message<P: TriblePattern>(
+    ws: &mut common::Ws,
+    catalog: &P,
+    message_id: Id,
+) -> Result<()> {
+    let (message_id, name, role, created_at, content_handle, reply_to) =
+        message_record(ws, catalog, message_id)?;
+    let content = load_longstring(ws, content_handle)?;
+    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
+    let content_type = message_content_type(catalog, message_id);
+    let attachments = message_attachments(ws, catalog, message_id)?;
+
+    println!("id: {message_id:x}");
+    println!("created_at: {lower}");
+    match role {
+        Some(role) => println!("author: {name} ({role})"),
+        None => println!("author: {name}"),
+    }
+    if let Some(parent) = reply_to {
+        println!("reply_to: {parent:x}");
+    }
+    if let Some(content_type) = content_type {
+        println!("content_type: {content_type}");
+    }
+    if !attachments.is_empty() {
+        println!("attachments: {}", attachments.len());
+        for att in attachments {
+            let mut extras = Vec::new();
+            if let Some(mime) = att.mime.as_deref() {
+                extras.push(mime.to_string());
+            }
+            if let Some(size) = att.size_bytes {
+                extras.push(format!("{size}b"));
+            }
+            if let (Some(w), Some(h)) = (att.width_px, att.height_px) {
+                extras.push(format!("{w}x{h}px"));
+            }
+            if att.has_data {
+                extras.push("data".to_string());
+            }
+            let label = att
+                .name
+                .as_deref()
+                .or(att.source_id.as_deref())
+                .unwrap_or("<unknown>");
+            if extras.is_empty() {
+                println!("  - {} {}", &format!("{:x}", att.id)[..8], label);
+            } else {
+                println!(
+                    "  - {} {} ({})",
+                    &format!("{:x}", att.id)[..8],
+                    label,
+                    extras.join(", ")
+                );
+            }
+        }
+    }
+    println!();
+    print!("{content}");
+    if !content.ends_with('\n') {
+        println!();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1890,6 +1969,63 @@ fn run_list_standalone(
             );
         }
         Ok(())
+    })();
+
+    let close_result = repo
+        .close()
+        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
+    match (res, close_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Show one message from the certified Succinct LSM snapshot.
+///
+/// ID resolution and every trible lookup run against the logical segment
+/// union. The raw commit DAG is never checked out; only the winning message's
+/// content and its directly referenced display metadata are fetched as blobs.
+fn run_show_standalone(
+    mut repo: common::Repo,
+    pile_path: &Path,
+    branch_id: Id,
+    id: String,
+) -> Result<()> {
+    let res = (|| -> Result<()> {
+        let (branch_meta, source_head) = read_archive_branch_snapshot(&mut repo, branch_id)?;
+        let kind = SuccinctRollup::new();
+        let manifest = Manifest::from_tribles(&branch_meta, kind.kind_id());
+        if !manifest.covers_head(source_head) {
+            bail!(
+                "Succinct index {} is stale at {:?}, source HEAD is {:?}; run `archive index`",
+                SuccinctRollup::KIND_ID_HEX,
+                manifest.covered,
+                source_head
+            );
+        }
+        if manifest.segments.is_empty() {
+            bail!("no Succinct archive segments on this pile yet — run `archive index`");
+        }
+
+        let attach_start = Instant::now();
+        let segments = {
+            let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
+            home.attach_manifest(&manifest)
+                .map_err(|e| anyhow!("attach Succinct segments: {e}"))?
+        };
+        tracing::info!(
+            segments = segments.len(),
+            elapsed_ms = attach_start.elapsed().as_millis() as u64,
+            "Succinct manifest and segments attached"
+        );
+        let succinct = SuccinctRollup::union(&segments);
+        let message_id = resolve_message_id(&succinct, &id)?;
+
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace for blob reads: {e:?}"))?;
+        print_message(&mut ws, &succinct, message_id)
     })();
 
     let close_result = repo
@@ -3236,6 +3372,7 @@ fn main() -> Result<()> {
     // work on archive-scale piles.
     let standalone_read = match &cmd {
         Command::List { .. } => Some("list"),
+        Command::Show { .. } => Some("show"),
         Command::Search { .. } => Some("search"),
         _ => None,
     };
@@ -3264,6 +3401,9 @@ fn main() -> Result<()> {
 
         return match &cmd {
             Command::List { limit } => run_list_standalone(repo, &pile_path, branch_id, *limit),
+            Command::Show { id } => {
+                run_show_standalone(repo, &pile_path, branch_id, id.clone())
+            }
             Command::Search { text, limit } => {
                 run_search_standalone(repo, &pile_path, branch_id, text.clone(), *limit)
             }
@@ -3321,68 +3461,11 @@ fn main() -> Result<()> {
             Command::List { .. } => {
                 unreachable!("indexed list is handled before the raw checkout path")
             }
-            Command::Show { id } => {
-                let message_id = resolve_message_id(&catalog, &id)?;
-                let (message_id, name, role, created_at, content_handle, reply_to) =
-                    message_record(&mut ws, &catalog, message_id)?;
-                let content = load_longstring(&mut ws, content_handle)?;
-                let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
-                let content_type = message_content_type(&catalog, message_id);
-                let attachments = message_attachments(&mut ws, &catalog, message_id)?;
-
-                println!("id: {message_id:x}");
-                println!("created_at: {lower}");
-                match role {
-                    Some(role) => println!("author: {name} ({role})"),
-                    None => println!("author: {name}"),
-                }
-                if let Some(parent) = reply_to {
-                    println!("reply_to: {parent:x}");
-                }
-                if let Some(content_type) = content_type {
-                    println!("content_type: {content_type}");
-                }
-                if !attachments.is_empty() {
-                    println!("attachments: {}", attachments.len());
-                    for att in attachments {
-                        let mut extras = Vec::new();
-                        if let Some(mime) = att.mime.as_deref() {
-                            extras.push(mime.to_string());
-                        }
-                        if let Some(size) = att.size_bytes {
-                            extras.push(format!("{size}b"));
-                        }
-                        if let (Some(w), Some(h)) = (att.width_px, att.height_px) {
-                            extras.push(format!("{w}x{h}px"));
-                        }
-                        if att.has_data {
-                            extras.push("data".to_string());
-                        }
-                        let label = att
-                            .name
-                            .as_deref()
-                            .or(att.source_id.as_deref())
-                            .unwrap_or("<unknown>");
-                        if extras.is_empty() {
-                            println!("  - {} {}", &format!("{:x}", att.id)[..8], label);
-                        } else {
-                            println!(
-                                "  - {} {} ({})",
-                                &format!("{:x}", att.id)[..8],
-                                label,
-                                extras.join(", ")
-                            );
-                        }
-                    }
-                }
-                println!();
-                print!("{content}");
-                if !content.ends_with('\n') {
-                    println!();
-                }
+            Command::Show { .. } => {
+                unreachable!("indexed show is handled before the raw checkout path")
             }
             Command::Thread { id, limit } => {
-                let leaf = resolve_message_id(&catalog, &id)?;
+                let leaf = resolve_message_id(&*catalog, &id)?;
                 let mut chain = Vec::new();
                 let mut seen = HashSet::new();
                 let mut current = leaf;
@@ -3406,7 +3489,7 @@ fn main() -> Result<()> {
                 chain.reverse();
                 for message_id in chain {
                     let (message_id, name, role, created_at, content_handle, _reply_to) =
-                        message_record(&mut ws, &catalog, message_id)?;
+                        message_record(&mut ws, &*catalog, message_id)?;
                     let content = load_longstring(&mut ws, content_handle)?;
                     let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
                     let role = role.as_deref().unwrap_or("");
