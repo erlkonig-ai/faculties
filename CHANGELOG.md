@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Codex can enforce orient-watcher continuity.** Versioned SessionStart and
+  Stop hook helpers under `hooks/codex/` hand the `liora-gpt` watcher to each
+  new primary thread, clear stale invisible consumers, and require one rearm
+  attempt before a turn can idle.
 - **Group broadcasts are first-class inbox messages.** `message list` and
   `orient show` now include messages addressed to any group the reader belongs
   to, matching `orient wait` wakeups and keeping read acknowledgements scoped
