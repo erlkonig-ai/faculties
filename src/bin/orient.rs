@@ -85,7 +85,17 @@ enum Command {
     /// news since the persona's checkpoint, print the same terse report
     /// `wait` prints (News: reasons + new message bodies) and advance the
     /// checkpoint; otherwise print nothing and exit 0
-    Poll,
+    Poll {
+        /// Print news WITHOUT advancing the checkpoint (and without
+        /// bootstrapping one). For harnesses that fire hooks identically
+        /// for root and subagents (e.g. Codex, openai/codex#16226): a
+        /// peeking hook can never steal the root persona's checkpoint
+        /// from a worker turn. Peek may re-print the same news on
+        /// consecutive turns until the watcher fires or messages are
+        /// acked — lossless by design; acks are the real handled-marker.
+        #[arg(long)]
+        peek: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1229,6 +1239,7 @@ fn check_news_once(
     compass_branch_id: Id,
     relations_branch_id: Id,
     orient_state_branch_id: Id,
+    peek: bool,
 ) -> Result<NewsCheck> {
     let view = load_watched_view(
         repo,
@@ -1251,12 +1262,16 @@ fn check_news_once(
     // Advance the checkpoint — the terse path skips cmd_show, which is
     // what normally saves it. Without this the checkpoint never moves
     // and every re-arm / next poll instantly re-fires on the same news.
-    save_checkpoint_heads(
-        repo,
-        orient_state_branch_id,
-        heads,
-        Some((persona_id, &view)),
-    )?;
+    // Peek mode skips the save: report without consuming, for hooks that
+    // can't tell whose turn they fire on (root vs subagent).
+    if !peek {
+        save_checkpoint_heads(
+            repo,
+            orient_state_branch_id,
+            heads,
+            Some((persona_id, &view)),
+        )?;
+    }
     Ok(NewsCheck::Fired)
 }
 
@@ -1265,7 +1280,7 @@ fn check_news_once(
 /// harness hooks (UserPromptSubmit and friends) so busy sessions
 /// passively ingest colony news at every turn boundary, while `wait`
 /// keeps its job of waking idle ones.
-fn cmd_poll(pile: &Path, persona: Option<&str>) -> Result<()> {
+fn cmd_poll(pile: &Path, persona: Option<&str>, peek: bool) -> Result<()> {
     with_repo(pile, |repo| {
         let compass_branch_id = repo
             .ensure_branch("compass", None)
@@ -1307,22 +1322,28 @@ fn cmd_poll(pile: &Path, persona: Option<&str>) -> Result<()> {
             compass_branch_id,
             relations_branch_id,
             orient_state_branch_id,
+            peek,
         )? {
-            // News printed + checkpoint advanced inside the shared path.
+            // News printed (+ checkpoint advanced unless peeking).
             NewsCheck::Fired => {}
             // No news: print nothing, write nothing.
             NewsCheck::Quiet(_) => {}
             // First poll for this persona: establish a baseline silently.
             // Dumping "everything currently unread" is a snapshot's job
             // (`orient show`), not a turn-boundary hook's; subsequent
-            // polls diff against this checkpoint.
+            // polls diff against this checkpoint. Peek writes NOTHING —
+            // not even a baseline (a worker turn must not initialize the
+            // root persona's checkpoint).
             NewsCheck::NoCheckpoint(view) => {
-                save_checkpoint_heads(
-                    repo,
-                    orient_state_branch_id,
-                    &heads,
-                    Some((persona_id, &view)),
-                )?;
+                if !peek {
+                    save_checkpoint_heads(
+                        repo,
+                        orient_state_branch_id,
+                        &heads,
+                        Some((persona_id, &view)),
+                    )?;
+                }
+                let _ = view;
             }
         }
         Ok(())
@@ -1385,6 +1406,7 @@ fn cmd_wait(
                 compass_branch_id,
                 relations_branch_id,
                 orient_state_branch_id,
+                false,
             )? {
                 NewsCheck::Fired => return Ok((true, true, true)),
                 NewsCheck::Quiet(view) | NewsCheck::NoCheckpoint(view) => Some(view),
@@ -1559,6 +1581,6 @@ fn main() -> Result<()> {
             todo_limit,
             poll_ms,
         ),
-        Command::Poll => cmd_poll(&cli.pile, cli.persona.as_deref()),
+        Command::Poll { peek } => cmd_poll(&cli.pile, cli.persona.as_deref(), peek),
     }
 }
