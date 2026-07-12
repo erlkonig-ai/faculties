@@ -1,8 +1,11 @@
 
-use std::collections::{HashMap, HashSet};
+use std::any::Any;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Read};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -52,13 +55,15 @@ mod common {
     use rayon::prelude::*;
     
     use tracing::info_span;
+    use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::Blob;
     use triblespace::core::id::ExclusiveId;
     pub use triblespace::core::metadata;
     use triblespace::core::repo::index_home::{
-        append_segment, set_coverage, IndexKind, Manifest,
+        append_prebuilt_segment, append_segment, set_coverage, IndexKind, Manifest,
+        SuccinctRollup,
     };
-    use triblespace::core::repo::pile::Pile;
+    use triblespace::core::repo::pile::{Pile, PileReader};
     use triblespace::core::repo::CommitBatch;
     use triblespace::core::repo::{Repository, Workspace};
     use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
@@ -68,8 +73,6 @@ mod common {
 
     #[cfg(feature = "gpu-succinct")]
     use triblespace::core::repo::index_home::AcceleratedSuccinctRollup;
-    #[cfg(not(feature = "gpu-succinct"))]
-    use triblespace::core::repo::index_home::SuccinctRollup;
     #[cfg(feature = "gpu-succinct")]
     use triblespace_gpu::WgpuWaveletFreeze;
 
@@ -249,20 +252,23 @@ mod common {
         Ok(())
     }
 
-    pub(super) fn index_archive_commit<R, K>(
-        storage: &mut Pile,
+    pub(super) struct PreparedIndexShard {
+        pub(super) succinct: Blob<UnknownBlob>,
+        pub(super) bm25: Option<Blob<UnknownBlob>>,
+    }
+
+    pub(super) struct PreparedArchiveCommit {
+        pub(super) commit: CommitHandle,
+        pub(super) shards: Vec<PreparedIndexShard>,
+        pub(super) tribles: usize,
+        pub(super) elapsed: std::time::Duration,
+    }
+
+    fn visit_archive_commit_shards(
+        reader: &PileReader,
         commit: CommitHandle,
-        succinct: &K,
-        bm25: &Bm25Rollup<R>,
-        head_meta: &mut TribleSet,
-    ) -> Result<()>
-    where
-        R: triblespace::core::repo::BlobStoreGet,
-        K: IndexKind,
-    {
-        let reader = storage
-            .reader()
-            .map_err(|err| anyhow!("open commit reader: {err:?}"))?;
+        mut visit: impl FnMut(TribleSet, TribleSet) -> Result<()>,
+    ) -> Result<usize> {
         let commit_meta: TribleSet = reader
             .get(commit)
             .map_err(|err| anyhow!("load commit {commit:?}: {err:?}"))?;
@@ -274,7 +280,7 @@ mod common {
         .map_err(|_| anyhow!("commit {commit:?} has ambiguous content"))?
         .map(|(handle,)| handle);
         let Some(content_handle) = content_handle else {
-            return Ok(());
+            return Ok(0);
         };
         let source: Blob<SimpleArchive> = reader
             .get(content_handle)
@@ -295,9 +301,6 @@ mod common {
                 .try_from_blob()
                 .map_err(|err| anyhow!("decode commit {commit:?} shard: {err}"))?;
 
-            append_segment(storage, succinct, &chunk, head_meta)
-                .map_err(|err| anyhow!("append Succinct leaf for {commit:?}: {err}"))?;
-
             let mut content = TribleSet::new();
             for trible in chunk
                 .iter()
@@ -312,11 +315,93 @@ mod common {
                 })?;
                 content.insert(trible);
             }
+            visit(chunk, content)?;
+        }
+        Ok(trible_count)
+    }
+
+    /// Resolve and freeze every physical leaf of one immutable source commit.
+    ///
+    /// This phase performs no writes: a standalone repair may run several
+    /// calls concurrently against cloned [`PileReader`] snapshots, then feed
+    /// the returned blobs to one ordered publisher. LongString handles are
+    /// deliberately validated before the infallible BM25 build seam, which
+    /// otherwise omits unreadable values.
+    pub(super) fn prepare_archive_commit(
+        reader: PileReader,
+        commit: CommitHandle,
+    ) -> Result<PreparedArchiveCommit> {
+        let started = std::time::Instant::now();
+        let succinct = SuccinctRollup::new();
+        let bm25 = Bm25Rollup::new(reader.clone(), archive::content.id());
+        let mut shards = Vec::new();
+        let trible_count = visit_archive_commit_shards(&reader, commit, |chunk, content| {
+            let bm25 = (!content.is_empty()).then(|| bm25.build(&content));
+            shards.push(PreparedIndexShard {
+                succinct: succinct.build(&chunk),
+                bm25,
+            });
+            Ok(())
+        })?;
+
+        Ok(PreparedArchiveCommit {
+            commit,
+            shards,
+            tribles: trible_count,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    /// Publish prebuilt leaves in their source shard/kind order. Mutable pile
+    /// state, manifest sequence assignment, and every LSM carry remain owned
+    /// by this one caller.
+    pub(super) fn publish_archive_commit<R, K>(
+        storage: &mut Pile,
+        prepared: PreparedArchiveCommit,
+        succinct: &K,
+        bm25: &Bm25Rollup<R>,
+        head_meta: &mut TribleSet,
+    ) -> Result<()>
+    where
+        R: triblespace::core::repo::BlobStoreGet,
+        K: IndexKind,
+    {
+        for shard in prepared.shards {
+            append_prebuilt_segment(storage, succinct, shard.succinct, head_meta).map_err(
+                |err| anyhow!("append Succinct leaf for {:?}: {err}", prepared.commit),
+            )?;
+            if let Some(segment) = shard.bm25 {
+                append_prebuilt_segment(storage, bm25, segment, head_meta).map_err(|err| {
+                    anyhow!("append BM25 leaf for {:?}: {err}", prepared.commit)
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn index_archive_commit<R, K>(
+        storage: &mut Pile,
+        commit: CommitHandle,
+        succinct: &K,
+        bm25: &Bm25Rollup<R>,
+        head_meta: &mut TribleSet,
+    ) -> Result<()>
+    where
+        R: triblespace::core::repo::BlobStoreGet,
+        K: IndexKind,
+    {
+        let reader = storage
+            .reader()
+            .map_err(|err| anyhow!("open commit reader: {err:?}"))?;
+        visit_archive_commit_shards(&reader, commit, |chunk, content| {
+            append_segment(storage, succinct, &chunk, head_meta)
+                .map_err(|err| anyhow!("append Succinct leaf for {commit:?}: {err}"))?;
             if !content.is_empty() {
                 append_segment(storage, bm25, &content, head_meta)
                     .map_err(|err| anyhow!("append BM25 leaf for {commit:?}: {err}"))?;
             }
-        }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -653,7 +738,14 @@ enum Command {
     /// Build or repair the Succinct and BM25 LSM indexes.
     /// Replays only uncovered commits and checkpoints after each one, so an
     /// interrupted run resumes without rebuilding already-covered history.
-    Index,
+    Index {
+        /// Maximum source commits being prepared or waiting for ordered
+        /// publication. Defaults to the square root of the active Rayon
+        /// worker count, balancing nested leaf-build parallelism. This bounds
+        /// commit count, not bytes; one large commit may hold several shards.
+        #[arg(long, env = "ARCHIVE_INDEX_PREPARE_IN_FLIGHT")]
+        prepare_in_flight: Option<NonZeroUsize>,
+    },
     /// List imported conversations.
     Imports {
         format: Option<String>,
@@ -1931,12 +2023,440 @@ fn advance_coverage_frontier(
     Ok(())
 }
 
+fn panic_payload(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+fn default_preparation_window(rayon_threads: usize) -> usize {
+    rayon_threads.isqrt().max(1)
+}
+
+/// Run independent preparation jobs on Rayon while publishing their results
+/// in exact input order. `max_in_flight` bounds the sum of running jobs and
+/// completed results waiting behind a slow earlier job; new work enters only
+/// when one ordered result has been published. The bound counts commits, not
+/// bytes: one prepared commit can itself contain several physical shards.
+fn run_ordered_preparation_pipeline<I, T, P, U>(
+    items: &[I],
+    max_in_flight: usize,
+    prepare: P,
+    mut publish: U,
+) -> Result<()>
+where
+    I: Copy + Send + Sync,
+    T: Send,
+    P: Fn(I) -> Result<T> + Send + Sync,
+    U: FnMut(usize, I, T) -> Result<()> + Send,
+{
+    if max_in_flight == 0 {
+        bail!("archive index preparation window must be at least 1");
+    }
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    // A scope owner blocks while receiving prepared results, so a one-thread
+    // pool has no second worker that could execute a spawned job. Window 1 is
+    // also the explicit serial baseline; run both cases inline while retaining
+    // the same panic-to-error and ordered-publish contract.
+    if max_in_flight == 1 || rayon::current_num_threads() == 1 {
+        for (ordinal, &item) in items.iter().enumerate() {
+            let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prepare(item)
+            }))
+            .unwrap_or_else(|payload| {
+                Err(anyhow!(
+                    "archive index preparation worker panicked: {}",
+                    panic_payload(payload)
+                ))
+            })
+            .with_context(|| format!("prepare archive commit {}/{}", ordinal + 1, items.len()))?;
+            publish(ordinal, item, prepared).with_context(|| {
+                format!("publish archive commit {}/{}", ordinal + 1, items.len())
+            })?;
+        }
+        return Ok(());
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let prepare = Arc::new(prepare);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(max_in_flight);
+
+    rayon::scope_fifo(move |scope| -> Result<()> {
+        let spawn = |ordinal: usize| {
+            let item = items[ordinal];
+            let sender = sender.clone();
+            let cancelled = Arc::clone(&cancelled);
+            let prepare = Arc::clone(&prepare);
+            scope.spawn_fifo(move |_| {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    prepare(item)
+                }))
+                .unwrap_or_else(|payload| {
+                    Err(anyhow!(
+                        "archive index preparation worker panicked: {}",
+                        panic_payload(payload)
+                    ))
+                });
+                // The receiver may disappear after the first ordered error.
+                // That is cancellation, not another worker failure.
+                let _ = sender.send((ordinal, outcome));
+            });
+        };
+
+        let mut next_to_dispatch = 0usize;
+        let mut next_to_publish = 0usize;
+        let mut completed = BTreeMap::new();
+        while next_to_dispatch < items.len() && next_to_dispatch < max_in_flight {
+            spawn(next_to_dispatch);
+            next_to_dispatch += 1;
+        }
+
+        while next_to_publish < items.len() {
+            let (ordinal, outcome) = match receiver.recv() {
+                Ok(value) => value,
+                Err(_) => {
+                    cancelled.store(true, Ordering::Release);
+                    bail!("archive index preparation workers stopped without a result");
+                }
+            };
+            completed.insert(ordinal, outcome);
+
+            while let Some(outcome) = completed.remove(&next_to_publish) {
+                let item = items[next_to_publish];
+                let prepared = match outcome {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        cancelled.store(true, Ordering::Release);
+                        return Err(err).with_context(|| {
+                            format!(
+                                "prepare archive commit {}/{}",
+                                next_to_publish + 1,
+                                items.len()
+                            )
+                        });
+                    }
+                };
+                if let Err(err) = publish(next_to_publish, item, prepared) {
+                    cancelled.store(true, Ordering::Release);
+                    return Err(err).with_context(|| {
+                        format!(
+                            "publish archive commit {}/{}",
+                            next_to_publish + 1,
+                            items.len()
+                        )
+                    });
+                }
+                next_to_publish += 1;
+
+                // Count both workers and reorder-buffer entries against the
+                // same window. A head-of-line stall therefore cannot admit an
+                // unbounded tail of fully materialised commit blobs.
+                if next_to_dispatch < items.len() {
+                    spawn(next_to_dispatch);
+                    next_to_dispatch += 1;
+                }
+                debug_assert!(next_to_dispatch - next_to_publish <= max_in_flight);
+            }
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod ordered_preparation_tests {
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::time::Duration;
+
+    use super::{default_preparation_window, run_ordered_preparation_pipeline};
+
+    #[test]
+    fn default_window_balances_nested_parallel_stages() {
+        assert_eq!(default_preparation_window(16), 4);
+        assert_eq!(default_preparation_window(8), 2);
+        assert_eq!(default_preparation_window(4), 2);
+        assert_eq!(default_preparation_window(2), 1);
+        assert_eq!(default_preparation_window(1), 1);
+    }
+
+    #[test]
+    fn reverse_completion_is_published_in_input_order() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(5)
+            .build()
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(4));
+        let completion = Arc::new(Mutex::new(Vec::new()));
+        let completion_from_workers = Arc::clone(&completion);
+        let barrier_from_workers = Arc::clone(&barrier);
+        let mut published = Vec::new();
+
+        pool.install(|| {
+            run_ordered_preparation_pipeline(
+                &[0usize, 1, 2, 3],
+                4,
+                move |item| {
+                    barrier_from_workers.wait();
+                    std::thread::sleep(Duration::from_millis((3 - item) as u64 * 20));
+                    completion_from_workers.lock().unwrap().push(item);
+                    Ok(item)
+                },
+                |ordinal, item, prepared| {
+                    assert_eq!(ordinal, item);
+                    assert_eq!(item, prepared);
+                    published.push(item);
+                    Ok(())
+                },
+            )
+        })
+        .unwrap();
+
+        assert_eq!(*completion.lock().unwrap(), [3, 2, 1, 0]);
+        assert_eq!(published, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn worker_panic_is_terminal_after_a_contiguous_prefix() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut published = Vec::new();
+        let error = pool
+            .install(|| {
+                run_ordered_preparation_pipeline(
+                    &[0usize, 1, 2, 3, 4, 5],
+                    4,
+                    |item| {
+                        if item == 3 {
+                            panic!("synthetic preparation panic");
+                        }
+                        Ok(item)
+                    },
+                    |_ordinal, item, prepared| {
+                        assert_eq!(item, prepared);
+                        published.push(item);
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("prepare archive commit 4/6"));
+        assert!(format!("{error:#}").contains("synthetic preparation panic"));
+        assert_eq!(published, [0, 1, 2]);
+    }
+
+    #[test]
+    fn one_thread_pool_uses_the_deadlock_free_serial_path() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let mut published = Vec::new();
+        pool.install(|| {
+            run_ordered_preparation_pipeline(
+                &[0usize, 1, 2, 3],
+                4,
+                Ok,
+                |_ordinal, item, prepared| {
+                    assert_eq!(item, prepared);
+                    published.push(item);
+                    Ok(())
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(published, [0, 1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod prebuilt_leaf_parity_tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+    use triblespace::core::repo::index_home::{
+        set_coverage, IndexKind, Manifest, SuccinctRollup,
+    };
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::core::repo::{BlobStore, Repository};
+    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::*;
+    use triblespace_search::index_bm25::Bm25Rollup;
+
+    use super::{common, run_ordered_preparation_pipeline};
+
+    fn temp_pile(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "archive-prebuilt-{label}-{}-{nanos}.pile",
+            std::process::id()
+        ))
+    }
+
+    fn build_source(path: &Path) -> Vec<common::CommitHandle> {
+        std::fs::File::create(path).unwrap();
+        let pile = Pile::open(path).unwrap();
+        let mut repo = Repository::new(
+            pile,
+            SigningKey::generate(&mut OsRng),
+            TribleSet::new(),
+        )
+        .unwrap();
+        let branch = *repo.create_branch("archive", None).unwrap();
+        let mut ws = repo.pull(branch).unwrap();
+        let mut commits = Vec::new();
+        for ordinal in 0..17 {
+            let message = *fucid();
+            let content = ws.put::<LongString, _>(format!("legacy parity document {ordinal}"));
+            let change: TribleSet = entity! { ExclusiveId::force_ref(&message) @
+                common::archive::content: content,
+            }
+            .into();
+            ws.commit(change, "source commit");
+            repo.push(&mut ws).unwrap();
+            commits.push(ws.head().unwrap());
+        }
+        repo.close().unwrap();
+        commits
+    }
+
+    type SegmentBytes = (u64, u64, [u8; 32], Vec<u8>);
+
+    fn finish_snapshot(
+        mut pile: Pile,
+        head: TribleSet,
+        kinds: [Id; 2],
+    ) -> (TribleSet, Vec<Vec<SegmentBytes>>) {
+        let reader = pile.reader().unwrap();
+        let segments = kinds
+            .into_iter()
+            .map(|kind| {
+                Manifest::from_tribles(&head, kind)
+                    .segments
+                    .into_iter()
+                    .map(|entry| {
+                        let blob: Blob<triblespace::core::blob::encodings::UnknownBlob> =
+                            reader.get(entry.blob).unwrap();
+                        (entry.level, entry.seq, entry.blob.raw, blob.bytes.to_vec())
+                    })
+                    .collect()
+            })
+            .collect();
+        drop(reader);
+        pile.close().unwrap();
+        (head, segments)
+    }
+
+    fn legacy_snapshot(
+        path: &Path,
+        commits: &[common::CommitHandle],
+    ) -> (TribleSet, Vec<Vec<SegmentBytes>>) {
+        let mut pile = Pile::open(path).unwrap();
+        pile.refresh().unwrap();
+        let succinct = SuccinctRollup::new();
+        let reader = pile.reader().unwrap();
+        let bm25 = Bm25Rollup::new(reader, common::archive::content.id());
+        let mut head = TribleSet::new();
+        for &commit in commits {
+            common::index_archive_commit(&mut pile, commit, &succinct, &bm25, &mut head).unwrap();
+        }
+        let covered = commits.last().copied().into_iter().collect();
+        set_coverage(&mut head, succinct.kind_id(), covered);
+        set_coverage(
+            &mut head,
+            bm25.kind_id(),
+            commits.last().copied().into_iter().collect(),
+        );
+        let kinds = [succinct.kind_id(), bm25.kind_id()];
+        drop(bm25);
+        finish_snapshot(pile, head, kinds)
+    }
+
+    fn prebuilt_window_one_snapshot(
+        path: &Path,
+        commits: &[common::CommitHandle],
+    ) -> (TribleSet, Vec<Vec<SegmentBytes>>) {
+        let mut pile = Pile::open(path).unwrap();
+        pile.refresh().unwrap();
+        let prepare_reader = pile.reader().unwrap();
+        let succinct = SuccinctRollup::new();
+        let bm25 = Bm25Rollup::new(prepare_reader.clone(), common::archive::content.id());
+        let mut head = TribleSet::new();
+        run_ordered_preparation_pipeline(
+            commits,
+            1,
+            |commit| common::prepare_archive_commit(prepare_reader.clone(), commit),
+            |_ordinal, _commit, prepared| {
+                common::publish_archive_commit(
+                    &mut pile,
+                    prepared,
+                    &succinct,
+                    &bm25,
+                    &mut head,
+                )
+            },
+        )
+        .unwrap();
+        let covered = commits.last().copied().into_iter().collect();
+        set_coverage(&mut head, succinct.kind_id(), covered);
+        set_coverage(
+            &mut head,
+            bm25.kind_id(),
+            commits.last().copied().into_iter().collect(),
+        );
+        let kinds = [succinct.kind_id(), bm25.kind_id()];
+        drop(bm25);
+        drop(prepare_reader);
+        finish_snapshot(pile, head, kinds)
+    }
+
+    #[test]
+    fn window_one_matches_literal_legacy_append_bytes_across_carries() {
+        let source = temp_pile("source");
+        let legacy = temp_pile("legacy");
+        let prebuilt = temp_pile("prebuilt");
+        let commits = build_source(&source);
+        std::fs::copy(&source, &legacy).unwrap();
+        std::fs::copy(&source, &prebuilt).unwrap();
+
+        assert_eq!(
+            legacy_snapshot(&legacy, &commits),
+            prebuilt_window_one_snapshot(&prebuilt, &commits)
+        );
+
+        for path in [source, legacy, prebuilt] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Build or repair the archive's two derived indexes by replaying source
 /// commits, never by checking out their union. Every source commit is one
 /// logical LSM leaf; large commit payloads are physically sharded under one
 /// atomic coverage advance. The frontier is checkpointed after each commit,
 /// making interruption and rerun idempotent.
-fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> Result<()> {
+fn run_index_standalone(
+    pile_path: &Path,
+    branch_id: Id,
+    branch_name: &str,
+    prepare_in_flight: Option<NonZeroUsize>,
+) -> Result<()> {
     // Standalone repair publishes index checkpoints directly rather than
     // pushing a workspace, so an on-commit hook is unnecessary. Own exactly
     // one rollup for this indexing lifecycle.
@@ -2050,52 +2570,93 @@ fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> R
             "indexing {} uncovered commit(s) as logical LSM leaves…",
             commits.len()
         );
+        let rayon_threads = rayon::current_num_threads();
+        let prepare_in_flight = prepare_in_flight
+            .map(NonZeroUsize::get)
+            .unwrap_or_else(|| default_preparation_window(rayon_threads));
+        eprintln!(
+            "  preparation pipeline: {prepare_in_flight} commit(s) in flight on {rayon_threads} Rayon worker(s)"
+        );
         let succinct = common::archive_succinct_rollup();
-        for (i, commit) in commits.iter().copied().enumerate() {
-            if i == 0 {
-                eprintln!("  starting commit 1/{} ({commit:?})", commits.len());
-            }
-            let commit_started = Instant::now();
-            common::index_archive_commit(
-                repo.storage_mut(),
-                commit,
-                &succinct,
-                &bm25,
-                &mut branch_meta,
-            )?;
-            advance_coverage_frontier(&mut ws, &mut frontier, commit)?;
-            set_coverage(
-                &mut branch_meta,
-                succinct_format.kind_id(),
-                frontier.clone(),
-            );
-            set_coverage(&mut branch_meta, bm25.kind_id(), frontier.clone());
-
-            let new_meta: Inline<Handle<SimpleArchive>> = repo
-                .storage_mut()
-                .put(branch_meta.clone())
-                .map_err(|err| anyhow!("store index checkpoint: {err:?}"))?;
-            match repo
-                .storage_mut()
-                .update(branch_id, Some(branch_meta_handle), Some(new_meta))
-                .map_err(|err| anyhow!("publish index checkpoint: {err:?}"))?
-            {
-                PushResult::Success() => branch_meta_handle = new_meta,
-                PushResult::Conflict(_) => {
-                    bail!("archive branch changed during indexing; rerun to resume from coverage")
-                }
-            }
-            let commit_elapsed = commit_started.elapsed();
-            if commit_elapsed.as_secs() >= 5 {
-                eprintln!(
-                    "  …{}/{} commit {commit:?} indexed and checkpointed in {:.1?}",
-                    i + 1,
-                    commits.len(),
-                    commit_elapsed,
+        let prepare_reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|err| anyhow!("open archive preparation reader: {err:?}"))?;
+        let index_started = Instant::now();
+        let commit_count = commits.len();
+        if let Some(commit) = commits.first() {
+            eprintln!("  starting commit 1/{} ({commit:?})", commits.len());
+        }
+        run_ordered_preparation_pipeline(
+            &commits,
+            prepare_in_flight,
+            |commit| common::prepare_archive_commit(prepare_reader.clone(), commit),
+            |i, commit, prepared| {
+                debug_assert_eq!(prepared.commit, commit);
+                let prepare_elapsed = prepared.elapsed;
+                let prepared_tribles = prepared.tribles;
+                let prepared_shards = prepared.shards.len();
+                let publish_started = Instant::now();
+                common::publish_archive_commit(
+                    repo.storage_mut(),
+                    prepared,
+                    &succinct,
+                    &bm25,
+                    &mut branch_meta,
+                )?;
+                advance_coverage_frontier(&mut ws, &mut frontier, commit)?;
+                set_coverage(
+                    &mut branch_meta,
+                    succinct_format.kind_id(),
+                    frontier.clone(),
                 );
-            } else if (i + 1) % 100 == 0 || i + 1 == commits.len() {
-                eprintln!("  …{}/{} commits indexed", i + 1, commits.len());
-            }
+                set_coverage(&mut branch_meta, bm25.kind_id(), frontier.clone());
+
+                let new_meta: Inline<Handle<SimpleArchive>> = repo
+                    .storage_mut()
+                    .put(branch_meta.clone())
+                    .map_err(|err| anyhow!("store index checkpoint: {err:?}"))?;
+                match repo
+                    .storage_mut()
+                    .update(branch_id, Some(branch_meta_handle), Some(new_meta))
+                    .map_err(|err| anyhow!("publish index checkpoint: {err:?}"))?
+                {
+                    PushResult::Success() => branch_meta_handle = new_meta,
+                    PushResult::Conflict(_) => {
+                        bail!(
+                            "archive branch changed during indexing; rerun to resume from coverage"
+                        )
+                    }
+                }
+                let publish_elapsed = publish_started.elapsed();
+                let commit_work = prepare_elapsed + publish_elapsed;
+                let rate =
+                    (i + 1) as f64 / index_started.elapsed().as_secs_f64().max(f64::EPSILON);
+                if commit_work.as_secs() >= 5 {
+                    eprintln!(
+                        "  …{}/{} commit {commit:?} indexed and checkpointed in {:.1?} (prepare {:.1?}; carry/checkpoint {:.1?}; {prepared_tribles} tribles/{prepared_shards} shard(s); {rate:.2} commits/s)",
+                        i + 1,
+                        commits.len(),
+                        commit_work,
+                        prepare_elapsed,
+                        publish_elapsed,
+                    );
+                } else if (i + 1) % 100 == 0 || i + 1 == commits.len() {
+                    eprintln!(
+                        "  …{}/{} commits indexed ({rate:.2} commits/s)",
+                        i + 1,
+                        commits.len()
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        if commit_count != 0 {
+            eprintln!(
+                "  indexed {commit_count} commit(s) in {:.1?} ({:.2} commits/s)",
+                index_started.elapsed(),
+                commit_count as f64 / index_started.elapsed().as_secs_f64().max(f64::EPSILON)
+            );
         }
 
         // A migration that only removed the legacy monolith still needs one
@@ -2224,8 +2785,8 @@ fn main() -> Result<()> {
             persona.as_deref(),
         );
     }
-    if let Command::Index = cmd {
-        return run_index_standalone(&pile_path, branch_id, &cli.branch);
+    if let Command::Index { prepare_in_flight } = cmd {
+        return run_index_standalone(&pile_path, branch_id, &cli.branch, prepare_in_flight);
     }
 
     let (mut repo, branch_id) = common::open_repo_for_read(&pile_path, branch_id, &cli.branch)?;
@@ -2391,7 +2952,7 @@ fn main() -> Result<()> {
             Command::Search { .. } => {
                 unreachable!("search is handled before opening the branch")
             }
-            Command::Index => {
+            Command::Index { .. } => {
                 unreachable!("index is handled before opening the branch")
             }
             Command::Imports { format, limit } => {
