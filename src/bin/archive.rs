@@ -607,9 +607,9 @@ enum Command {
         #[arg(long)]
         exact: bool,
     },
-    /// Build (or refresh) the BM25 search index over message content.
-    /// Rebuild-and-replace: each run mints a fresh index entity; search
-    /// uses the latest.
+    /// Build or repair the Succinct and BM25 LSM indexes.
+    /// Replays only uncovered commits and checkpoints after each one, so an
+    /// interrupted run resumes without rebuilding already-covered history.
     Index,
     /// List imported conversations.
     Imports {
