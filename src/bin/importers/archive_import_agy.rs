@@ -244,33 +244,33 @@ fn collect_agy_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 fn parse_jsonl(path: &Path) -> Result<Vec<JsonValue>> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut out = Vec::new();
-    for line in raw.lines() {
+    for (i, line) in raw.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(value) = serde_json::from_str::<JsonValue>(trimmed) {
-            out.push(value);
-        }
+        let value = serde_json::from_str::<JsonValue>(trimmed)
+            .with_context(|| format!("malformed JSON on line {}", i + 1))?;
+        out.push(value);
     }
     Ok(out)
 }
 
 fn collect_messages(conv_id: &str, records: &[JsonValue]) -> Vec<MessageRecord> {
     let mut out = Vec::new();
-    for value in records {
+    for (ordinal, value) in records.iter().enumerate() {
         let source = value.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
         let step_index = value.get("step_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let t = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         
         let created_at_str = value.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
         let created_at = Epoch::from_str(created_at_str).ok();
         
         let (role, author) = match source {
-            "USER_EXPLICIT" => ("user", "user"),
+            "USER_EXPLICIT" | "USER_INPUT" => ("user", "user"),
             "MODEL" => ("assistant", "assistant"),
             "SYSTEM" => {
-                let t = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 if t == "TOOL_CALL" || t == "TOOL_RESPONSE" {
                     ("system", "system")
                 } else {
@@ -280,19 +280,27 @@ fn collect_messages(conv_id: &str, records: &[JsonValue]) -> Vec<MessageRecord> 
             _ => continue,
         };
         
-        if content.is_empty() {
+        let content_to_store = if !content.is_empty() {
+            content.to_string()
+        } else {
+            serde_json::to_string(value).unwrap_or_default()
+        };
+        
+        if content_to_store.is_empty() {
             continue;
         }
         
+        let source_msg_id = format!("agy:{}:{}:{}", conv_id, step_index, ordinal);
+        
         out.push(MessageRecord {
             conversation_id: conv_id.to_string(),
-            source_message_id: format!("agy:{}:{}", conv_id, step_index),
+            source_message_id: source_msg_id,
             parent_source_id: None,
             role: role.to_string(),
             author: author.to_string(),
-            content: content.to_string(),
+            content: content_to_store,
             created_at,
-            order: step_index,
+            order: ordinal,
         });
     }
     out
