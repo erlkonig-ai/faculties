@@ -92,6 +92,10 @@ fragments by id and title. The set covers two shapes:
   - [Recipe: Multi-Agent Coordination](wiki:45e1b9bef3ad9836536ab7bce367deb0) — relations +
     local_messages + orient + compass for two-agent handoffs
     without race conditions or silent drops
+  - [Harness Hooks: Mechanical Colony Sync](wiki:5c86df3dcd5994de2967483fca7170ac) — watcher +
+    poll + turn-end enforcement per harness (Claude Code,
+    Codex, Antigravity); models have no internal clock, so
+    coordination is hook-enforced, not remembered
   - [Recipe: Auth Setup for a Multi-Agent Team](wiki:d06247b9d9183721e47a2940806e5d7f) — `trible
     team` + `pile net` for bootstrapping capability auth
     across two machines so the relay accepts both peers

@@ -93,5 +93,10 @@ but doesn't enforce.
   - "Teams: Capability-Based Membership" — for inter-pile sync
     over a real network (gossip + DHT), the auth-arc tools
     underneath this recipe.
+  - [Harness Hooks: Mechanical Colony Sync](wiki:5c86df3dcd5994de2967483fca7170ac)
+    — the enforcement layer that keeps this recipe's handshake
+    *live*: watcher, per-turn poll, and turn-end blocking,
+    per harness. Idle loops that rely on intention alone
+    peter out; install the hooks.
 
-Next stop: [Recipe: Auth Setup for a Multi-Agent Team](wiki:d06247b9d9183721e47a2940806e5d7f).
+Next stop: [Harness Hooks: Mechanical Colony Sync](wiki:5c86df3dcd5994de2967483fca7170ac).

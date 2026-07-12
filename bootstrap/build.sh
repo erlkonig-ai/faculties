@@ -40,6 +40,7 @@ ID_RELATIONS=e7e3f672a66b39e0b5b3c0eaf212b1da
 ID_WEB=abe651f605c823085d861f296d9f9907
 ID_RESEARCH=999d2565f2e3af57fa5cfe2ed507d450
 ID_COORD=45e1b9bef3ad9836536ab7bce367deb0
+ID_HOOKS=5c86df3dcd5994de2967483fca7170ac
 ID_AUTH=d06247b9d9183721e47a2940806e5d7f
 ID_TRIBLE=4e19893b36bf37d471bb9ea968edac20
 ID_PILEF=5232ea531fedfcb17bf15e88c3d52a36
@@ -157,6 +158,17 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/15_coordination_workflow.typ" \
   --tag bootstrap --tag onboarding --tag recipe --tag coordination >/dev/null
 
+# 22. Harness hooks — the mechanical colony-sync layer:
+# watcher (orient wait), per-turn poll (orient poll), and
+# Stop-hook enforcement, with per-harness install sections
+# (Claude Code / Codex / Antigravity). Models have no internal
+# clock, so this is hook-enforced, not remembered; part of
+# every new zooid's onboarding. Slotted after the coordination
+# recipe it keeps alive.
+"$WIKI" create "Harness Hooks: Mechanical Colony Sync (Watcher, Poll, Enforcement)" --force --id "${ID_HOOKS}" \
+  "@$BOOTSTRAP_DIR/22_harness_hooks.typ" \
+  --tag bootstrap --tag onboarding --tag hooks --tag coordination >/dev/null
+
 # 16. Auth setup recipe — chains `trible team`, `trible pile
 # net`, and the env-var configuration relays read. Order of
 # operations across founder + invitee machines so the
@@ -198,7 +210,7 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/21_authoring_a_faculty.typ" \
   --tag bootstrap --tag onboarding --tag faculties --tag authoring >/dev/null
 
-echo "    20 fragments created"
+echo "    21 fragments created"
 
 echo "==> Building compass goals"
 
@@ -248,7 +260,7 @@ echo "    OK: lint clean"
 
 echo "==> Sanity check"
 # Bump these when adding/removing entries above.
-EXPECTED_FRAGMENTS=20
+EXPECTED_FRAGMENTS=21
 EXPECTED_GOALS=7
 ACTUAL_FRAGMENTS=$("$WIKI" list --tag bootstrap 2>/dev/null \
   | grep -cE "^[0-9a-f]" || echo 0)
