@@ -56,7 +56,7 @@ mod common {
     use triblespace::core::id::ExclusiveId;
     pub use triblespace::core::metadata;
     use triblespace::core::repo::index_home::{
-        append_segment, set_coverage, IndexKind, Manifest, SuccinctRollup,
+        append_segment, set_coverage, IndexKind, Manifest,
     };
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::CommitBatch;
@@ -65,6 +65,13 @@ mod common {
     use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
     use triblespace::prelude::*;
     use triblespace_search::index_bm25::Bm25Rollup;
+
+    #[cfg(feature = "gpu-succinct")]
+    use triblespace::core::repo::index_home::AcceleratedSuccinctRollup;
+    #[cfg(not(feature = "gpu-succinct"))]
+    use triblespace::core::repo::index_home::SuccinctRollup;
+    #[cfg(feature = "gpu-succinct")]
+    use triblespace_gpu::WgpuWaveletFreeze;
 
     pub use faculties::schemas::archive::{self as archive_schema, archive, import_schema};
     pub use faculties::schemas::memory::comb;
@@ -78,6 +85,33 @@ mod common {
     /// commit leaf; all of its physical shards land atomically before its
     /// coverage certificate advances.
     const INDEX_PHYSICAL_LEAF_TRIBLES: usize = 1 << 16;
+
+    /// Conservative Apple Metal crossover measured against the summed input
+    /// rows before cross-segment deduplication.
+    #[cfg(feature = "gpu-succinct")]
+    const GPU_SUCCINCT_MIN_INPUT_ROWS: usize = 300_000;
+
+    #[cfg(feature = "gpu-succinct")]
+    pub(super) type ArchiveSuccinctRollup = AcceleratedSuccinctRollup<WgpuWaveletFreeze>;
+
+    #[cfg(not(feature = "gpu-succinct"))]
+    pub(super) type ArchiveSuccinctRollup = SuccinctRollup;
+
+    /// Construct one rollup per archive-indexing lifecycle. The hook keeps
+    /// this value alive across push attempts and batches so the WGPU runtime,
+    /// shader cache, allocator, and circuit-breaker state are reused.
+    #[cfg(feature = "gpu-succinct")]
+    pub(super) fn archive_succinct_rollup() -> ArchiveSuccinctRollup {
+        AcceleratedSuccinctRollup::new(
+            WgpuWaveletFreeze::new(&Default::default()),
+            GPU_SUCCINCT_MIN_INPUT_ROWS,
+        )
+    }
+
+    #[cfg(not(feature = "gpu-succinct"))]
+    pub(super) fn archive_succinct_rollup() -> ArchiveSuccinctRollup {
+        SuccinctRollup::new()
+    }
 
     pub(super) fn validate_physical_leaf_boundaries(bytes: &[u8]) -> Result<()> {
         debug_assert_eq!(bytes.len() % 64, 0);
@@ -161,23 +195,31 @@ mod common {
     }
 
     fn install_archive_index_hook(repo: &mut Repo, archive_branch: Id) {
+        // Delay backend construction until this repository actually pushes
+        // the archive branch. Other write lifecycles (notably replay cursor
+        // updates) share this opener but never need an indexing backend.
+        let mut succinct = None;
         repo.on_commit(move |storage, pushed_branch, batch, head_meta| {
             if pushed_branch != archive_branch {
                 return Ok(());
             }
-            index_archive_batch(storage, batch, head_meta).map_err(|err| {
+            let succinct = succinct.get_or_insert_with(archive_succinct_rollup);
+            index_archive_batch(storage, batch, succinct, head_meta).map_err(|err| {
                 Box::new(std::io::Error::other(format!("{err:#}")))
                     as Box<dyn std::error::Error + Send + Sync>
             })
         });
     }
 
-    fn index_archive_batch(
+    fn index_archive_batch<K>(
         storage: &mut Pile,
         batch: &CommitBatch,
+        succinct: &K,
         head_meta: &mut TribleSet,
-    ) -> Result<()> {
-        let succinct = SuccinctRollup::new();
+    ) -> Result<()>
+    where
+        K: IndexKind,
+    {
         let content_attr = archive::content.id();
         let bm25_reader = storage
             .reader()
@@ -196,7 +238,7 @@ mod common {
         }
 
         for commit in &batch.commits {
-            index_archive_commit(storage, *commit, &succinct, &bm25, head_meta)?;
+            index_archive_commit(storage, *commit, succinct, &bm25, head_meta)?;
         }
 
         // Both recipes live in one hook scratch set, so these certificates
@@ -207,15 +249,16 @@ mod common {
         Ok(())
     }
 
-    pub(super) fn index_archive_commit<R>(
+    pub(super) fn index_archive_commit<R, K>(
         storage: &mut Pile,
         commit: CommitHandle,
-        succinct: &SuccinctRollup,
+        succinct: &K,
         bm25: &Bm25Rollup<R>,
         head_meta: &mut TribleSet,
     ) -> Result<()>
     where
         R: triblespace::core::repo::BlobStoreGet,
+        K: IndexKind,
     {
         let reader = storage
             .reader()
@@ -1894,8 +1937,12 @@ fn advance_coverage_frontier(
 /// atomic coverage advance. The frontier is checkpointed after each commit,
 /// making interruption and rerun idempotent.
 fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> Result<()> {
-    let (mut repo, branch_id) = common::open_repo_for_write(pile_path, branch_id, branch_name)?;
+    // Standalone repair publishes index checkpoints directly rather than
+    // pushing a workspace, so an on-commit hook is unnecessary. Own exactly
+    // one rollup for this indexing lifecycle.
+    let mut repo = common::open_repo(pile_path)?;
     let res = (|| -> Result<()> {
+        common::validate_branch_for_read(&mut repo, branch_id, branch_name)?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -1916,13 +1963,16 @@ fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> R
             .get(branch_meta_handle)
             .map_err(|err| anyhow!("load archive branch metadata: {err:?}"))?;
 
-        let succinct = SuccinctRollup::new();
+        // Manifest compatibility and readability do not need a GPU backend.
+        // Accelerated and CPU Succinct rollups deliberately share kind id and
+        // canonical segment bytes.
+        let succinct_format = SuccinctRollup::new();
         let bm25_reader = repo
             .storage_mut()
             .reader()
             .map_err(|err| anyhow!("open BM25 reader: {err:?}"))?;
         let bm25 = Bm25Rollup::new(bm25_reader, common::archive::content.id());
-        let succinct_manifest = Manifest::from_tribles(&branch_meta, succinct.kind_id());
+        let succinct_manifest = Manifest::from_tribles(&branch_meta, succinct_format.kind_id());
         let bm25_manifest = Manifest::from_tribles(&branch_meta, bm25.kind_id());
 
         let reachable = ancestors(target_head)
@@ -1943,7 +1993,7 @@ fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> R
         let candidate_resume = same_frontier && frontier_is_reachable && !has_uncertified_segments;
         let manifests_readable = if candidate_resume {
             let succinct_result = {
-                let mut home = IndexHome::new(repo.storage_mut(), branch_id, succinct);
+                let mut home = IndexHome::new(repo.storage_mut(), branch_id, succinct_format);
                 home.attach_manifest(&succinct_manifest)
             };
             let bm25_result = {
@@ -1973,7 +2023,7 @@ fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> R
         let mut frontier = if resume {
             succinct_manifest.covered.clone()
         } else {
-            clear_manifest(&mut branch_meta, succinct.kind_id());
+            clear_manifest(&mut branch_meta, succinct_format.kind_id());
             clear_manifest(&mut branch_meta, bm25.kind_id());
             Vec::new()
         };
@@ -2000,6 +2050,7 @@ fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> R
             "indexing {} uncovered commit(s) as logical LSM leaves…",
             commits.len()
         );
+        let succinct = common::archive_succinct_rollup();
         for (i, commit) in commits.iter().copied().enumerate() {
             if i == 0 {
                 eprintln!("  starting commit 1/{} ({commit:?})", commits.len());
@@ -2013,7 +2064,11 @@ fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> R
                 &mut branch_meta,
             )?;
             advance_coverage_frontier(&mut ws, &mut frontier, commit)?;
-            set_coverage(&mut branch_meta, succinct.kind_id(), frontier.clone());
+            set_coverage(
+                &mut branch_meta,
+                succinct_format.kind_id(),
+                frontier.clone(),
+            );
             set_coverage(&mut branch_meta, bm25.kind_id(), frontier.clone());
 
             let new_meta: Inline<Handle<SimpleArchive>> = repo

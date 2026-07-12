@@ -123,6 +123,10 @@ imagine = ["dep:mary", "mary/flux", "dep:image"]
 # on 2026-06-30). Weights load from a durable standalone pile (QWEN3TTS_PILE);
 # mary/speak = qwen3tts port + the pile persist/load seam.
 voice = ["dep:mary", "mary/speak"]
+# Opt-in WGPU acceleration for large SuccinctArchive LSM carries. The normal
+# archive binary remains GPU-free; enabling this feature selects the reusable
+# CubeCL 0.9 WGPU backend with canonical CPU fallback.
+gpu-succinct = ["dep:triblespace-gpu", "triblespace-gpu/wgpu"]
 
 [dependencies]
 # Core: every CLI faculty depends on these.
@@ -133,6 +137,7 @@ hifitime = "4.2.3"
 rand_core = "0.6.4"
 triblespace = { version = "0.47", path = "../triblespace-rs" }
 triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
+triblespace-gpu = { version = "0.47.0", path = "../triblespace-rs/triblespace-gpu", optional = true, default-features = false }
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).
 anybytes = "0.20"           # files
