@@ -224,7 +224,48 @@ fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
             "unknown person label '{label}' (run playground/migrations/relations_backfill_norm.rs for older piles)"
         ),
         1 => Ok(matches[0]),
-        _ => bail!("multiple people match label '{label}'"),
+        _ => bail!(
+            "multiple people match label '{label}': {}",
+            matches.iter().map(|id| format!("{id:x}")).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Resolve a message RECIPIENT: a person or a group. On an exact-label tie
+/// between a group and person aliases, the group wins — addressing a
+/// broadcast set by its name is virtually always the intent (e.g. the
+/// `liora` group vs. stray personal aliases). Ties among multiple groups
+/// or with no group stay hard errors, listing the claimants.
+fn resolve_recipient_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
+    let trimmed = input.trim();
+    if let Some(id) = Id::from_hex(trimmed) {
+        return Ok(id);
+    }
+    let label = normalize_label(trimmed)?;
+    let key = normalize_lookup_key(trimmed)?;
+    let matches = resolve_normalized_person_matches(relations_space, &key);
+
+    match matches.len() {
+        0 => bail!(
+            "unknown recipient label '{label}' (run playground/migrations/relations_backfill_norm.rs for older piles)"
+        ),
+        1 => Ok(matches[0]),
+        _ => {
+            let groups: Vec<Id> = matches
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    exists!(pattern!(relations_space, [{ id @ metadata::tag: &KIND_GROUP }]))
+                })
+                .collect();
+            if groups.len() == 1 {
+                return Ok(groups[0]);
+            }
+            bail!(
+                "multiple recipients match label '{label}': {}",
+                matches.iter().map(|id| format!("{id:x}")).collect::<Vec<_>>().join(", ")
+            )
+        }
     }
 }
 
@@ -331,7 +372,7 @@ fn cmd_send(
     with_repo(pile, |repo| {
         let (relations_space, _relations_ws) = load_relations(repo, relations_branch_id)?;
         let from_id = resolve_person_id(&relations_space, &from)?;
-        let to_id = resolve_person_id(&relations_space, &to)?;
+        let to_id = resolve_recipient_id(&relations_space, &to)?;
 
         let mut ws = repo
             .pull(branch_id)
