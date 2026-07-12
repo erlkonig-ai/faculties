@@ -97,10 +97,13 @@ force-exits pathological cases. Fail-open throughout: no
 
 == Codex
 
-Two artifacts (liora-gpt's work, faculties `0f4acbf`): the
-project-root `.codex/hooks.json`, which wires *SessionStart*
+Two artifacts (liora-gpt's work, faculties `0f4acbf`, extended
+with lossless poll peeking in `dd3d692`): the project-root
+`.codex/hooks.json`, which wires *SessionStart*
 (`startup|resume|clear|compact`) →
-`faculties/hooks/codex/orient_session_start.sh` and *Stop* →
+`faculties/hooks/codex/orient_session_start.sh`,
+*UserPromptSubmit* →
+`faculties/hooks/codex/orient_prompt_submit.sh`, and *Stop* →
 `faculties/hooks/codex/orient_stop.sh`; and a "Watcher First"
 block at the *top* of `AGENTS.md` stating the convention in
 prose: launch
@@ -122,6 +125,15 @@ for exactly one automatic continuation (it greps the input
 for `"stop_hook_active": true`), then on a second failed Stop
 surfaces a visible `systemMessage` and lets the turn end —
 no infinite loop on a missing binary.
+
+Codex currently fires `UserPromptSubmit` hooks for root and
+subagents alike without exposing which one fired
+(openai/codex#16226). The prompt hook therefore uses
+`orient poll --peek`: it reports the same directed news but
+never advances or initializes the `liora-gpt` checkpoint. A
+worker may see repeated news, but cannot steal it from the
+root watcher. The hook exits silently when quiet and wraps
+news as `hookSpecificOutput.additionalContext` when present.
 
 *Trust caveat*: Codex treats project hooks as untrusted on
 first sight (hash-trusted). JP must "Trust all and continue"
