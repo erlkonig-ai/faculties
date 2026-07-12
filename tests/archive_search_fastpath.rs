@@ -7,7 +7,8 @@
 //!    than checking out the raw archive.
 //! 2. `archive index` replays source commits into Succinct + BM25 LSM leaves.
 //! 3. `archive list --limit N` returns the newest N messages from the
-//!    Succinct union, with bounded selection memory and no source checkout.
+//!    Succinct union by k-way merging reverse `created_at` AVE cursors, with
+//!    bounded selection work and no source checkout.
 //! 4. `archive search <term>` returns exactly the messages whose content
 //!    contains `<term>`, BM25-ranked, with each hit's author + content
 //!    snippet resolved through the cross-segment Succinct union and per-hit
@@ -23,6 +24,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
@@ -45,6 +47,8 @@ use triblespace_search::index_bm25::Bm25Rollup;
 /// `CLAUDE_JOB_TMP` is set; otherwise falls back to the system temp dir.
 /// Never a real pile.
 fn temp_pile_path() -> PathBuf {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
     let dir = std::env::var("CLAUDE_JOB_TMP")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
@@ -53,9 +57,10 @@ fn temp_pile_path() -> PathBuf {
         .unwrap()
         .as_nanos();
     dir.join(format!(
-        "faculties-archive-test-{}-{}.pile",
+        "faculties-archive-test-{}-{}-{}.pile",
         std::process::id(),
-        nanos
+        nanos,
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
@@ -122,6 +127,19 @@ fn bm25_fast_path_resolves_content_without_checkout() {
                 metadata::created_at: created_at,
             };
         }
+
+        // A newer timestamped non-message must not consume the result limit.
+        // The AVE cursor intentionally sees it first, then the bound union
+        // query rejects it before selecting H and G.
+        let timestamped_non_message = *fucid();
+        let when = Epoch::from_gregorian_tai(2026, 1, 1, 0, 1, 0, 0);
+        let created_at: Inline<inlineencodings::NsTAIInterval> =
+            (when, when).try_to_inline().unwrap();
+        change += entity! { ExclusiveId::force_ref(&timestamped_non_message) @
+            metadata::tag: archive::kind_author,
+            metadata::created_at: created_at,
+        };
+
         ws.commit(change.clone(), "stage synthetic archive");
         repo.push(&mut ws).expect("push");
 

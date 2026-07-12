@@ -35,11 +35,13 @@ All notable changes to this project will be documented in this file.
   accelerator errors retry on CPU before any manifest replacement.
 - **Archive list and search are indexed-only reads.** `archive list` now
   validates and attaches the branch-head Succinct manifest instead of checking
-  out the entire raw archive, keeps only a size-`--limit` newest-message heap,
-  and fetches author/content blobs only for those winners. Missing or stale
-  coverage fails with an `archive index` repair hint. The archive-scale
-  substring `search --exact` / `--case-sensitive` escape hatch is removed;
-  search never silently or explicitly falls back to a full checkout.
+  out the entire raw archive, k-way merges each segment's reverse
+  `created_at` AVE cursor, and stops after validating `--limit` complete
+  messages. Author/content blobs are fetched only for those winners. Missing
+  or stale coverage fails with an `archive index` repair hint. The
+  archive-scale substring `search --exact` / `--case-sensitive` escape hatch
+  is removed; search never silently or explicitly falls back to a full
+  checkout.
 - **Archive and memory BM25 search can retrieve standalone Unicode
   symbols.** The shared tokenizer now indexes non-ASCII symbol graphemes,
   so queries such as emoji take the normal indexed path instead of yielding

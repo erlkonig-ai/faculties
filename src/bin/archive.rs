@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::io::{BufRead, Read};
 use std::num::NonZeroUsize;
@@ -1040,31 +1039,10 @@ fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
 
 #[derive(Clone, Copy, Debug)]
 struct RecentMessage {
-    key: i128,
     message_id: Id,
     author_id: Id,
     content_handle: Inline<Handle<LongString>>,
     created_at: Inline<NsTAIInterval>,
-}
-
-impl PartialEq for RecentMessage {
-    fn eq(&self, other: &Self) -> bool {
-        (self.key, self.message_id) == (other.key, other.message_id)
-    }
-}
-
-impl Eq for RecentMessage {}
-
-impl PartialOrd for RecentMessage {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for RecentMessage {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        (self.key, self.message_id).cmp(&(other.key, other.message_id))
-    }
 }
 
 fn load_longstring(
@@ -1772,11 +1750,11 @@ fn read_archive_branch_snapshot(
 
 /// List recent messages from the certified Succinct LSM snapshot.
 ///
-/// This path deliberately has no raw-repository fallback. It retains only the
-/// newest `limit` records while scanning the compact index, so `--limit`
-/// bounds result-selection memory even though the current index has no
-/// chronological range cursor yet. Message and author blobs are fetched only
-/// for the selected rows.
+/// This path deliberately has no raw-repository fallback. Each segment walks
+/// its fixed-`created_at` AVE slice backward; a decoded k-way max merge then
+/// validates candidates against the logical union until `limit` complete
+/// messages have been found. Message and author blobs are fetched only for
+/// those selected rows.
 fn run_list_standalone(
     mut repo: common::Repo,
     pile_path: &Path,
@@ -1813,41 +1791,65 @@ fn run_list_standalone(
         let succinct = SuccinctRollup::union(&segments);
 
         let select_start = Instant::now();
-        let mut scanned = 0usize;
-        let mut recent = BinaryHeap::new();
+        let mut records = Vec::with_capacity(limit);
+        let mut candidates_examined = 0usize;
+        let mut duplicates_skipped = 0usize;
         if limit != 0 {
-            for (message_id, author_id, content_handle, created_at) in find!(
-                (
-                    message: Id,
-                    author: Id,
-                    content: Inline<Handle<LongString>>,
-                    created_at: Inline<NsTAIInterval>
-                ),
-                pattern!(&succinct, [{
-                    ?message @
-                        common::metadata::tag: common::archive::kind_message,
-                        common::archive::author: ?author,
-                        common::archive::content: ?content,
-                        common::metadata::created_at: ?created_at,
-                }])
-            ) {
-                scanned += 1;
-                recent.push(Reverse(RecentMessage {
-                    key: interval_key(created_at),
+            let created_at_attribute = common::metadata::created_at.id();
+            let mut cursors: Vec<_> = segments
+                .iter()
+                .map(|segment| {
+                    segment
+                        .iter_attribute_value_entities(&created_at_attribute)
+                        .rev()
+                })
+                .collect();
+            let mut heads = BinaryHeap::new();
+            for (segment_index, cursor) in cursors.iter_mut().enumerate() {
+                if let Some((created_at, message_id)) = cursor.next() {
+                    heads.push((created_at, message_id, segment_index));
+                }
+            }
+
+            let mut seen = HashSet::new();
+            while records.len() < limit {
+                let Some((created_at_raw, message_id, segment_index)) = heads.pop() else {
+                    break;
+                };
+                if let Some((next_created_at, next_message_id)) = cursors[segment_index].next() {
+                    heads.push((next_created_at, next_message_id, segment_index));
+                }
+                if !seen.insert((created_at_raw, message_id)) {
+                    duplicates_skipped += 1;
+                    continue;
+                }
+                candidates_examined += 1;
+
+                let created_at = Inline::<NsTAIInterval>::new(created_at_raw);
+                let Some((author_id, content_handle)) = find!(
+                    (author: Id, content: Inline<Handle<LongString>>),
+                    pattern!(&succinct, [{
+                        message_id @
+                            common::metadata::tag: common::archive::kind_message,
+                            common::archive::author: ?author,
+                            common::archive::content: ?content,
+                            common::metadata::created_at: created_at,
+                    }])
+                )
+                .next() else {
+                    continue;
+                };
+                records.push(RecentMessage {
                     message_id,
                     author_id,
                     content_handle,
                     created_at,
-                }));
-                if recent.len() > limit {
-                    recent.pop();
-                }
+                });
             }
         }
-        let mut records: Vec<_> = recent.into_iter().map(|Reverse(record)| record).collect();
-        records.sort_unstable_by(|a, b| b.cmp(a));
         tracing::info!(
-            scanned,
+            candidates_examined,
+            duplicates_skipped,
             selected = records.len(),
             elapsed_ms = select_start.elapsed().as_millis() as u64,
             "recent archive messages selected"
