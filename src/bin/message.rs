@@ -74,15 +74,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send a message
+    /// Send a message as $PERSONA (override the sender with --from)
     Send {
-        /// Sender label.
-        from: String,
-        /// Receiver label.
+        /// Receiver label (person or group).
         to: String,
         /// Message text.
         #[arg(value_name = "TEXT", help = "Message text. Use @path for file input or @- for stdin.")]
         text: String,
+        /// Sender label. Defaults to $PERSONA; pass explicitly for
+        /// deliberate cross-persona sends or shells without PERSONA.
+        /// There is intentionally no FROM positional — deriving the
+        /// sender makes the swapped-arguments bug (recipient in the
+        /// FROM slot, message lands in the wrong outbox and the real
+        /// recipient's watcher never fires) structurally impossible.
+        #[arg(long, env = "PERSONA", value_name = "LABEL")]
+        from: Option<String>,
     },
     /// List recent messages (latest first)
     List {
@@ -604,7 +610,18 @@ fn main() -> Result<()> {
     })?;
 
     match cmd {
-        Command::Send { text, from, to } => {
+        Command::Send { to, text, from } => {
+            // Sender derivation: --from wins, else $PERSONA (clap env
+            // fallback). A set-but-empty PERSONA counts as unset.
+            let Some(from) = from
+                .map(|f| f.trim().to_string())
+                .filter(|f| !f.is_empty())
+            else {
+                bail!(
+                    "no sender: set $PERSONA or pass --from <label>\n\
+                     usage: message send <TO> <TEXT> [--from <LABEL>]"
+                );
+            };
             let text = load_value_or_file(&text, "message text")?;
             cmd_send(
                 &cli.pile,

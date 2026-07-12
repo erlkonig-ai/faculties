@@ -81,6 +81,11 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
     },
+    /// Non-blocking news check for per-turn hooks: if there is directed
+    /// news since the persona's checkpoint, print the same terse report
+    /// `wait` prints (News: reasons + new message bodies) and advance the
+    /// checkpoint; otherwise print nothing and exit 0
+    Poll,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1197,6 +1202,133 @@ fn print_news_detail(
     Ok(())
 }
 
+/// Outcome of one shot of the wait fire-path (`check_news_once`).
+enum NewsCheck {
+    /// News was printed tersely and the checkpoint advanced.
+    Fired,
+    /// A checkpoint exists and nothing is new. Carries the freshly
+    /// loaded view so `wait` can use it as its loop baseline.
+    Quiet(WatchedView),
+    /// No checkpoint for this persona yet — the caller decides how to
+    /// establish the baseline (`wait` loops on the view; `poll` saves
+    /// it silently).
+    NoCheckpoint(WatchedView),
+}
+
+/// One shot of the wait fire-path for a persona: load the current
+/// watched view, diff it against the persona's last checkpoint, and if
+/// there is news print the terse report (`News:` reasons + the novel
+/// message bodies / zooids) and advance the checkpoint. Shared by
+/// `wait` (pre-loop check) and `poll` (the whole command) — one code
+/// path, blocking vs non-blocking only in the caller.
+fn check_news_once(
+    repo: &mut Repository<Pile>,
+    persona_id: Id,
+    heads: &WatchedHeads,
+    local_branch_id: Id,
+    compass_branch_id: Id,
+    relations_branch_id: Id,
+    orient_state_branch_id: Id,
+) -> Result<NewsCheck> {
+    let view = load_watched_view(
+        repo,
+        persona_id,
+        local_branch_id,
+        compass_branch_id,
+        relations_branch_id,
+    )?;
+    let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, persona_id)? else {
+        return Ok(NewsCheck::NoCheckpoint(view));
+    };
+    let reasons = view_news(&seen, &view, persona_id);
+    if reasons.is_empty() {
+        return Ok(NewsCheck::Quiet(view));
+    }
+    for reason in &reasons {
+        println!("News: {reason}");
+    }
+    print_news_detail(repo, &seen, &view, local_branch_id, relations_branch_id)?;
+    // Advance the checkpoint — the terse path skips cmd_show, which is
+    // what normally saves it. Without this the checkpoint never moves
+    // and every re-arm / next poll instantly re-fires on the same news.
+    save_checkpoint_heads(
+        repo,
+        orient_state_branch_id,
+        heads,
+        Some((persona_id, &view)),
+    )?;
+    Ok(NewsCheck::Fired)
+}
+
+/// One-shot, non-blocking `wait`: report news since the persona's
+/// checkpoint tersely, or print nothing and exit 0. Meant for per-turn
+/// harness hooks (UserPromptSubmit and friends) so busy sessions
+/// passively ingest colony news at every turn boundary, while `wait`
+/// keeps its job of waking idle ones.
+fn cmd_poll(pile: &Path, persona: Option<&str>) -> Result<()> {
+    with_repo(pile, |repo| {
+        let compass_branch_id = repo
+            .ensure_branch("compass", None)
+            .map_err(|e| anyhow!("ensure compass branch: {e:?}"))?;
+        let local_branch_id = repo
+            .ensure_branch("message", None)
+            .map_err(|e| anyhow!("ensure message branch: {e:?}"))?;
+        let relations_branch_id = repo
+            .ensure_branch("relations", None)
+            .map_err(|e| anyhow!("ensure relations branch: {e:?}"))?;
+        let orient_state_branch_id = repo
+            .ensure_branch("orient-state", None)
+            .map_err(|e| anyhow!("ensure orient-state branch: {e:?}"))?;
+
+        let Some(input) = persona else {
+            bail!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
+        };
+        let persona_id = {
+            let mut relations_ws = repo
+                .pull(relations_branch_id)
+                .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
+            let relations_space = relations_ws
+                .checkout(..)
+                .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+            resolve_persona(&relations_space, input)?
+        };
+
+        let heads = load_watched_heads(
+            repo,
+            local_branch_id,
+            compass_branch_id,
+            relations_branch_id,
+        )?;
+        match check_news_once(
+            repo,
+            persona_id,
+            &heads,
+            local_branch_id,
+            compass_branch_id,
+            relations_branch_id,
+            orient_state_branch_id,
+        )? {
+            // News printed + checkpoint advanced inside the shared path.
+            NewsCheck::Fired => {}
+            // No news: print nothing, write nothing.
+            NewsCheck::Quiet(_) => {}
+            // First poll for this persona: establish a baseline silently.
+            // Dumping "everything currently unread" is a snapshot's job
+            // (`orient show`), not a turn-boundary hook's; subsequent
+            // polls diff against this checkpoint.
+            NewsCheck::NoCheckpoint(view) => {
+                save_checkpoint_heads(
+                    repo,
+                    orient_state_branch_id,
+                    &heads,
+                    Some((persona_id, &view)),
+                )?;
+            }
+        }
+        Ok(())
+    })
+}
+
 fn cmd_wait(
     pile: &Path,
     persona: Option<&str>,
@@ -1245,36 +1377,18 @@ fn cmd_wait(
         };
 
         let mut baseline_view = match persona_id {
-            Some(pid) => {
-                let view = load_watched_view(
-                    repo,
-                    pid,
-                    local_branch_id,
-                    compass_branch_id,
-                    relations_branch_id,
-                )?;
-                if let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, pid)? {
-                    let reasons = view_news(&seen, &view, pid);
-                    if !reasons.is_empty() {
-                        for reason in &reasons {
-                            println!("News: {reason}");
-                        }
-                        print_news_detail(repo, &seen, &view, local_branch_id, relations_branch_id)?;
-                        // Advance the checkpoint — the terse path skips
-                        // cmd_show, which is what normally saves it. Without
-                        // this the checkpoint never moves and every re-arm
-                        // instantly re-fires on the same news.
-                        save_checkpoint_heads(
-                            repo,
-                            orient_state_branch_id,
-                            &baseline_heads,
-                            Some((pid, &view)),
-                        )?;
-                        return Ok((true, true, true));
-                    }
-                }
-                Some(view)
-            }
+            Some(pid) => match check_news_once(
+                repo,
+                pid,
+                &baseline_heads,
+                local_branch_id,
+                compass_branch_id,
+                relations_branch_id,
+                orient_state_branch_id,
+            )? {
+                NewsCheck::Fired => return Ok((true, true, true)),
+                NewsCheck::Quiet(view) | NewsCheck::NoCheckpoint(view) => Some(view),
+            },
             None => {
                 if let Some(last_seen) = load_checkpoint_heads(repo, orient_state_branch_id)? {
                     if baseline_heads != last_seen {
@@ -1445,5 +1559,6 @@ fn main() -> Result<()> {
             todo_limit,
             poll_ms,
         ),
+        Command::Poll => cmd_poll(&cli.pile, cli.persona.as_deref()),
     }
 }
