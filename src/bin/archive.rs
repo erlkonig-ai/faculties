@@ -14,9 +14,9 @@ use itertools::Itertools;
 use tracing::info_span;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use triblespace::core::patch::PATCH;
 use triblespace::core::repo::index_home::{
-    clear_manifest, replace_manifest, set_coverage, IndexHome, IndexKind, Manifest,
-    SuccinctRollup,
+    set_index_frontier, strip_recipe_manifest, IndexHome, IndexKind, Manifest, SuccinctRollup,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{
@@ -54,15 +54,14 @@ mod common {
     use rand_core::OsRng;
     use rayon::ThreadPoolBuilder;
     use rayon::prelude::*;
-    
+
     use tracing::info_span;
-    use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::Blob;
     use triblespace::core::id::ExclusiveId;
     pub use triblespace::core::metadata;
     use triblespace::core::repo::index_home::{
-        append_prebuilt_segment, append_segment, set_coverage, IndexKind, Manifest,
-        SuccinctRollup,
+        append_prepared_range, set_index_frontier, validate_monotone_batch, CommitRange, IndexKind,
+        Manifest, PreparedSuccinctArtifact, SuccinctRollup,
     };
     use triblespace::core::repo::pile::{Pile, PileReader};
     use triblespace::core::repo::CommitBatch;
@@ -71,6 +70,7 @@ mod common {
     use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
     use triblespace::prelude::*;
     use triblespace_search::index_bm25::Bm25Rollup;
+    use triblespace_search::succinct::SuccinctBM25Blob;
 
     #[cfg(feature = "gpu-succinct")]
     use triblespace::core::repo::index_home::AcceleratedSuccinctRollup;
@@ -222,45 +222,52 @@ mod common {
         head_meta: &mut TribleSet,
     ) -> Result<()>
     where
-        K: IndexKind,
+        K: IndexKind<PreparedArtifact = PreparedSuccinctArtifact>,
     {
         let content_attr = archive::content.id();
-        let bm25_reader = storage
+        let reader = storage
             .reader()
-            .map_err(|err| anyhow!("open BM25 content reader: {err:?}"))?;
-        let bm25 = Bm25Rollup::new(bm25_reader, content_attr);
-
-        for kind in [succinct.kind_id(), bm25.kind_id()] {
-            let manifest = Manifest::from_tribles(head_meta, kind);
-            if !manifest.covers_head(batch.base_head) {
-                return Err(anyhow!(
-                    "archive index {kind:x} is stale at {:?}, expected base {:?}; run `archive index`",
-                    manifest.covered,
-                    batch.base_head
-                ));
-            }
+            .map_err(|err| anyhow!("open archive index reader: {err:?}"))?;
+        validate_monotone_batch(&reader, batch.base_head, batch.new_head)
+            .map_err(|err| anyhow!("validate monotone archive batch: {err}"))?;
+        let bm25 = Bm25Rollup::new(reader.clone(), content_attr);
+        let succinct_manifest = Manifest::from_tribles(head_meta, &reader, succinct)
+            .map_err(|err| anyhow!("parse Succinct manifest: {err}"))?;
+        if !succinct_manifest.claims_head(batch.base_head) {
+            return Err(anyhow!(
+                "archive Succinct index is stale at {:?}, expected base {:?}; run `archive index`",
+                succinct_manifest.frontier(),
+                batch.base_head
+            ));
         }
+        let bm25_manifest = Manifest::from_tribles(head_meta, &reader, &bm25)
+            .map_err(|err| anyhow!("parse BM25 manifest: {err}"))?;
+        if !bm25_manifest.claims_head(batch.base_head) {
+            return Err(anyhow!(
+                "archive BM25 index is stale at {:?}, expected base {:?}; run `archive index`",
+                bm25_manifest.frontier(),
+                batch.base_head
+            ));
+        }
+        drop((succinct_manifest, bm25_manifest));
 
         for commit in &batch.commits {
-            index_archive_commit(storage, *commit, succinct, &bm25, head_meta)?;
+            let prepared = prepare_archive_commit(reader.clone(), *commit, true, true)?;
+            publish_archive_commit(storage, prepared, succinct, &bm25, head_meta)?;
         }
 
-        // Both recipes live in one hook scratch set, so these certificates
-        // and both manifests either land together in the branch CAS or not at
-        // all. Contentless merge commits still advance the certificates.
-        set_coverage(head_meta, succinct.kind_id(), vec![batch.new_head]);
-        set_coverage(head_meta, bm25.kind_id(), vec![batch.new_head]);
+        set_index_frontier(storage, succinct, head_meta, vec![batch.new_head])
+            .map_err(|err| anyhow!("advance Succinct index frontier: {err}"))?;
+        set_index_frontier(storage, &bm25, head_meta, vec![batch.new_head])
+            .map_err(|err| anyhow!("advance BM25 index frontier: {err}"))?;
         Ok(())
-    }
-
-    pub(super) struct PreparedIndexShard {
-        pub(super) succinct: Blob<UnknownBlob>,
-        pub(super) bm25: Option<Blob<UnknownBlob>>,
     }
 
     pub(super) struct PreparedArchiveCommit {
         pub(super) commit: CommitHandle,
-        pub(super) shards: Vec<PreparedIndexShard>,
+        pub(super) succinct: Option<Vec<PreparedSuccinctArtifact>>,
+        pub(super) bm25: Option<Vec<Blob<SuccinctBM25Blob>>>,
+        pub(super) physical_shards: usize,
         pub(super) tribles: usize,
         pub(super) elapsed: std::time::Duration,
     }
@@ -268,6 +275,7 @@ mod common {
     fn visit_archive_commit_shards(
         reader: &PileReader,
         commit: CommitHandle,
+        collect_content: bool,
         mut visit: impl FnMut(TribleSet, TribleSet) -> Result<()>,
     ) -> Result<usize> {
         let commit_meta: TribleSet = reader
@@ -303,18 +311,20 @@ mod common {
                 .map_err(|err| anyhow!("decode commit {commit:?} shard: {err}"))?;
 
             let mut content = TribleSet::new();
-            for trible in chunk
-                .iter()
-                .filter(|trible| *trible.a() == archive::content.id())
-            {
-                let handle = *trible.v::<Handle<LongString>>();
-                let _: View<str> = reader.get(handle).map_err(|err| {
-                    anyhow!(
-                        "archive content {:?} in commit {commit:?} is unreadable: {err:?}",
-                        handle.raw
-                    )
-                })?;
-                content.insert(trible);
+            if collect_content {
+                for trible in chunk
+                    .iter()
+                    .filter(|trible| *trible.a() == archive::content.id())
+                {
+                    let handle = *trible.v::<Handle<LongString>>();
+                    let _: View<str> = reader.get(handle).map_err(|err| {
+                        anyhow!(
+                            "archive content {:?} in commit {commit:?} is unreadable: {err:?}",
+                            handle.raw
+                        )
+                    })?;
+                    content.insert(trible);
+                }
             }
             visit(chunk, content)?;
         }
@@ -331,23 +341,39 @@ mod common {
     pub(super) fn prepare_archive_commit(
         reader: PileReader,
         commit: CommitHandle,
+        prepare_succinct: bool,
+        prepare_bm25: bool,
     ) -> Result<PreparedArchiveCommit> {
         let started = std::time::Instant::now();
         let succinct = SuccinctRollup::new();
         let bm25 = Bm25Rollup::new(reader.clone(), archive::content.id());
-        let mut shards = Vec::new();
-        let trible_count = visit_archive_commit_shards(&reader, commit, |chunk, content| {
-            let bm25 = (!content.is_empty()).then(|| bm25.build(&content));
-            shards.push(PreparedIndexShard {
-                succinct: succinct.build(&chunk),
-                bm25,
-            });
-            Ok(())
-        })?;
+        let mut succinct_artifacts = prepare_succinct.then(Vec::new);
+        let mut bm25_artifacts = prepare_bm25.then(Vec::new);
+        let mut physical_shards = 0usize;
+        let trible_count =
+            visit_archive_commit_shards(&reader, commit, prepare_bm25, |chunk, content| {
+                physical_shards += 1;
+                if let Some(artifacts) = succinct_artifacts.as_mut() {
+                    artifacts.extend(
+                        succinct
+                            .build(&chunk)
+                            .map_err(|err| anyhow!("build Succinct shard: {err}"))?,
+                    );
+                }
+                if let Some(artifacts) = bm25_artifacts.as_mut() {
+                    artifacts.extend(
+                        bm25.build(&content)
+                            .map_err(|err| anyhow!("build BM25 shard: {err}"))?,
+                    );
+                }
+                Ok(())
+            })?;
 
         Ok(PreparedArchiveCommit {
             commit,
-            shards,
+            succinct: succinct_artifacts,
+            bm25: bm25_artifacts,
+            physical_shards,
             tribles: trible_count,
             elapsed: started.elapsed(),
         })
@@ -365,44 +391,17 @@ mod common {
     ) -> Result<()>
     where
         R: triblespace::core::repo::BlobStoreGet,
-        K: IndexKind,
+        K: IndexKind<PreparedArtifact = PreparedSuccinctArtifact>,
     {
-        for shard in prepared.shards {
-            append_prebuilt_segment(storage, succinct, shard.succinct, head_meta).map_err(
-                |err| anyhow!("append Succinct leaf for {:?}: {err}", prepared.commit),
-            )?;
-            if let Some(segment) = shard.bm25 {
-                append_prebuilt_segment(storage, bm25, segment, head_meta).map_err(|err| {
-                    anyhow!("append BM25 leaf for {:?}: {err}", prepared.commit)
-                })?;
-            }
+        let range = CommitRange::leaf(prepared.commit);
+        if let Some(artifacts) = prepared.succinct {
+            append_prepared_range(storage, succinct, range.clone(), artifacts, head_meta)
+                .map_err(|err| anyhow!("append Succinct range for {:?}: {err}", prepared.commit))?;
         }
-        Ok(())
-    }
-
-    pub(super) fn index_archive_commit<R, K>(
-        storage: &mut Pile,
-        commit: CommitHandle,
-        succinct: &K,
-        bm25: &Bm25Rollup<R>,
-        head_meta: &mut TribleSet,
-    ) -> Result<()>
-    where
-        R: triblespace::core::repo::BlobStoreGet,
-        K: IndexKind,
-    {
-        let reader = storage
-            .reader()
-            .map_err(|err| anyhow!("open commit reader: {err:?}"))?;
-        visit_archive_commit_shards(&reader, commit, |chunk, content| {
-            append_segment(storage, succinct, &chunk, head_meta)
-                .map_err(|err| anyhow!("append Succinct leaf for {commit:?}: {err}"))?;
-            if !content.is_empty() {
-                append_segment(storage, bm25, &content, head_meta)
-                    .map_err(|err| anyhow!("append BM25 leaf for {commit:?}: {err}"))?;
-            }
-            Ok(())
-        })?;
+        if let Some(artifacts) = prepared.bm25 {
+            append_prepared_range(storage, bm25, range, artifacts, head_meta)
+                .map_err(|err| anyhow!("append BM25 range for {:?}: {err}", prepared.commit))?;
+        }
         Ok(())
     }
 
@@ -739,10 +738,8 @@ enum Command {
         limit: usize,
     },
     /// Build or repair the Succinct and BM25 LSM indexes.
-    /// Replays only uncovered commits and checkpoints after each one, so an
-    /// interrupted run resumes without rebuilding already-covered history.
-    /// Legacy Succinct segments are upgraded in place to persisted Rank9
-    /// sidecars, one manifest checkpoint at a time, without replaying facts.
+    /// Replays each recipe's uncovered commits and durably checkpoints after
+    /// every logical range, so interrupted runs resume independently.
     Index {
         /// Maximum source commits being prepared or waiting for ordered
         /// publication. Defaults to the square root of the active Rayon
@@ -1856,17 +1853,19 @@ fn run_list_standalone(
     let res = (|| -> Result<()> {
         let (branch_meta, source_head) = read_archive_branch_snapshot(&mut repo, branch_id)?;
         let kind = SuccinctRollup::new();
-        let manifest = Manifest::from_tribles(&branch_meta, kind.kind_id());
-        if !manifest.covers_head(source_head) {
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow!("open Succinct manifest reader: {e:?}"))?;
+        let manifest = Manifest::from_tribles(&branch_meta, &reader, &kind)
+            .map_err(|e| anyhow!("parse Succinct manifest: {e}"))?;
+        if !manifest.claims_head(source_head) {
             bail!(
-                "Succinct index {} is stale at {:?}, source HEAD is {:?}; run `archive index`",
-                SuccinctRollup::KIND_ID_HEX,
-                manifest.covered,
+                "Succinct index {:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
+                manifest.recipe(),
+                manifest.frontier(),
                 source_head
             );
-        }
-        if manifest.segments.is_empty() {
-            bail!("no Succinct archive segments on this pile yet — run `archive index`");
         }
 
         let attach_start = Instant::now();
@@ -1880,6 +1879,9 @@ fn run_list_standalone(
             elapsed_ms = attach_start.elapsed().as_millis() as u64,
             "Succinct manifest and segments attached"
         );
+        if segments.is_empty() {
+            return Ok(());
+        }
         let succinct = SuccinctRollup::union(&segments);
 
         let select_start = Instant::now();
@@ -1995,17 +1997,19 @@ fn run_show_standalone(
     let res = (|| -> Result<()> {
         let (branch_meta, source_head) = read_archive_branch_snapshot(&mut repo, branch_id)?;
         let kind = SuccinctRollup::new();
-        let manifest = Manifest::from_tribles(&branch_meta, kind.kind_id());
-        if !manifest.covers_head(source_head) {
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow!("open Succinct manifest reader: {e:?}"))?;
+        let manifest = Manifest::from_tribles(&branch_meta, &reader, &kind)
+            .map_err(|e| anyhow!("parse Succinct manifest: {e}"))?;
+        if !manifest.claims_head(source_head) {
             bail!(
-                "Succinct index {} is stale at {:?}, source HEAD is {:?}; run `archive index`",
-                SuccinctRollup::KIND_ID_HEX,
-                manifest.covered,
+                "Succinct index {:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
+                manifest.recipe(),
+                manifest.frontier(),
                 source_head
             );
-        }
-        if manifest.segments.is_empty() {
-            bail!("no Succinct archive segments on this pile yet — run `archive index`");
         }
 
         let attach_start = Instant::now();
@@ -2019,6 +2023,9 @@ fn run_show_standalone(
             elapsed_ms = attach_start.elapsed().as_millis() as u64,
             "Succinct manifest and segments attached"
         );
+        if segments.is_empty() {
+            bail!("archive contains no indexed facts");
+        }
         let succinct = SuccinctRollup::union(&segments);
         let message_id = resolve_message_id(&succinct, &id)?;
 
@@ -2070,32 +2077,28 @@ fn run_search_standalone(
             .storage_mut()
             .reader()
             .map_err(|e| anyhow!("open pile reader: {e:?}"))?;
-        let kind = Bm25Rollup::new(reader, content_attr);
-        let bm25_kind = kind.kind_id();
-        let bm25_manifest = Manifest::from_tribles(&branch_meta, bm25_kind);
-        if !bm25_manifest.covers_head(source_head) {
+        let kind = Bm25Rollup::new(reader.clone(), content_attr);
+        let bm25_manifest = Manifest::from_tribles(&branch_meta, &reader, &kind)
+            .map_err(|e| anyhow!("parse BM25 manifest: {e}"))?;
+        if !bm25_manifest.claims_head(source_head) {
             bail!(
-                "BM25 index {bm25_kind:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
-                bm25_manifest.covered,
+                "BM25 index {:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
+                bm25_manifest.recipe(),
+                bm25_manifest.frontier(),
                 source_head
             );
         }
 
         let succinct_kind = SuccinctRollup::new();
-        let succinct_manifest = Manifest::from_tribles(&branch_meta, succinct_kind.kind_id());
-        if !succinct_manifest.covers_head(source_head) {
+        let succinct_manifest = Manifest::from_tribles(&branch_meta, &reader, &succinct_kind)
+            .map_err(|e| anyhow!("parse Succinct manifest: {e}"))?;
+        if !succinct_manifest.claims_head(source_head) {
             bail!(
-                "Succinct index {} is stale at {:?}, source HEAD is {:?}; run `archive index`",
-                SuccinctRollup::KIND_ID_HEX,
-                succinct_manifest.covered,
+                "Succinct index {:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
+                succinct_manifest.recipe(),
+                succinct_manifest.frontier(),
                 source_head
             );
-        }
-        if bm25_manifest.segments.is_empty() {
-            bail!("no BM25 search segments on this pile yet — run `archive index`");
-        }
-        if succinct_manifest.segments.is_empty() {
-            bail!("no Succinct archive segments on this pile yet — run `archive index`");
         }
 
         // 1. Attach only the BM25 handles from the validated snapshot.
@@ -2109,6 +2112,9 @@ fn run_search_standalone(
             elapsed_ms = index_attach_start.elapsed().as_millis() as u64,
             "BM25 manifest and segments attached"
         );
+        if segments.is_empty() {
+            return Ok(());
+        }
 
         // 2. Rank across the segment union (per-segment BM25; best score wins).
         let bm25_start = Instant::now();
@@ -2143,6 +2149,9 @@ fn run_search_standalone(
             elapsed_ms = succinct_attach_start.elapsed().as_millis() as u64,
             "Succinct manifest and segments attached"
         );
+        if succinct_segments.is_empty() {
+            bail!("BM25 returned hits but the paired Succinct recipe has no artifacts");
+        }
         let succinct = SuccinctRollup::union(&succinct_segments);
         let mut ws = repo
             .pull(branch_id)
@@ -2209,21 +2218,6 @@ fn run_search_standalone(
         (Ok(()), Err(err)) => Err(err),
         (Ok(()), Ok(())) => Ok(()),
     }
-}
-
-fn remove_legacy_rollup(set: &mut TribleSet) -> bool {
-    let mut old = TribleSet::new();
-    for trible in set
-        .iter()
-        .filter(|trible| *trible.a() == triblespace::core::repo::rollup.id())
-    {
-        old.insert(trible);
-    }
-    if old.is_empty() {
-        return false;
-    }
-    *set = set.difference(&old);
-    true
 }
 
 fn advance_coverage_frontier(
@@ -2504,592 +2498,100 @@ mod ordered_preparation_tests {
     }
 }
 
-#[cfg(test)]
-mod prebuilt_leaf_parity_tests {
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use ed25519_dalek::SigningKey;
-    use rand_core::OsRng;
-    use triblespace::core::repo::index_home::{
-        set_coverage, IndexKind, Manifest, SuccinctRollup,
-    };
-    use triblespace::core::repo::pile::Pile;
-    use triblespace::core::repo::{BlobStore, Repository};
-    use triblespace::prelude::blobencodings::LongString;
-    use triblespace::prelude::*;
-    use triblespace_search::index_bm25::Bm25Rollup;
-
-    use super::{common, run_ordered_preparation_pipeline};
-
-    fn temp_pile(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "archive-prebuilt-{label}-{}-{nanos}.pile",
-            std::process::id()
-        ))
-    }
-
-    fn build_source(path: &Path) -> Vec<common::CommitHandle> {
-        std::fs::File::create(path).unwrap();
-        let pile = Pile::open(path).unwrap();
-        let mut repo = Repository::new(
-            pile,
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        )
-        .unwrap();
-        let branch = *repo.create_branch("archive", None).unwrap();
-        let mut ws = repo.pull(branch).unwrap();
-        let mut commits = Vec::new();
-        for ordinal in 0..17 {
-            let message = *fucid();
-            let content = ws.put::<LongString, _>(format!("legacy parity document {ordinal}"));
-            let change: TribleSet = entity! { ExclusiveId::force_ref(&message) @
-                common::archive::content: content,
-            }
-            .into();
-            ws.commit(change, "source commit");
-            repo.push(&mut ws).unwrap();
-            commits.push(ws.head().unwrap());
-        }
-        repo.close().unwrap();
-        commits
-    }
-
-    type SegmentBytes = (u64, u64, [u8; 32], Vec<u8>);
-
-    fn finish_snapshot(
-        mut pile: Pile,
-        head: TribleSet,
-        kinds: [Id; 2],
-    ) -> (TribleSet, Vec<Vec<SegmentBytes>>) {
-        let reader = pile.reader().unwrap();
-        let segments = kinds
-            .into_iter()
-            .map(|kind| {
-                Manifest::from_tribles(&head, kind)
-                    .segments
-                    .into_iter()
-                    .map(|entry| {
-                        let blob: Blob<triblespace::core::blob::encodings::UnknownBlob> =
-                            reader.get(entry.blob).unwrap();
-                        (entry.level, entry.seq, entry.blob.raw, blob.bytes.to_vec())
-                    })
-                    .collect()
-            })
-            .collect();
-        drop(reader);
-        pile.close().unwrap();
-        (head, segments)
-    }
-
-    fn legacy_snapshot(
-        path: &Path,
-        commits: &[common::CommitHandle],
-    ) -> (TribleSet, Vec<Vec<SegmentBytes>>) {
-        let mut pile = Pile::open(path).unwrap();
-        pile.refresh().unwrap();
-        let succinct = SuccinctRollup::new();
-        let reader = pile.reader().unwrap();
-        let bm25 = Bm25Rollup::new(reader, common::archive::content.id());
-        let mut head = TribleSet::new();
-        for &commit in commits {
-            common::index_archive_commit(&mut pile, commit, &succinct, &bm25, &mut head).unwrap();
-        }
-        let covered = commits.last().copied().into_iter().collect();
-        set_coverage(&mut head, succinct.kind_id(), covered);
-        set_coverage(
-            &mut head,
-            bm25.kind_id(),
-            commits.last().copied().into_iter().collect(),
-        );
-        let kinds = [succinct.kind_id(), bm25.kind_id()];
-        drop(bm25);
-        finish_snapshot(pile, head, kinds)
-    }
-
-    fn prebuilt_window_one_snapshot(
-        path: &Path,
-        commits: &[common::CommitHandle],
-    ) -> (TribleSet, Vec<Vec<SegmentBytes>>) {
-        let mut pile = Pile::open(path).unwrap();
-        pile.refresh().unwrap();
-        let prepare_reader = pile.reader().unwrap();
-        let succinct = SuccinctRollup::new();
-        let bm25 = Bm25Rollup::new(prepare_reader.clone(), common::archive::content.id());
-        let mut head = TribleSet::new();
-        run_ordered_preparation_pipeline(
-            commits,
-            1,
-            |commit| common::prepare_archive_commit(prepare_reader.clone(), commit),
-            |_ordinal, _commit, prepared| {
-                common::publish_archive_commit(
-                    &mut pile,
-                    prepared,
-                    &succinct,
-                    &bm25,
-                    &mut head,
-                )
-            },
-        )
-        .unwrap();
-        let covered = commits.last().copied().into_iter().collect();
-        set_coverage(&mut head, succinct.kind_id(), covered);
-        set_coverage(
-            &mut head,
-            bm25.kind_id(),
-            commits.last().copied().into_iter().collect(),
-        );
-        let kinds = [succinct.kind_id(), bm25.kind_id()];
-        drop(bm25);
-        drop(prepare_reader);
-        finish_snapshot(pile, head, kinds)
-    }
-
-    #[test]
-    fn window_one_matches_literal_legacy_append_bytes_across_carries() {
-        let source = temp_pile("source");
-        let legacy = temp_pile("legacy");
-        let prebuilt = temp_pile("prebuilt");
-        let commits = build_source(&source);
-        std::fs::copy(&source, &legacy).unwrap();
-        std::fs::copy(&source, &prebuilt).unwrap();
-
-        assert_eq!(
-            legacy_snapshot(&legacy, &commits),
-            prebuilt_window_one_snapshot(&prebuilt, &commits)
-        );
-
-        for path in [source, legacy, prebuilt] {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// Validate a manifest without retaining every attached segment at once.
-///
-/// Legacy Succinct attachments build Rank9 directories in heap. Keeping the
-/// complete forest alive merely to answer "is it readable?" would duplicate
-/// the migration's peak working set, so validation deliberately drops each
-/// attachment before loading the next segment.
-fn validate_manifest_segments<K>(
+fn inspect_recipe_manifest<K>(
     storage: &mut Pile,
-    manifest: &Manifest,
+    branch_meta: &TribleSet,
+    reachable: &PATCH<32>,
     kind: &K,
-) -> Result<()>
+) -> Result<Vec<common::CommitHandle>>
 where
     K: IndexKind,
 {
     let reader = storage
         .reader()
-        .map_err(|err| anyhow!("open index validation reader: {err:?}"))?;
-    for entry in &manifest.segments {
-        let blob = reader.get(entry.blob).map_err(|err| {
-            anyhow!(
-                "load index segment level {} seq {}: {err:?}",
-                entry.level,
-                entry.seq
-            )
-        })?;
-        kind.try_attach(blob).map_err(|err| {
-            anyhow!(
-                "attach index segment level {} seq {}: {err}",
-                entry.level,
-                entry.seq
-            )
-        })?;
+        .map_err(|err| anyhow!("open typed manifest reader: {err:?}"))?;
+    let manifest = Manifest::from_tribles(branch_meta, &reader, kind)
+        .map_err(|err| anyhow!("parse typed manifest: {err}"))?;
+    if let Some(foreign) = manifest
+        .frontier()
+        .iter()
+        .find(|tip| reachable.get(&tip.raw).is_none())
+    {
+        bail!("certified frontier tip {foreign:?} is not an ancestor of target HEAD");
     }
-    Ok(())
-}
-
-/// Rewrite immutable segments one at a time and checkpoint each replacement
-/// with the branch pin's ordinary compare-and-swap.
-///
-/// The replacement blob is stored before the new branch metadata is
-/// published. An interruption can therefore leave an unreferenced blob for a
-/// later reachability compaction, but can never leave a manifest pointing at
-/// a partial payload. A rerun reads the already-checkpointed manifest and
-/// skips every unchanged segment.
-fn rewrite_manifest_segments_checkpointed<F>(
-    storage: &mut Pile,
-    branch_id: Id,
-    branch_meta_handle: &mut Inline<Handle<SimpleArchive>>,
-    branch_meta: &mut TribleSet,
-    kind: Id,
-    mut rewrite: F,
-) -> Result<usize>
-where
-    F: FnMut(
-        Blob<triblespace::core::blob::encodings::UnknownBlob>,
-    ) -> Result<(
-        Blob<triblespace::core::blob::encodings::UnknownBlob>,
-        bool,
-    )>,
-{
-    let mut manifest = Manifest::from_tribles(branch_meta, kind);
-    let segment_count = manifest.segments.len();
-    let mut rewritten = 0usize;
-
-    for position in 0..segment_count {
-        let entry = manifest.segments[position];
-        let blob: Blob<triblespace::core::blob::encodings::UnknownBlob> = storage
-            .reader()
-            .map_err(|err| anyhow!("open segment migration reader: {err:?}"))?
-            .get(entry.blob)
-            .map_err(|err| {
+    manifest
+        .audit_exact_cover(&reader)
+        .map_err(|err| anyhow!("audit exact commit-range cover: {err}"))?;
+    for range in manifest.ranges() {
+        for artifact in range.artifacts() {
+            kind.attach(&reader, artifact).map_err(|err| {
                 anyhow!(
-                    "load index segment level {} seq {}: {err:?}",
-                    entry.level,
-                    entry.seq
+                    "attach typed artifact from range {:?}: {err}",
+                    range.range()
                 )
             })?;
-        let (replacement, changed) = rewrite(blob).with_context(|| {
-            format!(
-                "rewrite index segment level {} seq {}",
-                entry.level, entry.seq
-            )
-        })?;
-        if !changed {
-            continue;
         }
+    }
+    Ok(manifest.frontier().to_vec())
+}
 
-        let replacement_handle = storage
-            .put(replacement)
-            .map_err(|err| anyhow!("store rewritten index segment: {err:?}"))?;
-        if replacement_handle == entry.blob {
-            bail!(
-                "segment rewriter reported a change for unchanged level {} seq {}",
-                entry.level,
-                entry.seq
+fn recover_recipe_frontier<K>(
+    storage: &mut Pile,
+    branch_meta: &mut TribleSet,
+    reachable: &PATCH<32>,
+    kind: &K,
+    label: &str,
+) -> Result<Vec<common::CommitHandle>>
+where
+    K: IndexKind,
+{
+    match inspect_recipe_manifest(storage, branch_meta, reachable, kind) {
+        Ok(frontier) => Ok(frontier),
+        Err(err) => {
+            let recipe = kind
+                .recipe_fragment()
+                .root()
+                .ok_or_else(|| anyhow!("{label} recipe has no stable root"))?;
+            eprintln!(
+                "discarding only the invalid {label} recipe {recipe:x}; it will be rebuilt: {err:#}"
             );
+            strip_recipe_manifest(branch_meta, recipe);
+            Ok(Vec::new())
         }
-        manifest.segments[position].blob = replacement_handle;
-        replace_manifest(branch_meta, kind, &manifest);
-
-        let new_meta: Inline<Handle<SimpleArchive>> = storage
-            .put(branch_meta.clone())
-            .map_err(|err| anyhow!("store rewritten index manifest: {err:?}"))?;
-        match storage
-            .update(branch_id, Some(*branch_meta_handle), Some(new_meta))
-            .map_err(|err| anyhow!("publish rewritten index manifest: {err:?}"))?
-        {
-            PushResult::Success() => {
-                *branch_meta_handle = new_meta;
-                // The blob and metadata puts must be durable before this pin
-                // replacement is advertised as a resumable checkpoint.
-                storage
-                    .flush()
-                    .map_err(|err| anyhow!("flush rewritten index checkpoint: {err:?}"))?;
-            }
-            PushResult::Conflict(_) => {
-                bail!(
-                    "archive branch changed during segment migration; rerun to resume from the last checkpoint"
-                )
-            }
-        }
-
-        rewritten += 1;
-        eprintln!(
-            "  …rewrote segment {}/{} (level {}, seq {}) and checkpointed it",
-            position + 1,
-            segment_count,
-            entry.level,
-            entry.seq
-        );
-    }
-
-    Ok(rewritten)
-}
-
-#[cfg(test)]
-mod rank9_manifest_migration_tests {
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use anybytes::Bytes;
-    use triblespace::core::blob::encodings::UnknownBlob;
-
-    use super::*;
-
-    fn temp_pile() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "archive-rank9-manifest-migration-{}-{nanos}.pile",
-            std::process::id()
-        ))
-    }
-
-    fn put_unknown(pile: &mut Pile, payload: &[u8]) -> Inline<Handle<UnknownBlob>> {
-        pile.put(Blob::<UnknownBlob>::new(Bytes::from_source(
-            payload.to_vec(),
-        )))
-        .unwrap()
-    }
-
-    fn payloads_by_seq(
-        pile: &mut Pile,
-        head: &TribleSet,
-        kind: Id,
-    ) -> Vec<(u64, u64, Vec<u8>)> {
-        let reader = pile.reader().unwrap();
-        Manifest::from_tribles(head, kind)
-            .segments
-            .into_iter()
-            .map(|entry| {
-                let blob: Blob<UnknownBlob> = reader.get(entry.blob).unwrap();
-                (entry.level, entry.seq, blob.bytes.as_ref().to_vec())
-            })
-            .collect()
-    }
-
-    #[test]
-    fn segment_rewrite_checkpoints_resume_and_preserve_manifest_state() {
-        let path = temp_pile();
-        std::fs::File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        let branch_id = *fucid();
-        let kind = *fucid();
-        let other_kind = *fucid();
-
-        let old_zero = put_unknown(&mut pile, b"old-zero");
-        let already_new = put_unknown(&mut pile, b"new-one");
-        let old_two = put_unknown(&mut pile, b"old-two");
-        let other_blob = put_unknown(&mut pile, b"other-kind");
-        let covered: Inline<Handle<SimpleArchive>> = pile.put(TribleSet::new()).unwrap();
-
-        let mut manifest = Manifest::default();
-        manifest.adopt_segment(old_zero, 0);
-        manifest.adopt_segment(already_new, 2);
-        manifest.adopt_segment(old_two, 0);
-        manifest.set_covered(vec![covered]);
-        let expected_shape: Vec<_> = manifest
-            .segments
-            .iter()
-            .map(|entry| (entry.level, entry.seq))
-            .collect();
-
-        let mut other_manifest = Manifest::default();
-        other_manifest.adopt_segment(other_blob, 7);
-        other_manifest.set_covered(vec![covered]);
-        let expected_other = other_manifest.to_tribles(other_kind);
-
-        let mut branch_meta = manifest.to_tribles(kind);
-        branch_meta += expected_other.clone();
-        let mut branch_meta_handle: Inline<Handle<SimpleArchive>> =
-            pile.put(branch_meta.clone()).unwrap();
-        assert!(matches!(
-            pile.update(branch_id, None, Some(branch_meta_handle)).unwrap(),
-            PushResult::Success()
-        ));
-
-        let mut old_seen = 0usize;
-        let interrupted = rewrite_manifest_segments_checkpointed(
-            &mut pile,
-            branch_id,
-            &mut branch_meta_handle,
-            &mut branch_meta,
-            kind,
-            |blob| {
-                if !blob.bytes.as_ref().starts_with(b"old-") {
-                    return Ok((blob, false));
-                }
-                old_seen += 1;
-                if old_seen == 2 {
-                    bail!("synthetic interruption");
-                }
-                let mut bytes = blob.bytes.as_ref().to_vec();
-                bytes[..3].copy_from_slice(b"new");
-                Ok((
-                    Blob::<UnknownBlob>::new(Bytes::from_source(bytes)),
-                    true,
-                ))
-            },
-        )
-        .unwrap_err();
-        assert!(format!("{interrupted:#}").contains("synthetic interruption"));
-        assert_eq!(pile.head(branch_id).unwrap(), Some(branch_meta_handle));
-        let landed_after_interruption: TribleSet = pile
-            .reader()
-            .unwrap()
-            .get(branch_meta_handle)
-            .unwrap();
-        assert_eq!(landed_after_interruption, branch_meta);
-
-        // Resume from the durable branch state rather than the helper's
-        // in-memory copies.
-        pile.close().unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        branch_meta_handle = pile.head(branch_id).unwrap().unwrap();
-        branch_meta = pile
-            .reader()
-            .unwrap()
-            .get(branch_meta_handle)
-            .unwrap();
-        assert_eq!(
-            payloads_by_seq(&mut pile, &branch_meta, kind),
-            vec![
-                (0, 0, b"new-zero".to_vec()),
-                (0, 2, b"old-two".to_vec()),
-                (2, 1, b"new-one".to_vec()),
-            ]
-        );
-
-        let resumed = rewrite_manifest_segments_checkpointed(
-            &mut pile,
-            branch_id,
-            &mut branch_meta_handle,
-            &mut branch_meta,
-            kind,
-            |blob| {
-                if !blob.bytes.as_ref().starts_with(b"old-") {
-                    return Ok((blob, false));
-                }
-                let mut bytes = blob.bytes.as_ref().to_vec();
-                bytes[..3].copy_from_slice(b"new");
-                Ok((
-                    Blob::<UnknownBlob>::new(Bytes::from_source(bytes)),
-                    true,
-                ))
-            },
-        )
-        .unwrap();
-        assert_eq!(resumed, 1);
-
-        let final_manifest = Manifest::from_tribles(&branch_meta, kind);
-        assert_eq!(
-            final_manifest
-                .segments
-                .iter()
-                .map(|entry| (entry.level, entry.seq))
-                .collect::<Vec<_>>(),
-            expected_shape
-        );
-        assert_eq!(final_manifest.covered, vec![covered]);
-        assert_eq!(
-            Manifest::from_tribles(&branch_meta, other_kind).to_tribles(other_kind),
-            expected_other
-        );
-        assert_eq!(
-            payloads_by_seq(&mut pile, &branch_meta, kind),
-            vec![
-                (0, 0, b"new-zero".to_vec()),
-                (0, 2, b"new-two".to_vec()),
-                (2, 1, b"new-one".to_vec()),
-            ]
-        );
-
-        let head_before_idempotent_rerun = branch_meta_handle;
-        let length_before_idempotent_rerun = std::fs::metadata(&path).unwrap().len();
-        let unchanged = rewrite_manifest_segments_checkpointed(
-            &mut pile,
-            branch_id,
-            &mut branch_meta_handle,
-            &mut branch_meta,
-            kind,
-            |blob| Ok((blob, false)),
-        )
-        .unwrap();
-        assert_eq!(unchanged, 0);
-        assert_eq!(branch_meta_handle, head_before_idempotent_rerun);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            length_before_idempotent_rerun
-        );
-
-        pile.close().unwrap();
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn segment_rewrite_conflict_never_publishes_the_candidate_manifest() {
-        let path = temp_pile();
-        std::fs::File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        let branch_id = *fucid();
-        let kind = *fucid();
-        let concurrent_kind = *fucid();
-
-        let old_blob = put_unknown(&mut pile, b"old-segment");
-        let mut manifest = Manifest::default();
-        manifest.adopt_segment(old_blob, 3);
-        let mut branch_meta = manifest.to_tribles(kind);
-        let mut branch_meta_handle: Inline<Handle<SimpleArchive>> =
-            pile.put(branch_meta.clone()).unwrap();
-        assert!(matches!(
-            pile.update(branch_id, None, Some(branch_meta_handle)).unwrap(),
-            PushResult::Success()
-        ));
-
-        let mut concurrent = Pile::open(&path).unwrap();
-        let concurrent_blob = put_unknown(&mut concurrent, b"concurrent-segment");
-        let mut concurrent_manifest = Manifest::default();
-        concurrent_manifest.adopt_segment(concurrent_blob, 9);
-        let mut concurrent_meta = branch_meta.clone();
-        concurrent_meta += concurrent_manifest.to_tribles(concurrent_kind);
-        let concurrent_head: Inline<Handle<SimpleArchive>> =
-            concurrent.put(concurrent_meta.clone()).unwrap();
-        let expected_old_head = branch_meta_handle;
-
-        let conflict = rewrite_manifest_segments_checkpointed(
-            &mut pile,
-            branch_id,
-            &mut branch_meta_handle,
-            &mut branch_meta,
-            kind,
-            |blob| {
-                assert!(matches!(
-                    concurrent
-                        .update(branch_id, Some(expected_old_head), Some(concurrent_head))
-                        .unwrap(),
-                    PushResult::Success()
-                ));
-                let mut bytes = blob.bytes.as_ref().to_vec();
-                bytes[..3].copy_from_slice(b"new");
-                Ok((
-                    Blob::<UnknownBlob>::new(Bytes::from_source(bytes)),
-                    true,
-                ))
-            },
-        )
-        .unwrap_err();
-        assert!(format!("{conflict:#}").contains("changed during segment migration"));
-
-        let actual_head = pile.head(branch_id).unwrap().unwrap();
-        assert_eq!(actual_head, concurrent_head);
-        let actual_meta: TribleSet = pile.reader().unwrap().get(actual_head).unwrap();
-        assert_eq!(actual_meta, concurrent_meta);
-        assert_eq!(
-            Manifest::from_tribles(&actual_meta, kind).segments[0].blob,
-            old_blob
-        );
-
-        concurrent.close().unwrap();
-        pile.close().unwrap();
-        let _ = std::fs::remove_file(path);
     }
 }
 
-/// Build or repair the archive's two derived indexes by replaying source
-/// commits, never by checking out their union. Every source commit is one
-/// logical LSM leaf; large commit payloads are physically sharded under one
-/// atomic coverage advance. The frontier is checkpointed after each commit,
-/// making interruption and rerun idempotent.
+fn uncovered_commits(
+    ws: &mut common::Ws,
+    reachable: PATCH<32>,
+    frontier: &[common::CommitHandle],
+) -> Result<Vec<common::CommitHandle>> {
+    if frontier.is_empty() {
+        commits_topological(ws, reachable).context("order uncovered archive commits")
+    } else {
+        commits_topological(ws, difference(reachable, ancestors(frontier.to_vec())))
+            .context("order uncovered archive commits")
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArchiveIndexWork {
+    commit: common::CommitHandle,
+    succinct: bool,
+    bm25: bool,
+}
+
+/// Build or repair the archive's two typed range indexes directly from source
+/// commits. Each recipe keeps an independent certified frontier; one source
+/// commit becomes exactly one inclusive leaf range even when its physical
+/// artifacts are sharded. Empty projections are retained as artifact-free
+/// range certificates.
 fn run_index_standalone(
     pile_path: &Path,
     branch_id: Id,
     branch_name: &str,
     prepare_in_flight: Option<NonZeroUsize>,
 ) -> Result<()> {
-    // Standalone repair publishes index checkpoints directly rather than
-    // pushing a workspace, so an on-commit hook is unnecessary. Own exactly
-    // one rollup for this indexing lifecycle.
     let mut repo = common::open_repo(pile_path)?;
     let res = (|| -> Result<()> {
         common::validate_branch_for_read(&mut repo, branch_id, branch_name)?;
@@ -3105,126 +2607,71 @@ fn run_index_standalone(
             .head(branch_id)
             .map_err(|err| anyhow!("read archive branch head: {err:?}"))?
             .ok_or_else(|| anyhow!("archive branch is missing"))?;
-        let branch_reader = repo
+        let mut branch_meta: TribleSet = repo
             .storage_mut()
             .reader()
-            .map_err(|err| anyhow!("open branch reader: {err:?}"))?;
-        let mut branch_meta: TribleSet = branch_reader
+            .map_err(|err| anyhow!("open branch reader: {err:?}"))?
             .get(branch_meta_handle)
             .map_err(|err| anyhow!("load archive branch metadata: {err:?}"))?;
 
-        // Manifest compatibility and readability do not need a GPU backend.
-        // Accelerated and CPU Succinct rollups deliberately share kind id and
-        // canonical segment bytes.
+        let reachable = ancestors(target_head)
+            .select(&mut ws)
+            .context("walk archive commit DAG")?;
         let succinct_format = SuccinctRollup::new();
         let bm25_reader = repo
             .storage_mut()
             .reader()
             .map_err(|err| anyhow!("open BM25 reader: {err:?}"))?;
         let bm25 = Bm25Rollup::new(bm25_reader, common::archive::content.id());
-        let succinct_manifest = Manifest::from_tribles(&branch_meta, succinct_format.kind_id());
-        let bm25_manifest = Manifest::from_tribles(&branch_meta, bm25.kind_id());
 
-        let reachable = ancestors(target_head)
-            .select(&mut ws)
-            .context("walk archive commit DAG")?;
-        let same_frontier = succinct_manifest.covered == bm25_manifest.covered;
-        let frontier_is_reachable = succinct_manifest
-            .covered
-            .iter()
-            .all(|tip| reachable.get(&tip.raw).is_some());
-        // A pre-coverage manifest may already contain whole-corpus or
-        // repeatedly appended legacy segments. Empty coverage cannot certify
-        // those segments, so replaying on top would duplicate the corpus and
-        // then falsely bless it as current. Only a genuinely empty forest may
-        // bootstrap from an empty frontier.
-        let has_uncertified_segments = succinct_manifest.covered.is_empty()
-            && (!succinct_manifest.segments.is_empty() || !bm25_manifest.segments.is_empty());
-        let candidate_resume = same_frontier && frontier_is_reachable && !has_uncertified_segments;
-        let manifests_readable = if candidate_resume {
-            let succinct_result = validate_manifest_segments(
-                repo.storage_mut(),
-                &succinct_manifest,
-                &succinct_format,
-            );
-            let bm25_result =
-                validate_manifest_segments(repo.storage_mut(), &bm25_manifest, &bm25);
-            match (succinct_result, bm25_result) {
-                (Ok(_), Ok(_)) => true,
-                (succinct_result, bm25_result) => {
-                    eprintln!(
-                        "discarding unreadable archive index manifests (Succinct: {}; BM25: {})",
-                        succinct_result
-                            .err()
-                            .map_or_else(|| "ok".to_owned(), |err| err.to_string()),
-                        bm25_result
-                            .err()
-                            .map_or_else(|| "ok".to_owned(), |err| err.to_string()),
-                    );
-                    false
-                }
-            }
-        } else {
-            true
-        };
-        let resume = candidate_resume && manifests_readable;
+        let mut succinct_frontier = recover_recipe_frontier(
+            repo.storage_mut(),
+            &mut branch_meta,
+            &reachable,
+            &succinct_format,
+            "Succinct",
+        )?;
+        let mut bm25_frontier = recover_recipe_frontier(
+            repo.storage_mut(),
+            &mut branch_meta,
+            &reachable,
+            &bm25,
+            "BM25",
+        )?;
 
-        let mut frontier = if resume {
-            succinct_manifest.covered.clone()
-        } else {
-            clear_manifest(&mut branch_meta, succinct_format.kind_id());
-            clear_manifest(&mut branch_meta, bm25.kind_id());
-            Vec::new()
-        };
+        let succinct_missing = uncovered_commits(&mut ws, reachable.clone(), &succinct_frontier)?;
+        let bm25_missing = uncovered_commits(&mut ws, reachable.clone(), &bm25_frontier)?;
+        let succinct_missing: HashSet<[u8; 32]> = succinct_missing
+            .into_iter()
+            .map(|commit| commit.raw)
+            .collect();
+        let bm25_missing: HashSet<[u8; 32]> =
+            bm25_missing.into_iter().map(|commit| commit.raw).collect();
 
-        // The current writer already emits persisted Rank9/select sidecars.
-        // Bring older live segments to that layout without replaying source
-        // commits: copy their canonical raw prefix, serialize the indexes that
-        // the legacy attach already built, and CAS each manifest replacement.
-        // Existing V2 segments return byte-for-byte unchanged and cause no CAS.
-        let migrated_rank9 = if resume {
-            rewrite_manifest_segments_checkpointed(
-                repo.storage_mut(),
-                branch_id,
-                &mut branch_meta_handle,
-                &mut branch_meta,
-                succinct_format.kind_id(),
-                |blob| {
-                    succinct_format
-                        .upgrade_rank9_sidecars(blob)
-                        .map_err(|err| anyhow!("upgrade Succinct Rank9 sidecars: {err}"))
-                },
-            )?
-        } else {
-            0
-        };
-        if migrated_rank9 != 0 {
-            eprintln!(
-                "  migrated {migrated_rank9} Succinct segment(s) to persisted Rank9 sidecars"
-            );
-        }
-        let removed_legacy = remove_legacy_rollup(&mut branch_meta);
+        let work: Vec<_> = commits_topological(&mut ws, reachable.clone())
+            .context("order archive commits")?
+            .into_iter()
+            .filter_map(|commit| {
+                let succinct = succinct_missing.contains(&commit.raw);
+                let bm25 = bm25_missing.contains(&commit.raw);
+                (succinct || bm25).then_some(ArchiveIndexWork {
+                    commit,
+                    succinct,
+                    bm25,
+                })
+            })
+            .collect();
 
-        let commits = if frontier.as_slice() == [target_head] {
-            Vec::new()
-        } else if frontier.is_empty() {
-            commits_topological(&mut ws, reachable.clone()).context("order archive commits")?
-        } else {
-            commits_topological(
-                &mut ws,
-                difference(reachable.clone(), ancestors(frontier.clone())),
-            )
-            .context("order uncovered archive commits")?
-        };
-
-        if commits.is_empty() && !removed_legacy && resume {
-            println!("archive indexes already cover HEAD ({target_head:?})");
+        if work.is_empty() {
+            println!("archive typed indexes already cover HEAD ({target_head:?})");
             return Ok(());
         }
 
         eprintln!(
-            "indexing {} uncovered commit(s) as logical LSM leaves…",
-            commits.len()
+            "indexing {} source commit(s) (Succinct {}, BM25 {}) as typed logical ranges…",
+            work.len(),
+            succinct_missing.len(),
+            bm25_missing.len()
         );
         let rayon_threads = rayon::current_num_threads();
         let prepare_in_flight = prepare_in_flight
@@ -3233,25 +2680,32 @@ fn run_index_standalone(
         eprintln!(
             "  preparation pipeline: {prepare_in_flight} commit(s) in flight on {rayon_threads} Rayon worker(s)"
         );
+
         let succinct = common::archive_succinct_rollup();
         let prepare_reader = repo
             .storage_mut()
             .reader()
             .map_err(|err| anyhow!("open archive preparation reader: {err:?}"))?;
         let index_started = Instant::now();
-        let commit_count = commits.len();
-        if let Some(commit) = commits.first() {
-            eprintln!("  starting commit 1/{} ({commit:?})", commits.len());
-        }
+        let commit_count = work.len();
         run_ordered_preparation_pipeline(
-            &commits,
+            &work,
             prepare_in_flight,
-            |commit| common::prepare_archive_commit(prepare_reader.clone(), commit),
-            |i, commit, prepared| {
-                debug_assert_eq!(prepared.commit, commit);
+            |item| {
+                common::prepare_archive_commit(
+                    prepare_reader.clone(),
+                    item.commit,
+                    item.succinct,
+                    item.bm25,
+                )
+            },
+            |i, item, prepared| {
+                debug_assert_eq!(prepared.commit, item.commit);
+                debug_assert_eq!(prepared.succinct.is_some(), item.succinct);
+                debug_assert_eq!(prepared.bm25.is_some(), item.bm25);
                 let prepare_elapsed = prepared.elapsed;
                 let prepared_tribles = prepared.tribles;
-                let prepared_shards = prepared.shards.len();
+                let physical_shards = prepared.physical_shards;
                 let publish_started = Instant::now();
                 common::publish_archive_commit(
                     repo.storage_mut(),
@@ -3260,88 +2714,103 @@ fn run_index_standalone(
                     &bm25,
                     &mut branch_meta,
                 )?;
-                advance_coverage_frontier(&mut ws, &mut frontier, commit)?;
-                set_coverage(
-                    &mut branch_meta,
-                    succinct_format.kind_id(),
-                    frontier.clone(),
-                );
-                set_coverage(&mut branch_meta, bm25.kind_id(), frontier.clone());
+
+                if item.succinct {
+                    advance_coverage_frontier(&mut ws, &mut succinct_frontier, item.commit)?;
+                    set_index_frontier(
+                        repo.storage_mut(),
+                        &succinct_format,
+                        &mut branch_meta,
+                        succinct_frontier.clone(),
+                    )
+                    .map_err(|err| anyhow!("advance Succinct frontier: {err}"))?;
+                }
+                if item.bm25 {
+                    advance_coverage_frontier(&mut ws, &mut bm25_frontier, item.commit)?;
+                    set_index_frontier(
+                        repo.storage_mut(),
+                        &bm25,
+                        &mut branch_meta,
+                        bm25_frontier.clone(),
+                    )
+                    .map_err(|err| anyhow!("advance BM25 frontier: {err}"))?;
+                }
 
                 let new_meta: Inline<Handle<SimpleArchive>> = repo
                     .storage_mut()
                     .put(branch_meta.clone())
-                    .map_err(|err| anyhow!("store index checkpoint: {err:?}"))?;
+                    .map_err(|err| anyhow!("store typed index checkpoint: {err:?}"))?;
                 match repo
                     .storage_mut()
                     .update(branch_id, Some(branch_meta_handle), Some(new_meta))
-                    .map_err(|err| anyhow!("publish index checkpoint: {err:?}"))?
+                    .map_err(|err| anyhow!("publish typed index checkpoint: {err:?}"))?
                 {
                     PushResult::Success() => branch_meta_handle = new_meta,
                     PushResult::Conflict(_) => {
                         bail!(
-                            "archive branch changed during indexing; rerun to resume from coverage"
+                            "archive branch changed during indexing; rerun to resume each recipe from its certified frontier"
                         )
                     }
                 }
+                repo.storage_mut()
+                    .flush()
+                    .map_err(|err| anyhow!("flush typed index checkpoint: {err:?}"))?;
+
                 let publish_elapsed = publish_started.elapsed();
                 let commit_work = prepare_elapsed + publish_elapsed;
                 let rate =
                     (i + 1) as f64 / index_started.elapsed().as_secs_f64().max(f64::EPSILON);
                 if commit_work.as_secs() >= 5 {
                     eprintln!(
-                        "  …{}/{} commit {commit:?} indexed and checkpointed in {:.1?} (prepare {:.1?}; carry/checkpoint {:.1?}; {prepared_tribles} tribles/{prepared_shards} shard(s); {rate:.2} commits/s)",
+                        "  …{}/{} commit {:?} indexed and flushed in {:.1?} (prepare {:.1?}; carry/checkpoint {:.1?}; {prepared_tribles} tribles/{physical_shards} physical shard(s); {rate:.2} commits/s)",
                         i + 1,
-                        commits.len(),
+                        work.len(),
+                        item.commit,
                         commit_work,
                         prepare_elapsed,
                         publish_elapsed,
                     );
-                } else if (i + 1) % 100 == 0 || i + 1 == commits.len() {
+                } else if (i + 1) % 100 == 0 || i + 1 == work.len() {
                     eprintln!(
                         "  …{}/{} commits indexed ({rate:.2} commits/s)",
                         i + 1,
-                        commits.len()
+                        work.len()
                     );
                 }
                 Ok(())
             },
         )?;
-        if commit_count != 0 {
-            eprintln!(
-                "  indexed {commit_count} commit(s) in {:.1?} ({:.2} commits/s)",
-                index_started.elapsed(),
-                commit_count as f64 / index_started.elapsed().as_secs_f64().max(f64::EPSILON)
-            );
-        }
 
-        // A migration that only removed the legacy monolith still needs one
-        // metadata CAS even when coverage was already current.
-        if commits.is_empty() && removed_legacy {
-            let new_meta: Inline<Handle<SimpleArchive>> = repo
-                .storage_mut()
-                .put(branch_meta.clone())
-                .map_err(|err| anyhow!("store migrated index metadata: {err:?}"))?;
-            match repo
-                .storage_mut()
-                .update(branch_id, Some(branch_meta_handle), Some(new_meta))
-                .map_err(|err| anyhow!("publish migrated index metadata: {err:?}"))?
-            {
-                PushResult::Success() => {}
-                PushResult::Conflict(_) => {
-                    bail!("archive branch changed during index migration; rerun")
-                }
+        for (label, frontier) in [
+            ("Succinct", succinct_frontier.as_slice()),
+            ("BM25", bm25_frontier.as_slice()),
+        ] {
+            if frontier != [target_head] {
+                bail!(
+                    "{label} traversal ended at frontier {:?}, expected {:?}",
+                    frontier,
+                    target_head
+                );
             }
         }
-
-        if frontier.as_slice() != [target_head] {
-            bail!(
-                "index traversal ended at frontier {:?}, expected {:?}",
-                frontier,
-                target_head
-            );
+        let final_succinct = inspect_recipe_manifest(
+            repo.storage_mut(),
+            &branch_meta,
+            &reachable,
+            &succinct_format,
+        )?;
+        let final_bm25 =
+            inspect_recipe_manifest(repo.storage_mut(), &branch_meta, &reachable, &bm25)?;
+        if final_succinct.as_slice() != [target_head] || final_bm25.as_slice() != [target_head] {
+            bail!("final typed index audit did not certify archive HEAD");
         }
-        println!("archive Succinct and BM25 indexes now cover HEAD");
+
+        eprintln!(
+            "  indexed {commit_count} source commit(s) in {:.1?} ({:.2} commits/s)",
+            index_started.elapsed(),
+            commit_count as f64 / index_started.elapsed().as_secs_f64().max(f64::EPSILON)
+        );
+        println!("archive Succinct and BM25 typed indexes now cover HEAD");
         Ok(())
     })();
 

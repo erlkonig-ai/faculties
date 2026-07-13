@@ -34,10 +34,9 @@ use hifitime::Epoch;
 use rand_core::OsRng;
 
 use faculties::schemas::archive::archive;
-use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::metadata;
 use triblespace::core::repo::index_home::{
-    replace_manifest, IndexHome, IndexKind, Manifest, SuccinctRollup,
+    seg_succinct_rank9, IndexHome, IndexKind, Manifest, SuccinctRollup,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{PushResult, Repository};
@@ -223,46 +222,6 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         ws.commit(change.clone(), "stage synthetic archive");
         repo.push(&mut ws).expect("push");
 
-        // Simulate the pre-coverage index format: a live segment exists but
-        // the manifest has no covered_tip certificate. Bootstrap must discard
-        // it, not replay the corpus on top and bless duplicate postings.
-        let bm25_kind = {
-            let reader = repo.storage_mut().reader().expect("legacy BM25 reader");
-            let kind = Bm25Rollup::new(reader, archive::content.id());
-            let kind_id = kind.kind_id();
-            let mut legacy = IndexHome::new(repo.storage_mut(), branch_id, kind);
-            legacy
-                .update_index(&change)
-                .expect("write uncertified legacy BM25 segment");
-            let manifest = legacy.read_manifest().expect("read legacy manifest");
-            assert_eq!(manifest.segments.len(), 1);
-            assert!(manifest.covered.is_empty());
-            kind_id
-        };
-
-        // Also add an uncertified handle that does not exist. Search must
-        // reject stale coverage before attempting any segment attachment.
-        let old_head = repo
-            .storage_mut()
-            .head(branch_id)
-            .expect("read legacy branch head");
-        let reader = repo.storage_mut().reader().expect("legacy branch reader");
-        let mut head_set: TribleSet = reader
-            .get(old_head.expect("legacy branch metadata"))
-            .expect("load legacy branch metadata");
-        let mut manifest = Manifest::from_tribles(&head_set, bm25_kind);
-        manifest.adopt_segment(Inline::<Handle<UnknownBlob>>::new([0xA5; 32]), 0);
-        replace_manifest(&mut head_set, bm25_kind, &manifest);
-        let new_head: Inline<Handle<SimpleArchive>> = repo
-            .storage_mut()
-            .put(head_set)
-            .expect("store legacy branch metadata");
-        assert!(matches!(
-            repo.storage_mut()
-                .update(branch_id, old_head, Some(new_head))
-                .expect("publish legacy branch metadata"),
-            PushResult::Success()
-        ));
         repo.close().expect("close");
     }
 
@@ -315,7 +274,7 @@ fn bm25_fast_path_resolves_content_without_checkout() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("Succinct and BM25 indexes now cover HEAD"),
+        stdout.contains("Succinct and BM25 typed indexes now cover HEAD"),
         "index summary: {stdout}"
     );
 
@@ -379,7 +338,10 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         })
         .expect("fixture IDs deliberately share a prefix");
     let out = run_archive(&path, &["show", ambiguous_prefix.as_str()]);
-    assert!(!out.status.success(), "ambiguous prefix must not pick a row");
+    assert!(
+        !out.status.success(),
+        "ambiguous prefix must not pick a row"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("matches for prefix"),
         "ambiguous-prefix diagnostic: {}",
@@ -398,10 +360,7 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let out = run_archive(
-        &path,
-        &["--trace", "show", first_message_prefix.as_str()],
-    );
+    let out = run_archive(&path, &["--trace", "show", first_message_prefix.as_str()]);
     assert!(
         out.status.success(),
         "traced show failed: {}",
@@ -445,9 +404,7 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // The uncertified legacy segment was replaced, not retained beside the
-    // commit-native leaf. Total per-segment documents therefore equal the
-    // source corpus exactly once.
+    // Total per-artifact documents equal the source corpus exactly once.
     {
         let mut pile = Pile::open(&path).expect("open indexed pile");
         pile.refresh().expect("refresh indexed pile");
@@ -458,15 +415,17 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         let kind = Bm25Rollup::new(reader, archive::content.id());
         let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
         let manifest = home.read_manifest().expect("read indexed manifest");
-        assert!(manifest.covers_head(source_head));
-        let segments = home.attach_all().expect("attach indexed segments");
+        assert!(manifest.claims_head(source_head));
+        let segments = home
+            .attach_manifest(&manifest)
+            .expect("attach indexed artifacts");
         assert_eq!(
             segments
                 .iter()
                 .map(|segment| segment.doc_count())
                 .sum::<usize>(),
             docs.len() + 1,
-            "legacy postings must not survive commit-native bootstrap"
+            "typed ranges must not duplicate source postings"
         );
         repo.close().expect("close indexed repo");
     }
@@ -748,17 +707,16 @@ fn bm25_fast_path_resolves_content_without_checkout() {
     };
     assert_eq!(head_before, head_after, "completed rebuild is idempotent");
 
-    // A coverage certificate is not enough when one of its segment blobs is
-    // gone. Repair validates the certified forest, discards the unreadable
-    // manifest, and rebuilds from commits instead of reporting a false no-op.
+    // Rank9 handles are repeated unordered typed facts, paired to raw
+    // Succinct artifacts by the source handle embedded in each Rank9 blob.
+    // Cross-wire one pair: repair must strip and rebuild only Succinct while
+    // retaining the independently valid BM25 recipe byte-for-byte.
+    let bm25_before_corruption;
     {
         let mut pile = Pile::open(&path).expect("open for corrupt-manifest setup");
         pile.refresh().expect("refresh corrupt-manifest setup");
         let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
             .expect("open corrupt-manifest repo");
-        let reader = repo.storage_mut().reader().expect("corrupt BM25 reader");
-        let kind = Bm25Rollup::new(reader, archive::content.id());
-        let kind_id = kind.kind_id();
         let old_head = repo
             .storage_mut()
             .head(branch_id)
@@ -767,17 +725,49 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         let mut head_set: TribleSet = branch_reader
             .get(old_head.expect("branch metadata"))
             .expect("load branch metadata");
-        let mut manifest = Manifest::from_tribles(&head_set, kind_id);
-        assert!(manifest.covers_head(repo.pull(branch_id).expect("pull source").head()));
-        manifest.adopt_segment(Inline::<Handle<UnknownBlob>>::new([0xB6; 32]), 0);
-        replace_manifest(&mut head_set, kind_id, &manifest);
-
+        let source_head = repo.pull(branch_id).expect("pull source").head();
+        let reader = repo.storage_mut().reader().expect("typed manifest reader");
+        let bm25_kind = Bm25Rollup::new(reader.clone(), archive::content.id());
+        let bm25_manifest =
+            Manifest::from_tribles(&head_set, &reader, &bm25_kind).expect("valid BM25 manifest");
+        assert!(bm25_manifest.claims_head(source_head));
+        bm25_before_corruption = bm25_manifest.to_tribles();
         let succinct_kind = SuccinctRollup::new();
-        let succinct_kind_id = succinct_kind.kind_id();
-        let mut succinct_manifest = Manifest::from_tribles(&head_set, succinct_kind_id);
-        assert!(succinct_manifest.covers_head(repo.pull(branch_id).expect("pull source").head()));
-        succinct_manifest.adopt_segment(Inline::<Handle<UnknownBlob>>::new([0xB7; 32]), 0);
-        replace_manifest(&mut head_set, succinct_kind_id, &succinct_manifest);
+        let succinct_manifest = Manifest::from_tribles(&head_set, &reader, &succinct_kind)
+            .expect("valid Succinct manifest");
+        assert!(succinct_manifest.claims_head(source_head));
+        let target_range = succinct_manifest
+            .ranges()
+            .iter()
+            .find(|range| !range.artifacts().is_empty())
+            .expect("fixture has a Succinct artifact")
+            .entity();
+        let foreign_entity = *fucid();
+        let foreign_source: TribleSet = entity! { ExclusiveId::force_ref(&foreign_entity) @
+            metadata::tag: archive::kind_author,
+        }
+        .into();
+        let foreign_prepared = succinct_kind
+            .build(&foreign_source)
+            .expect("build foreign Succinct artifact")
+            .pop()
+            .expect("nonempty foreign Succinct artifact");
+        let foreign_rank9 = succinct_kind
+            .put(repo.storage_mut(), foreign_prepared)
+            .expect("store foreign Succinct artifact")
+            .rank9();
+        let mut old_rank9_fact = TribleSet::new();
+        for fact in head_set
+            .iter()
+            .filter(|fact| *fact.e() == target_range && *fact.a() == seg_succinct_rank9.id())
+        {
+            old_rank9_fact.insert(fact);
+        }
+        assert_eq!(old_rank9_fact.len(), 1);
+        head_set = head_set.difference(&old_rank9_fact);
+        head_set += entity! { ExclusiveId::force_ref(&target_range) @
+            seg_succinct_rank9: foreign_rank9,
+        };
 
         let new_head: Inline<Handle<SimpleArchive>> = repo
             .storage_mut()
@@ -794,34 +784,49 @@ fn bm25_fast_path_resolves_content_without_checkout() {
     let out = run_archive(&path, &["list", "--limit", "1"]);
     assert!(
         !out.status.success(),
-        "list must not fall back to raw history when a certified segment is missing"
+        "list must not fall back when typed Succinct pairing is invalid"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("attach Succinct segments"),
-        "missing-segment list diagnostic: {}",
+        String::from_utf8_lossy(&out.stderr).contains("foreign raw archive"),
+        "source-pairing list diagnostic: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let out = run_archive(&path, &["show", first_message_id.as_str()]);
     assert!(
         !out.status.success(),
-        "show must not fall back to raw history when a certified segment is missing"
+        "show must not fall back when typed Succinct pairing is invalid"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("attach Succinct segments"),
-        "missing-segment show diagnostic: {}",
+        String::from_utf8_lossy(&out.stderr).contains("foreign raw archive"),
+        "source-pairing show diagnostic: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
     let out = run_archive(&path, &["index"]);
     assert!(
         out.status.success(),
-        "repair of certified missing segment failed: {}",
+        "repair of invalid Succinct source pairing failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("discarding unreadable"),
-        "repair should diagnose the invalid certified forest"
+        String::from_utf8_lossy(&out.stderr)
+            .contains("discarding only the invalid Succinct recipe"),
+        "repair should diagnose only the invalid recipe: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    {
+        let mut pile = Pile::open(&path).expect("open repaired manifest");
+        pile.refresh().expect("refresh repaired manifest");
+        let head = pile.head(branch_id).unwrap().unwrap();
+        let reader = pile.reader().expect("repaired manifest reader");
+        let head_set: TribleSet = reader.get(head).unwrap();
+        let bm25_kind = Bm25Rollup::new(reader.clone(), archive::content.id());
+        let bm25_after = Manifest::from_tribles(&head_set, &reader, &bm25_kind)
+            .expect("BM25 survives Succinct repair");
+        assert_eq!(bm25_after.to_tribles(), bm25_before_corruption);
+        drop(reader);
+        pile.close().unwrap();
+    }
     let out = run_archive(&path, &["search", "beta"]);
     assert!(
         out.status.success() && String::from_utf8_lossy(&out.stdout).contains("alpha"),
@@ -886,13 +891,13 @@ fn index_does_not_certify_unreadable_archive_content() {
     let bm25 = Bm25Rollup::new(reader, archive::content.id());
     let mut bm25_home = IndexHome::new(repo.storage_mut(), branch_id, bm25);
     let bm25_manifest = bm25_home.read_manifest().expect("BM25 manifest");
-    assert!(bm25_manifest.segments.is_empty());
-    assert!(!bm25_manifest.covers_head(source_head));
+    assert!(bm25_manifest.ranges().is_empty());
+    assert!(!bm25_manifest.claims_head(source_head));
 
     let mut succinct_home = IndexHome::new(repo.storage_mut(), branch_id, SuccinctRollup::new());
     let succinct_manifest = succinct_home.read_manifest().expect("Succinct manifest");
-    assert!(succinct_manifest.segments.is_empty());
-    assert!(!succinct_manifest.covers_head(source_head));
+    assert!(succinct_manifest.ranges().is_empty());
+    assert!(!succinct_manifest.claims_head(source_head));
     repo.close().expect("close failed-index pile");
     let _ = std::fs::remove_file(&path);
 }

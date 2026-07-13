@@ -8,15 +8,18 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 
 use faculties::schemas::archive::archive;
-use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::blob::encodings::succinctarchive::{
+    SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob,
+};
 use triblespace::core::blob::Blob;
-use triblespace::core::repo::index_home::{IndexKind, Manifest, SuccinctRollup};
+use triblespace::core::repo::index_home::{Manifest, SuccinctRollup};
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{BlobStore, PinStore, Repository, Workspace};
 use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 use triblespace_search::index_bm25::Bm25Rollup;
+use triblespace_search::succinct::SuccinctBM25Blob;
 
 type CommitHandle = Inline<Handle<SimpleArchive>>;
 
@@ -120,8 +123,9 @@ fn build_success_source(path: &Path) -> Id {
 struct SegmentSnapshot {
     level: u64,
     seq: u64,
-    handle: [u8; 32],
-    bytes: Vec<u8>,
+    start: Vec<[u8; 32]>,
+    end: Vec<[u8; 32]>,
+    artifacts: Vec<Vec<([u8; 32], Vec<u8>)>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -148,33 +152,79 @@ fn snapshot(path: &Path, branch_id: Id) -> IndexSnapshot {
     let succinct_kind = SuccinctRollup::new();
     let bm25_kind = Bm25Rollup::new(reader.clone(), archive::content.id());
 
-    let read_segments = |manifest: Manifest| {
-        manifest
-            .segments
-            .into_iter()
-            .map(|entry| {
-                let blob: Blob<UnknownBlob> = reader.get(entry.blob).expect("segment blob");
-                SegmentSnapshot {
-                    level: entry.level,
-                    seq: entry.seq,
-                    handle: entry.blob.raw,
-                    bytes: blob.bytes.to_vec(),
-                }
-            })
-            .collect()
-    };
+    let succinct_manifest = Manifest::from_tribles(&branch_meta_set, &reader, &succinct_kind)
+        .expect("typed Succinct manifest");
+    let succinct = succinct_manifest
+        .ranges()
+        .iter()
+        .map(|entry| SegmentSnapshot {
+            level: entry.level(),
+            seq: entry.seq(),
+            start: entry
+                .range()
+                .start()
+                .iter()
+                .map(|commit| commit.raw)
+                .collect(),
+            end: entry
+                .range()
+                .end()
+                .iter()
+                .map(|commit| commit.raw)
+                .collect(),
+            artifacts: entry
+                .artifacts()
+                .iter()
+                .map(|artifact| {
+                    let raw: Blob<SuccinctArchiveBlob> =
+                        reader.get(artifact.raw()).expect("raw Succinct artifact");
+                    let rank9: Blob<SuccinctArchiveRank9IndexBlob> = reader
+                        .get(artifact.rank9())
+                        .expect("Rank9 Succinct artifact");
+                    vec![
+                        (artifact.raw().raw, raw.bytes.to_vec()),
+                        (artifact.rank9().raw, rank9.bytes.to_vec()),
+                    ]
+                })
+                .collect(),
+        })
+        .collect();
+    let bm25_manifest =
+        Manifest::from_tribles(&branch_meta_set, &reader, &bm25_kind).expect("typed BM25 manifest");
+    let bm25 = bm25_manifest
+        .ranges()
+        .iter()
+        .map(|entry| SegmentSnapshot {
+            level: entry.level(),
+            seq: entry.seq(),
+            start: entry
+                .range()
+                .start()
+                .iter()
+                .map(|commit| commit.raw)
+                .collect(),
+            end: entry
+                .range()
+                .end()
+                .iter()
+                .map(|commit| commit.raw)
+                .collect(),
+            artifacts: entry
+                .artifacts()
+                .iter()
+                .map(|handle| {
+                    let blob: Blob<SuccinctBM25Blob> = reader.get(*handle).expect("BM25 artifact");
+                    vec![(handle.raw, blob.bytes.to_vec())]
+                })
+                .collect(),
+        })
+        .collect();
 
     let snapshot = IndexSnapshot {
         branch_meta,
         branch_meta_bytes: branch_blob.bytes.to_vec(),
-        succinct: read_segments(Manifest::from_tribles(
-            &branch_meta_set,
-            succinct_kind.kind_id(),
-        )),
-        bm25: read_segments(Manifest::from_tribles(
-            &branch_meta_set,
-            bm25_kind.kind_id(),
-        )),
+        succinct,
+        bm25,
     };
     drop(reader);
     pile.close().expect("close snapshot pile");
@@ -288,12 +338,73 @@ fn preparation_failure_checkpoints_only_the_contiguous_prefix() {
         .get(branch_meta_handle)
         .expect("load branch metadata");
     let expected = vec![commits[bad_ordinal - 1]];
-    let succinct = Manifest::from_tribles(&branch_meta, SuccinctRollup::new().kind_id());
-    let bm25 = Bm25Rollup::new(reader, archive::content.id());
-    let bm25 = Manifest::from_tribles(&branch_meta, bm25.kind_id());
-    assert_eq!(succinct.covered, expected);
-    assert_eq!(bm25.covered, expected);
+    let succinct_kind = SuccinctRollup::new();
+    let succinct = Manifest::from_tribles(&branch_meta, &reader, &succinct_kind)
+        .expect("typed Succinct prefix manifest");
+    let bm25_kind = Bm25Rollup::new(reader.clone(), archive::content.id());
+    let bm25 = Manifest::from_tribles(&branch_meta, &reader, &bm25_kind)
+        .expect("typed BM25 prefix manifest");
+    assert_eq!(succinct.frontier(), expected);
+    assert_eq!(bm25.frontier(), expected);
+    succinct
+        .audit_exact_cover(&reader)
+        .expect("Succinct prefix cover");
+    bm25.audit_exact_cover(&reader).expect("BM25 prefix cover");
     pile.close().expect("close failed-index pile");
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn contentless_commit_is_a_certified_zero_artifact_range() {
+    let path = temp_pile_path("empty");
+    std::fs::File::create(&path).expect("create empty source pile");
+    let pile = Pile::open(&path).expect("open empty source pile");
+    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+        .expect("create empty source repository");
+    let branch_id = *repo.create_branch("archive", None).expect("create branch");
+    let mut ws = repo.pull(branch_id).expect("pull branch");
+    let source_head = push_commit(
+        &mut repo,
+        &mut ws,
+        TribleSet::new(),
+        "contentless source commit",
+    );
+    repo.close().expect("close empty source repository");
+
+    let output = run_archive(&path, &["index", "--prepare-in-flight", "1"]);
+    assert!(
+        output.status.success(),
+        "empty index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut pile = Pile::open(&path).expect("open empty indexed pile");
+    pile.refresh().expect("refresh empty indexed pile");
+    let branch_meta_handle = pile.head(branch_id).unwrap().unwrap();
+    let reader = pile.reader().expect("empty manifest reader");
+    let branch_meta: TribleSet = reader.get(branch_meta_handle).unwrap();
+    let succinct_kind = SuccinctRollup::new();
+    let succinct = Manifest::from_tribles(&branch_meta, &reader, &succinct_kind).unwrap();
+    let bm25_kind = Bm25Rollup::new(reader.clone(), archive::content.id());
+    let bm25 = Manifest::from_tribles(&branch_meta, &reader, &bm25_kind).unwrap();
+    assert!(succinct.claims_head(Some(source_head)));
+    assert_eq!(succinct.ranges().len(), 1);
+    assert_eq!(succinct.ranges()[0].range().start(), [source_head]);
+    assert_eq!(succinct.ranges()[0].range().end(), [source_head]);
+    assert!(succinct.ranges()[0].artifacts().is_empty());
+    assert!(bm25.claims_head(Some(source_head)));
+    assert_eq!(bm25.ranges().len(), 1);
+    assert_eq!(bm25.ranges()[0].range().start(), [source_head]);
+    assert_eq!(bm25.ranges()[0].range().end(), [source_head]);
+    assert!(bm25.ranges()[0].artifacts().is_empty());
+    drop(reader);
+    pile.close().expect("close empty indexed pile");
+
+    let list = run_archive(&path, &["list", "--limit", "10"]);
+    assert!(list.status.success() && list.stdout.is_empty());
+    let search = run_archive(&path, &["search", "anything"]);
+    assert!(search.status.success() && search.stdout.is_empty());
 
     let _ = std::fs::remove_file(path);
 }
