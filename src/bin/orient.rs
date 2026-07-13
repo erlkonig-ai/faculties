@@ -11,8 +11,8 @@ use faculties::schemas::compass::{
 use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
 use faculties::schemas::message::is_inbox_message;
 use faculties::schemas::orient::{
-    KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_ORIENT_CHECKPOINT_ID,
-    KIND_READ_ID, KIND_STATUS_ID, board, local, orient_state,
+    KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_ORIENT_CHECKPOINT_ID, KIND_READ_ID,
+    KIND_REVIEW_WATERMARK_ID, KIND_STATUS_ID, board, local, orient_state,
 };
 use faculties::schemas::relations::{groups_for_member, person_ids, relations as rel_attrs};
 use faculties::schemas::status::{KIND_STATUS_UPDATE, status as status_attrs};
@@ -701,6 +701,7 @@ fn cmd_show(
                     local_branch_id,
                     compass_branch_id,
                     relations_branch_id,
+                    orient_state_branch_id,
                 )?,
             )),
             None => None,
@@ -903,6 +904,7 @@ fn load_watched_view(
     local_branch_id: Id,
     compass_branch_id: Id,
     relations_branch_id: Id,
+    orient_state_branch_id: Id,
 ) -> Result<WatchedView> {
     let mut local_ws = repo
         .pull(local_branch_id)
@@ -966,7 +968,26 @@ fn load_watched_view(
     // Review actions are derived from the exact same request/attestation heads
     // that close the Compass gate. No parallel notification ledger is needed.
     let known_people = person_ids(&relations_space);
-    let review_actions = persona_review_actions(&compass_space, &known_people, persona_id);
+    let mut review_actions = persona_review_actions(&compass_space, &known_people, persona_id);
+
+    // Watermark filter (ack/snooze): drop owed reviewer assignments the persona
+    // has acknowledged, as long as their state (the attestation head-set) is
+    // unchanged and any snooze deadline is still in the future. Because
+    // `view_news` only wakes on ADDED assignments, an ack (a removal) never
+    // self-wakes; a later head change / a fresh superseding request id / an
+    // expired snooze all break the match and re-add the assignment → wake. This
+    // is the edge-trigger the review wake-storm needed. Author actions are
+    // never suppressed — a review the persona OWNS still needs their eyes.
+    let watermarks = load_review_watermarks(repo, orient_state_branch_id, persona_id)?;
+    if !watermarks.is_empty() {
+        let now = interval_key(epoch_interval(now_epoch()));
+        for review in review_actions.values_mut() {
+            review.assignments.retain(|request, heads| match watermarks.get(request) {
+                Some(wm) => !watermark_quiet(wm, heads, now),
+                None => true,
+            });
+        }
+    }
 
     // One line per goal:
     // "id:status:author:flags:review-assignments:author-action:assignment-state".
@@ -1333,6 +1354,88 @@ fn load_checkpoint_view(
     }))
 }
 
+/// Should an owed-review assignment be suppressed given the persona's
+/// watermark? `wm` is the `(acked head-set, optional snooze deadline)` recorded
+/// at ack/snooze time; `heads` is the assignment's *current* attestation
+/// head-set; `now` is the current interval key. Quiet iff the acked head-set
+/// still matches AND either it was a plain ack (no deadline) or the snooze
+/// deadline is still in the future. Any head change (malformed/forked
+/// transition, a fresh attestation) breaks the match and re-surfaces the review
+/// regardless of a live snooze — state changes always win over a timer.
+fn watermark_quiet(wm: &(BTreeSet<Id>, Option<i128>), heads: &BTreeSet<Id>, now: i128) -> bool {
+    let (acked_heads, deadline) = wm;
+    *acked_heads == *heads
+        && match deadline {
+            None => true,         // plain ack: quiet until the head-set changes
+            Some(d) => now <= *d, // snooze: quiet until the deadline passes
+        }
+}
+
+/// Load this persona's review watermarks (ack/snooze) from the orient-state
+/// branch, reduced latest-wins per request. Returns
+/// `request -> (acked attestation head-set, optional snooze deadline key)`.
+/// Empty when the branch has no head yet.
+fn load_review_watermarks(
+    repo: &mut Repository<Pile>,
+    orient_state_branch_id: Id,
+    persona_id: Id,
+) -> Result<BTreeMap<Id, (BTreeSet<Id>, Option<i128>)>> {
+    let Some(_head) = repo
+        .storage_mut()
+        .head(orient_state_branch_id)
+        .map_err(|e| anyhow!("orient state branch head: {e:?}"))?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut ws = repo
+        .pull(orient_state_branch_id)
+        .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout orient state: {e:?}"))?;
+
+    // Latest watermark event per request (by `at`).
+    let mut latest: BTreeMap<Id, (i128, Id)> = BTreeMap::new();
+    for (wm_id, request, at) in find!(
+        (wm_id: Id, request: Id, at: IntervalValue),
+        pattern!(&space, [{
+            ?wm_id @
+            metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+            orient_state::persona: &persona_id,
+            orient_state::wm_request: ?request,
+            orient_state::at: ?at,
+        }])
+    ) {
+        let key = interval_key(at);
+        latest
+            .entry(request)
+            .and_modify(|entry| {
+                if key > entry.0 {
+                    *entry = (key, wm_id);
+                }
+            })
+            .or_insert((key, wm_id));
+    }
+
+    // Read the winning watermark's acked head-set + optional snooze deadline.
+    let mut out: BTreeMap<Id, (BTreeSet<Id>, Option<i128>)> = BTreeMap::new();
+    for (request, (_at, wm_id)) in latest {
+        let heads: BTreeSet<Id> = find!(
+            h: Id,
+            pattern!(&space, [{ wm_id @ orient_state::wm_head: ?h }])
+        )
+        .collect();
+        let deadline: Option<i128> = find!(
+            d: IntervalValue,
+            pattern!(&space, [{ wm_id @ orient_state::wm_deadline: ?d }])
+        )
+        .next()
+        .map(interval_key);
+        out.insert(request, (heads, deadline));
+    }
+    Ok(out)
+}
+
 fn save_checkpoint_heads(
     repo: &mut Repository<Pile>,
     orient_state_branch_id: Id,
@@ -1569,6 +1672,7 @@ fn check_news_once(
         local_branch_id,
         compass_branch_id,
         relations_branch_id,
+        orient_state_branch_id,
     )?;
     let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, persona_id)? else {
         return Ok(NewsCheck::NoCheckpoint(view));
@@ -1781,6 +1885,7 @@ fn cmd_wait(
                         local_branch_id,
                         compass_branch_id,
                         relations_branch_id,
+                        orient_state_branch_id,
                     )?;
                     let reasons = view_news(view, &current_view, pid);
                     if !reasons.is_empty() {
@@ -2172,5 +2277,152 @@ mod tests {
         let new = view(format!("{goal:x}:done:{me:x}:i::"));
 
         assert!(view_news(&old, &new, me).is_empty());
+    }
+
+    // --- Review watermark (ack/snooze) quiet-decision ------------------------
+
+    fn heads(ids: &[Id]) -> BTreeSet<Id> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn plain_ack_is_quiet_while_heads_match() {
+        let h = heads(&[ufoid().id]);
+        // No deadline: quiet regardless of the clock, as long as heads match.
+        assert!(watermark_quiet(&(h.clone(), None), &h, 0));
+        assert!(watermark_quiet(&(h.clone(), None), &h, i128::MAX));
+    }
+
+    #[test]
+    fn ack_re_surfaces_when_attestation_head_appears() {
+        let existing = ufoid().id;
+        let acked = heads(&[existing]);
+        // A malformed/forked transition adds a head → the acked set no longer
+        // matches → not quiet, so the review re-surfaces.
+        let now_two = heads(&[existing, ufoid().id]);
+        assert!(!watermark_quiet(&(acked.clone(), None), &now_two, 0));
+        // An attestation the reviewer later retracts (head removed) also breaks
+        // the match — any change re-surfaces, not just growth.
+        assert!(!watermark_quiet(&(acked, None), &BTreeSet::new(), 0));
+    }
+
+    #[test]
+    fn empty_headset_ack_stays_quiet_until_first_attestation() {
+        // Pending review with no attestation yet: ack snapshots the empty set,
+        // and stays quiet until the reviewer's first attestation head lands.
+        assert!(watermark_quiet(&(BTreeSet::new(), None), &BTreeSet::new(), 0));
+        let posted = heads(&[ufoid().id]);
+        assert!(!watermark_quiet(&(BTreeSet::new(), None), &posted, 0));
+    }
+
+    #[test]
+    fn snooze_is_quiet_before_deadline_and_wakes_after() {
+        let h = heads(&[ufoid().id]);
+        let deadline = 1_000i128;
+        assert!(watermark_quiet(&(h.clone(), Some(deadline)), &h, 500)); // before
+        assert!(watermark_quiet(&(h.clone(), Some(deadline)), &h, 1_000)); // at (<=)
+        assert!(!watermark_quiet(&(h.clone(), Some(deadline)), &h, 1_001)); // after
+    }
+
+    #[test]
+    fn head_change_overrides_a_live_snooze() {
+        let existing = ufoid().id;
+        let acked = heads(&[existing]);
+        let changed = heads(&[existing, ufoid().id]);
+        // Deadline is still in the future, but the state moved: state wins.
+        assert!(!watermark_quiet(&(acked, Some(i128::MAX)), &changed, 0));
+    }
+
+    /// Full round-trip: the watermark entity `compass review ack/snooze` writes
+    /// onto the `orient-state` branch reads back through `load_review_watermarks`
+    /// exactly — latest-wins per (persona, request), per-persona scoping, the
+    /// repeated head-set, and the optional snooze deadline. Uses a fresh
+    /// file-backed pile via the production `open_repo` path (no extra dep).
+    #[test]
+    fn watermarks_round_trip_latest_wins_and_scope_by_persona() {
+        let path = std::env::temp_dir().join(format!("orient-wm-{:x}.pile", ufoid().id));
+        std::fs::File::create(&path).expect("create temp pile");
+        let mut repo = open_repo(&path).expect("open repo");
+        let osb = repo
+            .ensure_branch("orient-state", None)
+            .expect("ensure orient-state");
+
+        let me = ufoid().id;
+        let other = ufoid().id;
+        let req_ack = ufoid().id;
+        let req_snooze = ufoid().id;
+        let h1 = ufoid().id;
+        let h2 = ufoid().id;
+
+        let early = now_epoch();
+        let late = now_epoch() + hifitime::Duration::from_total_nanoseconds(10_000_000_000);
+        let deadline_epoch =
+            now_epoch() + hifitime::Duration::from_total_nanoseconds(3_600_000_000_000);
+
+        // Append one watermark event, exactly as `write_review_watermark` does.
+        fn write_wm(
+            repo: &mut Repository<Pile>,
+            osb: Id,
+            persona: Id,
+            request: Id,
+            head_ids: &[Id],
+            at: Epoch,
+            deadline: Option<Epoch>,
+        ) {
+            let mut ws = repo.pull(osb).expect("pull orient-state");
+            let wm_id = ufoid();
+            let mut change = TribleSet::new();
+            change += entity! { &wm_id @
+                metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+                orient_state::persona: &persona,
+                orient_state::wm_request: &request,
+                orient_state::wm_head*: head_ids.iter(),
+                orient_state::at: epoch_interval(at),
+            };
+            if let Some(d) = deadline {
+                change += entity! { &wm_id @ orient_state::wm_deadline: epoch_interval(d) };
+            }
+            ws.commit(change, "test watermark");
+            repo.push(&mut ws).expect("push watermark");
+        }
+
+        // req_ack: an early {h1} event superseded latest-wins by a later {h1,h2}
+        // event (no deadline → plain ack).
+        write_wm(&mut repo, osb, me, req_ack, &[h1], early, None);
+        write_wm(&mut repo, osb, me, req_ack, &[h1, h2], late, None);
+        // req_snooze: a single event carrying a deadline.
+        write_wm(&mut repo, osb, me, req_snooze, &[h1], late, Some(deadline_epoch));
+        // A different persona's watermark on the same request — must be ignored.
+        write_wm(&mut repo, osb, other, req_ack, &[h1], late, None);
+
+        let map = load_review_watermarks(&mut repo, osb, me).expect("load watermarks");
+
+        assert_eq!(map.len(), 2, "only this persona's two requests");
+
+        let (ack_heads, ack_deadline) = map.get(&req_ack).expect("req_ack present");
+        assert_eq!(ack_heads, &heads(&[h1, h2]), "later event won latest-wins");
+        assert!(ack_deadline.is_none(), "plain ack has no deadline");
+
+        let (snooze_heads, snooze_deadline) = map.get(&req_snooze).expect("req_snooze present");
+        assert_eq!(snooze_heads, &heads(&[h1]));
+        assert_eq!(
+            *snooze_deadline,
+            Some(interval_key(epoch_interval(deadline_epoch))),
+            "snooze deadline round-trips"
+        );
+
+        // The reconstructed map drives the same quiet-decision the filter uses.
+        let now = interval_key(epoch_interval(now_epoch()));
+        assert!(
+            watermark_quiet(map.get(&req_ack).unwrap(), &heads(&[h1, h2]), now),
+            "acked review with matching heads is quiet"
+        );
+        assert!(
+            !watermark_quiet(map.get(&req_ack).unwrap(), &heads(&[h1]), now),
+            "a head change re-surfaces it"
+        );
+
+        repo.close().ok();
+        let _ = std::fs::remove_file(&path);
     }
 }

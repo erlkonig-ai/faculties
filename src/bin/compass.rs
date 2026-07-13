@@ -14,6 +14,7 @@ use faculties::schemas::compass::{
 use faculties::schemas::relations::{
     active_person_ids, group, person_ids, relations as rel_attrs, KIND_GROUP, KIND_PERSON_ID,
 };
+use faculties::schemas::orient::{orient_state, KIND_REVIEW_WATERMARK_ID};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
@@ -149,6 +150,21 @@ enum ReviewCommand {
         /// Review report. Use @path for file input or @- for stdin.
         #[arg(long)]
         report: String,
+    },
+    /// Acknowledge an exact request: stop your watcher waking on it until its
+    /// state (your attestation head-set) changes, or a new request supersedes it.
+    Ack {
+        /// Exact request id or unique prefix (not a goal id).
+        request: String,
+    },
+    /// Snooze an exact request: acknowledge it AND set a deadline that
+    /// deliberately re-surfaces it (e.g. `--for 2h`, `--for 30m`, `--for 1d`).
+    Snooze {
+        /// Exact request id or unique prefix (not a goal id).
+        request: String,
+        /// Re-enqueue after this long (e.g. 90m, 2h, 1d).
+        #[arg(long = "for")]
+        duration: String,
     },
     /// Show the settlement projection for a goal or exact request.
     Status {
@@ -1533,6 +1549,123 @@ fn cmd_review_submit(
     Ok(())
 }
 
+/// Parse a snooze duration ("90m", "2h", "1d") into an absolute deadline.
+fn parse_snooze_deadline(duration: &str) -> Result<Epoch> {
+    let dur = humantime::parse_duration(duration.trim())
+        .with_context(|| format!("invalid --for duration '{duration}' (try 90m, 2h, 1d)"))?;
+    Ok(now_epoch() + hifitime::Duration::from_total_nanoseconds(dur.as_nanos() as i128))
+}
+
+/// Write a per-persona review watermark onto the private `orient-state` branch:
+/// `deadline == None` is a plain ACK (quiet until state/roster/target changes),
+/// `Some` is a SNOOZE (also re-enqueues after the deadline). Validates the
+/// request is active and the persona is in its frozen roster, then snapshots the
+/// reviewer's current attestation head-set so a later head change re-surfaces it.
+/// Returns the resolved request id.
+fn write_review_watermark(
+    pile: &Path,
+    branch_id: Id,
+    request_input: String,
+    persona: Option<&str>,
+    deadline: Option<Epoch>,
+) -> Result<Id> {
+    let persona = persona.ok_or_else(|| {
+        anyhow::anyhow!("review ack/snooze requires --persona <label-or-hex> or $PERSONA")
+    })?;
+    with_repo(pile, |repo| {
+        // Resolve the reviewer against the frozen roster (soft-retired ok).
+        let mut relations_ws = relations_workspace(repo)?;
+        let relations_space = relations_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let known_people = person_ids(&relations_space);
+        let reviewer = resolve_frozen_person(&relations_space, &known_people, persona)?;
+
+        // Read the compass board to validate the request and snapshot the
+        // reviewer's current attestation head-set.
+        let mut board_ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull board: {e:?}"))?;
+        let space = board_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
+        let request_id = resolve_request_id(&request_input, &space)?;
+        let request = review_request(&space, request_id)
+            .ok_or_else(|| anyhow::anyhow!("review request {request_id:x} is malformed"))?;
+        if !request_is_active(&space, request_id) {
+            bail!(
+                "review request {request_id:x} is stale or forked; ack/snooze the sole current exact request instead"
+            );
+        }
+        if !request.required.contains(&reviewer) {
+            bail!("persona {reviewer:x} is not in request {request_id:x}'s frozen reviewer roster");
+        }
+        let heads = active_attestation_ids_for_reviewer(&space, request_id, reviewer);
+
+        // Append the watermark on the private orient-state branch (CAS loop).
+        let orient_state_branch = repo
+            .ensure_branch("orient-state", None)
+            .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(orient_state_branch)
+            .map_err(|e| anyhow::anyhow!("pull orient-state: {e:?}"))?;
+        loop {
+            let now = epoch_interval(now_epoch());
+            let wm_id = ufoid();
+            let mut change = TribleSet::new();
+            change += entity! { &wm_id @
+                metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+                orient_state::persona: &reviewer,
+                orient_state::wm_request: &request_id,
+                orient_state::wm_head*: heads.iter(),
+                orient_state::at: now,
+            };
+            if let Some(deadline) = deadline {
+                change += entity! { &wm_id @
+                    orient_state::wm_deadline: epoch_interval(deadline),
+                };
+            }
+            let verb = if deadline.is_some() {
+                "snooze review"
+            } else {
+                "ack review"
+            };
+            ws.commit(change, verb);
+            match repo
+                .try_push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push review watermark: {e:?}"))?
+            {
+                None => return Ok(request_id),
+                Some(conflict) => ws = conflict,
+            }
+        }
+    })
+}
+
+fn cmd_review_ack(pile: &Path, branch_id: Id, request: String, persona: Option<&str>) -> Result<()> {
+    let request_id = write_review_watermark(pile, branch_id, request, persona, None)?;
+    println!(
+        "Acknowledged review request {request_id:x} — your watcher stays quiet on it until its state changes, a successor supersedes it, or you attest."
+    );
+    Ok(())
+}
+
+fn cmd_review_snooze(
+    pile: &Path,
+    branch_id: Id,
+    request: String,
+    duration: String,
+    persona: Option<&str>,
+) -> Result<()> {
+    let deadline = parse_snooze_deadline(&duration)?;
+    let request_id = write_review_watermark(pile, branch_id, request, persona, Some(deadline))?;
+    println!(
+        "Snoozed review request {request_id:x} for {} — it re-surfaces after that (or sooner if its state changes).",
+        duration.trim()
+    );
+    Ok(())
+}
+
 fn render_review_evaluation(
     board_ws: &mut Workspace<Pile>,
     relations_ws: &mut Workspace<Pile>,
@@ -2057,6 +2190,12 @@ fn main() -> Result<()> {
                 load_value_or_file(&report, "review report")?,
                 cli.persona.as_deref(),
             ),
+            ReviewCommand::Ack { request } => {
+                cmd_review_ack(&cli.pile, branch_id, request, cli.persona.as_deref())
+            }
+            ReviewCommand::Snooze { request, duration } => {
+                cmd_review_snooze(&cli.pile, branch_id, request, duration, cli.persona.as_deref())
+            }
             ReviewCommand::Status { id, history } => {
                 cmd_review_status(&cli.pile, branch_id, id, history)
             }
