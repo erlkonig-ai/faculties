@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Compass review is exact, triadic, and self-notifying.** `compass review`
+  now opens immutable candidate requests with a frozen three-person roster,
+  records mandatory-report attestations (`approve`, `request-changes`, or
+  `abstain`), evaluates one shared fail-closed gate, and writes exact evidence
+  settlements or visibly reasoned break-glass overrides. Requests and verdicts
+  use explicit supersession heads: explicitly opening a successor candidate
+  stales prior evidence, concurrent successors remain visible forks, and no
+  mutable approval flag is stored. Opening/settling are themselves the
+  `review`/`done` status events. Orient derives outstanding assignments from
+  those same heads, wakes peer reviewers on a new or refreshed candidate,
+  keeps the author's obligation visible in its snapshot, stays quiet for other
+  reviewers' progress, and shows the exact target. The Review bench retains
+  both active and structured-history goals, rendering the shared projection,
+  reviewer reports, stale candidates, forks, and override reasons with
+  relations names. Proof-defining events now have intrinsic IDs, guarded
+  transitions re-evaluate after compare-and-swap conflicts, raw moves cannot
+  detach structured review history, and settlement is an exact fail-closed
+  certificate whose sealed attestation heads are revalidated after replicas
+  merge. Noncanonical supersession edges cannot hide predecessors, and an
+  offline-concurrent vote makes the conflict visible instead of being erased
+  by a stale certificate. Orient additionally wakes the author with `REVISE`,
+  `SETTLE`, or `REPAIR` actions and re-wakes reviewers on malformed/forked
+  evidence while ordinary fulfillment/removal remains quiet.
 - **Codex can enforce orient-watcher continuity and ingest news while busy.**
   Versioned SessionStart, UserPromptSubmit, and Stop hook helpers under
   `hooks/codex/` hand the `liora-gpt` watcher to each new primary thread, clear
@@ -52,8 +75,9 @@ All notable changes to this project will be documented in this file.
   `viewer X.Y.Z (<git hash>)`. No compat alias.
 - **viewer: Review section.** New `ReviewPanel` widget (registered
   near the top of the notebook — the human's primary work surface)
-  renders every compass goal whose latest status is `review`: title,
-  tags, age, notes, wiki fragments referenced from note text (32-hex
+  renders active reviews plus goals carrying structured review history, so
+  settled and overridden evidence remains auditable: title, tags, age, notes,
+  wiki fragments referenced from note text (32-hex
   regex extraction, v0 until a real link edge lands), each rendered
   with full typst prose via the wiki widget's rendering path, plus
   decide entries whose `decide::about` edge points at the goal, shown

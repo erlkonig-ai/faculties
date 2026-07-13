@@ -3,7 +3,7 @@
 //! Used by `relations.rs` (the faculty CLI) and by any faculty that
 //! needs to resolve a person by label or alias (e.g. `message.rs`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use triblespace::core::metadata;
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
@@ -54,6 +54,79 @@ pub fn groups_for_member(space: &TribleSet, member: Id) -> HashSet<Id> {
         }])
     )
     .collect()
+}
+
+type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+
+fn interval_key(interval: IntervalValue) -> i128 {
+    let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
+    lower
+}
+
+/// People whose latest retirement event says retired.
+pub fn retired_person_ids(space: &TribleSet) -> HashSet<Id> {
+    let mut latest: HashMap<Id, (i128, bool)> = HashMap::new();
+    for (person, at) in find!(
+        (person: Id, at: IntervalValue),
+        pattern!(space, [{ _?evt @
+            metadata::tag: &KIND_RETIRE_ID,
+            relations::subject: ?person,
+            metadata::created_at: ?at,
+        }])
+    ) {
+        let key = interval_key(at);
+        latest
+            .entry(person)
+            .and_modify(|(current, retired)| {
+                if key >= *current {
+                    *current = key;
+                    *retired = true;
+                }
+            })
+            .or_insert((key, true));
+    }
+    for (person, at) in find!(
+        (person: Id, at: IntervalValue),
+        pattern!(space, [{ _?evt @
+            metadata::tag: &KIND_UNRETIRE_ID,
+            relations::subject: ?person,
+            metadata::created_at: ?at,
+        }])
+    ) {
+        let key = interval_key(at);
+        latest
+            .entry(person)
+            .and_modify(|(current, retired)| {
+                if key > *current {
+                    *current = key;
+                    *retired = false;
+                }
+            })
+            .or_insert((key, false));
+    }
+    latest
+        .into_iter()
+        .filter_map(|(id, (_, retired))| retired.then_some(id))
+        .collect()
+}
+
+/// IDs of people that currently exist and are not soft-retired.
+///
+/// Review rosters snapshot these IDs into the request. Group membership may
+/// change later without rewriting historical reviewer requirements.
+pub fn active_person_ids(space: &TribleSet) -> HashSet<Id> {
+    let retired = retired_person_ids(space);
+    person_ids(space)
+        .into_iter()
+        .filter(|id| !retired.contains(id))
+        .collect()
+}
+
+/// Every relations person, including soft-retired identities. Historical
+/// review requests validate against this set so later retirement cannot
+/// rewrite the meaning of a frozen roster.
+pub fn person_ids(space: &TribleSet) -> HashSet<Id> {
+    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])).collect()
 }
 
 pub mod relations {
@@ -129,5 +202,25 @@ mod tests {
             groups_for_member(&space, other_member),
             HashSet::from([second_group])
         );
+    }
+
+    #[test]
+    fn retirement_removes_future_assignment_without_erasing_identity() {
+        let person = ufoid().id;
+        let retirement = ufoid();
+        let epoch = hifitime::Epoch::from_gregorian_utc(2026, 7, 13, 12, 0, 0, 0);
+        let at: IntervalValue = (epoch, epoch).try_to_inline().unwrap();
+        let mut space = TribleSet::new();
+        space += entity! { ExclusiveId::force_ref(&person) @
+            metadata::tag: &KIND_PERSON_ID,
+        };
+        space += entity! { &retirement @
+            metadata::tag: &KIND_RETIRE_ID,
+            relations::subject: &person,
+            metadata::created_at: at,
+        };
+
+        assert!(person_ids(&space).contains(&person));
+        assert!(!active_person_ids(&space).contains(&person));
     }
 }

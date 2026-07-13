@@ -3,20 +3,20 @@
 `relations` is the contact registry. Each entry maps a short
 canonical label (the "handle") to a person record with names,
 aliases, and free-form notes. Other faculties — most notably
-`local_messages` — resolve recipient handles through this
+`message` — resolve recipient handles through this
 registry.
 
 == Why a separate faculty
 
 The pile branch model means each kind of state lives on its own
 branch. Relations stay on `relations`; messages on
-`local-messages`; goals on `compass`. Faculties that need
+`message`; goals on `compass`. Faculties that need
 people-references read from `relations` without owning the data.
 
 That separation matters when piles merge: two agents independently
 adding a person record for "alice" produce content-addressed
 duplicates the lint pass can deduplicate; if relations were
-inlined into local-messages each merge would risk inconsistent
+inlined into message each merge would risk inconsistent
 addressee data.
 
 == Usage
@@ -40,7 +40,7 @@ relations set jp --note "Project lead. Prefers async over sync."
 ```
 
 The label is the short form you'll type at faculty-call sites:
-`local_messages send jp "..."` resolves "jp" via the
+`message send jp "..."` resolves "jp" via the
 relations registry.
 
 == Conventions

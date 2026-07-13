@@ -1,11 +1,14 @@
 //! Read-only GORBIE-embeddable review bench.
 //!
-//! Renders every compass goal whose *latest* status is `"review"` as a
-//! collapsed-by-default section — the human's primary work surface for
-//! auditing finished-but-unblessed work. Per goal it gathers the whole
-//! review context in one place:
+//! Renders both active review goals and goals with structured review history
+//! as collapsed-by-default sections. Keeping closed reviews on the bench makes
+//! exact settlements and break-glass reasons auditable after the atomic
+//! settlement event moves a goal to `"done"`. The gate is the same
+//! heterogeneous, revision-bound settlement projection used by the Compass
+//! CLI and Orient; the widget never reimplements quorum semantics. Per goal it
+//! gathers:
 //!
-//! - title, tags, age (time in review + time since creation);
+//! - title, tags, latest-status age, and time since creation;
 //! - the goal's notes, newest-first;
 //! - wiki fragments REFERENCED from the notes — extracted by regexing
 //!   32-hex ids out of the note text (pragmatic v0: a real link edge
@@ -22,7 +25,7 @@
 //!
 //! ```ignore
 //! let mut panel = ReviewPanel::default();
-//! panel.render(ctx, compass_ws, wiki_ws, decide_ws);
+//! panel.render(ctx, compass_ws, wiki_ws, decide_ws, relations_ws);
 //! ```
 
 use std::collections::HashSet;
@@ -44,17 +47,17 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
-use crate::schemas::compass::{board as compass, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
+use crate::schemas::compass::{
+    active_request_ids_for_goal, all_request_ids_for_goal, board as compass, evaluate_goal,
+    latest_status_event, review_attestation, review_request, ReviewGateState, ReviewProjection,
+    SettlementMode, KIND_GOAL_ID, KIND_NOTE_ID, REVIEW_STATUS,
+};
 use crate::schemas::decide::{decide as decide_attrs, factor, KIND_CON, KIND_DECISION, KIND_PRO};
+use crate::schemas::relations::{person_ids, retired_person_ids};
 use crate::schemas::wiki::{attrs as wiki, KIND_VERSION_ID};
 use crate::widgets::wiki::render_wiki_content;
 
 type TextHandle = Inline<Handle<LongString>>;
-
-/// The compass status this bench collects. Not part of
-/// `DEFAULT_STATUSES` — it's the human-in-the-loop gate between
-/// "done by the agent" and "blessed by JP".
-const REVIEW_STATUS: &str = "review";
 
 // ── Palette (shared idiom across the dashboard widgets) ─────────────
 
@@ -89,6 +92,15 @@ fn color_resolved() -> egui::Color32 {
     egui::Color32::from_rgb(0xf7, 0xba, 0x0b)
 }
 
+fn gate_color(ui: &egui::Ui, tone: GateTone) -> egui::Color32 {
+    match tone {
+        GateTone::Good => color_pro(),
+        GateTone::Warn => color_resolved(),
+        GateTone::Bad => color_con(),
+        GateTone::Muted => color_muted(ui),
+    }
+}
+
 /// "Paper" frame recipe — matches the compass/decide card chrome.
 fn paper_frame(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::NONE
@@ -116,7 +128,11 @@ fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
     );
     let painter = ui.painter();
     painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
-    painter.galley(egui::pos2(rect.left() + PAD_X, rect.top()), galley, text_color);
+    painter.galley(
+        egui::pos2(rect.left() + PAD_X, rect.top()),
+        galley,
+        text_color,
+    );
 }
 
 // ── Time helpers ─────────────────────────────────────────────────────
@@ -159,16 +175,18 @@ fn hex32_regex() -> &'static Regex {
 
 // ── Cached snapshots ─────────────────────────────────────────────────
 
-/// Cached fact spaces + head markers for the three branches the bench
+/// Cached fact spaces + head markers for the four branches the bench
 /// reads. Queries run against the `TribleSet`s on demand; text blobs
 /// are dereffed through the owning branch's workspace at render time.
 struct ReviewLive {
     compass_space: TribleSet,
     wiki_space: TribleSet,
     decide_space: TribleSet,
+    relations_space: TribleSet,
     compass_head: Option<CommitHandle>,
     wiki_head: Option<CommitHandle>,
     decide_head: Option<CommitHandle>,
+    relations_head: Option<CommitHandle>,
 }
 
 fn checkout_space(ws: &mut Workspace<Pile>, label: &str) -> TribleSet {
@@ -185,6 +203,7 @@ impl ReviewLive {
         compass_ws: &mut Workspace<Pile>,
         wiki_ws: Option<&mut Workspace<Pile>>,
         decide_ws: Option<&mut Workspace<Pile>>,
+        relations_ws: Option<&mut Workspace<Pile>>,
     ) -> Self {
         let compass_space = checkout_space(compass_ws, "compass");
         let compass_head = compass_ws.head();
@@ -196,13 +215,19 @@ impl ReviewLive {
             Some(ws) => (checkout_space(ws, "decide"), ws.head()),
             None => (TribleSet::new(), None),
         };
+        let (relations_space, relations_head) = match relations_ws {
+            Some(ws) => (checkout_space(ws, "relations"), ws.head()),
+            None => (TribleSet::new(), None),
+        };
         ReviewLive {
             compass_space,
             wiki_space,
             decide_space,
+            relations_space,
             compass_head,
             wiki_head,
             decide_head,
+            relations_head,
         }
     }
 }
@@ -214,38 +239,339 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
     })
 }
 
-// ── On-demand queries ────────────────────────────────────────────────
+#[derive(Clone, Copy)]
+enum GateTone {
+    Good,
+    Warn,
+    Bad,
+    Muted,
+}
 
-/// Goals whose latest status event says "review", newest-entered
-/// first. Returns (goal_id, entered_review_at).
-fn review_goals(space: &TribleSet) -> Vec<(Id, i128)> {
-    // Latest status event per goal — same rollup CompassBoard does.
-    let mut latest: std::collections::HashMap<Id, (String, i128)> =
-        std::collections::HashMap::new();
-    for (gid, status, ts) in find!(
-        (gid: Id, status: String, ts: (i128, i128)),
-        pattern!(space, [{
-            _?event @
-            metadata::tag: &KIND_STATUS_ID,
-            compass::task: ?gid,
-            compass::status: ?status,
-            metadata::created_at: ?ts,
-        }])
-    ) {
-        match latest.get_mut(&gid) {
-            Some(slot) if slot.1 < ts.0 => *slot = (status, ts.0),
-            Some(_) => {}
-            None => {
-                latest.insert(gid, (status, ts.0));
+#[derive(Clone)]
+struct AttestationView {
+    id: Id,
+    verdict: String,
+    report: String,
+}
+
+#[derive(Clone)]
+struct ReviewerView {
+    id: Id,
+    name: String,
+    author: bool,
+    retired: bool,
+    heads: Vec<AttestationView>,
+}
+
+#[derive(Clone)]
+struct CertificateView {
+    id: Id,
+    mode: SettlementMode,
+    attestations: Vec<Id>,
+    override_event: Option<Id>,
+}
+
+#[derive(Clone)]
+struct CandidateView {
+    id: Id,
+    target: String,
+}
+
+#[derive(Clone)]
+struct SettlementView {
+    label: String,
+    progress: String,
+    tone: GateTone,
+    request_id: Option<Id>,
+    target: Option<String>,
+    author: Option<String>,
+    requested_at: Option<i128>,
+    reasons: Vec<String>,
+    reviewers: Vec<ReviewerView>,
+    certificates: Vec<CertificateView>,
+    candidates: Vec<CandidateView>,
+    stale: Vec<CandidateView>,
+    override_reason: Option<String>,
+}
+
+impl SettlementView {
+    fn header_target(&self) -> String {
+        let Some(target) = self.target.as_deref() else {
+            return if self.candidates.is_empty() {
+                "—".to_string()
+            } else {
+                format!("{} candidates", self.candidates.len())
+            };
+        };
+        let revision = target.rsplit('@').next().unwrap_or(target);
+        revision.chars().take(8).collect()
+    }
+}
+
+fn interval_key(interval: crate::schemas::compass::IntervalValue) -> Option<i128> {
+    let (lower, _): (i128, i128) = interval.try_from_inline().ok()?;
+    Some(lower)
+}
+
+fn person_name(space: &TribleSet, ws: Option<&mut Workspace<Pile>>, id: Id) -> String {
+    let handle = find!(h: TextHandle, pattern!(space, [{ id @ metadata::name: ?h }])).next();
+    match (ws, handle) {
+        (Some(ws), Some(handle)) => read_text(ws, handle).unwrap_or_else(|| fmt_id(id)),
+        _ => fmt_id(id),
+    }
+}
+
+fn candidate_view(space: &TribleSet, ws: &mut Workspace<Pile>, request_id: Id) -> CandidateView {
+    let target = review_request(space, request_id)
+        .and_then(|request| request.target())
+        .and_then(|handle| read_text(ws, handle))
+        .unwrap_or_else(|| "<malformed target>".to_string());
+    CandidateView {
+        id: request_id,
+        target,
+    }
+}
+
+fn build_settlement_view(
+    live: &ReviewLive,
+    goal_id: Id,
+    compass_ws: &mut Workspace<Pile>,
+    mut relations_ws: Option<&mut Workspace<Pile>>,
+) -> SettlementView {
+    let known_people = person_ids(&live.relations_space);
+    let projection = evaluate_goal(&live.compass_space, goal_id, &known_people);
+    let active_requests: HashSet<Id> = active_request_ids_for_goal(&live.compass_space, goal_id)
+        .into_iter()
+        .collect();
+    let stale = all_request_ids_for_goal(&live.compass_space, goal_id)
+        .into_iter()
+        .filter(|id| !active_requests.contains(id))
+        .map(|id| candidate_view(&live.compass_space, compass_ws, id))
+        .collect();
+
+    match projection {
+        ReviewProjection::Unbound => SettlementView {
+            label: "UNBOUND".to_string(),
+            progress: "0/3".to_string(),
+            tone: GateTone::Muted,
+            request_id: None,
+            target: None,
+            author: None,
+            requested_at: None,
+            reasons: vec![
+                "No immutable candidate is bound to this legacy review goal.".to_string(),
+            ],
+            reviewers: Vec::new(),
+            certificates: Vec::new(),
+            candidates: Vec::new(),
+            stale,
+            override_reason: None,
+        },
+        ReviewProjection::Forked { request_ids } => SettlementView {
+            label: "FORKED · GATE CLOSED".to_string(),
+            progress: "0/3".to_string(),
+            tone: GateTone::Bad,
+            request_id: None,
+            target: None,
+            author: None,
+            requested_at: None,
+            reasons: vec![
+                "Concurrent successor requests must be superseded by one new request.".to_string(),
+            ],
+            reviewers: Vec::new(),
+            certificates: Vec::new(),
+            candidates: request_ids
+                .into_iter()
+                .map(|id| candidate_view(&live.compass_space, compass_ws, id))
+                .collect(),
+            stale,
+            override_reason: None,
+        },
+        ReviewProjection::Bound(evaluation) => {
+            let author_id = evaluation.request.author();
+            let target = evaluation
+                .request
+                .target()
+                .and_then(|handle| read_text(compass_ws, handle));
+            let author = author_id
+                .map(|id| person_name(&live.relations_space, relations_ws.as_deref_mut(), id));
+            let requested_at = evaluation
+                .request
+                .created_at
+                .first()
+                .copied()
+                .and_then(interval_key);
+            let mut reasons = Vec::new();
+            let (label, progress, tone, settlements) = match &evaluation.state {
+                ReviewGateState::Invalid { reasons: why } => {
+                    reasons.extend(why.iter().cloned());
+                    (
+                        "INVALID".to_string(),
+                        "0/3".to_string(),
+                        GateTone::Bad,
+                        Vec::new(),
+                    )
+                }
+                ReviewGateState::Pending {
+                    submitted,
+                    required,
+                } => (
+                    "PENDING".to_string(),
+                    format!("{submitted}/{required}"),
+                    GateTone::Warn,
+                    Vec::new(),
+                ),
+                ReviewGateState::Blocked {
+                    submitted,
+                    reasons: why,
+                } => {
+                    reasons.extend(why.iter().cloned());
+                    (
+                        "BLOCKED".to_string(),
+                        format!("{submitted}/3"),
+                        GateTone::Bad,
+                        Vec::new(),
+                    )
+                }
+                ReviewGateState::Ready => (
+                    "READY".to_string(),
+                    "3/3".to_string(),
+                    GateTone::Good,
+                    Vec::new(),
+                ),
+                ReviewGateState::Settled { settlements } => {
+                    let overridden = settlements
+                        .iter()
+                        .any(|settlement| settlement.mode == SettlementMode::Override);
+                    (
+                        if overridden { "OVERRIDDEN" } else { "SETTLED" }.to_string(),
+                        if overridden { "OVERRIDE" } else { "3/3" }.to_string(),
+                        if overridden {
+                            GateTone::Warn
+                        } else {
+                            GateTone::Good
+                        },
+                        settlements.clone(),
+                    )
+                }
+            };
+            let override_reason = settlements
+                .iter()
+                .find(|settlement| settlement.mode == SettlementMode::Override)
+                .and_then(|settlement| settlement.override_event)
+                .and_then(|event| {
+                    find!(h: TextHandle, pattern!(&live.compass_space, [{ event @ metadata::description: ?h }])).next()
+                })
+                .and_then(|handle| read_text(compass_ws, handle));
+            let sealed_evidence = settlements
+                .iter()
+                .find(|settlement| settlement.mode == SettlementMode::Attestations)
+                .map(|settlement| settlement.attestations.as_slice());
+            let retired = retired_person_ids(&live.relations_space);
+            let reviewers = evaluation
+                .request
+                .required
+                .iter()
+                .copied()
+                .map(|reviewer| {
+                    let name = person_name(
+                        &live.relations_space,
+                        relations_ws.as_deref_mut(),
+                        reviewer,
+                    );
+                    // A green ordinary settlement renders its immutable proof
+                    // evidence, never a later/current reviewer frontier. An
+                    // override has no attestation proof, so its reviewer cards
+                    // deliberately preserve the live blockers it bypassed.
+                    let heads = if let Some(evidence) = sealed_evidence {
+                        evidence
+                            .iter()
+                            .filter_map(|id| review_attestation(&live.compass_space, *id))
+                            .filter(|head| head.reviewer() == Some(reviewer))
+                            .collect::<Vec<_>>()
+                    } else {
+                        evaluation
+                            .slots
+                            .iter()
+                            .find(|slot| slot.reviewer == reviewer)
+                            .map(|slot| slot.heads.clone())
+                            .unwrap_or_default()
+                    }
+                    .into_iter()
+                    .map(|head| AttestationView {
+                        id: head.id,
+                        verdict: head.verdict().unwrap_or("malformed").to_string(),
+                        report: head
+                            .report()
+                            .and_then(|handle| read_text(compass_ws, handle))
+                            .unwrap_or_default(),
+                    })
+                    .collect();
+                    ReviewerView {
+                        id: reviewer,
+                        name,
+                        author: author_id == Some(reviewer),
+                        retired: retired.contains(&reviewer),
+                        heads,
+                    }
+                })
+                .collect();
+            let certificates = settlements
+                .into_iter()
+                .map(|settlement| CertificateView {
+                    id: settlement.id,
+                    mode: settlement.mode,
+                    attestations: settlement.attestations,
+                    override_event: settlement.override_event,
+                })
+                .collect();
+            SettlementView {
+                label,
+                progress,
+                tone,
+                request_id: Some(evaluation.request.id),
+                target,
+                author,
+                requested_at,
+                reasons,
+                reviewers,
+                certificates,
+                candidates: Vec::new(),
+                stale,
+                override_reason,
             }
         }
     }
-    let mut goals: Vec<(Id, i128)> = latest
-        .into_iter()
-        .filter(|(_, (status, _))| status == REVIEW_STATUS)
-        .map(|(gid, (_, ts))| (gid, ts))
-        .collect();
-    goals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
+// ── On-demand queries ────────────────────────────────────────────────
+
+/// Active review goals plus every goal carrying structured review history.
+/// Active work sorts first, then each group is newest-status-first. Returns
+/// `(goal_id, latest_status, latest_status_at)`.
+fn review_goals(space: &TribleSet) -> Vec<(Id, String, i128)> {
+    // Reuse the schema's timestamp + event-id tie-break so every projection
+    // agrees after equal-time events merge.
+    let mut goals: Vec<(Id, String, i128)> = find!(
+        gid: Id,
+        pattern!(space, [{ ?gid @ metadata::tag: &KIND_GOAL_ID }])
+    )
+    .filter_map(|gid| {
+        latest_status_event(space, gid)
+            .and_then(|(_, status, at)| interval_key(at).map(|ts| (gid, status, ts)))
+    })
+    .filter(|(gid, status, _)| {
+        status == REVIEW_STATUS || !all_request_ids_for_goal(space, *gid).is_empty()
+    })
+    .collect();
+    goals.sort_by(|a, b| {
+        let a_active = a.1 == REVIEW_STATUS;
+        let b_active = b.1 == REVIEW_STATUS;
+        b_active
+            .cmp(&a_active)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     goals
 }
 
@@ -427,9 +753,9 @@ impl ReviewPanel {
         Self::default()
     }
 
-    /// Render the bench. `compass_ws` is required (the bench is a view
-    /// over compass goals); `wiki_ws` / `decide_ws` are optional — when
-    /// absent, referenced fragments / linked decisions simply don't
+    /// Render the bench. `compass_ws` and `relations_ws` are required because
+    /// exact gate validation needs the frozen identities; `wiki_ws` and
+    /// `decide_ws` are optional, in which case linked context simply does not
     /// resolve. READ-ONLY: no commits, no pushes.
     pub fn render(
         &mut self,
@@ -437,17 +763,20 @@ impl ReviewPanel {
         compass_ws: &mut Workspace<Pile>,
         mut wiki_ws: Option<&mut Workspace<Pile>>,
         decide_ws: Option<&mut Workspace<Pile>>,
+        relations_ws: &mut Workspace<Pile>,
     ) {
         let mut decide_ws = decide_ws;
         let compass_head = compass_ws.head();
         let wiki_head = wiki_ws.as_ref().and_then(|ws| ws.head());
         let decide_head = decide_ws.as_ref().and_then(|ws| ws.head());
+        let relations_head = relations_ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
             Some(l) => {
                 l.compass_head != compass_head
                     || l.wiki_head != wiki_head
                     || l.decide_head != decide_head
+                    || l.relations_head != relations_head
             }
         };
         if need_refresh {
@@ -455,22 +784,28 @@ impl ReviewPanel {
                 compass_ws,
                 wiki_ws.as_deref_mut(),
                 decide_ws.as_deref_mut(),
+                Some(&mut *relations_ws),
             ));
         }
-        let Some(live) = self.live.as_ref() else { return };
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
 
         let goals = review_goals(&live.compass_space);
+        let active_count = goals
+            .iter()
+            .filter(|(_, status, _)| status == REVIEW_STATUS)
+            .count();
+        let history_count = goals.len().saturating_sub(active_count);
         let now = now_tai_ns();
 
         ctx.section("Review", |ctx| {
             // Header count line.
             {
                 let ui = ctx.ui_mut();
-                let n = goals.len();
                 ui.label(
                     egui::RichText::new(format!(
-                        "{n} GOAL{} IN REVIEW",
-                        if n == 1 { "" } else { "S" }
+                        "{active_count} ACTIVE · {history_count} HISTORICAL"
                     ))
                     .monospace()
                     .strong()
@@ -490,7 +825,7 @@ impl ReviewPanel {
                     );
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("Nothing awaiting review.")
+                        egui::RichText::new("No review activity yet.")
                             .monospace()
                             .small()
                             .strong()
@@ -499,7 +834,7 @@ impl ReviewPanel {
                     ui.add_space(2.0);
                     ui.label(
                         egui::RichText::new(
-                            "Goals moved to status \"review\" via `compass move` land here.",
+                            "`compass review open` binds an exact candidate and assigns its frozen triad.",
                         )
                         .small()
                         .color(color_muted(ui)),
@@ -509,15 +844,29 @@ impl ReviewPanel {
                 return;
             }
 
-            for &(goal_id, entered_at) in &goals {
+            for (goal_id, latest_status, status_at) in &goals {
+                let goal_id = *goal_id;
                 let title = goal_title(&live.compass_space, compass_ws, goal_id);
+                let settlement = build_settlement_view(
+                    live,
+                    goal_id,
+                    compass_ws,
+                    Some(&mut *relations_ws),
+                );
                 let title_line = title.lines().next().unwrap_or("").trim();
                 // Include the id prefix in the section title so two
                 // same-titled goals don't share a persisted fold state.
                 let header = format!(
-                    "{} · {}",
-                    if title_line.is_empty() { "(untitled)" } else { title_line },
+                    "{} · {} · {} · {} · {}",
+                    if title_line.is_empty() {
+                        "(untitled)"
+                    } else {
+                        title_line
+                    },
                     &fmt_id(goal_id)[..8],
+                    settlement.header_target(),
+                    settlement.progress,
+                    settlement.label,
                 );
                 // Per-goal collapsed-by-default section — inherits the
                 // notebook-wide `set_default_section_open(false)`
@@ -527,11 +876,13 @@ impl ReviewPanel {
                         ctx,
                         live,
                         goal_id,
-                        entered_at,
+                        latest_status,
+                        *status_at,
                         now,
                         compass_ws,
                         wiki_ws.as_deref_mut(),
                         decide_ws.as_deref_mut(),
+                        &settlement,
                     );
                 });
             }
@@ -546,11 +897,13 @@ fn render_goal(
     ctx: &mut CardCtx<'_>,
     live: &ReviewLive,
     goal_id: Id,
-    entered_at: i128,
+    latest_status: &str,
+    status_at: i128,
     now: i128,
     compass_ws: &mut Workspace<Pile>,
     mut wiki_ws: Option<&mut Workspace<Pile>>,
     mut decide_ws: Option<&mut Workspace<Pile>>,
+    settlement: &SettlementView,
 ) {
     let tags = goal_tags(&live.compass_space, goal_id);
     let created_at = goal_created_at(&live.compass_space, goal_id);
@@ -570,10 +923,16 @@ fn render_goal(
                         .small()
                         .color(color_muted(ui)),
                 );
+                let status_label = if latest_status == REVIEW_STATUS {
+                    "IN REVIEW".to_string()
+                } else {
+                    latest_status.to_uppercase()
+                };
                 ui.label(
                     egui::RichText::new(format!(
-                        "IN REVIEW {} · CREATED {}",
-                        format_age(now, Some(entered_at)),
+                        "{} {} · CREATED {}",
+                        status_label,
+                        format_age(now, Some(status_at)),
                         format_age(now, created_at),
                     ))
                     .monospace()
@@ -590,6 +949,280 @@ fn render_goal(
                 }
             });
         });
+
+        // ── Revision-bound settlement ──
+        let state_label = settlement.label.clone();
+        let progress = settlement.progress.clone();
+        let tone = settlement.tone;
+        let request_id = settlement.request_id;
+        let target = settlement.target.clone();
+        let author = settlement.author.clone();
+        let requested_at = settlement.requested_at;
+        g.full(move |ctx| {
+            let ui = ctx.ui_mut();
+            ui.add_space(4.0);
+            paper_frame(ui)
+                .inner_margin(egui::Margin {
+                    left: 8,
+                    right: 8,
+                    top: 7,
+                    bottom: 7,
+                })
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        render_chip(ui, &state_label, gate_color(ui, tone));
+                        ui.label(egui::RichText::new(&progress).monospace().strong().small());
+                        if let Some(request_id) = request_id {
+                            ui.label(
+                                egui::RichText::new(format!("request {}", fmt_id(request_id)))
+                                    .monospace()
+                                    .small()
+                                    .color(color_muted(ui)),
+                            );
+                        }
+                        if let Some(author) = author.as_deref() {
+                            ui.label(
+                                egui::RichText::new(format!("author {author}"))
+                                    .small()
+                                    .color(color_muted(ui)),
+                            );
+                        }
+                        if requested_at.is_some() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "requested {}",
+                                    format_age(now, requested_at)
+                                ))
+                                .small()
+                                .color(color_muted(ui)),
+                            );
+                        }
+                    });
+                    if let Some(target) = target.as_deref() {
+                        ui.add_space(5.0);
+                        ui.label(
+                            egui::RichText::new("EXACT CANDIDATE")
+                                .monospace()
+                                .strong()
+                                .small()
+                                .color(color_muted(ui)),
+                        );
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(target).monospace().small())
+                                .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
+                    }
+                });
+        });
+
+        for reason in &settlement.reasons {
+            let reason = reason.clone();
+            g.full(move |ctx| {
+                let ui = ctx.ui_mut();
+                ui.label(
+                    egui::RichText::new(reason)
+                        .small()
+                        .strong()
+                        .color(color_con()),
+                );
+            });
+        }
+
+        for certificate in &settlement.certificates {
+            let certificate = certificate.clone();
+            g.full(move |ctx| {
+                let ui = ctx.ui_mut();
+                paper_frame(ui)
+                    .inner_margin(egui::Margin::same(7))
+                    .show(ui, |ui| {
+                        let mode = match certificate.mode {
+                            SettlementMode::Attestations => "TRIADIC CERTIFICATE",
+                            SettlementMode::Override => "BREAK-GLASS CERTIFICATE",
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            render_chip(ui, mode, color_resolved());
+                            ui.label(
+                                egui::RichText::new(fmt_id(certificate.id))
+                                    .monospace()
+                                    .small()
+                                    .color(color_muted(ui)),
+                            );
+                        });
+                        for evidence in &certificate.attestations {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "SEALED ATTESTATION {}",
+                                    fmt_id(*evidence)
+                                ))
+                                .monospace()
+                                .small(),
+                            );
+                        }
+                        if let Some(event) = certificate.override_event {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "SEALED OVERRIDE EVENT {}",
+                                    fmt_id(event)
+                                ))
+                                .monospace()
+                                .small(),
+                            );
+                        }
+                    });
+            });
+        }
+
+        if let Some(reason) = settlement.override_reason.clone() {
+            g.full(move |ctx| {
+                let ui = ctx.ui_mut();
+                ui.label(
+                    egui::RichText::new("BREAK-GLASS REASON")
+                        .monospace()
+                        .strong()
+                        .small()
+                        .color(color_resolved()),
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(reason).small())
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+            });
+        }
+
+        for candidate in &settlement.candidates {
+            let candidate = candidate.clone();
+            g.full(move |ctx| {
+                let ui = ctx.ui_mut();
+                paper_frame(ui)
+                    .inner_margin(egui::Margin::same(7))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("FORK HEAD {}", fmt_id(candidate.id)))
+                                .monospace()
+                                .strong()
+                                .small()
+                                .color(color_con()),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(candidate.target).monospace().small(),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
+                    });
+            });
+        }
+
+        for reviewer in &settlement.reviewers {
+            let reviewer = reviewer.clone();
+            g.full(move |ctx| {
+                let ui = ctx.ui_mut();
+                paper_frame(ui)
+                    .inner_margin(egui::Margin::same(7))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(&reviewer.name).strong());
+                            if reviewer.author {
+                                render_chip(ui, "AUTHOR", color_resolved());
+                            }
+                            if reviewer.retired {
+                                let retired_color = color_muted(ui);
+                                render_chip(ui, "RETIRED", retired_color);
+                            }
+                            ui.label(
+                                egui::RichText::new(fmt_id(reviewer.id))
+                                    .monospace()
+                                    .small()
+                                    .color(color_muted(ui)),
+                            );
+                        });
+                        match reviewer.heads.as_slice() {
+                            [] => {
+                                ui.label(
+                                    egui::RichText::new("PENDING")
+                                        .monospace()
+                                        .strong()
+                                        .small()
+                                        .color(color_muted(ui)),
+                                );
+                            }
+                            [head] => {
+                                let fill = match head.verdict.as_str() {
+                                    "approve" => color_pro(),
+                                    "request-changes" => color_con(),
+                                    _ => color_resolved(),
+                                };
+                                ui.horizontal_wrapped(|ui| {
+                                    render_chip(ui, &head.verdict.to_uppercase(), fill);
+                                    ui.label(
+                                        egui::RichText::new(fmt_id(head.id))
+                                            .monospace()
+                                            .small()
+                                            .color(color_muted(ui)),
+                                    );
+                                });
+                                if !head.report.is_empty() {
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(&head.report).small())
+                                            .wrap_mode(egui::TextWrapMode::Wrap),
+                                    );
+                                }
+                            }
+                            heads => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "FORKED — {} ACTIVE ATTESTATIONS",
+                                        heads.len()
+                                    ))
+                                    .monospace()
+                                    .strong()
+                                    .small()
+                                    .color(color_con()),
+                                );
+                                for head in heads {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · {}",
+                                            fmt_id(head.id),
+                                            head.verdict
+                                        ))
+                                        .monospace()
+                                        .small(),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                ui.add_space(3.0);
+            });
+        }
+
+        if !settlement.stale.is_empty() {
+            let stale = settlement.stale.clone();
+            g.full(move |ctx| {
+                let ui = ctx.ui_mut();
+                ui.label(
+                    egui::RichText::new(format!("STALE CANDIDATES ({})", stale.len()))
+                        .monospace()
+                        .strong()
+                        .small()
+                        .color(color_muted(ui)),
+                );
+                for candidate in stale {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · {}",
+                            fmt_id(candidate.id),
+                            candidate.target
+                        ))
+                        .monospace()
+                        .small()
+                        .color(color_muted(ui)),
+                    );
+                }
+            });
+        }
 
         // ── Notes ──
         g.full(|ctx| {
@@ -664,18 +1297,14 @@ fn render_goal(
                         pattern!(&live.wiki_space, [{ vid @ wiki::title: ?h }])
                     )
                     .next()
-                    .and_then(|h| {
-                        wiki_ws.as_deref_mut().and_then(|ws| read_text(ws, h))
-                    })
+                    .and_then(|h| wiki_ws.as_deref_mut().and_then(|ws| read_text(ws, h)))
                     .unwrap_or_default();
                     let content = find!(
                         h: TextHandle,
                         pattern!(&live.wiki_space, [{ vid @ wiki::content: ?h }])
                     )
                     .next()
-                    .and_then(|h| {
-                        wiki_ws.as_deref_mut().and_then(|ws| read_text(ws, h))
-                    })
+                    .and_then(|h| wiki_ws.as_deref_mut().and_then(|ws| read_text(ws, h)))
                     .unwrap_or_default();
                     g.full(move |ctx| {
                         let frag_col = colorhash::ral_categorical(frag_id.as_ref());
@@ -689,10 +1318,7 @@ fn render_goal(
                                 );
                                 ui.painter().circle_filled(dot_rect.center(), 5.0, frag_col);
                                 ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&title).strong(),
-                                    )
-                                    .wrap(),
+                                    egui::Label::new(egui::RichText::new(&title).strong()).wrap(),
                                 );
                                 ui.label(
                                     egui::RichText::new(format!("wiki:{}", fmt_id(frag_id)))
@@ -777,8 +1403,7 @@ fn render_goal(
                 Some(ws) => decision_factors(&live.decide_space, ws, did, KIND_CON),
                 None => Vec::new(),
             };
-            let resolved =
-                finished && outcome.as_deref().map_or(false, |o| !o.trim().is_empty());
+            let resolved = finished && outcome.as_deref().map_or(false, |o| !o.trim().is_empty());
 
             g.full(move |ctx| {
                 let ui = ctx.ui_mut();
@@ -869,4 +1494,70 @@ fn render_factor_column(
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schemas::compass::KIND_STATUS_ID;
+    use hifitime::Epoch;
+    use triblespace::macros::entity;
+    use triblespace::prelude::*;
+
+    fn at(second: u8) -> crate::schemas::compass::IntervalValue {
+        let epoch = Epoch::from_gregorian_utc(2026, 7, 13, 12, 0, second, 0);
+        (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    fn add_goal(space: &mut TribleSet, goal: Id) {
+        *space += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+        };
+    }
+
+    fn add_status(space: &mut TribleSet, goal: Id, status: &str, second: u8) {
+        let event = ufoid();
+        *space += entity! { &event @
+            metadata::tag: &KIND_STATUS_ID,
+            compass::task: &goal,
+            compass::status: status,
+            metadata::created_at: at(second),
+        };
+    }
+
+    #[test]
+    fn bench_retains_structured_history_after_settlement() {
+        let mut space = TribleSet::new();
+        let active = ufoid().id;
+        let settled = ufoid().id;
+        let ordinary_done = ufoid().id;
+        for goal in [active, settled, ordinary_done] {
+            add_goal(&mut space, goal);
+        }
+
+        add_status(&mut space, active, REVIEW_STATUS, 1);
+
+        let request = ufoid();
+        space += entity! { &request @
+            metadata::tag: &crate::schemas::compass::KIND_REVIEW_REQUEST_ID,
+            metadata::tag: &KIND_STATUS_ID,
+            compass::task: &settled,
+            compass::status: REVIEW_STATUS,
+            metadata::created_at: at(2),
+        };
+        add_status(&mut space, settled, crate::schemas::compass::DONE_STATUS, 3);
+        add_status(
+            &mut space,
+            ordinary_done,
+            crate::schemas::compass::DONE_STATUS,
+            4,
+        );
+
+        let rows = review_goals(&space);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, active, "active reviews sort before history");
+        assert_eq!(rows[0].1, REVIEW_STATUS);
+        assert_eq!(rows[1].0, settled);
+        assert_eq!(rows[1].1, crate::schemas::compass::DONE_STATUS);
+    }
 }

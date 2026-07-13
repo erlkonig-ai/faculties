@@ -1,7 +1,7 @@
 //! Unified pile inspector: composes all four faculty widgets with a
 //! single shared pile-path selector via `StorageState`.
 //!
-//! Run against a pile that has a `wiki`, `compass`, and `local-messages`
+//! Run against a pile that has a `wiki`, `compass`, and `message`
 //! branch:
 //!
 //! ```ignore
@@ -52,7 +52,7 @@ fn main(nb: &mut NotebookCtx) {
         move |ctx, tl| {
             let mut st = storage.read_mut(ctx);
             // Pull a fresh workspace per source each frame.
-            let branch_names: &[&str] = &["compass", "local-messages", "wiki"];
+            let branch_names: &[&str] = &["compass", "message", "wiki"];
             let mut pulled: Vec<(&str, Workspace<Pile>)> =
                 Vec::with_capacity(branch_names.len());
             for name in branch_names {
@@ -83,7 +83,7 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("local-messages") else { return };
+        let Some(mut ws) = st.workspace("message") else { return };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);

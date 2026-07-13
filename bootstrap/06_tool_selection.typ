@@ -4,7 +4,7 @@ A quick lookup for "which tool do I reach for here?"
 
 == Goals and tasks
 
-  - *Use* `compass goal-create` / `status` / `note`.
+  - *Use* `compass add` / `move` / `note`.
   - *Don't use* the harness's TaskCreate / TaskUpdate for
     persistent goals — those vanish at end of session.
   - *Do use* TaskCreate inline within a single conversation when
@@ -28,7 +28,7 @@ A quick lookup for "which tool do I reach for here?"
 
 == Direct messages between agents
 
-  - *Use* `local_messages` for in-place agent-to-agent
+  - *Use* `message` for in-place agent-to-agent
     messaging (append-only, with read acknowledgements).
   - For shared knowledge between two agents: a wiki fragment
     they both query is usually better than a message.

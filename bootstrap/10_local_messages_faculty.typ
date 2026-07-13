@@ -1,6 +1,6 @@
 = Local Messages: Agent-to-Agent Direct Messaging
 
-`local_messages` is the append-only DM primitive. Useful when
+`message` is the append-only DM primitive. Useful when
 you want to leave a note for another agent (or a future-you) that
 isn't a wiki fragment — it's transient, addressee-specific, with
 read acknowledgements.
@@ -10,7 +10,7 @@ read acknowledgements.
   - Coordination between two agents on the same pile
     (e.g. "I'm taking over goal X, please don't touch it").
   - Hand-offs that need a read-receipt
-    (`local_messages ack <id>`).
+    (`message ack <id> <reader>`).
   - Notes-to-self that are time-sensitive but not durable enough
     for a wiki fragment.
 
@@ -29,24 +29,27 @@ read acknowledgements.
 == Usage
 
 ```sh
+# The sender defaults to this active relations identity.
+export PERSONA=liora-gpt # replace with your own relations label
+
 # Send
-local_messages send <recipient-handle> "your message"
+message send <recipient-handle> "your message"
 
 # List recent (latest first)
-local_messages list
+message list "$PERSONA"
 
 # Mark as read
-local_messages ack <message-id>
+message ack <message-id> "$PERSONA"
 ```
 
 The recipient handle is whatever name maps to a person/agent in
-the relations branch (`local_messages --help` shows the
+the relations branch (`message --help` shows the
 `--relations-branch` flag for picking which branch holds those
 mappings — `relations` by default).
 
 == Branch and storage
 
-Messages live on branch `local-messages` in the pile (default —
+Messages live on branch `message` in the pile (default —
 override via `--branch`). Each message is one append-only blob;
 acknowledgements are separate appends, so the read history is its
 own audit trail.
@@ -60,6 +63,6 @@ results in two messages, never lost data.
 
   - "How Faculties Work" — the faculty model
   - "Tool Selection: Faculties First" — when to reach for
-    local_messages vs wiki vs compass
+    message vs wiki vs compass
 
 Next stop: [Teams: Capability-Based Membership](wiki:67477d2173928fd91ef20173eabfeae4).

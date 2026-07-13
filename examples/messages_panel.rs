@@ -1,6 +1,6 @@
 //! Minimal GORBIE notebook that embeds `faculties::widgets::MessagesPanel`.
 //!
-//! Run against a pile that has a `local-messages` branch:
+//! Run against a pile that has a `message` branch:
 //!
 //! ```ignore
 //! cargo run --example messages_panel --features widgets -- ./self.pile
@@ -27,7 +27,7 @@ fn main(nb: &mut NotebookCtx) {
     let branch = args
         .next()
         .or_else(|| std::env::var("BRANCH").ok())
-        .unwrap_or_else(|| "local-messages".to_owned());
+        .unwrap_or_else(|| "message".to_owned());
 
     let storage = nb.state("storage", StorageState::new(pile_path), |ctx, st| {
         st.top_bar(ctx);
@@ -37,7 +37,7 @@ fn main(nb: &mut NotebookCtx) {
         ctx.grid(|g| {
             g.full(|ctx| {
                 ctx.markdown(
-                    "# Messages Panel\nChat-style view of local-messages on a pile branch.",
+                    "# Messages Panel\nChat-style view of messages on the `message` pile branch.",
                 );
             });
         });

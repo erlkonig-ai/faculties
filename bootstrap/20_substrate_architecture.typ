@@ -10,7 +10,7 @@ down, so the tools — and you — never have to handle them.
     align(center)[*your agents* — any model, any harness]),
   text(1.2em, sym.arrow.b),
   box(stroke: 1pt, radius: 4pt, inset: 10pt, width: 26em,
-    align(center)[*faculties* — `compass` · `wiki` · `files` · `local_messages` · …]),
+    align(center)[*faculties* — `compass` · `wiki` · `files` · `message` · …]),
   text(1.2em, sym.arrow.b),
   box(stroke: 1pt, radius: 4pt, inset: 10pt, width: 26em,
     align(center)[*the workspace* — one pile: branches, blobs, signed commits]),
@@ -40,7 +40,7 @@ down, so the tools — and you — never have to handle them.
 You never coordinate with your peers — you *discover* them.
 Another agent's goals simply appear in
 [compass](wiki:7cdd48c272ff344628fe74f4c07783e4), their messages in
-[local-messages](wiki:65c6965cb3d11052e87804527734a697), the team's current situation in
+[message](wiki:65c6965cb3d11052e87804527734a697), the team's current situation in
 [orient](wiki:ff27b500d93e1d545b7465438a0146e1). Write as if alone, read as if omniscient;
 the [coordination recipe](wiki:45e1b9bef3ad9836536ab7bce367deb0) turns that into a
 working pattern.

@@ -116,16 +116,16 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/10_local_messages_faculty.typ" \
   --tag bootstrap --tag onboarding --tag local-messages --tag coordination >/dev/null
 
-# 11. Orient — situation snapshot of recent messages + doing +
-# todo. The "where was I?" command. Includes `orient.rs wait`
-# for blocking on relevant branch changes (idle-agent
-# coordination primitive).
+# 11. Orient — situation snapshot of recent messages, doing/todo,
+# and exact review obligations. Includes persona-scoped wait/poll;
+# review requests summon their frozen reviewers without a second
+# notification record.
 "$WIKI" create "Orient: The Situation-Snapshot Faculty" --force --id "${ID_ORIENT}" \
   "@$BOOTSTRAP_DIR/11_orient_faculty.typ" \
   --tag bootstrap --tag onboarding --tag orient --tag coordination >/dev/null
 
 # 12. Relations — contacts/handle registry. The label-to-person
-# mapping that local_messages and compass workflows resolve
+# mapping that message and compass workflows resolve
 # recipient/assignee references through. Conventions for
 # labels, aliases, when not to use it (network identities
 # belong to team CLI state, not relations).
@@ -149,11 +149,10 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/14_research_workflow.typ" \
   --tag bootstrap --tag onboarding --tag recipe --tag research >/dev/null
 
-# 15. Multi-agent coordination recipe — chains relations,
-# local_messages, orient, compass for two-agent handoff
-# patterns. The non-obvious bit is the handshake order:
-# status change is durable signal, message is the
-# notification, notes are the audit trail.
+# 15. Multi-agent coordination recipe — conversational handoffs use
+# messages; exact review assignment is derived automatically from
+# Compass request heads. Covers triadic settlement, revision refresh,
+# visible forks, and reasoned break-glass evidence.
 "$WIKI" create "Recipe: Multi-Agent Coordination" --force --id "${ID_COORD}" \
   "@$BOOTSTRAP_DIR/15_coordination_workflow.typ" \
   --tag bootstrap --tag onboarding --tag recipe --tag coordination >/dev/null

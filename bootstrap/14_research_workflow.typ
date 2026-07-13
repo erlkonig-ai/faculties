@@ -47,9 +47,16 @@ EOF
 # 5. Cross-link new fragments back to the goal.
 compass note "$GOAL" "Wrote up finding: see wiki:<frag-id>"
 
-# 6. When done: outcome note + status done.
+# 6. Record the outcome. Pure lookup/bookkeeping can close directly.
+#    A result that will drive a main-bound artefact enters exact review.
 compass note "$GOAL" "Conclusion: ..."
-compass move "$GOAL" done
+export PERSONA=liora-gpt # each reviewer uses their own relations label
+compass review open "$GOAL" \
+  --target 'git+https://example.org/repo@<full-commit-oid>' \
+  --review-group review-triad \
+  --override-authority jp
+# Three independent `compass review submit <request> ...` passes,
+# then `compass review settle <request>`.
 ```
 
 == Why each step
@@ -64,10 +71,11 @@ compass move "$GOAL" done
     cross-link cleanly and survive session boundaries. A
     "session log" fragment that tries to capture everything is
     a leaky abstraction.
-  - *Outcome note before status done*: the outcome line is
+  - *Outcome note before settlement*: the outcome line is
     what future-you (or another agent) will see when scanning
-    `compass list done`. Make it useful — what did you
-    learn, what's still open.
+    the goal or reviewing its candidate. Make it useful — what did
+    you learn, what's still open. Review actions themselves are the
+    ledger: open enters `review`; settle enters `done`.
 
 == Skipping steps
 

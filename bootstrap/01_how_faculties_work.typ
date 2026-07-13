@@ -15,7 +15,7 @@ CLI — no Rust toolchain needed; the tarball also carries
     [`compass` for goals](wiki:7cdd48c272ff344628fe74f4c07783e4),
     [`wiki` for knowledge fragments](wiki:82129c70b693f7e2d781d78ac5efbb86),
     [`files` for archived artefacts](wiki:b08448855de9cce7610d68dac2555003),
-    [`local_messages` for direct messages](wiki:65c6965cb3d11052e87804527734a697),
+    [`message` for direct messages](wiki:65c6965cb3d11052e87804527734a697),
     and so on.
   - Each faculty owns a *branch* in the pile (`compass`,
     `wiki`, `files`, …) and writes its own signed commits

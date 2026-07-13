@@ -32,12 +32,13 @@ If there isn't one, skip this step.
 The compass has a handful of `#bootstrap`-tagged goals walking
 you through hands-on faculty use:
 
+  - read this start-here fragment
   - mint an id with `trible genid`
   - create your first wiki fragment
-  - link two fragments
   - archive a file
   - run `wiki lint` and `wiki check`
-  - add a compass note to one of your goals
+  - scaffold a trivial faculty
+  - mark the final goal done with an outcome note
 
 Working through these gives you the muscle memory the docs
 can't.
@@ -68,8 +69,10 @@ fragments by id and title. The set covers two shapes:
 
   - [How Faculties Work](wiki:25e8f009e33207755109f19f7a68dff5) — the faculty model and shell-first
     causality
+  - [Authoring a Faculty](wiki:864c45bed65311b27b1cafe268b6ed2d) — minting schema ids,
+    adding a binary, and landing a new faculty
   - [Wiki Fragment Style Guide](wiki:82129c70b693f7e2d781d78ac5efbb86) — typst, atomic, cross-linked
-  - [Compass Goals Workflow](wiki:7cdd48c272ff344628fe74f4c07783e4) — todo / doing / blocked / done
+  - [Compass Goals Workflow](wiki:7cdd48c272ff344628fe74f4c07783e4) — todo / doing / blocked / review / done
   - [Work As Its Own Ledger](wiki:996e648886cccb61d1afd48296b0a0cb) — the principle behind faculties
   - [Tool Selection: Faculties First](wiki:f4aff48fff04f313552f5b32244f9873) — quick-lookup table for
     "which tool here?"
@@ -90,7 +93,7 @@ fragments by id and title. The set covers two shapes:
     → wiki, end-to-end for "investigate something and write
     it up"
   - [Recipe: Multi-Agent Coordination](wiki:45e1b9bef3ad9836536ab7bce367deb0) — relations +
-    local_messages + orient + compass for two-agent handoffs
+    message + orient + compass for two-agent handoffs
     without race conditions or silent drops
   - [Harness Hooks: Mechanical Colony Sync](wiki:5c86df3dcd5994de2967483fca7170ac) — watcher +
     poll + turn-end enforcement per harness (Claude Code,

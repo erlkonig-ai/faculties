@@ -1,12 +1,19 @@
-
-use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use anyhow::{bail, Context, Result};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::compass::{
-    DEFAULT_STATUSES, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
-    KIND_SPECS, KIND_STATUS_ID, board,
+    active_attestation_ids_for_reviewer, active_request_ids_for_goal, all_request_ids_for_goal,
+    board, evaluate_goal, evaluate_request, latest_status_event, review_attestation_fragment,
+    review_attestation_settlement_fragment, review_override_fragment,
+    review_override_settlement_fragment, review_request, review_request_fragment,
+    ReviewEvaluation, ReviewGateState, ReviewProjection, SettlementMode, DEFAULT_STATUSES,
+    KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
+    KIND_REVIEW_REQUEST_ID, KIND_SPECS, KIND_STATUS_ID, REVIEW_STATUS, VERDICT_ABSTAIN,
+    VERDICT_APPROVE, VERDICT_REQUEST_CHANGES,
 };
-use faculties::schemas::relations::relations as rel_attrs;
+use faculties::schemas::relations::{
+    active_person_ids, group, person_ids, relations as rel_attrs, KIND_GROUP, KIND_PERSON_ID,
+};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
@@ -101,11 +108,83 @@ enum Command {
         #[arg(long)]
         over: String,
     },
-    /// Resolve a hex prefix to a full 64-char goal id
+    /// Resolve a hex prefix to a full 32-char goal id
     Resolve {
         /// Hex prefix to search for
         prefix: String,
     },
+    /// Open, attest, inspect, and settle an exact review candidate.
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReviewCommand {
+    /// Bind a goal to one immutable target and atomically enter review.
+    Open {
+        /// Goal id or unique prefix.
+        goal: String,
+        /// Immutable artifact revision IRI (for example git+https://...@<full-oid>).
+        #[arg(long)]
+        target: String,
+        /// Accept an opaque IRI whose immutability Compass cannot verify.
+        /// The normal path only accepts validated content-addressed schemes.
+        #[arg(long)]
+        unsafe_opaque_target: bool,
+        /// Relations group whose membership is frozen as the three-person roster.
+        #[arg(long, default_value = "review-triad")]
+        review_group: String,
+        /// Optional independent person allowed to record a reasoned break-glass settlement.
+        #[arg(long)]
+        override_authority: Vec<String>,
+    },
+    /// Submit or replace this persona's attestation for one exact request.
+    Submit {
+        /// Exact request id or unique prefix (not a goal id).
+        request: String,
+        #[arg(value_enum)]
+        verdict: VerdictArg,
+        /// Review report. Use @path for file input or @- for stdin.
+        #[arg(long)]
+        report: String,
+    },
+    /// Show the settlement projection for a goal or exact request.
+    Status {
+        id: String,
+        /// Include every historical request for the goal.
+        #[arg(long)]
+        history: bool,
+    },
+    /// Exit successfully only when this exact active request may settle.
+    Gate { request: String },
+    /// Record the exact attestation proof and atomically move the goal to done.
+    Settle { request: String },
+    /// Record a reasoned break-glass proof and atomically move the goal to done.
+    Override {
+        request: String,
+        /// Non-empty reason. Use @path for file input or @- for stdin.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum VerdictArg {
+    Approve,
+    RequestChanges,
+    Abstain,
+}
+
+impl VerdictArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => VERDICT_APPROVE,
+            Self::RequestChanges => VERDICT_REQUEST_CHANGES,
+            Self::Abstain => VERDICT_ABSTAIN,
+        }
+    }
 }
 
 // ── on-demand board queries ───────────────────────────────────────────
@@ -198,8 +277,8 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         // Avoid Drop warnings on early errors.
         let _ = pile.close();
@@ -218,10 +297,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo
@@ -247,7 +323,8 @@ fn task_tags(space: &TribleSet, task_id: Id) -> Vec<String> {
     let mut tags: Vec<String> = find!(
         tag: String,
         pattern!(space, [{ task_id @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
-    ).collect();
+    )
+    .collect();
     tags.sort();
     tags.dedup();
     tags
@@ -258,23 +335,12 @@ fn task_parent(space: &TribleSet, task_id: Id) -> Option<Id> {
 }
 
 fn task_created_at(space: &TribleSet, task_id: Id) -> Option<IntervalValue> {
-    find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }]))
-        .next()
+    find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }])).next()
 }
 
 /// Latest status for a task.
 fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, IntervalValue)> {
-    find!(
-        (status: String, at: IntervalValue),
-        pattern!(space, [{
-            _?evt @
-            metadata::tag: &KIND_STATUS_ID,
-            board::task: &task_id,
-            board::status: ?status,
-            metadata::created_at: ?at,
-        }])
-    )
-    .max_by(|a, b| interval_key(a.1).cmp(&interval_key(b.1)))
+    latest_status_event(space, task_id).map(|(_, status, at)| (status, at))
 }
 
 /// All goal IDs.
@@ -289,7 +355,7 @@ fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
     Ok(view.to_string())
 }
 
-/// Parse a full 64-char hex ID. Returns a helpful error pointing to `compass resolve` on failure.
+/// Parse a full 32-char hex ID. Returns a helpful error pointing to `compass resolve` on failure.
 fn resolve_task_id(input: &str, space: &TribleSet) -> Result<Id> {
     faculties::resolve_id_prefix(input, all_goal_ids(space))
 }
@@ -308,8 +374,14 @@ fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
         }])
     ) {
         let key = interval_key(at);
-        latest.entry((higher, lower))
-            .and_modify(|(cur_key, cur_active)| { if key > *cur_key { *cur_key = key; *cur_active = true; } })
+        latest
+            .entry((higher, lower))
+            .and_modify(|(cur_key, cur_active)| {
+                if key > *cur_key {
+                    *cur_key = key;
+                    *cur_active = true;
+                }
+            })
             .or_insert((key, true));
     }
     for (higher, lower, at) in find!(
@@ -323,23 +395,34 @@ fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
         }])
     ) {
         let key = interval_key(at);
-        latest.entry((higher, lower))
-            .and_modify(|(cur_key, cur_active)| { if key > *cur_key { *cur_key = key; *cur_active = false; } })
+        latest
+            .entry((higher, lower))
+            .and_modify(|(cur_key, cur_active)| {
+                if key > *cur_key {
+                    *cur_key = key;
+                    *cur_active = false;
+                }
+            })
             .or_insert((key, false));
     }
-    latest.into_iter().filter(|(_, (_, active))| *active).map(|(k, _)| k).collect()
+    latest
+        .into_iter()
+        .filter(|(_, (_, active))| *active)
+        .map(|(k, _)| k)
+        .collect()
 }
 
 /// Check if `to` is an ancestor of `from` (or `from` itself) in the parent tree.
 fn is_ancestor(space: &TribleSet, from: Id, to: Id) -> bool {
-    from == to || exists!(
-        (_start: Id, _end: Id),
-        and!(
-            _start.is(from.to_inline()),
-            _end.is(to.to_inline()),
-            path!(space, _start board::parent+ _end)
+    from == to
+        || exists!(
+            (_start: Id, _end: Id),
+            and!(
+                _start.is(from.to_inline()),
+                _end.is(to.to_inline()),
+                path!(space, _start board::parent+ _end)
+            )
         )
-    )
 }
 
 /// Count notes for a task.
@@ -454,11 +537,19 @@ fn render_board(
         let notes = note_count(space, task_id);
         let parent = task_parent(space, task_id);
 
-        let sort_key = status_at.map(interval_key).or(created_at.map(interval_key)).unwrap_or(0);
-        columns
-            .entry(status)
-            .or_default()
-            .push(TaskRow { id: task_id, id_hex: fmt_id(task_id), title, tags, sort_key, note_count: notes, parent });
+        let sort_key = status_at
+            .map(interval_key)
+            .or(created_at.map(interval_key))
+            .unwrap_or(0);
+        columns.entry(status).or_default().push(TaskRow {
+            id: task_id,
+            id_hex: fmt_id(task_id),
+            title,
+            tags,
+            sort_key,
+            note_count: notes,
+            parent,
+        });
     }
 
     let mut ordered_statuses = Vec::new();
@@ -512,12 +603,18 @@ struct TaskRow {
 }
 
 impl TaskRow {
-
     fn tag_suffix(&self) -> String {
         if self.tags.is_empty() {
             String::new()
         } else {
-            format!(" {}", self.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "))
+            format!(
+                " {}",
+                self.tags
+                    .iter()
+                    .map(|t| format!("#{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
         }
     }
 
@@ -629,46 +726,141 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
         if existing.contains(&id) {
             continue;
         }
-        let name_handle = label
-            .to_owned()
-            .to_blob()
-            .get_handle();
+        let name_handle = label.to_owned().to_blob().get_handle();
         change += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_handle };
     }
     Ok(change)
 }
 
-/// Resolve the acting persona (relations label or 32-char hex id) —
-/// same semantics as `orient` / `message`.
-fn resolve_persona_id(repo: &mut Repository<Pile>, input: &str) -> Result<Id> {
-    let trimmed = input.trim();
-    if let Some(id) = Id::from_hex(trimmed) {
-        return Ok(id);
-    }
+fn relations_workspace(repo: &mut Repository<Pile>) -> Result<Workspace<Pile>> {
     let relations_branch_id = repo
         .ensure_branch("relations", None)
         .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
-    let mut ws = repo
-        .pull(relations_branch_id)
-        .map_err(|e| anyhow::anyhow!("pull relations workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+    repo.pull(relations_branch_id)
+        .map_err(|e| anyhow::anyhow!("pull relations workspace: {e:?}"))
+}
+
+/// Resolve a relations person inside an explicit eligibility set. Review
+/// identity is cooperative (the persona flag is still a claim), but it may
+/// not be an arbitrary Id.
+fn resolve_person_in(
+    space: &TribleSet,
+    eligible_people: &HashSet<Id>,
+    input: &str,
+    eligibility: &str,
+) -> Result<Id> {
+    let trimmed = input.trim();
+    if let Some(id) = Id::from_hex(trimmed) {
+        if eligible_people.contains(&id) {
+            return Ok(id);
+        }
+        bail!("persona '{trimmed}' is not {eligibility}");
+    }
     let key = trimmed.to_ascii_lowercase();
     let matches: Vec<Id> = find!(
         person_id: Id,
-        pattern!(&space, [{ ?person_id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID }])
+        pattern!(space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
     )
     .filter(|&person_id| {
-        exists!(pattern!(&space, [{ person_id @ rel_attrs::label_norm: key.as_str() }]))
-            || exists!(pattern!(&space, [{ person_id @ rel_attrs::alias_norm: key.as_str() }]))
+        eligible_people.contains(&person_id)
+            && (exists!(pattern!(space, [{ person_id @ rel_attrs::label_norm: key.as_str() }]))
+                || exists!(pattern!(space, [{ person_id @ rel_attrs::alias_norm: key.as_str() }])))
     })
     .collect();
     match matches.len() {
-        0 => bail!("unknown persona label '{trimmed}' (no relations entry; try the hex id)"),
+        0 => bail!("unknown persona label '{trimmed}' ({eligibility}; try the hex id)"),
         1 => Ok(matches[0]),
         _ => bail!("multiple relations entries match persona label '{trimmed}'"),
     }
+}
+
+/// Strictly resolve a live relations person for a new action or assignment.
+fn resolve_active_person(
+    space: &TribleSet,
+    active_people: &HashSet<Id>,
+    input: &str,
+) -> Result<Id> {
+    resolve_person_in(space, active_people, input, "an active relations person")
+}
+
+/// Resolve an existing relations person, including a soft-retired identity.
+/// A review request freezes its actors, so retirement removes future roster
+/// eligibility without revoking an already-assigned submit/settle/override
+/// role or rewriting historical proof.
+fn resolve_frozen_person(
+    space: &TribleSet,
+    known_people: &HashSet<Id>,
+    input: &str,
+) -> Result<Id> {
+    resolve_person_in(space, known_people, input, "a relations person")
+}
+
+/// Resolve the acting persona (relations label or 32-char hex id).
+fn resolve_persona_id(repo: &mut Repository<Pile>, input: &str) -> Result<Id> {
+    let mut ws = relations_workspace(repo)?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+    let active = active_person_ids(&space);
+    resolve_active_person(&space, &active, input)
+}
+
+fn resolve_group_id(space: &TribleSet, input: &str) -> Result<Id> {
+    let trimmed = input.trim();
+    if let Some(id) = Id::from_hex(trimmed) {
+        if exists!(pattern!(space, [{ id @ metadata::tag: &KIND_GROUP }])) {
+            return Ok(id);
+        }
+        bail!("'{trimmed}' is not a relations group");
+    }
+    let key = trimmed.to_ascii_lowercase();
+    let mut matches: Vec<Id> = find!(
+        id: Id,
+        pattern!(space, [{ ?id @
+            metadata::tag: &KIND_GROUP,
+            rel_attrs::label_norm: key.as_str(),
+        }])
+    )
+    .collect();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => bail!("unknown relations group '{trimmed}'"),
+        [id] => Ok(*id),
+        _ => bail!("multiple relations groups match '{trimmed}'"),
+    }
+}
+
+fn resolve_request_id(input: &str, space: &TribleSet) -> Result<Id> {
+    let ids: Vec<Id> = find!(
+        id: Id,
+        pattern!(space, [{ ?id @ metadata::tag: &KIND_REVIEW_REQUEST_ID }])
+    )
+    .collect();
+    faculties::resolve_id_prefix(input, ids)
+}
+
+fn person_label(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
+    find!(h: TextHandle, pattern!(space, [{ id @ metadata::name: ?h }]))
+        .next()
+        .and_then(|handle| read_text(ws, handle).ok())
+        .unwrap_or_else(|| fmt_id(id))
+}
+
+fn request_target(
+    ws: &mut Workspace<Pile>,
+    request: &faculties::schemas::compass::ReviewRequest,
+) -> String {
+    request
+        .target()
+        .and_then(|handle| read_text(ws, handle).ok())
+        .unwrap_or_else(|| "<malformed target>".to_string())
+}
+
+fn request_is_active(space: &TribleSet, request_id: Id) -> bool {
+    review_request(space, request_id)
+        .and_then(|request| request.goal())
+        .is_some_and(|goal| active_request_ids_for_goal(space, goal).as_slice() == [request_id])
 }
 
 fn cmd_add(
@@ -683,6 +875,9 @@ fn cmd_add(
     persona: Option<&str>,
 ) -> Result<()> {
     let status = normalize_status(status);
+    if status == REVIEW_STATUS {
+        bail!("review is a bound workflow state; use `compass review open <goal> --target ...`");
+    }
     let tags: Vec<String> = tags.into_iter().map(|t| t.trim().to_string()).collect();
     validate_short("status", &status)?;
     for tag in &tags {
@@ -696,7 +891,9 @@ fn cmd_add(
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let parent_id = match parent.as_deref() {
             Some(p) => {
-                let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+                let space = ws
+                    .checkout(..)
+                    .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
                 Some(resolve_task_id(p, &space)?)
             }
             None => None,
@@ -761,7 +958,9 @@ fn cmd_list(
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         render_board(&mut ws, &space, &status_filter, &tag_filter, show_done);
         Ok(())
     })
@@ -777,42 +976,67 @@ fn cmd_move(
 ) -> Result<()> {
     let status = normalize_status(status);
     validate_short("status", &status)?;
+    if status == REVIEW_STATUS {
+        bail!("review requires an exact candidate; use `compass review open <goal> --target ...`");
+    }
 
     let resolved = with_repo(pile, |repo| {
         let by_id = persona.map(|p| resolve_persona_id(repo, p)).transpose()?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let task_id = resolve_task_id(&id, &space)?;
-        let now = epoch_interval(now_epoch());
+        loop {
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            let task_id = resolve_task_id(&id, &space)?;
+            if !all_request_ids_for_goal(&space, task_id).is_empty() {
+                bail!(
+                    "goal {:x} is in the structured review lifecycle; raw status moves would detach its exact proof. Open a successor candidate with `compass review open`, settle/override the active request, or create a new goal after settlement",
+                    task_id
+                );
+            }
+            let now = epoch_interval(now_epoch());
 
-        let status_id = ufoid();
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-        change += entity! { &status_id @
-            metadata::tag: &KIND_STATUS_ID,
-            board::task: &task_id,
-            board::status: status.as_str(),
-            board::by?: by_id.as_ref(),
-            metadata::created_at: now,
-        };
+            let status_id = ufoid();
+            let mut change = TribleSet::new();
+            change += ensure_kind_entities(&mut ws)?;
+            change += entity! { &status_id @
+                metadata::tag: &KIND_STATUS_ID,
+                board::task: &task_id,
+                board::status: status.as_str(),
+                board::by?: by_id.as_ref(),
+                metadata::created_at: now,
+            };
 
-        ws.commit(change, "move goal");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push status: {e:?}"))?;
-        Ok(task_id)
+            ws.commit(change, "move goal");
+            match repo
+                .try_push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push status: {e:?}"))?
+            {
+                None => return Ok(task_id),
+                Some(conflict) => ws = conflict,
+            }
+        }
     })?;
     println!("Moved goal {:x} to {}", resolved, status);
     Ok(())
 }
 
-fn cmd_note(pile: &Path, _branch_name: &str, branch_id: Id, id: String, note: String) -> Result<()> {
+fn cmd_note(
+    pile: &Path,
+    _branch_name: &str,
+    branch_id: Id,
+    id: String,
+    note: String,
+) -> Result<()> {
     let task_id = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let task_id = resolve_task_id(&id, &space)?;
         let now = epoch_interval(now_epoch());
 
@@ -840,7 +1064,9 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let task_id = resolve_task_id(&id, &space)?;
 
         let title = task_title(&mut ws, &space, task_id);
@@ -883,7 +1109,9 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
                 board::status: ?status,
                 metadata::created_at: ?at,
             }])
-        ).map(|(status, at)| (status, interval_key(at), format_interval(at))).collect();
+        )
+        .map(|(status, at)| (status, interval_key(at), format_interval(at)))
+        .collect();
         if !history.is_empty() {
             history.sort_by(|a, b| a.1.cmp(&b.1));
             println!();
@@ -904,7 +1132,11 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
                 metadata::created_at: ?at,
             }])
         )
-        .filter_map(|(h, at)| read_text(&mut ws, h).ok().map(|text| (text, interval_key(at), format_interval(at))))
+        .filter_map(|(h, at)| {
+            read_text(&mut ws, h)
+                .ok()
+                .map(|text| (text, interval_key(at), format_interval(at)))
+        })
         .collect();
         if !notes.is_empty() {
             notes.sort_by(|a, b| a.1.cmp(&b.1));
@@ -943,7 +1175,9 @@ fn cmd_prioritize(
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let higher_id = resolve_task_id(&higher_input, &space)?;
         let lower_id = resolve_task_id(&lower_input, &space)?;
 
@@ -960,8 +1194,7 @@ fn cmd_prioritize(
         }
 
         if would_create_cycle(&edges, higher_id, lower_id) {
-            if is_ancestor(&space, higher_id, lower_id)
-                || is_ancestor(&space, lower_id, higher_id)
+            if is_ancestor(&space, higher_id, lower_id) || is_ancestor(&space, lower_id, higher_id)
             {
                 bail!("children are implicitly prioritized over their parents");
             }
@@ -985,7 +1218,11 @@ fn cmd_prioritize(
 
         let h_title = task_title(&mut ws, &space, higher_id);
         let l_title = task_title(&mut ws, &space, lower_id);
-        println!("{} > {}", if h_title.is_empty() { "?" } else { &h_title }, if l_title.is_empty() { "?" } else { &l_title });
+        println!(
+            "{} > {}",
+            if h_title.is_empty() { "?" } else { &h_title },
+            if l_title.is_empty() { "?" } else { &l_title }
+        );
         Ok(())
     })
 }
@@ -1001,7 +1238,9 @@ fn cmd_deprioritize(
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let higher_id = resolve_task_id(&higher_input, &space)?;
         let lower_id = resolve_task_id(&lower_input, &space)?;
 
@@ -1027,9 +1266,687 @@ fn cmd_deprioritize(
 
         let h_title = task_title(&mut ws, &space, higher_id);
         let l_title = task_title(&mut ws, &space, lower_id);
-        println!("Removed: {} > {}", if h_title.is_empty() { "?" } else { &h_title }, if l_title.is_empty() { "?" } else { &l_title });
+        println!(
+            "Removed: {} > {}",
+            if h_title.is_empty() { "?" } else { &h_title },
+            if l_title.is_empty() { "?" } else { &l_title }
+        );
         Ok(())
     })
+}
+
+fn is_hex_of_len(value: &str, lengths: &[usize]) -> bool {
+    lengths.contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_review_target(raw: &str, unsafe_opaque: bool) -> Result<String> {
+    let target = raw.trim();
+    if target.is_empty() {
+        bail!("review target is empty");
+    }
+    if target.chars().any(char::is_whitespace) {
+        bail!("review target must be one immutable IRI without whitespace");
+    }
+    if !target.contains(':') {
+        bail!("review target must be an immutable IRI (for example git+https://...@<full-oid>)");
+    }
+    let validated = if target.starts_with("git:") || target.starts_with("git+") {
+        let revision = target.rsplit_once('@').map(|(_, revision)| revision);
+        let full_oid = revision.is_some_and(|revision| is_hex_of_len(revision, &[40, 64]));
+        if !full_oid {
+            bail!(
+                "git review targets must end in @<full-40-or-64-hex-object-id>; mutable refs and short SHAs are not exact"
+            );
+        }
+        true
+    } else if let Some(hash) = target.strip_prefix("files:") {
+        is_hex_of_len(hash, &[64])
+    } else if let Some(hash) = target.strip_prefix("urn:blake3:") {
+        is_hex_of_len(hash, &[64])
+    } else if let Some(hash) = target.strip_prefix("urn:sha256:") {
+        is_hex_of_len(hash, &[64])
+    } else if let Some(hash) = target.strip_prefix("urn:sha512:") {
+        is_hex_of_len(hash, &[128])
+    } else {
+        false
+    };
+    if !validated && !unsafe_opaque {
+        bail!(
+            "review target scheme is not verifiably content-addressed; use a full Git object IRI, files:<64-hex>, urn:blake3:<64-hex>, urn:sha256:<64-hex>, or explicitly acknowledge the risk with --unsafe-opaque-target"
+        );
+    }
+    Ok(target.to_string())
+}
+
+fn cmd_review_open(
+    pile: &Path,
+    branch_id: Id,
+    goal_input: String,
+    target: String,
+    unsafe_opaque_target: bool,
+    review_group: String,
+    override_inputs: Vec<String>,
+    persona: Option<&str>,
+) -> Result<()> {
+    let persona = persona.ok_or_else(|| {
+        anyhow::anyhow!("review open requires --persona <label-or-hex> or $PERSONA")
+    })?;
+    let target = validate_review_target(&target, unsafe_opaque_target)?;
+
+    let (request_id, created) = with_repo(pile, |repo| {
+        let mut relations_ws = relations_workspace(repo)?;
+        let relations_space = relations_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let active_people = active_person_ids(&relations_space);
+        let known_people = person_ids(&relations_space);
+        let author = resolve_active_person(&relations_space, &active_people, persona)?;
+
+        let group_id = resolve_group_id(&relations_space, &review_group)?;
+        let mut required =
+            find!(member: Id, pattern!(&relations_space, [{ group_id @ group::member: ?member }]))
+                .collect::<Vec<_>>();
+        required.sort();
+        required.dedup();
+        if required.len() != 3 {
+            bail!(
+                "review roster must freeze exactly three distinct people including the author (found {})",
+                required.len()
+            );
+        }
+        if !required.contains(&author) {
+            bail!("review roster must include the author persona {author:x}");
+        }
+        let inactive: Vec<Id> = required
+            .iter()
+            .copied()
+            .filter(|id| !active_people.contains(id))
+            .collect();
+        if !inactive.is_empty() {
+            bail!("review group contains inactive or non-person members");
+        }
+
+        let mut override_authorities = Vec::new();
+        for input in &override_inputs {
+            override_authorities.push(resolve_active_person(
+                &relations_space,
+                &active_people,
+                input,
+            )?);
+        }
+        override_authorities.sort();
+        override_authorities.dedup();
+        if override_authorities.len() > 1 {
+            bail!("review may freeze at most one break-glass authority");
+        }
+        if override_authorities.contains(&author) {
+            bail!("the review author cannot appoint themselves as break-glass authority");
+        }
+
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        loop {
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
+            let goal_id = resolve_task_id(&goal_input, &space)?;
+            let heads = active_request_ids_for_goal(&space, goal_id);
+
+            if let [head] = heads.as_slice() {
+                if let Some(existing) = review_request(&space, *head) {
+                    let existing_target = request_target(&mut ws, &existing);
+                    let structurally_current = evaluate_request(&space, *head, &known_people)
+                        .is_some_and(|evaluation| {
+                            !matches!(evaluation.state, ReviewGateState::Invalid { .. })
+                        });
+                    if structurally_current
+                        && existing_target == target
+                        && existing.author() == Some(author)
+                        && existing.required == required
+                        && existing.override_authorities == override_authorities
+                    {
+                        return Ok((*head, false));
+                    }
+                }
+            }
+
+            let now = epoch_interval(now_epoch());
+            let target_handle = ws.put(target.clone());
+            let request = review_request_fragment(
+                goal_id,
+                author,
+                target_handle,
+                &required,
+                &override_authorities,
+                &heads,
+                now,
+            );
+            let request_id = request
+                .root()
+                .expect("a review request fragment has one intrinsic root");
+            let mut change = TribleSet::new();
+            change += ensure_kind_entities(&mut ws)?;
+            change += request;
+            ws.commit(change, "open review request");
+            match repo
+                .try_push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push review request: {e:?}"))?
+            {
+                None => return Ok((request_id, true)),
+                Some(conflict) => ws = conflict,
+            }
+        }
+    })?;
+
+    if created {
+        println!("Opened review request {request_id:x}");
+        println!("Target: {target}");
+    } else {
+        println!("Review request {request_id:x} is already current for that exact target");
+    }
+    Ok(())
+}
+
+fn cmd_review_submit(
+    pile: &Path,
+    branch_id: Id,
+    request_input: String,
+    verdict: VerdictArg,
+    report: String,
+    persona: Option<&str>,
+) -> Result<()> {
+    let persona = persona.ok_or_else(|| {
+        anyhow::anyhow!("review submit requires --persona <label-or-hex> or $PERSONA")
+    })?;
+    let report = report.trim().to_string();
+    if report.is_empty() {
+        bail!("review report is empty; settlement records evidence, not ceremonial votes");
+    }
+    let verdict = verdict.as_str();
+
+    let (attestation_id, request_id) = with_repo(pile, |repo| {
+        let mut relations_ws = relations_workspace(repo)?;
+        let relations_space = relations_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let known_people = person_ids(&relations_space);
+        let reviewer = resolve_frozen_person(&relations_space, &known_people, persona)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        loop {
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
+            let request_id = resolve_request_id(&request_input, &space)?;
+            let request = review_request(&space, request_id)
+                .ok_or_else(|| anyhow::anyhow!("review request {request_id:x} is malformed"))?;
+            if !request_is_active(&space, request_id) {
+                bail!(
+                    "review request {request_id:x} is stale or forked; attest the sole current exact request instead"
+                );
+            }
+            if !request.required.contains(&reviewer) {
+                bail!("persona {reviewer:x} is not in request {request_id:x}'s frozen reviewer roster");
+            }
+            if !matches!(
+                evaluate_request(&space, request_id, &known_people),
+                Some(ReviewEvaluation {
+                    state: ReviewGateState::Pending { .. }
+                        | ReviewGateState::Blocked { .. }
+                        | ReviewGateState::Ready,
+                    ..
+                })
+            ) {
+                bail!("review request {request_id:x} is invalid or already settled");
+            }
+
+            let heads = active_attestation_ids_for_reviewer(&space, request_id, reviewer);
+            let report_handle = ws.put(report.clone());
+            let now = epoch_interval(now_epoch());
+            let attestation = review_attestation_fragment(
+                request_id,
+                reviewer,
+                verdict,
+                report_handle,
+                &heads,
+                now,
+            );
+            let attestation_id = attestation
+                .root()
+                .expect("a review attestation fragment has one intrinsic root");
+            let mut change = TribleSet::new();
+            change += ensure_kind_entities(&mut ws)?;
+            change += attestation;
+            ws.commit(change, "submit review attestation");
+            match repo
+                .try_push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push review attestation: {e:?}"))?
+            {
+                None => return Ok((attestation_id, request_id)),
+                Some(conflict) => ws = conflict,
+            }
+        }
+    })?;
+    println!("Attested {verdict} on request {request_id:x} ({attestation_id:x})");
+    Ok(())
+}
+
+fn render_review_evaluation(
+    board_ws: &mut Workspace<Pile>,
+    relations_ws: &mut Workspace<Pile>,
+    relations_space: &TribleSet,
+    evaluation: &ReviewEvaluation,
+    active_binding: bool,
+) {
+    println!("Request: {:x}", evaluation.request.id);
+    println!("Target: {}", request_target(board_ws, &evaluation.request));
+    if let Some(author) = evaluation.request.author() {
+        println!(
+            "Author: {} ({:x})",
+            person_label(relations_ws, relations_space, author),
+            author
+        );
+    }
+    if !active_binding {
+        println!("Binding: HISTORICAL OR FORKED — exact gate commands are closed");
+    }
+    let gate = match &evaluation.state {
+        ReviewGateState::Invalid { reasons } => format!("INVALID — {}", reasons.join("; ")),
+        ReviewGateState::Pending {
+            submitted,
+            required,
+        } => {
+            format!("PENDING — {submitted}/{required} submitted")
+        }
+        ReviewGateState::Blocked { submitted, reasons } => {
+            format!("BLOCKED — {submitted}/3 submitted — {}", reasons.join("; "))
+        }
+        ReviewGateState::Ready if active_binding => {
+            "READY — exact candidate may settle".to_string()
+        }
+        ReviewGateState::Ready => {
+            "HISTORICAL READY EVIDENCE — request is not the sole active head".to_string()
+        }
+        ReviewGateState::Settled { settlements } => {
+            let override_count = settlements
+                .iter()
+                .filter(|s| s.mode == SettlementMode::Override)
+                .count();
+            if override_count == 0 {
+                "SETTLED — triadic attestation proof recorded".to_string()
+            } else {
+                "OVERRIDDEN — reasoned break-glass proof recorded".to_string()
+            }
+        }
+    };
+    println!("Gate: {gate}");
+    if let ReviewGateState::Settled { settlements } = &evaluation.state {
+        println!("Certificates:");
+        for settlement in settlements {
+            match settlement.mode {
+                SettlementMode::Attestations => {
+                    println!("- {:x} (triadic)", settlement.id);
+                    for evidence in &settlement.attestations {
+                        println!("    sealed attestation {:x}", evidence);
+                    }
+                }
+                SettlementMode::Override => {
+                    println!("- {:x} (break-glass)", settlement.id);
+                    if let Some(event) = settlement.override_event {
+                        println!("    sealed override event {:x}", event);
+                    }
+                }
+            }
+        }
+    }
+    println!("Reviewers:");
+    let author = evaluation.request.author();
+    for slot in &evaluation.slots {
+        let name = person_label(relations_ws, relations_space, slot.reviewer);
+        let role = if Some(slot.reviewer) == author {
+            " (author)"
+        } else {
+            ""
+        };
+        match slot.heads.as_slice() {
+            [] => println!("- {name}{role}: pending [{:x}]", slot.reviewer),
+            [head] => {
+                let verdict = head.verdict().unwrap_or("malformed");
+                println!("- {name}{role}: {verdict} [{:x}]", head.id);
+                if let Some(report) = head.report().and_then(|h| read_text(board_ws, h).ok()) {
+                    for line in report.lines() {
+                        println!("    {line}");
+                    }
+                }
+            }
+            heads => println!(
+                "- {name}{role}: FORKED ({} active attestations)",
+                heads.len()
+            ),
+        }
+    }
+}
+
+fn render_review_projection(
+    board_ws: &mut Workspace<Pile>,
+    board_space: &TribleSet,
+    relations_ws: &mut Workspace<Pile>,
+    relations_space: &TribleSet,
+    projection: ReviewProjection,
+) {
+    match projection {
+        ReviewProjection::Unbound => println!("Gate: UNBOUND — no exact review request"),
+        ReviewProjection::Forked { request_ids } => {
+            println!(
+                "Gate: FORKED — {} concurrent request heads; gate closed",
+                request_ids.len()
+            );
+            for id in request_ids {
+                if let Some(request) = review_request(board_space, id) {
+                    println!("- [{id:x}] {}", request_target(board_ws, &request));
+                } else {
+                    println!("- [{id:x}] malformed");
+                }
+            }
+        }
+        ReviewProjection::Bound(evaluation) => {
+            render_review_evaluation(board_ws, relations_ws, relations_space, &evaluation, true)
+        }
+    }
+}
+
+fn cmd_review_status(pile: &Path, branch_id: Id, input: String, history: bool) -> Result<()> {
+    with_repo(pile, |repo| {
+        let mut relations_ws = relations_workspace(repo)?;
+        let relations_space = relations_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let known_people = person_ids(&relations_space);
+        let mut board_ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let board_space = board_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
+
+        let request_matches: Vec<Id> = find!(
+            id: Id,
+            pattern!(&board_space, [{ ?id @ metadata::tag: &KIND_REVIEW_REQUEST_ID }])
+        )
+        .filter(|id| fmt_id(*id).starts_with(&input.to_ascii_lowercase()))
+        .collect();
+        let goal_id = match request_matches.as_slice() {
+            [request_id] => {
+                let evaluation = evaluate_request(&board_space, *request_id, &known_people)
+                    .ok_or_else(|| anyhow::anyhow!("malformed review request {request_id:x}"))?;
+                let goal = evaluation.request.goal();
+                let active_binding = request_is_active(&board_space, *request_id);
+                render_review_evaluation(
+                    &mut board_ws,
+                    &mut relations_ws,
+                    &relations_space,
+                    &evaluation,
+                    active_binding,
+                );
+                goal
+            }
+            [] => {
+                let goal_id = resolve_task_id(&input, &board_space)?;
+                println!("Goal: {goal_id:x}");
+                render_review_projection(
+                    &mut board_ws,
+                    &board_space,
+                    &mut relations_ws,
+                    &relations_space,
+                    evaluate_goal(&board_space, goal_id, &known_people),
+                );
+                Some(goal_id)
+            }
+            _ => bail!("review request prefix '{input}' is ambiguous"),
+        };
+
+        if history {
+            if let Some(goal_id) = goal_id {
+                let active: HashSet<Id> = active_request_ids_for_goal(&board_space, goal_id)
+                    .into_iter()
+                    .collect();
+                let ids = all_request_ids_for_goal(&board_space, goal_id);
+                println!("History:");
+                if ids.is_empty() {
+                    println!("- None");
+                }
+                for id in ids {
+                    let state = if active.contains(&id) {
+                        "ACTIVE"
+                    } else {
+                        "STALE"
+                    };
+                    let target = review_request(&board_space, id)
+                        .map(|request| request_target(&mut board_ws, &request))
+                        .unwrap_or_else(|| "<malformed target>".to_string());
+                    println!("- {state} [{id:x}] {target}");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn load_exact_active_evaluation(
+    space: &TribleSet,
+    request_input: &str,
+    known_people: &HashSet<Id>,
+) -> Result<ReviewEvaluation> {
+    let request_id = resolve_request_id(request_input, space)?;
+    if !request_is_active(space, request_id) {
+        bail!("review request {request_id:x} is stale or fork-superseded");
+    }
+    evaluate_request(space, request_id, known_people)
+        .ok_or_else(|| anyhow::anyhow!("malformed review request {request_id:x}"))
+}
+
+fn cmd_review_gate(pile: &Path, branch_id: Id, request_input: String) -> Result<()> {
+    with_repo(pile, |repo| {
+        let mut relations_ws = relations_workspace(repo)?;
+        let relations_space = relations_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let known_people = person_ids(&relations_space);
+        let mut board_ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let board_space = board_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
+        let evaluation =
+            load_exact_active_evaluation(&board_space, &request_input, &known_people)?;
+        let passes = matches!(
+            evaluation.state,
+            ReviewGateState::Ready | ReviewGateState::Settled { .. }
+        );
+        render_review_evaluation(
+            &mut board_ws,
+            &mut relations_ws,
+            &relations_space,
+            &evaluation,
+            true,
+        );
+        if !passes {
+            bail!(
+                "review gate is closed for request {:x}",
+                evaluation.request.id
+            );
+        }
+        Ok(())
+    })
+}
+
+fn cmd_review_settle(
+    pile: &Path,
+    branch_id: Id,
+    request_input: String,
+    persona: Option<&str>,
+) -> Result<()> {
+    let persona = persona.ok_or_else(|| {
+        anyhow::anyhow!("review settle requires --persona <label-or-hex> or $PERSONA")
+    })?;
+    let (settlement_id, created) = with_repo(pile, |repo| {
+        let mut relations_ws = relations_workspace(repo)?;
+        let relations_space = relations_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let known_people = person_ids(&relations_space);
+        let settler = resolve_frozen_person(&relations_space, &known_people, persona)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        loop {
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
+            let evaluation =
+                load_exact_active_evaluation(&space, &request_input, &known_people)?;
+            if let ReviewGateState::Settled { settlements } = &evaluation.state {
+                return Ok((settlements[0].id, false));
+            }
+            if !matches!(evaluation.state, ReviewGateState::Ready) {
+                bail!(
+                    "review gate is not ready for request {:x}",
+                    evaluation.request.id
+                );
+            }
+            if evaluation.request.author() != Some(settler) {
+                bail!(
+                    "only request author {:x} may record the final settlement",
+                    evaluation.request.author().expect("ready request has one author")
+                );
+            }
+            let goal = evaluation
+                .request
+                .goal()
+                .ok_or_else(|| anyhow::anyhow!("review request has no unique goal"))?;
+            let evidence: Vec<Id> = evaluation
+                .slots
+                .iter()
+                .map(|slot| slot.heads[0].id)
+                .collect();
+            let now = epoch_interval(now_epoch());
+            let settlement = review_attestation_settlement_fragment(
+                evaluation.request.id,
+                goal,
+                settler,
+                &evidence,
+                now,
+            );
+            let settlement_id = settlement
+                .root()
+                .expect("a review settlement fragment has one intrinsic root");
+            let mut change = TribleSet::new();
+            change += ensure_kind_entities(&mut ws)?;
+            change += settlement;
+            ws.commit(change, "settle reviewed goal");
+            match repo
+                .try_push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push review settlement: {e:?}"))?
+            {
+                None => return Ok((settlement_id, true)),
+                Some(conflict) => ws = conflict,
+            }
+        }
+    })?;
+    if created {
+        println!("Settled review with exact attestation proof {settlement_id:x}");
+    } else {
+        println!("Review is already settled by {settlement_id:x}");
+    }
+    Ok(())
+}
+
+fn cmd_review_override(
+    pile: &Path,
+    branch_id: Id,
+    request_input: String,
+    reason: String,
+    persona: Option<&str>,
+) -> Result<()> {
+    let persona = persona.ok_or_else(|| {
+        anyhow::anyhow!("review override requires --persona <label-or-hex> or $PERSONA")
+    })?;
+    let reason = reason.trim().to_string();
+    if reason.is_empty() {
+        bail!("break-glass override requires a non-empty reason");
+    }
+    let (settlement_id, created) = with_repo(pile, |repo| {
+        let mut relations_ws = relations_workspace(repo)?;
+        let relations_space = relations_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let known_people = person_ids(&relations_space);
+        let actor = resolve_frozen_person(&relations_space, &known_people, persona)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        loop {
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
+            let evaluation =
+                load_exact_active_evaluation(&space, &request_input, &known_people)?;
+            if let ReviewGateState::Settled { settlements } = &evaluation.state {
+                return Ok((settlements[0].id, false));
+            }
+            if matches!(evaluation.state, ReviewGateState::Invalid { .. }) {
+                bail!(
+                    "break-glass cannot override malformed candidate integrity for request {:x}",
+                    evaluation.request.id
+                );
+            }
+            if !evaluation.request.override_authorities.contains(&actor) {
+                bail!("persona {actor:x} is not a frozen override authority for this request");
+            }
+            let goal = evaluation
+                .request
+                .goal()
+                .ok_or_else(|| anyhow::anyhow!("review request has no unique goal"))?;
+            let now = epoch_interval(now_epoch());
+            let reason_handle = ws.put(reason.clone());
+            let override_event =
+                review_override_fragment(evaluation.request.id, actor, reason_handle, now);
+            let override_id = override_event
+                .root()
+                .expect("a review override fragment has one intrinsic root");
+            let settlement = review_override_settlement_fragment(
+                evaluation.request.id,
+                goal,
+                actor,
+                override_id,
+                now,
+            );
+            let settlement_id = settlement
+                .root()
+                .expect("a review settlement fragment has one intrinsic root");
+            let mut change = TribleSet::new();
+            change += ensure_kind_entities(&mut ws)?;
+            change += override_event;
+            change += settlement;
+            ws.commit(change, "override and settle reviewed goal");
+            match repo
+                .try_push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push review override: {e:?}"))?
+            {
+                None => return Ok((settlement_id, true)),
+                Some(conflict) => ws = conflict,
+            }
+        }
+    })?;
+    if created {
+        println!("Recorded break-glass settlement {settlement_id:x}");
+    } else {
+        println!("Review is already settled by {settlement_id:x}");
+    }
+    Ok(())
 }
 
 fn cmd_resolve(pile: &Path, _branch_name: &str, branch_id: Id, prefix: String) -> Result<()> {
@@ -1037,7 +1954,9 @@ fn cmd_resolve(pile: &Path, _branch_name: &str, branch_id: Id, prefix: String) -
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let id = resolve_task_id(&prefix, &space)?;
         println!("{:x}", id);
         Ok(())
@@ -1086,10 +2005,17 @@ fn main() -> Result<()> {
                 cli.persona.as_deref(),
             )
         }
-        Command::List { status, tag, all } => cmd_list(&cli.pile, &cli.branch, branch_id, status, tag, all),
-        Command::Move { id, status } => {
-            cmd_move(&cli.pile, &cli.branch, branch_id, id, status, cli.persona.as_deref())
+        Command::List { status, tag, all } => {
+            cmd_list(&cli.pile, &cli.branch, branch_id, status, tag, all)
         }
+        Command::Move { id, status } => cmd_move(
+            &cli.pile,
+            &cli.branch,
+            branch_id,
+            id,
+            status,
+            cli.persona.as_deref(),
+        ),
         Command::Note { id, note } => {
             let note = load_value_or_file(&note, "goal note")?;
             cmd_note(&cli.pile, &cli.branch, branch_id, id, note)
@@ -1102,5 +2028,135 @@ fn main() -> Result<()> {
             cmd_deprioritize(&cli.pile, &cli.branch, branch_id, higher, over)
         }
         Command::Resolve { prefix } => cmd_resolve(&cli.pile, &cli.branch, branch_id, prefix),
+        Command::Review { command } => match command {
+            ReviewCommand::Open {
+                goal,
+                target,
+                unsafe_opaque_target,
+                review_group,
+                override_authority,
+            } => cmd_review_open(
+                &cli.pile,
+                branch_id,
+                goal,
+                target,
+                unsafe_opaque_target,
+                review_group,
+                override_authority,
+                cli.persona.as_deref(),
+            ),
+            ReviewCommand::Submit {
+                request,
+                verdict,
+                report,
+            } => cmd_review_submit(
+                &cli.pile,
+                branch_id,
+                request,
+                verdict,
+                load_value_or_file(&report, "review report")?,
+                cli.persona.as_deref(),
+            ),
+            ReviewCommand::Status { id, history } => {
+                cmd_review_status(&cli.pile, branch_id, id, history)
+            }
+            ReviewCommand::Gate { request } => cmd_review_gate(&cli.pile, branch_id, request),
+            ReviewCommand::Settle { request } => {
+                cmd_review_settle(&cli.pile, branch_id, request, cli.persona.as_deref())
+            }
+            ReviewCommand::Override { request, reason } => cmd_review_override(
+                &cli.pile,
+                branch_id,
+                request,
+                load_value_or_file(&reason, "override reason")?,
+                cli.persona.as_deref(),
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_review_target_requires_a_full_object_id() {
+        assert!(validate_review_target(
+            "git+https://example.test/repo@1111111111111111111111111111111111111111",
+            false,
+        )
+        .is_ok());
+        assert!(validate_review_target("git+https://example.test/repo@main", false).is_err());
+        assert!(validate_review_target("git+https://example.test/repo@1234abcd", false).is_err());
+        assert!(validate_review_target("https://example.test/repo/main", false).is_err());
+        assert!(validate_review_target("https://example.test/repo/main", true).is_ok());
+        assert!(validate_review_target(
+            "files:1111111111111111111111111111111111111111111111111111111111111111",
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn exact_request_commands_reject_each_head_of_a_fork() {
+        let goal = ufoid().id;
+        let author = ufoid().id;
+        let reviewers = [author, ufoid().id, ufoid().id];
+        let target = "urn:blake3:1111111111111111111111111111111111111111111111111111111111111111"
+            .to_blob()
+            .get_handle();
+        let now = epoch_interval(Epoch::from_gregorian_utc(2026, 7, 13, 12, 0, 0, 0));
+        let base = review_request_fragment(goal, author, target, &reviewers, &[], &[], now);
+        let base_id = base.root().unwrap();
+        let left = review_request_fragment(
+            goal,
+            author,
+            target,
+            &reviewers,
+            &[],
+            &[base_id],
+            now,
+        );
+        let left_id = left.root().unwrap();
+        let right = review_request_fragment(
+            goal,
+            author,
+            target,
+            &reviewers,
+            &[],
+            &[base_id],
+            later_interval_for_test(),
+        );
+        let right_id = right.root().unwrap();
+        let mut space = TribleSet::new();
+        space += entity! { ExclusiveId::force_ref(&goal) @ metadata::tag: &KIND_GOAL_ID };
+        space += base;
+        space += left;
+        space += right;
+
+        assert!(!request_is_active(&space, left_id));
+        assert!(!request_is_active(&space, right_id));
+    }
+
+    #[test]
+    fn frozen_review_role_survives_soft_retirement() {
+        let person = ufoid().id;
+        let mut space = TribleSet::new();
+        space += entity! { ExclusiveId::force_ref(&person) @
+            metadata::tag: &KIND_PERSON_ID,
+        };
+        let known = HashSet::from([person]);
+        let active = HashSet::new();
+        let input = format!("{person:x}");
+
+        assert!(resolve_active_person(&space, &active, &input).is_err());
+        assert_eq!(
+            resolve_frozen_person(&space, &known, &input).unwrap(),
+            person
+        );
+    }
+
+    fn later_interval_for_test() -> IntervalValue {
+        epoch_interval(Epoch::from_gregorian_utc(2026, 7, 13, 12, 0, 1, 0))
     }
 }

@@ -64,24 +64,24 @@ viewer               # picks up PILE from the environment
 
 If you're an AI agent landing in this repo for the first time —
 or setting one up — `bootstrap.pile` ships a curated onboarding
-substrate: 19 wiki fragments, fully cross-linked into a guided
+substrate: 21 wiki fragments, fully cross-linked into a guided
 tour (a start-here hub plus a "Next stop" spine), in four layers:
 
-  1. **Foundations** (6) — faculty model, wiki authoring,
-     compass workflow, the work-as-its-own-ledger principle,
-     tool selection lookup, and the getting-started hub.
-  2. **Specific faculties** (6) — files, teams, local_messages,
+  1. **Foundations** (7) — faculty model and authoring, wiki
+     authoring, compass workflow, the work-as-its-own-ledger
+     principle, tool selection lookup, and the getting-started hub.
+  2. **Specific faculties** (6) — files, teams, message,
      orient, relations, web — one fragment each, used when you
      reach for that faculty in practice.
-  3. **Recipes** (3) — chained-faculty workflows: research
-     (compass → web → files → wiki), multi-agent coordination
-     (relations + local_messages + orient + compass), and team
-     auth setup (`trible team` + `pile net`).
+  3. **Recipes and coordination** (4) — chained-faculty workflows:
+     research (compass → web → files → wiki), multi-agent
+     coordination (relations + message + orient + compass), harness
+     hooks, and team auth setup (`trible team` + `pile net`).
   4. **Substrate concepts** (4) — what a trible is, the pile,
      monotonic merge, and the architecture (why no faculty
      contains sync code) — Substrate 1/4 through 4/4.
 
-Plus 6 `#bootstrap`-tagged compass goals walking through hands-on
+Plus 7 `#bootstrap`-tagged compass goals walking through hands-on
 faculty use (mint an id, create a fragment, archive a file, run
 lint/check, mark a goal done with an outcome note).
 
@@ -93,8 +93,8 @@ cp bootstrap.pile ./self.pile
 export PILE=./self.pile
 
 # Verify:
-wiki list --tag bootstrap          # 19 fragments
-compass list                       # 6 hands-on goals in TODO
+wiki list --tag bootstrap          # 21 fragments
+compass list                       # 7 hands-on goals in TODO
 ```
 
 (To add the tour to an *existing* pile instead, append it:
@@ -138,7 +138,7 @@ telling the tool what to show you next, and the history falls out naturally.
 | `headspace` | Model/prompt configuration |
 | `reason` | Record reasoning steps alongside actions |
 | `patience` | Soft timers and pacing |
-| `local_messages` | Direct messaging between personas and humans |
+| `message` | Direct messaging between personas and humans |
 | `relations` | People, affinity, contact info |
 | `teams` | Microsoft Teams archive and bridge |
 | `triage` | Workflow staging for inbound items |
@@ -160,9 +160,10 @@ content-addressed blob store.
 
 ## GORBIE viewer
 
-The installed `viewer` binary composes all four widgets
-(activity timeline, wiki graph, compass kanban, local-messages
-thread) against a single pile — see the screenshot above.
+The installed `viewer` binary composes the full faculty dashboard —
+review, activity, wiki, compass, messages, relations, archives, and
+the other available panels — against a single pile. See the screenshot
+above.
 
 From a checkout:
 
@@ -173,7 +174,7 @@ cargo run --release --bin viewer -- ./self.pile
 Standalone per-widget demos (showing how to embed a single widget
 in your own [GORBIE] notebook) are in `examples/`: `compass_board.rs`,
 `wiki_viewer.rs`, `messages_panel.rs`, `branch_timeline.rs`, and
-`pile_inspector.rs` (source for the binary above).
+`pile_inspector.rs` (a compact multi-widget composition example).
 
 [GORBIE]: https://github.com/triblespace/GORBIE
 

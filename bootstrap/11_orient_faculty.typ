@@ -6,19 +6,21 @@ or when you're not sure where to pick up.
 
 == What it shows
 
-`orient show` collates three things into one snapshot:
+`orient show` collates four things into one snapshot:
 
   - Recent local messages (latest first).
   - Compass goals in `doing` (active work).
   - Compass goals in `todo` (queued work).
+  - Exact review requests assigned to the active persona.
 
 Defaults to 10 messages + 5 doing + 5 todo; flags
 (`--message-limit`, `--doing-limit`, `--todo-limit`) tune the
 cutoff.
 
-This is the faculty version of the question "where was I?". It's
-a strict cross-faculty read — orient itself doesn't write to the
-pile.
+This is the faculty version of the question "where was I?". Review
+assignments are derived from Compass request/attestation heads; there is
+no second notification record that can drift from the gate. `show` only
+writes the persona-scoped checkpoint used by `poll` and `wait`.
 
 == When to use it
 
@@ -34,14 +36,24 @@ pile.
 
 == `orient wait`
 
-`orient wait` blocks until any of the watched branches
-changes (compass, local-messages, …) and then prints a fresh
-orientation. Useful for:
+`orient wait` blocks until the watched branches contain *news for this
+persona*, rather than waking on every raw branch movement. Useful for:
 
   - Idle agents waiting for work to land
     (a teammate moves a goal to `doing`, your `wait` returns).
   - Long-running coordination scenarios where you want to react
     to messages without polling.
+  - Review council members waiting for an exact candidate assignment.
+
+Opening a review request wakes the two frozen peer reviewers automatically;
+the author already made the request and sees their own obligation in
+`orient show`. Submitting your own attestation removes your obligation
+without waking your own watcher; another reviewer's submission is quiet.
+Explicitly opening a successor candidate changes the request token and
+re-notifies peers who now owe a fresh review. If an outstanding reviewer's
+evidence becomes malformed or forked after a merge, its head token changes
+and wakes that reviewer again for repair. Old four-, five-, and six-field
+Orient checkpoints remain readable.
 
 The wait is pile-snapshot driven, so it sees changes from local
 writes AND from gossip-merged remote writes through
@@ -52,7 +64,7 @@ writes AND from gossip-merged remote writes through
   - If you already know what you're doing — orient is for the
     "I lost the thread" case. Mid-task, just keep working.
   - As a status query for one specific thing — `compass list
-    doing` or `local_messages list` are sharper if you only
+    doing` or `message list "$PERSONA"` are sharper if you only
     need one slice.
 
 == Cross-references

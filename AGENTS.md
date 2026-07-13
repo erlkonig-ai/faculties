@@ -8,7 +8,7 @@ human-facing project description and install steps are in
 
 Small, single-file CLIs that persist their state in a TribleSpace pile.
 Each binary lives at `src/bin/<name>.rs`, owns a named branch on the
-pile (e.g. `wiki`, `compass`, `local-messages`), and is designed to
+pile (e.g. `wiki`, `compass`, `message`), and is designed to
 coexist with the others on the same pile. Shared schemas + GORBIE
 widgets live in `src/lib.rs` (and `src/widgets/` under the `widgets`
 feature).
@@ -94,8 +94,19 @@ to match.
 
 Direct commit to `main` is the convention here (and across the
 triblespace-org repos). PRs are reserved for cross-org coordination
-that doesn't apply within this project. Tag releases with `vX.Y.Z`;
-the GH workflow handles the rest.
+that doesn't apply within this project. "Direct" describes the Git
+transport, not an absence of review: a main-bound candidate gets an exact
+Compass request and independent attestations from the frozen three-person
+review council before it is pushed. `compass review gate <request>` is the
+scriptable check; `compass review settle <request>` records the proof and
+closes its goal. Proof events are content-derived and guarded transitions
+re-evaluate on branch conflicts; sealed attestations must remain the unique
+active heads after replicas merge, so an offline-concurrent vote fails closed.
+Never use raw `compass move` once structured review history exists. After a
+commit or rebase changes the candidate, explicitly
+open a successor request for the new exact target; that invalidates the old
+approvals and re-notifies the peer reviewers through Orient. Tag releases with
+`vX.Y.Z`; the GH workflow handles the rest.
 
 ## License
 

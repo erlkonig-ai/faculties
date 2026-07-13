@@ -1,8 +1,7 @@
 //! GORBIE-backed viewer for a faculties pile.
 //!
-//! Composes the `wiki`, `compass`, `message`, and activity-
-//! timeline widgets against a single shared pile — the GUI
-//! counterpart to the CLI faculties in the repo root.
+//! Composes the faculty dashboard widgets against a single shared
+//! pile — the GUI counterpart to the CLI faculties in the repo root.
 //!
 //! Usage:
 //! ```sh
@@ -12,9 +11,8 @@
 //! # on the command line (--pile <path> or positional) beats it
 //! ```
 //!
-//! This mirrors `examples/pile_inspector.rs`; the example is kept as
-//! a source reference for library users composing their own
-//! notebook layouts.
+//! `examples/pile_inspector.rs` is a smaller source reference for
+//! library users composing their own notebook layouts.
 
 use std::path::PathBuf;
 
@@ -103,7 +101,14 @@ fn main(nb: &mut NotebookCtx) {
         let Some(mut compass) = st.workspace("compass") else { return };
         let mut wiki = st.workspace("wiki");
         let mut decide = st.workspace("decide");
-        panel.render(ctx, &mut compass, wiki.as_mut(), decide.as_mut());
+        let Some(mut relations) = st.workspace("relations") else { return };
+        panel.render(
+            ctx,
+            &mut compass,
+            wiki.as_mut(),
+            decide.as_mut(),
+            &mut relations,
+        );
     });
 
     nb.state("headspace", HeadspaceViewer::default(), move |ctx, panel| {

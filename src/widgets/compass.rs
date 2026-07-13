@@ -1,8 +1,8 @@
 //! Full-featured GORBIE-embeddable compass (kanban) board widget.
 //!
 //! Renders goals from a triblespace pile's `compass` branch grouped into
-//! kanban columns by their latest status (default: todo / doing / blocked
-//! / done). The widget holds only UI + cached-query state; the host is
+//! kanban columns by their latest status (default: todo / doing / blocked /
+//! review / done). The widget holds only UI + cached-query state; the host is
 //! responsible for pulling the compass branch and passing the workspace
 //! in at render time. Writes go through `Workspace::commit(..)`; pushing
 //! is the host's responsibility (e.g. via
@@ -88,10 +88,13 @@ fn color_doing() -> egui::Color32 {
 fn color_blocked() -> egui::Color32 {
     egui::Color32::from_rgb(0xcc, 0x0a, 0x17) // RAL 3020
 }
+fn color_review() -> egui::Color32 {
+    egui::Color32::from_rgb(0x92, 0x45, 0x92) // RAL 4008
+}
 fn color_done() -> egui::Color32 {
     egui::Color32::from_rgb(0x15, 0x4e, 0xa1) // RAL 5005
 }
-// Theme-adaptive neutrals. The status colors (todo/doing/blocked/
+// Theme-adaptive neutrals. The status colors (todo/doing/blocked/review/
 // done) are legible on both light and dark backgrounds, but the
 // frame / card / muted colors need to flip with the theme — hard-
 // coded dark shades turned into "dark on dark" (body text uses
@@ -137,6 +140,7 @@ fn status_color(status: &str) -> egui::Color32 {
         "todo" => color_todo(),
         "doing" => color_doing(),
         "blocked" => color_blocked(),
+        "review" => color_review(),
         "done" => color_done(),
         // Mid-grey fallback — legible on both light and dark panels
         // without needing a `&Ui` argument.

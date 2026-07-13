@@ -18,7 +18,7 @@ step? If separate, redesign until it's not.
 
   - `wiki create` *is* the writing. The fragment is durable
     the moment it's saved.
-  - `compass status <id> doing` *is* the claim. No separate
+  - `compass move <id> doing` *is* the claim. No separate
     "log that I started this".
   - `files add <path>` *is* the archive step. The handle is
     the citation.
