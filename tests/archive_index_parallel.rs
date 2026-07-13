@@ -137,8 +137,8 @@ struct IndexSnapshot {
 }
 
 fn snapshot(path: &Path, branch_id: Id) -> IndexSnapshot {
-    let mut pile = Pile::open(path).expect("open indexed pile");
-    pile.refresh().expect("refresh indexed pile");
+    let mut pile = Pile::open(path).expect("open pile");
+    pile.refresh().expect("refresh pile");
     let branch_meta = pile
         .head(branch_id)
         .expect("read branch pin")
@@ -379,8 +379,8 @@ fn contentless_commit_is_a_certified_zero_artifact_range() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let mut pile = Pile::open(&path).expect("open empty indexed pile");
-    pile.refresh().expect("refresh empty indexed pile");
+    let mut pile = Pile::open(&path).expect("open empty pile");
+    pile.refresh().expect("refresh empty pile");
     let branch_meta_handle = pile.head(branch_id).unwrap().unwrap();
     let reader = pile.reader().expect("empty manifest reader");
     let branch_meta: TribleSet = reader.get(branch_meta_handle).unwrap();
@@ -399,7 +399,7 @@ fn contentless_commit_is_a_certified_zero_artifact_range() {
     assert_eq!(bm25.ranges()[0].range().end(), [source_head]);
     assert!(bm25.ranges()[0].artifacts().is_empty());
     drop(reader);
-    pile.close().expect("close empty indexed pile");
+    pile.close().expect("close empty pile");
 
     let list = run_archive(&path, &["list", "--limit", "10"]);
     assert!(list.status.success() && list.stdout.is_empty());

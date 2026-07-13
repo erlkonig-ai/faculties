@@ -419,21 +419,12 @@ mod common {
         Ok((repo, branch_id))
     }
 
-    fn pile_index_path(pile_path: &Path) -> PathBuf {
-        let mut path = pile_path.as_os_str().to_os_string();
-        path.push(".pidx");
-        PathBuf::from(path)
-    }
-
     pub fn open_repo(pile_path: &Path) -> Result<Repo> {
         let open_start = std::time::Instant::now();
-        let index_path = pile_index_path(pile_path);
-        let mut pile = Pile::open_indexed_or_replay(pile_path, &index_path)
-            .map_err(|e| anyhow!("open pile: {e:?}"))?;
+        let mut pile = Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
         tracing::info!(
-            index = %index_path.display(),
             elapsed_ms = open_start.elapsed().as_millis() as u64,
-            "pile mmap and optional locator-index open complete"
+            "pile mmap open complete"
         );
         let refresh_start = std::time::Instant::now();
         if let Err(err) = pile.refresh() {

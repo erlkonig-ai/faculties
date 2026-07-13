@@ -406,8 +406,8 @@ fn bm25_fast_path_resolves_content_without_checkout() {
 
     // Total per-artifact documents equal the source corpus exactly once.
     {
-        let mut pile = Pile::open(&path).expect("open indexed pile");
-        pile.refresh().expect("refresh indexed pile");
+        let mut pile = Pile::open(&path).expect("open pile");
+        pile.refresh().expect("refresh pile");
         let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
             .expect("open indexed repo");
         let source_head = repo.pull(branch_id).expect("pull indexed branch").head();

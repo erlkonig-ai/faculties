@@ -42,12 +42,6 @@ All notable changes to this project will be documented in this file.
   archive-scale substring `search --exact` / `--case-sensitive` escape hatch
   is removed; search never silently or explicitly falls back to a full
   checkout.
-- **Archive opens use the optional mapped pile-locator sidecar.** Every archive
-  lifecycle now attempts `<pile>.pidx` through TribleSpace's best-effort
-  indexed opener. A valid immutable prefix is mapped and only its append tail
-  is replayed; a missing, malformed, stale, or wrong-identity cache falls back
-  to the ordinary authoritative pile replay. Faculties neither mutates nor
-  publishes the derived sidecar yet.
 - **Archive and memory BM25 search can retrieve standalone Unicode
   symbols.** The shared tokenizer now indexes non-ASCII symbol graphemes,
   so queries such as emoji take the normal indexed path instead of yielding
