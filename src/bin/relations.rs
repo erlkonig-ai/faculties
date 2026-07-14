@@ -3,8 +3,9 @@ use anyhow::{Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::relations::{
-    DEFAULT_BRANCH, KIND_GROUP, KIND_PERSON_ID, KIND_RETIRE_ID, KIND_UNRETIRE_ID, group,
-    head_members, head_snapshot_of, relations,
+    group_snapshot_fragment, resolve_group_head, DEFAULT_BRANCH, GroupHead, KIND_GROUP,
+    KIND_PERSON_ID, KIND_RETIRE_ID, KIND_UNRETIRE_ID, group, head_members, head_snapshot_of,
+    relations,
 };
 use hifitime::Epoch;
 use rand_core::OsRng;
@@ -1049,28 +1050,57 @@ fn resolve_member_id(space: &TribleSet, raw: &str) -> Result<Id> {
 /// state, superseding `prior` (the previous head, if any). Returns the change
 /// to commit and the new snapshot id. Every group edit (add/remove/rename,
 /// and migration) goes through here so a snapshot is always a complete state.
+/// The group's unique head snapshot + its members, failing CLOSED on a
+/// Missing/Forked/Invalid group so no edit is built on an ambiguous state.
+fn require_unique_head(space: &TribleSet, gid: Id) -> Result<(Id, Vec<Id>)> {
+    match resolve_group_head(space, gid) {
+        GroupHead::Unique(head) => {
+            let mut members: Vec<Id> = head_members(space, gid).into_iter().collect();
+            members.sort();
+            Ok((head, members))
+        }
+        GroupHead::Missing => bail!(
+            "group {} has no snapshot yet; run `relations group migrate`",
+            fmt_id(gid)
+        ),
+        GroupHead::Forked(heads) => bail!(
+            "group {} has {} concurrent heads (forked); reconcile before editing",
+            fmt_id(gid),
+            heads.len()
+        ),
+        GroupHead::Invalid(reason) => {
+            bail!("group {} is invalid ({reason}); cannot edit", fmt_id(gid))
+        }
+    }
+}
+
 fn mint_group_snapshot(
     ws: &mut Workspace<Pile>,
     anchor: Id,
     members: &[Id],
     label: &str,
     key: &str,
-    prior: Option<Id>,
+    predecessors: &[Id],
 ) -> (TribleSet, Id) {
-    let snap = ufoid().id;
-    let now = epoch_interval(now_epoch());
     let label_handle = ws.put(label.to_string());
+    // Intrinsic content-sealed snapshot: id = hash of {anchor, name handle,
+    // sorted members, sorted predecessor heads} — built through the single
+    // `group_snapshot_fragment` authority the on-read validator also uses, so
+    // mint and validation can never disagree. Identical content dedups; a
+    // supersedes cycle is structurally impossible (an id depends on its
+    // predecessors). label_norm + created_at are derived/exhaust and added as
+    // separate facts outside the sealed identity.
+    let sealed = group_snapshot_fragment(anchor, label_handle, members, predecessors);
+    let snap = sealed
+        .root()
+        .expect("a group snapshot fragment has one intrinsic root");
+    let now = epoch_interval(now_epoch());
     let mut change = TribleSet::new();
+    change += sealed;
     change += entity! { ExclusiveId::force_ref(&snap) @
-        group::snapshot_of: &anchor,
-        metadata::name: label_handle,
         relations::label_norm: key,
         metadata::created_at: now,
-        group::member*: members.iter(),
     };
-    if let Some(prior) = prior {
-        change += entity! { ExclusiveId::force_ref(&snap) @ metadata::supersedes: &prior };
-    }
     (change, snap)
 }
 
@@ -1083,21 +1113,15 @@ fn cmd_group_create(pile: &Path, branch_id: Id, name: String) -> Result<()> {
         if let Ok(existing) = resolve_group_id(&space, &name) {
             bail!("group '{label}' already exists ({})", fmt_id(existing));
         }
-        // Anchor: pure identity. Name/label_norm/members live on snapshots, so
-        // the current state is always the anchor's head snapshot. A fresh group
-        // gets snapshot-0 (its name, no members, supersedes nothing).
+        // Stable extrinsic anchor: pure identity. Name/members live on
+        // intrinsic snapshots, so the current state is always the anchor's
+        // unique head snapshot. A fresh group gets snapshot-0 (its name, no
+        // members, no predecessors).
         let gid = ufoid().id;
-        let snap = ufoid().id;
-        let now = epoch_interval(now_epoch());
-        let label_handle = ws.put(label.clone());
         let mut change = TribleSet::new();
         change += entity! { ExclusiveId::force_ref(&gid) @ metadata::tag: &KIND_GROUP };
-        change += entity! { ExclusiveId::force_ref(&snap) @
-            group::snapshot_of: &gid,
-            metadata::name: label_handle,
-            relations::label_norm: key.as_str(),
-            metadata::created_at: now,
-        };
+        let (snap_change, _) = mint_group_snapshot(&mut ws, gid, &[], &label, &key, &[]);
+        change += snap_change;
         ws.commit(change, "relations group create");
         repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
         Ok(gid)
@@ -1112,19 +1136,17 @@ fn cmd_group_add(pile: &Path, branch_id: Id, group: String, person: String) -> R
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
         let gid = resolve_group_id(&space, &group)?;
         let pid = resolve_member_id(&space, &person)?;
-        let head = head_snapshot_of(&space, gid);
-        let mut members = group_members(&space, gid);
+        let (head, mut members) = require_unique_head(&space, gid)?;
         if members.contains(&pid) {
             return Ok((gid, pid, false));
         }
         members.push(pid);
         members.sort();
-        let name = head
-            .and_then(|h| person_label(&mut ws, &space, h))
-            .ok_or_else(|| anyhow!("group {} has no current name", fmt_id(gid)))?;
+        let name = person_label(&mut ws, &space, head)
+            .ok_or_else(|| anyhow!("group {} head snapshot has no name", fmt_id(gid)))?;
         let label = normalize_label(&name)?;
         let key = normalize_lookup_key(&name)?;
-        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, head);
+        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &[head]);
         ws.commit(change, "relations group add");
         repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
         Ok((gid, pid, true))
@@ -1143,18 +1165,16 @@ fn cmd_group_remove(pile: &Path, branch_id: Id, group: String, person: String) -
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
         let gid = resolve_group_id(&space, &group)?;
         let pid = resolve_member_id(&space, &person)?;
-        let head = head_snapshot_of(&space, gid);
-        let mut members = group_members(&space, gid);
+        let (head, mut members) = require_unique_head(&space, gid)?;
         if !members.contains(&pid) {
             return Ok((gid, pid, false));
         }
         members.retain(|&m| m != pid);
-        let name = head
-            .and_then(|h| person_label(&mut ws, &space, h))
-            .ok_or_else(|| anyhow!("group {} has no current name", fmt_id(gid)))?;
+        let name = person_label(&mut ws, &space, head)
+            .ok_or_else(|| anyhow!("group {} head snapshot has no name", fmt_id(gid)))?;
         let label = normalize_label(&name)?;
         let key = normalize_lookup_key(&name)?;
-        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, head);
+        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &[head]);
         ws.commit(change, "relations group remove");
         repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
         Ok((gid, pid, true))
@@ -1179,9 +1199,8 @@ fn cmd_group_rename(pile: &Path, branch_id: Id, group: String, name: String) -> 
                 bail!("group '{label}' already exists ({})", fmt_id(other));
             }
         }
-        let head = head_snapshot_of(&space, gid);
-        let members = group_members(&space, gid);
-        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, head);
+        let (head, members) = require_unique_head(&space, gid)?;
+        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &[head]);
         ws.commit(change, "relations group rename");
         repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
         Ok(gid)
@@ -1199,8 +1218,10 @@ fn cmd_group_migrate(pile: &Path, branch_id: Id) -> Result<()> {
         let mut change = TribleSet::new();
         let mut count = 0usize;
         for gid in anchors {
-            // Groups that already have a head snapshot are new-form; skip them.
-            if head_snapshot_of(&space, gid).is_some() {
+            // Only a legacy anchor-direct group (no snapshots at all => Missing)
+            // needs snapshot-0. Groups that already have any snapshot
+            // (Unique/Forked/Invalid) are left untouched.
+            if !matches!(resolve_group_head(&space, gid), GroupHead::Missing) {
                 continue;
             }
             let mut members: Vec<Id> =
@@ -1211,7 +1232,7 @@ fn cmd_group_migrate(pile: &Path, branch_id: Id) -> Result<()> {
                 .ok_or_else(|| anyhow!("legacy group {} has no name to migrate", fmt_id(gid)))?;
             let label = normalize_label(&name)?;
             let key = normalize_lookup_key(&name)?;
-            let (snapshot, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, None);
+            let (snapshot, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &[]);
             change += snapshot;
             count += 1;
         }
@@ -1238,12 +1259,30 @@ fn cmd_group_list(pile: &Path, branch_id: Id) -> Result<()> {
             return Ok(());
         }
         for gid in groups {
-            let head = head_snapshot_of(&space, gid);
-            let label = head
-                .and_then(|h| person_label(&mut ws, &space, h))
-                .unwrap_or_else(|| fmt_id(gid));
-            let members = group_members(&space, gid);
-            println!("[{}] {label} — {} member(s)", fmt_id(gid), members.len());
+            // Surface anomalies rather than reporting a broken group as an
+            // empty one: an unmigrated legacy group, a fork, or a corrupt
+            // snapshot must be VISIBLE so it gets reconciled, not silently
+            // dropped from delivery/gating.
+            match resolve_group_head(&space, gid) {
+                GroupHead::Unique(head) => {
+                    let label =
+                        person_label(&mut ws, &space, head).unwrap_or_else(|| fmt_id(gid));
+                    let members = group_members(&space, gid);
+                    println!("[{}] {label} — {} member(s)", fmt_id(gid), members.len());
+                }
+                GroupHead::Missing => println!(
+                    "[{}] !! unmigrated legacy group — run `relations group migrate`",
+                    fmt_id(gid)
+                ),
+                GroupHead::Forked(heads) => println!(
+                    "[{}] !! FORKED across {} heads — reconcile before use",
+                    fmt_id(gid),
+                    heads.len()
+                ),
+                GroupHead::Invalid(reason) => {
+                    println!("[{}] !! INVALID: {reason}", fmt_id(gid))
+                }
+            }
         }
         Ok(())
     })
@@ -1254,10 +1293,24 @@ fn cmd_group_show(pile: &Path, branch_id: Id, group: String) -> Result<()> {
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
         let gid = resolve_group_id(&space, &group)?;
-        let head = head_snapshot_of(&space, gid);
-        let label = head
-            .and_then(|h| person_label(&mut ws, &space, h))
-            .unwrap_or_else(|| fmt_id(gid));
+        // Anomalies are surfaced explicitly: a broken group must never look
+        // like a healthy empty one.
+        let head = match resolve_group_head(&space, gid) {
+            GroupHead::Unique(head) => head,
+            GroupHead::Missing => bail!(
+                "group {} is an unmigrated legacy group — run `relations group migrate`",
+                fmt_id(gid)
+            ),
+            GroupHead::Forked(heads) => bail!(
+                "group {} is FORKED across {} concurrent heads — reconcile before use",
+                fmt_id(gid),
+                heads.len()
+            ),
+            GroupHead::Invalid(reason) => {
+                bail!("group {} is INVALID: {reason}", fmt_id(gid))
+            }
+        };
+        let label = person_label(&mut ws, &space, head).unwrap_or_else(|| fmt_id(gid));
         println!("group: {label} ({})", fmt_id(gid));
         let members = group_members(&space, gid);
         if members.is_empty() {
@@ -1376,5 +1429,205 @@ fn main() -> Result<()> {
             GroupCmd::List => cmd_group_list(&cli.pile, branch_id),
             GroupCmd::Show { group } => cmd_group_show(&cli.pile, branch_id, group),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    struct TestPile(PathBuf);
+
+    impl TestPile {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("faculties-relations-{}.pile", ufoid().id));
+            File::create(&path).expect("create test pile");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn sorted(mut v: Vec<Id>) -> Vec<Id> {
+        v.sort();
+        v
+    }
+
+    fn branch(pile: &Path) -> Id {
+        with_repo(pile, |repo| {
+            repo.ensure_branch(DEFAULT_BRANCH, None)
+                .map_err(|e| anyhow!("ensure branch: {e:?}"))
+        })
+        .expect("ensure relations branch")
+    }
+
+    fn seed_person(pile: &Path, branch_id: Id, id: Id, name: &str) {
+        with_repo(pile, |repo| {
+            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+            let handle = ws.put(name.to_string());
+            let mut change = TribleSet::new();
+            change += entity! { ExclusiveId::force_ref(&id) @
+                metadata::tag: &KIND_PERSON_ID,
+                metadata::name: handle,
+            };
+            ws.commit(change, "seed person");
+            repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+            Ok(())
+        })
+        .expect("seed person");
+    }
+
+    /// Seed a legacy anchor-direct group: name + members live DIRECTLY on the
+    /// anchor (the pre-snapshot model), with no snapshot entity at all. This is
+    /// exactly the shape `group migrate` must promote.
+    fn seed_legacy_group(
+        pile: &Path,
+        branch_id: Id,
+        anchor: Id,
+        name: Option<&str>,
+        members: &[Id],
+    ) {
+        with_repo(pile, |repo| {
+            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+            let mut change = TribleSet::new();
+            change += entity! { ExclusiveId::force_ref(&anchor) @ metadata::tag: &KIND_GROUP };
+            if let Some(name) = name {
+                let handle = ws.put(name.to_string());
+                change += entity! { ExclusiveId::force_ref(&anchor) @ metadata::name: handle };
+            }
+            for m in members {
+                change += entity! { ExclusiveId::force_ref(&anchor) @ group::member: m };
+            }
+            ws.commit(change, "seed legacy group");
+            repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+            Ok(())
+        })
+        .expect("seed legacy group");
+    }
+
+    fn head(pile: &Path, branch_id: Id, anchor: Id) -> GroupHead {
+        with_repo(pile, |repo| {
+            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+            let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+            Ok(resolve_group_head(&space, anchor))
+        })
+        .expect("read head")
+    }
+
+    fn members(pile: &Path, branch_id: Id, anchor: Id) -> Vec<Id> {
+        with_repo(pile, |repo| {
+            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+            let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+            Ok(group_members(&space, anchor))
+        })
+        .expect("read members")
+    }
+
+    fn resolve(pile: &Path, branch_id: Id, name: &str) -> Result<Id> {
+        with_repo(pile, |repo| {
+            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+            let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+            resolve_group_id(&space, name)
+        })
+    }
+
+    #[test]
+    fn migrate_promotes_legacy_groups_and_is_idempotent() {
+        let pile = TestPile::new();
+        let b = branch(pile.path());
+        let mut anchors = Vec::new();
+        for i in 0..4 {
+            let anchor = ufoid().id;
+            let m1 = ufoid().id;
+            let m2 = ufoid().id;
+            seed_legacy_group(pile.path(), b, anchor, Some(&format!("group-{i}")), &[m1, m2]);
+            anchors.push((anchor, sorted(vec![m1, m2])));
+        }
+        // Before migration each is a VISIBLE unmigrated legacy group (Missing),
+        // not a healthy-looking empty one.
+        for (anchor, _) in &anchors {
+            assert_eq!(head(pile.path(), b, *anchor), GroupHead::Missing);
+        }
+        cmd_group_migrate(pile.path(), b).expect("migrate");
+        let heads: Vec<Id> = anchors
+            .iter()
+            .map(|(anchor, want)| match head(pile.path(), b, *anchor) {
+                GroupHead::Unique(h) => {
+                    assert_eq!(&members(pile.path(), b, *anchor), want);
+                    h
+                }
+                other => panic!("expected Unique after migrate, got {other:?}"),
+            })
+            .collect();
+        // Idempotent: a second migration re-mints nothing; every head is byte
+        // -identical (migrate only touches Missing groups).
+        cmd_group_migrate(pile.path(), b).expect("migrate idempotent");
+        for ((anchor, _), h) in anchors.iter().zip(heads) {
+            assert_eq!(head(pile.path(), b, *anchor), GroupHead::Unique(h));
+        }
+    }
+
+    #[test]
+    fn migrate_empty_legacy_group_yields_unique_empty_head() {
+        let pile = TestPile::new();
+        let b = branch(pile.path());
+        let anchor = ufoid().id;
+        seed_legacy_group(pile.path(), b, anchor, Some("empty"), &[]);
+        cmd_group_migrate(pile.path(), b).expect("migrate");
+        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
+        assert!(members(pile.path(), b, anchor).is_empty());
+    }
+
+    #[test]
+    fn migrate_malformed_legacy_group_without_name_fails_visible() {
+        let pile = TestPile::new();
+        let b = branch(pile.path());
+        let anchor = ufoid().id;
+        seed_legacy_group(pile.path(), b, anchor, None, &[ufoid().id]);
+        // Fails LOUDLY rather than silently minting a nameless snapshot.
+        let err = cmd_group_migrate(pile.path(), b).unwrap_err();
+        assert!(err.to_string().contains("no name"), "unexpected error: {err}");
+        // Still visibly un-migrated (Missing), never a healthy zero-member group.
+        assert_eq!(head(pile.path(), b, anchor), GroupHead::Missing);
+    }
+
+    #[test]
+    fn create_add_remove_rename_roundtrip() {
+        let pile = TestPile::new();
+        let b = branch(pile.path());
+        let alice = ufoid().id;
+        let bob = ufoid().id;
+        seed_person(pile.path(), b, alice, "Alice");
+        seed_person(pile.path(), b, bob, "Bob");
+
+        cmd_group_create(pile.path(), b, "Crew".to_string()).expect("create");
+        let anchor = resolve(pile.path(), b, "Crew").expect("resolve crew");
+        // Fresh group: Unique head, zero members.
+        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
+        assert!(members(pile.path(), b, anchor).is_empty());
+
+        cmd_group_add(pile.path(), b, "Crew".to_string(), fmt_id(alice)).expect("add alice");
+        cmd_group_add(pile.path(), b, "Crew".to_string(), fmt_id(bob)).expect("add bob");
+        assert_eq!(members(pile.path(), b, anchor), sorted(vec![alice, bob]));
+
+        cmd_group_remove(pile.path(), b, "Crew".to_string(), fmt_id(alice)).expect("remove alice");
+        assert_eq!(members(pile.path(), b, anchor), vec![bob]);
+
+        // Rename: only the NEW name resolves; the anchor and membership persist.
+        cmd_group_rename(pile.path(), b, "Crew".to_string(), "Squad".to_string()).expect("rename");
+        assert!(resolve(pile.path(), b, "Crew").is_err());
+        assert_eq!(resolve(pile.path(), b, "Squad").expect("resolve squad"), anchor);
+        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
+        assert_eq!(members(pile.path(), b, anchor), vec![bob]);
     }
 }

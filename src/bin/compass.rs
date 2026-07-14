@@ -4,7 +4,7 @@ use ed25519_dalek::SigningKey;
 use faculties::schemas::compass::{
     active_attestation_ids_for_reviewer, active_request_ids_for_goal,
     all_attestation_ids_for_reviewer, all_request_ids_for_goal, board, evaluate_goal,
-    evaluate_request_live, latest_status_event, review, review_attestation_fragment,
+    evaluate_request_live, latest_status_event, review_attestation_fragment,
     review_attestation_settlement_fragment, review_override_fragment,
     review_override_settlement_fragment, review_request, review_request_fragment,
     review_roster_successor_fragment, ReviewEvaluation, ReviewGateState, ReviewProjection,
@@ -1489,6 +1489,7 @@ fn cmd_review_open(
                 &required,
                 &override_authorities,
                 &heads,
+                Some(group_id),
                 now,
             );
             let request_id = request
@@ -1496,12 +1497,12 @@ fn cmd_review_open(
                 .expect("a review request fragment has one intrinsic root");
             let mut change = TribleSet::new();
             change += ensure_kind_entities(&mut ws)?;
+            // The live-roster group anchor is SEALED into the request's
+            // intrinsic id (above). The gate resolves the group's CURRENT head
+            // members at eval time, so removing a member unblocks this request
+            // with no supersede-for-reroster; the binding itself cannot be
+            // added or rewritten after the fact.
             change += request;
-            // Level B: record the live-roster group anchor as an extra fact
-            // (outside the sealed fragment) so the gate resolves the group's
-            // CURRENT members at eval time. Removing a member then unblocks
-            // this request with no supersede-for-reroster.
-            change += entity! { ExclusiveId::force_ref(&request_id) @ review::group: &group_id };
             ws.commit(change, "open review request");
             match repo
                 .try_push(&mut ws)
@@ -1628,6 +1629,7 @@ fn cmd_review_supersede(
                 &required,
                 &evaluation.request.override_authorities,
                 predecessor_id,
+                Some(group_id),
                 now,
             );
             let successor_id = successor
@@ -1650,12 +1652,13 @@ fn cmd_review_supersede(
                 &required,
                 &evaluation.request.override_authorities,
                 predecessor_id,
+                Some(group_id),
                 now,
             );
             let mut change = TribleSet::new();
             change += ensure_kind_entities(&mut ws)?;
+            // The group binding is sealed into the successor's intrinsic id.
             change += successor;
-            change += entity! { ExclusiveId::force_ref(&successor_id) @ review::group: &group_id };
             ws.commit(change, "supersede review roster");
             match repo
                 .try_push(&mut ws)
@@ -1704,24 +1707,28 @@ fn cmd_review_submit(
                 .checkout(..)
                 .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
             let request_id = resolve_request_id(&request_input, &space)?;
-            let request = review_request(&space, request_id)
-                .ok_or_else(|| anyhow::anyhow!("review request {request_id:x} is malformed"))?;
             if !request_is_active(&space, request_id) {
                 bail!(
                     "review request {request_id:x} is stale or forked; attest the sole current exact request instead"
                 );
             }
-            if !request.required.contains(&reviewer) {
-                bail!("persona {reviewer:x} is not in request {request_id:x}'s frozen reviewer roster");
+            let evaluation =
+                evaluate_request_live(&space, request_id, &known_people, &relations_space)
+                    .ok_or_else(|| anyhow::anyhow!("review request {request_id:x} is malformed"))?;
+            // Eligibility is the CURRENT (effective) roster, not the frozen
+            // open-time snapshot: a member added to the group after open is
+            // required by the gate and must be able to attest, and one removed
+            // no longer is. Frozen-roster gating here would deadlock the gate.
+            if !evaluation.effective_required.contains(&reviewer) {
+                bail!(
+                    "persona {reviewer:x} is not in request {request_id:x}'s current reviewer roster"
+                );
             }
             if !matches!(
-                evaluate_request_live(&space, request_id, &known_people, &relations_space),
-                Some(ReviewEvaluation {
-                    state: ReviewGateState::Pending { .. }
-                        | ReviewGateState::Blocked { .. }
-                        | ReviewGateState::Ready,
-                    ..
-                })
+                evaluation.state,
+                ReviewGateState::Pending { .. }
+                    | ReviewGateState::Blocked { .. }
+                    | ReviewGateState::Ready
             ) {
                 bail!("review request {request_id:x} is invalid or already settled");
             }
@@ -1798,15 +1805,17 @@ fn write_review_watermark(
             .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
         let request_id = resolve_request_id(&request_input, &space)?;
-        let request = review_request(&space, request_id)
-            .ok_or_else(|| anyhow::anyhow!("review request {request_id:x} is malformed"))?;
         if !request_is_active(&space, request_id) {
             bail!(
                 "review request {request_id:x} is stale or forked; ack/snooze the sole current exact request instead"
             );
         }
-        if !request.required.contains(&reviewer) {
-            bail!("persona {reviewer:x} is not in request {request_id:x}'s frozen reviewer roster");
+        let evaluation = evaluate_request_live(&space, request_id, &known_people, &relations_space)
+            .ok_or_else(|| anyhow::anyhow!("review request {request_id:x} is malformed"))?;
+        // Ack/snooze eligibility follows the CURRENT (effective) roster, the
+        // same source the gate and submit use — never the frozen open-time one.
+        if !evaluation.effective_required.contains(&reviewer) {
+            bail!("persona {reviewer:x} is not in request {request_id:x}'s current reviewer roster");
         }
         let heads = active_attestation_ids_for_reviewer(&space, request_id, reviewer);
 
@@ -2182,12 +2191,25 @@ fn cmd_review_settle(
                 .iter()
                 .map(|slot| slot.heads[0].id)
                 .collect();
+            // Seal the exact group head + effective roster this proof settled
+            // against, so later group changes never revalidate it. A legacy
+            // (groupless) request seals nothing and keeps its historical id.
+            let (snapshot, roster): (Option<Id>, &[Id]) = if evaluation.request.group().is_some() {
+                (
+                    evaluation.resolved_snapshot,
+                    evaluation.effective_required.as_slice(),
+                )
+            } else {
+                (None, &[])
+            };
             let now = epoch_interval(now_epoch());
             let settlement = review_attestation_settlement_fragment(
                 evaluation.request.id,
                 goal,
                 settler,
                 &evidence,
+                snapshot,
+                roster,
                 now,
             );
             let settlement_id = settlement
@@ -2267,11 +2289,16 @@ fn cmd_review_override(
             let override_id = override_event
                 .root()
                 .expect("a review override fragment has one intrinsic root");
+            // Break-glass bypasses the roster entirely, so the certificate
+            // seals no snapshot/roster: the override event + frozen authority
+            // is its whole proof.
             let settlement = review_override_settlement_fragment(
                 evaluation.request.id,
                 goal,
                 actor,
                 override_id,
+                None,
+                &[],
                 now,
             );
             let settlement_id = settlement
@@ -2444,7 +2471,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::schemas::relations::group;
+    use faculties::schemas::relations::group_snapshot_fragment;
     use faculties::schemas::compass::review;
     use faculties::schemas::relations::KIND_RETIRE_ID;
     use std::fs::File;
@@ -2491,14 +2518,17 @@ mod tests {
                     metadata::tag: &KIND_PERSON_ID,
                 };
             }
-            let snapshot_id = ufoid().id;
             relations_change += entity! { ExclusiveId::force_ref(&group_id) @
                 metadata::tag: &KIND_GROUP,
             };
-            relations_change += entity! { ExclusiveId::force_ref(&snapshot_id) @
-                group::snapshot_of: &group_id,
-                group::member*: reviewers.iter(),
-            };
+            // Mint the roster as a content-canonical snapshot through the same
+            // authority the real `relations group` path uses.
+            relations_change += group_snapshot_fragment(
+                group_id,
+                "cli-review-roster".to_string().to_blob().get_handle(),
+                &reviewers,
+                &[],
+            );
             relations_ws.commit(relations_change, "seed review roster");
             repo.push(&mut relations_ws)
                 .map_err(|e| anyhow::anyhow!("push relations fixture: {e:?}"))?;
@@ -2583,15 +2613,16 @@ mod tests {
                 .pull(branch)
                 .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
             let group_id = ufoid().id;
-            let snapshot_id = ufoid().id;
             let mut fragment = TribleSet::new();
             fragment += entity! { ExclusiveId::force_ref(&group_id) @
                 metadata::tag: &KIND_GROUP,
             };
-            fragment += entity! { ExclusiveId::force_ref(&snapshot_id) @
-                group::snapshot_of: &group_id,
-                group::member*: members.iter(),
-            };
+            fragment += group_snapshot_fragment(
+                group_id,
+                "cli-alternate-roster".to_string().to_blob().get_handle(),
+                members,
+                &[],
+            );
             ws.commit(fragment, "seed alternate review roster");
             repo.push(&mut ws)
                 .map_err(|e| anyhow::anyhow!("push alternate review roster: {e:?}"))?;
@@ -2674,6 +2705,7 @@ mod tests {
                 &predecessor.required,
                 &predecessor.override_authorities,
                 &[predecessor_id],
+                predecessor.group(),
                 epoch_interval(now_epoch()),
             );
             let id = fragment.root().expect("intrinsic fixture successor");
@@ -3684,7 +3716,7 @@ mod tests {
             .to_blob()
             .get_handle();
         let now = epoch_interval(Epoch::from_gregorian_utc(2026, 7, 13, 12, 0, 0, 0));
-        let base = review_request_fragment(goal, author, target, &reviewers, &[], &[], now);
+        let base = review_request_fragment(goal, author, target, &reviewers, &[], &[], None, now);
         let base_id = base.root().unwrap();
         let left = review_request_fragment(
             goal,
@@ -3693,6 +3725,7 @@ mod tests {
             &reviewers,
             &[],
             &[base_id],
+            None,
             now,
         );
         let left_id = left.root().unwrap();
@@ -3703,6 +3736,7 @@ mod tests {
             &reviewers,
             &[],
             &[base_id],
+            None,
             later_interval_for_test(),
         );
         let right_id = right.root().unwrap();

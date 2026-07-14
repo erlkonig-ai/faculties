@@ -5,7 +5,7 @@
 //! read compass boards from a pile (the playground dashboard, the pile
 //! inspector notebook, etc.).
 
-use crate::schemas::relations::head_members;
+use crate::schemas::relations::{head_members, resolve_group_head, snapshot_composition, GroupHead};
 use std::collections::{BTreeSet, HashSet};
 use triblespace::core::metadata;
 use triblespace::macros::{find, id_hex, pattern};
@@ -89,9 +89,12 @@ pub mod review {
         /// snapshot resolves this request's reviewers at gate time. When
         /// present, the gate ignores the frozen `required` snapshot and
         /// resolves the group's current members live, so removing a member
-        /// unblocks the request with no supersede-for-reroster. Written as an
-        /// extra fact outside the sealed fragment, so adding it never
-        /// invalidates an existing request.
+        /// unblocks the request with no supersede-for-reroster. SEALED into the
+        /// request's intrinsic id (exactly zero or one per request): the binding
+        /// cannot be added, changed, or duplicated after creation without
+        /// breaking canonicality. A groupless (legacy) request omits it and its
+        /// id is unchanged; you cannot retroactively bind a group — open a new
+        /// request instead.
         "159A8189CD8DAA0098A250B3DE5BBBBB" as group: inlineencodings::GenId;
         /// Frozen break-glass authority roster on a request (repeated).
         "8079D8E6C5F8DC92EF3DFF7111CF7612" as override_authority: inlineencodings::GenId;
@@ -108,6 +111,16 @@ pub mod review {
         "7BF4989BFA09875884BF89E165B2C913" as attestation: inlineencodings::GenId;
         /// Settlement -> exact break-glass override event used.
         "A624198E9D3180377FBADD000B571A1B" as override_event: inlineencodings::GenId;
+        /// Settlement -> the group head snapshot it certified against, if the
+        /// request sealed a group. Provenance/audit: records which exact group
+        /// composition signed off. Optional (legacy settlements omit it).
+        "FADBA88F321A2DAF2145FD7F5180FB84" as settled_snapshot: inlineencodings::GenId;
+        /// Settlement -> the exact effective roster it certified against
+        /// (repeated). Sealed at settle time so the certificate validates
+        /// self-contained against its OWN roster; later group changes never
+        /// revalidate it. Legacy (groupless) settlements omit it and fall back
+        /// to the request's frozen `required`.
+        "806A834B4B4118FE086BB4AFF61988F5" as settled_member: inlineencodings::GenId;
     }
 }
 
@@ -127,6 +140,7 @@ pub fn review_request_fragment(
     required: &[Id],
     override_authorities: &[Id],
     supersedes: &[Id],
+    group: Option<Id>,
     created_at: IntervalValue,
 ) -> Fragment {
     entity! { _ @
@@ -139,6 +153,7 @@ pub fn review_request_fragment(
         review::required*: required.iter(),
         review::override_authority*: override_authorities.iter(),
         review::supersedes*: supersedes.iter(),
+        review::group?: group.as_ref(),
         metadata::created_at: created_at,
     }
 }
@@ -155,6 +170,7 @@ pub fn review_roster_successor_fragment(
     required: &[Id],
     override_authorities: &[Id],
     predecessor: Id,
+    group: Option<Id>,
     created_at: IntervalValue,
 ) -> Fragment {
     entity! { _ @
@@ -168,6 +184,7 @@ pub fn review_roster_successor_fragment(
         review::override_authority*: override_authorities.iter(),
         review::supersedes: &predecessor,
         review::roster_predecessor: &predecessor,
+        review::group?: group.as_ref(),
         metadata::created_at: created_at,
     }
 }
@@ -209,11 +226,18 @@ pub fn review_override_fragment(
 }
 
 /// Construct a settlement whose proof is the exact attestation head set.
+///
+/// `snapshot`/`roster` seal the exact group head and effective roster this
+/// certificate settled against (both empty/`None` for a legacy groupless
+/// request, leaving the id unchanged). They are part of the intrinsic id, so a
+/// tampered roster breaks canonicality instead of silently re-scoping the proof.
 pub fn review_attestation_settlement_fragment(
     request: Id,
     goal: Id,
     actor: Id,
     evidence: &[Id],
+    snapshot: Option<Id>,
+    roster: &[Id],
     created_at: IntervalValue,
 ) -> Fragment {
     entity! { _ @
@@ -221,6 +245,8 @@ pub fn review_attestation_settlement_fragment(
         metadata::tag: &KIND_STATUS_ID,
         review::request: &request,
         review::attestation*: evidence.iter(),
+        review::settled_snapshot?: snapshot.as_ref(),
+        review::settled_member*: roster.iter(),
         board::task: &goal,
         board::status: DONE_STATUS,
         board::by: &actor,
@@ -234,6 +260,8 @@ pub fn review_override_settlement_fragment(
     goal: Id,
     actor: Id,
     override_event: Id,
+    snapshot: Option<Id>,
+    roster: &[Id],
     created_at: IntervalValue,
 ) -> Fragment {
     entity! { _ @
@@ -241,6 +269,8 @@ pub fn review_override_settlement_fragment(
         metadata::tag: &KIND_STATUS_ID,
         review::request: &request,
         review::override_event: &override_event,
+        review::settled_snapshot?: snapshot.as_ref(),
+        review::settled_member*: roster.iter(),
         board::task: &goal,
         board::status: DONE_STATUS,
         board::by: &actor,
@@ -262,8 +292,10 @@ pub struct ReviewRequest {
     pub roster_predecessors: Vec<Id>,
     pub created_at: Vec<IntervalValue>,
     /// Live roster source (relations group anchor), if this request records
-    /// one. Deliberately NOT part of `canonical_id` — it is an extra fact, so
-    /// it never invalidates a request and the gate can prefer it at eval time.
+    /// one. SEALED into `canonical_id` (exactly zero or one): the binding is
+    /// part of the request's intrinsic identity, so it cannot be added,
+    /// changed, or duplicated after creation. `group()` reads it; the gate
+    /// resolves its current head members as the effective roster.
     pub groups: Vec<Id>,
 }
 
@@ -295,6 +327,13 @@ impl ReviewRequest {
         let author = self.author()?;
         let target = self.target()?;
         let created_at = exactly_one(&self.created_at)?;
+        // Exactly zero or one sealed group binding. A second appended
+        // `review::group` fact is ambiguous and must fail canonicality rather
+        // than be silently ignored by picking the first.
+        if self.groups.len() > 1 {
+            return None;
+        }
+        let group = self.groups.first().copied();
         match self.roster_predecessors.as_slice() {
             [] => review_request_fragment(
                 goal,
@@ -303,6 +342,7 @@ impl ReviewRequest {
                 &self.required,
                 &self.override_authorities,
                 &self.supersedes,
+                group,
                 created_at,
             )
             .root(),
@@ -314,6 +354,7 @@ impl ReviewRequest {
                     &self.required,
                     &self.override_authorities,
                     *predecessor,
+                    group,
                     created_at,
                 )
                 .root()
@@ -415,6 +456,8 @@ struct ReviewSettlement {
     actors: Vec<Id>,
     attestations: Vec<Id>,
     override_events: Vec<Id>,
+    settled_snapshots: Vec<Id>,
+    settled_members: Vec<Id>,
     created_at: Vec<IntervalValue>,
 }
 
@@ -429,6 +472,13 @@ impl ReviewSettlement {
         let goal = exactly_one(&self.tasks)?;
         let actor = exactly_one(&self.actors)?;
         let created_at = exactly_one(&self.created_at)?;
+        // At most one sealed snapshot; the roster is a set. Reconstruct from
+        // the exact stored facts so any tampering breaks the intrinsic id.
+        if self.settled_snapshots.len() > 1 {
+            return None;
+        }
+        let snapshot = self.settled_snapshots.first().copied();
+        let roster = sorted_unique(self.settled_members.clone());
         let (expected, mode) = match (self.attestations.is_empty(), self.override_events.as_slice())
         {
             (false, []) => (
@@ -437,6 +487,8 @@ impl ReviewSettlement {
                     goal,
                     actor,
                     &self.attestations,
+                    snapshot,
+                    &roster,
                     created_at,
                 ),
                 SettlementMode::Attestations,
@@ -447,6 +499,8 @@ impl ReviewSettlement {
                     goal,
                     actor,
                     *override_event,
+                    snapshot,
+                    &roster,
                     created_at,
                 ),
                 SettlementMode::Override,
@@ -519,6 +573,16 @@ pub struct ReviewEvaluation {
     pub request: ReviewRequest,
     pub slots: Vec<ReviewerSlot>,
     pub state: ReviewGateState,
+    /// The group head snapshot this evaluation resolved against, if the request
+    /// seals a group anchor and it resolved to a unique head. `None` for legacy
+    /// (groupless) requests or when the group is Missing/Forked/Invalid. The
+    /// settle command seals this into the settlement certificate so later group
+    /// changes never revalidate a settled proof.
+    pub resolved_snapshot: Option<Id>,
+    /// The live roster the gate actually evaluated: the resolved head's members
+    /// for a group request, or the frozen `request.required` for a legacy one.
+    /// Never mutates `request.required`.
+    pub effective_required: Vec<Id>,
 }
 
 #[derive(Debug, Clone)]
@@ -730,6 +794,13 @@ fn review_settlement(space: &TribleSet, settlement_id: Id) -> Option<ReviewSettl
         override_events: sorted_unique(
             find!(v: Id, pattern!(space, [{ settlement_id @ review::override_event: ?v }])).collect(),
         ),
+        settled_snapshots: sorted_unique(
+            find!(v: Id, pattern!(space, [{ settlement_id @ review::settled_snapshot: ?v }]))
+                .collect(),
+        ),
+        settled_members: sorted_unique(
+            find!(v: Id, pattern!(space, [{ settlement_id @ review::settled_member: ?v }])).collect(),
+        ),
         created_at: sorted_unique(
             find!(v: IntervalValue, pattern!(space, [{ settlement_id @ metadata::created_at: ?v }]))
                 .collect(),
@@ -855,7 +926,53 @@ fn attestation_satisfies(
 /// causally-later comment. Any extra head fails closed and requires an
 /// explicit successor request. Authenticity remains cooperative until actors
 /// gain signed capabilities.
-fn valid_settlements(space: &TribleSet, request: &ReviewRequest) -> Vec<ValidSettlement> {
+/// The exact roster an attestation settlement certified against, or `None` when
+/// its sealed roster is malformed or (for a group request) fails to anchor to
+/// the canonical snapshot it names.
+///
+/// - Group request: the settlement must seal exactly one snapshot and a
+///   non-empty member set. With a relations space, that snapshot must be a
+///   canonical snapshot of THIS request's group whose members are exactly the
+///   sealed set (authoritative anchor); without one, the sealed set is trusted
+///   cooperatively — the same trust level as unsigned attestations.
+/// - Legacy (groupless) request: the settlement must seal nothing; the roster
+///   is the request's frozen `required`, sealed by its own intrinsic id.
+fn settled_roster(
+    settlement: &ReviewSettlement,
+    request: &ReviewRequest,
+    relations_space: Option<&TribleSet>,
+) -> Option<Vec<Id>> {
+    match request.group() {
+        Some(group) => {
+            let [snapshot] = settlement.settled_snapshots.as_slice() else {
+                return None;
+            };
+            let members = sorted_unique(settlement.settled_members.clone());
+            if members.is_empty() {
+                return None;
+            }
+            if let Some(rel) = relations_space {
+                match snapshot_composition(rel, *snapshot) {
+                    Some((anchor, snap_members)) if anchor == group && snap_members == members => {}
+                    _ => return None,
+                }
+            }
+            Some(members)
+        }
+        None => {
+            if !settlement.settled_snapshots.is_empty() || !settlement.settled_members.is_empty() {
+                return None;
+            }
+            Some(request.required.clone())
+        }
+    }
+}
+
+fn valid_settlements(
+    space: &TribleSet,
+    request: &ReviewRequest,
+    relations_space: Option<&TribleSet>,
+) -> Vec<ValidSettlement> {
     let Some(goal) = request.goal() else {
         return Vec::new();
     };
@@ -879,13 +996,23 @@ fn valid_settlements(space: &TribleSet, request: &ReviewRequest) -> Vec<ValidSet
         {
             continue;
         }
-        if mode == SettlementMode::Attestations
-            && settlement.attestations.len() == request.required.len()
-            && settlement.actors.as_slice() == [author]
-        {
+        if mode == SettlementMode::Attestations && settlement.actors.as_slice() == [author] {
+            // The exact roster this certificate settled against. A group
+            // request seals its live roster (and the head snapshot) INTO the
+            // settlement, so later group changes never revalidate it; when a
+            // relations space is available we re-anchor that sealed roster to
+            // the canonical snapshot it names. A legacy (groupless) request
+            // carries its roster in its own intrinsic id (`required`) and its
+            // settlement must not claim a separate one.
+            let Some(sealed_roster) = settled_roster(&settlement, request, relations_space) else {
+                continue;
+            };
             let mut reviewers = BTreeSet::new();
-            let mut all_valid = true;
+            let mut all_valid = settlement.attestations.len() == sealed_roster.len();
             for attestation_id in &settlement.attestations {
+                if !all_valid {
+                    break;
+                }
                 let Some(attestation) = review_attestation(space, *attestation_id) else {
                     all_valid = false;
                     break;
@@ -894,7 +1021,7 @@ fn valid_settlements(space: &TribleSet, request: &ReviewRequest) -> Vec<ValidSet
                     all_valid = false;
                     break;
                 };
-                if !request.required.contains(&reviewer)
+                if !sealed_roster.contains(&reviewer)
                     || !attestation_satisfies(&attestation, request.id, reviewer, author)
                     || active_attestation_ids_for_reviewer(space, request.id, reviewer)
                         .as_slice()
@@ -905,7 +1032,7 @@ fn valid_settlements(space: &TribleSet, request: &ReviewRequest) -> Vec<ValidSet
                     break;
                 }
             }
-            if all_valid && reviewers.len() == request.required.len() {
+            if all_valid && reviewers.len() == sealed_roster.len() {
                 valid.push(ValidSettlement {
                     id,
                     mode: SettlementMode::Attestations,
@@ -1218,6 +1345,41 @@ fn status_event_is_predecessor_of_request(
 /// Compass/Relations snapshots and avoids consulting mutable group membership.
 /// Frozen-roster evaluation: uses the request's sealed `required`. Used by
 /// tests and any caller without a relations snapshot at hand.
+/// How a request's roster changed between its FROZEN open-time snapshot and its
+/// CURRENT effective (live group) roster, classified for the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterTransition {
+    /// In both rosters — must still attest anew.
+    pub retained: Vec<Id>,
+    /// In the current roster but not the frozen one — newly required, re-opens
+    /// the gate until they attest.
+    pub added: Vec<Id>,
+    /// In the frozen roster but no longer current — no longer gates.
+    pub removed: Vec<Id>,
+}
+
+/// Classify the transition from a request's frozen roster to its effective one.
+///
+/// POLICY (deliberate, per the live-group design — "take the current group
+/// composition as what must sign off"): the gate consults ONLY the current
+/// effective roster. A reviewer REMOVED from the group after opening no longer
+/// gates — INCLUDING one who had submitted a blocker: that block is WAIVED,
+/// because membership is the source of truth for who must sign off. A reviewer
+/// ADDED after opening is newly required and re-opens the gate until they
+/// attest. This is a pure function of the two rosters; neither is mutated (the
+/// frozen roster stays sealed in the request's identity). Making the rule
+/// explicit here is the guard against a waiver arising as an accidental
+/// side effect rather than a stated choice.
+pub fn roster_transition(frozen_required: &[Id], effective_required: &[Id]) -> RosterTransition {
+    let frozen: BTreeSet<Id> = frozen_required.iter().copied().collect();
+    let effective: BTreeSet<Id> = effective_required.iter().copied().collect();
+    RosterTransition {
+        retained: effective.intersection(&frozen).copied().collect(),
+        added: effective.difference(&frozen).copied().collect(),
+        removed: frozen.difference(&effective).copied().collect(),
+    }
+}
+
 pub fn evaluate_request(
     space: &TribleSet,
     request_id: Id,
@@ -1249,16 +1411,40 @@ fn evaluate_request_inner(
     // Identity + supersede-protocol checks use the FROZEN sealed roster.
     let canonical_ok = request.is_canonical();
     let roster_reasons = roster_successor_invalid_reasons(space, &request, known_people);
-    // Level B live roster: if the request records a group anchor AND a relations
-    // snapshot is supplied, resolve that group's CURRENT head members as the
-    // effective roster; otherwise keep the frozen `required`.
-    let mut request = request;
-    if let (Some(relations_space), Some(group)) = (relations_space, request.group()) {
-        request.required =
-            sorted_unique(head_members(relations_space, group).into_iter().collect());
-    }
-    let settlements = valid_settlements(space, &request);
     let mut invalid = Vec::new();
+    // Live roster: resolve the request's group anchor to its UNIQUE head
+    // snapshot (resolved_snapshot) and that head's members (effective_required).
+    // The frozen `request.required` is NEVER mutated. Missing/Forked/Invalid
+    // fails the gate CLOSED; a legacy request (no group) keeps its frozen
+    // sealed roster as the effective one.
+    let (resolved_snapshot, effective_required): (Option<Id>, Vec<Id>) =
+        match (relations_space, request.group()) {
+            (Some(rel), Some(group)) => match resolve_group_head(rel, group) {
+                GroupHead::Unique(head) => (
+                    Some(head),
+                    sorted_unique(head_members(rel, group).into_iter().collect()),
+                ),
+                GroupHead::Missing => {
+                    invalid.push(format!(
+                        "review group {group:x} has no snapshot; run `relations group migrate`"
+                    ));
+                    (None, Vec::new())
+                }
+                GroupHead::Forked(heads) => {
+                    invalid.push(format!(
+                        "review group {group:x} is forked across {} heads; reconcile first",
+                        heads.len()
+                    ));
+                    (None, Vec::new())
+                }
+                GroupHead::Invalid(reason) => {
+                    invalid.push(format!("review group {group:x} is invalid: {reason}"));
+                    (None, Vec::new())
+                }
+            },
+            _ => (None, request.required.clone()),
+        };
+    let settlements = valid_settlements(space, &request, relations_space);
     if !request.tags.contains(&KIND_STATUS_ID)
         || request.statuses.as_slice() != [REVIEW_STATUS]
     {
@@ -1286,10 +1472,10 @@ fn evaluate_request_inner(
         }
     }
     if let Some(author) = request.author() {
-        if !request.required.contains(&author) {
+        if !effective_required.contains(&author) {
             invalid.push("review roster must include the author".to_string());
         }
-        if !request.required.iter().any(|reviewer| *reviewer != author) {
+        if !effective_required.iter().any(|reviewer| *reviewer != author) {
             invalid.push(
                 "review roster must include at least one distinct non-author reviewer".to_string(),
             );
@@ -1301,8 +1487,7 @@ fn evaluate_request_inner(
     if request.override_authorities.len() > 1 {
         invalid.push("review may freeze at most one break-glass authority".to_string());
     }
-    let unknown: Vec<Id> = request
-        .required
+    let unknown: Vec<Id> = effective_required
         .iter()
         .copied()
         .filter(|id| !known_people.contains(id))
@@ -1344,7 +1529,7 @@ fn evaluate_request_inner(
     }
 
     let mut slots = Vec::new();
-    for reviewer in &request.required {
+    for reviewer in &effective_required {
         let heads = active_attestation_ids_for_reviewer(space, request.id, *reviewer)
             .into_iter()
             .filter_map(|id| review_attestation(space, id))
@@ -1406,10 +1591,10 @@ fn evaluate_request_inner(
                 submitted,
                 reasons: blocked,
             }
-        } else if submitted < request.required.len() {
+        } else if submitted < effective_required.len() {
             ReviewGateState::Pending {
                 submitted,
-                required: request.required.len(),
+                required: effective_required.len(),
             }
         } else {
             ReviewGateState::Ready
@@ -1420,6 +1605,8 @@ fn evaluate_request_inner(
         request,
         slots,
         state,
+        resolved_snapshot,
+        effective_required,
     })
 }
 
@@ -1459,7 +1646,10 @@ pub fn outstanding_review_requests(
         if matches!(
             evaluation.state,
             ReviewGateState::Invalid { .. } | ReviewGateState::Settled { .. }
-        ) || !evaluation.request.required.contains(&reviewer_id)
+        ) || !evaluation
+            .slots
+            .iter()
+            .any(|slot| slot.reviewer == reviewer_id)
         {
             continue;
         }
@@ -1509,6 +1699,7 @@ mod tests {
             required,
             authorities,
             supersedes,
+            None,
             now(),
         );
         let id = fragment.root().expect("intrinsic review request");
@@ -1533,6 +1724,7 @@ mod tests {
             required,
             authorities,
             predecessor,
+            None,
             now(),
         );
         let id = fragment.root().expect("intrinsic roster successor");
@@ -1581,8 +1773,9 @@ mod tests {
                 add_attestation(space, request, *reviewer, verdict, &[])
             })
             .collect::<Vec<_>>();
-        let fragment =
-            review_attestation_settlement_fragment(request, goal, author, &evidence, now());
+        let fragment = review_attestation_settlement_fragment(
+            request, goal, author, &evidence, None, &[], now(),
+        );
         let id = fragment.root().expect("intrinsic review settlement");
         *space += fragment;
         id
@@ -1614,45 +1807,242 @@ mod tests {
 
     #[test]
     fn live_group_roster_resolves_current_members_not_the_frozen_snapshot() {
-        use crate::schemas::relations::{group as rel_group, KIND_GROUP as REL_KIND_GROUP};
+        use crate::schemas::relations::{group_snapshot_fragment, KIND_GROUP as REL_KIND_GROUP};
         let (mut space, goal, reviewers, authority, known) = fixture();
-        let request = add_request(
-            &mut space,
+        let group = ufoid().id;
+        // Seal the live-roster group anchor INTO the request's intrinsic id.
+        let target_handle: TextHandle = "urn:revision:live-roster".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
             goal,
             reviewers[0],
-            &reviewers,
+            target_handle,
+            &sorted_unique(reviewers.to_vec()),
             &[authority],
             &[],
-            "urn:revision:live-roster",
+            Some(group),
+            now(),
         );
-        // Record a live-roster group anchor on the request (extra fact, so it
-        // does not disturb the sealed identity).
-        let group = ufoid().id;
-        space += entity! { ExclusiveId::force_ref(&request) @ review::group: &group };
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
 
-        // Frozen path: the sealed roster is all three reviewers.
+        // Frozen path (no relations space): the effective roster falls back to
+        // the sealed frozen roster = all three reviewers.
         let frozen = evaluate_request(&space, request, &known).unwrap();
-        assert_eq!(frozen.request.required, sorted_unique(reviewers.to_vec()));
+        assert_eq!(frozen.effective_required, sorted_unique(reviewers.to_vec()));
+        assert_eq!(frozen.resolved_snapshot, None);
 
         // Relations snapshot: the group's head lists only the first two
         // reviewers (the third was removed from the group).
-        let snapshot = ufoid().id;
+        let name: TextHandle = "live-roster".to_blob().get_handle();
+        let snapshot_fragment =
+            group_snapshot_fragment(group, name, &[reviewers[0], reviewers[1]], &[]);
+        let snapshot = snapshot_fragment.root().expect("intrinsic snapshot");
         let mut relations_space = TribleSet::new();
         relations_space +=
             entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
-        relations_space += entity! { ExclusiveId::force_ref(&snapshot) @
-            rel_group::snapshot_of: &group,
-            rel_group::member: reviewers[0],
-            rel_group::member: reviewers[1],
-        };
+        relations_space += snapshot_fragment;
 
         // Live path: the effective roster is the group's CURRENT head = {r0, r1}.
         let live = evaluate_request_live(&space, request, &known, &relations_space).unwrap();
         assert_eq!(
-            live.request.required,
+            live.effective_required,
             sorted_unique(vec![reviewers[0], reviewers[1]])
         );
-        assert!(!live.request.required.contains(&reviewers[2]));
+        assert!(!live.effective_required.contains(&reviewers[2]));
+        assert_eq!(live.resolved_snapshot, Some(snapshot));
+        // The frozen sealed roster is never mutated.
+        assert_eq!(live.request.required, sorted_unique(reviewers.to_vec()));
+    }
+
+    #[test]
+    fn roster_transition_classifies_added_removed_and_retained() {
+        let a = ufoid().id;
+        let b = ufoid().id;
+        let c = ufoid().id;
+        // frozen = {a, b}; effective = {a, c}. a retained, c added, b removed.
+        let t = roster_transition(&[a, b], &sorted_unique(vec![a, c]));
+        assert_eq!(t.retained, vec![a]);
+        assert_eq!(t.added, vec![c]);
+        assert_eq!(t.removed, vec![b]);
+    }
+
+    #[test]
+    fn group_removal_waives_a_pending_blocker_per_explicit_policy() {
+        use crate::schemas::relations::{group_snapshot_fragment, KIND_GROUP as REL_KIND_GROUP};
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let group = ufoid().id;
+        let target: TextHandle = "urn:revision:waiver".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(group),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+
+        // Group head initially lists all three reviewers.
+        let name: TextHandle = "waiver-roster".to_blob().get_handle();
+        let s0 = group_snapshot_fragment(group, name, &reviewers, &[]);
+        let s0_id = s0.root().expect("intrinsic snapshot");
+        let mut relations = TribleSet::new();
+        relations += entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
+        relations += s0;
+
+        // author abstains, r1 approves, r2 requests changes => BLOCKED.
+        add_attestation(&mut space, request, author, VERDICT_ABSTAIN, &[]);
+        add_attestation(&mut space, request, reviewers[1], VERDICT_APPROVE, &[]);
+        add_attestation(&mut space, request, reviewers[2], VERDICT_REQUEST_CHANGES, &[]);
+        assert!(matches!(
+            evaluate_request_live(&space, request, &known, &relations)
+                .unwrap()
+                .state,
+            ReviewGateState::Blocked { .. }
+        ));
+
+        // Remove the blocker r2 from the group (new head supersedes s0). The
+        // block is WAIVED: the current roster {author, r1} is abstain+approve.
+        let name2: TextHandle = "waiver-roster".to_blob().get_handle();
+        relations += group_snapshot_fragment(group, name2, &[author, reviewers[1]], &[s0_id]);
+        let eval = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert_eq!(
+            eval.effective_required,
+            sorted_unique(vec![author, reviewers[1]])
+        );
+        assert!(matches!(eval.state, ReviewGateState::Ready), "got {:?}", eval.state);
+        // The waiver is the removed reviewer, stated explicitly.
+        let transition = roster_transition(&eval.request.required, &eval.effective_required);
+        assert_eq!(transition.removed, vec![reviewers[2]]);
+    }
+
+    #[test]
+    fn group_addition_after_open_newly_requires_the_member() {
+        use crate::schemas::relations::{group_snapshot_fragment, KIND_GROUP as REL_KIND_GROUP};
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let author = reviewers[0];
+        let group = ufoid().id;
+        let newcomer = ufoid().id;
+        let mut known = known;
+        known.insert(newcomer);
+        let target: TextHandle = "urn:revision:addition".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(group),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+
+        let name: TextHandle = "addition-roster".to_blob().get_handle();
+        let s0 = group_snapshot_fragment(group, name, &reviewers, &[]);
+        let s0_id = s0.root().expect("intrinsic snapshot");
+        let mut relations = TribleSet::new();
+        relations += entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
+        relations += s0;
+
+        // Both original members attest => Ready under the opening roster.
+        add_attestation(&mut space, request, author, VERDICT_ABSTAIN, &[]);
+        add_attestation(&mut space, request, reviewers[1], VERDICT_APPROVE, &[]);
+        assert!(matches!(
+            evaluate_request_live(&space, request, &known, &relations)
+                .unwrap()
+                .state,
+            ReviewGateState::Ready
+        ));
+
+        // Add a newcomer to the group: the gate re-opens to Pending until they attest.
+        let name2: TextHandle = "addition-roster".to_blob().get_handle();
+        let grown = [author, reviewers[1], newcomer];
+        relations += group_snapshot_fragment(group, name2, &grown, &[s0_id]);
+        let eval = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert_eq!(eval.effective_required, sorted_unique(grown.to_vec()));
+        assert!(
+            matches!(eval.state, ReviewGateState::Pending { submitted: 2, required: 3 }),
+            "got {:?}",
+            eval.state
+        );
+        let transition = roster_transition(&eval.request.required, &eval.effective_required);
+        assert_eq!(transition.added, vec![newcomer]);
+    }
+
+    #[test]
+    fn a_settled_group_review_stays_settled_after_the_group_changes() {
+        use crate::schemas::relations::{group_snapshot_fragment, KIND_GROUP as REL_KIND_GROUP};
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let author = reviewers[0];
+        let group = ufoid().id;
+        let target: TextHandle = "urn:revision:settled-stays".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(group),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+
+        let name: TextHandle = "settled-roster".to_blob().get_handle();
+        let s0 = group_snapshot_fragment(group, name, &reviewers, &[]);
+        let s0_id = s0.root().expect("intrinsic snapshot");
+        let mut relations = TribleSet::new();
+        relations += entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
+        relations += s0;
+
+        let author_ev = add_attestation(&mut space, request, author, VERDICT_ABSTAIN, &[]);
+        let peer_ev = add_attestation(&mut space, request, reviewers[1], VERDICT_APPROVE, &[]);
+        let ready = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert!(matches!(ready.state, ReviewGateState::Ready));
+
+        // Settle sealing the exact head snapshot + effective roster.
+        space += review_attestation_settlement_fragment(
+            request,
+            goal,
+            author,
+            &[author_ev, peer_ev],
+            ready.resolved_snapshot,
+            &ready.effective_required,
+            now(),
+        );
+        assert!(matches!(
+            evaluate_request_live(&space, request, &known, &relations)
+                .unwrap()
+                .state,
+            ReviewGateState::Settled { .. }
+        ));
+
+        // The group GROWS afterward (a newcomer is added). The certificate is
+        // immutable: it validates against its OWN sealed roster, never the new
+        // one, so the review stays Settled — never reverted to Pending.
+        let newcomer = ufoid().id;
+        let mut known = known;
+        known.insert(newcomer);
+        let name2: TextHandle = "settled-roster".to_blob().get_handle();
+        relations += group_snapshot_fragment(
+            group,
+            name2,
+            &[author, reviewers[1], newcomer],
+            &[s0_id],
+        );
+        let after = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert!(
+            matches!(after.state, ReviewGateState::Settled { .. }),
+            "certificate revalidated against a future roster: {:?}",
+            after.state
+        );
     }
 
     #[test]
@@ -1713,6 +2103,8 @@ mod tests {
             goal,
             reviewers[0],
             &[author_evidence, peer_evidence],
+            None,
+            &[],
             now(),
         );
         let settlement_id = settlement.root().expect("intrinsic pair settlement");
@@ -2108,6 +2500,8 @@ mod tests {
             goal,
             reviewers[0],
             &evidence,
+            None,
+            &[],
             now(),
         );
         assert!(matches!(
@@ -2173,6 +2567,8 @@ mod tests {
             goal,
             authority,
             override_id,
+            None,
+            &[],
             now(),
         );
         match evaluate_request(&space, successor, &known).unwrap().state {
@@ -2351,6 +2747,8 @@ mod tests {
             goal,
             authority,
             override_id,
+            None,
+            &[],
             now(),
         );
         match evaluate_request(&space, successor, &known).unwrap().state {
@@ -2725,6 +3123,8 @@ mod tests {
             goal,
             reviewers[0],
             &evidence,
+            None,
+            &[],
             now(),
         );
         let settlement = fragment.root().expect("intrinsic review settlement");
@@ -2773,6 +3173,8 @@ mod tests {
             goal,
             reviewers[0],
             &evidence,
+            None,
+            &[],
             now(),
         );
         let settlement = fragment.root().expect("intrinsic review settlement");
@@ -2996,6 +3398,8 @@ mod tests {
             goal,
             reviewers[0],
             &approvals,
+            None,
+            &[],
             now(),
         );
 
@@ -3028,6 +3432,8 @@ mod tests {
             goal,
             reviewers[0],
             &evidence,
+            None,
+            &[],
             now(),
         );
         let settlement = fragment.root().expect("intrinsic review settlement");
@@ -3064,6 +3470,8 @@ mod tests {
             goal,
             authority,
             override_id,
+            None,
+            &[],
             now(),
         );
         let settlement = settlement_fragment
@@ -3103,6 +3511,8 @@ mod tests {
             goal,
             authority,
             override_id,
+            None,
+            &[],
             now(),
         );
         space += entity! { ExclusiveId::force_ref(&override_id) @
@@ -3260,8 +3670,9 @@ mod tests {
             add_attestation(&mut space, request, reviewers[1], VERDICT_APPROVE, &[]),
             add_attestation(&mut space, request, outsider, VERDICT_APPROVE, &[]),
         ];
-        let fragment =
-            review_attestation_settlement_fragment(request, goal, reviewers[0], &evidence, now());
+        let fragment = review_attestation_settlement_fragment(
+            request, goal, reviewers[0], &evidence, None, &[], now(),
+        );
         space += fragment;
         assert!(matches!(
             evaluate_request(&space, request, &active).unwrap().state,
