@@ -905,6 +905,10 @@ struct LoadedWatchedView {
     /// `view`. Delivery writes compare these during CAS retries so they cannot
     /// overwrite a concurrently-issued explicit ack or snooze.
     review_watermark_ids: BTreeMap<Id, Id>,
+    /// Earliest live snooze deadline among review assignments suppressed from
+    /// `view`. Unlike branch movement, the passage of this deadline is itself a
+    /// wake edge, so `wait` uses it as an additional scheduler input.
+    next_review_deadline: Option<i128>,
 }
 
 fn load_watched_snapshot(
@@ -915,6 +919,41 @@ fn load_watched_snapshot(
     relations_branch_id: Id,
     orient_state_branch_id: Id,
 ) -> Result<LoadedWatchedView> {
+    load_watched_snapshot_inner(
+        repo,
+        persona_id,
+        local_branch_id,
+        compass_branch_id,
+        relations_branch_id,
+        orient_state_branch_id,
+        |_| Ok(()),
+    )
+}
+
+/// Load one persona view with a causal watermark -> Compass acquisition order.
+///
+/// An explicit ack/snooze snapshots Compass before it appends orient-state. By
+/// reading orient-state first here, an explicit event is therefore either:
+///
+/// - already observed, in which case the later Compass pull sees the same or a
+///   newer review state; or
+/// - appended after our watermark snapshot, in which case the delivery CAS
+///   observes a different event id and preserves that explicit intent.
+///
+/// `after_watermark_snapshot` is a no-op in production and a deterministic race
+/// seam in tests.
+fn load_watched_snapshot_inner<F>(
+    repo: &mut Repository<Pile>,
+    persona_id: Id,
+    local_branch_id: Id,
+    compass_branch_id: Id,
+    relations_branch_id: Id,
+    orient_state_branch_id: Id,
+    after_watermark_snapshot: F,
+) -> Result<LoadedWatchedView>
+where
+    F: FnOnce(&mut Repository<Pile>) -> Result<()>,
+{
     let mut local_ws = repo
         .pull(local_branch_id)
         .map_err(|e| anyhow!("pull local workspace: {e:?}"))?;
@@ -968,6 +1007,15 @@ fn load_watched_snapshot(
     ))
     .collect();
 
+    // Watermarks MUST precede the Compass pull below. See the acquisition-order
+    // proof on `load_watched_snapshot_inner` and the save-time event-id CAS.
+    let watermarks = load_review_watermarks(repo, orient_state_branch_id, persona_id)?;
+    let review_watermark_ids = watermarks
+        .iter()
+        .map(|(request, watermark)| (*request, watermark.id))
+        .collect();
+    after_watermark_snapshot(repo)?;
+
     let mut compass_ws = repo
         .pull(compass_branch_id)
         .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
@@ -986,20 +1034,11 @@ fn load_watched_snapshot(
     // same state. A later head change, fresh successor request id, or expired
     // snooze breaks the match and re-adds the assignment → wake. Author actions
     // are never suppressed — a review the persona OWNS still needs their eyes.
-    let watermarks = load_review_watermarks(repo, orient_state_branch_id, persona_id)?;
-    let review_watermark_ids = watermarks
-        .iter()
-        .map(|(request, watermark)| (*request, watermark.id))
-        .collect();
-    if !watermarks.is_empty() {
-        let now = interval_key(epoch_interval(now_epoch()));
-        for review in review_actions.values_mut() {
-            review.assignments.retain(|request, heads| match watermarks.get(request) {
-                Some(wm) => !watermark_quiet(&wm.heads, wm.deadline, heads, now),
-                None => true,
-            });
-        }
-    }
+    let next_review_deadline = apply_review_watermarks(
+        &mut review_actions,
+        &watermarks,
+        interval_key(epoch_interval(now_epoch())),
+    );
 
     // One line per goal:
     // "id:status:author:flags:review-assignments:author-action:assignment-state".
@@ -1088,6 +1127,7 @@ fn load_watched_snapshot(
             roster,
         },
         review_watermark_ids,
+        next_review_deadline,
     })
 }
 
@@ -1567,6 +1607,34 @@ fn watermark_quiet(
         }
 }
 
+/// Apply delivery/ack/snooze watermarks to the derived review assignments and
+/// return the earliest deadline whose passage can change the filtered view.
+/// Only a live snooze with an exactly matching active head-set is relevant:
+/// stale-head watermarks are already visible edges, plain acks have no clock
+/// edge, and fulfilled/stale requests are absent from `actions` altogether.
+fn apply_review_watermarks(
+    actions: &mut BTreeMap<Id, PersonaGoalReview>,
+    watermarks: &BTreeMap<Id, ReviewWatermark>,
+    now: i128,
+) -> Option<i128> {
+    let mut next_deadline: Option<i128> = None;
+    for review in actions.values_mut() {
+        review.assignments.retain(|request, heads| {
+            let Some(watermark) = watermarks.get(request) else {
+                return true;
+            };
+            if !watermark_quiet(&watermark.heads, watermark.deadline, heads, now) {
+                return true;
+            }
+            if let Some(deadline) = watermark.deadline {
+                next_deadline = Some(next_deadline.map_or(deadline, |next| next.min(deadline)));
+            }
+            false
+        });
+    }
+    next_deadline
+}
+
 /// Load this persona's review watermarks (delivery/ack/snooze) from the
 /// orient-state branch, reduced latest-wins per request. Returns
 /// `request -> { event id, acked head-set, optional snooze deadline key }`.
@@ -1700,12 +1768,39 @@ fn save_checkpoint(
     review_deliveries: &BTreeMap<Id, BTreeSet<Id>>,
     observed_review_watermarks: &BTreeMap<Id, Id>,
 ) -> Result<()> {
+    save_checkpoint_inner(
+        repo,
+        orient_state_branch_id,
+        heads,
+        persona_view,
+        review_deliveries,
+        observed_review_watermarks,
+        |_, _| Ok(()),
+    )
+}
+
+/// Checkpoint implementation with a deterministic pre-push seam used to prove
+/// that a real orient-state CAS conflict cannot overwrite explicit reader
+/// intent. Production supplies a no-op.
+fn save_checkpoint_inner<F>(
+    repo: &mut Repository<Pile>,
+    orient_state_branch_id: Id,
+    heads: &WatchedHeads,
+    persona_view: Option<(Id, &WatchedView)>,
+    review_deliveries: &BTreeMap<Id, BTreeSet<Id>>,
+    observed_review_watermarks: &BTreeMap<Id, Id>,
+    mut before_push: F,
+) -> Result<()>
+where
+    F: FnMut(&mut Repository<Pile>, usize) -> Result<()>,
+{
     if !review_deliveries.is_empty() && persona_view.is_none() {
         bail!("review deliveries require a persona-scoped checkpoint");
     }
     let mut ws = repo
         .pull(orient_state_branch_id)
         .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
+    let mut attempt = 0usize;
 
     loop {
         // Only auto-watermark against the orient-state snapshot used to build
@@ -1771,6 +1866,8 @@ fn save_checkpoint(
             "orient checkpoint and review delivery"
         };
         ws.commit(change, message);
+        before_push(repo, attempt)?;
+        attempt += 1;
         match repo
             .try_push(&mut ws)
             .map_err(|e| anyhow!("push orient checkpoint: {e:?}"))?
@@ -1788,6 +1885,65 @@ fn branch_head_by_id(
     repo.storage_mut()
         .head(branch_id)
         .map_err(|e| anyhow!("branch head {:x}: {e:?}", branch_id))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitBoundary {
+    Poll,
+    Timeout,
+    ReviewDeadline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WaitStep {
+    delay: Duration,
+    boundary: WaitBoundary,
+}
+
+/// Duration until `now > deadline`, matching `watermark_quiet`'s inclusive
+/// deadline. At exact equality this is one nanosecond, never a zero-delay busy
+/// loop; an already-expired deadline is immediately due.
+fn duration_until_after(now: i128, deadline: i128) -> Duration {
+    let nanos = deadline.saturating_sub(now).saturating_add(1);
+    if nanos <= 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
+}
+
+/// Pick the next scheduler boundary. Timeout wins an exact tie because a
+/// snooze remains quiet through its deadline; a strictly earlier review
+/// deadline beats both a coarse poll and a later timeout even if sleep
+/// overshoots both boundaries.
+fn plan_wait_step(
+    poll: Duration,
+    timeout_remaining: Option<Duration>,
+    now: i128,
+    review_deadline: Option<i128>,
+) -> WaitStep {
+    let mut step = WaitStep {
+        delay: poll,
+        boundary: WaitBoundary::Poll,
+    };
+    if let Some(remaining) = timeout_remaining {
+        if remaining <= step.delay {
+            step = WaitStep {
+                delay: remaining,
+                boundary: WaitBoundary::Timeout,
+            };
+        }
+    }
+    if let Some(deadline) = review_deadline {
+        let remaining = duration_until_after(now, deadline);
+        if remaining < step.delay {
+            step = WaitStep {
+                delay: remaining,
+                boundary: WaitBoundary::ReviewDeadline,
+            };
+        }
+    }
+    step
 }
 
 fn parse_wait_target(target: Option<&WaitTarget>) -> Result<Option<Duration>> {
@@ -1947,16 +2103,22 @@ fn print_news_detail(
 }
 
 /// Outcome of one shot of the wait fire-path (`check_news_once`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchBaseline {
+    view: WatchedView,
+    next_review_deadline: Option<i128>,
+}
+
 enum NewsCheck {
     /// News was printed tersely and the checkpoint advanced.
     Fired,
     /// A checkpoint exists and nothing is new. Carries the freshly
     /// loaded view so `wait` can use it as its loop baseline.
-    Quiet(WatchedView),
+    Quiet(WatchBaseline),
     /// No checkpoint for this persona yet — the caller decides how to
     /// establish the baseline (`wait` loops on the view; `poll` saves
     /// it silently).
-    NoCheckpoint(WatchedView),
+    NoCheckpoint(WatchBaseline),
 }
 
 /// One shot of the wait fire-path for a persona: load the current
@@ -1975,7 +2137,11 @@ fn check_news_once(
     orient_state_branch_id: Id,
     peek: bool,
 ) -> Result<NewsCheck> {
-    let loaded = load_watched_snapshot(
+    let LoadedWatchedView {
+        view,
+        review_watermark_ids,
+        next_review_deadline,
+    } = load_watched_snapshot(
         repo,
         persona_id,
         local_branch_id,
@@ -1983,9 +2149,11 @@ fn check_news_once(
         relations_branch_id,
         orient_state_branch_id,
     )?;
-    let view = loaded.view;
     let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, persona_id)? else {
-        return Ok(NewsCheck::NoCheckpoint(view));
+        return Ok(NewsCheck::NoCheckpoint(WatchBaseline {
+            view,
+            next_review_deadline,
+        }));
     };
     let report = view_news_report(&seen, &view, persona_id);
     if report.is_empty() {
@@ -2000,7 +2168,10 @@ fn check_news_once(
                 Some((persona_id, &view)),
             )?;
         }
-        return Ok(NewsCheck::Quiet(view));
+        return Ok(NewsCheck::Quiet(WatchBaseline {
+            view,
+            next_review_deadline,
+        }));
     }
     for reason in report.reasons() {
         println!("News: {reason}");
@@ -2020,7 +2191,7 @@ fn check_news_once(
             persona_id,
             &view,
             &deliveries,
-            &loaded.review_watermark_ids,
+            &review_watermark_ids,
         )?;
     }
     Ok(NewsCheck::Fired)
@@ -2085,16 +2256,16 @@ fn cmd_poll(pile: &Path, persona: Option<&str>, peek: bool) -> Result<()> {
             // polls diff against this checkpoint. Peek writes NOTHING —
             // not even a baseline (a worker turn must not initialize the
             // root persona's checkpoint).
-            NewsCheck::NoCheckpoint(view) => {
+            NewsCheck::NoCheckpoint(baseline) => {
                 if !peek {
                     save_checkpoint_heads(
                         repo,
                         orient_state_branch_id,
                         &heads,
-                        Some((persona_id, &view)),
+                        Some((persona_id, &baseline.view)),
                     )?;
                 }
-                let _ = view;
+                let _ = baseline;
             }
         }
         Ok(())
@@ -2160,7 +2331,9 @@ fn cmd_wait(
                 false,
             )? {
                 NewsCheck::Fired => return Ok((true, true, true)),
-                NewsCheck::Quiet(view) | NewsCheck::NoCheckpoint(view) => Some(view),
+                NewsCheck::Quiet(baseline) | NewsCheck::NoCheckpoint(baseline) => {
+                    Some(baseline)
+                }
             },
             None => {
                 if let Some(last_seen) = load_checkpoint_heads(repo, orient_state_branch_id)? {
@@ -2176,24 +2349,44 @@ fn cmd_wait(
         let start = Instant::now();
 
         loop {
-            if let Some(timeout) = timeout {
-                if start.elapsed() >= timeout {
+            let timeout_remaining = timeout.map(|limit| limit.saturating_sub(start.elapsed()));
+            let now = interval_key(epoch_interval(now_epoch()));
+            let review_deadline = baseline_view
+                .as_ref()
+                .and_then(|baseline| baseline.next_review_deadline);
+            let step = plan_wait_step(poll, timeout_remaining, now, review_deadline);
+            if !step.delay.is_zero() {
+                std::thread::sleep(step.delay);
+            }
+            if step.boundary == WaitBoundary::Timeout {
+                // A sleep may return early on some platforms. Re-plan rather
+                // than reporting a timeout before the monotonic limit.
+                if timeout.is_some_and(|limit| start.elapsed() >= limit) {
                     return Ok((false, false, false));
                 }
+                continue;
             }
-            std::thread::sleep(poll);
             let current_heads = load_watched_heads(
                 repo,
                 local_branch_id,
                 compass_branch_id,
                 relations_branch_id,
             )?;
-            if current_heads == baseline_heads {
+            let now = interval_key(epoch_interval(now_epoch()));
+            let review_deadline_due = baseline_view
+                .as_ref()
+                .and_then(|baseline| baseline.next_review_deadline)
+                .is_some_and(|deadline| now > deadline);
+            if current_heads == baseline_heads && !review_deadline_due {
                 continue;
             }
             match (persona_id, baseline_view.as_mut()) {
-                (Some(pid), Some(view)) => {
-                    let loaded = load_watched_snapshot(
+                (Some(pid), Some(baseline)) => {
+                    let LoadedWatchedView {
+                        view: current_view,
+                        review_watermark_ids,
+                        next_review_deadline,
+                    } = load_watched_snapshot(
                         repo,
                         pid,
                         local_branch_id,
@@ -2201,13 +2394,18 @@ fn cmd_wait(
                         relations_branch_id,
                         orient_state_branch_id,
                     )?;
-                    let current_view = loaded.view;
-                    let report = view_news_report(view, &current_view, pid);
+                    let report = view_news_report(&baseline.view, &current_view, pid);
                     if !report.is_empty() {
                         for reason in report.reasons() {
                             println!("News: {reason}");
                         }
-                        print_news_detail(repo, &*view, &current_view, local_branch_id, relations_branch_id)?;
+                        print_news_detail(
+                            repo,
+                            &baseline.view,
+                            &current_view,
+                            local_branch_id,
+                            relations_branch_id,
+                        )?;
                         // Advance the checkpoint and mark every review included
                         // in the digest delivered at its exact active head-set.
                         let deliveries = report.review_deliveries();
@@ -2218,7 +2416,7 @@ fn cmd_wait(
                             pid,
                             &current_view,
                             &deliveries,
-                            &loaded.review_watermark_ids,
+                            &review_watermark_ids,
                         )?;
                         return Ok((false, true, true));
                     }
@@ -2226,7 +2424,7 @@ fn cmd_wait(
                     // persona's traffic, fulfilled review work) — absorb it
                     // and keep waiting. Persist changed quiet views so a
                     // removal followed by a restart and re-add still wakes.
-                    if *view != current_view {
+                    if baseline.view != current_view {
                         save_checkpoint_heads(
                             repo,
                             orient_state_branch_id,
@@ -2235,7 +2433,8 @@ fn cmd_wait(
                         )?;
                     }
                     baseline_heads = current_heads;
-                    *view = current_view;
+                    baseline.view = current_view;
+                    baseline.next_review_deadline = next_review_deadline;
                 }
                 _ => return Ok((false, true, false)),
             }
@@ -2364,6 +2563,126 @@ mod tests {
             goals_view: goals_view.into(),
             roster: BTreeSet::new(),
         }
+    }
+
+    struct ReviewFixture {
+        path: PathBuf,
+        repo: Repository<Pile>,
+        local_branch: Id,
+        compass_branch: Id,
+        relations_branch: Id,
+        orient_branch: Id,
+        persona: Id,
+        request: Id,
+        initial_head: Option<Id>,
+    }
+
+    fn review_fixture(with_malformed_head: bool) -> ReviewFixture {
+        use faculties::schemas::compass::{
+            review_attestation_fragment, review_request_fragment,
+        };
+        use faculties::schemas::relations::KIND_PERSON_ID;
+
+        let path = std::env::temp_dir().join(format!("orient-review-{:x}.pile", ufoid().id));
+        std::fs::File::create(&path).expect("create temp pile");
+        let mut repo = open_repo(&path).expect("open repo");
+        let local_branch = repo.ensure_branch("message", None).expect("message branch");
+        let compass_branch = repo.ensure_branch("compass", None).expect("compass branch");
+        let relations_branch = repo
+            .ensure_branch("relations", None)
+            .expect("relations branch");
+        let orient_branch = repo
+            .ensure_branch("orient-state", None)
+            .expect("orient branch");
+        let persona = ufoid().id;
+        let author = ufoid().id;
+        let third = ufoid().id;
+        let goal = ufoid().id;
+
+        let mut relations_ws = repo.pull(relations_branch).expect("pull relations");
+        let mut people = TribleSet::new();
+        for person in [persona, author, third] {
+            people += entity! { ExclusiveId::force_ref(&person) @
+                metadata::tag: &KIND_PERSON_ID,
+                rel_attrs::affinity: "zooid",
+            };
+        }
+        relations_ws.commit(people, "test review people");
+        repo.push(&mut relations_ws).expect("push relations");
+
+        let mut compass_ws = repo.pull(compass_branch).expect("pull compass");
+        let target = compass_ws.put("urn:test:orient-review".to_string());
+        let created_at = epoch_interval(now_epoch());
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &[author, persona, third],
+            &[],
+            &[],
+            created_at,
+        );
+        let request = request_fragment.root().expect("request root");
+        let mut board = TribleSet::new();
+        board += entity! { ExclusiveId::force_ref(&goal) @ metadata::tag: &KIND_GOAL_ID };
+        board += request_fragment;
+        let initial_head = with_malformed_head.then(|| {
+            let report = compass_ws.put("malformed h1".to_string());
+            let attestation = review_attestation_fragment(
+                request,
+                persona,
+                "malformed-h1",
+                report,
+                &[],
+                created_at,
+            );
+            let id = attestation.root().expect("attestation root");
+            board += attestation;
+            id
+        });
+        compass_ws.commit(board, "test pending review");
+        repo.push(&mut compass_ws).expect("push compass");
+
+        ReviewFixture {
+            path,
+            repo,
+            local_branch,
+            compass_branch,
+            relations_branch,
+            orient_branch,
+            persona,
+            request,
+            initial_head,
+        }
+    }
+
+    fn remove_fixture(fixture: ReviewFixture) {
+        fixture.repo.close().ok();
+        let _ = std::fs::remove_file(fixture.path);
+    }
+
+    fn write_fixture_snooze(
+        fixture: &mut ReviewFixture,
+        deadline: Epoch,
+        review_heads: &[Id],
+    ) -> Id {
+        let watermark = ufoid();
+        let mut orient = fixture
+            .repo
+            .pull(fixture.orient_branch)
+            .expect("pull fixture orient");
+        let mut change = TribleSet::new();
+        change += entity! { &watermark @
+            metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+            orient_state::persona: &fixture.persona,
+            orient_state::wm_request: &fixture.request,
+            orient_state::wm_head*: review_heads.iter(),
+            orient_state::wm_deadline: epoch_interval(deadline),
+            orient_state::at: epoch_interval(now_epoch()),
+        };
+        orient.commit(change, "test fixture snooze");
+        fixture.repo.push(&mut orient).expect("push fixture snooze");
+        watermark.id
     }
 
     #[test]
@@ -2770,6 +3089,237 @@ mod tests {
     }
 
     #[test]
+    fn matching_live_snoozes_publish_only_the_earliest_relevant_deadline() {
+        let goal = ufoid().id;
+        let request_early = ufoid().id;
+        let request_late = ufoid().id;
+        let request_changed = ufoid().id;
+        let head = ufoid().id;
+        let changed_head = ufoid().id;
+        let mut actions = BTreeMap::from([(
+            goal,
+            PersonaGoalReview {
+                assignments: BTreeMap::from([
+                    (request_early, BTreeSet::from([head])),
+                    (request_late, BTreeSet::from([head])),
+                    (request_changed, BTreeSet::from([changed_head])),
+                ]),
+                author: None,
+            },
+        )]);
+        let watermarks = BTreeMap::from([
+            (
+                request_early,
+                ReviewWatermark {
+                    id: ufoid().id,
+                    heads: BTreeSet::from([head]),
+                    deadline: Some(100),
+                },
+            ),
+            (
+                request_late,
+                ReviewWatermark {
+                    id: ufoid().id,
+                    heads: BTreeSet::from([head]),
+                    deadline: Some(200),
+                },
+            ),
+            (
+                request_changed,
+                ReviewWatermark {
+                    id: ufoid().id,
+                    heads: BTreeSet::from([head]),
+                    deadline: Some(50),
+                },
+            ),
+        ]);
+
+        assert_eq!(apply_review_watermarks(&mut actions, &watermarks, 0), Some(100));
+        assert_eq!(
+            actions[&goal].assignments,
+            BTreeMap::from([(request_changed, BTreeSet::from([changed_head]))]),
+            "a stale-head watermark is a visible edge, not a scheduler deadline"
+        );
+    }
+
+    #[test]
+    fn wait_planner_respects_inclusive_deadlines_and_timeout_order() {
+        let poll = Duration::from_secs(10);
+
+        let at_equality = plan_wait_step(poll, None, 100, Some(100));
+        assert_eq!(at_equality.boundary, WaitBoundary::ReviewDeadline);
+        assert_eq!(at_equality.delay, Duration::from_nanos(1));
+        assert!(!at_equality.delay.is_zero(), "deadline equality must not spin");
+
+        assert_eq!(
+            plan_wait_step(poll, None, 101, Some(100)),
+            WaitStep {
+                delay: Duration::ZERO,
+                boundary: WaitBoundary::ReviewDeadline,
+            }
+        );
+        assert_eq!(
+            plan_wait_step(poll, Some(Duration::from_secs(5)), 0, Some(999)),
+            WaitStep {
+                delay: Duration::from_nanos(1_000),
+                boundary: WaitBoundary::ReviewDeadline,
+            },
+            "a deadline before both coarse poll and timeout wins"
+        );
+        assert_eq!(
+            plan_wait_step(
+                poll,
+                Some(Duration::from_nanos(500)),
+                0,
+                Some(999),
+            ),
+            WaitStep {
+                delay: Duration::from_nanos(500),
+                boundary: WaitBoundary::Timeout,
+            },
+            "an earlier timeout wins"
+        );
+        assert_eq!(
+            plan_wait_step(
+                poll,
+                Some(Duration::from_nanos(1_000)),
+                0,
+                Some(999),
+            )
+            .boundary,
+            WaitBoundary::Timeout,
+            "timeout wins the exact tie because the snooze is quiet through equality"
+        );
+    }
+
+    #[test]
+    fn snooze_deadline_wakes_without_branch_movement_then_rearms_quietly() {
+        let mut fixture = review_fixture(false);
+        let deadline = now_epoch() + hifitime::Duration::from_total_nanoseconds(400_000_000);
+        let explicit = write_fixture_snooze(&mut fixture, deadline, &[]);
+        let baseline = load_watched_snapshot(
+            &mut fixture.repo,
+            fixture.persona,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+            fixture.orient_branch,
+        )
+        .expect("load snoozed baseline");
+        assert!(!baseline
+            .view
+            .goals_view
+            .contains(&format!("{:x}@", fixture.request)));
+        assert_eq!(
+            baseline.next_review_deadline,
+            Some(interval_key(epoch_interval(deadline)))
+        );
+        let heads = load_watched_heads(
+            &mut fixture.repo,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+        )
+        .expect("baseline heads");
+        save_checkpoint_heads(
+            &mut fixture.repo,
+            fixture.orient_branch,
+            &heads,
+            Some((fixture.persona, &baseline.view)),
+        )
+        .expect("save snoozed baseline");
+        fixture.repo.close().expect("close fixture before wait");
+
+        let persona = fmt_id(fixture.persona);
+        let started = Instant::now();
+        cmd_wait(
+            &fixture.path,
+            Some(&persona),
+            Some(WaitTarget::For {
+                duration: "3s".to_string(),
+            }),
+            1,
+            1,
+            1,
+            2_000,
+        )
+        .expect("deadline wakes wait");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "wait must not surface a still-live 400ms snooze immediately: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_800),
+            "the 400ms deadline must beat both a 2s poll and a 3s timeout: {elapsed:?}"
+        );
+
+        fixture.repo = open_repo(&fixture.path).expect("reopen fixture");
+        let watermark = load_review_watermarks(
+            &mut fixture.repo,
+            fixture.orient_branch,
+            fixture.persona,
+        )
+        .expect("load automatic delivery")
+        .remove(&fixture.request)
+        .expect("delivered request watermark");
+        assert_ne!(watermark.id, explicit);
+        assert_eq!(watermark.heads, BTreeSet::new());
+        assert_eq!(watermark.deadline, None);
+
+        // The delivered checkpoint still contains the surfaced assignment;
+        // first rearm absorbs its watermark-filtered removal, second rearm is
+        // fully unchanged. Neither may fire or create another watermark.
+        let heads = load_watched_heads(
+            &mut fixture.repo,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+        )
+        .expect("rearm heads");
+        assert!(matches!(
+            check_news_once(
+                &mut fixture.repo,
+                fixture.persona,
+                &heads,
+                fixture.local_branch,
+                fixture.compass_branch,
+                fixture.relations_branch,
+                fixture.orient_branch,
+                false,
+            )
+            .expect("first quiet rearm"),
+            NewsCheck::Quiet(_)
+        ));
+        assert!(matches!(
+            check_news_once(
+                &mut fixture.repo,
+                fixture.persona,
+                &heads,
+                fixture.local_branch,
+                fixture.compass_branch,
+                fixture.relations_branch,
+                fixture.orient_branch,
+                false,
+            )
+            .expect("second quiet rearm"),
+            NewsCheck::Quiet(_)
+        ));
+        assert_eq!(
+            load_review_watermarks(
+                &mut fixture.repo,
+                fixture.orient_branch,
+                fixture.persona,
+            )
+            .expect("watermark after quiet rearm")[&fixture.request]
+                .id,
+            watermark.id
+        );
+
+        remove_fixture(fixture);
+    }
+
+    #[test]
     fn checkpoint_and_review_digest_delivery_round_trip_together() {
         let path = std::env::temp_dir().join(format!("orient-delivery-{:x}.pile", ufoid().id));
         std::fs::File::create(&path).expect("create temp pile");
@@ -2874,6 +3424,231 @@ mod tests {
             .expect("load watermarks")
             .remove(&request)
             .expect("snooze remains");
+        assert_eq!(watermark.id, snooze_id.id);
+        assert_eq!(
+            watermark.deadline,
+            Some(interval_key(epoch_interval(deadline)))
+        );
+
+        repo.close().ok();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn watermark_before_compass_order_preserves_newer_explicit_h2_snooze() {
+        use faculties::schemas::compass::review_attestation_fragment;
+
+        let mut fixture = review_fixture(true);
+        let h1 = fixture.initial_head.expect("fixture h1");
+        let initial = load_watched_snapshot(
+            &mut fixture.repo,
+            fixture.persona,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+            fixture.orient_branch,
+        )
+        .expect("load h1 snapshot");
+        assert!(initial
+            .view
+            .goals_view
+            .contains(&format!("{:x}@{:x}", fixture.request, h1)));
+        let initial_heads = load_watched_heads(
+            &mut fixture.repo,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+        )
+        .expect("initial heads");
+        save_checkpoint_heads(
+            &mut fixture.repo,
+            fixture.orient_branch,
+            &initial_heads,
+            Some((fixture.persona, &initial.view)),
+        )
+        .expect("save h1 baseline");
+
+        let explicit_id = ufoid();
+        let deadline = now_epoch() + hifitime::Duration::from_total_nanoseconds(3_600_000_000_000);
+        let mut h2 = None;
+        let loaded = load_watched_snapshot_inner(
+            &mut fixture.repo,
+            fixture.persona,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+            fixture.orient_branch,
+            |repo| {
+                // This seam runs after the watcher read orient-state but before
+                // it pulls Compass. The writer advances Compass H1 -> H2 first,
+                // then records explicit reader intent for H2.
+                let mut compass = repo
+                    .pull(fixture.compass_branch)
+                    .map_err(|e| anyhow!("pull h2 compass: {e:?}"))?;
+                let at = epoch_interval(now_epoch());
+                let report = compass.put("malformed h2".to_string());
+                let attestation = review_attestation_fragment(
+                    fixture.request,
+                    fixture.persona,
+                    "malformed-h2",
+                    report,
+                    &[h1],
+                    at,
+                );
+                let h2_id = attestation.root().expect("h2 root");
+                let mut change = TribleSet::new();
+                change += attestation;
+                compass.commit(change, "test advance review to h2");
+                repo.push(&mut compass)
+                    .map_err(|e| anyhow!("push h2 compass: {e:?}"))?;
+                h2 = Some(h2_id);
+
+                let mut orient = repo
+                    .pull(fixture.orient_branch)
+                    .map_err(|e| anyhow!("pull explicit h2 snooze: {e:?}"))?;
+                let mut change = TribleSet::new();
+                change += entity! { &explicit_id @
+                    metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+                    orient_state::persona: &fixture.persona,
+                    orient_state::wm_request: &fixture.request,
+                    orient_state::wm_head: &h2_id,
+                    orient_state::wm_deadline: epoch_interval(deadline),
+                    orient_state::at: epoch_interval(now_epoch()),
+                };
+                orient.commit(change, "test explicit h2 snooze");
+                repo.push(&mut orient)
+                    .map_err(|e| anyhow!("push explicit h2 snooze: {e:?}"))?;
+                Ok(())
+            },
+        )
+        .expect("load causally ordered h2 snapshot");
+        let h2 = h2.expect("hook produced h2");
+        assert!(loaded
+            .view
+            .goals_view
+            .contains(&format!("{:x}@{:x}", fixture.request, h2)));
+        assert_eq!(
+            loaded.review_watermark_ids.get(&fixture.request),
+            None,
+            "the explicit event landed after the watermark snapshot"
+        );
+
+        let report = view_news_report(&initial.view, &loaded.view, fixture.persona);
+        assert_eq!(report.reasons().len(), 1);
+        assert!(report.reasons()[0].contains("updated"));
+        let current_heads = load_watched_heads(
+            &mut fixture.repo,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+        )
+        .expect("current heads");
+        save_checkpoint_with_review_deliveries(
+            &mut fixture.repo,
+            fixture.orient_branch,
+            &current_heads,
+            fixture.persona,
+            &loaded.view,
+            &report.review_deliveries(),
+            &loaded.review_watermark_ids,
+        )
+        .expect("CAS preserves explicit h2 snooze");
+
+        let watermark = load_review_watermarks(
+            &mut fixture.repo,
+            fixture.orient_branch,
+            fixture.persona,
+        )
+        .expect("load final watermark")
+        .remove(&fixture.request)
+        .expect("h2 watermark");
+        assert_eq!(watermark.id, explicit_id.id);
+        assert_eq!(watermark.heads, BTreeSet::from([h2]));
+        assert_eq!(
+            watermark.deadline,
+            Some(interval_key(epoch_interval(deadline)))
+        );
+
+        // Once the explicit event is present before acquisition, the later
+        // Compass pull sees H2 and the matching snooze filters it quietly.
+        let quiet = load_watched_snapshot(
+            &mut fixture.repo,
+            fixture.persona,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+            fixture.orient_branch,
+        )
+        .expect("load quiet h2 snapshot");
+        assert!(!quiet.view.goals_view.contains(&format!("{:x}@", fixture.request)));
+        assert_eq!(
+            quiet.next_review_deadline,
+            Some(interval_key(epoch_interval(deadline)))
+        );
+
+        remove_fixture(fixture);
+    }
+
+    #[test]
+    fn explicit_snooze_wins_a_real_checkpoint_try_push_conflict() {
+        let path = std::env::temp_dir().join(format!("orient-cas-race-{:x}.pile", ufoid().id));
+        std::fs::File::create(&path).expect("create temp pile");
+        let mut repo = open_repo(&path).expect("open repo");
+        let orient_branch = repo
+            .ensure_branch("orient-state", None)
+            .expect("ensure orient-state");
+        let persona = ufoid().id;
+        let request = ufoid().id;
+        let review_head = ufoid().id;
+        let snooze_id = ufoid();
+        let deadline = now_epoch() + hifitime::Duration::from_total_nanoseconds(3_600_000_000_000);
+        let watched_heads = WatchedHeads {
+            local: None,
+            compass: None,
+            relations: None,
+        };
+        let mut injected = false;
+
+        save_checkpoint_inner(
+            &mut repo,
+            orient_branch,
+            &watched_heads,
+            Some((persona, &view("review digest view"))),
+            &BTreeMap::from([(request, BTreeSet::from([review_head]))]),
+            &BTreeMap::new(),
+            |repo, attempt| {
+                if attempt != 0 {
+                    return Ok(());
+                }
+                injected = true;
+                // The checkpoint workspace was pulled before this commit. Its
+                // first try_push must conflict; the retry must re-read this
+                // explicit event and drop the automatic delivery.
+                let mut explicit = repo
+                    .pull(orient_branch)
+                    .map_err(|e| anyhow!("pull explicit snooze: {e:?}"))?;
+                let mut change = TribleSet::new();
+                change += entity! { &snooze_id @
+                    metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+                    orient_state::persona: &persona,
+                    orient_state::wm_request: &request,
+                    orient_state::wm_head: &review_head,
+                    orient_state::wm_deadline: epoch_interval(deadline),
+                    orient_state::at: epoch_interval(now_epoch()),
+                };
+                explicit.commit(change, "test explicit snooze conflict");
+                repo.push(&mut explicit)
+                    .map_err(|e| anyhow!("push explicit snooze: {e:?}"))?;
+                Ok(())
+            },
+        )
+        .expect("checkpoint retry preserves explicit snooze");
+        assert!(injected, "the test must force the conflict seam");
+
+        let watermark = load_review_watermarks(&mut repo, orient_branch, persona)
+            .expect("load watermarks")
+            .remove(&request)
+            .expect("explicit snooze remains");
         assert_eq!(watermark.id, snooze_id.id);
         assert_eq!(
             watermark.deadline,
