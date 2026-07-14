@@ -1411,12 +1411,20 @@ fn evaluate_request_inner(
     // Identity + supersede-protocol checks use the FROZEN sealed roster.
     let canonical_ok = request.is_canonical();
     let roster_reasons = roster_successor_invalid_reasons(space, &request, known_people);
+    // `invalid` holds IDENTITY/STRUCTURAL reasons that gate unconditionally.
+    // `roster_invalid` holds reasons that depend on resolving the CURRENT group
+    // (a forked/missing/invalid group, or the author/external/unknown checks
+    // over its live members). Those describe the current group, NOT a sealed
+    // historical certificate, so they must never invalidate a valid settlement
+    // — they only fail-close a still-pending request. Keeping them apart is the
+    // fix for a settled review flipping to Invalid when its group later forks.
     let mut invalid = Vec::new();
+    let mut roster_invalid = Vec::new();
     // Live roster: resolve the request's group anchor to its UNIQUE head
     // snapshot (resolved_snapshot) and that head's members (effective_required).
     // The frozen `request.required` is NEVER mutated. Missing/Forked/Invalid
-    // fails the gate CLOSED; a legacy request (no group) keeps its frozen
-    // sealed roster as the effective one.
+    // fails a PENDING request closed; a legacy request (no group) keeps its
+    // frozen sealed roster as the effective one.
     let (resolved_snapshot, effective_required): (Option<Id>, Vec<Id>) =
         match (relations_space, request.group()) {
             (Some(rel), Some(group)) => match resolve_group_head(rel, group) {
@@ -1425,20 +1433,20 @@ fn evaluate_request_inner(
                     sorted_unique(head_members(rel, group).into_iter().collect()),
                 ),
                 GroupHead::Missing => {
-                    invalid.push(format!(
+                    roster_invalid.push(format!(
                         "review group {group:x} has no snapshot; run `relations group migrate`"
                     ));
                     (None, Vec::new())
                 }
                 GroupHead::Forked(heads) => {
-                    invalid.push(format!(
+                    roster_invalid.push(format!(
                         "review group {group:x} is forked across {} heads; reconcile first",
                         heads.len()
                     ));
                     (None, Vec::new())
                 }
                 GroupHead::Invalid(reason) => {
-                    invalid.push(format!("review group {group:x} is invalid: {reason}"));
+                    roster_invalid.push(format!("review group {group:x} is invalid: {reason}"));
                     (None, Vec::new())
                 }
             },
@@ -1472,14 +1480,18 @@ fn evaluate_request_inner(
         }
     }
     if let Some(author) = request.author() {
+        // Roster-membership checks depend on the CURRENT effective roster, so
+        // they are deferred behind a valid settlement (roster_invalid).
         if !effective_required.contains(&author) {
-            invalid.push("review roster must include the author".to_string());
+            roster_invalid.push("review roster must include the author".to_string());
         }
         if !effective_required.iter().any(|reviewer| *reviewer != author) {
-            invalid.push(
+            roster_invalid.push(
                 "review roster must include at least one distinct non-author reviewer".to_string(),
             );
         }
+        // The break-glass authority is a frozen request field, not a live-roster
+        // property, so it gates unconditionally.
         if request.override_authorities.contains(&author) {
             invalid.push("review author cannot be their own break-glass authority".to_string());
         }
@@ -1493,7 +1505,7 @@ fn evaluate_request_inner(
         .filter(|id| !known_people.contains(id))
         .collect();
     if !unknown.is_empty() {
-        invalid.push(format!(
+        roster_invalid.push(format!(
             "review roster contains {} unknown people",
             unknown.len()
         ));
@@ -1543,7 +1555,17 @@ fn evaluate_request_inner(
     let state = if !invalid.is_empty() {
         ReviewGateState::Invalid { reasons: invalid }
     } else if !settlements.is_empty() {
+        // A valid certificate is honored regardless of the CURRENT group state:
+        // it validated against its OWN sealed historical snapshot + roster,
+        // which stay canonical (append-only) even after the live group forks,
+        // empties, or is superseded. Current-group reasons never revalidate it.
         ReviewGateState::Settled { settlements }
+    } else if !roster_invalid.is_empty() {
+        // No settlement: a broken/forked/empty current group fails the pending
+        // gate closed until the group is reconciled.
+        ReviewGateState::Invalid {
+            reasons: roster_invalid,
+        }
     } else {
         let author = request.author().expect("validated above");
         let mut submitted = 0;
@@ -1614,10 +1636,11 @@ pub fn evaluate_goal(
     space: &TribleSet,
     goal_id: Id,
     known_people: &HashSet<Id>,
+    relations_space: Option<&TribleSet>,
 ) -> ReviewProjection {
     match active_request_ids_for_goal(space, goal_id).as_slice() {
         [] => ReviewProjection::Unbound,
-        [request_id] => evaluate_request_inner(space, *request_id, known_people, None)
+        [request_id] => evaluate_request_inner(space, *request_id, known_people, relations_space)
             .map(ReviewProjection::Bound)
             .unwrap_or(ReviewProjection::Unbound),
         request_ids => ReviewProjection::Forked {
@@ -1634,13 +1657,16 @@ pub fn outstanding_review_requests(
     space: &TribleSet,
     known_people: &HashSet<Id>,
     reviewer_id: Id,
+    relations_space: Option<&TribleSet>,
 ) -> Vec<(Id, Id)> {
     let mut obligations = Vec::new();
     let goals = sorted_unique(
         find!(goal: Id, pattern!(space, [{ ?goal @ metadata::tag: &KIND_GOAL_ID }])).collect(),
     );
     for goal in goals {
-        let ReviewProjection::Bound(evaluation) = evaluate_goal(space, goal, known_people) else {
+        let ReviewProjection::Bound(evaluation) =
+            evaluate_goal(space, goal, known_people, relations_space)
+        else {
             continue;
         };
         if matches!(
@@ -2107,6 +2133,141 @@ mod tests {
     }
 
     #[test]
+    fn a_settled_group_review_survives_a_later_fork_of_its_group() {
+        // gpt's adversarial finding: a settled review must not flip to Invalid
+        // when its group later FORKS. The certificate is anchored to its sealed
+        // historical snapshot (still canonical after the fork); the forked
+        // CURRENT group only fails a still-pending gate closed.
+        use crate::schemas::relations::{group_snapshot_fragment, KIND_GROUP as REL_KIND_GROUP};
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let author = reviewers[0];
+        let group = ufoid().id;
+        let target: TextHandle = "urn:revision:settled-fork".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(group),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+
+        let name: TextHandle = "fork-roster".to_blob().get_handle();
+        let s0 = group_snapshot_fragment(group, name, &reviewers, &[]);
+        let s0_id = s0.root().expect("intrinsic snapshot");
+        let mut relations = TribleSet::new();
+        relations += entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
+        relations += s0;
+
+        let author_ev = add_attestation(&mut space, request, author, VERDICT_ABSTAIN, &[]);
+        let peer_ev = add_attestation(&mut space, request, reviewers[1], VERDICT_APPROVE, &[]);
+        let ready = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert!(matches!(ready.state, ReviewGateState::Ready));
+        space += review_attestation_settlement_fragment(
+            request,
+            goal,
+            author,
+            &[author_ev, peer_ev],
+            ready.resolved_snapshot,
+            &ready.effective_required,
+            now(),
+        );
+        assert!(matches!(
+            evaluate_request_live(&space, request, &known, &relations)
+                .unwrap()
+                .state,
+            ReviewGateState::Settled { .. }
+        ));
+
+        // Two canonical children both supersede s0 with divergent members => the
+        // CURRENT group is Forked. A pending gate would fail closed here.
+        let newcomer = ufoid().id;
+        let mut known = known;
+        known.insert(newcomer);
+        let child_a: TextHandle = "fork-roster".to_blob().get_handle();
+        let child_b: TextHandle = "fork-roster".to_blob().get_handle();
+        relations += group_snapshot_fragment(
+            group,
+            child_a,
+            &[author, reviewers[1], newcomer],
+            &[s0_id],
+        );
+        relations += group_snapshot_fragment(group, child_b, &[author], &[s0_id]);
+        assert!(matches!(
+            resolve_group_head(&relations, group),
+            GroupHead::Forked(_)
+        ));
+        let after = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert!(
+            matches!(after.state, ReviewGateState::Settled { .. }),
+            "settled review flipped to {:?} when its group forked",
+            after.state
+        );
+    }
+
+    #[test]
+    fn an_override_settled_group_review_survives_a_later_fork() {
+        // Break-glass is intentionally roster-INDEPENDENT: an override
+        // certificate seals no snapshot/roster (the authority + reason is the
+        // whole proof), so a later group fork cannot revalidate it either.
+        use crate::schemas::relations::{group_snapshot_fragment, KIND_GROUP as REL_KIND_GROUP};
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let author = reviewers[0];
+        let group = ufoid().id;
+        let target: TextHandle = "urn:revision:override-fork".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(group),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+
+        let name: TextHandle = "ovr-roster".to_blob().get_handle();
+        let s0 = group_snapshot_fragment(group, name, &reviewers, &[]);
+        let s0_id = s0.root().expect("intrinsic snapshot");
+        let mut relations = TribleSet::new();
+        relations += entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
+        relations += s0;
+
+        // The frozen authority overrides and settles — no reviewer attestations.
+        let reason: TextHandle = "shipping under deadline".to_blob().get_handle();
+        let override_event = review_override_fragment(request, authority, reason, now());
+        let override_id = override_event.root().expect("intrinsic override");
+        space += override_event;
+        space += review_override_settlement_fragment(
+            request, goal, authority, override_id, None, &[], now(),
+        );
+        assert!(matches!(
+            evaluate_request_live(&space, request, &known, &relations)
+                .unwrap()
+                .state,
+            ReviewGateState::Settled { .. }
+        ));
+
+        // The group forks afterward — the break-glass certificate is unaffected.
+        let child_a: TextHandle = "ovr-roster".to_blob().get_handle();
+        let child_b: TextHandle = "ovr-roster".to_blob().get_handle();
+        relations += group_snapshot_fragment(group, child_a, &[author], &[s0_id]);
+        relations += group_snapshot_fragment(group, child_b, &reviewers, &[s0_id]);
+        let after = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert!(
+            matches!(after.state, ReviewGateState::Settled { .. }),
+            "override-settled review flipped to {:?} when its group forked",
+            after.state
+        );
+    }
+
+    #[test]
     fn pair_author_abstain_and_independent_approval_is_exact_and_settleable() {
         let (mut space, goal, reviewers, authority, known) = pair_fixture();
         let request = add_request(
@@ -2121,7 +2282,7 @@ mod tests {
 
         for reviewer in reviewers {
             assert_eq!(
-                outstanding_review_requests(&space, &known, reviewer),
+                outstanding_review_requests(&space, &known, reviewer, None),
                 vec![(goal, request)]
             );
         }
@@ -2140,9 +2301,9 @@ mod tests {
                 required: 2
             }
         ));
-        assert!(outstanding_review_requests(&space, &known, reviewers[0]).is_empty());
+        assert!(outstanding_review_requests(&space, &known, reviewers[0], None).is_empty());
         assert_eq!(
-            outstanding_review_requests(&space, &known, reviewers[1]),
+            outstanding_review_requests(&space, &known, reviewers[1], None),
             vec![(goal, request)]
         );
 
@@ -2157,7 +2318,7 @@ mod tests {
             evaluate_request(&space, request, &known).unwrap().state,
             ReviewGateState::Ready
         ));
-        assert!(outstanding_review_requests(&space, &known, reviewers[1]).is_empty());
+        assert!(outstanding_review_requests(&space, &known, reviewers[1], None).is_empty());
 
         let settlement = review_attestation_settlement_fragment(
             request,
@@ -2461,7 +2622,7 @@ mod tests {
             "urn:revision:right",
         );
 
-        match evaluate_goal(&space, goal, &active) {
+        match evaluate_goal(&space, goal, &active, None) {
             ReviewProjection::Forked { request_ids } => {
                 assert_eq!(request_ids.len(), 2);
                 assert!(request_ids.contains(&left));
@@ -2512,7 +2673,7 @@ mod tests {
         ));
         for reviewer in reviewers {
             assert_eq!(
-                outstanding_review_requests(&space, &active, reviewer),
+                outstanding_review_requests(&space, &active, reviewer, None),
                 vec![(goal, second)]
             );
         }
@@ -3424,7 +3585,7 @@ mod tests {
         expected.sort();
         assert_eq!(active_request_ids_for_goal(&space, goal), expected);
         assert!(matches!(
-            evaluate_goal(&space, goal, &known),
+            evaluate_goal(&space, goal, &known, None),
             ReviewProjection::Forked { .. }
         ));
     }
@@ -3682,7 +3843,7 @@ mod tests {
             ReviewGateState::Blocked { .. }
         ));
         assert_eq!(
-            outstanding_review_requests(&space, &known, reviewers[1]),
+            outstanding_review_requests(&space, &known, reviewers[1], None),
             vec![(goal, request)]
         );
     }

@@ -4,7 +4,7 @@ use chrono::{
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::schemas::compass::{
-    active_attestation_ids_for_reviewer, evaluate_goal, evaluate_request, latest_status_event,
+    active_attestation_ids_for_reviewer, evaluate_goal, evaluate_request_live, latest_status_event,
     outstanding_review_requests, review_request, ReviewGateState, ReviewProjection,
     VERDICT_REQUEST_CHANGES,
 };
@@ -586,7 +586,7 @@ fn cmd_show(
                     .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
                 let known_people = person_ids(&relations_space);
                 let actions =
-                    persona_review_actions(&compass_space, &known_people, persona_id);
+                    persona_review_actions(&compass_space, &known_people, persona_id, &relations_space);
                 if actions.is_empty() {
                     println!("- None");
                 } else {
@@ -774,10 +774,11 @@ fn persona_review_actions(
     compass_space: &TribleSet,
     known_people: &HashSet<Id>,
     persona_id: Id,
+    relations_space: &TribleSet,
 ) -> BTreeMap<Id, PersonaGoalReview> {
     let mut actions = BTreeMap::<Id, PersonaGoalReview>::new();
     for (goal, request) in
-        outstanding_review_requests(compass_space, known_people, persona_id)
+        outstanding_review_requests(compass_space, known_people, persona_id, Some(relations_space))
     {
         let heads = active_attestation_ids_for_reviewer(compass_space, request, persona_id)
             .into_iter()
@@ -795,7 +796,7 @@ fn persona_review_actions(
     )
     .collect();
     for goal in goals {
-        let author_action = match evaluate_goal(compass_space, goal, known_people) {
+        let author_action = match evaluate_goal(compass_space, goal, known_people, Some(relations_space)) {
             ReviewProjection::Unbound => None,
             ReviewProjection::Bound(evaluation) => {
                 // `contains` deliberately keeps a malformed multi-author
@@ -832,7 +833,7 @@ fn persona_review_actions(
             }
             ReviewProjection::Forked { request_ids } => {
                 let authored = request_ids.iter().any(|request_id| {
-                    evaluate_request(compass_space, *request_id, known_people)
+                    evaluate_request_live(compass_space, *request_id, known_people, relations_space)
                         .is_some_and(|evaluation| {
                             evaluation.request.authors.contains(&persona_id)
                         })
@@ -968,7 +969,7 @@ fn load_watched_view(
     // Review actions are derived from the exact same request/attestation heads
     // that close the Compass gate. No parallel notification ledger is needed.
     let known_people = person_ids(&relations_space);
-    let mut review_actions = persona_review_actions(&compass_space, &known_people, persona_id);
+    let mut review_actions = persona_review_actions(&compass_space, &known_people, persona_id, &relations_space);
 
     // Watermark filter (ack/snooze): drop owed reviewer assignments the persona
     // has acknowledged, as long as their state (the attestation head-set) is

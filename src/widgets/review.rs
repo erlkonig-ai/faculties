@@ -346,7 +346,12 @@ fn build_settlement_view(
     mut relations_ws: Option<&mut Workspace<Pile>>,
 ) -> SettlementView {
     let known_people = person_ids(&live.relations_space);
-    let projection = evaluate_goal(&live.compass_space, goal_id, &known_people);
+    let projection = evaluate_goal(
+        &live.compass_space,
+        goal_id,
+        &known_people,
+        Some(&live.relations_space),
+    );
     let active_requests: HashSet<Id> = active_request_ids_for_goal(&live.compass_space, goal_id)
         .into_iter()
         .collect();

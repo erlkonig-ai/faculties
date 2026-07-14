@@ -2060,7 +2060,7 @@ fn cmd_review_status(pile: &Path, branch_id: Id, input: String, history: bool) -
                     &board_space,
                     &mut relations_ws,
                     &relations_space,
-                    evaluate_goal(&board_space, goal_id, &known_people),
+                    evaluate_goal(&board_space, goal_id, &known_people, Some(&relations_space)),
                 );
                 Some(goal_id)
             }
@@ -2565,7 +2565,7 @@ mod tests {
             let board_space = board_ws
                 .checkout(..)
                 .map_err(|e| anyhow::anyhow!("checkout compass: {e:?}"))?;
-            match evaluate_goal(&board_space, goal, &known) {
+            match evaluate_goal(&board_space, goal, &known, Some(&relations_space)) {
                 ReviewProjection::Bound(evaluation) => Ok(evaluation),
                 other => bail!("expected bound review, got {other:?}"),
             }
