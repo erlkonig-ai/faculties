@@ -898,14 +898,23 @@ struct WatchedView {
     roster: std::collections::BTreeSet<Id>,
 }
 
-fn load_watched_view(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedWatchedView {
+    view: WatchedView,
+    /// Exact latest orient-state watermark events observed while constructing
+    /// `view`. Delivery writes compare these during CAS retries so they cannot
+    /// overwrite a concurrently-issued explicit ack or snooze.
+    review_watermark_ids: BTreeMap<Id, Id>,
+}
+
+fn load_watched_snapshot(
     repo: &mut Repository<Pile>,
     persona_id: Id,
     local_branch_id: Id,
     compass_branch_id: Id,
     relations_branch_id: Id,
     orient_state_branch_id: Id,
-) -> Result<WatchedView> {
+) -> Result<LoadedWatchedView> {
     let mut local_ws = repo
         .pull(local_branch_id)
         .map_err(|e| anyhow!("pull local workspace: {e:?}"))?;
@@ -970,20 +979,23 @@ fn load_watched_view(
     let known_people = person_ids(&relations_space);
     let mut review_actions = persona_review_actions(&compass_space, &known_people, persona_id);
 
-    // Watermark filter (ack/snooze): drop owed reviewer assignments the persona
-    // has acknowledged, as long as their state (the attestation head-set) is
-    // unchanged and any snooze deadline is still in the future. Because
-    // `view_news` only wakes on ADDED assignments, an ack (a removal) never
-    // self-wakes; a later head change / a fresh superseding request id / an
-    // expired snooze all break the match and re-add the assignment → wake. This
-    // is the edge-trigger the review wake-storm needed. Author actions are
-    // never suppressed — a review the persona OWNS still needs their eyes.
+    // Watermark filter (delivery/ack/snooze): drop owed reviewer assignments
+    // the persona has already seen at this exact attestation head-set, while an
+    // optional live snooze deadline still defers it. `wait` appends delivery
+    // watermarks atomically with its checkpoint; explicit ack/snooze uses the
+    // same state. A later head change, fresh successor request id, or expired
+    // snooze breaks the match and re-adds the assignment → wake. Author actions
+    // are never suppressed — a review the persona OWNS still needs their eyes.
     let watermarks = load_review_watermarks(repo, orient_state_branch_id, persona_id)?;
+    let review_watermark_ids = watermarks
+        .iter()
+        .map(|(request, watermark)| (*request, watermark.id))
+        .collect();
     if !watermarks.is_empty() {
         let now = interval_key(epoch_interval(now_epoch()));
         for review in review_actions.values_mut() {
             review.assignments.retain(|request, heads| match watermarks.get(request) {
-                Some(wm) => !watermark_quiet(wm, heads, now),
+                Some(wm) => !watermark_quiet(&wm.heads, wm.deadline, heads, now),
                 None => true,
             });
         }
@@ -1069,25 +1081,167 @@ fn load_watched_view(
     goal_lines.sort();
     let goals_view = goal_lines.join("\n");
 
-    Ok(WatchedView {
-        unread,
-        goals_view,
-        roster,
+    Ok(LoadedWatchedView {
+        view: WatchedView {
+            unread,
+            goals_view,
+            roster,
+        },
+        review_watermark_ids,
     })
 }
 
-/// What news is in `new` relative to `old`? Returns one line per
-/// item, empty = no news. Unread and roster are growth-only: a
+fn load_watched_view(
+    repo: &mut Repository<Pile>,
+    persona_id: Id,
+    local_branch_id: Id,
+    compass_branch_id: Id,
+    relations_branch_id: Id,
+    orient_state_branch_id: Id,
+) -> Result<WatchedView> {
+    Ok(load_watched_snapshot(
+        repo,
+        persona_id,
+        local_branch_id,
+        compass_branch_id,
+        relations_branch_id,
+        orient_state_branch_id,
+    )?
+    .view)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewNotice {
+    goal: String,
+    request: String,
+    updated: bool,
+    /// Exact active attestation head-set at delivery time. `None` is only
+    /// possible for an old checkpoint encoding that did not carry head state;
+    /// such a notice is shown but deliberately not auto-watermarked.
+    delivery: Option<(Id, BTreeSet<Id>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NewsItem {
+    Text(String),
+    Review(ReviewNotice),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NewsReport {
+    items: Vec<NewsItem>,
+}
+
+impl NewsReport {
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Render all review assignments as one digest while leaving message,
+    /// roster, goal-status, and author-action reasons independent. A large
+    /// review backlog therefore consumes one watcher fire, not one per item.
+    fn reasons(&self) -> Vec<String> {
+        let reviews: Vec<&ReviewNotice> = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                NewsItem::Review(review) => Some(review),
+                NewsItem::Text(_) => None,
+            })
+            .collect();
+        let review_digest = (!reviews.is_empty()).then(|| {
+            let updated = reviews.iter().filter(|review| review.updated).count();
+            let labels = reviews
+                .iter()
+                .map(|review| {
+                    let short = &review.request[..review.request.len().min(8)];
+                    let suffix = if review.updated { " updated" } else { "" };
+                    format!("[{}] request {short}{suffix}", review.goal)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let updated_suffix = if updated == 0 {
+                String::new()
+            } else {
+                format!("; {updated} updated")
+            };
+            format!(
+                "REVIEWS ({} pending{updated_suffix}): {labels}",
+                reviews.len()
+            )
+        });
+
+        let mut rendered = Vec::new();
+        let mut digest_rendered = false;
+        for item in &self.items {
+            match item {
+                NewsItem::Text(reason) => rendered.push(reason.clone()),
+                NewsItem::Review(_) if !digest_rendered => {
+                    rendered.push(review_digest.clone().expect("reviews are non-empty"));
+                    digest_rendered = true;
+                }
+                NewsItem::Review(_) => {}
+            }
+        }
+        rendered
+    }
+
+    /// Per-request delivery watermarks to append in the same commit as the
+    /// checkpoint. Conflicting encodings fail open: if one request somehow
+    /// carries two different head-sets, omit its watermark so the malformed
+    /// edge can wake again instead of being hidden.
+    fn review_deliveries(&self) -> BTreeMap<Id, BTreeSet<Id>> {
+        let mut deliveries = BTreeMap::<Id, BTreeSet<Id>>::new();
+        let mut conflicts = BTreeSet::<Id>::new();
+        for notice in self.items.iter().filter_map(|item| match item {
+            NewsItem::Review(review) => Some(review),
+            NewsItem::Text(_) => None,
+        }) {
+            let Some((request, heads)) = &notice.delivery else {
+                continue;
+            };
+            if conflicts.contains(request) {
+                continue;
+            }
+            match deliveries.get(request) {
+                Some(existing) if existing != heads => {
+                    deliveries.remove(request);
+                    conflicts.insert(*request);
+                }
+                Some(_) => {}
+                None => {
+                    deliveries.insert(*request, heads.clone());
+                }
+            }
+        }
+        deliveries
+    }
+}
+
+fn parse_delivery(request: &str, heads: Option<&String>) -> Option<(Id, BTreeSet<Id>)> {
+    let request = Id::from_hex(request)?;
+    let heads = heads?;
+    if heads == "-" {
+        return Some((request, BTreeSet::new()));
+    }
+    let parsed: Option<BTreeSet<Id>> = heads.split('+').map(Id::from_hex).collect();
+    Some((request, parsed?))
+}
+
+/// What news is in `new` relative to `old`? Unread and roster are growth-only: a
 /// message leaving the unread set (the persona acked it) is not
 /// news, an arriving message is; a NEW person is news, enrichment
 /// of an existing entry is not (so another zooid's multi-commit
 /// contact-editing burst wakes at most once). Goals wake on relevant
-/// status changes and review-action token changes — the reason line names
-/// the goal/request so the woken agent never has to diff the board by hand.
-fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String> {
-    let mut reasons = Vec::new();
+/// status changes and review-action token changes. Reviewer assignments remain
+/// structured until rendering so one wait can coalesce them and atomically mark
+/// the exact delivered head-sets as seen.
+fn view_news_report(old: &WatchedView, new: &WatchedView, persona_id: Id) -> NewsReport {
+    let mut report = NewsReport::default();
     for msg in new.unread.difference(&old.unread) {
-        reasons.push(format!("new message [{}]", fmt_id(*msg)));
+        report
+            .items
+            .push(NewsItem::Text(format!("new message [{}]", fmt_id(*msg))));
     }
     // Goal lines are
     // "id:status:author:flags:review-assignments:author-action:assignment-state".
@@ -1115,7 +1269,7 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
             .map(|(request, heads)| (request.to_owned(), heads.to_owned()))
             .collect()
     };
-    let parse = |view: &str| -> HashMap<
+    let parse = |view: &str| -> BTreeMap<
         String,
         (
             String,
@@ -1167,8 +1321,17 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
             // wake a reviewer: fulfilling/removing `a` from `a,b` must not
             // make the still-present `b` look like a refreshed candidate.
             for request in assignments.difference(&previous_assignments) {
-                let short = &request[..request.len().min(8)];
-                reasons.push(format!("REVIEW [{id}] (request {short})"));
+                report.items.push(NewsItem::Review(ReviewNotice {
+                    goal: id.clone(),
+                    request: request.clone(),
+                    updated: false,
+                    delivery: parse_delivery(
+                        request,
+                        assignment_state
+                            .as_ref()
+                            .and_then(|current| current.get(request)),
+                    ),
+                }));
                 action_notified = true;
             }
             for request in assignments.intersection(&previous_assignments) {
@@ -1180,10 +1343,19 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
                             != assignment_state
                                 .as_ref()
                                 .and_then(|current| current.get(request))
-                    });
+                });
                 if changed {
-                    let short = &request[..request.len().min(8)];
-                    reasons.push(format!("REVIEW updated [{id}] (request {short})"));
+                    report.items.push(NewsItem::Review(ReviewNotice {
+                        goal: id.clone(),
+                        request: request.clone(),
+                        updated: true,
+                        delivery: parse_delivery(
+                            request,
+                            assignment_state
+                                .as_ref()
+                                .and_then(|current| current.get(request)),
+                        ),
+                    }));
                     action_notified = true;
                 }
             }
@@ -1208,7 +1380,9 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
             } else {
                 " updated"
             };
-            reasons.push(format!("{action}{updated} [{id}] (request {short})"));
+            report.items.push(NewsItem::Text(format!(
+                "{action}{updated} [{id}] (request {short})"
+            )));
             action_notified = true;
         }
 
@@ -1217,18 +1391,29 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
         }
         match old_goals.get(id) {
             None if !own_edit && addressed => {
-                reasons.push(format!("new goal [{id}] ({status})"))
+                report
+                    .items
+                    .push(NewsItem::Text(format!("new goal [{id}] ({status})")))
             }
             Some((prev, _, _, _, _, _)) if prev != status && !own_edit && relevant => {
-                reasons.push(format!("goal [{id}]: {prev} → {status}"))
+                report.items.push(NewsItem::Text(format!(
+                    "goal [{id}]: {prev} → {status}"
+                )))
             }
             _ => {}
         }
     }
     for person in new.roster.difference(&old.roster) {
-        reasons.push(format!("new person [{}]", fmt_id(*person)));
+        report
+            .items
+            .push(NewsItem::Text(format!("new person [{}]", fmt_id(*person))));
     }
-    reasons
+    report
+}
+
+#[cfg(test)]
+fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String> {
+    view_news_report(old, new, persona_id).reasons()
 }
 
 fn load_checkpoint_heads(
@@ -1354,32 +1539,43 @@ fn load_checkpoint_view(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewWatermark {
+    id: Id,
+    heads: BTreeSet<Id>,
+    deadline: Option<i128>,
+}
+
 /// Should an owed-review assignment be suppressed given the persona's
-/// watermark? `wm` is the `(acked head-set, optional snooze deadline)` recorded
-/// at ack/snooze time; `heads` is the assignment's *current* attestation
+/// watermark? `acked_heads` + `deadline` are the state recorded at
+/// delivery/ack/snooze time; `heads` is the assignment's *current* attestation
 /// head-set; `now` is the current interval key. Quiet iff the acked head-set
 /// still matches AND either it was a plain ack (no deadline) or the snooze
 /// deadline is still in the future. Any head change (malformed/forked
 /// transition, a fresh attestation) breaks the match and re-surfaces the review
 /// regardless of a live snooze — state changes always win over a timer.
-fn watermark_quiet(wm: &(BTreeSet<Id>, Option<i128>), heads: &BTreeSet<Id>, now: i128) -> bool {
-    let (acked_heads, deadline) = wm;
+fn watermark_quiet(
+    acked_heads: &BTreeSet<Id>,
+    deadline: Option<i128>,
+    heads: &BTreeSet<Id>,
+    now: i128,
+) -> bool {
     *acked_heads == *heads
         && match deadline {
             None => true,         // plain ack: quiet until the head-set changes
-            Some(d) => now <= *d, // snooze: quiet until the deadline passes
+            Some(d) => now <= d,  // snooze: quiet until the deadline passes
         }
 }
 
-/// Load this persona's review watermarks (ack/snooze) from the orient-state
-/// branch, reduced latest-wins per request. Returns
-/// `request -> (acked attestation head-set, optional snooze deadline key)`.
+/// Load this persona's review watermarks (delivery/ack/snooze) from the
+/// orient-state branch, reduced latest-wins per request. Returns
+/// `request -> { event id, acked head-set, optional snooze deadline key }`.
 /// Empty when the branch has no head yet.
 fn load_review_watermarks(
     repo: &mut Repository<Pile>,
     orient_state_branch_id: Id,
     persona_id: Id,
-) -> Result<BTreeMap<Id, (BTreeSet<Id>, Option<i128>)>> {
+) -> Result<BTreeMap<Id, ReviewWatermark>> {
     let Some(_head) = repo
         .storage_mut()
         .head(orient_state_branch_id)
@@ -1394,11 +1590,20 @@ fn load_review_watermarks(
         .checkout(..)
         .map_err(|e| anyhow!("checkout orient state: {e:?}"))?;
 
-    // Latest watermark event per request (by `at`).
-    let mut latest: BTreeMap<Id, (i128, Id)> = BTreeMap::new();
+    Ok(review_watermarks_from_space(&space, persona_id))
+}
+
+fn review_watermarks_from_space(
+    space: &TribleSet,
+    persona_id: Id,
+) -> BTreeMap<Id, ReviewWatermark> {
+    // Latest watermark event per request. Explicit reader intent wins an
+    // equal-timestamp offline merge against automatic delivery; the intrinsic
+    // event id remains the deterministic final tie-break within each class.
+    let mut latest: BTreeMap<Id, (i128, bool, Id)> = BTreeMap::new();
     for (wm_id, request, at) in find!(
         (wm_id: Id, request: Id, at: IntervalValue),
-        pattern!(&space, [{
+        pattern!(space, [{
             ?wm_id @
             metadata::tag: &KIND_REVIEW_WATERMARK_ID,
             orient_state::persona: &persona_id,
@@ -1407,33 +1612,43 @@ fn load_review_watermarks(
         }])
     ) {
         let key = interval_key(at);
+        let explicit = !exists!(pattern!(space, [{
+            wm_id @ orient_state::wm_delivery_checkpoint: _?checkpoint
+        }]));
         latest
             .entry(request)
             .and_modify(|entry| {
-                if key > entry.0 {
-                    *entry = (key, wm_id);
+                if (key, explicit, wm_id) > *entry {
+                    *entry = (key, explicit, wm_id);
                 }
             })
-            .or_insert((key, wm_id));
+            .or_insert((key, explicit, wm_id));
     }
 
     // Read the winning watermark's acked head-set + optional snooze deadline.
-    let mut out: BTreeMap<Id, (BTreeSet<Id>, Option<i128>)> = BTreeMap::new();
-    for (request, (_at, wm_id)) in latest {
+    let mut out = BTreeMap::new();
+    for (request, (_at, _explicit, wm_id)) in latest {
         let heads: BTreeSet<Id> = find!(
             h: Id,
-            pattern!(&space, [{ wm_id @ orient_state::wm_head: ?h }])
+            pattern!(space, [{ wm_id @ orient_state::wm_head: ?h }])
         )
         .collect();
         let deadline: Option<i128> = find!(
             d: IntervalValue,
-            pattern!(&space, [{ wm_id @ orient_state::wm_deadline: ?d }])
+            pattern!(space, [{ wm_id @ orient_state::wm_deadline: ?d }])
         )
         .next()
         .map(interval_key);
-        out.insert(request, (heads, deadline));
+        out.insert(
+            request,
+            ReviewWatermark {
+                id: wm_id,
+                heads,
+                deadline,
+            },
+        );
     }
-    Ok(out)
+    out
 }
 
 fn save_checkpoint_heads(
@@ -1442,34 +1657,128 @@ fn save_checkpoint_heads(
     heads: &WatchedHeads,
     persona_view: Option<(Id, &WatchedView)>,
 ) -> Result<()> {
+    save_checkpoint(
+        repo,
+        orient_state_branch_id,
+        heads,
+        persona_view,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+}
+
+/// Advance the persona checkpoint and append every surfaced review's exact
+/// active head-set in one orient-state commit. This makes delivery itself the
+/// reader watermark: re-arming sees unchanged pending work as standing state,
+/// while a successor request or any head-set change breaks the match and wakes
+/// again. The orient-state branch is not a watched input, so this own write is
+/// absorbed rather than becoming a fresh wake.
+fn save_checkpoint_with_review_deliveries(
+    repo: &mut Repository<Pile>,
+    orient_state_branch_id: Id,
+    heads: &WatchedHeads,
+    persona_id: Id,
+    view: &WatchedView,
+    review_deliveries: &BTreeMap<Id, BTreeSet<Id>>,
+    observed_review_watermarks: &BTreeMap<Id, Id>,
+) -> Result<()> {
+    save_checkpoint(
+        repo,
+        orient_state_branch_id,
+        heads,
+        Some((persona_id, view)),
+        review_deliveries,
+        observed_review_watermarks,
+    )
+}
+
+fn save_checkpoint(
+    repo: &mut Repository<Pile>,
+    orient_state_branch_id: Id,
+    heads: &WatchedHeads,
+    persona_view: Option<(Id, &WatchedView)>,
+    review_deliveries: &BTreeMap<Id, BTreeSet<Id>>,
+    observed_review_watermarks: &BTreeMap<Id, Id>,
+) -> Result<()> {
+    if !review_deliveries.is_empty() && persona_view.is_none() {
+        bail!("review deliveries require a persona-scoped checkpoint");
+    }
     let mut ws = repo
         .pull(orient_state_branch_id)
         .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
 
-    let checkpoint_id = ufoid();
-    let now = epoch_interval(now_epoch());
-    let mut change = TribleSet::new();
-    change += entity! { &checkpoint_id @
-        metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
-        orient_state::at: now,
-        orient_state::local_head?: heads.local,
-        orient_state::compass_head?: heads.compass,
-        orient_state::relations_head?: heads.relations,
-    };
-    if let Some((persona_id, view)) = persona_view {
-        let goals_handle = ws.put(view.goals_view.clone());
-        change += entity! { &checkpoint_id @
-            orient_state::persona: &persona_id,
-            orient_state::goals_view: goals_handle,
-            orient_state::unread_msg*: view.unread.iter(),
-            orient_state::roster_member*: view.roster.iter(),
-        };
-    }
+    loop {
+        // Only auto-watermark against the orient-state snapshot used to build
+        // the digest. If an explicit ack/snooze (or another delivery) landed
+        // concurrently, the latest event id differs and wins; retrying never
+        // overwrites that newer reader intent.
+        let eligible_deliveries: BTreeMap<Id, BTreeSet<Id>> =
+            if let Some((persona_id, _)) = persona_view {
+                if review_deliveries.is_empty() {
+                    BTreeMap::new()
+                } else {
+                    let current_space = ws
+                        .checkout(..)
+                        .map_err(|e| anyhow!("checkout orient state for delivery: {e:?}"))?;
+                    let current = review_watermarks_from_space(&current_space, persona_id);
+                    review_deliveries
+                        .iter()
+                        .filter(|(request, _)| {
+                            current.get(*request).map(|watermark| watermark.id)
+                                == observed_review_watermarks.get(*request).copied()
+                        })
+                        .map(|(request, heads)| (*request, heads.clone()))
+                        .collect()
+                }
+            } else {
+                BTreeMap::new()
+            };
 
-    ws.commit(change, "orient checkpoint");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow!("push orient checkpoint: {e:?}"))?;
-    Ok(())
+        let checkpoint_id = ufoid();
+        let now = epoch_interval(now_epoch());
+        let mut change = TribleSet::new();
+        change += entity! { &checkpoint_id @
+            metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
+            orient_state::at: now,
+            orient_state::local_head?: heads.local,
+            orient_state::compass_head?: heads.compass,
+            orient_state::relations_head?: heads.relations,
+        };
+        if let Some((persona_id, view)) = persona_view {
+            let goals_handle = ws.put(view.goals_view.clone());
+            change += entity! { &checkpoint_id @
+                orient_state::persona: &persona_id,
+                orient_state::goals_view: goals_handle,
+                orient_state::unread_msg*: view.unread.iter(),
+                orient_state::roster_member*: view.roster.iter(),
+            };
+            for (request, review_heads) in &eligible_deliveries {
+                let watermark_id = ufoid();
+                change += entity! { &watermark_id @
+                    metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+                    orient_state::persona: &persona_id,
+                    orient_state::wm_request: request,
+                    orient_state::wm_head*: review_heads.iter(),
+                    orient_state::wm_delivery_checkpoint: &checkpoint_id,
+                    orient_state::at: now,
+                };
+            }
+        }
+
+        let message = if eligible_deliveries.is_empty() {
+            "orient checkpoint"
+        } else {
+            "orient checkpoint and review delivery"
+        };
+        ws.commit(change, message);
+        match repo
+            .try_push(&mut ws)
+            .map_err(|e| anyhow!("push orient checkpoint: {e:?}"))?
+        {
+            None => return Ok(()),
+            Some(conflict) => ws = conflict,
+        }
+    }
 }
 
 fn branch_head_by_id(
@@ -1666,7 +1975,7 @@ fn check_news_once(
     orient_state_branch_id: Id,
     peek: bool,
 ) -> Result<NewsCheck> {
-    let view = load_watched_view(
+    let loaded = load_watched_snapshot(
         repo,
         persona_id,
         local_branch_id,
@@ -1674,11 +1983,12 @@ fn check_news_once(
         relations_branch_id,
         orient_state_branch_id,
     )?;
+    let view = loaded.view;
     let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, persona_id)? else {
         return Ok(NewsCheck::NoCheckpoint(view));
     };
-    let reasons = view_news(&seen, &view, persona_id);
-    if reasons.is_empty() {
+    let report = view_news_report(&seen, &view, persona_id);
+    if report.is_empty() {
         // Quiet removals still change the comparison baseline. Persist them so
         // a fulfilled assignment that is later re-added wakes even if the
         // watcher/poller restarted in between. Peek remains strictly read-only.
@@ -1692,7 +2002,7 @@ fn check_news_once(
         }
         return Ok(NewsCheck::Quiet(view));
     }
-    for reason in &reasons {
+    for reason in report.reasons() {
         println!("News: {reason}");
     }
     print_news_detail(repo, &seen, &view, local_branch_id, relations_branch_id)?;
@@ -1702,11 +2012,15 @@ fn check_news_once(
     // Peek mode skips the save: report without consuming, for hooks that
     // can't tell whose turn they fire on (root vs subagent).
     if !peek {
-        save_checkpoint_heads(
+        let deliveries = report.review_deliveries();
+        save_checkpoint_with_review_deliveries(
             repo,
             orient_state_branch_id,
             heads,
-            Some((persona_id, &view)),
+            persona_id,
+            &view,
+            &deliveries,
+            &loaded.review_watermark_ids,
         )?;
     }
     Ok(NewsCheck::Fired)
@@ -1879,7 +2193,7 @@ fn cmd_wait(
             }
             match (persona_id, baseline_view.as_mut()) {
                 (Some(pid), Some(view)) => {
-                    let current_view = load_watched_view(
+                    let loaded = load_watched_snapshot(
                         repo,
                         pid,
                         local_branch_id,
@@ -1887,18 +2201,24 @@ fn cmd_wait(
                         relations_branch_id,
                         orient_state_branch_id,
                     )?;
-                    let reasons = view_news(view, &current_view, pid);
-                    if !reasons.is_empty() {
-                        for reason in &reasons {
+                    let current_view = loaded.view;
+                    let report = view_news_report(view, &current_view, pid);
+                    if !report.is_empty() {
+                        for reason in report.reasons() {
                             println!("News: {reason}");
                         }
                         print_news_detail(repo, &*view, &current_view, local_branch_id, relations_branch_id)?;
-                        // Advance the checkpoint (terse path skips cmd_show).
-                        save_checkpoint_heads(
+                        // Advance the checkpoint and mark every review included
+                        // in the digest delivered at its exact active head-set.
+                        let deliveries = report.review_deliveries();
+                        save_checkpoint_with_review_deliveries(
                             repo,
                             orient_state_branch_id,
                             &current_heads,
-                            Some((pid, &current_view)),
+                            pid,
+                            &current_view,
+                            &deliveries,
+                            &loaded.review_watermark_ids,
                         )?;
                         return Ok((false, true, true));
                     }
@@ -2127,11 +2447,11 @@ mod tests {
 
         let news = view_news(&pending, &one_bad_head, me);
         assert_eq!(news.len(), 1);
-        assert!(news[0].contains("REVIEW updated"));
+        assert!(news[0].contains("updated"));
 
         let news = view_news(&one_bad_head, &forked, me);
         assert_eq!(news.len(), 1);
-        assert!(news[0].contains("REVIEW updated"));
+        assert!(news[0].contains("updated"));
     }
 
     #[test]
@@ -2193,6 +2513,117 @@ mod tests {
         assert_eq!(news.len(), 1);
         assert!(news[0].contains(&fmt_id(second)[..8]));
         assert!(!news[0].contains(&fmt_id(first)[..8]));
+    }
+
+    #[test]
+    fn multiple_review_edges_render_one_digest_and_capture_exact_heads() {
+        let me = ufoid().id;
+        let other = ufoid().id;
+        let goal_a = ufoid().id;
+        let goal_b = ufoid().id;
+        let request_a = Id::from_hex("11111111111111111111111111111111").unwrap();
+        let request_b = Id::from_hex("22222222222222222222222222222222").unwrap();
+        let head_a = ufoid().id;
+        let head_b = ufoid().id;
+        let old = view(format!(
+            "{goal_a:x}:doing:{other:x}:i:\n{goal_b:x}:doing:{other:x}:i:"
+        ));
+        let new = view(format!(
+            "{goal_a:x}:review:{other:x}:ir:{request_a:x}::{request_a:x}@-\n\
+             {goal_b:x}:review:{other:x}:ir:{request_b:x}::{request_b:x}@{head_a:x}+{head_b:x}"
+        ));
+
+        let report = view_news_report(&old, &new, me);
+        let reasons = report.reasons();
+        assert_eq!(reasons.len(), 1, "all reviewer work is one digest");
+        assert!(reasons[0].starts_with("REVIEWS (2 pending)"));
+        assert!(reasons[0].contains(&fmt_id(request_a)[..8]));
+        assert!(reasons[0].contains(&fmt_id(request_b)[..8]));
+
+        let deliveries = report.review_deliveries();
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries.get(&request_a), Some(&BTreeSet::new()));
+        assert_eq!(
+            deliveries.get(&request_b),
+            Some(&BTreeSet::from([head_a, head_b]))
+        );
+    }
+
+    #[test]
+    fn review_digest_keeps_direct_and_group_message_edges_prompt() {
+        let me = ufoid().id;
+        let other = ufoid().id;
+        let group = ufoid().id;
+        let direct_message = ufoid().id;
+        let group_message = ufoid().id;
+        let goal = ufoid().id;
+        let request = ufoid().id;
+        let groups = HashSet::from([group]);
+        assert!(is_inbox_message(other, me, me, &groups));
+        assert!(is_inbox_message(other, group, me, &groups));
+
+        let old = view("");
+        let mut new = view(format!(
+            "{goal:x}:review:{other:x}:r:{request:x}::{request:x}@-"
+        ));
+        new.unread = BTreeSet::from([direct_message, group_message]);
+        let reasons = view_news_report(&old, &new, me).reasons();
+
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.starts_with("new message"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.starts_with("REVIEWS"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn delivered_review_is_quiet_until_a_real_head_edge() {
+        let me = ufoid().id;
+        let other = ufoid().id;
+        let goal = ufoid().id;
+        let request = ufoid().id;
+        let first_head = ufoid().id;
+        let second_head = ufoid().id;
+        let empty = view("");
+        let first = view(format!(
+            "{goal:x}:review:{other:x}:r:{request:x}::{request:x}@{first_head:x}"
+        ));
+        let first_report = view_news_report(&empty, &first, me);
+        let first_delivery = first_report.review_deliveries();
+        let first_watermark = first_delivery[&request].clone();
+        assert!(watermark_quiet(
+            &first_watermark,
+            None,
+            &BTreeSet::from([first_head]),
+            0
+        ));
+
+        let changed = view(format!(
+            "{goal:x}:review:{other:x}:r:{request:x}::{request:x}@{first_head:x}+{second_head:x}"
+        ));
+        assert!(!watermark_quiet(
+            &first_watermark,
+            None,
+            &BTreeSet::from([first_head, second_head]),
+            0
+        ));
+        let changed_report = view_news_report(&first, &changed, me);
+        let reasons = changed_report.reasons();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("updated"));
+        assert_eq!(
+            changed_report.review_deliveries().get(&request),
+            Some(&BTreeSet::from([first_head, second_head]))
+        );
     }
 
     #[test]
@@ -2289,8 +2720,8 @@ mod tests {
     fn plain_ack_is_quiet_while_heads_match() {
         let h = heads(&[ufoid().id]);
         // No deadline: quiet regardless of the clock, as long as heads match.
-        assert!(watermark_quiet(&(h.clone(), None), &h, 0));
-        assert!(watermark_quiet(&(h.clone(), None), &h, i128::MAX));
+        assert!(watermark_quiet(&h, None, &h, 0));
+        assert!(watermark_quiet(&h, None, &h, i128::MAX));
     }
 
     #[test]
@@ -2300,28 +2731,33 @@ mod tests {
         // A malformed/forked transition adds a head → the acked set no longer
         // matches → not quiet, so the review re-surfaces.
         let now_two = heads(&[existing, ufoid().id]);
-        assert!(!watermark_quiet(&(acked.clone(), None), &now_two, 0));
+        assert!(!watermark_quiet(&acked, None, &now_two, 0));
         // An attestation the reviewer later retracts (head removed) also breaks
         // the match — any change re-surfaces, not just growth.
-        assert!(!watermark_quiet(&(acked, None), &BTreeSet::new(), 0));
+        assert!(!watermark_quiet(&acked, None, &BTreeSet::new(), 0));
     }
 
     #[test]
     fn empty_headset_ack_stays_quiet_until_first_attestation() {
         // Pending review with no attestation yet: ack snapshots the empty set,
         // and stays quiet until the reviewer's first attestation head lands.
-        assert!(watermark_quiet(&(BTreeSet::new(), None), &BTreeSet::new(), 0));
+        assert!(watermark_quiet(
+            &BTreeSet::new(),
+            None,
+            &BTreeSet::new(),
+            0
+        ));
         let posted = heads(&[ufoid().id]);
-        assert!(!watermark_quiet(&(BTreeSet::new(), None), &posted, 0));
+        assert!(!watermark_quiet(&BTreeSet::new(), None, &posted, 0));
     }
 
     #[test]
     fn snooze_is_quiet_before_deadline_and_wakes_after() {
         let h = heads(&[ufoid().id]);
         let deadline = 1_000i128;
-        assert!(watermark_quiet(&(h.clone(), Some(deadline)), &h, 500)); // before
-        assert!(watermark_quiet(&(h.clone(), Some(deadline)), &h, 1_000)); // at (<=)
-        assert!(!watermark_quiet(&(h.clone(), Some(deadline)), &h, 1_001)); // after
+        assert!(watermark_quiet(&h, Some(deadline), &h, 500)); // before
+        assert!(watermark_quiet(&h, Some(deadline), &h, 1_000)); // at (<=)
+        assert!(!watermark_quiet(&h, Some(deadline), &h, 1_001)); // after
     }
 
     #[test]
@@ -2330,7 +2766,184 @@ mod tests {
         let acked = heads(&[existing]);
         let changed = heads(&[existing, ufoid().id]);
         // Deadline is still in the future, but the state moved: state wins.
-        assert!(!watermark_quiet(&(acked, Some(i128::MAX)), &changed, 0));
+        assert!(!watermark_quiet(&acked, Some(i128::MAX), &changed, 0));
+    }
+
+    #[test]
+    fn checkpoint_and_review_digest_delivery_round_trip_together() {
+        let path = std::env::temp_dir().join(format!("orient-delivery-{:x}.pile", ufoid().id));
+        std::fs::File::create(&path).expect("create temp pile");
+        let mut repo = open_repo(&path).expect("open repo");
+        let orient_branch = repo
+            .ensure_branch("orient-state", None)
+            .expect("ensure orient-state");
+        let persona = ufoid().id;
+        let request_a = ufoid().id;
+        let request_b = ufoid().id;
+        let head_a = ufoid().id;
+        let head_b = ufoid().id;
+        let watched = view("checkpoint view");
+        let deliveries = BTreeMap::from([
+            (request_a, BTreeSet::new()),
+            (request_b, BTreeSet::from([head_a, head_b])),
+        ]);
+        let watched_heads = WatchedHeads {
+            local: None,
+            compass: None,
+            relations: None,
+        };
+
+        save_checkpoint_with_review_deliveries(
+            &mut repo,
+            orient_branch,
+            &watched_heads,
+            persona,
+            &watched,
+            &deliveries,
+            &BTreeMap::new(),
+        )
+        .expect("save checkpoint + delivery");
+
+        assert_eq!(
+            load_checkpoint_view(&mut repo, orient_branch, persona)
+                .expect("load checkpoint")
+                .expect("checkpoint exists"),
+            watched
+        );
+        let watermarks =
+            load_review_watermarks(&mut repo, orient_branch, persona).expect("load watermarks");
+        assert_eq!(watermarks.len(), 2);
+        assert_eq!(watermarks[&request_a].heads, BTreeSet::new());
+        assert_eq!(watermarks[&request_a].deadline, None);
+        assert_eq!(
+            watermarks[&request_b].heads,
+            BTreeSet::from([head_a, head_b])
+        );
+        assert_eq!(watermarks[&request_b].deadline, None);
+
+        repo.close().ok();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_explicit_snooze_wins_over_automatic_delivery() {
+        let path = std::env::temp_dir().join(format!("orient-snooze-race-{:x}.pile", ufoid().id));
+        std::fs::File::create(&path).expect("create temp pile");
+        let mut repo = open_repo(&path).expect("open repo");
+        let orient_branch = repo
+            .ensure_branch("orient-state", None)
+            .expect("ensure orient-state");
+        let persona = ufoid().id;
+        let request = ufoid().id;
+        let review_head = ufoid().id;
+        let snooze_id = ufoid();
+        let deadline = now_epoch() + hifitime::Duration::from_total_nanoseconds(3_600_000_000_000);
+
+        // This explicit snooze lands after the watcher constructed its view;
+        // the watcher's observed watermark map is therefore still empty.
+        let mut ws = repo.pull(orient_branch).expect("pull orient-state");
+        let mut change = TribleSet::new();
+        change += entity! { &snooze_id @
+            metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+            orient_state::persona: &persona,
+            orient_state::wm_request: &request,
+            orient_state::wm_head: &review_head,
+            orient_state::wm_deadline: epoch_interval(deadline),
+            orient_state::at: epoch_interval(now_epoch()),
+        };
+        ws.commit(change, "test concurrent explicit snooze");
+        repo.push(&mut ws).expect("push snooze");
+
+        let watched_heads = WatchedHeads {
+            local: None,
+            compass: None,
+            relations: None,
+        };
+        save_checkpoint_with_review_deliveries(
+            &mut repo,
+            orient_branch,
+            &watched_heads,
+            persona,
+            &view("review digest view"),
+            &BTreeMap::from([(request, BTreeSet::from([review_head]))]),
+            &BTreeMap::new(),
+        )
+        .expect("save checkpoint without overwriting snooze");
+
+        let watermark = load_review_watermarks(&mut repo, orient_branch, persona)
+            .expect("load watermarks")
+            .remove(&request)
+            .expect("snooze remains");
+        assert_eq!(watermark.id, snooze_id.id);
+        assert_eq!(
+            watermark.deadline,
+            Some(interval_key(epoch_interval(deadline)))
+        );
+
+        repo.close().ok();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn equal_timestamp_explicit_intent_wins_after_offline_merge() {
+        fn low_and_high_ids() -> (Id, Id) {
+            let a = ufoid().id;
+            let b = ufoid().id;
+            if a < b { (a, b) } else { (b, a) }
+        }
+
+        let persona = ufoid().id;
+        let request_ack = ufoid().id;
+        let request_snooze = ufoid().id;
+        let review_head = ufoid().id;
+        let checkpoint = ufoid().id;
+        let (explicit_ack, automatic_ack) = low_and_high_ids();
+        let (explicit_snooze, automatic_snooze) = low_and_high_ids();
+        let at = epoch_interval(now_epoch());
+        let deadline = epoch_interval(
+            now_epoch() + hifitime::Duration::from_total_nanoseconds(3_600_000_000_000),
+        );
+        let mut space = TribleSet::new();
+
+        // Give both automatic events the larger id: the old `(at, id)`
+        // projection would therefore discard the equal-time explicit intent.
+        space += entity! { ExclusiveId::force_ref(&automatic_ack) @
+            metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+            orient_state::persona: &persona,
+            orient_state::wm_request: &request_ack,
+            orient_state::wm_head: &review_head,
+            orient_state::wm_delivery_checkpoint: &checkpoint,
+            orient_state::at: at,
+        };
+        space += entity! { ExclusiveId::force_ref(&explicit_ack) @
+            metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+            orient_state::persona: &persona,
+            orient_state::wm_request: &request_ack,
+            orient_state::wm_head: &review_head,
+            orient_state::at: at,
+        };
+        space += entity! { ExclusiveId::force_ref(&automatic_snooze) @
+            metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+            orient_state::persona: &persona,
+            orient_state::wm_request: &request_snooze,
+            orient_state::wm_head: &review_head,
+            orient_state::wm_delivery_checkpoint: &checkpoint,
+            orient_state::at: at,
+        };
+        space += entity! { ExclusiveId::force_ref(&explicit_snooze) @
+            metadata::tag: &KIND_REVIEW_WATERMARK_ID,
+            orient_state::persona: &persona,
+            orient_state::wm_request: &request_snooze,
+            orient_state::wm_head: &review_head,
+            orient_state::wm_deadline: deadline,
+            orient_state::at: at,
+        };
+
+        let map = review_watermarks_from_space(&space, persona);
+        assert_eq!(map[&request_ack].id, explicit_ack);
+        assert_eq!(map[&request_ack].deadline, None);
+        assert_eq!(map[&request_snooze].id, explicit_snooze);
+        assert_eq!(map[&request_snooze].deadline, Some(interval_key(deadline)));
     }
 
     /// Full round-trip: the watermark entity `compass review ack/snooze` writes
@@ -2399,14 +3012,14 @@ mod tests {
 
         assert_eq!(map.len(), 2, "only this persona's two requests");
 
-        let (ack_heads, ack_deadline) = map.get(&req_ack).expect("req_ack present");
-        assert_eq!(ack_heads, &heads(&[h1, h2]), "later event won latest-wins");
-        assert!(ack_deadline.is_none(), "plain ack has no deadline");
+        let ack = map.get(&req_ack).expect("req_ack present");
+        assert_eq!(ack.heads, heads(&[h1, h2]), "later event won latest-wins");
+        assert!(ack.deadline.is_none(), "plain ack has no deadline");
 
-        let (snooze_heads, snooze_deadline) = map.get(&req_snooze).expect("req_snooze present");
-        assert_eq!(snooze_heads, &heads(&[h1]));
+        let snooze = map.get(&req_snooze).expect("req_snooze present");
+        assert_eq!(snooze.heads, heads(&[h1]));
         assert_eq!(
-            *snooze_deadline,
+            snooze.deadline,
             Some(interval_key(epoch_interval(deadline_epoch))),
             "snooze deadline round-trips"
         );
@@ -2414,11 +3027,11 @@ mod tests {
         // The reconstructed map drives the same quiet-decision the filter uses.
         let now = interval_key(epoch_interval(now_epoch()));
         assert!(
-            watermark_quiet(map.get(&req_ack).unwrap(), &heads(&[h1, h2]), now),
+            watermark_quiet(&ack.heads, ack.deadline, &heads(&[h1, h2]), now),
             "acked review with matching heads is quiet"
         );
         assert!(
-            !watermark_quiet(map.get(&req_ack).unwrap(), &heads(&[h1]), now),
+            !watermark_quiet(&ack.heads, ack.deadline, &heads(&[h1]), now),
             "a head change re-surfaces it"
         );
 

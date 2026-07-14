@@ -26,7 +26,14 @@ All notable changes to this project will be documented in this file.
   offline-concurrent vote makes the conflict visible instead of being erased
   by a stale certificate. Orient additionally wakes the author with `REVISE`,
   `SETTLE`, or `REPAIR` actions and re-wakes reviewers on malformed/forked
-  evidence while ordinary fulfillment/removal remains quiet.
+  evidence while ordinary fulfillment/removal remains quiet. Reviewer wakes
+  are coalesced into one digest; delivering it atomically appends a
+  persona-scoped watermark for every exact request + active head-set alongside
+  the checkpoint. Re-arming therefore suppresses standing unchanged work,
+  while successor/head-set edges and direct or group messages still wake. A
+  guarded delivery write preserves any explicit ack/snooze that races it;
+  delivery-to-checkpoint provenance also gives explicit intent deterministic
+  precedence when equal-timestamp events meet in an offline merge.
 - **Codex can enforce orient-watcher continuity and ingest news while busy.**
   Versioned SessionStart, UserPromptSubmit, and Stop hook helpers under
   `hooks/codex/` hand the `liora-gpt` watcher to each new primary thread, clear

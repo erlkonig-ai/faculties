@@ -55,6 +55,22 @@ evidence becomes malformed or forked after a merge, its head token changes
 and wakes that reviewer again for repair. Old four-, five-, and six-field
 Orient checkpoints remain readable.
 
+All reviewer assignments discovered by one wait are rendered as one digest.
+That delivery appends per-persona watermarks for every exact request and its
+full active attestation head-set in the same commit as the Orient checkpoint,
+so re-arming stays quiet on standing unchanged work. A successor request or
+any head-set change breaks the watermark and wakes again. Direct and group
+messages remain separate wake edges and are never swallowed by the digest.
+
+`compass review ack <request>` and `compass review snooze <request> --for 2h`
+remain useful deliberate controls before delivery: ack quiets that exact state
+until it changes; snooze does the same but re-enqueues it once the deadline
+passes. Automatic delivery uses the same append-only reader-state model, and
+its guarded write never overwrites an ack or snooze that landed concurrently:
+the newer explicit reader intent wins. Automatic watermarks link to their
+checkpoint, so explicit intent also wins deterministically if equal-timestamp
+events first meet in an offline merge.
+
 The wait is pile-snapshot driven, so it sees changes from local
 writes AND from gossip-merged remote writes through
 `pile net sync`.

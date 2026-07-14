@@ -15,11 +15,11 @@ pub const KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
 pub const KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
 pub const KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
 pub const KIND_ORIENT_CHECKPOINT_ID: Id = id_hex!("163114E5F2272D15F21E1994EF418A31");
-/// Per-persona review watermark: an append-only ack/snooze event that lets a
-/// reviewer say "I've seen this exact review; stop surfacing it until its state
-/// (the reviewer's active attestation head-set) changes" — plus an optional
-/// snooze deadline that deliberately re-enqueues it. Private per-persona watch
-/// state on the `orient-state` branch; reduced latest-wins per (persona, request).
+/// Per-persona review watermark: append-only delivery, ack, and snooze events
+/// that mean "I've seen this exact review at this active attestation head-set."
+/// A changed head-set re-enqueues it; an optional snooze deadline deliberately
+/// re-enqueues an otherwise unchanged request. Private per-persona watch state
+/// on `orient-state`, reduced latest-wins per (persona, request).
 pub const KIND_REVIEW_WATERMARK_ID: Id = id_hex!("A085287A166006EC395ED7682B24EF3E");
 
 pub const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
@@ -77,8 +77,9 @@ pub mod orient_state {
         "7D7D457CA0184919497E2585CF779125" as goals_view: inlineencodings::Handle<blobencodings::LongString>;
         "5D3327421EB2F0D92FD50CF32D5A513C" as roster_member: inlineencodings::GenId;
 
-        // Review watermark (KIND_REVIEW_WATERMARK_ID): the review this ack/snooze
-        // acknowledges, keyed with `persona` + `at` above (latest-wins).
+        // Review watermark (KIND_REVIEW_WATERMARK_ID): the review this
+        // delivery/ack/snooze acknowledges, keyed with `persona` + `at` above
+        // (latest-wins).
         "C5BEDFE3A37A1432FEE9B7BA6231E456" as wm_request: inlineencodings::GenId;
         // Snapshot of the reviewer's active attestation head-set at ack time
         // (repeated). A later head change (malformed/forked transition) no longer
@@ -87,5 +88,11 @@ pub mod orient_state {
         // Snooze deadline: present = deferred (re-enqueue once `now > deadline`);
         // absent = a plain ack (quiet until the head-set or request id changes).
         "8F6BAB7F7F8EB992964532B82FE884D2" as wm_deadline: inlineencodings::NsTAIInterval;
+        // Present only on automatic delivery watermarks and links them to the
+        // checkpoint written in the same commit. Besides provenance, this lets
+        // an explicit ack/snooze deterministically win an equal-timestamp
+        // offline merge instead of leaving reader intent to random event-id
+        // ordering. Minted with `trible genid` on 2026-07-14.
+        "7794CFE715C4EB51469F449FA88BA324" as wm_delivery_checkpoint: inlineencodings::GenId;
     }
 }
