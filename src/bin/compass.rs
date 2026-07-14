@@ -134,7 +134,8 @@ enum ReviewCommand {
         /// The normal path only accepts validated content-addressed schemes.
         #[arg(long)]
         unsafe_opaque_target: bool,
-        /// Relations group whose membership is frozen as the three-person roster.
+        /// Relations group whose active members are frozen as the roster.
+        /// It must include the author and at least one distinct reviewer.
         #[arg(long, default_value = "review-triad")]
         review_group: String,
         /// Optional independent person allowed to record a reasoned break-glass settlement.
@@ -847,6 +848,23 @@ fn resolve_group_id(space: &TribleSet, input: &str) -> Result<Id> {
     }
 }
 
+fn validate_frozen_review_roster(
+    required: &[Id],
+    author: Id,
+    active_people: &HashSet<Id>,
+) -> Result<()> {
+    if !required.contains(&author) {
+        bail!("review roster must include the author persona {author:x}");
+    }
+    if !required.iter().any(|reviewer| *reviewer != author) {
+        bail!("review roster must include at least one distinct non-author reviewer");
+    }
+    if required.iter().any(|id| !active_people.contains(id)) {
+        bail!("review group contains inactive or non-person members");
+    }
+    Ok(())
+}
+
 fn resolve_request_id(input: &str, space: &TribleSet) -> Result<Id> {
     let ids: Vec<Id> = find!(
         id: Id,
@@ -1364,23 +1382,7 @@ fn cmd_review_open(
                 .collect::<Vec<_>>();
         required.sort();
         required.dedup();
-        if required.len() != 3 {
-            bail!(
-                "review roster must freeze exactly three distinct people including the author (found {})",
-                required.len()
-            );
-        }
-        if !required.contains(&author) {
-            bail!("review roster must include the author persona {author:x}");
-        }
-        let inactive: Vec<Id> = required
-            .iter()
-            .copied()
-            .filter(|id| !active_people.contains(id))
-            .collect();
-        if !inactive.is_empty() {
-            bail!("review group contains inactive or non-person members");
-        }
+        validate_frozen_review_roster(&required, author, &active_people)?;
 
         let mut override_authorities = Vec::new();
         for input in &override_inputs {
@@ -1694,7 +1696,11 @@ fn render_review_evaluation(
             format!("PENDING — {submitted}/{required} submitted")
         }
         ReviewGateState::Blocked { submitted, reasons } => {
-            format!("BLOCKED — {submitted}/3 submitted — {}", reasons.join("; "))
+            format!(
+                "BLOCKED — {submitted}/{} submitted — {}",
+                evaluation.request.required.len(),
+                reasons.join("; ")
+            )
         }
         ReviewGateState::Ready if active_binding => {
             "READY — exact candidate may settle".to_string()
@@ -1708,7 +1714,7 @@ fn render_review_evaluation(
                 .filter(|s| s.mode == SettlementMode::Override)
                 .count();
             if override_count == 0 {
-                "SETTLED — triadic attestation proof recorded".to_string()
+                "SETTLED — exact attestation proof recorded".to_string()
             } else {
                 "OVERRIDDEN — reasoned break-glass proof recorded".to_string()
             }
@@ -1720,7 +1726,11 @@ fn render_review_evaluation(
         for settlement in settlements {
             match settlement.mode {
                 SettlementMode::Attestations => {
-                    println!("- {:x} (triadic)", settlement.id);
+                    println!(
+                        "- {:x} ({} reviewers)",
+                        settlement.id,
+                        evaluation.request.required.len()
+                    );
                     for evidence in &settlement.attestations {
                         println!("    sealed attestation {:x}", evidence);
                     }
@@ -2217,6 +2227,352 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+
+    struct TestPile(PathBuf);
+
+    impl TestPile {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "faculties-compass-review-{}.pile",
+                ufoid().id
+            ));
+            File::create(&path).expect("create test pile");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn seed_cli_review(pile: &Path, reviewer_count: usize) -> Result<(Id, Id, Vec<Id>, Id)> {
+        with_repo(pile, |repo| {
+            let reviewers: Vec<Id> = (0..reviewer_count).map(|_| ufoid().id).collect();
+            let group_id = ufoid().id;
+            let relations_branch = repo
+                .ensure_branch("relations", None)
+                .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
+            let mut relations_ws = repo
+                .pull(relations_branch)
+                .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+            let mut relations_change = TribleSet::new();
+            for reviewer in &reviewers {
+                relations_change += entity! { ExclusiveId::force_ref(reviewer) @
+                    metadata::tag: &KIND_PERSON_ID,
+                };
+            }
+            relations_change += entity! { ExclusiveId::force_ref(&group_id) @
+                metadata::tag: &KIND_GROUP,
+                group::member*: reviewers.iter(),
+            };
+            relations_ws.commit(relations_change, "seed review roster");
+            repo.push(&mut relations_ws)
+                .map_err(|e| anyhow::anyhow!("push relations fixture: {e:?}"))?;
+
+            let board_branch = repo
+                .ensure_branch("compass", None)
+                .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
+            let mut board_ws = repo
+                .pull(board_branch)
+                .map_err(|e| anyhow::anyhow!("pull compass: {e:?}"))?;
+            let goal = ufoid().id;
+            let goal_fragment = entity! { ExclusiveId::force_ref(&goal) @
+                metadata::tag: &KIND_GOAL_ID,
+            };
+            board_ws.commit(goal_fragment, "seed review goal");
+            repo.push(&mut board_ws)
+                .map_err(|e| anyhow::anyhow!("push goal fixture: {e:?}"))?;
+            Ok((board_branch, goal, reviewers, group_id))
+        })
+    }
+
+    fn cli_evaluation(pile: &Path, branch_id: Id, goal: Id) -> ReviewEvaluation {
+        with_repo(pile, |repo| {
+            let mut relations_ws = relations_workspace(repo)?;
+            let relations_space = relations_ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+            let known = person_ids(&relations_space);
+            let mut board_ws = repo
+                .pull(branch_id)
+                .map_err(|e| anyhow::anyhow!("pull compass: {e:?}"))?;
+            let board_space = board_ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout compass: {e:?}"))?;
+            match evaluate_goal(&board_space, goal, &known) {
+                ReviewProjection::Bound(evaluation) => Ok(evaluation),
+                other => bail!("expected bound review, got {other:?}"),
+            }
+        })
+        .expect("evaluate CLI review fixture")
+    }
+
+    fn add_active_cli_person(pile: &Path) -> Id {
+        with_repo(pile, |repo| {
+            let branch = repo
+                .ensure_branch("relations", None)
+                .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
+            let mut ws = repo
+                .pull(branch)
+                .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+            let person = ufoid().id;
+            let fragment = entity! { ExclusiveId::force_ref(&person) @
+                metadata::tag: &KIND_PERSON_ID,
+            };
+            ws.commit(fragment, "seed active outsider");
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push active outsider: {e:?}"))?;
+            Ok(person)
+        })
+        .expect("add active CLI person")
+    }
+
+    fn open_cli_review_as(
+        pile: &Path,
+        branch_id: Id,
+        goal: Id,
+        author: Id,
+        group_id: Id,
+    ) -> Result<Id> {
+        let author = format!("{author:x}");
+        cmd_review_open(
+            pile,
+            branch_id,
+            format!("{goal:x}"),
+            "urn:blake3:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            false,
+            format!("{group_id:x}"),
+            Vec::new(),
+            Some(&author),
+        )?;
+        Ok(cli_evaluation(pile, branch_id, goal).request.id)
+    }
+
+    fn open_cli_review(
+        pile: &Path,
+        branch_id: Id,
+        goal: Id,
+        reviewers: &[Id],
+        group_id: Id,
+    ) -> Result<Id> {
+        open_cli_review_as(pile, branch_id, goal, reviewers[0], group_id)
+    }
+
+    #[test]
+    fn cli_pair_gate_runs_from_open_through_exact_settlement() {
+        let pile = TestPile::new();
+        let (branch, goal, reviewers, group) = seed_cli_review(pile.path(), 2).unwrap();
+        let request = open_cli_review(pile.path(), branch, goal, &reviewers, group).unwrap();
+
+        cmd_review_submit(
+            pile.path(),
+            branch,
+            format!("{request:x}"),
+            VerdictArg::Abstain,
+            "author inspected the exact candidate".to_string(),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Pending {
+                submitted: 1,
+                required: 2
+            }
+        ));
+
+        cmd_review_submit(
+            pile.path(),
+            branch,
+            format!("{request:x}"),
+            VerdictArg::Approve,
+            "independent reviewer approves".to_string(),
+            Some(&format!("{:x}", reviewers[1])),
+        )
+        .unwrap();
+        cmd_review_gate(pile.path(), branch, format!("{request:x}")).unwrap();
+        cmd_review_settle(
+            pile.path(),
+            branch,
+            format!("{request:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+
+        match cli_evaluation(pile.path(), branch, goal).state {
+            ReviewGateState::Settled { settlements } => {
+                assert_eq!(settlements.len(), 1);
+                assert_eq!(settlements[0].attestations.len(), 2);
+            }
+            other => panic!("expected exact pair settlement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_pair_change_request_blocks_the_gate() {
+        let pile = TestPile::new();
+        let (branch, goal, reviewers, group) = seed_cli_review(pile.path(), 2).unwrap();
+        let request = open_cli_review(pile.path(), branch, goal, &reviewers, group).unwrap();
+        cmd_review_submit(
+            pile.path(),
+            branch,
+            format!("{request:x}"),
+            VerdictArg::Abstain,
+            "author abstains".to_string(),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        cmd_review_submit(
+            pile.path(),
+            branch,
+            format!("{request:x}"),
+            VerdictArg::RequestChanges,
+            "independent reviewer found a blocker".to_string(),
+            Some(&format!("{:x}", reviewers[1])),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Blocked { submitted: 2, .. }
+        ));
+        assert!(cmd_review_gate(pile.path(), branch, format!("{request:x}")).is_err());
+    }
+
+    #[test]
+    fn cli_open_rejects_author_only_and_missing_author_rosters() {
+        let author_only_pile = TestPile::new();
+        let (branch, goal, reviewers, group) = seed_cli_review(author_only_pile.path(), 1).unwrap();
+        let err =
+            open_cli_review(author_only_pile.path(), branch, goal, &reviewers, group).unwrap_err();
+        assert!(format!("{err:#}").contains("at least one distinct non-author reviewer"));
+
+        let missing_author_pile = TestPile::new();
+        let (branch, goal, _reviewers, group) =
+            seed_cli_review(missing_author_pile.path(), 2).unwrap();
+        let outsider = add_active_cli_person(missing_author_pile.path());
+        let err = open_cli_review_as(missing_author_pile.path(), branch, goal, outsider, group)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("must include the author persona"));
+    }
+
+    #[test]
+    fn cli_triad_gate_remains_all_required() {
+        let pile = TestPile::new();
+        let (branch, goal, reviewers, group) = seed_cli_review(pile.path(), 3).unwrap();
+        let request = open_cli_review(pile.path(), branch, goal, &reviewers, group).unwrap();
+        for (reviewer, verdict) in [
+            (reviewers[0], VerdictArg::Abstain),
+            (reviewers[1], VerdictArg::Approve),
+        ] {
+            cmd_review_submit(
+                pile.path(),
+                branch,
+                format!("{request:x}"),
+                verdict,
+                "triad review evidence".to_string(),
+                Some(&format!("{reviewer:x}")),
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Pending {
+                submitted: 2,
+                required: 3
+            }
+        ));
+        assert!(cmd_review_gate(pile.path(), branch, format!("{request:x}")).is_err());
+
+        cmd_review_submit(
+            pile.path(),
+            branch,
+            format!("{request:x}"),
+            VerdictArg::Approve,
+            "second peer approves".to_string(),
+            Some(&format!("{:x}", reviewers[2])),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Ready
+        ));
+    }
+
+    #[test]
+    fn cli_five_person_gate_has_no_cardinality_cutoff() {
+        let pile = TestPile::new();
+        let (branch, goal, reviewers, group) = seed_cli_review(pile.path(), 5).unwrap();
+        let request = open_cli_review(pile.path(), branch, goal, &reviewers, group).unwrap();
+        for (index, reviewer) in reviewers.iter().enumerate().take(4) {
+            let verdict = if index == 0 {
+                VerdictArg::Abstain
+            } else {
+                VerdictArg::Approve
+            };
+            cmd_review_submit(
+                pile.path(),
+                branch,
+                format!("{request:x}"),
+                verdict,
+                "large-council review evidence".to_string(),
+                Some(&format!("{reviewer:x}")),
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Pending {
+                submitted: 4,
+                required: 5
+            }
+        ));
+        assert!(cmd_review_gate(pile.path(), branch, format!("{request:x}")).is_err());
+
+        cmd_review_submit(
+            pile.path(),
+            branch,
+            format!("{request:x}"),
+            VerdictArg::Approve,
+            "final council member approves".to_string(),
+            Some(&format!("{:x}", reviewers[4])),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Ready
+        ));
+    }
+
+    #[test]
+    fn cli_roster_validator_preserves_active_external_requirement() {
+        let author = ufoid().id;
+        let peer = ufoid().id;
+        let third = ufoid().id;
+        let fourth = ufoid().id;
+        let fifth = ufoid().id;
+        let active = HashSet::from([author, peer, third, fourth, fifth]);
+
+        assert!(validate_frozen_review_roster(&[author, peer], author, &active).is_ok());
+        assert!(validate_frozen_review_roster(&[author, peer, third], author, &active).is_ok());
+        assert!(validate_frozen_review_roster(
+            &[author, peer, third, fourth, fifth],
+            author,
+            &active
+        )
+        .is_ok());
+        assert!(validate_frozen_review_roster(&[author], author, &active).is_err());
+        assert!(validate_frozen_review_roster(&[peer, third], author, &active).is_err());
+        assert!(validate_frozen_review_roster(&[author, ufoid().id], author, &active).is_err());
+    }
 
     #[test]
     fn git_review_target_requires_a_full_object_id() {

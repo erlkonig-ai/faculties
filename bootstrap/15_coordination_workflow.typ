@@ -18,6 +18,11 @@ relations add liora-gpt --affinity zooid
 relations add liora-cc  --affinity zooid
 relations add liora-agy --affinity zooid
 relations add jp --affinity user
+relations group create review-pair
+relations group add review-pair liora-gpt
+relations group add review-pair liora-cc
+
+# A three-person council remains supported when all three are active:
 relations group create review-triad
 relations group add review-triad liora-gpt
 relations group add review-triad liora-cc
@@ -28,8 +33,10 @@ export PERSONA=liora-gpt
 ```
 
 Do not reuse the broad `liora` group: it contains role zooids as well as the
-three substrate variants. A request snapshots the dedicated group's three
-person IDs, so later group edits do not alter old obligations.
+substrate variants. A request snapshots the sorted-unique active membership of
+its dedicated group, so later group edits do not alter old obligations. There
+is no fixed maximum: the author must be one member and at least one distinct
+member must be an independent reviewer.
 
 == Work hand-off
 
@@ -62,15 +69,15 @@ When the candidate is ready, its author opens one exact request:
 export PERSONA=liora-gpt # the candidate author's relations label
 REQUEST=$(compass review open "$GOAL" \
   --target 'git+https://example.org/repo@<full-commit-oid>' \
-  --review-group review-triad \
+  --review-group review-pair \
   --override-authority jp \
   | grep -oE '[0-9a-f]{32}' | head -1)
 ```
 
 That single operation also moves the goal to `review`. Every frozen reviewer
-now sees the request under `Reviews:`; `orient wait` wakes the two peers, while
-the author sees their own obligation in `orient show`. Do not send three
-duplicate "please review" messages.
+now sees the request under `Reviews:`; `orient wait` wakes the non-author
+reviewer(s), while the author sees their own obligation in `orient show`. Do
+not send duplicate "please review" messages.
 
 Each reviewer inspects independently and binds the report to the request ID:
 
@@ -80,8 +87,9 @@ compass review submit "$REQUEST" approve --report @review-card.txt
 # or: request-changes / abstain
 ```
 
-All three submit. Both non-authors must approve; the author may approve or
-abstain; any active `request-changes` blocks. Review reports are mandatory.
+Every frozen reviewer submits. Every non-author must approve; the author may
+approve or abstain; any active `request-changes` blocks. Review reports are
+mandatory.
 After the gate opens:
 
 ```sh
@@ -89,9 +97,9 @@ compass review gate "$REQUEST"
 compass review settle "$REQUEST"
 ```
 
-Settlement records the exact three attestation IDs and is itself the `done`
-status event. The work history is therefore exhaust of doing the work, not a
-separate documentation chore.
+Settlement records exactly one attestation ID per frozen reviewer and is itself
+the `done` status event. The work history is therefore exhaust of doing the
+work, not a separate documentation chore.
 
 The author records ordinary settlement. Every proof event has a
 content-derived identity, and guarded transitions publish with compare-and-

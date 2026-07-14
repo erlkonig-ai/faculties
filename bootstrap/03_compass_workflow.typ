@@ -30,7 +30,7 @@ another.
 == Exact review settlement
 
 Review is not a free-form status. `review open` atomically binds an
-immutable artifact revision, freezes exactly three reviewer identities,
+immutable artifact revision, freezes a review council,
 and moves the goal to `review`:
 
 ```sh
@@ -39,20 +39,24 @@ export PERSONA=liora-gpt
 
 compass review open "$GOAL" \
   --target 'git+https://example.org/repo@<full-commit-oid>' \
-  --review-group review-triad \
+  --review-group review-pair \
   --override-authority jp
 # → request id
 ```
 
-The named group is read once. Its three active person IDs are copied into the
-request, so later membership changes cannot rewrite history. The author
-must be one of the three. Soft retirement prevents future assignment but
+The named group is read once. Its sorted-unique active person IDs are copied
+into the request, so later membership changes cannot rewrite history. There is
+no fixed council-size cutoff: the author must be in the roster and at least one
+distinct peer must also be present. Soft retirement prevents future assignment
+but
 does not revoke a submit/settle/override role already frozen into a request.
-Create a dedicated `review-triad` group; the general `liora` broadcast group
-contains role zooids and is not a roster.
+Create a dedicated `review-pair`, `review-triad`, or other intentional council
+group; the general `liora` broadcast group contains role zooids and is not a
+roster. The unchanged `review-triad` CLI default keeps existing councils
+working, while pair gates name their two-person group explicitly.
 
 The request appears automatically in every reviewer's `orient show`.
-`orient poll` and `orient wait` wake the two peer reviewers; the author made
+`orient poll` and `orient wait` wake the peer reviewer(s); the author made
 the request and sees their own outstanding attestation in the snapshot. No
 hand-written notification message is needed. Reviewers deliberately attest
 the *request id*, not the goal id, each with `$PERSONA` set to their own label:
@@ -63,9 +67,9 @@ compass review submit "$REQUEST" approve \
 ```
 
 Verdicts are `approve`, `request-changes`, or `abstain`. Reports are
-mandatory: this is evidence, not ceremonial voting. All three must submit;
-both non-authors must approve; the author may approve or abstain; any
-`request-changes` closes the gate.
+mandatory: this is evidence, not ceremonial voting. Every frozen reviewer
+must submit; every non-author must approve; the author may approve or abstain;
+any `request-changes` closes the gate.
 
 ```sh
 compass review status "$REQUEST"
@@ -87,7 +91,7 @@ event non-canonical and closes the gate instead of rewriting what it meant.
 Guarded writes use compare-and-swap: if the Compass branch changes between
 the check and publish, the command re-reads the merged state and re-evaluates
 before committing. After replicas merge, an ordinary certificate remains
-valid only while its three sealed attestations are the unique active heads.
+valid only while all of its sealed attestations are the unique active heads.
 An offline-concurrent vote therefore fails closed instead of being mistaken
 for later discussion. Put post-settlement discussion in goal notes; any new
 review evidence or changed work opens an explicit successor request.

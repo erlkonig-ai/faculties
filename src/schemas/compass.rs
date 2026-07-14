@@ -915,15 +915,14 @@ pub fn evaluate_request(
             invalid.push("request must name an entity tagged as a goal".to_string());
         }
     }
-    if request.required.len() != 3 {
-        invalid.push(format!(
-            "review roster must contain exactly three people (found {})",
-            request.required.len()
-        ));
-    }
     if let Some(author) = request.author() {
         if !request.required.contains(&author) {
             invalid.push("review roster must include the author".to_string());
+        }
+        if !request.required.iter().any(|reviewer| *reviewer != author) {
+            invalid.push(
+                "review roster must include at least one distinct non-author reviewer".to_string(),
+            );
         }
         if request.override_authorities.contains(&author) {
             invalid.push("review author cannot be their own break-glass authority".to_string());
@@ -1170,10 +1169,10 @@ mod tests {
         id
     }
 
-    fn fixture() -> (TribleSet, Id, [Id; 3], Id, HashSet<Id>) {
+    fn fixture_with_reviewers<const N: usize>() -> (TribleSet, Id, [Id; N], Id, HashSet<Id>) {
         let mut space = TribleSet::new();
         let goal = ufoid().id;
-        let reviewers = [ufoid().id, ufoid().id, ufoid().id];
+        let reviewers = std::array::from_fn(|_| ufoid().id);
         let authority = ufoid().id;
         let active = reviewers
             .iter()
@@ -1184,6 +1183,243 @@ mod tests {
             metadata::tag: &KIND_GOAL_ID,
         };
         (space, goal, reviewers, authority, active)
+    }
+
+    fn fixture() -> (TribleSet, Id, [Id; 3], Id, HashSet<Id>) {
+        fixture_with_reviewers()
+    }
+
+    fn pair_fixture() -> (TribleSet, Id, [Id; 2], Id, HashSet<Id>) {
+        fixture_with_reviewers()
+    }
+
+    #[test]
+    fn pair_author_abstain_and_independent_approval_is_exact_and_settleable() {
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let request = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:pair",
+        );
+
+        for reviewer in reviewers {
+            assert_eq!(
+                outstanding_review_requests(&space, &known, reviewer),
+                vec![(goal, request)]
+            );
+        }
+
+        let author_evidence = add_attestation(
+            &mut space,
+            request,
+            reviewers[0],
+            VERDICT_ABSTAIN,
+            &[],
+        );
+        assert!(matches!(
+            evaluate_request(&space, request, &known).unwrap().state,
+            ReviewGateState::Pending {
+                submitted: 1,
+                required: 2
+            }
+        ));
+        assert!(outstanding_review_requests(&space, &known, reviewers[0]).is_empty());
+        assert_eq!(
+            outstanding_review_requests(&space, &known, reviewers[1]),
+            vec![(goal, request)]
+        );
+
+        let peer_evidence = add_attestation(
+            &mut space,
+            request,
+            reviewers[1],
+            VERDICT_APPROVE,
+            &[],
+        );
+        assert!(matches!(
+            evaluate_request(&space, request, &known).unwrap().state,
+            ReviewGateState::Ready
+        ));
+        assert!(outstanding_review_requests(&space, &known, reviewers[1]).is_empty());
+
+        let settlement = review_attestation_settlement_fragment(
+            request,
+            goal,
+            reviewers[0],
+            &[author_evidence, peer_evidence],
+            now(),
+        );
+        let settlement_id = settlement.root().expect("intrinsic pair settlement");
+        space += settlement;
+        match evaluate_request(&space, request, &known).unwrap().state {
+            ReviewGateState::Settled { settlements } => {
+                assert_eq!(settlements.len(), 1);
+                assert_eq!(settlements[0].id, settlement_id);
+                assert_eq!(settlements[0].attestations.len(), 2);
+            }
+            other => panic!("expected pair settlement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pair_change_request_and_unknown_reject_both_block() {
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let request = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:pair-blocked",
+        );
+        add_attestation(
+            &mut space,
+            request,
+            reviewers[0],
+            VERDICT_ABSTAIN,
+            &[],
+        );
+        let blocker = add_attestation(
+            &mut space,
+            request,
+            reviewers[1],
+            VERDICT_REQUEST_CHANGES,
+            &[],
+        );
+        assert!(matches!(
+            evaluate_request(&space, request, &known).unwrap().state,
+            ReviewGateState::Blocked { submitted: 2, .. }
+        ));
+
+        add_attestation(
+            &mut space,
+            request,
+            reviewers[1],
+            "reject",
+            &[blocker],
+        );
+        match evaluate_request(&space, request, &known).unwrap().state {
+            ReviewGateState::Blocked { submitted, reasons } => {
+                assert_eq!(submitted, 2);
+                assert!(reasons.iter().any(|reason| reason.contains("unknown verdict 'reject'")));
+            }
+            other => panic!("expected unknown rejection to fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn author_only_empty_and_missing_author_rosters_are_invalid() {
+        let (mut one_space, one_goal, one_reviewer, one_authority, one_known) =
+            fixture_with_reviewers::<1>();
+        let one_request = add_request(
+            &mut one_space,
+            one_goal,
+            one_reviewer[0],
+            &one_reviewer,
+            &[one_authority],
+            &[],
+            "urn:revision:one-reviewer",
+        );
+        match evaluate_request(&one_space, one_request, &one_known)
+            .unwrap()
+            .state
+        {
+            ReviewGateState::Invalid { reasons } => assert!(reasons
+                .iter()
+                .any(|reason| reason.contains("at least one distinct non-author"))),
+            other => panic!("expected author-only roster to be invalid, got {other:?}"),
+        }
+
+        let (mut empty_space, empty_goal, empty_people, empty_authority, mut empty_known) =
+            fixture_with_reviewers::<0>();
+        let empty_author = ufoid().id;
+        empty_known.insert(empty_author);
+        let empty_request = add_request(
+            &mut empty_space,
+            empty_goal,
+            empty_author,
+            &empty_people,
+            &[empty_authority],
+            &[],
+            "urn:revision:empty-roster",
+        );
+        assert!(matches!(
+            evaluate_request(&empty_space, empty_request, &empty_known)
+                .unwrap()
+                .state,
+            ReviewGateState::Invalid { .. }
+        ));
+
+        let (mut missing_space, missing_goal, required, missing_authority, mut missing_known) =
+            fixture_with_reviewers::<2>();
+        let missing_author = ufoid().id;
+        missing_known.insert(missing_author);
+        let missing_request = add_request(
+            &mut missing_space,
+            missing_goal,
+            missing_author,
+            &required,
+            &[missing_authority],
+            &[],
+            "urn:revision:missing-author",
+        );
+        match evaluate_request(&missing_space, missing_request, &missing_known)
+            .unwrap()
+            .state
+        {
+            ReviewGateState::Invalid { reasons } => assert!(reasons
+                .iter()
+                .any(|reason| reason.contains("must include the author"))),
+            other => panic!("expected missing-author roster to be invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn five_person_council_remains_all_required() {
+        let (mut space, goal, reviewers, authority, known) = fixture_with_reviewers::<5>();
+        let request = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:five-reviewers",
+        );
+        add_attestation(
+            &mut space,
+            request,
+            reviewers[0],
+            VERDICT_ABSTAIN,
+            &[],
+        );
+        for reviewer in &reviewers[1..4] {
+            add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[]);
+        }
+        assert!(matches!(
+            evaluate_request(&space, request, &known).unwrap().state,
+            ReviewGateState::Pending {
+                submitted: 4,
+                required: 5
+            }
+        ));
+
+        add_attestation(
+            &mut space,
+            request,
+            reviewers[4],
+            VERDICT_APPROVE,
+            &[],
+        );
+        assert!(matches!(
+            evaluate_request(&space, request, &known).unwrap().state,
+            ReviewGateState::Ready
+        ));
     }
 
     #[test]
@@ -1212,6 +1448,13 @@ mod tests {
             VERDICT_APPROVE,
             &[],
         );
+        assert!(matches!(
+            evaluate_request(&space, request, &active).unwrap().state,
+            ReviewGateState::Pending {
+                submitted: 2,
+                required: 3
+            }
+        ));
         add_attestation(
             &mut space,
             request,

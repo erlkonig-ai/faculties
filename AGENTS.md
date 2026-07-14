@@ -96,9 +96,12 @@ Direct commit to `main` is the convention here (and across the
 triblespace-org repos). PRs are reserved for cross-org coordination
 that doesn't apply within this project. "Direct" describes the Git
 transport, not an absence of review: a main-bound candidate gets an exact
-Compass request and independent attestations from the frozen three-person
-review council before it is pushed. `compass review gate <request>` is the
-scriptable check; `compass review settle <request>` records the proof and
+Compass request and independent attestations from a frozen review council
+before it is pushed. The roster must include the author and at least one
+distinct peer. Every frozen member must respond; the author may abstain, while
+every non-author must approve.
+`compass review gate <request>` is the scriptable check;
+`compass review settle <request>` records the proof and
 closes its goal. Proof events are content-derived and guarded transitions
 re-evaluate on branch conflicts; sealed attestations must remain the unique
 active heads after replicas merge, so an offline-concurrent vote fails closed.

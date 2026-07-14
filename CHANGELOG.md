@@ -4,9 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-- **Compass review is exact, triadic, and self-notifying.** `compass review`
-  now opens immutable candidate requests with a frozen three-person roster,
-  records mandatory-report attestations (`approve`, `request-changes`, or
+- **Compass review supports exact pair and larger-council gates.**
+  `compass review` now opens immutable candidate requests with the sorted-unique active
+  membership of a relations group frozen as its roster. The roster must include
+  the author and at least one distinct peer; it has no arbitrary upper bound.
+  Every frozen reviewer must respond, the author may abstain, and every
+  non-author must approve, so pairs, existing triads, and larger councils share
+  one all-required rule. It records mandatory-report attestations (`approve`,
+  `request-changes`, or
   `abstain`), evaluates one shared fail-closed gate, and writes exact evidence
   settlements or visibly reasoned break-glass overrides. Requests and verdicts
   use explicit supersession heads: explicitly opening a successor candidate

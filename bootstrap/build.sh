@@ -151,7 +151,7 @@ echo "==> Building wiki fragments"
 
 # 15. Multi-agent coordination recipe — conversational handoffs use
 # messages; exact review assignment is derived automatically from
-# Compass request heads. Covers triadic settlement, revision refresh,
+# Compass request heads. Covers pair/council settlement, revision refresh,
 # visible forks, and reasoned break-glass evidence.
 "$WIKI" create "Recipe: Multi-Agent Coordination" --force --id "${ID_COORD}" \
   "@$BOOTSTRAP_DIR/15_coordination_workflow.typ" \

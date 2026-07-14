@@ -53,10 +53,10 @@ compass note "$GOAL" "Conclusion: ..."
 export PERSONA=liora-gpt # each reviewer uses their own relations label
 compass review open "$GOAL" \
   --target 'git+https://example.org/repo@<full-commit-oid>' \
-  --review-group review-triad \
+  --review-group review-pair \
   --override-authority jp
-# Three independent `compass review submit <request> ...` passes,
-# then `compass review settle <request>`.
+# One attestation from every frozen reviewer, then
+# `compass review settle <request>`.
 ```
 
 == Why each step

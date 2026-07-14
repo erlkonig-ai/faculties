@@ -271,6 +271,13 @@ struct CertificateView {
     override_event: Option<Id>,
 }
 
+fn certificate_label(certificate: &CertificateView) -> &'static str {
+    match certificate.mode {
+        SettlementMode::Attestations => "ATTESTATION CERTIFICATE",
+        SettlementMode::Override => "BREAK-GLASS CERTIFICATE",
+    }
+}
+
 #[derive(Clone)]
 struct CandidateView {
     id: Id,
@@ -352,7 +359,7 @@ fn build_settlement_view(
     match projection {
         ReviewProjection::Unbound => SettlementView {
             label: "UNBOUND".to_string(),
-            progress: "0/3".to_string(),
+            progress: "—".to_string(),
             tone: GateTone::Muted,
             request_id: None,
             target: None,
@@ -369,7 +376,7 @@ fn build_settlement_view(
         },
         ReviewProjection::Forked { request_ids } => SettlementView {
             label: "FORKED · GATE CLOSED".to_string(),
-            progress: "0/3".to_string(),
+            progress: "—".to_string(),
             tone: GateTone::Bad,
             request_id: None,
             target: None,
@@ -388,6 +395,7 @@ fn build_settlement_view(
             override_reason: None,
         },
         ReviewProjection::Bound(evaluation) => {
+            let required = evaluation.request.required.len();
             let author_id = evaluation.request.author();
             let target = evaluation
                 .request
@@ -407,7 +415,7 @@ fn build_settlement_view(
                     reasons.extend(why.iter().cloned());
                     (
                         "INVALID".to_string(),
-                        "0/3".to_string(),
+                        format!("0/{required}"),
                         GateTone::Bad,
                         Vec::new(),
                     )
@@ -428,14 +436,14 @@ fn build_settlement_view(
                     reasons.extend(why.iter().cloned());
                     (
                         "BLOCKED".to_string(),
-                        format!("{submitted}/3"),
+                        format!("{submitted}/{required}"),
                         GateTone::Bad,
                         Vec::new(),
                     )
                 }
                 ReviewGateState::Ready => (
                     "READY".to_string(),
-                    "3/3".to_string(),
+                    format!("{required}/{required}"),
                     GateTone::Good,
                     Vec::new(),
                 ),
@@ -445,7 +453,11 @@ fn build_settlement_view(
                         .any(|settlement| settlement.mode == SettlementMode::Override);
                     (
                         if overridden { "OVERRIDDEN" } else { "SETTLED" }.to_string(),
-                        if overridden { "OVERRIDE" } else { "3/3" }.to_string(),
+                        if overridden {
+                            "OVERRIDE".to_string()
+                        } else {
+                            format!("{required}/{required}")
+                        },
                         if overridden {
                             GateTone::Warn
                         } else {
@@ -474,11 +486,8 @@ fn build_settlement_view(
                 .iter()
                 .copied()
                 .map(|reviewer| {
-                    let name = person_name(
-                        &live.relations_space,
-                        relations_ws.as_deref_mut(),
-                        reviewer,
-                    );
+                    let name =
+                        person_name(&live.relations_space, relations_ws.as_deref_mut(), reviewer);
                     // A green ordinary settlement renders its immutable proof
                     // evidence, never a later/current reviewer frontier. An
                     // override has no attestation proof, so its reviewer cards
@@ -834,7 +843,7 @@ impl ReviewPanel {
                     ui.add_space(2.0);
                     ui.label(
                         egui::RichText::new(
-                            "`compass review open` binds an exact candidate and assigns its frozen triad.",
+                            "`compass review open` binds an exact candidate and assigns its frozen review roster.",
                         )
                         .small()
                         .color(color_muted(ui)),
@@ -1036,10 +1045,7 @@ fn render_goal(
                 paper_frame(ui)
                     .inner_margin(egui::Margin::same(7))
                     .show(ui, |ui| {
-                        let mode = match certificate.mode {
-                            SettlementMode::Attestations => "TRIADIC CERTIFICATE",
-                            SettlementMode::Override => "BREAK-GLASS CERTIFICATE",
-                        };
+                        let mode = certificate_label(&certificate);
                         ui.horizontal_wrapped(|ui| {
                             render_chip(ui, mode, color_resolved());
                             ui.label(
@@ -1523,6 +1529,21 @@ mod tests {
             compass::status: status,
             metadata::created_at: at(second),
         };
+    }
+
+    #[test]
+    fn pair_settlement_uses_cardinality_neutral_certificate_label() {
+        let certificate = CertificateView {
+            id: ufoid().id,
+            mode: SettlementMode::Attestations,
+            attestations: vec![ufoid().id, ufoid().id],
+            override_event: None,
+        };
+
+        assert_eq!(certificate.attestations.len(), 2);
+        let label = certificate_label(&certificate);
+        assert_eq!(label, "ATTESTATION CERTIFICATE");
+        assert!(!label.contains("TRIADIC"));
     }
 
     #[test]

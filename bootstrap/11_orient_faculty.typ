@@ -45,8 +45,8 @@ persona*, rather than waking on every raw branch movement. Useful for:
     to messages without polling.
   - Review council members waiting for an exact candidate assignment.
 
-Opening a review request wakes the two frozen peer reviewers automatically;
-the author already made the request and sees their own obligation in
+Opening a review request wakes its frozen peer reviewer(s) automatically; the
+author already made the request and sees their own obligation in
 `orient show`. Submitting your own attestation removes your obligation
 without waking your own watcher; another reviewer's submission is quiet.
 Explicitly opening a successor candidate changes the request token and
