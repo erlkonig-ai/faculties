@@ -5,7 +5,9 @@
 //! read compass boards from a pile (the playground dashboard, the pile
 //! inspector notebook, etc.).
 
-use crate::schemas::relations::{head_members, resolve_group_head, snapshot_composition, GroupHead};
+use crate::schemas::relations::{
+    head_members, resolve_group_head, snapshot_composition, GroupHead, KIND_GROUP as REL_KIND_GROUP,
+};
 use std::collections::{BTreeSet, HashSet};
 use triblespace::core::metadata;
 use triblespace::macros::{find, id_hex, pattern};
@@ -255,6 +257,14 @@ pub fn review_attestation_settlement_fragment(
 }
 
 /// Construct a settlement whose proof is one exact break-glass event.
+///
+/// INVARIANT (deliberately narrowed): break-glass is roster-INDEPENDENT. Its
+/// whole proof is the frozen authority + reason; it seals no snapshot/roster
+/// (`snapshot`/`roster` are threaded for signature symmetry but the override
+/// settle path always passes `None`/`&[]`). This is intentional, not an
+/// oversight: an override is often invoked PRECISELY when the group is forked or
+/// broken and there is no unique roster to observe. `valid_settlements` skips
+/// the roster check for override certificates for the same reason.
 pub fn review_override_settlement_fragment(
     request: Id,
     goal: Id,
@@ -952,6 +962,13 @@ fn settled_roster(
                 return None;
             }
             if let Some(rel) = relations_space {
+                // Anchor the sealed roster to a canonical snapshot of THIS
+                // request's group, and require the group to be a real
+                // KIND_GROUP anchor (the same protocol boundary the live gate
+                // enforces) — a settled request skips the gate's roster check.
+                if !exists!(pattern!(rel, [{ group @ metadata::tag: &REL_KIND_GROUP }])) {
+                    return None;
+                }
                 match snapshot_composition(rel, *snapshot) {
                     Some((anchor, snap_members)) if anchor == group && snap_members == members => {}
                     _ => return None,
@@ -1041,6 +1058,11 @@ fn valid_settlements(
                 });
             }
         } else if mode == SettlementMode::Override {
+            // Break-glass is roster-INDEPENDENT by design (see
+            // `review_override_settlement_fragment`): the proof is the frozen
+            // authority + the exact override event, with NO `settled_roster`
+            // check. An override may be invoked precisely when the group is
+            // forked/broken, so there is no unique roster to seal or validate.
             if let Some(event) = review_override(space, settlement.override_events[0]) {
                 if exactly_one(&event.requests) == Some(request.id)
                     && event.actors.len() == 1
@@ -1427,6 +1449,17 @@ fn evaluate_request_inner(
     // frozen sealed roster as the effective one.
     let (resolved_snapshot, effective_required): (Option<Id>, Vec<Id>) =
         match (relations_space, request.group()) {
+            // Protocol boundary: the sealed anchor must actually be a KIND_GROUP,
+            // not merely some id that happens to carry a canonical snapshot DAG.
+            // Otherwise a crafted `snapshot_of` graph on an arbitrary id could
+            // masquerade as a roster source.
+            (Some(rel), Some(group))
+                if !exists!(pattern!(rel, [{ group @ metadata::tag: &REL_KIND_GROUP }])) =>
+            {
+                roster_invalid
+                    .push(format!("review group {group:x} is not a KIND_GROUP anchor"));
+                (None, Vec::new())
+            }
             (Some(rel), Some(group)) => match resolve_group_head(rel, group) {
                 GroupHead::Unique(head) => (
                     Some(head),
@@ -2264,6 +2297,40 @@ mod tests {
             matches!(after.state, ReviewGateState::Settled { .. }),
             "override-settled review flipped to {:?} when its group forked",
             after.state
+        );
+    }
+
+    #[test]
+    fn a_non_kind_group_anchor_with_a_snapshot_dag_is_rejected_at_the_gate() {
+        // Protocol boundary: a crafted `snapshot_of` DAG on an arbitrary id must
+        // not be honored as a roster source — the anchor must be a KIND_GROUP.
+        use crate::schemas::relations::group_snapshot_fragment;
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let imposter = ufoid().id;
+        let target: TextHandle = "urn:revision:imposter".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(imposter),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+        // A well-formed snapshot DAG on `imposter`, but it is NOT tagged
+        // KIND_GROUP, so the gate must refuse it.
+        let name: TextHandle = "imposter".to_blob().get_handle();
+        let mut relations = TribleSet::new();
+        relations += group_snapshot_fragment(imposter, name, &reviewers, &[]);
+        let eval = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert!(
+            matches!(eval.state, ReviewGateState::Invalid { .. }),
+            "non-KIND_GROUP imposter anchor was accepted: {:?}",
+            eval.state
         );
     }
 

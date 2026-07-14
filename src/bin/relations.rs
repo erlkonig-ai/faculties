@@ -200,6 +200,10 @@ enum GroupCmd {
     Reconcile {
         /// Group label or id
         group: String,
+        /// Name for the reconciled head. Required only when concurrent renames
+        /// left the fork heads with different names; otherwise inherited.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// List groups and their members
     List,
@@ -1252,7 +1256,12 @@ fn cmd_group_migrate(pile: &Path, branch_id: Id) -> Result<()> {
     Ok(())
 }
 
-fn cmd_group_reconcile(pile: &Path, branch_id: Id, group: String) -> Result<()> {
+fn cmd_group_reconcile(
+    pile: &Path,
+    branch_id: Id,
+    group: String,
+    name: Option<String>,
+) -> Result<()> {
     let (gid, healed) = with_repo(pile, |repo| {
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
@@ -1277,13 +1286,33 @@ fn cmd_group_reconcile(pile: &Path, branch_id: Id, group: String) -> Result<()> 
         }
         members.sort();
         members.dedup();
-        // Every canonical fork head carries the same name unless a concurrent
-        // rename diverged; take the first head's name (a rename fork is rare and
-        // the operator can rename after healing).
-        let name = person_label(&mut ws, &space, heads[0])
-            .ok_or_else(|| anyhow!("fork head {} has no name", fmt_id(heads[0])))?;
-        let label = normalize_label(&name)?;
-        let key = normalize_lookup_key(&name)?;
+        // Name selection is EXPLICIT, never a silent content-hash pick. If the
+        // fork heads agree on a name we adopt it; if concurrent renames diverged
+        // we refuse until the operator chooses with `--name`.
+        let chosen_name = match &name {
+            Some(explicit) => explicit.clone(),
+            None => {
+                let mut names: Vec<String> = Vec::new();
+                for &head in &heads {
+                    match person_label(&mut ws, &space, head) {
+                        Some(n) => names.push(n),
+                        None => bail!("fork head {} has no name", fmt_id(head)),
+                    }
+                }
+                names.sort();
+                names.dedup();
+                match names.as_slice() {
+                    [single] => single.clone(),
+                    _ => bail!(
+                        "group {} fork heads disagree on name ({}); pass --name <name> to choose",
+                        fmt_id(gid),
+                        names.join(", ")
+                    ),
+                }
+            }
+        };
+        let label = normalize_label(&chosen_name)?;
+        let key = normalize_lookup_key(&chosen_name)?;
         // One intrinsic child superseding EVERY head => a single un-superseded head.
         let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &heads);
         ws.commit(change, "relations group reconcile");
@@ -1478,7 +1507,9 @@ fn main() -> Result<()> {
             }
             GroupCmd::Rename { group, name } => cmd_group_rename(&cli.pile, branch_id, group, name),
             GroupCmd::Migrate => cmd_group_migrate(&cli.pile, branch_id),
-            GroupCmd::Reconcile { group } => cmd_group_reconcile(&cli.pile, branch_id, group),
+            GroupCmd::Reconcile { group, name } => {
+                cmd_group_reconcile(&cli.pile, branch_id, group, name)
+            }
             GroupCmd::List => cmd_group_list(&cli.pile, branch_id),
             GroupCmd::Show { group } => cmd_group_show(&cli.pile, branch_id, group),
         },
@@ -1715,12 +1746,36 @@ mod tests {
         // While forked, ordinary edits fail closed.
         assert!(cmd_group_add(pile.path(), b, fmt_id(anchor), fmt_id(m2)).is_err());
 
-        cmd_group_reconcile(pile.path(), b, fmt_id(anchor)).expect("reconcile");
+        cmd_group_reconcile(pile.path(), b, fmt_id(anchor), None).expect("reconcile");
         assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
         // The union of both heads' members survives (nothing silently dropped).
         assert_eq!(members(pile.path(), b, anchor), sorted(vec![m1, m2]));
         // Reconcile on a healthy group is a visible no-op.
-        cmd_group_reconcile(pile.path(), b, fmt_id(anchor)).expect("reconcile no-op");
+        cmd_group_reconcile(pile.path(), b, fmt_id(anchor), None).expect("reconcile no-op");
         assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
+    }
+
+    #[test]
+    fn reconcile_refuses_divergent_names_without_an_explicit_choice() {
+        let pile = TestPile::new();
+        let b = branch(pile.path());
+        let anchor = ufoid().id;
+        let m1 = ufoid().id;
+        // Concurrent renames: two heads with DIFFERENT names.
+        seed_snapshot(pile.path(), b, anchor, "alpha", &[m1], &[]);
+        seed_snapshot(pile.path(), b, anchor, "beta", &[m1], &[]);
+        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Forked(_)));
+        // No --name => refuses rather than silently picking by content-hash order.
+        let err = cmd_group_reconcile(pile.path(), b, fmt_id(anchor), None).unwrap_err();
+        assert!(
+            err.to_string().contains("disagree on name"),
+            "unexpected error: {err}"
+        );
+        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Forked(_)));
+        // With an explicit name it heals to a single named head.
+        cmd_group_reconcile(pile.path(), b, fmt_id(anchor), Some("gamma".to_string()))
+            .expect("reconcile with explicit name");
+        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
+        assert_eq!(resolve(pile.path(), b, "gamma").expect("resolve gamma"), anchor);
     }
 }
