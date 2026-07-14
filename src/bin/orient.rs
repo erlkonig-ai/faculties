@@ -923,6 +923,26 @@ fn load_watched_snapshot(
     relations_branch_id: Id,
     orient_state_branch_id: Id,
 ) -> Result<LoadedWatchedView> {
+    load_watched_snapshot_at(
+        repo,
+        persona_id,
+        local_branch_id,
+        compass_branch_id,
+        relations_branch_id,
+        orient_state_branch_id,
+        interval_key(epoch_interval(now_epoch())),
+    )
+}
+
+fn load_watched_snapshot_at(
+    repo: &mut Repository<Pile>,
+    persona_id: Id,
+    local_branch_id: Id,
+    compass_branch_id: Id,
+    relations_branch_id: Id,
+    orient_state_branch_id: Id,
+    evaluation_now: i128,
+) -> Result<LoadedWatchedView> {
     load_watched_snapshot_inner(
         repo,
         persona_id,
@@ -930,6 +950,7 @@ fn load_watched_snapshot(
         compass_branch_id,
         relations_branch_id,
         orient_state_branch_id,
+        evaluation_now,
         |_| Ok(()),
     )
 }
@@ -946,6 +967,7 @@ fn load_watched_snapshot(
 ///
 /// `after_watermark_snapshot` is a no-op in production and a deterministic race
 /// seam in tests.
+#[allow(clippy::too_many_arguments)] // Clock capture and race seam are explicit inputs.
 fn load_watched_snapshot_inner<F>(
     repo: &mut Repository<Pile>,
     persona_id: Id,
@@ -953,6 +975,7 @@ fn load_watched_snapshot_inner<F>(
     compass_branch_id: Id,
     relations_branch_id: Id,
     orient_state_branch_id: Id,
+    evaluation_now: i128,
     after_watermark_snapshot: F,
 ) -> Result<LoadedWatchedView>
 where
@@ -1042,7 +1065,7 @@ where
     let next_review_deadline = apply_review_watermarks(
         &mut review_actions,
         &watermarks,
-        interval_key(epoch_interval(now_epoch())),
+        evaluation_now,
     );
 
     // One line per goal:
@@ -1740,7 +1763,7 @@ fn save_checkpoint_heads(
     orient_state_branch_id: Id,
     heads: &WatchedHeads,
     persona_view: Option<(Id, &WatchedView)>,
-) -> Result<Option<CommitHandle>> {
+) -> Result<SavedCheckpoint> {
     save_checkpoint(
         repo,
         orient_state_branch_id,
@@ -1765,7 +1788,7 @@ fn save_checkpoint_with_review_deliveries(
     view: &WatchedView,
     review_deliveries: &BTreeMap<Id, BTreeSet<Id>>,
     observed_review_watermarks: &BTreeMap<Id, Id>,
-) -> Result<Option<CommitHandle>> {
+) -> Result<SavedCheckpoint> {
     save_checkpoint(
         repo,
         orient_state_branch_id,
@@ -1783,7 +1806,7 @@ fn save_checkpoint(
     persona_view: Option<(Id, &WatchedView)>,
     review_deliveries: &BTreeMap<Id, BTreeSet<Id>>,
     observed_review_watermarks: &BTreeMap<Id, Id>,
-) -> Result<Option<CommitHandle>> {
+) -> Result<SavedCheckpoint> {
     save_checkpoint_inner(
         repo,
         orient_state_branch_id,
@@ -1806,7 +1829,7 @@ fn save_checkpoint_inner<F>(
     review_deliveries: &BTreeMap<Id, BTreeSet<Id>>,
     observed_review_watermarks: &BTreeMap<Id, Id>,
     mut before_push: F,
-) -> Result<Option<CommitHandle>>
+) -> Result<SavedCheckpoint>
 where
     F: FnMut(&mut Repository<Pile>, usize) -> Result<()>,
 {
@@ -1881,6 +1904,7 @@ where
         } else {
             "orient checkpoint and review delivery"
         };
+        let parent = ws.head();
         ws.commit(change, message);
         before_push(repo, attempt)?;
         attempt += 1;
@@ -1888,9 +1912,34 @@ where
             .try_push(&mut ws)
             .map_err(|e| anyhow!("push orient checkpoint: {e:?}"))?
         {
-            None => return Ok(ws.head()),
+            None => {
+                return Ok(SavedCheckpoint {
+                    head: ws.head(),
+                    parent,
+                })
+            }
             Some(conflict) => ws = conflict,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SavedCheckpoint {
+    head: Option<CommitHandle>,
+    parent: Option<CommitHandle>,
+}
+
+/// Advance past our own checkpoint only when it was based directly on the
+/// watermark snapshot we evaluated. If another Orient commit intervened, keep
+/// the older observed head so the next poll must reload that concurrent state.
+fn head_after_checkpoint(
+    observed: Option<CommitHandle>,
+    saved: SavedCheckpoint,
+) -> Option<CommitHandle> {
+    if saved.parent == observed {
+        saved.head
+    } else {
+        observed
     }
 }
 
@@ -1903,6 +1952,19 @@ fn branch_head_by_id(
         .map_err(|e| anyhow!("branch head {:x}: {e:?}", branch_id))
 }
 
+/// Repository branch heads are pin/metadata handles, while `Workspace::head`
+/// is the commit handle. Transient Orient invalidation must compare the latter
+/// to the exact workspace head carried by `LoadedWatchedView`.
+fn branch_commit_head_by_id(
+    repo: &mut Repository<Pile>,
+    branch_id: Id,
+) -> Result<Option<CommitHandle>> {
+    let ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull branch {:x} for commit head: {e:?}", branch_id))?;
+    Ok(ws.head())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitBoundary {
     Timeout,
@@ -1912,10 +1974,16 @@ enum WaitBoundary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WaitStep {
     delay: Duration,
-    /// Earliest non-poll boundary planned before sleeping. Retaining this is
-    /// what lets a coarse Poll overshoot dispatch timeout vs review in their
-    /// original order instead of whichever clock is checked first afterward.
-    semantic_boundary: Option<WaitBoundary>,
+    semantic_boundary: Option<SemanticBoundary>,
+}
+
+/// An absolute semantic edge measured on the wait's monotonic timeline.
+/// Absolute positions remain ordered after both edges have passed; unlike
+/// saturated remaining durations, they cannot collapse into a false tie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticBoundary {
+    at: Duration,
+    kind: WaitBoundary,
 }
 
 /// Duration until `now > deadline`, matching `watermark_quiet`'s inclusive
@@ -1930,50 +1998,87 @@ fn duration_until_after(now: i128, deadline: i128) -> Duration {
     }
 }
 
-/// Pick the next sleep duration while preserving the earliest semantic edge
-/// independently of a shorter coarse poll. Timeout wins an exact tie; a
-/// strictly earlier review deadline remains authoritative even if sleep
-/// overshoots both semantic boundaries.
-fn plan_wait_step(
-    poll: Duration,
-    timeout_remaining: Option<Duration>,
-    now: i128,
+fn earliest_semantic_boundary(
+    timeout: Option<Duration>,
+    wait_start_wall: i128,
     review_deadline: Option<i128>,
-) -> WaitStep {
-    let mut step = WaitStep {
-        delay: poll,
-        semantic_boundary: None,
-    };
-    if let Some(remaining) = timeout_remaining {
-        step.semantic_boundary = Some(WaitBoundary::Timeout);
-        step.delay = step.delay.min(remaining);
-    }
+) -> Option<SemanticBoundary> {
+    let mut boundary = timeout.map(|at| SemanticBoundary {
+        at,
+        kind: WaitBoundary::Timeout,
+    });
     if let Some(deadline) = review_deadline {
-        let remaining = duration_until_after(now, deadline);
-        let review_is_semantically_first =
-            timeout_remaining.is_none_or(|timeout| remaining < timeout);
-        if review_is_semantically_first {
-            step.semantic_boundary = Some(WaitBoundary::ReviewDeadline);
+        let review = SemanticBoundary {
+            at: duration_until_after(wait_start_wall, deadline),
+            kind: WaitBoundary::ReviewDeadline,
+        };
+        // Strict replacement makes timeout win an exact tie.
+        if boundary.is_none_or(|current| review.at < current.at) {
+            boundary = Some(review);
         }
-        step.delay = step.delay.min(remaining);
     }
-    step
+    boundary
 }
 
-/// Resolve semantic edges that are actually due after a possibly-overshooting
-/// sleep. When both clocks passed during a coarse Poll, use their order from
-/// the pre-sleep plan; timeout wins an exact tie.
-fn due_wait_boundary(
-    step: WaitStep,
-    timeout_due: bool,
-    review_deadline_due: bool,
-) -> Option<WaitBoundary> {
-    match (timeout_due, review_deadline_due) {
-        (true, true) => step.semantic_boundary.or(Some(WaitBoundary::Timeout)),
-        (true, false) => Some(WaitBoundary::Timeout),
-        (false, true) => Some(WaitBoundary::ReviewDeadline),
-        (false, false) => None,
+fn earlier_semantic_boundary(
+    left: Option<SemanticBoundary>,
+    right: Option<SemanticBoundary>,
+) -> Option<SemanticBoundary> {
+    match (left, right) {
+        (None, boundary) | (boundary, None) => boundary,
+        (Some(left), Some(right)) => {
+            if right.at < left.at
+                || (right.at == left.at
+                    && right.kind == WaitBoundary::Timeout
+                    && left.kind != WaitBoundary::Timeout)
+            {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
     }
+}
+
+/// Pick the next sleep duration while preserving the earliest semantic edge
+/// independently of a shorter coarse poll.
+#[cfg(test)]
+fn plan_wait_step(
+    poll: Duration,
+    elapsed: Duration,
+    timeout: Option<Duration>,
+    wait_start_wall: i128,
+    review_deadline: Option<i128>,
+) -> WaitStep {
+    let semantic_boundary =
+        earliest_semantic_boundary(timeout, wait_start_wall, review_deadline);
+    plan_wait_step_for_boundary(poll, elapsed, semantic_boundary)
+}
+
+fn plan_wait_step_for_boundary(
+    poll: Duration,
+    elapsed: Duration,
+    semantic_boundary: Option<SemanticBoundary>,
+) -> WaitStep {
+    let mut delay = poll;
+    if let Some(boundary) = semantic_boundary {
+        delay = delay.min(boundary.at.saturating_sub(elapsed));
+    }
+    WaitStep {
+        delay,
+        semantic_boundary,
+    }
+}
+
+/// Resolve the absolute semantic winner after any amount of scheduler or
+/// refresh overshoot.
+fn due_wait_boundary(
+    boundary: Option<SemanticBoundary>,
+    elapsed: Duration,
+) -> Option<WaitBoundary> {
+    boundary
+        .filter(|boundary| elapsed >= boundary.at)
+        .map(|boundary| boundary.kind)
 }
 
 fn parse_wait_target(target: Option<&WaitTarget>) -> Result<Option<Duration>> {
@@ -2194,12 +2299,13 @@ fn check_news_once(
         // a fulfilled assignment that is later re-added wakes even if the
         // watcher/poller restarted in between. Peek remains strictly read-only.
         if !peek && view != seen {
-            orient_state_head = save_checkpoint_heads(
+            let saved = save_checkpoint_heads(
                 repo,
                 orient_state_branch_id,
                 heads,
                 Some((persona_id, &view)),
             )?;
+            orient_state_head = head_after_checkpoint(orient_state_head, saved);
         }
         return Ok(NewsCheck::Quiet(WatchBaseline {
             view,
@@ -2322,23 +2428,26 @@ fn cmd_wait(
         (message_limit, doing_limit, todo_limit),
         poll_ms,
         |_| Ok(()),
+        || {},
     )
 }
 
-fn cmd_wait_inner<F>(
+fn cmd_wait_inner<F, G>(
     pile: &Path,
     persona: Option<&str>,
     target: Option<WaitTarget>,
     limits: (usize, usize, usize),
     poll_ms: u64,
     after_baseline: F,
+    mut before_refresh: G,
 ) -> Result<()>
 where
     F: FnOnce(&mut Repository<Pile>) -> Result<()>,
+    G: FnMut(),
 {
     // Production supplies a no-op. Tests use this seam to append orient-state
-    // immediately after the wait has frozen its baseline/head, without a
-    // scheduler race or arbitrary thread sleep.
+    // immediately after the wait has frozen its baseline/head, or count/delay
+    // full refreshes, without a scheduler race.
     let (message_limit, doing_limit, todo_limit) = limits;
     let timeout = parse_wait_target(target.as_ref())?;
     let (detected_change_before_wait, changed, news_printed) = with_repo(pile, move |repo| {
@@ -2409,27 +2518,29 @@ where
         after_baseline(repo)?;
 
         let poll = Duration::from_millis(poll_ms.max(1));
+        // Sample wall time first so mapping a wall-clock review deadline onto
+        // the monotonic wait timeline is conservative rather than early.
+        let wait_start_wall = interval_key(epoch_interval(now_epoch()));
         let start = Instant::now();
+        let mut pending_semantic_boundary = None;
 
         loop {
-            let timeout_remaining = timeout.map(|limit| limit.saturating_sub(start.elapsed()));
-            let now = interval_key(epoch_interval(now_epoch()));
             let review_deadline = baseline_view
                 .as_ref()
                 .and_then(|baseline| baseline.next_review_deadline);
-            let step = plan_wait_step(poll, timeout_remaining, now, review_deadline);
+            let semantic_boundary = earlier_semantic_boundary(
+                pending_semantic_boundary,
+                earliest_semantic_boundary(timeout, wait_start_wall, review_deadline),
+            );
+            let step = plan_wait_step_for_boundary(poll, start.elapsed(), semantic_boundary);
             if !step.delay.is_zero() {
                 std::thread::sleep(step.delay);
             }
-            let timeout_due = timeout.is_some_and(|limit| start.elapsed() >= limit);
-            let now = interval_key(epoch_interval(now_epoch()));
-            let review_deadline_due = baseline_view
-                .as_ref()
-                .and_then(|baseline| baseline.next_review_deadline)
-                .is_some_and(|deadline| now > deadline);
-            if due_wait_boundary(step, timeout_due, review_deadline_due)
-                == Some(WaitBoundary::Timeout)
-            {
+            let evaluation_elapsed = start.elapsed();
+            let evaluation_now = interval_key(epoch_interval(now_epoch()));
+            let due_at_evaluation =
+                due_wait_boundary(step.semantic_boundary, evaluation_elapsed);
+            if due_at_evaluation == Some(WaitBoundary::Timeout) {
                 return Ok((false, false, false));
             }
             let current_heads = load_watched_heads(
@@ -2439,32 +2550,54 @@ where
                 relations_branch_id,
             )?;
             let current_orient_head = if persona_id.is_some() {
-                branch_head_by_id(repo, orient_state_branch_id)?
+                branch_commit_head_by_id(repo, orient_state_branch_id)?
             } else {
                 None
             };
             let orient_state_changed = current_orient_head != baseline_orient_head;
             if current_heads == baseline_heads
-                && !review_deadline_due
+                && due_at_evaluation != Some(WaitBoundary::ReviewDeadline)
                 && !orient_state_changed
             {
+                if due_wait_boundary(step.semantic_boundary, start.elapsed())
+                    == Some(WaitBoundary::Timeout)
+                {
+                    return Ok((false, false, false));
+                }
                 continue;
             }
             match (persona_id, baseline_view.as_mut()) {
                 (Some(pid), Some(baseline)) => {
+                    before_refresh();
                     let LoadedWatchedView {
                         view: current_view,
                         orient_state_head,
                         review_watermark_ids,
                         next_review_deadline,
-                    } = load_watched_snapshot(
+                    } = load_watched_snapshot_at(
                         repo,
                         pid,
                         local_branch_id,
                         compass_branch_id,
                         relations_branch_id,
                         orient_state_branch_id,
+                        evaluation_now,
                     )?;
+                    // Keep the boundary that caused this iteration even when
+                    // expiry removes its deadline from the refreshed view. A
+                    // newly acquired deadline may be earlier, so merge it onto
+                    // the same absolute monotonic timeline.
+                    let refreshed_boundary = earliest_semantic_boundary(
+                        timeout,
+                        wait_start_wall,
+                        next_review_deadline,
+                    );
+                    let iteration_boundary = earlier_semantic_boundary(
+                        step.semantic_boundary,
+                        refreshed_boundary,
+                    );
+                    let boundary_at_evaluation =
+                        due_wait_boundary(iteration_boundary, evaluation_elapsed);
                     let report = view_news_report(&baseline.view, &current_view, pid);
                     if !report.is_empty() {
                         for reason in report.reasons() {
@@ -2497,18 +2630,42 @@ where
                     // removal followed by a restart and re-add still wakes.
                     let mut refreshed_orient_head = orient_state_head;
                     if baseline.view != current_view {
-                        refreshed_orient_head = save_checkpoint_heads(
+                        let saved = save_checkpoint_heads(
                             repo,
                             orient_state_branch_id,
                             &current_heads,
                             Some((pid, &current_view)),
                         )?;
+                        refreshed_orient_head =
+                            head_after_checkpoint(refreshed_orient_head, saved);
                     }
                     baseline_heads = current_heads;
                     baseline_orient_head = refreshed_orient_head;
                     baseline.view = current_view;
                     baseline.orient_state_head = refreshed_orient_head;
                     baseline.next_review_deadline = next_review_deadline;
+
+                    // Work above may cross both boundaries. Preserve their
+                    // absolute order through refresh, filtering, and checkpoint.
+                    match due_wait_boundary(iteration_boundary, start.elapsed()) {
+                        Some(WaitBoundary::Timeout) => {
+                            return Ok((false, false, false));
+                        }
+                        Some(WaitBoundary::ReviewDeadline) => {
+                            // The captured snapshot remains a valid logical
+                            // pre-expiry state. Persist that quiet transition,
+                            // then carry the review-first edge until a snapshot
+                            // is evaluated on its far side.
+                            pending_semantic_boundary = if boundary_at_evaluation
+                                == Some(WaitBoundary::ReviewDeadline)
+                            {
+                                None
+                            } else {
+                                iteration_boundary
+                            };
+                        }
+                        None => pending_semantic_boundary = None,
+                    }
                 }
                 _ => return Ok((false, true, false)),
             }
@@ -3236,100 +3393,178 @@ mod tests {
     fn wait_planner_respects_inclusive_deadlines_and_timeout_order() {
         let poll = Duration::from_secs(10);
 
-        let at_equality = plan_wait_step(poll, None, 100, Some(100));
+        let at_equality = plan_wait_step(poll, Duration::ZERO, None, 100, Some(100));
         assert_eq!(
             at_equality.semantic_boundary,
-            Some(WaitBoundary::ReviewDeadline)
+            Some(SemanticBoundary {
+                at: Duration::from_nanos(1),
+                kind: WaitBoundary::ReviewDeadline,
+            })
         );
         assert_eq!(at_equality.delay, Duration::from_nanos(1));
         assert!(!at_equality.delay.is_zero(), "deadline equality must not spin");
 
         assert_eq!(
-            plan_wait_step(poll, None, 101, Some(100)),
+            plan_wait_step(poll, Duration::ZERO, None, 101, Some(100)),
             WaitStep {
                 delay: Duration::ZERO,
-                semantic_boundary: Some(WaitBoundary::ReviewDeadline),
+                semantic_boundary: Some(SemanticBoundary {
+                    at: Duration::ZERO,
+                    kind: WaitBoundary::ReviewDeadline,
+                }),
             }
         );
         assert_eq!(
-            plan_wait_step(poll, Some(Duration::from_secs(5)), 0, Some(999)),
+            plan_wait_step(
+                poll,
+                Duration::ZERO,
+                Some(Duration::from_secs(5)),
+                0,
+                Some(999),
+            ),
             WaitStep {
                 delay: Duration::from_nanos(1_000),
-                semantic_boundary: Some(WaitBoundary::ReviewDeadline),
+                semantic_boundary: Some(SemanticBoundary {
+                    at: Duration::from_nanos(1_000),
+                    kind: WaitBoundary::ReviewDeadline,
+                }),
             },
             "a deadline before both coarse poll and timeout wins"
         );
         assert_eq!(
             plan_wait_step(
                 poll,
+                Duration::ZERO,
                 Some(Duration::from_nanos(500)),
                 0,
                 Some(999),
             ),
             WaitStep {
                 delay: Duration::from_nanos(500),
-                semantic_boundary: Some(WaitBoundary::Timeout),
+                semantic_boundary: Some(SemanticBoundary {
+                    at: Duration::from_nanos(500),
+                    kind: WaitBoundary::Timeout,
+                }),
             },
             "an earlier timeout wins"
         );
         assert_eq!(
             plan_wait_step(
                 poll,
+                Duration::ZERO,
                 Some(Duration::from_nanos(1_000)),
                 0,
                 Some(999),
             )
             .semantic_boundary,
-            Some(WaitBoundary::Timeout),
+            Some(SemanticBoundary {
+                at: Duration::from_nanos(1_000),
+                kind: WaitBoundary::Timeout,
+            }),
             "timeout wins the exact tie because the snooze is quiet through equality"
         );
     }
 
     #[test]
-    fn poll_overshoot_dispatches_the_saved_semantic_order() {
+    fn slow_iteration_dispatches_the_absolute_semantic_order() {
         let poll = Duration::from_nanos(10);
+        let finished_after_both = Duration::from_nanos(40);
 
         let timeout_first = plan_wait_step(
             poll,
+            Duration::ZERO,
             Some(Duration::from_nanos(20)),
             0,
             Some(29),
         );
         assert_eq!(timeout_first.delay, poll, "Poll is the immediate edge");
         assert_eq!(
-            due_wait_boundary(timeout_first, true, true),
+            due_wait_boundary(
+                earlier_semantic_boundary(
+                    timeout_first.semantic_boundary,
+                    earliest_semantic_boundary(Some(Duration::from_nanos(20)), 0, None),
+                ),
+                finished_after_both,
+            ),
             Some(WaitBoundary::Timeout),
-            "a Poll overshoot must not let the later review edge mask timeout"
+            "slow post-Poll work must not let the later review edge mask timeout"
         );
 
         let review_first = plan_wait_step(
             poll,
+            Duration::ZERO,
             Some(Duration::from_nanos(30)),
             0,
             Some(19),
         );
         assert_eq!(review_first.delay, poll, "Poll is the immediate edge");
         assert_eq!(
-            due_wait_boundary(review_first, true, true),
+            due_wait_boundary(
+                earlier_semantic_boundary(
+                    review_first.semantic_boundary,
+                    earliest_semantic_boundary(Some(Duration::from_nanos(30)), 0, None),
+                ),
+                finished_after_both,
+            ),
             Some(WaitBoundary::ReviewDeadline),
-            "a Poll overshoot must not let the later timeout mask review"
+            "expiry removing the deadline must not let the later timeout mask review"
         );
 
         let exact_tie = plan_wait_step(
             poll,
+            Duration::ZERO,
             Some(Duration::from_nanos(20)),
             0,
             Some(19),
         );
         assert_eq!(exact_tie.delay, poll, "Poll is the immediate edge");
         assert_eq!(
-            due_wait_boundary(exact_tie, true, true),
+            due_wait_boundary(
+                earlier_semantic_boundary(
+                    exact_tie.semantic_boundary,
+                    earliest_semantic_boundary(Some(Duration::from_nanos(20)), 0, None),
+                ),
+                finished_after_both,
+            ),
             Some(WaitBoundary::Timeout),
             "timeout wins an exact semantic tie"
         );
     }
 
-    fn run_post_baseline_snooze_case(initial_snooze: bool) {
+    #[test]
+    fn deadline_acquired_during_slow_refresh_keeps_absolute_order() {
+        let finished_after_both = Duration::from_nanos(40);
+        let initial = earliest_semantic_boundary(Some(Duration::from_nanos(30)), 0, None);
+
+        let review_first = earlier_semantic_boundary(
+            initial,
+            earliest_semantic_boundary(Some(Duration::from_nanos(30)), 0, Some(19)),
+        );
+        assert_eq!(
+            due_wait_boundary(review_first, finished_after_both),
+            Some(WaitBoundary::ReviewDeadline)
+        );
+
+        let timeout_first = earlier_semantic_boundary(
+            earliest_semantic_boundary(Some(Duration::from_nanos(20)), 0, None),
+            earliest_semantic_boundary(Some(Duration::from_nanos(20)), 0, Some(29)),
+        );
+        assert_eq!(
+            due_wait_boundary(timeout_first, finished_after_both),
+            Some(WaitBoundary::Timeout)
+        );
+
+        let exact_tie = earlier_semantic_boundary(
+            earliest_semantic_boundary(Some(Duration::from_nanos(20)), 0, None),
+            earliest_semantic_boundary(Some(Duration::from_nanos(20)), 0, Some(19)),
+        );
+        assert_eq!(
+            due_wait_boundary(exact_tie, finished_after_both),
+            Some(WaitBoundary::Timeout)
+        );
+    }
+
+    fn run_post_baseline_snooze_case(initial_snooze: bool, slow_acquisition: bool) {
         let mut fixture = review_fixture(false);
         let initial_deadline = initial_snooze.then(|| {
             now_epoch() + hifitime::Duration::from_total_nanoseconds(3_000_000_000)
@@ -3386,20 +3621,26 @@ mod tests {
 
         let persona = fmt_id(fixture.persona);
         let mut injected = None;
+        let mut delay_first_refresh = slow_acquisition;
         let started = Instant::now();
         cmd_wait_inner(
             &fixture.path,
             Some(&persona),
             Some(WaitTarget::For {
-                duration: "2s".to_string(),
+                duration: if slow_acquisition { "200ms" } else { "2s" }.to_string(),
             }),
             (1, 1, 1),
             20,
             |repo| {
                 // This runs after cmd_wait has captured a quiet baseline and
                 // its exact orient-state head. No semantic branch moves.
-                let deadline =
-                    now_epoch() + hifitime::Duration::from_total_nanoseconds(400_000_000);
+                let deadline_ns = if slow_acquisition {
+                    100_000_000
+                } else {
+                    400_000_000
+                };
+                let deadline = now_epoch()
+                    + hifitime::Duration::from_total_nanoseconds(deadline_ns);
                 injected = Some(write_test_watermark(
                     repo,
                     fixture.orient_branch,
@@ -3410,16 +3651,25 @@ mod tests {
                 ));
                 Ok(())
             },
+            || {
+                if std::mem::take(&mut delay_first_refresh) {
+                    // Cross both the newly acquired 100ms review edge and the
+                    // 200ms timeout while filtering at the captured wake time.
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            },
         )
         .expect("post-baseline snooze wakes at its acquired deadline");
         let elapsed = started.elapsed();
+        let lower = if slow_acquisition { 250 } else { 100 };
+        let upper = if slow_acquisition { 1_000 } else { 1_500 };
         assert!(
-            elapsed >= Duration::from_millis(100),
+            elapsed >= Duration::from_millis(lower),
             "a live snooze must not surface immediately: {elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_millis(1_500),
-            "the injected 400ms deadline must beat the 2s timeout: {elapsed:?}"
+            elapsed < Duration::from_millis(upper),
+            "the review-first deadline must beat timeout: {elapsed:?}"
         );
 
         fixture.repo = open_repo(&fixture.path).expect("reopen post-baseline fixture");
@@ -3450,12 +3700,84 @@ mod tests {
 
     #[test]
     fn snooze_appended_after_deadline_free_baseline_is_acquired_and_wakes() {
-        run_post_baseline_snooze_case(false);
+        run_post_baseline_snooze_case(false, false);
     }
 
     #[test]
     fn shortened_snooze_appended_after_baseline_replaces_the_wait_plan() {
-        run_post_baseline_snooze_case(true);
+        run_post_baseline_snooze_case(true, false);
+    }
+
+    #[test]
+    fn newly_acquired_review_first_deadline_survives_slow_filtering() {
+        run_post_baseline_snooze_case(false, true);
+    }
+
+    #[test]
+    fn unchanged_commit_head_after_quiet_save_does_not_refresh_again() {
+        let mut fixture = review_fixture(false);
+        let baseline = load_watched_snapshot(
+            &mut fixture.repo,
+            fixture.persona,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+            fixture.orient_branch,
+        )
+        .expect("load visible review baseline");
+        assert!(baseline
+            .view
+            .goals_view
+            .contains(&format!("{:x}@", fixture.request)));
+        let semantic_heads = load_watched_heads(
+            &mut fixture.repo,
+            fixture.local_branch,
+            fixture.compass_branch,
+            fixture.relations_branch,
+        )
+        .expect("quiescence semantic heads");
+        save_checkpoint_heads(
+            &mut fixture.repo,
+            fixture.orient_branch,
+            &semantic_heads,
+            Some((fixture.persona, &baseline.view)),
+        )
+        .expect("save visible baseline");
+        fixture.repo.close().expect("close quiescence fixture");
+
+        let persona = fmt_id(fixture.persona);
+        let mut refreshes = 0usize;
+        cmd_wait_inner(
+            &fixture.path,
+            Some(&persona),
+            Some(WaitTarget::For {
+                duration: "150ms".to_string(),
+            }),
+            (1, 1, 1),
+            20,
+            |repo| {
+                // A post-baseline plain ack makes the view quietly remove the
+                // assignment, so the first refresh writes a new checkpoint.
+                write_test_watermark(
+                    repo,
+                    fixture.orient_branch,
+                    fixture.persona,
+                    fixture.request,
+                    None,
+                    &[],
+                );
+                Ok(())
+            },
+            || refreshes += 1,
+        )
+        .expect("quiet checkpoint wait reaches timeout");
+        assert_eq!(
+            refreshes, 1,
+            "the saved workspace commit head must quiesce subsequent polls"
+        );
+
+        fixture.repo = open_repo(&fixture.path).expect("reopen quiescence fixture");
+        remove_fixture(fixture);
     }
 
     #[test]
@@ -3744,6 +4066,7 @@ mod tests {
             fixture.compass_branch,
             fixture.relations_branch,
             fixture.orient_branch,
+            interval_key(epoch_interval(now_epoch())),
             |repo| {
                 // This seam runs after the watcher read orient-state but before
                 // it pulls Compass. The writer advances Compass H1 -> H2 first,
@@ -3875,7 +4198,8 @@ mod tests {
         };
         let mut injected = false;
 
-        save_checkpoint_inner(
+        let observed_orient_head = None;
+        let saved = save_checkpoint_inner(
             &mut repo,
             orient_branch,
             &watched_heads,
@@ -3910,6 +4234,11 @@ mod tests {
         )
         .expect("checkpoint retry preserves explicit snooze");
         assert!(injected, "the test must force the conflict seam");
+        assert_eq!(
+            head_after_checkpoint(observed_orient_head, saved),
+            observed_orient_head,
+            "an intervening explicit commit must remain a scheduler invalidation"
+        );
 
         let watermark = load_review_watermarks(&mut repo, orient_branch, persona)
             .expect("load watermarks")
