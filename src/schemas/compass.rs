@@ -5,6 +5,7 @@
 //! read compass boards from a pile (the playground dashboard, the pile
 //! inspector notebook, etc.).
 
+use crate::schemas::relations::head_members;
 use std::collections::{BTreeSet, HashSet};
 use triblespace::core::metadata;
 use triblespace::macros::{find, id_hex, pattern};
@@ -80,8 +81,18 @@ pub mod review {
     attributes! {
         /// Attestation/override/settlement -> immutable review request.
         "7DDEFBFDB2BC2EED08E31A4EE01699DD" as request: inlineencodings::GenId;
-        /// Frozen required reviewer roster on a request (repeated).
+        /// Frozen required reviewer roster on a request (repeated). Legacy
+        /// requests (and, as a snapshot, all requests) carry this; the gate
+        /// prefers the live `group` roster below when present.
         "8070093BBD38BD6A06D5078D01BF2C18" as required: inlineencodings::GenId;
+        /// Live roster source: the relations group anchor whose CURRENT head
+        /// snapshot resolves this request's reviewers at gate time. When
+        /// present, the gate ignores the frozen `required` snapshot and
+        /// resolves the group's current members live, so removing a member
+        /// unblocks the request with no supersede-for-reroster. Written as an
+        /// extra fact outside the sealed fragment, so adding it never
+        /// invalidates an existing request.
+        "159A8189CD8DAA0098A250B3DE5BBBBB" as group: inlineencodings::GenId;
         /// Frozen break-glass authority roster on a request (repeated).
         "8079D8E6C5F8DC92EF3DFF7111CF7612" as override_authority: inlineencodings::GenId;
         /// approve | request-changes | abstain.
@@ -250,6 +261,10 @@ pub struct ReviewRequest {
     pub supersedes: Vec<Id>,
     pub roster_predecessors: Vec<Id>,
     pub created_at: Vec<IntervalValue>,
+    /// Live roster source (relations group anchor), if this request records
+    /// one. Deliberately NOT part of `canonical_id` — it is an extra fact, so
+    /// it never invalidates a request and the gate can prefer it at eval time.
+    pub groups: Vec<Id>,
 }
 
 impl ReviewRequest {
@@ -263,6 +278,11 @@ impl ReviewRequest {
 
     pub fn target(&self) -> Option<TextHandle> {
         exactly_one(&self.targets)
+    }
+
+    /// The live-roster group anchor this request records, if any.
+    pub fn group(&self) -> Option<Id> {
+        self.groups.first().copied()
     }
 
     fn canonical_id(&self) -> Option<Id> {
@@ -616,6 +636,9 @@ pub fn review_request(space: &TribleSet, request_id: Id) -> Option<ReviewRequest
     let roster_predecessors = sorted_unique(
         find!(v: Id, pattern!(space, [{ request_id @ review::roster_predecessor: ?v }])).collect(),
     );
+    let groups = sorted_unique(
+        find!(v: Id, pattern!(space, [{ request_id @ review::group: ?v }])).collect(),
+    );
     let created_at = sorted_unique(
         find!(v: IntervalValue, pattern!(space, [{ request_id @ metadata::created_at: ?v }]))
             .collect(),
@@ -632,6 +655,7 @@ pub fn review_request(space: &TribleSet, request_id: Id) -> Option<ReviewRequest
         supersedes,
         roster_predecessors,
         created_at,
+        groups,
     })
 }
 
@@ -1192,12 +1216,47 @@ fn status_event_is_predecessor_of_request(
 /// not retroactively invalidate a frozen roster or its historical evidence.
 /// Keeping it explicit makes the projection deterministic for one pair of
 /// Compass/Relations snapshots and avoids consulting mutable group membership.
+/// Frozen-roster evaluation: uses the request's sealed `required`. Used by
+/// tests and any caller without a relations snapshot at hand.
 pub fn evaluate_request(
     space: &TribleSet,
     request_id: Id,
     known_people: &HashSet<Id>,
 ) -> Option<ReviewEvaluation> {
+    evaluate_request_inner(space, request_id, known_people, None)
+}
+
+/// Live-roster evaluation: when the request records a `review::group` anchor,
+/// resolves that group's CURRENT head members from `relations_space` as the
+/// effective roster, so removing a member unblocks the request with no
+/// supersede-for-reroster. Falls back to the frozen roster otherwise.
+pub fn evaluate_request_live(
+    space: &TribleSet,
+    request_id: Id,
+    known_people: &HashSet<Id>,
+    relations_space: &TribleSet,
+) -> Option<ReviewEvaluation> {
+    evaluate_request_inner(space, request_id, known_people, Some(relations_space))
+}
+
+fn evaluate_request_inner(
+    space: &TribleSet,
+    request_id: Id,
+    known_people: &HashSet<Id>,
+    relations_space: Option<&TribleSet>,
+) -> Option<ReviewEvaluation> {
     let request = review_request(space, request_id)?;
+    // Identity + supersede-protocol checks use the FROZEN sealed roster.
+    let canonical_ok = request.is_canonical();
+    let roster_reasons = roster_successor_invalid_reasons(space, &request, known_people);
+    // Level B live roster: if the request records a group anchor AND a relations
+    // snapshot is supplied, resolve that group's CURRENT head members as the
+    // effective roster; otherwise keep the frozen `required`.
+    let mut request = request;
+    if let (Some(relations_space), Some(group)) = (relations_space, request.group()) {
+        request.required =
+            sorted_unique(head_members(relations_space, group).into_iter().collect());
+    }
     let settlements = valid_settlements(space, &request);
     let mut invalid = Vec::new();
     if !request.tags.contains(&KIND_STATUS_ID)
@@ -1217,14 +1276,10 @@ pub fn evaluate_request(
     if request.created_at.len() != 1 {
         invalid.push("request must have exactly one creation time".to_string());
     }
-    if !request.is_canonical() {
+    if !canonical_ok {
         invalid.push("request id does not seal its proof-defining fields".to_string());
     }
-    invalid.extend(roster_successor_invalid_reasons(
-        space,
-        &request,
-        known_people,
-    ));
+    invalid.extend(roster_reasons);
     if let Some(goal) = request.goal() {
         if !exists!(pattern!(space, [{ goal @ metadata::tag: &KIND_GOAL_ID }])) {
             invalid.push("request must name an entity tagged as a goal".to_string());
@@ -1375,7 +1430,7 @@ pub fn evaluate_goal(
 ) -> ReviewProjection {
     match active_request_ids_for_goal(space, goal_id).as_slice() {
         [] => ReviewProjection::Unbound,
-        [request_id] => evaluate_request(space, *request_id, known_people)
+        [request_id] => evaluate_request_inner(space, *request_id, known_people, None)
             .map(ReviewProjection::Bound)
             .unwrap_or(ReviewProjection::Unbound),
         request_ids => ReviewProjection::Forked {
@@ -1555,6 +1610,49 @@ mod tests {
 
     fn pair_fixture() -> (TribleSet, Id, [Id; 2], Id, HashSet<Id>) {
         fixture_with_reviewers()
+    }
+
+    #[test]
+    fn live_group_roster_resolves_current_members_not_the_frozen_snapshot() {
+        use crate::schemas::relations::{group as rel_group, KIND_GROUP as REL_KIND_GROUP};
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let request = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:live-roster",
+        );
+        // Record a live-roster group anchor on the request (extra fact, so it
+        // does not disturb the sealed identity).
+        let group = ufoid().id;
+        space += entity! { ExclusiveId::force_ref(&request) @ review::group: &group };
+
+        // Frozen path: the sealed roster is all three reviewers.
+        let frozen = evaluate_request(&space, request, &known).unwrap();
+        assert_eq!(frozen.request.required, sorted_unique(reviewers.to_vec()));
+
+        // Relations snapshot: the group's head lists only the first two
+        // reviewers (the third was removed from the group).
+        let snapshot = ufoid().id;
+        let mut relations_space = TribleSet::new();
+        relations_space +=
+            entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
+        relations_space += entity! { ExclusiveId::force_ref(&snapshot) @
+            rel_group::snapshot_of: &group,
+            rel_group::member: reviewers[0],
+            rel_group::member: reviewers[1],
+        };
+
+        // Live path: the effective roster is the group's CURRENT head = {r0, r1}.
+        let live = evaluate_request_live(&space, request, &known, &relations_space).unwrap();
+        assert_eq!(
+            live.request.required,
+            sorted_unique(vec![reviewers[0], reviewers[1]])
+        );
+        assert!(!live.request.required.contains(&reviewers[2]));
     }
 
     #[test]

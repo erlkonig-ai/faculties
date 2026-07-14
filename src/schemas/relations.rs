@@ -35,25 +35,14 @@ pub mod group {
     use super::*;
     attributes! {
         // Membership edge: group -> member (a person/window id). Repeated.
+        // On a snapshot entity this is the FULL member set at that version.
         "EF5B6F8429FA30D503BA8B8F3ABD5FD9" as member: inlineencodings::GenId;
+        // Anchor edge: snapshot -> its stable group anchor id. The current
+        // group state is the snapshot of an anchor that nothing supersedes
+        // (via `metadata::supersedes`). Name + members live on the snapshot,
+        // so both version on rename/add/remove.
+        "D944552B560826095BCEAFDAACE6DF66" as snapshot_of: inlineencodings::GenId;
     }
-}
-
-/// Return every directly-addressable group that contains `member`.
-///
-/// Message readers use this alongside the member's own id so broadcast
-/// delivery, unread state, and watcher wakeups all share the same recipient
-/// semantics.
-pub fn groups_for_member(space: &TribleSet, member: Id) -> HashSet<Id> {
-    find!(
-        group_id: Id,
-        pattern!(space, [{
-            ?group_id @
-                metadata::tag: &KIND_GROUP,
-                group::member: member,
-        }])
-    )
-    .collect()
 }
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -61,6 +50,70 @@ type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 fn interval_key(interval: IntervalValue) -> i128 {
     let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
     lower
+}
+
+/// Creation time of a snapshot (nanosecond lower bound), or `i128::MIN` if
+/// unstamped. Used only as a deterministic tie-break between concurrent
+/// un-superseded heads.
+fn snapshot_created_at(space: &TribleSet, snapshot: Id) -> i128 {
+    find!(
+        at: IntervalValue,
+        pattern!(space, [{ snapshot @ metadata::created_at: ?at }])
+    )
+    .map(interval_key)
+    .max()
+    .unwrap_or(i128::MIN)
+}
+
+/// The current head snapshot of a group `anchor`: the snapshot of `anchor`
+/// that nothing supersedes.
+///
+/// Head resolution is non-monotonic ("nothing supersedes it"), so it is
+/// computed here at the periphery over the append-only `metadata::supersedes`
+/// DAG — never a stored "latest" pointer and never a monotonic pattern (the
+/// engine cannot express negation). This is exactly why the supersedes model
+/// is merge-safe: the facts stay append-only, so a merge only unions edges;
+/// the head is recomputed at read time. Concurrent edits can leave more than
+/// one un-superseded head (an honest fork); we pick the latest by
+/// `created_at` as a deterministic tie-break, leaving both visible in history
+/// for later reconciliation.
+pub fn head_snapshot_of(space: &TribleSet, anchor: Id) -> Option<Id> {
+    let snapshots: HashSet<Id> =
+        find!(s: Id, pattern!(space, [{ ?s @ group::snapshot_of: anchor }])).collect();
+    let superseded: HashSet<Id> = find!(
+        old: Id,
+        pattern!(space, [{ _?newer @ group::snapshot_of: anchor, metadata::supersedes: ?old }])
+    )
+    .collect();
+    snapshots
+        .into_iter()
+        .filter(|s| !superseded.contains(s))
+        .max_by_key(|&s| snapshot_created_at(space, s))
+}
+
+/// Current members of a group `anchor` = the members of its head snapshot.
+pub fn head_members(space: &TribleSet, anchor: Id) -> HashSet<Id> {
+    match head_snapshot_of(space, anchor) {
+        Some(head) => {
+            find!(m: Id, pattern!(space, [{ head @ group::member: ?m }])).collect()
+        }
+        None => HashSet::new(),
+    }
+}
+
+/// Return every directly-addressable group whose CURRENT membership (its head
+/// snapshot) contains `member`.
+///
+/// Message readers use this alongside the member's own id so broadcast
+/// delivery, unread state, and watcher wakeups all share the same recipient
+/// semantics.
+pub fn groups_for_member(space: &TribleSet, member: Id) -> HashSet<Id> {
+    find!(
+        anchor: Id,
+        pattern!(space, [{ ?anchor @ metadata::tag: &KIND_GROUP }])
+    )
+    .filter(|&anchor| head_members(space, anchor).contains(&member))
+    .collect()
 }
 
 /// People whose latest retirement event says retired.
@@ -177,20 +230,28 @@ mod tests {
         let member = ufoid().id;
         let other_member = ufoid().id;
         let first_group = ufoid().id;
+        let first_snap = ufoid().id;
         let second_group = ufoid().id;
+        let second_snap = ufoid().id;
         let non_group = ufoid().id;
+        let non_snap = ufoid().id;
         let mut space = TribleSet::new();
 
-        space += entity! { ExclusiveId::force_ref(&first_group) @
-            metadata::tag: &KIND_GROUP,
+        // Anchors carry only the KIND_GROUP tag; members live on the head snapshot.
+        space += entity! { ExclusiveId::force_ref(&first_group) @ metadata::tag: &KIND_GROUP };
+        space += entity! { ExclusiveId::force_ref(&first_snap) @
+            group::snapshot_of: &first_group,
             group::member: member,
         };
-        space += entity! { ExclusiveId::force_ref(&second_group) @
-            metadata::tag: &KIND_GROUP,
+        space += entity! { ExclusiveId::force_ref(&second_group) @ metadata::tag: &KIND_GROUP };
+        space += entity! { ExclusiveId::force_ref(&second_snap) @
+            group::snapshot_of: &second_group,
             group::member: member,
             group::member: other_member,
         };
-        space += entity! { ExclusiveId::force_ref(&non_group) @
+        // Not a group (no KIND_GROUP tag) even though its snapshot lists the member.
+        space += entity! { ExclusiveId::force_ref(&non_snap) @
+            group::snapshot_of: &non_group,
             group::member: member,
         };
 
@@ -202,6 +263,34 @@ mod tests {
             groups_for_member(&space, other_member),
             HashSet::from([second_group])
         );
+    }
+
+    #[test]
+    fn head_members_follows_the_unsuperseded_snapshot() {
+        let anchor = ufoid().id;
+        let m1 = ufoid().id;
+        let m2 = ufoid().id;
+        let s0 = ufoid().id;
+        let s1 = ufoid().id;
+        let mut space = TribleSet::new();
+        space += entity! { ExclusiveId::force_ref(&anchor) @ metadata::tag: &KIND_GROUP };
+        // s0 = {m1, m2}; s1 supersedes s0 with m2 removed (a `remove`).
+        space += entity! { ExclusiveId::force_ref(&s0) @
+            group::snapshot_of: &anchor,
+            group::member: m1,
+            group::member: m2,
+        };
+        space += entity! { ExclusiveId::force_ref(&s1) @
+            group::snapshot_of: &anchor,
+            group::member: m1,
+            metadata::supersedes: &s0,
+        };
+        // Head = s1 (nothing supersedes it); current members = {m1}, not {m1, m2}.
+        assert_eq!(head_snapshot_of(&space, anchor), Some(s1));
+        assert_eq!(head_members(&space, anchor), HashSet::from([m1]));
+        assert!(!head_members(&space, anchor).contains(&m2));
+        assert_eq!(groups_for_member(&space, m1), HashSet::from([anchor]));
+        assert!(groups_for_member(&space, m2).is_empty());
     }
 
     #[test]

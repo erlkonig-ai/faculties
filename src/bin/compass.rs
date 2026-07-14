@@ -4,7 +4,7 @@ use ed25519_dalek::SigningKey;
 use faculties::schemas::compass::{
     active_attestation_ids_for_reviewer, active_request_ids_for_goal,
     all_attestation_ids_for_reviewer, all_request_ids_for_goal, board, evaluate_goal,
-    evaluate_request, latest_status_event, review_attestation_fragment,
+    evaluate_request_live, latest_status_event, review, review_attestation_fragment,
     review_attestation_settlement_fragment, review_override_fragment,
     review_override_settlement_fragment, review_request, review_request_fragment,
     review_roster_successor_fragment, ReviewEvaluation, ReviewGateState, ReviewProjection,
@@ -13,7 +13,8 @@ use faculties::schemas::compass::{
     VERDICT_ABSTAIN, VERDICT_APPROVE, VERDICT_REQUEST_CHANGES,
 };
 use faculties::schemas::relations::{
-    active_person_ids, group, person_ids, relations as rel_attrs, KIND_GROUP, KIND_PERSON_ID,
+    active_person_ids, head_members, head_snapshot_of, person_ids, relations as rel_attrs,
+    KIND_GROUP, KIND_PERSON_ID,
 };
 use faculties::schemas::orient::{orient_state, KIND_REVIEW_WATERMARK_ID};
 use hifitime::Epoch;
@@ -840,14 +841,14 @@ fn resolve_group_id(space: &TribleSet, input: &str) -> Result<Id> {
         bail!("'{trimmed}' is not a relations group");
     }
     let key = trimmed.to_ascii_lowercase();
-    let mut matches: Vec<Id> = find!(
-        id: Id,
-        pattern!(space, [{ ?id @
-            metadata::tag: &KIND_GROUP,
-            rel_attrs::label_norm: key.as_str(),
-        }])
-    )
-    .collect();
+    // Name resolves through the head snapshot (a rename supersedes the old name).
+    let mut matches: Vec<Id> = find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_GROUP }]))
+        .filter(|&id| {
+            head_snapshot_of(space, id).is_some_and(|head| {
+                exists!(pattern!(space, [{ head @ rel_attrs::label_norm: key.as_str() }]))
+            })
+        })
+        .collect();
     matches.sort();
     matches.dedup();
     match matches.as_slice() {
@@ -1386,9 +1387,9 @@ fn cmd_review_open(
         let author = resolve_active_person(&relations_space, &active_people, persona)?;
 
         let group_id = resolve_group_id(&relations_space, &review_group)?;
-        let mut required =
-            find!(member: Id, pattern!(&relations_space, [{ group_id @ group::member: ?member }]))
-                .collect::<Vec<_>>();
+        // Freeze the CURRENT roster: the members of the group's head snapshot
+        // (not stale anchor-direct edges).
+        let mut required: Vec<Id> = head_members(&relations_space, group_id).into_iter().collect();
         required.sort();
         required.dedup();
         validate_frozen_review_roster(&required, author, &active_people)?;
@@ -1435,7 +1436,7 @@ fn cmd_review_open(
 
             if !same_target_heads.is_empty() {
                 if let ([head], [existing]) = (heads.as_slice(), parsed_heads.as_slice()) {
-                    let structurally_current = evaluate_request(&space, *head, &known_people)
+                    let structurally_current = evaluate_request_live(&space, *head, &known_people, &relations_space)
                         .is_some_and(|evaluation| {
                             !matches!(evaluation.state, ReviewGateState::Invalid { .. })
                         });
@@ -1465,7 +1466,7 @@ fn cmd_review_open(
             }
 
             if let ([head], [existing]) = (heads.as_slice(), parsed_heads.as_slice()) {
-                let structurally_current = evaluate_request(&space, *head, &known_people)
+                let structurally_current = evaluate_request_live(&space, *head, &known_people, &relations_space)
                     .is_some_and(|evaluation| {
                         !matches!(evaluation.state, ReviewGateState::Invalid { .. })
                     });
@@ -1496,6 +1497,11 @@ fn cmd_review_open(
             let mut change = TribleSet::new();
             change += ensure_kind_entities(&mut ws)?;
             change += request;
+            // Level B: record the live-roster group anchor as an extra fact
+            // (outside the sealed fragment) so the gate resolves the group's
+            // CURRENT members at eval time. Removing a member then unblocks
+            // this request with no supersede-for-reroster.
+            change += entity! { ExclusiveId::force_ref(&request_id) @ review::group: &group_id };
             ws.commit(change, "open review request");
             match repo
                 .try_push(&mut ws)
@@ -1536,11 +1542,7 @@ fn cmd_review_supersede(
         let known_people = person_ids(&relations_space);
         let actor = resolve_active_person(&relations_space, &active_people, persona)?;
         let group_id = resolve_group_id(&relations_space, &review_group)?;
-        let mut required = find!(
-            member: Id,
-            pattern!(&relations_space, [{ group_id @ group::member: ?member }])
-        )
-        .collect::<Vec<_>>();
+        let mut required: Vec<Id> = head_members(&relations_space, group_id).into_iter().collect();
         required.sort();
         required.dedup();
 
@@ -1562,7 +1564,7 @@ fn cmd_review_supersede(
                     "review request {predecessor_id:x} is not the unique current review head"
                 );
             }
-            let evaluation = evaluate_request(&space, predecessor_id, &known_people)
+            let evaluation = evaluate_request_live(&space, predecessor_id, &known_people, &relations_space)
                 .ok_or_else(|| anyhow::anyhow!("review request {predecessor_id:x} is malformed"))?;
             match &evaluation.state {
                 ReviewGateState::Invalid { reasons } => bail!(
@@ -1633,7 +1635,7 @@ fn cmd_review_supersede(
                 .expect("a review request fragment has one intrinsic root");
             let mut candidate_space = space.clone().into_facts();
             candidate_space += successor;
-            let candidate = evaluate_request(&candidate_space, successor_id, &known_people)
+            let candidate = evaluate_request_live(&candidate_space, successor_id, &known_people, &relations_space)
                 .ok_or_else(|| anyhow::anyhow!("prospective roster successor is malformed"))?;
             if let ReviewGateState::Invalid { reasons } = candidate.state {
                 bail!(
@@ -1653,6 +1655,7 @@ fn cmd_review_supersede(
             let mut change = TribleSet::new();
             change += ensure_kind_entities(&mut ws)?;
             change += successor;
+            change += entity! { ExclusiveId::force_ref(&successor_id) @ review::group: &group_id };
             ws.commit(change, "supersede review roster");
             match repo
                 .try_push(&mut ws)
@@ -1712,7 +1715,7 @@ fn cmd_review_submit(
                 bail!("persona {reviewer:x} is not in request {request_id:x}'s frozen reviewer roster");
             }
             if !matches!(
-                evaluate_request(&space, request_id, &known_people),
+                evaluate_request_live(&space, request_id, &known_people, &relations_space),
                 Some(ReviewEvaluation {
                     state: ReviewGateState::Pending { .. }
                         | ReviewGateState::Blocked { .. }
@@ -2025,7 +2028,7 @@ fn cmd_review_status(pile: &Path, branch_id: Id, input: String, history: bool) -
         .collect();
         let goal_id = match request_matches.as_slice() {
             [request_id] => {
-                let evaluation = evaluate_request(&board_space, *request_id, &known_people)
+                let evaluation = evaluate_request_live(&board_space, *request_id, &known_people, &relations_space)
                     .ok_or_else(|| anyhow::anyhow!("malformed review request {request_id:x}"))?;
                 let goal = evaluation.request.goal();
                 let active_binding = request_is_active(&board_space, *request_id);
@@ -2084,12 +2087,13 @@ fn load_exact_active_evaluation(
     space: &TribleSet,
     request_input: &str,
     known_people: &HashSet<Id>,
+    relations_space: &TribleSet,
 ) -> Result<ReviewEvaluation> {
     let request_id = resolve_request_id(request_input, space)?;
     if !request_is_active(space, request_id) {
         bail!("review request {request_id:x} is stale or fork-superseded");
     }
-    evaluate_request(space, request_id, known_people)
+    evaluate_request_live(space, request_id, known_people, relations_space)
         .ok_or_else(|| anyhow::anyhow!("malformed review request {request_id:x}"))
 }
 
@@ -2107,7 +2111,7 @@ fn cmd_review_gate(pile: &Path, branch_id: Id, request_input: String) -> Result<
             .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
         let evaluation =
-            load_exact_active_evaluation(&board_space, &request_input, &known_people)?;
+            load_exact_active_evaluation(&board_space, &request_input, &known_people, &relations_space)?;
         let passes = matches!(
             evaluation.state,
             ReviewGateState::Ready | ReviewGateState::Settled { .. }
@@ -2153,7 +2157,7 @@ fn cmd_review_settle(
                 .checkout(..)
                 .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
             let evaluation =
-                load_exact_active_evaluation(&space, &request_input, &known_people)?;
+                load_exact_active_evaluation(&space, &request_input, &known_people, &relations_space)?;
             if let ReviewGateState::Settled { settlements } = &evaluation.state {
                 return Ok((settlements[0].id, false));
             }
@@ -2239,7 +2243,7 @@ fn cmd_review_override(
                 .checkout(..)
                 .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
             let evaluation =
-                load_exact_active_evaluation(&space, &request_input, &known_people)?;
+                load_exact_active_evaluation(&space, &request_input, &known_people, &relations_space)?;
             if let ReviewGateState::Settled { settlements } = &evaluation.state {
                 return Ok((settlements[0].id, false));
             }
@@ -2440,6 +2444,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faculties::schemas::relations::group;
     use faculties::schemas::compass::review;
     use faculties::schemas::relations::KIND_RETIRE_ID;
     use std::fs::File;
@@ -2486,8 +2491,12 @@ mod tests {
                     metadata::tag: &KIND_PERSON_ID,
                 };
             }
+            let snapshot_id = ufoid().id;
             relations_change += entity! { ExclusiveId::force_ref(&group_id) @
                 metadata::tag: &KIND_GROUP,
+            };
+            relations_change += entity! { ExclusiveId::force_ref(&snapshot_id) @
+                group::snapshot_of: &group_id,
                 group::member*: reviewers.iter(),
             };
             relations_ws.commit(relations_change, "seed review roster");
@@ -2574,8 +2583,13 @@ mod tests {
                 .pull(branch)
                 .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
             let group_id = ufoid().id;
-            let fragment = entity! { ExclusiveId::force_ref(&group_id) @
+            let snapshot_id = ufoid().id;
+            let mut fragment = TribleSet::new();
+            fragment += entity! { ExclusiveId::force_ref(&group_id) @
                 metadata::tag: &KIND_GROUP,
+            };
+            fragment += entity! { ExclusiveId::force_ref(&snapshot_id) @
+                group::snapshot_of: &group_id,
                 group::member*: members.iter(),
             };
             ws.commit(fragment, "seed alternate review roster");

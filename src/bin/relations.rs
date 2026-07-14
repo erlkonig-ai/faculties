@@ -3,7 +3,8 @@ use anyhow::{Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::relations::{
-    DEFAULT_BRANCH, KIND_GROUP, KIND_PERSON_ID, KIND_RETIRE_ID, KIND_UNRETIRE_ID, group, relations,
+    DEFAULT_BRANCH, KIND_GROUP, KIND_PERSON_ID, KIND_RETIRE_ID, KIND_UNRETIRE_ID, group,
+    head_members, head_snapshot_of, relations,
 };
 use hifitime::Epoch;
 use rand_core::OsRng;
@@ -177,6 +178,22 @@ enum GroupCmd {
         /// Person label or id
         person: String,
     },
+    /// Remove a person from a group
+    Remove {
+        /// Group label or id
+        group: String,
+        /// Person label or id
+        person: String,
+    },
+    /// Rename a group
+    Rename {
+        /// Group label or id
+        group: String,
+        /// New canonical short label
+        name: String,
+    },
+    /// One-time: give legacy anchor-direct groups their initial snapshot.
+    Migrate,
     /// List groups and their members
     List,
     /// Show a group's members
@@ -984,11 +1001,16 @@ fn resolve_group_id(space: &TribleSet, raw: &str) -> Result<Id> {
         }
     }
     let key = normalize_lookup_key(trimmed)?;
-    let mut matches: Vec<Id> = find!(
-        gid: Id,
-        pattern!(space, [{ ?gid @ metadata::tag: &KIND_GROUP, relations::label_norm: key.as_str() }])
-    )
-    .collect();
+    // Name lookup resolves through the head snapshot: an anchor matches when
+    // its current (un-superseded) snapshot carries this label_norm. A rename
+    // supersedes the old name, so only the current name resolves.
+    let mut matches: Vec<Id> = find!(gid: Id, pattern!(space, [{ ?gid @ metadata::tag: &KIND_GROUP }]))
+        .filter(|&gid| {
+            head_snapshot_of(space, gid).is_some_and(|head| {
+                exists!(pattern!(space, [{ head @ relations::label_norm: key.as_str() }]))
+            })
+        })
+        .collect();
     matches.sort();
     matches.dedup();
     match matches.len() {
@@ -999,7 +1021,10 @@ fn resolve_group_id(space: &TribleSet, raw: &str) -> Result<Id> {
 }
 
 fn group_members(space: &TribleSet, group_id: Id) -> Vec<Id> {
-    find!(m: Id, pattern!(space, [{ group_id @ group::member: ?m }])).collect()
+    // Current members = the members of the anchor's head snapshot.
+    let mut members: Vec<Id> = head_members(space, group_id).into_iter().collect();
+    members.sort();
+    members
 }
 
 /// Resolve a person by hex id (or prefix) OR by label/alias — `group add`
@@ -1020,25 +1045,58 @@ fn resolve_member_id(space: &TribleSet, raw: &str) -> Result<Id> {
     }
 }
 
+/// Mint a new group snapshot carrying the full `{name, label_norm, members}`
+/// state, superseding `prior` (the previous head, if any). Returns the change
+/// to commit and the new snapshot id. Every group edit (add/remove/rename,
+/// and migration) goes through here so a snapshot is always a complete state.
+fn mint_group_snapshot(
+    ws: &mut Workspace<Pile>,
+    anchor: Id,
+    members: &[Id],
+    label: &str,
+    key: &str,
+    prior: Option<Id>,
+) -> (TribleSet, Id) {
+    let snap = ufoid().id;
+    let now = epoch_interval(now_epoch());
+    let label_handle = ws.put(label.to_string());
+    let mut change = TribleSet::new();
+    change += entity! { ExclusiveId::force_ref(&snap) @
+        group::snapshot_of: &anchor,
+        metadata::name: label_handle,
+        relations::label_norm: key,
+        metadata::created_at: now,
+        group::member*: members.iter(),
+    };
+    if let Some(prior) = prior {
+        change += entity! { ExclusiveId::force_ref(&snap) @ metadata::supersedes: &prior };
+    }
+    (change, snap)
+}
+
 fn cmd_group_create(pile: &Path, branch_id: Id, name: String) -> Result<()> {
     let label = normalize_label(&name)?;
     let key = normalize_lookup_key(&name)?;
     let group_id = with_repo(pile, |repo| {
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        for gid in find!(
-            gid: Id,
-            pattern!(&space, [{ ?gid @ metadata::tag: &KIND_GROUP, relations::label_norm: key.as_str() }])
-        ) {
-            bail!("group '{label}' already exists ({})", fmt_id(gid));
+        if let Ok(existing) = resolve_group_id(&space, &name) {
+            bail!("group '{label}' already exists ({})", fmt_id(existing));
         }
+        // Anchor: pure identity. Name/label_norm/members live on snapshots, so
+        // the current state is always the anchor's head snapshot. A fresh group
+        // gets snapshot-0 (its name, no members, supersedes nothing).
         let gid = ufoid().id;
+        let snap = ufoid().id;
+        let now = epoch_interval(now_epoch());
         let label_handle = ws.put(label.clone());
         let mut change = TribleSet::new();
-        change += entity! { ExclusiveId::force_ref(&gid) @
-            metadata::tag: &KIND_GROUP,
+        change += entity! { ExclusiveId::force_ref(&gid) @ metadata::tag: &KIND_GROUP };
+        change += entity! { ExclusiveId::force_ref(&snap) @
+            group::snapshot_of: &gid,
             metadata::name: label_handle,
             relations::label_norm: key.as_str(),
+            metadata::created_at: now,
         };
         ws.commit(change, "relations group create");
         repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
@@ -1054,11 +1112,19 @@ fn cmd_group_add(pile: &Path, branch_id: Id, group: String, person: String) -> R
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
         let gid = resolve_group_id(&space, &group)?;
         let pid = resolve_member_id(&space, &person)?;
-        if group_members(&space, gid).contains(&pid) {
+        let head = head_snapshot_of(&space, gid);
+        let mut members = group_members(&space, gid);
+        if members.contains(&pid) {
             return Ok((gid, pid, false));
         }
-        let mut change = TribleSet::new();
-        change += entity! { ExclusiveId::force_ref(&gid) @ group::member: pid };
+        members.push(pid);
+        members.sort();
+        let name = head
+            .and_then(|h| person_label(&mut ws, &space, h))
+            .ok_or_else(|| anyhow!("group {} has no current name", fmt_id(gid)))?;
+        let label = normalize_label(&name)?;
+        let key = normalize_lookup_key(&name)?;
+        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, head);
         ws.commit(change, "relations group add");
         repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
         Ok((gid, pid, true))
@@ -1068,6 +1134,94 @@ fn cmd_group_add(pile: &Path, branch_id: Id, group: String, person: String) -> R
     } else {
         println!("{} already in group {}.", fmt_id(pid), fmt_id(gid));
     }
+    Ok(())
+}
+
+fn cmd_group_remove(pile: &Path, branch_id: Id, group: String, person: String) -> Result<()> {
+    let (gid, pid, removed) = with_repo(pile, |repo| {
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        let gid = resolve_group_id(&space, &group)?;
+        let pid = resolve_member_id(&space, &person)?;
+        let head = head_snapshot_of(&space, gid);
+        let mut members = group_members(&space, gid);
+        if !members.contains(&pid) {
+            return Ok((gid, pid, false));
+        }
+        members.retain(|&m| m != pid);
+        let name = head
+            .and_then(|h| person_label(&mut ws, &space, h))
+            .ok_or_else(|| anyhow!("group {} has no current name", fmt_id(gid)))?;
+        let label = normalize_label(&name)?;
+        let key = normalize_lookup_key(&name)?;
+        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, head);
+        ws.commit(change, "relations group remove");
+        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+        Ok((gid, pid, true))
+    })?;
+    if removed {
+        println!("Removed {} from group {}.", fmt_id(pid), fmt_id(gid));
+    } else {
+        println!("{} is not in group {}.", fmt_id(pid), fmt_id(gid));
+    }
+    Ok(())
+}
+
+fn cmd_group_rename(pile: &Path, branch_id: Id, group: String, name: String) -> Result<()> {
+    let label = normalize_label(&name)?;
+    let key = normalize_lookup_key(&name)?;
+    let gid = with_repo(pile, |repo| {
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        let gid = resolve_group_id(&space, &group)?;
+        if let Ok(other) = resolve_group_id(&space, &name) {
+            if other != gid {
+                bail!("group '{label}' already exists ({})", fmt_id(other));
+            }
+        }
+        let head = head_snapshot_of(&space, gid);
+        let members = group_members(&space, gid);
+        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, head);
+        ws.commit(change, "relations group rename");
+        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+        Ok(gid)
+    })?;
+    println!("Renamed group {} to {label}.", fmt_id(gid));
+    Ok(())
+}
+
+fn cmd_group_migrate(pile: &Path, branch_id: Id) -> Result<()> {
+    let migrated = with_repo(pile, |repo| {
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        let anchors: Vec<Id> =
+            find!(gid: Id, pattern!(&space, [{ ?gid @ metadata::tag: &KIND_GROUP }])).collect();
+        let mut change = TribleSet::new();
+        let mut count = 0usize;
+        for gid in anchors {
+            // Groups that already have a head snapshot are new-form; skip them.
+            if head_snapshot_of(&space, gid).is_some() {
+                continue;
+            }
+            let mut members: Vec<Id> =
+                find!(m: Id, pattern!(&space, [{ gid @ group::member: ?m }])).collect();
+            members.sort();
+            members.dedup();
+            let name = person_label(&mut ws, &space, gid)
+                .ok_or_else(|| anyhow!("legacy group {} has no name to migrate", fmt_id(gid)))?;
+            let label = normalize_label(&name)?;
+            let key = normalize_lookup_key(&name)?;
+            let (snapshot, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, None);
+            change += snapshot;
+            count += 1;
+        }
+        if count > 0 {
+            ws.commit(change, "relations migrate groups to snapshots");
+            repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+        }
+        Ok(count)
+    })?;
+    println!("Migrated {migrated} legacy group(s) to snapshot form.");
     Ok(())
 }
 
@@ -1084,7 +1238,10 @@ fn cmd_group_list(pile: &Path, branch_id: Id) -> Result<()> {
             return Ok(());
         }
         for gid in groups {
-            let label = person_label(&mut ws, &space, gid).unwrap_or_else(|| fmt_id(gid));
+            let head = head_snapshot_of(&space, gid);
+            let label = head
+                .and_then(|h| person_label(&mut ws, &space, h))
+                .unwrap_or_else(|| fmt_id(gid));
             let members = group_members(&space, gid);
             println!("[{}] {label} — {} member(s)", fmt_id(gid), members.len());
         }
@@ -1097,7 +1254,10 @@ fn cmd_group_show(pile: &Path, branch_id: Id, group: String) -> Result<()> {
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
         let gid = resolve_group_id(&space, &group)?;
-        let label = person_label(&mut ws, &space, gid).unwrap_or_else(|| fmt_id(gid));
+        let head = head_snapshot_of(&space, gid);
+        let label = head
+            .and_then(|h| person_label(&mut ws, &space, h))
+            .unwrap_or_else(|| fmt_id(gid));
         println!("group: {label} ({})", fmt_id(gid));
         let members = group_members(&space, gid);
         if members.is_empty() {
@@ -1208,6 +1368,11 @@ fn main() -> Result<()> {
         Command::Group { command } => match command {
             GroupCmd::Create { name } => cmd_group_create(&cli.pile, branch_id, name),
             GroupCmd::Add { group, person } => cmd_group_add(&cli.pile, branch_id, group, person),
+            GroupCmd::Remove { group, person } => {
+                cmd_group_remove(&cli.pile, branch_id, group, person)
+            }
+            GroupCmd::Rename { group, name } => cmd_group_rename(&cli.pile, branch_id, group, name),
+            GroupCmd::Migrate => cmd_group_migrate(&cli.pile, branch_id),
             GroupCmd::List => cmd_group_list(&cli.pile, branch_id),
             GroupCmd::Show { group } => cmd_group_show(&cli.pile, branch_id, group),
         },
