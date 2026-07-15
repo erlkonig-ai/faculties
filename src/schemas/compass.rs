@@ -1100,9 +1100,9 @@ fn valid_settlements(
                     && event.created_at.len() == 1
                     && event.is_canonical()
                     // ONE certificate per override: the settlement's time must
-                    // equal the event's, so the event id — which already seals
-                    // its time — determines a single canonical settlement rather
-                    // than one per arbitrary settlement `created_at`.
+                    // equal the event's. Alternate-time wrappers are still
+                    // canonical, but only the event-time settlement is VALID, so
+                    // one override event yields exactly one valid certificate.
                     && settlement.created_at == event.created_at
                 {
                     valid.push(ValidSettlement {
@@ -1522,6 +1522,11 @@ pub fn override_creation_blockers(
                 .push("cannot verify the group anchor without a relations space".to_string()),
         }
     }
+    // Full roster-successor lineage protocol (the same authority the gate uses),
+    // not a re-derived subset: an illegal same-target roster successor whose
+    // supersede edge does not match its predecessor is a protocol error that
+    // must block override, even though it is canonical and the sole head.
+    blockers.extend(roster_successor_invalid_reasons(space, request, known_people));
     blockers
 }
 
@@ -1683,16 +1688,28 @@ fn evaluate_request_inner(
                     .to_string(),
             );
         }
-        if let Some(goal) = request.goal() {
-            let bound = latest_status_event(space, goal).is_some_and(|(event, status, _)| {
-                (event == request.id && status == REVIEW_STATUS)
-                    || status_event_is_predecessor_of_request(space, event, &request)
-            });
-            if !bound {
-                invalid.push(
-                    "request is not the goal's current exact review status event".to_string(),
-                );
-            }
+    }
+    // The review binding must be the goal's CURRENT status head, whether pending
+    // OR settled: a newer UNRELATED status (e.g. `doing`) detaches it and
+    // re-opens the gate rather than letting a stale certificate read as Settled.
+    // The review's own lifecycle events never detach it: the request itself, any
+    // canonical predecessor, and ANY settlement OF this request (a settlement is
+    // a DONE status event; an invalid duplicate cert is still part of this
+    // review, handled by the conflict check above, not a detachment). This is
+    // the read/CAS-side guard (override CREATION checks the same via
+    // `override_creation_blockers`).
+    if let Some(goal) = request.goal() {
+        let request_settlements = settlement_ids_for_request(space, request.id);
+        let head_current = latest_status_event(space, goal).is_some_and(|(event, status, _)| {
+            (event == request.id && status == REVIEW_STATUS)
+                || request_settlements.contains(&event)
+                || status_event_is_predecessor_of_request(space, event, &request)
+        });
+        if !head_current {
+            invalid.push(
+                "request is not the goal's current status head (detached by a newer status event)"
+                    .to_string(),
+            );
         }
     }
 
@@ -2690,6 +2707,71 @@ mod tests {
                 ReviewGateState::Settled { .. }
             ),
             "grouped override not settled with a real group + relations"
+        );
+    }
+
+    #[test]
+    fn a_settled_review_detaches_when_a_newer_status_reopens_the_goal() {
+        // Seam: an EXISTING valid certificate must not resurrect a request that
+        // a newer non-review status (e.g. `doing`) has detached — the read/CAS
+        // evaluation, not only override creation, must require currency.
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let request = add_request(
+            &mut space,
+            goal,
+            author,
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:settled-detach",
+        );
+        let _settlement = settle_request(&mut space, goal, request, author, &reviewers);
+        assert!(matches!(
+            evaluate_request(&space, request, &known).unwrap().state,
+            ReviewGateState::Settled { .. }
+        ));
+        // A newer `doing` status re-opens the goal (work resumed).
+        let moved = ufoid();
+        space += entity! { &moved @
+            metadata::tag: &KIND_STATUS_ID,
+            board::task: &goal,
+            board::status: "doing",
+            metadata::created_at: later(),
+        };
+        match evaluate_request(&space, request, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(
+                reasons.iter().any(|r| r.contains("current status head")),
+                "unexpected reasons: {reasons:?}"
+            ),
+            other => panic!("settled-then-detached review should re-open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn override_creation_is_blocked_by_roster_successor_lineage_errors() {
+        // Seam: the shared override authority must include the FULL roster
+        // lineage protocol — an illegal roster successor (here, a missing sealed
+        // predecessor) must block override, not slip through as zero blockers.
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let phantom = ufoid().id;
+        let successor = add_roster_successor(
+            &mut space,
+            goal,
+            author,
+            &reviewers,
+            &[authority],
+            phantom,
+            "urn:revision:illegal-successor",
+        );
+        let req = review_request(&space, successor).expect("request readable");
+        let blockers = override_creation_blockers(&space, &req, &known, None);
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.contains("roster predecessor") && b.contains("missing")),
+            "roster lineage error not surfaced by the shared authority: {blockers:?}"
         );
     }
 
@@ -4191,7 +4273,7 @@ mod tests {
         match evaluate_request(&space, request, &known).unwrap().state {
             ReviewGateState::Invalid { reasons } => assert!(reasons
                 .iter()
-                .any(|reason| reason.contains("current exact review status"))),
+                .any(|reason| reason.contains("current status head"))),
             other => panic!("expected detached request to fail closed, got {other:?}"),
         }
     }
