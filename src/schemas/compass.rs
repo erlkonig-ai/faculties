@@ -621,7 +621,7 @@ fn sorted_unique<T: Ord>(mut values: Vec<T>) -> Vec<T> {
     values
 }
 
-fn interval_key(interval: IntervalValue) -> i128 {
+pub fn interval_key(interval: IntervalValue) -> i128 {
     let (lower, _): (i128, i128) = interval
         .try_from_inline()
         .expect("NsTAIInterval inline values have a lower bound");
@@ -1041,6 +1041,11 @@ fn valid_settlements(
             };
             let mut reviewers = BTreeSet::new();
             let mut all_valid = settlement.attestations.len() == sealed_roster.len();
+            // Proof-determined identity: the certificate's time is the MAX time
+            // over its sealed evidence, so identical evidence yields an identical
+            // settlement id — one certificate per proof, never a time-forked pair
+            // (which append-only merges could never later remove).
+            let mut max_attestation_time: Option<IntervalValue> = None;
             for attestation_id in &settlement.attestations {
                 if !all_valid {
                     break;
@@ -1050,6 +1055,10 @@ fn valid_settlements(
                     break;
                 };
                 let Some(reviewer) = attestation.reviewer() else {
+                    all_valid = false;
+                    break;
+                };
+                let Some(at) = exactly_one(&attestation.created_at) else {
                     all_valid = false;
                     break;
                 };
@@ -1063,8 +1072,14 @@ fn valid_settlements(
                     all_valid = false;
                     break;
                 }
+                max_attestation_time = Some(match max_attestation_time {
+                    Some(current) if interval_key(current) >= interval_key(at) => current,
+                    _ => at,
+                });
             }
-            if all_valid && reviewers.len() == sealed_roster.len() {
+            let time_is_proof_determined =
+                max_attestation_time.is_some_and(|t| settlement.created_at.as_slice() == [t]);
+            if all_valid && time_is_proof_determined && reviewers.len() == sealed_roster.len() {
                 valid.push(ValidSettlement {
                     id,
                     mode: SettlementMode::Attestations,
@@ -1365,7 +1380,11 @@ fn status_event_is_predecessor_of_request(
     event: Id,
     request: &ReviewRequest,
 ) -> bool {
+    // Only a CANONICAL settlement may map to its request: a malformed settlement
+    // record cannot spoof a predecessor mapping (its request field is untrusted),
+    // so it resolves to its own id and matches nothing in the lineage.
     let target = review_settlement(space, event)
+        .filter(|settlement| settlement.canonical_mode().is_some())
         .and_then(|settlement| exactly_one(&settlement.requests))
         .unwrap_or(event);
     let goal = request.goal();
@@ -1692,17 +1711,40 @@ fn evaluate_request_inner(
     // The review binding must be the goal's CURRENT status head, whether pending
     // OR settled: a newer UNRELATED status (e.g. `doing`) detaches it and
     // re-opens the gate rather than letting a stale certificate read as Settled.
-    // The review's own lifecycle events never detach it: the request itself, any
-    // canonical predecessor, and ANY settlement OF this request (a settlement is
-    // a DONE status event; an invalid duplicate cert is still part of this
-    // review, handled by the conflict check above, not a detachment). This is
+    // POSITIVE currency rests ONLY on exact VALID evidence: the request itself, a
+    // VALID certificate of it, or a canonical predecessor. An INVALID same-request
+    // settlement record (malformed, or a duplicate at the wrong time) is
+    // TRANSPARENT — conservative negative evidence at most, never a positive
+    // head — so we scan PAST it to the real lifecycle/unrelated status beneath,
+    // rather than letting a raw tag+request record mask a reopened goal. This is
     // the read/CAS-side guard (override CREATION checks the same via
     // `override_creation_blockers`).
     if let Some(goal) = request.goal() {
-        let request_settlements = settlement_ids_for_request(space, request.id);
-        let head_current = latest_status_event(space, goal).is_some_and(|(event, status, _)| {
+        let valid_certificate_ids: HashSet<Id> = settlements.iter().map(|s| s.id).collect();
+        let request_settlement_records: HashSet<Id> =
+            settlement_ids_for_request(space, request.id)
+                .into_iter()
+                .collect();
+        let latest_authoritative = find!(
+            (event: Id, status: String, at: IntervalValue),
+            pattern!(space, [{ ?event @
+                metadata::tag: &KIND_STATUS_ID,
+                board::task: &goal,
+                board::status: ?status,
+                metadata::created_at: ?at,
+            }])
+        )
+        .filter(|(event, _, _)| {
+            // Drop transparent invalid same-request settlement records.
+            !(request_settlement_records.contains(event)
+                && !valid_certificate_ids.contains(event))
+        })
+        .max_by(|left, right| {
+            (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0))
+        });
+        let head_current = latest_authoritative.is_some_and(|(event, status, _)| {
             (event == request.id && status == REVIEW_STATUS)
-                || request_settlements.contains(&event)
+                || valid_certificate_ids.contains(&event)
                 || status_event_is_predecessor_of_request(space, event, &request)
         });
         if !head_current {
@@ -2708,6 +2750,106 @@ mod tests {
             ),
             "grouped override not settled with a real group + relations"
         );
+    }
+
+    #[test]
+    fn a_malformed_settlement_record_cannot_mask_a_reopened_goal() {
+        // Seam: a raw KIND_REVIEW_SETTLEMENT+STATUS record (no canonical proof),
+        // newer than a `doing` reopen, must be TRANSPARENT — it cannot
+        // positively re-establish currency and mask the reopened goal.
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let request = add_request(
+            &mut space,
+            goal,
+            author,
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:mask-reopen",
+        );
+        let _settlement = settle_request(&mut space, goal, request, author, &reviewers);
+        assert!(matches!(
+            evaluate_request(&space, request, &known).unwrap().state,
+            ReviewGateState::Settled { .. }
+        ));
+        // A newer `doing` re-opens the goal.
+        let reopened = ufoid();
+        space += entity! { &reopened @
+            metadata::tag: &KIND_STATUS_ID,
+            board::task: &goal,
+            board::status: "doing",
+            metadata::created_at: later(),
+        };
+        // An EVEN-NEWER malformed settlement record (tag+request+done+time, but
+        // no canonical proof) tries to mask the reopen.
+        let even_later = {
+            let epoch = Epoch::from_gregorian_utc(2026, 7, 13, 12, 2, 0, 0);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let malformed = ufoid();
+        space += entity! { &malformed @
+            metadata::tag: &KIND_REVIEW_SETTLEMENT_ID,
+            metadata::tag: &KIND_STATUS_ID,
+            review::request: &request,
+            board::task: &goal,
+            board::status: DONE_STATUS,
+            metadata::created_at: even_later,
+        };
+        match evaluate_request(&space, request, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(
+                reasons.iter().any(|r| r.contains("current status head")),
+                "unexpected reasons: {reasons:?}"
+            ),
+            other => panic!("malformed settlement masked reopened goal: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_attestation_certificate_time_is_proof_determined_no_fork() {
+        // Seam: an ordinary cert's identity included arbitrary created_at, so the
+        // same evidence at two times forked into two valid certs. The time is now
+        // proof-determined (max attestation time), so only one is valid.
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let request = add_request(
+            &mut space,
+            goal,
+            author,
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:cert-time",
+        );
+        let evidence: Vec<Id> = reviewers
+            .iter()
+            .map(|&reviewer| {
+                let verdict = if reviewer == author {
+                    VERDICT_ABSTAIN
+                } else {
+                    VERDICT_APPROVE
+                };
+                add_attestation(&mut space, request, reviewer, verdict, &[])
+            })
+            .collect();
+        // Two settlements, SAME evidence, DIFFERENT created_at. The
+        // proof-determined time is the max attestation time = now(); the later()
+        // wrapper is canonical-but-INVALID.
+        space += review_attestation_settlement_fragment(
+            request, goal, author, &evidence, None, &[], now(),
+        );
+        space += review_attestation_settlement_fragment(
+            request, goal, author, &evidence, None, &[], later(),
+        );
+        match evaluate_request(&space, request, &known).unwrap().state {
+            ReviewGateState::Settled { settlements } => assert_eq!(
+                settlements.len(),
+                1,
+                "attestation cert forked into {} valid certs",
+                settlements.len()
+            ),
+            other => panic!("expected Settled with one proof-determined cert, got {other:?}"),
+        }
     }
 
     #[test]

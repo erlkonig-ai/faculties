@@ -2194,6 +2194,16 @@ fn cmd_review_settle(
                 .iter()
                 .map(|slot| slot.heads[0].id)
                 .collect();
+            // Proof-determined settlement time: the MAX attestation time over
+            // the sealed evidence, so identical evidence yields an identical
+            // settlement id (one certificate per proof, no time-forked pair).
+            let settled_at = evaluation
+                .slots
+                .iter()
+                .filter_map(|slot| slot.heads.first())
+                .filter_map(|head| head.created_at.first().copied())
+                .max_by_key(|iv| interval_key(*iv))
+                .ok_or_else(|| anyhow::anyhow!("cannot derive settlement time from evidence"))?;
             // Seal the exact group head + effective roster this proof settled
             // against, so later group changes never revalidate it. A legacy
             // (groupless) request seals nothing and keeps its historical id.
@@ -2205,7 +2215,6 @@ fn cmd_review_settle(
             } else {
                 (None, &[])
             };
-            let now = epoch_interval(now_epoch());
             let settlement = review_attestation_settlement_fragment(
                 evaluation.request.id,
                 goal,
@@ -2213,7 +2222,7 @@ fn cmd_review_settle(
                 &evidence,
                 snapshot,
                 roster,
-                now,
+                settled_at,
             );
             let settlement_id = settlement
                 .root()
