@@ -236,6 +236,13 @@ fn interval_key(interval: IntervalValue) -> i128 {
     lower
 }
 
+/// Total order over an interval — `(lower, upper)` — so the settle command
+/// picks the SAME maximal evidence time the schema validator does (see
+/// `faculties::schemas::compass::interval_ord_key`).
+fn interval_ord_key(interval: IntervalValue) -> (i128, i128) {
+    interval.try_from_inline().unwrap()
+}
+
 fn format_interval(interval: IntervalValue) -> String {
     let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     format!("{}", lower)
@@ -2202,7 +2209,7 @@ fn cmd_review_settle(
                 .iter()
                 .filter_map(|slot| slot.heads.first())
                 .filter_map(|head| head.created_at.first().copied())
-                .max_by_key(|iv| interval_key(*iv))
+                .max_by_key(|iv| interval_ord_key(*iv))
                 .ok_or_else(|| anyhow::anyhow!("cannot derive settlement time from evidence"))?;
             // Seal the exact group head + effective roster this proof settled
             // against, so later group changes never revalidate it. A legacy

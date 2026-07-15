@@ -628,6 +628,17 @@ pub fn interval_key(interval: IntervalValue) -> i128 {
     lower
 }
 
+/// A TOTAL order key over an interval — `(lower, upper)`, not just the lower
+/// bound. The proof-determined settlement time uses this so the CLI (which sets
+/// the time) and the validator (which checks it) pick the SAME maximal evidence
+/// even for distinct intervals that share a lower bound; `interval_key` alone
+/// would tie them and let the two sides diverge.
+pub fn interval_ord_key(interval: IntervalValue) -> (i128, i128) {
+    interval
+        .try_from_inline()
+        .expect("NsTAIInterval inline values have both bounds")
+}
+
 /// Natural DAG heads, plus every node in a component that cannot be reached
 /// from those heads. The caller must supply only authenticated/canonical
 /// supersession edges: a malformed source cannot use its own edges to hide an
@@ -1084,7 +1095,7 @@ fn valid_settlements(
                     break;
                 }
                 max_attestation_time = Some(match max_attestation_time {
-                    Some(current) if interval_key(current) >= interval_key(at) => current,
+                    Some(current) if interval_ord_key(current) >= interval_ord_key(at) => current,
                     _ => at,
                 });
             }
@@ -1755,8 +1766,16 @@ fn evaluate_request_inner(
                 metadata::created_at: ?at,
             }])
         )
-        .filter(|(event, _, _)| {
-            !(settlement_records_on_goal.contains(event) && !valid_certificate_ids.contains(event))
+        .filter(|(event, status, _)| {
+            // Transparency is PER-INTERPRETATION, not per-entity: only an
+            // invalid settlement's DONE-status row is dropped. An unrelated
+            // lifecycle status (e.g. `doing`) on the SAME append-only entity —
+            // e.g. a malformed settlement tag overlaid onto the legitimate newer
+            // `doing` event — keeps its own status row, so it can never be erased
+            // to reveal a stale Settled beneath it.
+            !(status.as_str() == DONE_STATUS
+                && settlement_records_on_goal.contains(event)
+                && !valid_certificate_ids.contains(event))
         })
         .max_by(|left, right| {
             (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0))
@@ -2934,6 +2953,112 @@ mod tests {
                 .any(|b| b.contains("roster predecessor") && b.contains("missing")),
             "roster lineage error not surfaced by the shared authority: {blockers:?}"
         );
+    }
+
+    #[test]
+    fn audit_invalid_settlement_overlay_must_not_erase_unrelated_status() {
+        // Seam (gpt): overlaying a settlement tag + request onto the legitimate
+        // newer `doing` event must NOT erase that event — transparency drops only
+        // a DONE-status settlement interpretation, never an unrelated lifecycle
+        // status row on the same append-only entity.
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let request = add_request(
+            &mut space,
+            goal,
+            author,
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:overlay",
+        );
+        let _cert = settle_request(&mut space, goal, request, author, &reviewers);
+        assert!(matches!(
+            evaluate_request(&space, request, &known).unwrap().state,
+            ReviewGateState::Settled { .. }
+        ));
+        // The reopen `doing` event, ALSO carrying a (malformed) settlement
+        // tag+request overlay on the SAME entity.
+        let reopened = ufoid();
+        space += entity! { &reopened @
+            metadata::tag: &KIND_STATUS_ID,
+            metadata::tag: &KIND_REVIEW_SETTLEMENT_ID,
+            board::task: &goal,
+            board::status: "doing",
+            review::request: &request,
+            metadata::created_at: later(),
+        };
+        match evaluate_request(&space, request, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(
+                reasons.iter().any(|r| r.contains("current status head")),
+                "unexpected reasons: {reasons:?}"
+            ),
+            other => panic!("a settlement overlay erased the reopen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_cli_and_validator_must_choose_same_equal_lower_interval() {
+        // Seam (gpt): the proof-determined time uses a TOTAL order (lower, upper),
+        // not just the lower bound. The CLI settle path and the validator share
+        // `interval_ord_key`, so for two attestations with an equal lower bound
+        // but distinct intervals they choose the SAME maximal evidence.
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let author = reviewers[0];
+        let request = add_request(
+            &mut space,
+            goal,
+            author,
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:equal-lower",
+        );
+        let interval = |upper_min: u8| {
+            let lower = Epoch::from_gregorian_utc(2026, 7, 13, 12, 0, 0, 0);
+            let upper = Epoch::from_gregorian_utc(2026, 7, 13, 12, upper_min, 0, 0);
+            (lower, upper).try_to_inline().unwrap()
+        };
+        let iv_lo = interval(1); // (12:00, 12:01)
+        let iv_hi = interval(2); // (12:00, 12:02) — same lower, larger upper => max
+        let attest = |space: &mut TribleSet, reviewer: Id, verdict: &str, at| {
+            let report = format!("report {reviewer:x}").to_blob().get_handle();
+            let fragment = review_attestation_fragment(request, reviewer, verdict, report, &[], at);
+            let id = fragment.root().expect("intrinsic attestation");
+            *space += fragment;
+            id
+        };
+        let a_ev = attest(&mut space, author, VERDICT_ABSTAIN, iv_lo);
+        let b_ev = attest(&mut space, reviewers[1], VERDICT_APPROVE, iv_hi);
+        // The total-order-max cert (time iv_hi) is VALID; the lower-only tie
+        // loser (time iv_lo) is INVALID — so exactly one certificate is valid.
+        space += review_attestation_settlement_fragment(
+            request,
+            goal,
+            author,
+            &[a_ev, b_ev],
+            None,
+            &[],
+            iv_hi,
+        );
+        space += review_attestation_settlement_fragment(
+            request,
+            goal,
+            author,
+            &[a_ev, b_ev],
+            None,
+            &[],
+            iv_lo,
+        );
+        match evaluate_request(&space, request, &known).unwrap().state {
+            ReviewGateState::Settled { settlements } => assert_eq!(
+                settlements.len(),
+                1,
+                "expected only the total-order-max certificate valid, got {}",
+                settlements.len()
+            ),
+            other => panic!("total-order-max proof time was not accepted: {other:?}"),
+        }
     }
 
     #[test]
