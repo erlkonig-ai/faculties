@@ -1039,6 +1039,17 @@ fn valid_settlements(
             let Some(sealed_roster) = settled_roster(&settlement, request, relations_space) else {
                 continue;
             };
+            // The sealed roster must meet the same floor the gate enforces on the
+            // effective roster: it includes the author AND at least one DISTINCT
+            // non-author reviewer. Otherwise a self-only (author-only) sealed
+            // roster could settle via the author's own abstain with no external
+            // review — the ≥1-external invariant lives in `roster_invalid`, which
+            // is gated behind settlements, so it must be re-asserted here.
+            if !sealed_roster.contains(&author)
+                || !sealed_roster.iter().any(|reviewer| *reviewer != author)
+            {
+                continue;
+            }
             let mut reviewers = BTreeSet::new();
             let mut all_valid = settlement.attestations.len() == sealed_roster.len();
             // Proof-determined identity: the certificate's time is the MAX time
@@ -1721,10 +1732,20 @@ fn evaluate_request_inner(
     // `override_creation_blockers`).
     if let Some(goal) = request.goal() {
         let valid_certificate_ids: HashSet<Id> = settlements.iter().map(|s| s.id).collect();
-        let request_settlement_records: HashSet<Id> =
-            settlement_ids_for_request(space, request.id)
-                .into_iter()
-                .collect();
+        // EVERY settlement record on this goal (of ANY request). Only R's OWN
+        // VALID certificates are authoritative for R's currency; every other
+        // settlement record — malformed, a wrong-time duplicate, OR a
+        // canonical-but-invalid wrapper of ANOTHER request (e.g. a predecessor)
+        // — is TRANSPARENT and can never positively establish R's currency, so
+        // the scan passes over it to the real lifecycle/unrelated status beneath.
+        let settlement_records_on_goal: HashSet<Id> = find!(
+            id: Id,
+            pattern!(space, [{ ?id @
+                metadata::tag: &KIND_REVIEW_SETTLEMENT_ID,
+                board::task: &goal,
+            }])
+        )
+        .collect();
         let latest_authoritative = find!(
             (event: Id, status: String, at: IntervalValue),
             pattern!(space, [{ ?event @
@@ -1735,9 +1756,7 @@ fn evaluate_request_inner(
             }])
         )
         .filter(|(event, _, _)| {
-            // Drop transparent invalid same-request settlement records.
-            !(request_settlement_records.contains(event)
-                && !valid_certificate_ids.contains(event))
+            !(settlement_records_on_goal.contains(event) && !valid_certificate_ids.contains(event))
         })
         .max_by(|left, right| {
             (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0))
@@ -2915,6 +2934,124 @@ mod tests {
                 .any(|b| b.contains("roster predecessor") && b.contains("missing")),
             "roster lineage error not surfaced by the shared authority: {blockers:?}"
         );
+    }
+
+    #[test]
+    fn a_self_only_sealed_roster_does_not_settle() {
+        // Seam (adversarial pre-audit): a grouped settlement sealing a SELF-ONLY
+        // (author-only) roster must not settle via the author's own abstain — the
+        // >=1-distinct-non-author floor must be re-asserted on the sealed roster.
+        use crate::schemas::relations::{group_snapshot_fragment, KIND_GROUP as REL_KIND_GROUP};
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let author = reviewers[0];
+        let group = ufoid().id;
+        let target: TextHandle = "urn:revision:self-only".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(group),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+        // The group head is SELF-ONLY {author}.
+        let name: TextHandle = "self-only".to_blob().get_handle();
+        let snapshot = group_snapshot_fragment(group, name, &[author], &[]);
+        let snapshot_id = snapshot.root().expect("intrinsic snapshot");
+        let mut relations = TribleSet::new();
+        relations += entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
+        relations += snapshot;
+        let author_ev = add_attestation(&mut space, request, author, VERDICT_ABSTAIN, &[]);
+        // A settlement sealing roster={author}, snapshot={author}, author's abstain.
+        space += review_attestation_settlement_fragment(
+            request,
+            goal,
+            author,
+            &[author_ev],
+            Some(snapshot_id),
+            &[author],
+            now(),
+        );
+        assert!(
+            !matches!(
+                evaluate_request_live(&space, request, &known, &relations)
+                    .unwrap()
+                    .state,
+                ReviewGateState::Settled { .. }
+            ),
+            "a self-only sealed roster settled with no external reviewer"
+        );
+    }
+
+    #[test]
+    fn a_predecessor_settlement_wrapper_is_transparent_after_reopen() {
+        // Seam (gpt's flagged focus): a canonical-but-invalid settlement of a
+        // PREDECESSOR request must not gain positive currency (via the predecessor
+        // mapping) and mask a reopened goal. Every settlement record that is not
+        // R's OWN valid certificate is transparent.
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let predecessor = add_request(
+            &mut space,
+            goal,
+            author,
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:pred-wrap",
+        );
+        let request = add_roster_successor(
+            &mut space,
+            goal,
+            author,
+            &reviewers,
+            &[authority],
+            predecessor,
+            "urn:revision:pred-wrap",
+        );
+        // A `doing` reopens the goal while R (the successor) is still pending.
+        let reopened = ufoid();
+        space += entity! { &reopened @
+            metadata::tag: &KIND_STATUS_ID,
+            board::task: &goal,
+            board::status: "doing",
+            metadata::created_at: later(),
+        };
+        // A CANONICAL settlement of the PREDECESSOR P, backpatched NEWEST. It maps
+        // to P (a predecessor of R) via canonical_mode, so without the broadened
+        // transparency filter it would positively re-establish R's currency and
+        // mask the reopen. It must be TRANSPARENT (not R's own valid certificate).
+        let even_later = {
+            let epoch = Epoch::from_gregorian_utc(2026, 7, 13, 12, 2, 0, 0);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let pred_evidence = vec![add_attestation(
+            &mut space,
+            predecessor,
+            author,
+            VERDICT_ABSTAIN,
+            &[],
+        )];
+        space += review_attestation_settlement_fragment(
+            predecessor,
+            goal,
+            author,
+            &pred_evidence,
+            None,
+            &[],
+            even_later,
+        );
+        match evaluate_request(&space, request, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(
+                reasons.iter().any(|r| r.contains("current status head")),
+                "unexpected reasons: {reasons:?}"
+            ),
+            other => panic!("predecessor settlement wrapper masked a reopened goal: {other:?}"),
+        }
     }
 
     #[test]
