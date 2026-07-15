@@ -259,19 +259,17 @@ pub fn review_attestation_settlement_fragment(
 /// Construct a settlement whose proof is one exact break-glass event.
 ///
 /// INVARIANT (deliberately narrowed): break-glass is roster-INDEPENDENT. Its
-/// whole proof is the frozen authority + reason; it seals no snapshot/roster
-/// (`snapshot`/`roster` are threaded for signature symmetry but the override
-/// settle path always passes `None`/`&[]`). This is intentional, not an
-/// oversight: an override is often invoked PRECISELY when the group is forked or
-/// broken and there is no unique roster to observe. `valid_settlements` skips
-/// the roster check for override certificates for the same reason.
+/// whole proof is the frozen authority + the exact override event; it seals NO
+/// snapshot/roster at all — the fields are structurally absent, and
+/// `canonical_mode` REQUIRES them absent, so there is exactly one canonical id
+/// per (request, goal, actor, event, time). An override is often invoked
+/// precisely when the group is forked/broken and there is no unique roster to
+/// observe, so `valid_settlements` also skips the roster check for overrides.
 pub fn review_override_settlement_fragment(
     request: Id,
     goal: Id,
     actor: Id,
     override_event: Id,
-    snapshot: Option<Id>,
-    roster: &[Id],
     created_at: IntervalValue,
 ) -> Fragment {
     entity! { _ @
@@ -279,8 +277,6 @@ pub fn review_override_settlement_fragment(
         metadata::tag: &KIND_STATUS_ID,
         review::request: &request,
         review::override_event: &override_event,
-        review::settled_snapshot?: snapshot.as_ref(),
-        review::settled_member*: roster.iter(),
         board::task: &goal,
         board::status: DONE_STATUS,
         board::by: &actor,
@@ -482,39 +478,48 @@ impl ReviewSettlement {
         let goal = exactly_one(&self.tasks)?;
         let actor = exactly_one(&self.actors)?;
         let created_at = exactly_one(&self.created_at)?;
-        // At most one sealed snapshot; the roster is a set. Reconstruct from
-        // the exact stored facts so any tampering breaks the intrinsic id.
-        if self.settled_snapshots.len() > 1 {
-            return None;
-        }
-        let snapshot = self.settled_snapshots.first().copied();
-        let roster = sorted_unique(self.settled_members.clone());
         let (expected, mode) = match (self.attestations.is_empty(), self.override_events.as_slice())
         {
-            (false, []) => (
-                review_attestation_settlement_fragment(
-                    request,
-                    goal,
-                    actor,
-                    &self.attestations,
-                    snapshot,
-                    &roster,
-                    created_at,
-                ),
-                SettlementMode::Attestations,
-            ),
-            (true, [override_event]) => (
-                review_override_settlement_fragment(
-                    request,
-                    goal,
-                    actor,
-                    *override_event,
-                    snapshot,
-                    &roster,
-                    created_at,
-                ),
-                SettlementMode::Override,
-            ),
+            (false, []) => {
+                // Attestation settlement: MAY seal a group snapshot + roster.
+                // At most one snapshot; the roster is a set. Reconstruct from
+                // the exact stored facts so any tampering breaks the id.
+                if self.settled_snapshots.len() > 1 {
+                    return None;
+                }
+                let snapshot = self.settled_snapshots.first().copied();
+                let roster = sorted_unique(self.settled_members.clone());
+                (
+                    review_attestation_settlement_fragment(
+                        request,
+                        goal,
+                        actor,
+                        &self.attestations,
+                        snapshot,
+                        &roster,
+                        created_at,
+                    ),
+                    SettlementMode::Attestations,
+                )
+            }
+            (true, [override_event]) => {
+                // Break-glass seals NO snapshot/roster by law — require both
+                // structurally ABSENT, so there is exactly one canonical id per
+                // override rather than one per arbitrary (snapshot, roster).
+                if !self.settled_snapshots.is_empty() || !self.settled_members.is_empty() {
+                    return None;
+                }
+                (
+                    review_override_settlement_fragment(
+                        request,
+                        goal,
+                        actor,
+                        *override_event,
+                        created_at,
+                    ),
+                    SettlementMode::Override,
+                )
+            }
             _ => return None,
         };
         (expected.root() == Some(self.id)).then_some(mode)
@@ -1063,6 +1068,19 @@ fn valid_settlements(
             // authority + the exact override event, with NO `settled_roster`
             // check. An override may be invoked precisely when the group is
             // forked/broken, so there is no unique roster to seal or validate.
+            //
+            // Protocol integrity STILL applies even to break-glass: if the
+            // request seals a group anchor, that anchor must be a real
+            // KIND_GROUP (checked WITHOUT requiring a healthy current head, so a
+            // legitimately forked/missing group can still be overridden). This
+            // stops an imposter anchor + override from validating as Settled.
+            if let Some(group) = request.group() {
+                if let Some(rel) = relations_space {
+                    if !exists!(pattern!(rel, [{ group @ metadata::tag: &REL_KIND_GROUP }])) {
+                        continue;
+                    }
+                }
+            }
             if let Some(event) = review_override(space, settlement.override_events[0]) {
                 if exactly_one(&event.requests) == Some(request.id)
                     && event.actors.len() == 1
@@ -2278,7 +2296,7 @@ mod tests {
         let override_id = override_event.root().expect("intrinsic override");
         space += override_event;
         space += review_override_settlement_fragment(
-            request, goal, authority, override_id, None, &[], now(),
+            request, goal, authority, override_id, now(),
         );
         assert!(matches!(
             evaluate_request_live(&space, request, &known, &relations)
@@ -2296,6 +2314,101 @@ mod tests {
         assert!(
             matches!(after.state, ReviewGateState::Settled { .. }),
             "override-settled review flipped to {:?} when its group forked",
+            after.state
+        );
+    }
+
+    #[test]
+    fn an_imposter_anchor_cannot_be_settled_by_break_glass() {
+        // The override path is roster-independent, but protocol integrity still
+        // applies: a crafted snapshot DAG on a non-KIND_GROUP id must not be
+        // settleable even via break-glass.
+        use crate::schemas::relations::group_snapshot_fragment;
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let author = reviewers[0];
+        let imposter = ufoid().id;
+        let target: TextHandle = "urn:revision:imposter-override".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(imposter),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+        let name: TextHandle = "imposter".to_blob().get_handle();
+        let mut relations = TribleSet::new();
+        relations += group_snapshot_fragment(imposter, name, &reviewers, &[]);
+        // A canonical break-glass override by the frozen authority.
+        let reason: TextHandle = "sneaking past the roster".to_blob().get_handle();
+        let override_event = review_override_fragment(request, authority, reason, now());
+        let override_id = override_event.root().expect("intrinsic override");
+        space += override_event;
+        space += review_override_settlement_fragment(request, goal, authority, override_id, now());
+        // The imposter anchor is not a KIND_GROUP, so the override certificate
+        // does not validate — the review is NOT Settled.
+        let eval = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert!(
+            !matches!(eval.state, ReviewGateState::Settled { .. }),
+            "imposter anchor was settled via break-glass: {:?}",
+            eval.state
+        );
+    }
+
+    #[test]
+    fn a_forked_but_real_group_can_be_settled_by_break_glass() {
+        // Break-glass exists for broken groups: a REAL KIND_GROUP that is forked
+        // fails the pending gate closed, but the frozen authority can override
+        // it (the anchor is a real group, so integrity is satisfied even with no
+        // unique head).
+        use crate::schemas::relations::{group_snapshot_fragment, KIND_GROUP as REL_KIND_GROUP};
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let author = reviewers[0];
+        let group = ufoid().id;
+        let target: TextHandle = "urn:revision:forked-override".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(group),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+        let mut relations = TribleSet::new();
+        relations += entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
+        let n1: TextHandle = "r".to_blob().get_handle();
+        let n2: TextHandle = "r".to_blob().get_handle();
+        relations += group_snapshot_fragment(group, n1, &[author], &[]);
+        relations += group_snapshot_fragment(group, n2, &reviewers, &[]);
+        assert!(matches!(
+            resolve_group_head(&relations, group),
+            GroupHead::Forked(_)
+        ));
+        // Without a settlement, the forked group fails the pending gate closed.
+        assert!(matches!(
+            evaluate_request_live(&space, request, &known, &relations)
+                .unwrap()
+                .state,
+            ReviewGateState::Invalid { .. }
+        ));
+        // The frozen authority overrides it despite the fork.
+        let reason: TextHandle = "unblock the forked group".to_blob().get_handle();
+        let override_event = review_override_fragment(request, authority, reason, now());
+        let override_id = override_event.root().expect("intrinsic override");
+        space += override_event;
+        space += review_override_settlement_fragment(request, goal, authority, override_id, now());
+        let after = evaluate_request_live(&space, request, &known, &relations).unwrap();
+        assert!(
+            matches!(after.state, ReviewGateState::Settled { .. }),
+            "forked real group was not settled by break-glass: {:?}",
             after.state
         );
     }
@@ -2856,8 +2969,6 @@ mod tests {
             goal,
             authority,
             override_id,
-            None,
-            &[],
             now(),
         );
         match evaluate_request(&space, successor, &known).unwrap().state {
@@ -3036,8 +3147,6 @@ mod tests {
             goal,
             authority,
             override_id,
-            None,
-            &[],
             now(),
         );
         match evaluate_request(&space, successor, &known).unwrap().state {
@@ -3759,8 +3868,6 @@ mod tests {
             goal,
             authority,
             override_id,
-            None,
-            &[],
             now(),
         );
         let settlement = settlement_fragment
@@ -3800,8 +3907,6 @@ mod tests {
             goal,
             authority,
             override_id,
-            None,
-            &[],
             now(),
         );
         space += entity! { ExclusiveId::force_ref(&override_id) @

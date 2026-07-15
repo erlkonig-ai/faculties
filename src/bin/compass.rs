@@ -2271,19 +2271,52 @@ fn cmd_review_override(
             if let ReviewGateState::Settled { settlements } = &evaluation.state {
                 return Ok((settlements[0].id, false));
             }
-            if matches!(evaluation.state, ReviewGateState::Invalid { .. }) {
+            // Break-glass eligibility is INTEGRITY-ONLY. It must work precisely
+            // when the live roster is Forked/Missing/Invalid — that is exactly
+            // what break-glass is FOR — so it NEVER rejects on roster
+            // resolution (an `Invalid` gate caused by a forked/broken group is
+            // still overridable). It DOES require the request's own integrity:
+            // canonical identity, the sole current head, a well-formed frozen
+            // authority set, and (if grouped) a REAL KIND_GROUP anchor — with no
+            // healthy head required.
+            let request = &evaluation.request;
+            if !request.is_canonical() {
                 bail!(
-                    "break-glass cannot override malformed candidate integrity for request {:x}",
-                    evaluation.request.id
+                    "break-glass cannot override a non-canonical request {:x}",
+                    request.id
                 );
             }
-            if !evaluation.request.override_authorities.contains(&actor) {
-                bail!("persona {actor:x} is not a frozen override authority for this request");
+            if !request_is_active(&space, request.id) {
+                bail!(
+                    "request {:x} is stale or forked; override the sole current exact request instead",
+                    request.id
+                );
             }
-            let goal = evaluation
-                .request
+            let goal = request
                 .goal()
                 .ok_or_else(|| anyhow::anyhow!("review request has no unique goal"))?;
+            let author = request
+                .author()
+                .ok_or_else(|| anyhow::anyhow!("review request has no unique author"))?;
+            if request.override_authorities.len() > 1 {
+                bail!(
+                    "review request {:x} freezes more than one break-glass authority",
+                    request.id
+                );
+            }
+            if request.override_authorities.contains(&author) {
+                bail!("review author cannot be their own break-glass authority");
+            }
+            if let Some(group) = request.group() {
+                if !exists!(pattern!(&relations_space, [{ group @ metadata::tag: &KIND_GROUP }])) {
+                    bail!(
+                        "review group {group:x} is not a KIND_GROUP anchor; break-glass still requires a real group"
+                    );
+                }
+            }
+            if !request.override_authorities.contains(&actor) {
+                bail!("persona {actor:x} is not a frozen override authority for this request");
+            }
             let now = epoch_interval(now_epoch());
             let reason_handle = ws.put(reason.clone());
             let override_event =
@@ -2299,8 +2332,6 @@ fn cmd_review_override(
                 goal,
                 actor,
                 override_id,
-                None,
-                &[],
                 now,
             );
             let settlement_id = settlement
@@ -2631,6 +2662,76 @@ mod tests {
             Ok(group_id)
         })
         .expect("add CLI group")
+    }
+
+    /// Fork an existing group by committing a second divergent snapshot-0 (no
+    /// predecessor) with different members: two un-superseded heads => Forked.
+    fn fork_cli_group(pile: &Path, group_id: Id, members: &[Id]) {
+        with_repo(pile, |repo| {
+            let branch = repo
+                .ensure_branch("relations", None)
+                .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
+            let mut ws = repo
+                .pull(branch)
+                .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+            let mut fragment = TribleSet::new();
+            fragment += group_snapshot_fragment(
+                group_id,
+                "cli-forked-head".to_string().to_blob().get_handle(),
+                members,
+                &[],
+            );
+            ws.commit(fragment, "seed divergent review roster head");
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push divergent head: {e:?}"))?;
+            Ok(())
+        })
+        .expect("fork CLI group")
+    }
+
+    #[test]
+    fn cli_break_glass_overrides_a_forked_group() {
+        let pile = TestPile::new();
+        let (branch, goal, reviewers, group) =
+            seed_cli_review(pile.path(), 2).expect("seed cli review");
+        let author = reviewers[0];
+        let authority = add_active_cli_person(pile.path());
+        // Open the review with the authority frozen as break-glass.
+        cmd_review_open(
+            pile.path(),
+            branch,
+            format!("{goal:x}"),
+            TEST_TARGET.to_string(),
+            false,
+            format!("{group:x}"),
+            vec![format!("{authority:x}")],
+            Some(&format!("{author:x}")),
+        )
+        .expect("open review with break-glass authority");
+        let request = cli_evaluation(pile.path(), branch, goal).request.id;
+
+        // Fork the group: the live roster resolves to Forked, so the gate is
+        // Invalid — the pre-fix code refused break-glass here.
+        fork_cli_group(pile.path(), group, &[reviewers[0]]);
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Invalid { .. }
+        ));
+
+        // Break-glass by the frozen authority SUCCEEDS despite the forked gate —
+        // exactly the broken-group case break-glass exists for.
+        cmd_review_override(
+            pile.path(),
+            branch,
+            format!("{request:x}"),
+            "unblock the forked group".to_string(),
+            Some(&format!("{authority:x}")),
+        )
+        .expect("break-glass override of a forked group");
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Settled { .. }
+        ));
     }
 
     fn retire_cli_person(pile: &Path, person: Id) {
