@@ -87,9 +87,8 @@ fn interval_key(interval: IntervalValue) -> i128 {
 /// and NEVER a timestamp tie-break. Snapshots are intrinsic/content-sealed
 /// (id = hash of {anchor, name handle, sorted members, sorted predecessor
 /// heads}), so cycles and rogue snapshots are structurally impossible; any
-/// that appear are `Invalid`. `Forked`/`Invalid` fail closed: callers that
-/// write groups or gate reviews stop until the anomaly is reconciled (one
-/// intrinsic child superseding every fork head).
+/// that appear are `Invalid`. Callers that require one current composition
+/// stop on `Forked`/`Invalid` until one intrinsic child supersedes every head.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupHead {
     /// No snapshots for this anchor yet.
@@ -182,10 +181,8 @@ pub fn head_members(space: &TribleSet, anchor: Id) -> HashSet<Id> {
 /// The (anchor, sorted members) a specific group `snapshot` commits to, or
 /// `None` when it is not a content-canonical snapshot in `space`. Unlike
 /// [`head_members`] this resolves an EXACT historical snapshot id, not the
-/// anchor's current head — the review gate uses it to anchor a settlement's
-/// sealed roster to the real group composition it certified against, which the
-/// append-only snapshot store keeps resolvable forever even after the group
-/// moves on.
+/// anchor's current head. Consumers can therefore cite the real historical
+/// composition even after the group moves on.
 pub fn snapshot_composition(space: &TribleSet, snapshot: Id) -> Option<(Id, Vec<Id>)> {
     if !snapshot_is_canonical(space, snapshot) {
         return None;
@@ -263,9 +260,6 @@ pub fn retired_person_ids(space: &TribleSet) -> HashSet<Id> {
 }
 
 /// IDs of people that currently exist and are not soft-retired.
-///
-/// Review rosters snapshot these IDs into the request. Group membership may
-/// change later without rewriting historical reviewer requirements.
 pub fn active_person_ids(space: &TribleSet) -> HashSet<Id> {
     let retired = retired_person_ids(space);
     person_ids(space)
@@ -274,9 +268,7 @@ pub fn active_person_ids(space: &TribleSet) -> HashSet<Id> {
         .collect()
 }
 
-/// Every relations person, including soft-retired identities. Historical
-/// review requests validate against this set so later retirement cannot
-/// rewrite the meaning of a frozen roster.
+/// Every relations person, including soft-retired identities.
 pub fn person_ids(space: &TribleSet) -> HashSet<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])).collect()
 }
@@ -397,8 +389,7 @@ mod tests {
         let (s1, facts) = snap(anchor, "roster", &[m1], &[s0]);
         space += facts;
         // The OLD snapshot still resolves to its exact composition {m1, m2},
-        // even though the current head is s1 = {m1}. This is what keeps a
-        // settlement certificate valid after the group moves on.
+        // even though the current head is s1 = {m1}.
         assert_eq!(
             snapshot_composition(&space, s0),
             Some((anchor, sorted_pair(m1, m2)))

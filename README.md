@@ -161,7 +161,7 @@ content-addressed blob store.
 ## GORBIE viewer
 
 The installed `viewer` binary composes the full faculty dashboard —
-review, activity, wiki, compass, messages, relations, archives, and
+activity, wiki, compass, messages, relations, archives, and
 the other available panels — against a single pile. See the screenshot
 above.
 

@@ -1218,8 +1218,8 @@ impl WikiGraph {
 
 /// A clicked URL in a rendered typst fragment that the viewer should
 /// handle internally (rather than letting egui open it in a browser).
-/// `pub(crate)` so sibling widgets (the review bench) can reuse the
-/// same typst-render-and-intercept path instead of reimplementing it.
+/// `pub(crate)` so sibling widgets can reuse the same
+/// typst-render-and-intercept path instead of reimplementing it.
 pub(crate) enum LinkClick {
     /// `wiki:<hex>` link — `Id` is either a fragment or a version id.
     Wiki(Id),

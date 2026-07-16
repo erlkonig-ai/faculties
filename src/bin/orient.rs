@@ -3,21 +3,17 @@ use chrono::{
     DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
 };
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::schemas::compass::{
-    active_attestation_ids_for_reviewer, evaluate_goal, evaluate_request_live, latest_status_event,
-    outstanding_review_requests, review_request, ReviewGateState, ReviewProjection,
-    VERDICT_REQUEST_CHANGES,
-};
+use faculties::schemas::compass::latest_status_event;
 use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
 use faculties::schemas::message::is_inbox_message;
 use faculties::schemas::orient::{
     KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_ORIENT_CHECKPOINT_ID, KIND_READ_ID,
-    KIND_REVIEW_WATERMARK_ID, KIND_STATUS_ID, board, local, orient_state,
+    KIND_STATUS_ID, board, local, orient_state,
 };
-use faculties::schemas::relations::{groups_for_member, person_ids, relations as rel_attrs};
+use faculties::schemas::relations::{groups_for_member, relations as rel_attrs};
 use faculties::schemas::status::{KIND_STATUS_UPDATE, status as status_attrs};
 use hifitime::Epoch;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -575,56 +571,6 @@ fn cmd_show(
             }
         }
 
-        println!("Reviews:");
-        match effective_persona {
-            Some(persona_id) => {
-                let mut relations_ws = repo
-                    .pull(relations_branch_id)
-                    .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-                let relations_space = relations_ws
-                    .checkout(..)
-                    .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-                let known_people = person_ids(&relations_space);
-                let actions =
-                    persona_review_actions(&compass_space, &known_people, persona_id, &relations_space);
-                if actions.is_empty() {
-                    println!("- None");
-                } else {
-                    for (goal_id, review) in actions.into_iter().take(10) {
-                        let title = task_title(&mut compass_ws, &compass_space, goal_id);
-                        println!("- [{}] {}", fmt_id(goal_id), title);
-                        for request_id in review.assignments.into_keys() {
-                            let target = review_request(&compass_space, request_id)
-                                .and_then(|request| request.target())
-                                .and_then(|handle| read_text(&mut compass_ws, handle).ok())
-                                .unwrap_or_else(|| "<malformed target>".to_string());
-                            println!(
-                                "    {} request [{}] {}",
-                                ReviewAction::Review.label(),
-                                fmt_id(request_id),
-                                target
-                            );
-                        }
-                        if let Some(author) = review.author {
-                            for request_id in author.requests {
-                                let target = review_request(&compass_space, request_id)
-                                    .and_then(|request| request.target())
-                                    .and_then(|handle| read_text(&mut compass_ws, handle).ok())
-                                    .unwrap_or_else(|| "<malformed target>".to_string());
-                                println!(
-                                    "    {} request [{}] {}",
-                                    author.action.label(),
-                                    fmt_id(request_id),
-                                    target
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            None => println!("- Unavailable: no persona"),
-        }
-
         drop(compass_ws);
 
         // Colony: each zooid's current status (latest-per-window).
@@ -701,7 +647,6 @@ fn cmd_show(
                     local_branch_id,
                     compass_branch_id,
                     relations_branch_id,
-                    orient_state_branch_id,
                 )?,
             )),
             None => None,
@@ -729,165 +674,6 @@ fn load_watched_heads(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewAction {
-    Review,
-    Revise,
-    Settle,
-    Repair,
-}
-
-impl ReviewAction {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Review => "REVIEW",
-            Self::Revise => "REVISE",
-            Self::Settle => "SETTLE",
-            Self::Repair => "REPAIR",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AuthorReviewAction {
-    action: ReviewAction,
-    requests: BTreeSet<Id>,
-    /// Active attestation heads are part of the author's wake token. A
-    /// replacement blocker is actionable even if the gate remains BLOCKED.
-    heads: BTreeSet<Id>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PersonaGoalReview {
-    /// Exact requests for which this persona still owes an attestation,
-    /// paired with their active head sets. The heads are part of the wake
-    /// token so no-head → malformed/forked transitions re-notify the reviewer.
-    assignments: BTreeMap<Id, BTreeSet<Id>>,
-    /// Work owned by the request author after the reviewers have acted.
-    author: Option<AuthorReviewAction>,
-}
-
-/// Derive the review work this persona can act on now. Reviewer assignments
-/// and author actions intentionally coexist: an author may still owe their own
-/// attestation while also needing to repair malformed or forked review state.
-fn persona_review_actions(
-    compass_space: &TribleSet,
-    known_people: &HashSet<Id>,
-    persona_id: Id,
-    relations_space: &TribleSet,
-) -> BTreeMap<Id, PersonaGoalReview> {
-    let mut actions = BTreeMap::<Id, PersonaGoalReview>::new();
-    for (goal, request) in
-        outstanding_review_requests(compass_space, known_people, persona_id, Some(relations_space))
-    {
-        let heads = active_attestation_ids_for_reviewer(compass_space, request, persona_id)
-            .into_iter()
-            .collect();
-        actions
-            .entry(goal)
-            .or_default()
-            .assignments
-            .insert(request, heads);
-    }
-
-    let goals: BTreeSet<Id> = find!(
-        goal: Id,
-        pattern!(compass_space, [{ ?goal @ metadata::tag: &KIND_GOAL_ID }])
-    )
-    .collect();
-    for goal in goals {
-        let author_action = match evaluate_goal(compass_space, goal, known_people, Some(relations_space)) {
-            ReviewProjection::Unbound => None,
-            ReviewProjection::Bound(evaluation) => {
-                // `contains` deliberately keeps a malformed multi-author
-                // request visible to every named author as REPAIR work.
-                if !evaluation.request.authors.contains(&persona_id) {
-                    None
-                } else {
-                    let has_change_request = evaluation.slots.iter().any(|slot| {
-                        matches!(slot.heads.as_slice(), [head]
-                            if head.is_canonical()
-                                && head.request() == Some(evaluation.request.id)
-                                && head.reviewer() == Some(slot.reviewer)
-                                && head.verdict() == Some(VERDICT_REQUEST_CHANGES))
-                    });
-                    let action = match &evaluation.state {
-                        ReviewGateState::Blocked { .. } if has_change_request => {
-                            Some(ReviewAction::Revise)
-                        }
-                        ReviewGateState::Blocked { .. } => Some(ReviewAction::Repair),
-                        ReviewGateState::Ready => Some(ReviewAction::Settle),
-                        ReviewGateState::Invalid { .. } => Some(ReviewAction::Repair),
-                        ReviewGateState::Pending { .. } | ReviewGateState::Settled { .. } => None,
-                    };
-                    action.map(|action| AuthorReviewAction {
-                        action,
-                        requests: [evaluation.request.id].into_iter().collect(),
-                        heads: evaluation
-                            .slots
-                            .iter()
-                            .flat_map(|slot| slot.heads.iter().map(|head| head.id))
-                            .collect(),
-                    })
-                }
-            }
-            ReviewProjection::Forked { request_ids } => {
-                let authored = request_ids.iter().any(|request_id| {
-                    evaluate_request_live(compass_space, *request_id, known_people, relations_space)
-                        .is_some_and(|evaluation| {
-                            evaluation.request.authors.contains(&persona_id)
-                        })
-                });
-                authored.then(|| AuthorReviewAction {
-                    action: ReviewAction::Repair,
-                    requests: request_ids.into_iter().collect(),
-                    heads: BTreeSet::new(),
-                })
-            }
-        };
-        if let Some(author_action) = author_action {
-            actions.entry(goal).or_default().author = Some(author_action);
-        }
-    }
-    actions
-}
-
-fn ids_token(ids: &BTreeSet<Id>) -> String {
-    ids.iter().map(|id| fmt_id(*id)).collect::<Vec<_>>().join(",")
-}
-
-fn assignment_state_token(assignments: &BTreeMap<Id, BTreeSet<Id>>) -> String {
-    assignments
-        .iter()
-        .map(|(request, heads)| {
-            let heads = if heads.is_empty() {
-                "-".to_string()
-            } else {
-                heads
-                    .iter()
-                    .map(|head| fmt_id(*head))
-                    .collect::<Vec<_>>()
-                    .join("+")
-            };
-            format!("{}@{heads}", fmt_id(*request))
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn author_action_token(action: Option<&AuthorReviewAction>) -> String {
-    action
-        .map(|action| {
-            format!(
-                "{}@{}@{}",
-                action.action.label(),
-                ids_token(&action.requests),
-                ids_token(&action.heads)
-            )
-        })
-        .unwrap_or_default()
-}
-
 /// The persona-relevant view of the watched branches: what counts as
 /// NEWS for one zooid. Raw branch movement that doesn't change this
 /// view — the persona's own acks and sends, another persona's reads —
@@ -905,7 +691,6 @@ fn load_watched_view(
     local_branch_id: Id,
     compass_branch_id: Id,
     relations_branch_id: Id,
-    orient_state_branch_id: Id,
 ) -> Result<WatchedView> {
     let mut local_ws = repo
         .pull(local_branch_id)
@@ -922,24 +707,19 @@ fn load_watched_view(
     let relations_space = relations_ws
         .checkout(..)
         .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-    // Groups this persona belongs to — a message addressed to one of them
-    // is news for the persona too (this is how broadcasts/colony work,
-    // replacing the old liora-cc magic id).
     let my_groups = groups_for_member(&relations_space, persona_id);
-    let unread: std::collections::BTreeSet<Id> = message_rows
+    let unread = message_rows
         .into_iter()
         .filter(|msg| {
-            // your own sends never wake you — including to a group you're in.
             is_inbox_message(msg.from, msg.to, persona_id, &my_groups)
                 && !reads.contains_key(&(msg.id, persona_id))
         })
         .map(|msg| msg.id)
         .collect();
-    // Only zooid personas count toward the watched roster. A new colony
-    // member is news; bulk contact/lead imports (hundreds of KIND_PERSON
-    // entries from e.g. a LinkedIn pull) must NOT wake every watcher.
-    // Gate on affinity = "zooid".
-    let roster: std::collections::BTreeSet<Id> = find!(
+
+    // Only zooid personas count toward the watched roster. Bulk contact
+    // imports must not wake every watcher.
+    let roster = find!(
         person_id: Id,
         pattern!(&relations_space, [{
             ?person_id @
@@ -948,9 +728,10 @@ fn load_watched_view(
         }])
     )
     .collect();
-    // The persona's normalized labels/aliases — goals tagged with one of
-    // these are "addressed to" the persona for wake purposes.
-    let persona_keys: std::collections::HashSet<String> = find!(
+
+    // A goal tagged with one of this persona's normalized labels or aliases is
+    // explicitly addressed to them.
+    let persona_keys: HashSet<String> = find!(
         key: String,
         pattern!(&relations_space, [{ persona_id @ rel_attrs::label_norm: ?key }])
     )
@@ -966,44 +747,14 @@ fn load_watched_view(
     let compass_space = compass_ws
         .checkout(..)
         .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
-    // Review actions are derived from the exact same request/attestation heads
-    // that close the Compass gate. No parallel notification ledger is needed.
-    let known_people = person_ids(&relations_space);
-    let mut review_actions = persona_review_actions(&compass_space, &known_people, persona_id, &relations_space);
 
-    // Watermark filter (ack/snooze): drop owed reviewer assignments the persona
-    // has acknowledged, as long as their state (the attestation head-set) is
-    // unchanged and any snooze deadline is still in the future. Because
-    // `view_news` only wakes on ADDED assignments, an ack (a removal) never
-    // self-wakes; a later head change / a fresh superseding request id / an
-    // expired snooze all break the match and re-add the assignment → wake. This
-    // is the edge-trigger the review wake-storm needed. Author actions are
-    // never suppressed — a review the persona OWNS still needs their eyes.
-    let watermarks = load_review_watermarks(repo, orient_state_branch_id, persona_id)?;
-    if !watermarks.is_empty() {
-        let now = interval_key(epoch_interval(now_epoch()));
-        for review in review_actions.values_mut() {
-            review.assignments.retain(|request, heads| match watermarks.get(request) {
-                Some(wm) => !watermark_quiet(wm, heads, now),
-                None => true,
-            });
-        }
-    }
-
-    // One line per goal:
-    // "id:status:author:flags:review-assignments:author-action:assignment-state".
-    // Author = persona hex
-    // on the latest status event (empty when unattributed), so own
-    // edits can be absorbed. Flags carry the relevance bits view_news
-    // scopes wakes by: i = persona is involved (authored any status
-    // event on the goal), p = goal carries one of the persona's
-    // labels as a tag, c = goal tagged "colony" (wakes everyone), r = one
-    // or more concrete review/author actions for this persona.
+    // One line per goal: "id:status:author:flags". Author is the acting
+    // persona on the latest status event. Flags are i = this persona has
+    // authored a status on the goal, p = explicitly persona-tagged, and
+    // c = colony-tagged.
     let mut goal_lines: Vec<String> =
         find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
             .map(|id| {
-                let latest = latest_status_event(&compass_space, id);
-
                 let involved = exists!(pattern!(&compass_space, [{
                     _?evt @
                     metadata::tag: &KIND_STATUS_ID,
@@ -1027,125 +778,51 @@ fn load_watched_view(
                 if colony_tagged {
                     flags.push('c');
                 }
-                let assignments_token = review_actions
-                    .get(&id)
-                    .map(|review| {
-                        ids_token(&review.assignments.keys().copied().collect())
-                    })
-                    .unwrap_or_default();
-                let assignment_state = review_actions
-                    .get(&id)
-                    .map(|review| assignment_state_token(&review.assignments))
-                    .unwrap_or_default();
-                let author_token = author_action_token(
-                    review_actions
-                        .get(&id)
-                        .and_then(|review| review.author.as_ref()),
-                );
-                if !assignments_token.is_empty() || !author_token.is_empty() {
-                    flags.push('r');
-                }
 
-                match latest {
-                    Some((evt, status, _)) => {
+                match latest_status_event(&compass_space, id) {
+                    Some((event, status, _)) => {
                         let by = find!(
                             by: Id,
-                            pattern!(&compass_space, [{ evt @ board::by: ?by }])
+                            pattern!(&compass_space, [{ event @ board::by: ?by }])
                         )
                         .next()
                         .map(fmt_id)
                         .unwrap_or_default();
-                        format!(
-                            "{:x}:{status}:{by}:{flags}:{assignments_token}:{author_token}:{assignment_state}",
-                            id
-                        )
+                        format!("{id:x}:{status}:{by}:{flags}")
                     }
-                    None => format!(
-                        "{:x}:::{flags}:{assignments_token}:{author_token}:{assignment_state}",
-                        id
-                    ),
+                    None => format!("{id:x}:::{flags}"),
                 }
             })
             .collect();
     goal_lines.sort();
-    let goals_view = goal_lines.join("\n");
 
     Ok(WatchedView {
         unread,
-        goals_view,
+        goals_view: goal_lines.join("\n"),
         roster,
     })
 }
 
 /// What news is in `new` relative to `old`? Returns one line per
-/// item, empty = no news. Unread and roster are growth-only: a
-/// message leaving the unread set (the persona acked it) is not
-/// news, an arriving message is; a NEW person is news, enrichment
-/// of an existing entry is not (so another zooid's multi-commit
-/// contact-editing burst wakes at most once). Goals wake on relevant
-/// status changes and review-action token changes — the reason line names
-/// the goal/request so the woken agent never has to diff the board by hand.
+/// item, empty = no news. Unread and roster are growth-only. Goal status
+/// changes wake only when the goal is relevant to this persona; a new goal
+/// wakes only when explicitly addressed by persona or colony tag.
 fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String> {
     let mut reasons = Vec::new();
     for msg in new.unread.difference(&old.unread) {
         reasons.push(format!("new message [{}]", fmt_id(*msg)));
     }
-    // Goal lines are
-    // "id:status:author:flags:review-assignments:author-action:assignment-state".
-    // Older four-, five-, and six-field checkpoints parse with empty trailing
-    // tokens. Scope:
-    // a change the persona itself authored is never news; a change by
-    // someone else is news only when the goal is RELEVANT to the
-    // persona — involved (i: persona authored a status event on it),
-    // persona-tagged (p), colony-tagged (c), or review-assigned (r). A brand-new goal is
-    // news only when tagged for the persona or the colony — tagging a
-    // goal with a persona's label is the "summon that zooid" primitive;
-    // unclaimed work is discovered at snapshots, not via wakes.
-    let me = fmt_id(persona_id);
-    let parse_ids = |token: &str| -> BTreeSet<String> {
-        token
-            .split(',')
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let parse_assignment_state = |token: &str| -> HashMap<String, String> {
-        token
-            .split(',')
-            .filter_map(|entry| entry.split_once('@'))
-            .map(|(request, heads)| (request.to_owned(), heads.to_owned()))
-            .collect()
-    };
-    let parse = |view: &str| -> HashMap<
-        String,
-        (
-            String,
-            String,
-            String,
-            BTreeSet<String>,
-            String,
-            Option<HashMap<String, String>>,
-        ),
-    > {
+
+    let parse = |view: &str| -> HashMap<String, (String, String, String)> {
         view.lines()
             .filter_map(|line| {
-                let mut parts = line.splitn(7, ':');
-                let id = parts.next()?.to_owned();
-                let status = parts.next().unwrap_or("").to_owned();
-                let by = parts.next().unwrap_or("").to_owned();
-                let flags = parts.next().unwrap_or("").to_owned();
-                let assignments = parse_ids(parts.next().unwrap_or(""));
-                let author_action = parts.next().unwrap_or("").to_owned();
-                let assignment_state = parts.next().map(parse_assignment_state);
+                let mut parts = line.splitn(4, ':');
                 Some((
-                    id,
+                    parts.next()?.to_owned(),
                     (
-                        status,
-                        by,
-                        flags,
-                        assignments,
-                        author_action,
-                        assignment_state,
+                        parts.next().unwrap_or("").to_owned(),
+                        parts.next().unwrap_or("").to_owned(),
+                        parts.next().unwrap_or("").to_owned(),
                     ),
                 ))
             })
@@ -1153,79 +830,23 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
     };
     let old_goals = parse(&old.goals_view);
     let new_goals = parse(&new.goals_view);
-    for (id, (status, by, flags, assignments, author_action, assignment_state)) in &new_goals {
+    let me = fmt_id(persona_id);
+
+    for (id, (status, by, flags)) in &new_goals {
         let own_edit = *by == me;
-        let addressed = flags.contains('p') || flags.contains('c') || flags.contains('r');
+        let addressed = flags.contains('p') || flags.contains('c');
         let relevant = flags.contains('i') || addressed;
-        let previous_assignments = old_goals
-            .get(id)
-            .map(|(_, _, _, assignments, _, _)| assignments)
-            .cloned()
-            .unwrap_or_default();
-        let mut action_notified = false;
-        if !own_edit {
-            // Assignment tokens are sets, not opaque strings. Only additions
-            // wake a reviewer: fulfilling/removing `a` from `a,b` must not
-            // make the still-present `b` look like a refreshed candidate.
-            for request in assignments.difference(&previous_assignments) {
-                let short = &request[..request.len().min(8)];
-                reasons.push(format!("REVIEW [{id}] (request {short})"));
-                action_notified = true;
-            }
-            for request in assignments.intersection(&previous_assignments) {
-                let changed = old_goals
-                    .get(id)
-                    .and_then(|(_, _, _, _, _, states)| states.as_ref())
-                    .is_some_and(|states| {
-                        states.get(request)
-                            != assignment_state
-                                .as_ref()
-                                .and_then(|current| current.get(request))
-                    });
-                if changed {
-                    let short = &request[..request.len().min(8)];
-                    reasons.push(format!("REVIEW updated [{id}] (request {short})"));
-                    action_notified = true;
-                }
-            }
-        }
-
-        let previous_author_action = old_goals
-            .get(id)
-            .map(|(_, _, _, _, action, _)| action.as_str())
-            .unwrap_or("");
-        if !author_action.is_empty() && author_action != previous_author_action {
-            let mut parts = author_action.splitn(3, '@');
-            let action = parts.next().unwrap_or("REPAIR");
-            let request = parts
-                .next()
-                .unwrap_or("")
-                .split(',')
-                .next()
-                .unwrap_or("");
-            let short = &request[..request.len().min(8)];
-            let updated = if previous_author_action.is_empty() {
-                ""
-            } else {
-                " updated"
-            };
-            reasons.push(format!("{action}{updated} [{id}] (request {short})"));
-            action_notified = true;
-        }
-
-        if action_notified {
-            continue;
-        }
         match old_goals.get(id) {
             None if !own_edit && addressed => {
-                reasons.push(format!("new goal [{id}] ({status})"))
+                reasons.push(format!("new goal [{id}] ({status})"));
             }
-            Some((prev, _, _, _, _, _)) if prev != status && !own_edit && relevant => {
-                reasons.push(format!("goal [{id}]: {prev} → {status}"))
+            Some((previous, _, _)) if previous != status && !own_edit && relevant => {
+                reasons.push(format!("goal [{id}]: {previous} → {status}"));
             }
             _ => {}
         }
     }
+
     for person in new.roster.difference(&old.roster) {
         reasons.push(format!("new person [{}]", fmt_id(*person)));
     }
@@ -1353,88 +974,6 @@ fn load_checkpoint_view(
         goals_view,
         roster,
     }))
-}
-
-/// Should an owed-review assignment be suppressed given the persona's
-/// watermark? `wm` is the `(acked head-set, optional snooze deadline)` recorded
-/// at ack/snooze time; `heads` is the assignment's *current* attestation
-/// head-set; `now` is the current interval key. Quiet iff the acked head-set
-/// still matches AND either it was a plain ack (no deadline) or the snooze
-/// deadline is still in the future. Any head change (malformed/forked
-/// transition, a fresh attestation) breaks the match and re-surfaces the review
-/// regardless of a live snooze — state changes always win over a timer.
-fn watermark_quiet(wm: &(BTreeSet<Id>, Option<i128>), heads: &BTreeSet<Id>, now: i128) -> bool {
-    let (acked_heads, deadline) = wm;
-    *acked_heads == *heads
-        && match deadline {
-            None => true,         // plain ack: quiet until the head-set changes
-            Some(d) => now <= *d, // snooze: quiet until the deadline passes
-        }
-}
-
-/// Load this persona's review watermarks (ack/snooze) from the orient-state
-/// branch, reduced latest-wins per request. Returns
-/// `request -> (acked attestation head-set, optional snooze deadline key)`.
-/// Empty when the branch has no head yet.
-fn load_review_watermarks(
-    repo: &mut Repository<Pile>,
-    orient_state_branch_id: Id,
-    persona_id: Id,
-) -> Result<BTreeMap<Id, (BTreeSet<Id>, Option<i128>)>> {
-    let Some(_head) = repo
-        .storage_mut()
-        .head(orient_state_branch_id)
-        .map_err(|e| anyhow!("orient state branch head: {e:?}"))?
-    else {
-        return Ok(BTreeMap::new());
-    };
-    let mut ws = repo
-        .pull(orient_state_branch_id)
-        .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout orient state: {e:?}"))?;
-
-    // Latest watermark event per request (by `at`).
-    let mut latest: BTreeMap<Id, (i128, Id)> = BTreeMap::new();
-    for (wm_id, request, at) in find!(
-        (wm_id: Id, request: Id, at: IntervalValue),
-        pattern!(&space, [{
-            ?wm_id @
-            metadata::tag: &KIND_REVIEW_WATERMARK_ID,
-            orient_state::persona: &persona_id,
-            orient_state::wm_request: ?request,
-            orient_state::at: ?at,
-        }])
-    ) {
-        let key = interval_key(at);
-        latest
-            .entry(request)
-            .and_modify(|entry| {
-                if key > entry.0 {
-                    *entry = (key, wm_id);
-                }
-            })
-            .or_insert((key, wm_id));
-    }
-
-    // Read the winning watermark's acked head-set + optional snooze deadline.
-    let mut out: BTreeMap<Id, (BTreeSet<Id>, Option<i128>)> = BTreeMap::new();
-    for (request, (_at, wm_id)) in latest {
-        let heads: BTreeSet<Id> = find!(
-            h: Id,
-            pattern!(&space, [{ wm_id @ orient_state::wm_head: ?h }])
-        )
-        .collect();
-        let deadline: Option<i128> = find!(
-            d: IntervalValue,
-            pattern!(&space, [{ wm_id @ orient_state::wm_deadline: ?d }])
-        )
-        .next()
-        .map(interval_key);
-        out.insert(request, (heads, deadline));
-    }
-    Ok(out)
 }
 
 fn save_checkpoint_heads(
@@ -1673,16 +1212,14 @@ fn check_news_once(
         local_branch_id,
         compass_branch_id,
         relations_branch_id,
-        orient_state_branch_id,
     )?;
     let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, persona_id)? else {
         return Ok(NewsCheck::NoCheckpoint(view));
     };
     let reasons = view_news(&seen, &view, persona_id);
     if reasons.is_empty() {
-        // Quiet removals still change the comparison baseline. Persist them so
-        // a fulfilled assignment that is later re-added wakes even if the
-        // watcher/poller restarted in between. Peek remains strictly read-only.
+        // Quiet changes still update the comparison baseline. Peek remains
+        // strictly read-only.
         if !peek && view != seen {
             save_checkpoint_heads(
                 repo,
@@ -1886,7 +1423,6 @@ fn cmd_wait(
                         local_branch_id,
                         compass_branch_id,
                         relations_branch_id,
-                        orient_state_branch_id,
                     )?;
                     let reasons = view_news(view, &current_view, pid);
                     if !reasons.is_empty() {
@@ -1903,10 +1439,8 @@ fn cmd_wait(
                         )?;
                         return Ok((false, true, true));
                     }
-                    // Movement without news (own ack/send, another
-                    // persona's traffic, fulfilled review work) — absorb it
-                    // and keep waiting. Persist changed quiet views so a
-                    // removal followed by a restart and re-add still wakes.
+                    // Movement without news (an own edit or another persona's
+                    // traffic) is absorbed while the watcher keeps waiting.
                     if *view != current_view {
                         save_checkpoint_heads(
                             repo,
@@ -2048,382 +1582,58 @@ mod tests {
     }
 
     #[test]
-    fn old_four_field_checkpoint_parses_and_new_review_wakes() {
+    fn addressed_new_goal_wakes() {
         let me = ufoid().id;
-        let other = ufoid().id;
         let goal = ufoid().id;
-        let request = ufoid().id;
-        let old = view(format!("{goal:x}:review:{other:x}:i"));
-        let new = view(format!("{goal:x}:review:{other:x}:ir:{request:x}"));
-
-        let news = view_news(&old, &new, me);
-        assert_eq!(news.len(), 1);
-        assert!(news[0].contains("REVIEW"));
+        let news = view_news(&view(""), &view(format!("{goal:x}:todo::p")), me);
+        assert_eq!(news, [format!("new goal [{goal:x}] (todo)")]);
     }
 
     #[test]
-    fn old_six_field_existing_assignment_upgrades_quietly() {
+    fn unaddressed_new_goal_is_quiet() {
         let me = ufoid().id;
-        let other = ufoid().id;
         let goal = ufoid().id;
-        let request = ufoid().id;
-        let old = view(format!("{goal:x}:review:{other:x}:r:{request:x}:"));
-        let new = view(format!(
-            "{goal:x}:review:{other:x}:r:{request:x}::{request:x}@-"
-        ));
+        assert!(view_news(&view(""), &view(format!("{goal:x}:todo::")), me).is_empty());
+    }
 
+    #[test]
+    fn own_status_change_is_quiet() {
+        let me = ufoid().id;
+        let goal = ufoid().id;
+        let old = view(format!("{goal:x}:todo:{me:x}:ip"));
+        let new = view(format!("{goal:x}:doing:{me:x}:ip"));
         assert!(view_news(&old, &new, me).is_empty());
     }
 
     #[test]
-    fn non_required_persona_is_quiet() {
+    fn relevant_peer_status_change_wakes() {
         let me = ufoid().id;
-        let other = ufoid().id;
+        let peer = ufoid().id;
         let goal = ufoid().id;
-        let old = view(format!("{goal:x}:doing:{other:x}:"));
-        let new = view(format!("{goal:x}:review:{other:x}:"));
-
-        assert!(view_news(&old, &new, me).is_empty());
-    }
-
-    #[test]
-    fn own_review_open_does_not_wake_author() {
-        let me = ufoid().id;
-        let goal = ufoid().id;
-        let request = ufoid().id;
-        let old = view(format!("{goal:x}:doing:{me:x}:i:"));
-        let new = view(format!("{goal:x}:review:{me:x}:ir:{request:x}"));
-
-        assert!(view_news(&old, &new, me).is_empty());
-    }
-
-    #[test]
-    fn unchanged_review_assignment_is_quiet() {
-        let me = ufoid().id;
-        let other = ufoid().id;
-        let goal = ufoid().id;
-        let request = ufoid().id;
-        let line = format!("{goal:x}:review:{other:x}:r:{request:x}::{request:x}@-");
-
-        assert!(view_news(&view(line.clone()), &view(line), me).is_empty());
-    }
-
-    #[test]
-    fn malformed_or_forked_attestation_heads_rewake_reviewer() {
-        let me = ufoid().id;
-        let other = ufoid().id;
-        let goal = ufoid().id;
-        let request = ufoid().id;
-        let malformed = ufoid().id;
-        let concurrent = ufoid().id;
-        let pending = view(format!(
-            "{goal:x}:review:{other:x}:r:{request:x}::{request:x}@-"
-        ));
-        let one_bad_head = view(format!(
-            "{goal:x}:review:{other:x}:r:{request:x}::{request:x}@{malformed:x}"
-        ));
-        let forked = view(format!(
-            "{goal:x}:review:{other:x}:r:{request:x}::{request:x}@{malformed:x}+{concurrent:x}"
-        ));
-
-        let news = view_news(&pending, &one_bad_head, me);
-        assert_eq!(news.len(), 1);
-        assert!(news[0].contains("REVIEW updated"));
-
-        let news = view_news(&one_bad_head, &forked, me);
-        assert_eq!(news.len(), 1);
-        assert!(news[0].contains("REVIEW updated"));
-    }
-
-    #[test]
-    fn successor_request_re_notifies_reviewer() {
-        let me = ufoid().id;
-        let other = ufoid().id;
-        let goal = ufoid().id;
-        let first = Id::from_hex("11111111111111111111111111111111").unwrap();
-        let second = Id::from_hex("22222222222222222222222222222222").unwrap();
-        let old = view(format!("{goal:x}:review:{other:x}:r:{first:x}"));
-        let new = view(format!("{goal:x}:review:{other:x}:r:{second:x}"));
-
-        let news = view_news(&old, &new, me);
-        assert_eq!(news.len(), 1);
-        assert!(news[0].contains("REVIEW"));
-        assert!(news[0].contains(&fmt_id(second)[..8]));
-    }
-
-    #[test]
-    fn fulfilled_assignment_removal_is_not_news() {
-        let me = ufoid().id;
-        let other = ufoid().id;
-        let goal = ufoid().id;
-        let request = ufoid().id;
-        let old = view(format!("{goal:x}:review:{other:x}:r:{request:x}"));
-        let new = view(format!("{goal:x}:review:{other:x}::"));
-
-        assert!(view_news(&old, &new, me).is_empty());
-    }
-
-    #[test]
-    fn removing_one_of_two_assignments_does_not_false_wake() {
-        let me = ufoid().id;
-        let other = ufoid().id;
-        let goal = ufoid().id;
-        let first = ufoid().id;
-        let second = ufoid().id;
-        let old = view(format!(
-            "{goal:x}:review:{other:x}:r:{first:x},{second:x}:"
-        ));
-        let new = view(format!("{goal:x}:review:{other:x}:r:{second:x}:"));
-
-        assert!(view_news(&old, &new, me).is_empty());
-    }
-
-    #[test]
-    fn only_newly_added_assignment_id_wakes() {
-        let me = ufoid().id;
-        let other = ufoid().id;
-        let goal = ufoid().id;
-        let first = Id::from_hex("11111111111111111111111111111111").unwrap();
-        let second = Id::from_hex("22222222222222222222222222222222").unwrap();
-        let old = view(format!("{goal:x}:review:{other:x}:r:{first:x}:"));
-        let new = view(format!(
-            "{goal:x}:review:{other:x}:r:{first:x},{second:x}:"
-        ));
-
-        let news = view_news(&old, &new, me);
-        assert_eq!(news.len(), 1);
-        assert!(news[0].contains(&fmt_id(second)[..8]));
-        assert!(!news[0].contains(&fmt_id(first)[..8]));
-    }
-
-    #[test]
-    fn quiet_removal_then_readd_wakes_from_updated_baseline() {
-        let me = ufoid().id;
-        let other = ufoid().id;
-        let goal = ufoid().id;
-        let request = ufoid().id;
-        let assigned = view(format!("{goal:x}:review:{other:x}:r:{request:x}:"));
-        let fulfilled = view(format!("{goal:x}:review:{other:x}:::"));
-
-        assert!(view_news(&assigned, &fulfilled, me).is_empty());
-        let news = view_news(&fulfilled, &assigned, me);
-        assert_eq!(news.len(), 1);
-        assert!(news[0].contains("REVIEW"));
-    }
-
-    #[test]
-    fn author_state_transition_wakes_even_when_status_author_is_self() {
-        let me = ufoid().id;
-        let goal = ufoid().id;
-        let request = ufoid().id;
-        let blocker = ufoid().id;
-        let approval = ufoid().id;
-        let old = view(format!(
-            "{goal:x}:review:{me:x}:ir::REVISE@{request:x}@{blocker:x}"
-        ));
-        let new = view(format!(
-            "{goal:x}:review:{me:x}:ir::SETTLE@{request:x}@{approval:x}"
-        ));
-
-        let news = view_news(&old, &new, me);
-        assert_eq!(news.len(), 1);
-        assert!(news[0].contains("SETTLE updated"));
-    }
-
-    #[test]
-    fn replacement_blocker_re_notifies_author() {
-        let me = ufoid().id;
-        let goal = ufoid().id;
-        let request = ufoid().id;
-        let first = ufoid().id;
-        let second = ufoid().id;
-        let old = view(format!(
-            "{goal:x}:review:{me:x}:ir::REVISE@{request:x}@{first:x}"
-        ));
-        let new = view(format!(
-            "{goal:x}:review:{me:x}:ir::REVISE@{request:x}@{second:x}"
-        ));
-
-        let news = view_news(&old, &new, me);
-        assert_eq!(news.len(), 1);
-        assert!(news[0].contains("REVISE updated"));
-    }
-
-    #[test]
-    fn fork_repair_action_wakes_its_author() {
-        let me = ufoid().id;
-        let goal = ufoid().id;
-        let first = Id::from_hex("11111111111111111111111111111111").unwrap();
-        let second = Id::from_hex("22222222222222222222222222222222").unwrap();
-        let old = view(format!("{goal:x}:review:{me:x}:i::"));
-        let new = view(format!(
-            "{goal:x}:review:{me:x}:ir::REPAIR@{first:x},{second:x}@"
-        ));
-
-        let news = view_news(&old, &new, me);
-        assert_eq!(news.len(), 1);
-        assert!(news[0].contains("REPAIR"));
-        assert!(news[0].contains(&fmt_id(first)[..8]));
-    }
-
-    #[test]
-    fn completed_author_action_removal_is_quiet() {
-        let me = ufoid().id;
-        let goal = ufoid().id;
-        let request = ufoid().id;
-        let approval = ufoid().id;
-        let old = view(format!(
-            "{goal:x}:review:{me:x}:ir::SETTLE@{request:x}@{approval:x}"
-        ));
-        let new = view(format!("{goal:x}:done:{me:x}:i::"));
-
-        assert!(view_news(&old, &new, me).is_empty());
-    }
-
-    // --- Review watermark (ack/snooze) quiet-decision ------------------------
-
-    fn heads(ids: &[Id]) -> BTreeSet<Id> {
-        ids.iter().copied().collect()
-    }
-
-    #[test]
-    fn plain_ack_is_quiet_while_heads_match() {
-        let h = heads(&[ufoid().id]);
-        // No deadline: quiet regardless of the clock, as long as heads match.
-        assert!(watermark_quiet(&(h.clone(), None), &h, 0));
-        assert!(watermark_quiet(&(h.clone(), None), &h, i128::MAX));
-    }
-
-    #[test]
-    fn ack_re_surfaces_when_attestation_head_appears() {
-        let existing = ufoid().id;
-        let acked = heads(&[existing]);
-        // A malformed/forked transition adds a head → the acked set no longer
-        // matches → not quiet, so the review re-surfaces.
-        let now_two = heads(&[existing, ufoid().id]);
-        assert!(!watermark_quiet(&(acked.clone(), None), &now_two, 0));
-        // An attestation the reviewer later retracts (head removed) also breaks
-        // the match — any change re-surfaces, not just growth.
-        assert!(!watermark_quiet(&(acked, None), &BTreeSet::new(), 0));
-    }
-
-    #[test]
-    fn empty_headset_ack_stays_quiet_until_first_attestation() {
-        // Pending review with no attestation yet: ack snapshots the empty set,
-        // and stays quiet until the reviewer's first attestation head lands.
-        assert!(watermark_quiet(&(BTreeSet::new(), None), &BTreeSet::new(), 0));
-        let posted = heads(&[ufoid().id]);
-        assert!(!watermark_quiet(&(BTreeSet::new(), None), &posted, 0));
-    }
-
-    #[test]
-    fn snooze_is_quiet_before_deadline_and_wakes_after() {
-        let h = heads(&[ufoid().id]);
-        let deadline = 1_000i128;
-        assert!(watermark_quiet(&(h.clone(), Some(deadline)), &h, 500)); // before
-        assert!(watermark_quiet(&(h.clone(), Some(deadline)), &h, 1_000)); // at (<=)
-        assert!(!watermark_quiet(&(h.clone(), Some(deadline)), &h, 1_001)); // after
-    }
-
-    #[test]
-    fn head_change_overrides_a_live_snooze() {
-        let existing = ufoid().id;
-        let acked = heads(&[existing]);
-        let changed = heads(&[existing, ufoid().id]);
-        // Deadline is still in the future, but the state moved: state wins.
-        assert!(!watermark_quiet(&(acked, Some(i128::MAX)), &changed, 0));
-    }
-
-    /// Full round-trip: the watermark entity `compass review ack/snooze` writes
-    /// onto the `orient-state` branch reads back through `load_review_watermarks`
-    /// exactly — latest-wins per (persona, request), per-persona scoping, the
-    /// repeated head-set, and the optional snooze deadline. Uses a fresh
-    /// file-backed pile via the production `open_repo` path (no extra dep).
-    #[test]
-    fn watermarks_round_trip_latest_wins_and_scope_by_persona() {
-        let path = std::env::temp_dir().join(format!("orient-wm-{:x}.pile", ufoid().id));
-        std::fs::File::create(&path).expect("create temp pile");
-        let mut repo = open_repo(&path).expect("open repo");
-        let osb = repo
-            .ensure_branch("orient-state", None)
-            .expect("ensure orient-state");
-
-        let me = ufoid().id;
-        let other = ufoid().id;
-        let req_ack = ufoid().id;
-        let req_snooze = ufoid().id;
-        let h1 = ufoid().id;
-        let h2 = ufoid().id;
-
-        let early = now_epoch();
-        let late = now_epoch() + hifitime::Duration::from_total_nanoseconds(10_000_000_000);
-        let deadline_epoch =
-            now_epoch() + hifitime::Duration::from_total_nanoseconds(3_600_000_000_000);
-
-        // Append one watermark event, exactly as `write_review_watermark` does.
-        fn write_wm(
-            repo: &mut Repository<Pile>,
-            osb: Id,
-            persona: Id,
-            request: Id,
-            head_ids: &[Id],
-            at: Epoch,
-            deadline: Option<Epoch>,
-        ) {
-            let mut ws = repo.pull(osb).expect("pull orient-state");
-            let wm_id = ufoid();
-            let mut change = TribleSet::new();
-            change += entity! { &wm_id @
-                metadata::tag: &KIND_REVIEW_WATERMARK_ID,
-                orient_state::persona: &persona,
-                orient_state::wm_request: &request,
-                orient_state::wm_head*: head_ids.iter(),
-                orient_state::at: epoch_interval(at),
-            };
-            if let Some(d) = deadline {
-                change += entity! { &wm_id @ orient_state::wm_deadline: epoch_interval(d) };
-            }
-            ws.commit(change, "test watermark");
-            repo.push(&mut ws).expect("push watermark");
-        }
-
-        // req_ack: an early {h1} event superseded latest-wins by a later {h1,h2}
-        // event (no deadline → plain ack).
-        write_wm(&mut repo, osb, me, req_ack, &[h1], early, None);
-        write_wm(&mut repo, osb, me, req_ack, &[h1, h2], late, None);
-        // req_snooze: a single event carrying a deadline.
-        write_wm(&mut repo, osb, me, req_snooze, &[h1], late, Some(deadline_epoch));
-        // A different persona's watermark on the same request — must be ignored.
-        write_wm(&mut repo, osb, other, req_ack, &[h1], late, None);
-
-        let map = load_review_watermarks(&mut repo, osb, me).expect("load watermarks");
-
-        assert_eq!(map.len(), 2, "only this persona's two requests");
-
-        let (ack_heads, ack_deadline) = map.get(&req_ack).expect("req_ack present");
-        assert_eq!(ack_heads, &heads(&[h1, h2]), "later event won latest-wins");
-        assert!(ack_deadline.is_none(), "plain ack has no deadline");
-
-        let (snooze_heads, snooze_deadline) = map.get(&req_snooze).expect("req_snooze present");
-        assert_eq!(snooze_heads, &heads(&[h1]));
+        let old = view(format!("{goal:x}:todo:{peer:x}:p"));
+        let new = view(format!("{goal:x}:doing:{peer:x}:p"));
         assert_eq!(
-            *snooze_deadline,
-            Some(interval_key(epoch_interval(deadline_epoch))),
-            "snooze deadline round-trips"
+            view_news(&old, &new, me),
+            [format!("goal [{goal:x}]: todo → doing")]
         );
+    }
 
-        // The reconstructed map drives the same quiet-decision the filter uses.
-        let now = interval_key(epoch_interval(now_epoch()));
-        assert!(
-            watermark_quiet(map.get(&req_ack).unwrap(), &heads(&[h1, h2]), now),
-            "acked review with matching heads is quiet"
+    #[test]
+    fn unread_message_and_new_roster_member_wake() {
+        let me = ufoid().id;
+        let message = ufoid().id;
+        let person = ufoid().id;
+        let old = view("");
+        let mut new = view("");
+        new.unread.insert(message);
+        new.roster.insert(person);
+        let news = view_news(&old, &new, me);
+        assert_eq!(
+            news,
+            [
+                format!("new message [{message:x}]"),
+                format!("new person [{person:x}]"),
+            ]
         );
-        assert!(
-            !watermark_quiet(map.get(&req_ack).unwrap(), &heads(&[h1]), now),
-            "a head change re-surfaces it"
-        );
-
-        repo.close().ok();
-        let _ = std::fs::remove_file(&path);
     }
 }

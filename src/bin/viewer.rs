@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use faculties::widgets::{
     AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
     GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
-    RelationsViewer, ReviewPanel, StatusViewer, StorageState, TeamsViewer, TimelineSource,
+    RelationsViewer, StatusViewer, StorageState, TeamsViewer, TimelineSource,
     TriageViewer, WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
@@ -92,23 +92,6 @@ fn main(nb: &mut NotebookCtx) {
         // always render sections open.
         ctx.set_default_section_open(false);
         st.top_bar(ctx);
-    });
-
-    // Review bench near the top — the human's primary work surface.
-    // READ-ONLY (auditing posture): no pushes.
-    nb.state("review", ReviewPanel::default(), move |ctx, panel| {
-        let mut st = storage.read_mut(ctx);
-        let Some(mut compass) = st.workspace("compass") else { return };
-        let mut wiki = st.workspace("wiki");
-        let mut decide = st.workspace("decide");
-        let Some(mut relations) = st.workspace("relations") else { return };
-        panel.render(
-            ctx,
-            &mut compass,
-            wiki.as_mut(),
-            decide.as_mut(),
-            &mut relations,
-        );
     });
 
     nb.state("headspace", HeadspaceViewer::default(), move |ctx, panel| {

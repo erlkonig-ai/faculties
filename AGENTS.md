@@ -94,22 +94,14 @@ to match.
 
 Direct commit to `main` is the convention here (and across the
 triblespace-org repos). PRs are reserved for cross-org coordination
-that doesn't apply within this project. "Direct" describes the Git
-transport, not an absence of review: a main-bound candidate gets an exact
-Compass request and independent attestations from a frozen review council
-before it is pushed. The roster must include the author and at least one
-distinct peer. Every frozen member must respond; the author may abstain, while
-every non-author must approve.
-`compass review gate <request>` is the scriptable check;
-`compass review settle <request>` records the proof and
-closes its goal. Proof events are content-derived and guarded transitions
-re-evaluate on branch conflicts; sealed attestations must remain the unique
-active heads after replicas merge, so an offline-concurrent vote fails closed.
-Never use raw `compass move` once structured review history exists. After a
-commit or rebase changes the candidate, explicitly
-open a successor request for the new exact target; that invalidates the old
-approvals and re-notifies the peer reviewers through Orient. Tag releases with
-`vX.Y.Z`; the GH workflow handles the rest.
+that doesn't apply within this project. Reviews, when requested, are
+asynchronous diagnostics against an exact artifact: reviewers record what
+they observed, where, and with what evidence. They do not prescribe a fix,
+own Compass status, or block the author from continuing. A finding may become
+a normal follow-up goal after it is checked against the current artifact;
+later development may already have removed its cause. Any release or
+publication policy belongs at that boundary, not inside Compass. Tag releases
+with `vX.Y.Z`; the GH workflow handles the rest.
 
 ## License
 
