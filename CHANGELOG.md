@@ -11,6 +11,16 @@ All notable changes to this project will be documented in this file.
   `todo`, `doing`, `blocked`, and `done` as its four defaults. Ordinary notes
   may now carry the same optional `$PERSONA` attribution as status events.
   Historical unknown facts remain preserved by the append-only pile.
+- **Compass notes are addressable ledger records.** Note creation and `show`
+  expose stable note IDs; repeatable tags, opaque exact references, and
+  displayed `metadata::supersedes` edges add composable provenance without
+  hiding history or creating workflow. Inline `faculty:hex` links materialize
+  references as exhaust. Orient wakes once for newly visible foreign or
+  unattributed notes on relevant goals (or directly tagged notes), keeps own
+  notes quiet, upgrades legacy checkpoints without a flood, and unions seen
+  note-ID deltas across persona checkpoints. This prevents later replay after
+  divergent checkpoints are committed without claiming a simultaneous
+  exactly-once delivery lock, and keeps persisted note history linear.
 - **Codex can enforce orient-watcher continuity and ingest news while busy.**
   Versioned SessionStart, UserPromptSubmit, and Stop hook helpers under
   `hooks/codex/` hand the `liora-gpt` watcher to each new primary thread, clear

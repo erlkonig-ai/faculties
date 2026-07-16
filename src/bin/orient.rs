@@ -7,13 +7,13 @@ use faculties::schemas::compass::latest_status_event;
 use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
 use faculties::schemas::message::is_inbox_message;
 use faculties::schemas::orient::{
-    KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_ORIENT_CHECKPOINT_ID, KIND_READ_ID,
-    KIND_STATUS_ID, board, local, orient_state,
+    board, local, orient_state, KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_NOTE_ID,
+    KIND_ORIENT_CHECKPOINT_ID, KIND_READ_ID, KIND_STATUS_ID,
 };
 use faculties::schemas::relations::{groups_for_member, relations as rel_attrs};
 use faculties::schemas::status::{KIND_STATUS_UPDATE, status as status_attrs};
 use hifitime::Epoch;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -359,15 +359,46 @@ fn task_title(
         .unwrap_or_default()
 }
 
-fn task_tags(space: &TribleSet, task_id: Id) -> Vec<String> {
-    let mut tags: Vec<String> = find!(
-        tag: String,
-        pattern!(space, [{ task_id @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
-    )
-    .collect();
+fn entity_tags(space: &TribleSet, entity_id: Id) -> Vec<String> {
+    let mut tags: Vec<String> =
+        find!(tag: String, pattern!(space, [{ entity_id @ board::tag: ?tag }])).collect();
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn visible_notes(
+    space: &TribleSet,
+    persona_id: Id,
+    persona_keys: &HashSet<String>,
+    relevant_goals: &HashSet<Id>,
+) -> BTreeMap<Id, Id> {
+    let mut notes = BTreeMap::new();
+    for (note_id, goal_id) in find!(
+        (note_id: Id, goal_id: Id),
+        pattern!(space, [
+            {
+                ?note_id @
+                metadata::tag: &KIND_NOTE_ID,
+                board::task: ?goal_id,
+                board::note: _?body,
+            },
+            { ?goal_id @ metadata::tag: &KIND_GOAL_ID },
+        ])
+    ) {
+        let own_note = exists!(pattern!(space, [{ note_id @ board::by: &persona_id }]));
+        if own_note {
+            continue;
+        }
+        let directly_addressed = entity_tags(space, note_id).iter().any(|tag| {
+            tag.eq_ignore_ascii_case("colony")
+                || persona_keys.contains(&tag.to_ascii_lowercase())
+        });
+        if directly_addressed || relevant_goals.contains(&goal_id) {
+            insert_note_goal(&mut notes, note_id, goal_id);
+        }
+    }
+    notes
 }
 
 fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, IntervalValue)> {
@@ -555,7 +586,7 @@ fn cmd_show(
             } else {
                 for (_key, task_id) in doing.into_iter().take(doing_limit) {
                     let title = task_title(&mut compass_ws, &compass_space, task_id);
-                    let tag_suffix = render_tags(&task_tags(&compass_space, task_id));
+                    let tag_suffix = render_tags(&entity_tags(&compass_space, task_id));
                     println!("- [{}] {}{}", fmt_id(task_id), title, tag_suffix);
                 }
             }
@@ -565,7 +596,7 @@ fn cmd_show(
             } else {
                 for (_key, task_id) in todo.into_iter().take(todo_limit) {
                     let title = task_title(&mut compass_ws, &compass_space, task_id);
-                    let tag_suffix = render_tags(&task_tags(&compass_space, task_id));
+                    let tag_suffix = render_tags(&entity_tags(&compass_space, task_id));
                     println!("- [{}] {}{}", fmt_id(task_id), title, tag_suffix);
                 }
             }
@@ -639,23 +670,33 @@ fn cmd_show(
         }
 
         let persona_view = match effective_persona {
-            Some(persona_id) => Some((
-                persona_id,
-                load_watched_view(
+            Some(persona_id) => {
+                let view = load_watched_view(
                     repo,
                     persona_id,
                     local_branch_id,
                     compass_branch_id,
                     relations_branch_id,
-                )?,
-            )),
+                )?;
+                let seen_notes = if let Some(checkpoint) =
+                    load_checkpoint_view(repo, orient_state_branch_id, persona_id)?
+                {
+                    checkpoint.view.notes
+                } else {
+                    BTreeMap::new()
+                };
+                let notes_delta = newly_seen_notes(&view.notes, &seen_notes);
+                Some((persona_id, view, notes_delta))
+            }
             None => None,
         };
         save_checkpoint_heads(
             repo,
             orient_state_branch_id,
             &current_heads,
-            persona_view.as_ref().map(|(pid, view)| (*pid, view)),
+            persona_view
+                .as_ref()
+                .map(|(pid, view, notes_delta)| (*pid, view, notes_delta)),
         )?;
         Ok(())
     })
@@ -680,9 +721,89 @@ fn load_watched_heads(
 /// is not news and must not wake the persona's watcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WatchedView {
-    unread: std::collections::BTreeSet<Id>,
+    unread: BTreeSet<Id>,
     goals_view: String,
-    roster: std::collections::BTreeSet<Id>,
+    roster: BTreeSet<Id>,
+    // Cumulative seen note ids mapped to their goal for compact wake text.
+    // `load_watched_view` starts with the currently visible set; callers
+    // union the checkpoint history into it before comparing or saving.
+    notes: BTreeMap<Id, Id>,
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointView {
+    view: WatchedView,
+    // False only for checkpoints written before notes_view existed. That
+    // transition establishes a quiet baseline instead of replaying history.
+    has_notes_view: bool,
+}
+
+fn insert_note_goal(notes: &mut BTreeMap<Id, Id>, note_id: Id, goal_id: Id) {
+    notes
+        .entry(note_id)
+        .and_modify(|existing| {
+            if goal_id < *existing {
+                *existing = goal_id;
+            }
+        })
+        .or_insert(goal_id);
+}
+
+fn union_note_views(target: &mut BTreeMap<Id, Id>, source: &BTreeMap<Id, Id>) {
+    for (&note_id, &goal_id) in source {
+        insert_note_goal(target, note_id, goal_id);
+    }
+}
+
+fn newly_seen_notes(
+    visible: &BTreeMap<Id, Id>,
+    seen: &BTreeMap<Id, Id>,
+) -> BTreeMap<Id, Id> {
+    visible
+        .iter()
+        .filter(|(note_id, _)| !seen.contains_key(*note_id))
+        .map(|(&note_id, &goal_id)| (note_id, goal_id))
+        .collect()
+}
+
+fn serialize_notes_view(notes: &BTreeMap<Id, Id>) -> String {
+    notes
+        .iter()
+        .map(|(note_id, goal_id)| format!("{note_id:x}:{goal_id:x}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_notes_view(text: &str) -> Result<BTreeMap<Id, Id>> {
+    let mut notes = BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let (note, goal) = line
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid notes_view line {}: missing ':'", index + 1))?;
+        let note_id = Id::from_hex(note)
+            .ok_or_else(|| anyhow!("invalid note id on notes_view line {}", index + 1))?;
+        let goal_id = Id::from_hex(goal)
+            .ok_or_else(|| anyhow!("invalid goal id on notes_view line {}", index + 1))?;
+        insert_note_goal(&mut notes, note_id, goal_id);
+    }
+    Ok(notes)
+}
+
+/// Canonicalize a current visibility snapshot against the cumulative seen
+/// history. A legacy checkpoint has no note baseline, so all notes visible at
+/// upgrade time become seen without producing news.
+fn carry_seen_notes(
+    seen: &mut WatchedView,
+    current: &mut WatchedView,
+    has_notes_view: bool,
+) {
+    if !has_notes_view {
+        seen.notes = current.notes.clone();
+    }
+    union_note_views(&mut current.notes, &seen.notes);
 }
 
 fn load_watched_view(
@@ -750,56 +871,82 @@ fn load_watched_view(
 
     // One line per goal: "id:status:author:flags". Author is the acting
     // persona on the latest status event. Flags are i = this persona has
-    // authored a status on the goal, p = explicitly persona-tagged, and
+    // authored a status or note on the goal, p = explicitly persona-tagged, and
     // c = colony-tagged.
-    let mut goal_lines: Vec<String> =
+    let mut goal_lines = Vec::new();
+    let mut relevant_goals = HashSet::new();
+    for id in
         find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
-            .map(|id| {
-                let involved = exists!(pattern!(&compass_space, [{
-                    _?evt @
-                    metadata::tag: &KIND_STATUS_ID,
-                    board::task: &id,
-                    board::by: &persona_id,
-                }]));
-                let tags = task_tags(&compass_space, id);
-                let persona_tagged = tags
-                    .iter()
-                    .any(|tag| persona_keys.contains(&tag.to_ascii_lowercase()));
-                let colony_tagged = tags
-                    .iter()
-                    .any(|tag| tag.eq_ignore_ascii_case("colony"));
-                let mut flags = String::new();
-                if involved {
-                    flags.push('i');
-                }
-                if persona_tagged {
-                    flags.push('p');
-                }
-                if colony_tagged {
-                    flags.push('c');
-                }
+    {
+        let authored_status = exists!(pattern!(&compass_space, [{
+            _?evt @
+            metadata::tag: &KIND_STATUS_ID,
+            board::task: &id,
+            board::by: &persona_id,
+        }]));
+        let authored_note = exists!(pattern!(&compass_space, [{
+            _?evt @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &id,
+            board::note: _?body,
+            board::by: &persona_id,
+        }]));
+        let involved = authored_status || authored_note;
+        let tags = entity_tags(&compass_space, id);
+        let persona_tagged = tags
+            .iter()
+            .any(|tag| persona_keys.contains(&tag.to_ascii_lowercase()));
+        let colony_tagged = tags
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case("colony"));
+        let mut flags = String::new();
+        if involved {
+            flags.push('i');
+        }
+        if persona_tagged {
+            flags.push('p');
+        }
+        if colony_tagged {
+            flags.push('c');
+        }
+        if involved || persona_tagged || colony_tagged {
+            relevant_goals.insert(id);
+        }
 
-                match latest_status_event(&compass_space, id) {
-                    Some((event, status, _)) => {
-                        let by = find!(
-                            by: Id,
-                            pattern!(&compass_space, [{ event @ board::by: ?by }])
-                        )
-                        .next()
-                        .map(fmt_id)
-                        .unwrap_or_default();
-                        format!("{id:x}:{status}:{by}:{flags}")
-                    }
-                    None => format!("{id:x}:::{flags}"),
-                }
-            })
-            .collect();
+        let line = match latest_status_event(&compass_space, id) {
+            Some((event, status, _)) => {
+                let by = find!(
+                    by: Id,
+                    pattern!(&compass_space, [{ event @ board::by: ?by }])
+                )
+                .next()
+                .map(fmt_id)
+                .unwrap_or_default();
+                format!("{id:x}:{status}:{by}:{flags}")
+            }
+            None => format!("{id:x}:::{flags}"),
+        };
+        goal_lines.push(line);
+    }
     goal_lines.sort();
+
+    // Notes are neutral ledger records. A foreign or unattributed note is
+    // visible when its goal is already relevant to this persona, or when the
+    // note itself carries a persona/colony attention tag. Own attributed
+    // notes remain quiet; absence of attribution is deliberately not treated
+    // as ownership.
+    let notes = visible_notes(
+        &compass_space,
+        persona_id,
+        &persona_keys,
+        &relevant_goals,
+    );
 
     Ok(WatchedView {
         unread,
         goals_view: goal_lines.join("\n"),
         roster,
+        notes,
     })
 }
 
@@ -849,6 +996,15 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
 
     for person in new.roster.difference(&old.roster) {
         reasons.push(format!("new person [{}]", fmt_id(*person)));
+    }
+    for (note_id, goal_id) in &new.notes {
+        if !old.notes.contains_key(note_id) {
+            reasons.push(format!(
+                "new note [{}] on goal [{}]",
+                fmt_id(*note_id),
+                fmt_id(*goal_id)
+            ));
+        }
     }
     reasons
 }
@@ -916,7 +1072,7 @@ fn load_checkpoint_view(
     repo: &mut Repository<Pile>,
     orient_state_branch_id: Id,
     persona_id: Id,
-) -> Result<Option<WatchedView>> {
+) -> Result<Option<CheckpointView>> {
     let Some(_head) = repo
         .storage_mut()
         .head(orient_state_branch_id)
@@ -931,7 +1087,7 @@ fn load_checkpoint_view(
         .checkout(..)
         .map_err(|e| anyhow!("checkout orient state: {e:?}"))?;
 
-    let mut latest: Option<(Id, i128)> = None;
+    let mut checkpoints = Vec::new();
     for (checkpoint_id, at) in find!(
         (checkpoint_id: Id, at: Inline<inlineencodings::NsTAIInterval>),
         pattern!(&space, [{
@@ -942,15 +1098,17 @@ fn load_checkpoint_view(
         }])
     ) {
         let key = interval_key(at);
-        if latest.is_none_or(|(_, current)| key > current) {
-            latest = Some((checkpoint_id, key));
-        }
+        checkpoints.push((checkpoint_id, key));
     }
-    let Some((checkpoint_id, _)) = latest else {
+    let Some((checkpoint_id, _)) = checkpoints
+        .iter()
+        .copied()
+        .max_by_key(|(checkpoint_id, key)| (*key, *checkpoint_id))
+    else {
         return Ok(None);
     };
 
-    let unread: std::collections::BTreeSet<Id> = find!(
+    let unread: BTreeSet<Id> = find!(
         msg: Id,
         pattern!(&space, [{ checkpoint_id @ orient_state::unread_msg: ?msg }])
     )
@@ -963,16 +1121,40 @@ fn load_checkpoint_view(
     .map(|h| read_text(&mut ws, h))
     .transpose()?
     .unwrap_or_default();
-    let roster: std::collections::BTreeSet<Id> = find!(
+    let roster: BTreeSet<Id> = find!(
         person: Id,
         pattern!(&space, [{ checkpoint_id @ orient_state::roster_member: ?person }])
     )
     .collect();
 
-    Ok(Some(WatchedView {
-        unread,
-        goals_view,
-        roster,
+    // notes_view is a per-checkpoint delta, unlike the latest-snapshot fields
+    // above. Union every persona checkpoint so two divergent committed
+    // checkpoints cannot cause either one's seen note IDs to replay later.
+    let mut notes = BTreeMap::new();
+    let mut has_notes_view = false;
+    for (checkpoint_id, _) in checkpoints {
+        let handles: Vec<TextHandle> = find!(
+            handle: TextHandle,
+            pattern!(&space, [{ checkpoint_id @ orient_state::notes_view: ?handle }])
+        )
+        .collect();
+        if !handles.is_empty() {
+            has_notes_view = true;
+        }
+        for handle in handles {
+            let encoded = read_text(&mut ws, handle)?;
+            union_note_views(&mut notes, &parse_notes_view(&encoded)?);
+        }
+    }
+
+    Ok(Some(CheckpointView {
+        view: WatchedView {
+            unread,
+            goals_view,
+            roster,
+            notes,
+        },
+        has_notes_view,
     }))
 }
 
@@ -980,7 +1162,7 @@ fn save_checkpoint_heads(
     repo: &mut Repository<Pile>,
     orient_state_branch_id: Id,
     heads: &WatchedHeads,
-    persona_view: Option<(Id, &WatchedView)>,
+    persona_view: Option<(Id, &WatchedView, &BTreeMap<Id, Id>)>,
 ) -> Result<()> {
     let mut ws = repo
         .pull(orient_state_branch_id)
@@ -996,11 +1178,17 @@ fn save_checkpoint_heads(
         orient_state::compass_head?: heads.compass,
         orient_state::relations_head?: heads.relations,
     };
-    if let Some((persona_id, view)) = persona_view {
+    if let Some((persona_id, view, notes_delta)) = persona_view {
         let goals_handle = ws.put(view.goals_view.clone());
+        // Persist only newly seen pairs. Presence of this handle, even when
+        // empty, marks the checkpoint as notes-aware. Readers union all
+        // committed deltas, so divergent checkpoints cannot replay an ID
+        // after both are visible; this is not a simultaneous-delivery lock.
+        let notes_handle = ws.put(serialize_notes_view(notes_delta));
         change += entity! { &checkpoint_id @
             orient_state::persona: &persona_id,
             orient_state::goals_view: goals_handle,
+            orient_state::notes_view: notes_handle,
             orient_state::unread_msg*: view.unread.iter(),
             orient_state::roster_member*: view.roster.iter(),
         };
@@ -1185,8 +1373,8 @@ enum NewsCheck {
     /// loaded view so `wait` can use it as its loop baseline.
     Quiet(WatchedView),
     /// No checkpoint for this persona yet — the caller decides how to
-    /// establish the baseline (`wait` loops on the view; `poll` saves
-    /// it silently).
+    /// establish the baseline (`wait` and non-peeking `poll` save it
+    /// silently; peeking remains read-only).
     NoCheckpoint(WatchedView),
 }
 
@@ -1206,26 +1394,29 @@ fn check_news_once(
     orient_state_branch_id: Id,
     peek: bool,
 ) -> Result<NewsCheck> {
-    let view = load_watched_view(
+    let mut view = load_watched_view(
         repo,
         persona_id,
         local_branch_id,
         compass_branch_id,
         relations_branch_id,
     )?;
-    let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, persona_id)? else {
+    let Some(mut seen) = load_checkpoint_view(repo, orient_state_branch_id, persona_id)? else {
         return Ok(NewsCheck::NoCheckpoint(view));
     };
-    let reasons = view_news(&seen, &view, persona_id);
+    let legacy_upgrade = !seen.has_notes_view;
+    let notes_delta = newly_seen_notes(&view.notes, &seen.view.notes);
+    carry_seen_notes(&mut seen.view, &mut view, seen.has_notes_view);
+    let reasons = view_news(&seen.view, &view, persona_id);
     if reasons.is_empty() {
         // Quiet changes still update the comparison baseline. Peek remains
         // strictly read-only.
-        if !peek && view != seen {
+        if !peek && (legacy_upgrade || view != seen.view) {
             save_checkpoint_heads(
                 repo,
                 orient_state_branch_id,
                 heads,
-                Some((persona_id, &view)),
+                Some((persona_id, &view, &notes_delta)),
             )?;
         }
         return Ok(NewsCheck::Quiet(view));
@@ -1233,7 +1424,13 @@ fn check_news_once(
     for reason in &reasons {
         println!("News: {reason}");
     }
-    print_news_detail(repo, &seen, &view, local_branch_id, relations_branch_id)?;
+    print_news_detail(
+        repo,
+        &seen.view,
+        &view,
+        local_branch_id,
+        relations_branch_id,
+    )?;
     // Advance the checkpoint — the terse path skips cmd_show, which is
     // what normally saves it. Without this the checkpoint never moves
     // and every re-arm / next poll instantly re-fires on the same news.
@@ -1244,7 +1441,7 @@ fn check_news_once(
             repo,
             orient_state_branch_id,
             heads,
-            Some((persona_id, &view)),
+            Some((persona_id, &view, &notes_delta)),
         )?;
     }
     Ok(NewsCheck::Fired)
@@ -1311,11 +1508,12 @@ fn cmd_poll(pile: &Path, persona: Option<&str>, peek: bool) -> Result<()> {
             // root persona's checkpoint).
             NewsCheck::NoCheckpoint(view) => {
                 if !peek {
+                    let notes_delta = view.notes.clone();
                     save_checkpoint_heads(
                         repo,
                         orient_state_branch_id,
                         &heads,
-                        Some((persona_id, &view)),
+                        Some((persona_id, &view, &notes_delta)),
                     )?;
                 }
                 let _ = view;
@@ -1384,7 +1582,21 @@ fn cmd_wait(
                 false,
             )? {
                 NewsCheck::Fired => return Ok((true, true, true)),
-                NewsCheck::Quiet(view) | NewsCheck::NoCheckpoint(view) => Some(view),
+                NewsCheck::Quiet(view) => Some(view),
+                NewsCheck::NoCheckpoint(view) => {
+                    // A wait may run for hours before another watched branch
+                    // moves. Persist its quiet initial note baseline now; if
+                    // only a later delta were saved, these pre-existing IDs
+                    // could replay after the watcher restarted.
+                    let notes_delta = view.notes.clone();
+                    save_checkpoint_heads(
+                        repo,
+                        orient_state_branch_id,
+                        &baseline_heads,
+                        Some((pid, &view, &notes_delta)),
+                    )?;
+                    Some(view)
+                }
             },
             None => {
                 if let Some(last_seen) = load_checkpoint_heads(repo, orient_state_branch_id)? {
@@ -1417,25 +1629,33 @@ fn cmd_wait(
             }
             match (persona_id, baseline_view.as_mut()) {
                 (Some(pid), Some(view)) => {
-                    let current_view = load_watched_view(
+                    let mut current_view = load_watched_view(
                         repo,
                         pid,
                         local_branch_id,
                         compass_branch_id,
                         relations_branch_id,
                     )?;
+                    let notes_delta = newly_seen_notes(&current_view.notes, &view.notes);
+                    union_note_views(&mut current_view.notes, &view.notes);
                     let reasons = view_news(view, &current_view, pid);
                     if !reasons.is_empty() {
                         for reason in &reasons {
                             println!("News: {reason}");
                         }
-                        print_news_detail(repo, &*view, &current_view, local_branch_id, relations_branch_id)?;
+                        print_news_detail(
+                            repo,
+                            view,
+                            &current_view,
+                            local_branch_id,
+                            relations_branch_id,
+                        )?;
                         // Advance the checkpoint (terse path skips cmd_show).
                         save_checkpoint_heads(
                             repo,
                             orient_state_branch_id,
                             &current_heads,
-                            Some((pid, &current_view)),
+                            Some((pid, &current_view, &notes_delta)),
                         )?;
                         return Ok((false, true, true));
                     }
@@ -1446,7 +1666,7 @@ fn cmd_wait(
                             repo,
                             orient_state_branch_id,
                             &current_heads,
-                            Some((pid, &current_view)),
+                            Some((pid, &current_view, &notes_delta)),
                         )?;
                     }
                     baseline_heads = current_heads;
@@ -1571,13 +1791,47 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
     fn view(goals_view: impl Into<String>) -> WatchedView {
         WatchedView {
             unread: BTreeSet::new(),
             goals_view: goals_view.into(),
             roster: BTreeSet::new(),
+            notes: BTreeMap::new(),
+        }
+    }
+
+    struct TestPile {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestPile {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let sequence = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "faculties-orient-note-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("test.pile");
+            fs::File::create(&path).unwrap();
+            Self { dir, path }
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -1635,5 +1889,242 @@ mod tests {
                 format!("new person [{person:x}]"),
             ]
         );
+    }
+
+    #[test]
+    fn newly_visible_note_wakes_with_its_goal() {
+        let me = ufoid().id;
+        let goal = ufoid().id;
+        let note = ufoid().id;
+        let old = view("");
+        let mut new = view("");
+        new.notes.insert(note, goal);
+        assert_eq!(
+            view_news(&old, &new, me),
+            [format!("new note [{note:x}] on goal [{goal:x}]")]
+        );
+    }
+
+    #[test]
+    fn legacy_checkpoint_establishes_a_quiet_note_baseline() {
+        let me = ufoid().id;
+        let goal = ufoid().id;
+        let existing = ufoid().id;
+        let later = ufoid().id;
+        let mut seen = view("");
+        let mut current = view("");
+        current.notes.insert(existing, goal);
+
+        carry_seen_notes(&mut seen, &mut current, false);
+        assert!(view_news(&seen, &current, me).is_empty());
+
+        let baseline = current;
+        let mut next = baseline.clone();
+        next.notes.insert(later, goal);
+        assert_eq!(
+            view_news(&baseline, &next, me),
+            [format!("new note [{later:x}] on goal [{goal:x}]")]
+        );
+    }
+
+    #[test]
+    fn divergent_committed_note_deltas_union_without_later_replay() {
+        let me = ufoid().id;
+        let goal = ufoid().id;
+        let first = ufoid().id;
+        let second = ufoid().id;
+        let left = BTreeMap::from([(first, goal)]);
+        let right = BTreeMap::from([(second, goal)]);
+        let visible = BTreeMap::from([(first, goal), (second, goal)]);
+        assert_eq!(newly_seen_notes(&visible, &left), right);
+        let mut union = left;
+        union_note_views(&mut union, &right);
+
+        let encoded = serialize_notes_view(&union);
+        let decoded = parse_notes_view(&encoded).unwrap();
+        assert_eq!(decoded, BTreeMap::from([(first, goal), (second, goal)]));
+
+        let mut seen = view("");
+        seen.notes = decoded;
+        let mut current = view("");
+        current.notes = BTreeMap::from([(first, goal), (second, goal)]);
+        carry_seen_notes(&mut seen, &mut current, true);
+        assert!(view_news(&seen, &current, me).is_empty());
+    }
+
+    #[test]
+    fn stored_legacy_and_divergent_checkpoint_deltas_upgrade_and_union() {
+        let pile = TestPile::new();
+        let persona = ufoid().id;
+        let goal = ufoid().id;
+        let existing = ufoid().id;
+        let concurrent = ufoid().id;
+        let mut repo = open_repo(&pile.path).unwrap();
+        let branch_id = repo.ensure_branch("orient-state", None).unwrap();
+
+        // Write the old shape directly: persona view, but no notes_view.
+        let mut ws = repo.pull(branch_id).unwrap();
+        let checkpoint = ufoid();
+        let at = epoch_interval(now_epoch());
+        let goals = ws.put(String::new());
+        let mut change = TribleSet::new();
+        change += entity! { &checkpoint @
+            metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
+            orient_state::at: at,
+            orient_state::persona: &persona,
+            orient_state::goals_view: goals,
+        };
+        ws.commit(change, "legacy orient checkpoint");
+        repo.push(&mut ws).unwrap();
+
+        let mut loaded = load_checkpoint_view(&mut repo, branch_id, persona)
+            .unwrap()
+            .unwrap();
+        assert!(!loaded.has_notes_view);
+        let mut current = view("");
+        current.notes.insert(existing, goal);
+        carry_seen_notes(&mut loaded.view, &mut current, loaded.has_notes_view);
+        assert!(view_news(&loaded.view, &current, persona).is_empty());
+
+        let heads = WatchedHeads {
+            local: None,
+            compass: None,
+            relations: None,
+        };
+        let initial_delta = BTreeMap::from([(existing, goal)]);
+        save_checkpoint_heads(
+            &mut repo,
+            branch_id,
+            &heads,
+            Some((persona, &current, &initial_delta)),
+        )
+        .unwrap();
+
+        // Model a stale concurrent writer that only carried its own note.
+        let mut stale = view("");
+        stale.notes.insert(concurrent, goal);
+        let concurrent_delta = BTreeMap::from([(concurrent, goal)]);
+        save_checkpoint_heads(
+            &mut repo,
+            branch_id,
+            &heads,
+            Some((persona, &stale, &concurrent_delta)),
+        )
+        .unwrap();
+
+        let mut ws = repo.pull(branch_id).unwrap();
+        let space = ws.checkout(..).unwrap();
+        let mut persisted_deltas: Vec<String> = find!(
+            handle: TextHandle,
+            pattern!(&space, [{
+                _?checkpoint @
+                orient_state::persona: &persona,
+                orient_state::notes_view: ?handle,
+            }])
+        )
+        .map(|handle| read_text(&mut ws, handle).unwrap())
+        .collect();
+        persisted_deltas.sort();
+        let mut expected_deltas = vec![
+            serialize_notes_view(&initial_delta),
+            serialize_notes_view(&concurrent_delta),
+        ];
+        expected_deltas.sort();
+        assert_eq!(persisted_deltas, expected_deltas);
+
+        let loaded = load_checkpoint_view(&mut repo, branch_id, persona)
+            .unwrap()
+            .unwrap();
+        assert!(loaded.has_notes_view);
+        assert_eq!(
+            loaded.view.notes,
+            BTreeMap::from([(existing, goal), (concurrent, goal)])
+        );
+        repo.close().unwrap();
+    }
+
+    #[test]
+    fn visibility_includes_foreign_and_unattributed_but_not_own_notes() {
+        let me = ufoid().id;
+        let peer = ufoid().id;
+        let relevant_goal = ufoid().id;
+        let unrelated_goal = ufoid().id;
+        let foreign = ufoid();
+        let unattributed = ufoid();
+        let own = ufoid();
+        let direct = ufoid();
+        let unrelated = ufoid();
+        let malformed = ufoid();
+        let non_goal_target = ufoid().id;
+        let wrong_target = ufoid();
+        let body = "body".to_blob().get_handle();
+        let mut space = TribleSet::new();
+        space += entity! { ExclusiveId::force_ref(&relevant_goal) @
+            metadata::tag: &KIND_GOAL_ID,
+        };
+        space += entity! { ExclusiveId::force_ref(&unrelated_goal) @
+            metadata::tag: &KIND_GOAL_ID,
+        };
+        space += entity! { &foreign @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &relevant_goal,
+            board::note: body,
+            board::by: &peer,
+        };
+        space += entity! { &unattributed @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &relevant_goal,
+            board::note: body,
+        };
+        space += entity! { &own @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &relevant_goal,
+            board::note: body,
+            board::by: &me,
+        };
+        space += entity! { &direct @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &unrelated_goal,
+            board::note: body,
+            board::by: &peer,
+            board::tag: "me",
+        };
+        space += entity! { &unrelated @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &unrelated_goal,
+            board::note: body,
+            board::by: &peer,
+        };
+        space += entity! { &malformed @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &relevant_goal,
+            board::by: &peer,
+        };
+        space += entity! { &wrong_target @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &non_goal_target,
+            board::note: body,
+            board::by: &peer,
+            board::tag: "me",
+        };
+
+        let visible = visible_notes(
+            &space,
+            me,
+            &HashSet::from(["me".to_string()]),
+            &HashSet::from([relevant_goal]),
+        );
+        assert_eq!(
+            visible,
+            BTreeMap::from([
+                (foreign.id, relevant_goal),
+                (unattributed.id, relevant_goal),
+                (direct.id, unrelated_goal),
+            ])
+        );
+        assert!(!visible.contains_key(&own.id));
+        assert!(!visible.contains_key(&unrelated.id));
+        assert!(!visible.contains_key(&malformed.id));
+        assert!(!visible.contains_key(&wrong_target.id));
     }
 }

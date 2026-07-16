@@ -80,6 +80,18 @@ enum Command {
         id: String,
         #[arg(help = "Note text. Use @path for file input or @- for stdin.")]
         note: String,
+        /// Short note tag (repeatable). Persona or colony tags request
+        /// attention through Orient without assigning workflow semantics.
+        #[arg(long)]
+        tag: Vec<String>,
+        /// Opaque exact reference stored on the note (repeatable). Recognized
+        /// inline `[text](faculty:hex)` links are stored automatically too.
+        #[arg(long = "ref", value_name = "REFERENCE")]
+        reference: Vec<String>,
+        /// Existing note this note supersedes (repeatable). The edge is
+        /// provenance only: Compass keeps and displays every note.
+        #[arg(long, value_name = "NOTE_ID")]
+        supersedes: Vec<String>,
     },
     /// Show a goal with history and notes
     Show {
@@ -160,7 +172,9 @@ fn extract_references(text: &str) -> Vec<(String, String)> {
     let mut rest = text;
     while let Some(paren) = rest.find("](") {
         let after = &rest[paren + 2..];
-        let end = after.find(')').unwrap_or(after.len());
+        let Some(end) = after.find(')') else {
+            break;
+        };
         let link = &after[..end];
         if let Some(colon) = link.find(':') {
             let faculty = &link[..colon];
@@ -177,11 +191,18 @@ fn extract_references(text: &str) -> Vec<(String, String)> {
                 refs.push((faculty.to_string(), hex));
             }
         }
-        rest = &after[end.min(after.len()).max(1)..];
+        rest = &after[end + 1..];
     }
     refs.sort();
     refs.dedup();
     refs
+}
+
+fn extract_reference_values(text: &str) -> Vec<String> {
+    extract_references(text)
+        .into_iter()
+        .map(|(faculty, hex)| format!("{faculty}:{hex}"))
+        .collect()
 }
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
@@ -270,6 +291,23 @@ fn all_goal_ids(space: &TribleSet) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])).collect()
 }
 
+/// All note event IDs.
+fn all_note_ids(space: &TribleSet) -> Vec<Id> {
+    find!(
+        id: Id,
+        pattern!(space, [
+            {
+                ?id @
+                metadata::tag: &KIND_NOTE_ID,
+                board::task: _?goal,
+                board::note: _?body,
+            },
+            { _?goal @ metadata::tag: &KIND_GOAL_ID },
+        ])
+    )
+    .collect()
+}
+
 fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
     let view: View<str> = ws
         .get::<View<str>, blobencodings::LongString>(handle)
@@ -280,6 +318,19 @@ fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
 /// Parse a full 32-char hex ID. Returns a helpful error pointing to `compass resolve` on failure.
 fn resolve_task_id(input: &str, space: &TribleSet) -> Result<Id> {
     faculties::resolve_id_prefix(input, all_goal_ids(space))
+}
+
+fn resolve_note_id(input: &str, space: &TribleSet) -> Result<Id> {
+    let trimmed = input.trim();
+    if trimmed.len() != 32 {
+        bail!("supersedes requires a full 32-char note id: '{trimmed}'");
+    }
+    let note_id = Id::from_hex(trimmed)
+        .ok_or_else(|| anyhow::anyhow!("invalid note id '{trimmed}'"))?;
+    if !all_note_ids(space).contains(&note_id) {
+        bail!("supersedes target is not an existing note: '{trimmed}'");
+    }
+    Ok(note_id)
 }
 
 /// Compute active priority edges from the space.
@@ -353,6 +404,45 @@ fn note_count(space: &TribleSet, task_id: Id) -> usize {
         _n: TextHandle,
         pattern!(space, [{ _?evt @ metadata::tag: &KIND_NOTE_ID, board::task: &task_id, board::note: ?_n }])
     ).count()
+}
+
+fn event_actor(space: &TribleSet, event_id: Id) -> Option<Id> {
+    find!(by: Id, pattern!(space, [{ event_id @ board::by: ?by }])).next()
+}
+
+fn note_tags(space: &TribleSet, note_id: Id) -> Vec<String> {
+    let mut tags: Vec<String> =
+        find!(tag: String, pattern!(space, [{ note_id @ board::tag: ?tag }])).collect();
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn note_references(
+    ws: &mut Workspace<Pile>,
+    space: &TribleSet,
+    note_id: Id,
+) -> Vec<String> {
+    let mut references: Vec<String> = find!(
+        handle: TextHandle,
+        pattern!(space, [{ note_id @ board::reference: ?handle }])
+    )
+    .filter_map(|handle| read_text(ws, handle).ok())
+    .collect();
+    references.sort();
+    references.dedup();
+    references
+}
+
+fn note_supersedes(space: &TribleSet, note_id: Id) -> Vec<Id> {
+    let mut predecessors: Vec<Id> = find!(
+        predecessor: Id,
+        pattern!(space, [{ note_id @ metadata::supersedes: ?predecessor }])
+    )
+    .collect();
+    predecessors.sort();
+    predecessors.dedup();
+    predecessors
 }
 
 /// Check if adding (higher, lower) would create a cycle in the priority DAG.
@@ -522,6 +612,18 @@ struct TaskRow {
     sort_key: i128,
     note_count: usize,
     parent: Option<Id>,
+}
+
+#[derive(Debug)]
+struct NoteRow {
+    id: Id,
+    text: String,
+    sort_key: i128,
+    at: String,
+    by: Option<Id>,
+    tags: Vec<String>,
+    references: Vec<String>,
+    supersedes: Vec<Id>,
 }
 
 impl TaskRow {
@@ -733,7 +835,7 @@ fn cmd_add(
         validate_short("tag", tag)?;
     }
 
-    let task_ref = with_repo(pile, |repo| {
+    let (task_ref, note_ref) = with_repo(pile, |repo| {
         let by_id = persona.map(|p| resolve_persona_id(repo, p)).transpose()?;
         let mut ws = repo
             .pull(branch_id)
@@ -771,13 +873,21 @@ fn cmd_add(
             metadata::created_at: now,
         };
 
+        let mut note_ref = None;
         if let Some(note) = note {
             let note_id = ufoid();
+            note_ref = Some(note_id.id);
+            let reference_handles: Vec<TextHandle> = extract_reference_values(&note)
+                .into_iter()
+                .map(|reference| ws.put(reference))
+                .collect();
+            let note_handle = ws.put(note);
             change += entity! { &note_id @
                 metadata::tag: &KIND_NOTE_ID,
                 board::task: &task_ref,
-                board::note: ws.put(note),
+                board::note: note_handle,
                 board::by?: by_id.as_ref(),
+                board::reference*: reference_handles.iter(),
                 metadata::created_at: now,
             };
         }
@@ -785,9 +895,12 @@ fn cmd_add(
         ws.commit(change, "add goal");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push goal: {e:?}"))?;
-        Ok(task_ref)
+        Ok((task_ref, note_ref))
     })?;
     println!("Added goal {:x}", task_ref);
+    if let Some(note_ref) = note_ref {
+        println!("Added note {:x} to goal {:x}", note_ref, task_ref);
+    }
     Ok(())
 }
 
@@ -869,9 +982,23 @@ fn cmd_note(
     branch_id: Id,
     id: String,
     note: String,
+    tags: Vec<String>,
+    mut references: Vec<String>,
+    supersedes: Vec<String>,
     persona: Option<&str>,
 ) -> Result<()> {
-    let task_id = with_repo(pile, |repo| {
+    let tags: Vec<String> = tags.into_iter().map(|tag| tag.trim().to_string()).collect();
+    for tag in &tags {
+        validate_short("tag", tag)?;
+    }
+    if let Some(reference) = references.iter().find(|reference| reference.trim().is_empty()) {
+        bail!("reference must not be empty: {reference:?}");
+    }
+    references.extend(extract_reference_values(&note));
+    references.sort();
+    references.dedup();
+
+    let (task_id, note_id) = with_repo(pile, |repo| {
         let by_id = persona.map(|p| resolve_persona_id(repo, p)).transpose()?;
         let mut ws = repo
             .pull(branch_id)
@@ -880,25 +1007,38 @@ fn cmd_note(
             .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let task_id = resolve_task_id(&id, &space)?;
+        let superseded_ids: Vec<Id> = supersedes
+            .iter()
+            .map(|input| resolve_note_id(input, &space))
+            .collect::<Result<_>>()?;
         let now = epoch_interval(now_epoch());
 
         let note_id = ufoid();
+        let note_ref = note_id.id;
+        let note_handle = ws.put(note);
+        let reference_handles: Vec<TextHandle> = references
+            .into_iter()
+            .map(|reference| ws.put(reference))
+            .collect();
         let mut change = TribleSet::new();
         change += ensure_kind_entities(&mut ws)?;
         change += entity! { &note_id @
             metadata::tag: &KIND_NOTE_ID,
             board::task: &task_id,
-            board::note: ws.put(note),
+            board::note: note_handle,
             board::by?: by_id.as_ref(),
+            board::tag*: tags.iter().map(|tag| tag.as_str()),
+            board::reference*: reference_handles.iter(),
+            metadata::supersedes*: superseded_ids.iter(),
             metadata::created_at: now,
         };
 
         ws.commit(change, "add goal note");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push note: {e:?}"))?;
-        Ok(task_id)
+        Ok((task_id, note_ref))
     })?;
-    println!("Noted goal {:x}", task_id);
+    println!("Added note {:x} to goal {:x}", note_id, task_id);
     Ok(())
 }
 
@@ -943,55 +1083,106 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
         }
 
         // Status history for this task.
-        let mut history: Vec<(String, i128, String)> = find!(
-            (status: String, at: IntervalValue),
+        let mut history: Vec<(i128, Id, String, String, Option<Id>)> = find!(
+            (event: Id, status: String, at: IntervalValue),
             pattern!(&space, [{
-                _?evt @
+                ?event @
                 metadata::tag: &KIND_STATUS_ID,
                 board::task: &task_id,
                 board::status: ?status,
                 metadata::created_at: ?at,
             }])
         )
-        .map(|(status, at)| (status, interval_key(at), format_interval(at)))
+        .map(|(event, status, at)| {
+            (
+                interval_key(at),
+                event,
+                format_interval(at),
+                status,
+                event_actor(&space, event),
+            )
+        })
         .collect();
         if !history.is_empty() {
-            history.sort_by(|a, b| a.1.cmp(&b.1));
+            history.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
             println!();
             println!("Status history:");
-            for (status, _, at_str) in &history {
-                println!("- {at_str} {status}");
+            for (_, _, at, status, by) in &history {
+                match by {
+                    Some(by) => println!("- {at} {status} by {by:x}"),
+                    None => println!("- {at} {status}"),
+                }
             }
         }
 
         // Notes for this task.
-        let mut notes: Vec<(String, i128, String)> = find!(
-            (note_handle: TextHandle, at: IntervalValue),
+        let mut notes: Vec<NoteRow> = find!(
+            (note_id: Id, note_handle: TextHandle, at: IntervalValue),
             pattern!(&space, [{
-                _?evt @
+                ?note_id @
                 metadata::tag: &KIND_NOTE_ID,
                 board::task: &task_id,
                 board::note: ?note_handle,
                 metadata::created_at: ?at,
             }])
         )
-        .filter_map(|(h, at)| {
-            read_text(&mut ws, h)
-                .ok()
-                .map(|text| (text, interval_key(at), format_interval(at)))
+        .filter_map(|(note_id, handle, at)| {
+            read_text(&mut ws, handle).ok().map(|text| NoteRow {
+                id: note_id,
+                text,
+                sort_key: interval_key(at),
+                at: format_interval(at),
+                by: event_actor(&space, note_id),
+                tags: note_tags(&space, note_id),
+                references: note_references(&mut ws, &space, note_id),
+                supersedes: note_supersedes(&space, note_id),
+            })
         })
         .collect();
         if !notes.is_empty() {
-            notes.sort_by(|a, b| a.1.cmp(&b.1));
+            notes.sort_by(|a, b| (a.sort_key, a.id).cmp(&(b.sort_key, b.id)));
             println!();
             println!("Notes:");
-            for (text, _, at_str) in &notes {
-                println!("- {at_str} {text}");
+            for note in &notes {
+                match note.by {
+                    Some(by) => println!("- [{}] {} by {by:x}", fmt_id(note.id), note.at),
+                    None => println!("- [{}] {}", fmt_id(note.id), note.at),
+                }
+                if note.text.is_empty() {
+                    println!("  (empty)");
+                } else {
+                    for line in note.text.lines() {
+                        println!("  {line}");
+                    }
+                }
+                if !note.tags.is_empty() {
+                    println!(
+                        "  tags: {}",
+                        note.tags
+                            .iter()
+                            .map(|tag| format!("#{tag}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+                if !note.references.is_empty() {
+                    println!("  refs: {}", note.references.join(", "));
+                }
+                if !note.supersedes.is_empty() {
+                    println!(
+                        "  supersedes: {}",
+                        note.supersedes
+                            .iter()
+                            .map(|id| fmt_id(*id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
             }
 
             let mut all_refs = Vec::new();
-            for (text, _, _) in &notes {
-                all_refs.extend(extract_references(text));
+            for note in &notes {
+                all_refs.extend(extract_references(&note.text));
             }
             all_refs.sort();
             all_refs.dedup();
@@ -1185,9 +1376,25 @@ fn main() -> Result<()> {
             status,
             cli.persona.as_deref(),
         ),
-        Command::Note { id, note } => {
+        Command::Note {
+            id,
+            note,
+            tag,
+            reference,
+            supersedes,
+        } => {
             let note = load_value_or_file(&note, "goal note")?;
-            cmd_note(&cli.pile, &cli.branch, branch_id, id, note, cli.persona.as_deref())
+            cmd_note(
+                &cli.pile,
+                &cli.branch,
+                branch_id,
+                id,
+                note,
+                tag,
+                reference,
+                supersedes,
+                cli.persona.as_deref(),
+            )
         }
         Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
         Command::Prioritize { higher, over } => {
@@ -1197,6 +1404,25 @@ fn main() -> Result<()> {
             cmd_deprioritize(&cli.pile, &cli.branch, branch_id, higher, over)
         }
         Command::Resolve { prefix } => cmd_resolve(&cli.pile, &cli.branch, branch_id, prefix),
+    }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_references_are_exact_sorted_and_deduplicated() {
+        assert_eq!(
+            extract_reference_values(
+                "[wiki](wiki:ABcd1234) [again](wiki:ABcd1234) [git](git:DEADBEEF)"
+            ),
+            ["git:DEADBEEF", "wiki:ABcd1234"]
+        );
+    }
+
+    #[test]
+    fn dangling_markdown_link_is_not_a_reference_or_a_panic() {
+        assert!(extract_reference_values("unfinished ](").is_empty());
     }
 }

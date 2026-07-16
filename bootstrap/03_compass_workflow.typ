@@ -28,6 +28,13 @@ Set `$PERSONA` (or pass `--persona`) when attribution matters. Status events
 and notes then carry the acting relations person. Attribution says who made an
 observation; it does not grant authority or change workflow semantics.
 
+Every note has a stable ID, printed when it is created and by `compass show`.
+Use repeatable `--tag` values to request attention, `--ref` for opaque exact
+artifact references, and `--supersedes <full-note-id>` when one note records a
+newer observation. Recognized `[text](faculty:hex)` links are stored as
+references automatically. Supersedes is provenance only: Compass still shows
+both notes and never infers a current one.
+
 == Workflow neutrality
 
 Compass is a durable queue and journal, not a release gate. Review, acceptance,

@@ -14,6 +14,7 @@ pub const KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
 pub const KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
 pub const KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
 pub const KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
+pub const KIND_NOTE_ID: Id = id_hex!("D4E49A6F02A14E66B62076AE4C01715F");
 pub const KIND_ORIENT_CHECKPOINT_ID: Id = id_hex!("163114E5F2272D15F21E1994EF418A31");
 
 pub const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
@@ -51,6 +52,7 @@ pub mod board {
         "61C44E0F8A73443ED592A713151E99A4" as status: inlineencodings::ShortString;
         // Acting persona on a status event (see schemas::compass::board::by).
         "34718CDC13D0E3D8750DB58105390AB3" as by: inlineencodings::GenId;
+        "47351DF00B3DDA96CB305157CD53D781" as note: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 
@@ -69,6 +71,11 @@ pub mod orient_state {
         "AE16414EE1D15DBAC9DF44F77A742E0A" as persona: inlineencodings::GenId;
         "174944957EC01DF2C10D470DBCE4263F" as unread_msg: inlineencodings::GenId;
         "7D7D457CA0184919497E2585CF779125" as goals_view: inlineencodings::Handle<blobencodings::LongString>;
+        // Sorted newly-seen note-id/goal-id lines for this checkpoint. Readers
+        // union every persona checkpoint. Optional only so pre-notification
+        // checkpoints remain readable; new checkpoints always carry it,
+        // including an empty delta that marks format initialization.
+        "673BA8486630927882901829C286FA15" as notes_view: inlineencodings::Handle<blobencodings::LongString>;
         "5D3327421EB2F0D92FD50CF32D5A513C" as roster_member: inlineencodings::GenId;
     }
 }

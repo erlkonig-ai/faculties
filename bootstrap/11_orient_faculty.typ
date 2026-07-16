@@ -29,8 +29,15 @@ When a persona is set, `show` also advances that persona's checkpoint used by
 `orient wait` blocks until the watched branches contain news for this persona,
 rather than waking on every raw branch movement. Directed news includes unread
 inbox or group messages, relevant goal transitions, new goals tagged with the
-persona or `colony`, and new zooids. The persona's own status edits and message
-acknowledgements stay quiet.
+persona or `colony`, new zooids, and newly visible Compass notes. A foreign or
+unattributed note is visible when its goal involves the persona or carries a
+persona/`colony` tag itself; the persona's own attributed notes, status edits,
+and message acknowledgements stay quiet.
+
+Each checkpoint stores only its newly seen note IDs; readers union those
+deltas. Once divergent checkpoints are committed and visible, neither set can
+replay later (this is not a lock against simultaneous delivery). Upgrading an
+older checkpoint records the notes already present as a quiet baseline.
 
 The wait is pile-snapshot driven, so it sees local writes and gossip-merged
 remote writes through `pile net sync`. `orient poll` performs the same news

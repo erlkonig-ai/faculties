@@ -128,10 +128,10 @@ telling the tool what to show you next, and the history falls out naturally.
 
 | Faculty | Purpose |
 |---|---|
-| `compass` | Kanban goal/task board with status, tags, notes, priorities |
+| `compass` | Goal/status/priority board plus referenceable ledger notes |
 | `wiki` | Personal wiki with typst fragments, links, and full-text search |
 | `files` | File organizer backed by blob storage and tags |
-| `orient` | Situation awareness dashboard — what's happening right now |
+| `orient` | Situation awareness and directed message/goal/note notifications |
 | `atlas` | Cross-branch map of the pile's contents |
 | `gauge` | Metrics and counters |
 | `memory` | Long-term memory: compact history and salient fragments |
