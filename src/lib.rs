@@ -16,6 +16,8 @@ pub const GIT_VERSION: &str = concat!(
     ")"
 );
 
+#[cfg(feature = "local-embed")]
+pub mod nomic;
 pub mod schemas;
 pub mod tokens;
 

@@ -2665,28 +2665,13 @@ fn collect_typ_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 // embed` is the build step (embed each current fragment's content once, store
 // the vector as exhaust on its latest version), `wiki similar` the query.
 // Complements `wiki search` (lexical substring) by matching MEANING.
+//
+// The embedder loads ENTIRELY from the nomic text model pile — weights and
+// tokenizer — via the shared `faculties::nomic` seam (one-time setup:
+// `memory import-tokenizer <tokenizer.json>`). No HF cache at runtime.
 
 #[cfg(feature = "local-embed")]
-const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
-
-/// Durable embedder pile — weights load from the pile only (write it with
-/// mary's `embed_persist`); `NOMIC_TEXT_PILE` overrides. tokenizer.json stays
-/// a small HF-cache side-file.
-#[cfg(feature = "local-embed")]
-const NOMIC_TEXT_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_text.pile";
-
-#[cfg(feature = "local-embed")]
-fn load_nomic_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
-    let pile = std::env::var("NOMIC_TEXT_PILE").unwrap_or_else(|_| NOMIC_TEXT_PILE.to_string());
-    let tok = mary::embed::hf_cache_resolve(NOMIC_TEXT_MODEL, "tokenizer.json")
-        .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {NOMIC_TEXT_MODEL}"))?;
-    mary::embed::load_nomic_text_from_pile(
-        std::path::Path::new(&pile),
-        &tok,
-        mary::embed::default_device(),
-    )
-    .map_err(|e| anyhow::anyhow!("load nomic text embedder from pile {pile}: {e:?}"))
-}
+use faculties::nomic::load_text_embedder as load_nomic_text_embedder;
 
 /// L2-normalize so dot-product == cosine downstream (the shared `nearest` core
 /// assumes unit vectors).

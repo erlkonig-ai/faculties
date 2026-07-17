@@ -37,6 +37,7 @@ use triblespace::prelude::*;
              memory density [<grain>]        — find where the hierarchy is BUSHY (many flat leaf-children under one span, no intermediate arc summary) vs balanced vs coarse; worst-first\n  \
              memory search <query>           — lexical (BM25) search over chunk summaries (build/refresh with `memory index`)\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
+             memory import-tokenizer <json>   — one-time: store the text model's tokenizer.json in the nomic model pile, so the embedder is fully pile-loaded (no HF cache) [needs --features local-embed]\n  \
              memory lens [<theme>]            — thematic lenses beside the spine: list them, or print a theme's narratives (create with `create --lens <theme>`)\n  \
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
@@ -409,46 +410,30 @@ fn cmd_search(pile_path: &Path, args: &[String]) -> Result<()> {
 // `embeddings::attr::embedding` space as files/photos, so this is the memory end
 // of one cross-faculty semantic search: a text query here is directly
 // comparable to an image candidate there (nomic text+vision are co-embedded).
+//
+// Both embedders load ENTIRELY from their model piles — weights and
+// tokenizer — via the shared `faculties::nomic` seam. Import the tokenizer
+// once with `memory import-tokenizer <tokenizer.json>`; after that the
+// HF cache can evict whatever it likes.
 
 #[cfg(feature = "local-embed")]
-const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
+use faculties::nomic;
 
-/// Durable embedder piles — weights load from piles only (write them with
-/// mary's `embed_persist`); env vars override so the faculty isn't pinned to
-/// one machine's paths. tokenizer.json stays a small HF-cache side-file.
+/// `memory import-tokenizer <tokenizer.json>` — append the text model's
+/// tokenizer to the nomic text pile, once, making the embedder self-contained
+/// (idempotent; see `faculties::nomic::import_tokenizer`).
 #[cfg(feature = "local-embed")]
-const NOMIC_TEXT_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_text.pile";
-#[cfg(feature = "local-embed")]
-const NOMIC_VISION_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_vision.pile";
-
-#[cfg(feature = "local-embed")]
-fn load_nomic_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
-    let pile = std::env::var("NOMIC_TEXT_PILE").unwrap_or_else(|_| NOMIC_TEXT_PILE.to_string());
-    let tok = mary::embed::hf_cache_resolve(NOMIC_TEXT_MODEL, "tokenizer.json")
-        .ok_or_else(|| anyhow!("tokenizer.json not in HF cache for {NOMIC_TEXT_MODEL}"))?;
-    mary::embed::load_nomic_text_from_pile(
-        std::path::Path::new(&pile),
-        &tok,
-        mary::embed::default_device(),
-    )
-    .map_err(|e| anyhow!("load nomic text embedder from pile {pile}: {e:?}"))
+fn cmd_import_tokenizer(args: &[String]) -> Result<()> {
+    let [path] = args else {
+        bail!("usage: memory import-tokenizer <path/to/tokenizer.json>");
+    };
+    nomic::import_tokenizer(&nomic::text_pile(), Path::new(path), nomic::NOMIC_TEXT_MODEL)
 }
 
-#[cfg(feature = "local-embed")]
-fn load_nomic_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
-    let pile = std::env::var("NOMIC_VISION_PILE").unwrap_or_else(|_| NOMIC_VISION_PILE.to_string());
-    mary::embed::load_nomic_vision_from_pile(
-        std::path::Path::new(&pile),
-        mary::embed::default_device(),
-    )
-    .map_err(|e| anyhow!("load nomic vision embedder from pile {pile}: {e:?}"))
+#[cfg(not(feature = "local-embed"))]
+fn cmd_import_tokenizer(_args: &[String]) -> Result<()> {
+    bail!("`memory import-tokenizer` needs the local embedder — rebuild with `--features local-embed`");
 }
-
-/// nomic-embed-vision-v1.5 — the image encoder co-embedded into the SAME 768-d
-/// space as nomic-text, so an image memory's vector is directly comparable to a
-/// text query's. Used by `memory embed` for wordless image chunks.
-#[cfg(feature = "local-embed")]
-const NOMIC_VISION_MODEL: &str = "nomic-ai/nomic-embed-vision-v1.5";
 
 /// L2-normalize so dot-product == cosine downstream (the shared `nearest` core
 /// and `put_embedding` both assume unit vectors; nomic's raw output is not
@@ -539,7 +524,7 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
                         Some(e) => e,
                         None => {
                             eprintln!("memory: loading nomic-embed-text (once)…");
-                            text_emb = Some(load_nomic_text_embedder()?);
+                            text_emb = Some(nomic::load_text_embedder()?);
                             text_emb.as_ref().unwrap()
                         }
                     };
@@ -555,7 +540,7 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
                         Some(e) => e,
                         None => {
                             eprintln!("memory: loading nomic-embed-vision (once)…");
-                            vision_emb = Some(load_nomic_vision_embedder()?);
+                            vision_emb = Some(nomic::load_vision_embedder()?);
                             vision_emb.as_ref().unwrap()
                         }
                     };
@@ -603,7 +588,7 @@ fn cmd_similar(pile_path: &Path, args: &[String]) -> Result<()> {
     }
     let query = args.join(" ");
     eprintln!("memory: loading nomic-embed-text (once)…");
-    let emb = load_nomic_text_embedder()?;
+    let emb = nomic::load_text_embedder()?;
     let qv = l2_normalize(
         emb.embed_query(&query)
             .map_err(|e| anyhow!("embed query: {e:?}"))?,
@@ -762,6 +747,13 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "similar") {
         return cmd_similar(&cli.pile, &cli.ids[1..]);
+    }
+    if cli
+        .ids
+        .first()
+        .is_some_and(|value| value == "import-tokenizer")
+    {
+        return cmd_import_tokenizer(&cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "context") {
         return cmd_context(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
@@ -1890,7 +1882,7 @@ fn semantic_about_scores(
         return Ok(None);
     }
     eprintln!("memory: loading nomic-embed-text for --about (once)…");
-    let emb = load_nomic_text_embedder()?;
+    let emb = nomic::load_text_embedder()?;
     let qv = l2_normalize(
         emb.embed_query(query)
             .map_err(|e| anyhow!("embed query: {e:?}"))?,
@@ -1987,7 +1979,7 @@ fn semantic_eligibility_scores(
         return Ok(None);
     }
     eprintln!("memory: loading nomic-embed-text for --filter/--remove (once)…");
-    let emb = load_nomic_text_embedder()?;
+    let emb = nomic::load_text_embedder()?;
     let qv = l2_normalize(
         emb.embed_query(query)
             .map_err(|e| anyhow!("embed query: {e:?}"))?,
