@@ -34,6 +34,10 @@ use triblespace::prelude::*;
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
              memory context [<budget>] [--chars N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded+un-lexically-scorable chunks are kept (fail-open) with a stderr warning.\n  \
+             memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/liora/cover/<KEY>/`, NOT the pile\n  \
+             memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
+             memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
+             memory cover reset [--session KEY]   — rewind the cursor to 0 (does NOT regenerate the stored cover)\n  \
              memory density [<grain>]        — find where the hierarchy is BUSHY (many flat leaf-children under one span, no intermediate arc summary) vs balanced vs coarse; worst-first\n  \
              memory search <query>           — lexical (BM25) search over chunk summaries (build/refresh with `memory index`)\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
@@ -785,6 +789,9 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "context") {
         return cmd_context(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "cover") {
+        return cmd_cover(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "lens") {
         return cmd_lens(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
@@ -2131,291 +2138,648 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
     let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
 
     with_repo(pile_path, |repo| {
-        let branch_id = match explicit_branch_id {
-            Some(id) => id,
-            None => repo
-                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
-        };
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout branch")?;
+        let cover = build_context_cover(
+            repo,
+            explicit_branch_id,
+            budget_chars,
+            about.as_deref(),
+            filter_q.as_deref(),
+            remove_q.as_deref(),
+            sim_threshold,
+        )?;
+        print!("{cover}");
+        Ok(())
+    })
+}
 
-        let spans = collect_chunk_spans(&space);
-        if spans.is_empty() {
-            println!("no memory chunks on branch {branch_id:x}");
-            return Ok(());
-        }
-        let n = spans.len();
+/// Build the context-cover TEXT — exactly what `memory context` prints to
+/// stdout — without printing it. Shared by `cmd_context` (which prints it) and
+/// `cover start` (which stores it for cursor-chunked reading), so the cover
+/// semantics — antichain completeness, the character budget, the
+/// `--about`/`--filter`/`--remove` composition — live in one place and the two
+/// callers can never drift.
+fn build_context_cover(
+    repo: &mut Repository<Pile>,
+    explicit_branch_id: Option<Id>,
+    budget_chars: usize,
+    about: Option<&str>,
+    filter_q: Option<&str>,
+    remove_q: Option<&str>,
+    sim_threshold: f32,
+) -> Result<String> {
+    use std::fmt::Write as _;
 
-        // Containment is time-range subsumption (the only hierarchy): a chunk's
-        // immediate parent is the *tightest* strictly-wider chunk that spans it.
-        let strict_contains = |a: usize, b: usize| -> bool {
-            spans[a].0 <= spans[b].0
-                && spans[a].1 >= spans[b].1
-                && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
-        };
-        let width = |i: usize| spans[i].1 - spans[i].0;
-        let mut parent: Vec<Option<usize>> = vec![None; n];
-        for i in 0..n {
-            let mut best: Option<usize> = None;
-            for j in 0..n {
-                if j != i && strict_contains(j, i) {
-                    best = Some(match best {
-                        Some(b) if width(b) <= width(j) => b,
-                        _ => j,
-                    });
-                }
-            }
-            parent[i] = best;
-        }
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut roots: Vec<usize> = Vec::new();
-        for i in 0..n {
-            match parent[i] {
-                Some(p) => children[p].push(i),
-                None => roots.push(i),
-            }
-        }
+    let branch_id = match explicit_branch_id {
+        Some(id) => id,
+        None => repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
+    };
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
+    let space = ws.checkout(..).context("checkout branch")?;
 
-        // Eligibility gates. `--filter` keeps only chunks whose positive
-        // similarity to its query is ABOVE the threshold; `--remove` drops chunks
-        // whose similarity is above it (an anti-filter — the negation lives in the
-        // RETRIEVAL, not the query text, sidestepping embedding-negation failure).
-        // These decide WHICH chunks may appear; `--about` decides DETAIL WEIGHTING
-        // among the eligible; the budget decides how many / how coarse. A removed
-        // chunk must never be emitted at any granularity (enforced by gating the
-        // selected cover below). Both compose with each other and with `--about`.
-        let universe: Vec<Id> = spans.iter().map(|s| s.2).collect();
-        let filter_elig = match &filter_q {
-            Some(q) => Some(eligibility_scores(&space, &mut ws, q, &universe)?),
-            None => None,
-        };
-        let remove_elig = match &remove_q {
-            Some(q) => Some(eligibility_scores(&space, &mut ws, q, &universe)?),
-            None => None,
-        };
-        // Fail-open honesty: unembedded, un-lexically-scorable chunks can't be
-        // assessed, so they are KEPT — but say so loudly, because for the
-        // intimate-exclusion use of `--remove` a silent keep would LEAK.
-        for (label, elig) in [("--filter", &filter_elig), ("--remove", &remove_elig)] {
-            if let Some((_, unscorable)) = elig {
-                if !unscorable.is_empty() {
-                    let ids: Vec<String> = unscorable.iter().map(|id| format!("{id:x}")).collect();
-                    eprintln!(
-                        "memory: {} unembedded chunk(s) not scorable for {label} — kept (fail-open); \
-                         run `memory embed` to make them filterable: {}",
-                        unscorable.len(),
-                        ids.join(", ")
-                    );
-                }
+    let mut out = String::new();
+    let spans = collect_chunk_spans(&space);
+    if spans.is_empty() {
+        writeln!(out, "no memory chunks on branch {branch_id:x}")?;
+        return Ok(out);
+    }
+    let n = spans.len();
+
+    // Containment is time-range subsumption (the only hierarchy): a chunk's
+    // immediate parent is the *tightest* strictly-wider chunk that spans it.
+    let strict_contains = |a: usize, b: usize| -> bool {
+        spans[a].0 <= spans[b].0
+            && spans[a].1 >= spans[b].1
+            && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
+    };
+    let width = |i: usize| spans[i].1 - spans[i].0;
+    let mut parent: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        let mut best: Option<usize> = None;
+        for j in 0..n {
+            if j != i && strict_contains(j, i) {
+                best = Some(match best {
+                    Some(b) if width(b) <= width(j) => b,
+                    _ => j,
+                });
             }
         }
-        let eligible = |id: Id| -> bool {
-            if let Some((scores, _)) = &filter_elig {
-                match scores.get(&id) {
-                    Some(v) => {
-                        if *v <= sim_threshold {
-                            return false;
-                        }
-                    }
-                    None => {} // unscorable → fail-open KEEP (warned above)
-                }
+        parent[i] = best;
+    }
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut roots: Vec<usize> = Vec::new();
+    for i in 0..n {
+        match parent[i] {
+            Some(p) => children[p].push(i),
+            None => roots.push(i),
+        }
+    }
+
+    // Eligibility gates. `--filter` keeps only chunks whose positive
+    // similarity to its query is ABOVE the threshold; `--remove` drops chunks
+    // whose similarity is above it (an anti-filter — the negation lives in the
+    // RETRIEVAL, not the query text, sidestepping embedding-negation failure).
+    // These decide WHICH chunks may appear; `--about` decides DETAIL WEIGHTING
+    // among the eligible; the budget decides how many / how coarse. A removed
+    // chunk must never be emitted at any granularity (enforced by gating the
+    // selected cover below). Both compose with each other and with `--about`.
+    let universe: Vec<Id> = spans.iter().map(|s| s.2).collect();
+    let filter_elig = match filter_q {
+        Some(q) => Some(eligibility_scores(&space, &mut ws, q, &universe)?),
+        None => None,
+    };
+    let remove_elig = match remove_q {
+        Some(q) => Some(eligibility_scores(&space, &mut ws, q, &universe)?),
+        None => None,
+    };
+    // Fail-open honesty: unembedded, un-lexically-scorable chunks can't be
+    // assessed, so they are KEPT — but say so loudly, because for the
+    // intimate-exclusion use of `--remove` a silent keep would LEAK.
+    for (label, elig) in [("--filter", &filter_elig), ("--remove", &remove_elig)] {
+        if let Some((_, unscorable)) = elig {
+            if !unscorable.is_empty() {
+                let ids: Vec<String> = unscorable.iter().map(|id| format!("{id:x}")).collect();
+                eprintln!(
+                    "memory: {} unembedded chunk(s) not scorable for {label} — kept (fail-open); \
+                     run `memory embed` to make them filterable: {}",
+                    unscorable.len(),
+                    ids.join(", ")
+                );
             }
-            if let Some((scores, _)) = &remove_elig {
-                if let Some(v) = scores.get(&id) {
-                    if *v > sim_threshold {
+        }
+    }
+    let eligible = |id: Id| -> bool {
+        if let Some((scores, _)) = &filter_elig {
+            match scores.get(&id) {
+                Some(v) => {
+                    if *v <= sim_threshold {
                         return false;
                     }
                 }
-                // unscorable (absent from map) → fail-open KEEP
+                None => {} // unscorable → fail-open KEEP (warned above)
             }
-            true
-        };
+        }
+        if let Some((scores, _)) = &remove_elig {
+            if let Some(v) = scores.get(&id) {
+                if *v > sim_threshold {
+                    return false;
+                }
+            }
+            // unscorable (absent from map) → fail-open KEEP
+        }
+        true
+    };
 
-        // Relevance scoring for detail weighting: score every chunk against a
-        // query, then propagate each node's score up to a subtree maximum (a node
-        // is worth descending into if ANY memory beneath it is relevant). `--about`
-        // drives this when present; with only `--filter`, reuse the filter scores
-        // so the cover descends TOWARD the eligible material instead of staying
-        // coarse (otherwise a filtered cover would surface little detail).
-        let relevance: Vec<f32> = if about.is_some() || filter_q.is_some() {
-            let scores: std::collections::HashMap<Id, f32> = if let Some(query) = &about {
-                about_relevance_scores(&space, &mut ws, query)?
-            } else {
-                filter_elig.as_ref().unwrap().0.clone()
-            };
-            let mut r: Vec<f32> = (0..n)
-                .map(|i| *scores.get(&spans[i].2).unwrap_or(&0.0))
-                .collect();
-            // Narrow→wide so children precede parents; lift each subtree maximum up.
-            let mut order: Vec<usize> = (0..n).collect();
-            order.sort_by_key(|&i| spans[i].1 - spans[i].0);
-            for &i in &order {
-                if let Some(p) = parent[i] {
-                    if r[i] > r[p] {
-                        r[p] = r[i];
+    // Relevance scoring for detail weighting: score every chunk against a
+    // query, then propagate each node's score up to a subtree maximum (a node
+    // is worth descending into if ANY memory beneath it is relevant). `--about`
+    // drives this when present; with only `--filter`, reuse the filter scores
+    // so the cover descends TOWARD the eligible material instead of staying
+    // coarse (otherwise a filtered cover would surface little detail).
+    let relevance: Vec<f32> = if about.is_some() || filter_q.is_some() {
+        let scores: std::collections::HashMap<Id, f32> = if let Some(query) = about {
+            about_relevance_scores(&space, &mut ws, query)?
+        } else {
+            filter_elig.as_ref().unwrap().0.clone()
+        };
+        let mut r: Vec<f32> = (0..n)
+            .map(|i| *scores.get(&spans[i].2).unwrap_or(&0.0))
+            .collect();
+        // Narrow→wide so children precede parents; lift each subtree maximum up.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| spans[i].1 - spans[i].0);
+        for &i in &order {
+            if let Some(p) = parent[i] {
+                if r[i] > r[p] {
+                    r[p] = r[i];
+                }
+            }
+        }
+        r
+    } else {
+        vec![0.0; n]
+    };
+
+    // Floor of the cover: the coarsest antichain (all roots), oldest first.
+    // Completeness is invariant — never drop a memory to fit. If even this
+    // overflows, the hierarchy lacks a coarse-enough apex; tell the caller
+    // how to raise one instead of silently losing the past.
+    roots.sort_by(|&a, &b| spans[a].0.cmp(&spans[b].0).then(spans[b].1.cmp(&spans[a].1)));
+    let mut cost_cache: Vec<Option<usize>> = vec![None; n];
+    let mut used = 0usize;
+    for &i in &roots {
+        used = used.saturating_add(context_chunk_cost(&mut ws, &space, &spans, &mut cost_cache, i)?);
+    }
+    if used > budget_chars {
+        let earliest = roots.iter().map(|&i| spans[i].0).min().unwrap();
+        let latest = roots.iter().map(|&i| spans[i].1).max().unwrap();
+        bail!(
+            "incomplete cover: the coarsest cover of all memories needs ~{} characters, over the {budget_chars}-character budget.\n\
+             Your memory hierarchy has {} top-level chunk(s) with no coarser parent spanning them, so no in-budget cover can contain everything.\n\
+             Raise a coarser apex over the whole extent, then retry:\n    \
+             memory create {}..{} \"<one coarse summary of this whole span>\"\n\
+             (A well-maintained hierarchy keeps a coarse summary over its full extent — this is how you add the missing layer.)",
+            used,
+            roots.len(),
+            fmt_epoch(key_to_epoch(earliest)),
+            fmt_epoch(key_to_epoch(latest)),
+        );
+    }
+
+    // Refine recency-first: spend the remaining budget splitting the most
+    // recent splittable chunk into its immediate children, so detail
+    // concentrates toward now and the deep past stays coarse. (The playground
+    // gets this gradient from drop-oldest; we get it from the split order,
+    // since completeness forbids dropping.)
+    let mut cover: Vec<usize> = roots.clone();
+    loop {
+        let remaining = budget_chars.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let mut best: Option<usize> = None; // position in `cover`
+        let mut best_extra = 0usize;
+        let mut best_key: Option<(f32, i128, i128, usize, Id)> = None;
+        for pos in 0..cover.len() {
+            let i = cover[pos];
+            if children[i].len() < 2 {
+                continue;
+            }
+            let mut kids_cost = 0usize;
+            for &k in &children[i] {
+                kids_cost = kids_cost
+                    .saturating_add(context_chunk_cost(&mut ws, &space, &spans, &mut cost_cache, k)?);
+            }
+            let pcost = context_chunk_cost(&mut ws, &space, &spans, &mut cost_cache, i)?;
+            let extra = kids_cost.saturating_sub(pcost);
+            if extra > remaining {
+                continue;
+            }
+            // Priority: relevance (subtree-max, when --about) desc → recency
+            // (latest end) desc → width desc → detail gained desc → id asc.
+            // Without --about every relevance is 0, so recency leads exactly as
+            // before; with it, the cover descends into the query-relevant
+            // subtrees first and leaves the rest coarse.
+            let key = (relevance[i], spans[i].1, width(i), extra, spans[i].2);
+            let better = match best_key {
+                None => true,
+                Some((br, be, bw, bx, bid)) => {
+                    if key.0 != br {
+                        key.0 > br
+                    } else if key.1 != be {
+                        key.1 > be
+                    } else if key.2 != bw {
+                        key.2 > bw
+                    } else if key.3 != bx {
+                        key.3 > bx
+                    } else {
+                        key.4 < bid
                     }
                 }
+            };
+            if better {
+                best = Some(pos);
+                best_extra = extra;
+                best_key = Some(key);
             }
-            r
-        } else {
-            vec![0.0; n]
+        }
+        let Some(pos) = best else {
+            break;
         };
+        let kids = children[cover[pos]].clone();
+        cover.splice(pos..=pos, kids);
+        used = used.saturating_add(best_extra);
+    }
 
-        // Floor of the cover: the coarsest antichain (all roots), oldest first.
-        // Completeness is invariant — never drop a memory to fit. If even this
-        // overflows, the hierarchy lacks a coarse-enough apex; tell the caller
-        // how to raise one instead of silently losing the past.
-        roots.sort_by(|&a, &b| spans[a].0.cmp(&spans[b].0).then(spans[b].1.cmp(&spans[a].1)));
-        let mut cost_cache: Vec<Option<usize>> = vec![None; n];
-        let mut used = 0usize;
-        for &i in &roots {
-            used = used.saturating_add(context_chunk_cost(&mut ws, &space, &spans, &mut cost_cache, i)?);
+    // Enforce eligibility at the chunk level the cover selected: a removed /
+    // filtered-out chunk is not emitted at ANY granularity. V1 LIMITATION: a
+    // surviving coarse ANCESTOR's summary is pre-written text and passes
+    // through unchanged, so it may still *mention* removed material in its
+    // prose — we drop selected nodes, we do not rewrite ancestor summaries.
+    if filter_elig.is_some() || remove_elig.is_some() {
+        cover.retain(|&i| eligible(spans[i].2));
+        // Recompute the character tally honestly over what actually survived.
+        used = 0;
+        for &i in &cover {
+            used = used.saturating_add(context_chunk_cost(
+                &mut ws,
+                &space,
+                &spans,
+                &mut cost_cache,
+                i,
+            )?);
         }
-        if used > budget_chars {
-            let earliest = roots.iter().map(|&i| spans[i].0).min().unwrap();
-            let latest = roots.iter().map(|&i| spans[i].1).max().unwrap();
-            bail!(
-                "incomplete cover: the coarsest cover of all memories needs ~{} characters, over the {budget_chars}-character budget.\n\
-                 Your memory hierarchy has {} top-level chunk(s) with no coarser parent spanning them, so no in-budget cover can contain everything.\n\
-                 Raise a coarser apex over the whole extent, then retry:\n    \
-                 memory create {}..{} \"<one coarse summary of this whole span>\"\n\
-                 (A well-maintained hierarchy keeps a coarse summary over its full extent — this is how you add the missing layer.)",
-                used,
-                roots.len(),
-                fmt_epoch(key_to_epoch(earliest)),
-                fmt_epoch(key_to_epoch(latest)),
-            );
-        }
+    }
 
-        // Refine recency-first: spend the remaining budget splitting the most
-        // recent splittable chunk into its immediate children, so detail
-        // concentrates toward now and the deep past stays coarse. (The playground
-        // gets this gradient from drop-oldest; we get it from the split order,
-        // since completeness forbids dropping.)
-        let mut cover: Vec<usize> = roots.clone();
-        loop {
-            let remaining = budget_chars.saturating_sub(used);
-            if remaining == 0 {
-                break;
-            }
-            let mut best: Option<usize> = None; // position in `cover`
-            let mut best_extra = 0usize;
-            let mut best_key: Option<(f32, i128, i128, usize, Id)> = None;
-            for pos in 0..cover.len() {
-                let i = cover[pos];
-                if children[i].len() < 2 {
-                    continue;
-                }
-                let mut kids_cost = 0usize;
-                for &k in &children[i] {
-                    kids_cost = kids_cost
-                        .saturating_add(context_chunk_cost(&mut ws, &space, &spans, &mut cost_cache, k)?);
-                }
-                let pcost = context_chunk_cost(&mut ws, &space, &spans, &mut cost_cache, i)?;
-                let extra = kids_cost.saturating_sub(pcost);
-                if extra > remaining {
-                    continue;
-                }
-                // Priority: relevance (subtree-max, when --about) desc → recency
-                // (latest end) desc → width desc → detail gained desc → id asc.
-                // Without --about every relevance is 0, so recency leads exactly as
-                // before; with it, the cover descends into the query-relevant
-                // subtrees first and leaves the rest coarse.
-                let key = (relevance[i], spans[i].1, width(i), extra, spans[i].2);
-                let better = match best_key {
-                    None => true,
-                    Some((br, be, bw, bx, bid)) => {
-                        if key.0 != br {
-                            key.0 > br
-                        } else if key.1 != be {
-                            key.1 > be
-                        } else if key.2 != bw {
-                            key.2 > bw
-                        } else if key.3 != bx {
-                            key.3 > bx
-                        } else {
-                            key.4 < bid
+    // Emit coarse → fine: time order, indented by containment depth, each
+    // chunk's span header followed by its summary content.
+    cover.sort_by(|&a, &b| spans[a].0.cmp(&spans[b].0).then(spans[b].1.cmp(&spans[a].1)));
+    let mode = {
+        let mut parts = vec![match about {
+            Some(q) => format!("most detail on memories about \"{q}\""),
+            None => "recent in most detail".to_string(),
+        }];
+        if let Some(q) = filter_q {
+            parts.push(format!("filtered to \"{q}\""));
+        }
+        if let Some(q) = remove_q {
+            parts.push(format!("excluding \"{q}\""));
+        }
+        format!("coarse → fine; {}", parts.join("; "))
+    };
+    writeln!(
+        out,
+        "memory context — {} chunk(s), ~{} of {} characters ({mode})",
+        cover.len(),
+        used,
+        budget_chars,
+    )?;
+    for &i in &cover {
+        let (s, e, id) = spans[i];
+        let depth = (0..n).filter(|&j| j != i && strict_contains(j, i)).count();
+        let indent = "  ".repeat(depth);
+        writeln!(out)?;
+        writeln!(
+            out,
+            "{indent}{}  ({:x})",
+            format_time_range(key_to_epoch(s), key_to_epoch(e)),
+            id
+        )?;
+        if let Some(handle) = chunk_summary_handle(&space, id) {
+            let summary: View<str> = ws.get(handle).context("read chunk summary")?;
+            writeln!(out, "{}", summary.trim_end())?;
+        } else if chunk_image_handle(&space, id).is_some() {
+            writeln!(out, "[image memory @ {}]", chunk_span_str(&space, id))?;
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// cover subcommand family — cursor-chunked reader over the context cover
+// ---------------------------------------------------------------------------
+//
+// The context cover is too large to ingest in one gulp, so a harness hook can
+// force COMPLETE ingestion through a cursor: `cover start` generates the text
+// (exactly what `memory context --chars N` prints) and stores it with a zeroed
+// cursor; `cover continue` prints the next chunk and advances; `cover status`
+// answers "fully ingested?" through its exit code; `cover reset` rewinds
+// without regenerating. This is ephemeral harness plumbing, NOT knowledge — it
+// must never touch the pile. State lives under
+// `${XDG_CACHE_HOME:-$HOME/.cache}/liora/cover/<session>/` as `cover.txt`
+// (the stored cover, byte-exact) plus `cursor.json` (the read offset).
+
+const COVER_DEFAULT_CHARS: usize = 400_000;
+/// Default chunk size — sized so a chunk printed to stdout survives
+/// tool-result truncation in one piece.
+const COVER_DEFAULT_CHUNK_CHARS: usize = 20_000;
+const COVER_TEXT_FILE: &str = "cover.txt";
+const COVER_CURSOR_FILE: &str = "cursor.json";
+
+/// The cursor half of the cover state: how far `cover continue` has read into
+/// the stored cover, in CHARACTERS (the same unit as the context budget — no
+/// byte/char ambiguity, and chunk boundaries can never split a multi-byte
+/// character).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CoverCursor {
+    /// Characters of the stored cover already emitted.
+    offset: usize,
+    /// Chunk size in characters, fixed at `cover start`.
+    chunk_chars: usize,
+    /// Total characters of the stored cover.
+    total_chars: usize,
+    /// When the cover was generated (TAI, the clock every chunk uses).
+    generated_at: String,
+}
+
+/// State directory for one cover session:
+/// `${XDG_CACHE_HOME:-$HOME/.cache}/liora/cover/<key>`. The key becomes a
+/// directory name, so path-shaped keys are rejected outright.
+fn cover_session_dir(key: &str) -> Result<PathBuf> {
+    if key.is_empty() || key == "." || key == ".." || key.contains('/') || key.contains('\\') {
+        bail!("invalid session key `{key}` (it becomes a directory name)");
+    }
+    let base = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            let home = std::env::var_os("HOME")
+                .ok_or_else(|| anyhow!("neither XDG_CACHE_HOME nor HOME is set"))?;
+            PathBuf::from(home).join(".cache")
+        }
+    };
+    Ok(base.join("liora").join("cover").join(key))
+}
+
+/// How many chunks a cover of `total_chars` splits into at `chunk_chars`.
+fn cover_chunk_count(total_chars: usize, chunk_chars: usize) -> usize {
+    (total_chars + chunk_chars - 1) / chunk_chars
+}
+
+/// Byte index of the `chars`-th character of `text` (`text.len()` past the
+/// end), so chunk slicing lands on character boundaries, never mid-codepoint.
+fn cover_byte_of_char(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+fn cover_save_cursor(dir: &Path, cursor: &CoverCursor) -> Result<()> {
+    let path = dir.join(COVER_CURSOR_FILE);
+    let json = serde_json::to_string_pretty(cursor).context("encode cover cursor")?;
+    std::fs::write(&path, json).with_context(|| format!("write {}", path.display()))
+}
+
+/// Store a freshly generated cover with a zeroed cursor. Returns
+/// `(chunk_count, total_chars)`.
+fn cover_write_state(
+    dir: &Path,
+    cover: &str,
+    chunk_chars: usize,
+    generated_at: String,
+) -> Result<(usize, usize)> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create cover state dir {}", dir.display()))?;
+    let text_path = dir.join(COVER_TEXT_FILE);
+    std::fs::write(&text_path, cover)
+        .with_context(|| format!("write {}", text_path.display()))?;
+    let total_chars = cover.chars().count();
+    let cursor = CoverCursor {
+        offset: 0,
+        chunk_chars,
+        total_chars,
+        generated_at,
+    };
+    cover_save_cursor(dir, &cursor)?;
+    Ok((cover_chunk_count(total_chars, chunk_chars), total_chars))
+}
+
+/// Load `(cover text, cursor)` from a session dir; `None` when no cover has
+/// been started there.
+fn cover_read_state(dir: &Path) -> Result<Option<(String, CoverCursor)>> {
+    let text_path = dir.join(COVER_TEXT_FILE);
+    let cursor_path = dir.join(COVER_CURSOR_FILE);
+    if !text_path.exists() || !cursor_path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&text_path)
+        .with_context(|| format!("read {}", text_path.display()))?;
+    let raw = std::fs::read_to_string(&cursor_path)
+        .with_context(|| format!("read {}", cursor_path.display()))?;
+    let cursor: CoverCursor = serde_json::from_str(&raw)
+        .with_context(|| format!("parse {}", cursor_path.display()))?;
+    if cursor.chunk_chars == 0 {
+        bail!(
+            "corrupt cover cursor {} (chunk_chars is 0) — rerun `memory cover start`",
+            cursor_path.display()
+        );
+    }
+    Ok(Some((text, cursor)))
+}
+
+/// One `cover continue` step: the emitted chunk with its coordinates, or the
+/// already-complete marker. Separated from printing so tests can walk the
+/// chunks and prove reassembly equals the stored cover byte-for-byte.
+enum CoverStep {
+    AlreadyComplete {
+        chunks: usize,
+    },
+    Chunk {
+        index: usize,
+        chunks: usize,
+        start_char: usize,
+        end_char: usize,
+        text: String,
+        complete: bool,
+    },
+}
+
+/// Advance the cover cursor in `dir` by one chunk and persist the new offset.
+fn cover_advance(dir: &Path) -> Result<CoverStep> {
+    let Some((text, mut cursor)) = cover_read_state(dir)? else {
+        bail!(
+            "no cover in {} — run `memory cover start` first",
+            dir.display()
+        );
+    };
+    let chunks = cover_chunk_count(cursor.total_chars, cursor.chunk_chars);
+    if cursor.offset >= cursor.total_chars {
+        return Ok(CoverStep::AlreadyComplete { chunks });
+    }
+    let start_char = cursor.offset;
+    let end_char = (start_char + cursor.chunk_chars).min(cursor.total_chars);
+    let chunk = text[cover_byte_of_char(&text, start_char)..cover_byte_of_char(&text, end_char)]
+        .to_string();
+    cursor.offset = end_char;
+    cover_save_cursor(dir, &cursor)?;
+    Ok(CoverStep::Chunk {
+        index: start_char / cursor.chunk_chars + 1,
+        chunks,
+        start_char,
+        end_char,
+        text: chunk,
+        complete: end_char >= cursor.total_chars,
+    })
+}
+
+/// The `cover status` line plus completeness. A missing state reads as an
+/// empty, INCOMPLETE cover, so a session-start hook treats "never started" and
+/// "not done yet" the same way: block until a start + full walk has happened.
+fn cover_status_line(dir: &Path) -> Result<(String, bool)> {
+    let Some((_, cursor)) = cover_read_state(dir)? else {
+        return Ok(("complete=false loaded=0/0 chars=0/0".to_string(), false));
+    };
+    let chunks = cover_chunk_count(cursor.total_chars, cursor.chunk_chars);
+    let complete = cursor.offset >= cursor.total_chars;
+    let loaded = if complete {
+        chunks
+    } else {
+        cursor.offset / cursor.chunk_chars
+    };
+    Ok((
+        format!(
+            "complete={complete} loaded={loaded}/{chunks} chars={}/{}",
+            cursor.offset, cursor.total_chars
+        ),
+        complete,
+    ))
+}
+
+/// Rewind the cursor to 0; the stored cover is untouched (reset never
+/// regenerates). Returns the number of chunks now pending.
+fn cover_reset_cursor(dir: &Path) -> Result<usize> {
+    let Some((_, mut cursor)) = cover_read_state(dir)? else {
+        bail!(
+            "no cover in {} — run `memory cover start` first",
+            dir.display()
+        );
+    };
+    cursor.offset = 0;
+    cover_save_cursor(dir, &cursor)?;
+    Ok(cover_chunk_count(cursor.total_chars, cursor.chunk_chars))
+}
+
+/// `memory cover start|continue|status|reset` — the cursor state machine a
+/// harness hook drives to force complete ingestion of the context cover:
+/// reset (or start) on session start, block turn-end until `status` exits 0.
+fn cmd_cover(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+    let usage = "usage: memory cover start [--chars N] [--chunk-chars M] [--session KEY]\n\
+                 \x20      memory cover continue [--session KEY]\n\
+                 \x20      memory cover status [--session KEY]\n\
+                 \x20      memory cover reset [--session KEY]";
+    let Some(verb) = args.first().map(String::as_str) else {
+        bail!("{usage}");
+    };
+    if matches!(verb, "--help" | "-h") {
+        println!("{usage}");
+        return Ok(());
+    }
+    let mut budget_chars: usize = COVER_DEFAULT_CHARS;
+    let mut chunk_chars: usize = COVER_DEFAULT_CHUNK_CHARS;
+    let mut session = "default".to_string();
+    {
+        let mut i = 1;
+        while i < args.len() {
+            let flag = args[i].as_str();
+            match flag {
+                "--chars" | "--chunk-chars" | "--session" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("{flag} needs a value\n{usage}"))?;
+                    match flag {
+                        "--session" => session = raw.clone(),
+                        _ => {
+                            let n: usize = raw.parse().map_err(|_| {
+                                anyhow!("{flag} expects a positive integer, got `{raw}`")
+                            })?;
+                            if n == 0 {
+                                bail!("{flag} must be positive");
+                            }
+                            if flag == "--chars" {
+                                budget_chars = n;
+                            } else {
+                                chunk_chars = n;
+                            }
                         }
                     }
-                };
-                if better {
-                    best = Some(pos);
-                    best_extra = extra;
-                    best_key = Some(key);
+                    i += 2;
                 }
-            }
-            let Some(pos) = best else {
-                break;
-            };
-            let kids = children[cover[pos]].clone();
-            cover.splice(pos..=pos, kids);
-            used = used.saturating_add(best_extra);
-        }
-
-        // Enforce eligibility at the chunk level the cover selected: a removed /
-        // filtered-out chunk is not emitted at ANY granularity. V1 LIMITATION: a
-        // surviving coarse ANCESTOR's summary is pre-written text and passes
-        // through unchanged, so it may still *mention* removed material in its
-        // prose — we drop selected nodes, we do not rewrite ancestor summaries.
-        if filter_elig.is_some() || remove_elig.is_some() {
-            cover.retain(|&i| eligible(spans[i].2));
-            // Recompute the character tally honestly over what actually survived.
-            used = 0;
-            for &i in &cover {
-                used = used.saturating_add(context_chunk_cost(
-                    &mut ws,
-                    &space,
-                    &spans,
-                    &mut cost_cache,
-                    i,
-                )?);
+                other => bail!("unknown argument `{other}`\n{usage}"),
             }
         }
+    }
+    let dir = cover_session_dir(&session)?;
 
-        // Emit coarse → fine: time order, indented by containment depth, each
-        // chunk's span header followed by its summary content.
-        cover.sort_by(|&a, &b| spans[a].0.cmp(&spans[b].0).then(spans[b].1.cmp(&spans[a].1)));
-        let mode = {
-            let mut parts = vec![match &about {
-                Some(q) => format!("most detail on memories about \"{q}\""),
-                None => "recent in most detail".to_string(),
-            }];
-            if let Some(q) = &filter_q {
-                parts.push(format!("filtered to \"{q}\""));
-            }
-            if let Some(q) = &remove_q {
-                parts.push(format!("excluding \"{q}\""));
-            }
-            format!("coarse → fine; {}", parts.join("; "))
-        };
-        println!(
-            "memory context — {} chunk(s), ~{} of {} characters ({mode})",
-            cover.len(),
-            used,
-            budget_chars,
-        );
-        for &i in &cover {
-            let (s, e, id) = spans[i];
-            let depth = (0..n).filter(|&j| j != i && strict_contains(j, i)).count();
-            let indent = "  ".repeat(depth);
-            println!();
+    match verb {
+        "start" => {
+            let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
+            let cover = with_repo(pile_path, |repo| {
+                build_context_cover(
+                    repo,
+                    explicit_branch_id,
+                    budget_chars,
+                    None,
+                    None,
+                    None,
+                    DEFAULT_SIM_THRESHOLD,
+                )
+            })?;
+            let now = Epoch::now()
+                .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+            let (chunks, total) = cover_write_state(&dir, &cover, chunk_chars, fmt_epoch(now))?;
             println!(
-                "{indent}{}  ({:x})",
-                format_time_range(key_to_epoch(s), key_to_epoch(e)),
-                id
+                "cover: generated {chunks} chunks (~{chunk_chars} chars each, {total} chars total); run 'memory cover continue'"
             );
-            if let Some(handle) = chunk_summary_handle(&space, id) {
-                let summary: View<str> = ws.get(handle).context("read chunk summary")?;
-                println!("{}", summary.trim_end());
-            } else if chunk_image_handle(&space, id).is_some() {
-                println!("[image memory @ {}]", chunk_span_str(&space, id));
-            }
+            Ok(())
         }
-        Ok(())
-    })
+        "continue" => match cover_advance(&dir)? {
+            CoverStep::AlreadyComplete { chunks } => {
+                println!("COVER COMPLETE {chunks}/{chunks} (nothing to do)");
+                Ok(())
+            }
+            CoverStep::Chunk {
+                index,
+                chunks,
+                start_char,
+                end_char,
+                text,
+                complete,
+            } => {
+                println!("COVER CHUNK {index}/{chunks} (chars {start_char}..{end_char})");
+                // The chunk itself, verbatim; a bare newline is appended only
+                // when the chunk does not end on one, to keep the following
+                // line (or the shell prompt) off the chunk's last line. The
+                // stored cover is untouched by this — reassembly from state is
+                // byte-exact.
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+                if complete {
+                    println!("COVER COMPLETE {chunks}/{chunks}");
+                }
+                Ok(())
+            }
+        },
+        "status" => {
+            let (line, complete) = cover_status_line(&dir)?;
+            println!("{line}");
+            // Hook-friendly: the exit code IS the answer (0 complete, 1 not).
+            if !complete {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        "reset" => {
+            let chunks = cover_reset_cursor(&dir)?;
+            println!("cover: cursor reset ({chunks} chunks pending)");
+            Ok(())
+        }
+        other => bail!("unknown cover subcommand `{other}`\n{usage}"),
+    }
 }
 
 /// the fine edge; `check 13w` finds regions with no coarse cover).
@@ -3230,4 +3594,202 @@ fn with_repo<T>(
         eprintln!("warning: failed to close pile cleanly: {err:#}");
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    struct TestPile(PathBuf);
+
+    impl TestPile {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("faculties-memory-cover-{}.pile", ufoid().id));
+            File::create(&path).expect("create test pile");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A fresh cover-state dir under the system temp dir, removed on drop —
+    /// the tests never touch the real `~/.cache/liora/cover/`.
+    struct TestStateDir(PathBuf);
+
+    impl TestStateDir {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("faculties-memory-cover-state-{}", ufoid().id)),
+            )
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestStateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Walk `cover continue` steps until the final chunk, returning the
+    /// emitted chunk texts in order.
+    fn walk_chunks(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            match cover_advance(dir).expect("advance cover") {
+                CoverStep::Chunk { text, complete, .. } => {
+                    out.push(text);
+                    if complete {
+                        return out;
+                    }
+                }
+                CoverStep::AlreadyComplete { .. } => return out,
+            }
+        }
+    }
+
+    #[test]
+    fn cover_chunks_reassemble_byte_for_byte() {
+        let state = TestStateDir::new();
+        // Multi-byte characters spread across chunk boundaries: 7-char chunks
+        // land inside the em-dashes unless slicing is character-aware.
+        let cover = "memory context — 3 chunk(s)\n\nalpha — beta\ngamma — delta\n";
+        let (chunks, total) =
+            cover_write_state(state.path(), cover, 7, "t".to_string()).expect("write cover state");
+        assert_eq!(total, cover.chars().count());
+        assert_eq!(chunks, cover_chunk_count(total, 7));
+
+        let emitted = walk_chunks(state.path());
+        assert_eq!(emitted.len(), chunks);
+        assert_eq!(emitted.concat(), cover, "reassembly must be byte-for-byte");
+        // Every chunk but the last is exactly chunk_chars characters.
+        for text in &emitted[..emitted.len() - 1] {
+            assert_eq!(text.chars().count(), 7);
+        }
+    }
+
+    #[test]
+    fn cover_status_flips_and_reset_rearms() {
+        let state = TestStateDir::new();
+        cover_write_state(state.path(), "0123456789", 4, "t".to_string()).expect("write");
+
+        // Fresh cover: incomplete, nothing loaded (exit code 1 in the CLI).
+        let (line, complete) = cover_status_line(state.path()).expect("status");
+        assert_eq!(line, "complete=false loaded=0/3 chars=0/10");
+        assert!(!complete);
+
+        // First chunk: 1/3, chars 0..4, not yet complete.
+        match cover_advance(state.path()).expect("advance") {
+            CoverStep::Chunk {
+                index,
+                chunks,
+                start_char,
+                end_char,
+                text,
+                complete,
+            } => {
+                assert_eq!((index, chunks, start_char, end_char), (1, 3, 0, 4));
+                assert_eq!(text, "0123");
+                assert!(!complete);
+            }
+            CoverStep::AlreadyComplete { .. } => panic!("expected a chunk"),
+        }
+        let (line, complete) = cover_status_line(state.path()).expect("status");
+        assert_eq!(line, "complete=false loaded=1/3 chars=4/10");
+        assert!(!complete);
+
+        // Drain the rest: status flips to complete (exit code 0 in the CLI).
+        walk_chunks(state.path());
+        let (line, complete) = cover_status_line(state.path()).expect("status");
+        assert_eq!(line, "complete=true loaded=3/3 chars=10/10");
+        assert!(complete);
+
+        // A further continue is the idempotent nothing-to-do marker.
+        match cover_advance(state.path()).expect("advance") {
+            CoverStep::AlreadyComplete { chunks } => assert_eq!(chunks, 3),
+            CoverStep::Chunk { .. } => panic!("expected AlreadyComplete"),
+        }
+
+        // Reset re-arms the cursor without touching the stored cover.
+        let pending = cover_reset_cursor(state.path()).expect("reset");
+        assert_eq!(pending, 3);
+        let (line, complete) = cover_status_line(state.path()).expect("status");
+        assert_eq!(line, "complete=false loaded=0/3 chars=0/10");
+        assert!(!complete);
+        assert_eq!(walk_chunks(state.path()).concat(), "0123456789");
+    }
+
+    #[test]
+    fn cover_missing_state_semantics() {
+        let state = TestStateDir::new();
+        // Status on a never-started session reads incomplete (hook blocks)…
+        let (line, complete) = cover_status_line(state.path()).expect("status");
+        assert_eq!(line, "complete=false loaded=0/0 chars=0/0");
+        assert!(!complete);
+        // …while continue and reset refuse outright: there is nothing to read.
+        assert!(cover_advance(state.path()).is_err());
+        assert!(cover_reset_cursor(state.path()).is_err());
+    }
+
+    #[test]
+    fn cover_start_generates_the_context_cover_from_a_pile() {
+        let pile = TestPile::new();
+        // Seed a coarse apex over two fine day-chunks — the shape the
+        // antichain cover splits when the budget allows.
+        with_repo(pile.path(), |repo| {
+            let apex = (
+                parse_tai_timestamp("2026-01-01T00:00:00")?,
+                parse_tai_timestamp("2026-01-03T00:00:00")?,
+            );
+            create_chunk(repo, "apex: two days of cover-cursor work", apex, None)?;
+            let day1 = (
+                parse_tai_timestamp("2026-01-01T00:00:00")?,
+                parse_tai_timestamp("2026-01-02T00:00:00")?,
+            );
+            create_chunk(repo, "day one: built the state machine", day1, None)?;
+            let day2 = (
+                parse_tai_timestamp("2026-01-02T00:00:00")?,
+                parse_tai_timestamp("2026-01-03T00:00:00")?,
+            );
+            create_chunk(repo, "day two: wired the hooks", day2, None)?;
+            Ok(())
+        })
+        .expect("seed pile");
+
+        // The exact text `memory context --chars 10000` would print.
+        let cover = with_repo(pile.path(), |repo| {
+            build_context_cover(repo, None, 10_000, None, None, None, DEFAULT_SIM_THRESHOLD)
+        })
+        .expect("build context cover");
+        assert!(cover.starts_with("memory context — "));
+        assert!(cover.contains("day one: built the state machine"));
+        assert!(cover.contains("day two: wired the hooks"));
+
+        // Store + walk exactly as `cover start` / `cover continue` do.
+        let state = TestStateDir::new();
+        let (chunks, total) =
+            cover_write_state(state.path(), &cover, 50, "t".to_string()).expect("write");
+        assert_eq!(total, cover.chars().count());
+        let emitted = walk_chunks(state.path());
+        assert_eq!(emitted.len(), chunks);
+        assert_eq!(
+            emitted.concat(),
+            cover,
+            "chunk reassembly must equal the stored cover"
+        );
+    }
 }
