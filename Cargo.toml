@@ -1,3 +1,11 @@
+# This crate is also the workspace root. `faculties-secrets` is the extracted
+# capability + envelope-encryption core of the `secrets` faculty, split out so
+# lean consumers (playground/OAuth) can depend on it without the mary/GORBIE/egui
+# stack. The `[patch.crates-io]` at the bottom applies to the whole workspace
+# (patch only takes effect from the workspace root).
+[workspace]
+members = ["faculties-secrets"]
+
 [package]
 name = "faculties"
 version = "0.20.2"
@@ -141,6 +149,7 @@ hifitime = "4.2.3"
 rand_core = "0.6.4"
 triblespace = { version = "0.47", path = "../triblespace-rs" }
 triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
+faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
 triblespace-gpu = { version = "0.47.0", path = "../triblespace-rs/triblespace-gpu", optional = true, default-features = false }
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).

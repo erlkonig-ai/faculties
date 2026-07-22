@@ -21,6 +21,14 @@ pub mod nomic;
 pub mod schemas;
 pub mod tokens;
 
+/// The `secrets` faculty's capability + envelope-encryption core, re-exported so
+/// faculties consumers can reach it as `faculties::secrets::SecretsRepo`. It
+/// lives in the standalone `faculties-secrets` crate (deps: triblespace + dryoc +
+/// anybytes only) so lean consumers (playground/OAuth) can depend on it directly
+/// without pulling the mary/GORBIE/egui stack — one implementation, two access
+/// paths.
+pub use faculties_secrets as secrets;
+
 #[cfg(feature = "widgets")]
 pub mod widgets;
 

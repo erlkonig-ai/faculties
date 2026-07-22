@@ -1,0 +1,21 @@
+[package]
+name = "faculties-secrets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The capability + envelope-encryption core of the `secrets` faculty, extracted so both the CLI and (later) the playground/OAuth can depend on it without pulling all of faculties. Deps are only triblespace + dryoc + anybytes (plus the small ed25519/hifitime/rand_core crates the repo API forces)."
+authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
+homepage = "https://github.com/triblespace/faculties"
+repository = "https://github.com/triblespace/faculties"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+anybytes = "0.20"
+dryoc = "0.8"           # secrets (libsodium-compatible pure-Rust crypto)
+ed25519-dalek = "2.1.1" # repo signing key (Repository::new)
+hifitime = "4.2.3"      # Epoch (commit timestamps)
+rand_core = "0.6.4"     # OsRng for key generation
+triblespace = { version = "0.47", path = "../../triblespace-rs" }
