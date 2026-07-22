@@ -2430,13 +2430,15 @@ fn build_context_cover(
         }
         format!("coarse → fine; {}", parts.join("; "))
     };
-    writeln!(
-        out,
+    // Header goes to stderr, not into the returned cover buffer: the time-ranges
+    // are the drill key the wake ritual / `memory cover` ingests, so this
+    // summary line stays out of stdout (and out of the stored cover text).
+    eprintln!(
         "memory context — {} chunk(s), ~{} of {} characters ({mode})",
         cover.len(),
         used,
         budget_chars,
-    )?;
+    );
     for &i in &cover {
         let (s, e, id) = spans[i];
         let depth = (0..n).filter(|&j| j != i && strict_contains(j, i)).count();
@@ -2444,9 +2446,8 @@ fn build_context_cover(
         writeln!(out)?;
         writeln!(
             out,
-            "{indent}{}  ({:x})",
+            "{indent}{}",
             format_time_range(key_to_epoch(s), key_to_epoch(e)),
-            id
         )?;
         if let Some(handle) = chunk_summary_handle(&space, id) {
             let summary: View<str> = ws.get(handle).context("read chunk summary")?;
@@ -3775,7 +3776,9 @@ mod tests {
             build_context_cover(repo, None, 10_000, None, None, None, DEFAULT_SIM_THRESHOLD)
         })
         .expect("build context cover");
-        assert!(cover.starts_with("memory context — "));
+        // The header now goes to stderr, not into the returned/stored buffer, so
+        // the cover text the wake ritual ingests must NOT carry it.
+        assert!(!cover.contains("memory context — "));
         assert!(cover.contains("day one: built the state machine"));
         assert!(cover.contains("day two: wired the hooks"));
 
