@@ -16,6 +16,7 @@ pub const GIT_VERSION: &str = concat!(
     ")"
 );
 
+pub mod memory_cover;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
 pub mod schemas;

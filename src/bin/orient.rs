@@ -3,7 +3,10 @@ use chrono::{
     DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
 };
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::compass::latest_status_event;
+use faculties::schemas::memory::DEFAULT_MEMORY_BRANCH;
+use faculties::schemas::wiki::{cover_fragments, WIKI_BRANCH_NAME};
 use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
 use faculties::schemas::message::is_inbox_message;
 use faculties::schemas::orient::{
@@ -57,6 +60,18 @@ enum Command {
         /// Max local messages to show
         #[arg(long, default_value_t = 10)]
         message_limit: usize,
+        /// Max doing goals to show
+        #[arg(long, default_value_t = 5)]
+        doing_limit: usize,
+        /// Max todo goals to show
+        #[arg(long, default_value_t = 5)]
+        todo_limit: usize,
+    },
+    /// Assemble the full wake bundle: memory cover + cover-tagged beliefs + goals
+    Wake {
+        /// CHARACTER budget for the memory cover
+        #[arg(long, default_value_t = 200_000)]
+        chars: usize,
         /// Max doing goals to show
         #[arg(long, default_value_t = 5)]
         doing_limit: usize,
@@ -405,6 +420,66 @@ fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, Interva
     latest_status_event(space, task_id).map(|(_, status, at)| (status, at))
 }
 
+/// Render the `Compass:` goal block (Doing/Todo, most-recent first, capped by
+/// the two limits) exactly as the orient snapshot shows it, into a string.
+/// Shared by `cmd_show` (which prints it) and `cmd_wake` (which appends it to
+/// the wake bundle) so the two can never drift.
+fn render_compass_goals(
+    ws: &mut Workspace<Pile>,
+    space: &TribleSet,
+    doing_limit: usize,
+    todo_limit: usize,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut doing: Vec<(i128, Id)> = Vec::new();
+    let mut todo: Vec<(i128, Id)> = Vec::new();
+    for task_id in find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
+        let (status, status_at) = task_latest_status(space, task_id)
+            .map(|(s, at)| (s.to_lowercase(), Some(interval_key(at))))
+            .unwrap_or_else(|| ("todo".to_string(), None));
+        let created_key: i128 = find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }]))
+            .next().map(interval_key).unwrap_or(0);
+        let sort_key = status_at.unwrap_or(created_key);
+        if status == "doing" {
+            doing.push((sort_key, task_id));
+        } else if status == "todo" {
+            todo.push((sort_key, task_id));
+        }
+    }
+
+    doing.sort_by(|a, b| b.0.cmp(&a.0));
+    todo.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut out = String::new();
+    writeln!(out, "Compass:").unwrap();
+    if doing.is_empty() && todo.is_empty() {
+        writeln!(out, "- No goals.").unwrap();
+    } else {
+        writeln!(out, "Doing:").unwrap();
+        if doing.is_empty() {
+            writeln!(out, "- None").unwrap();
+        } else {
+            for (_key, task_id) in doing.into_iter().take(doing_limit) {
+                let title = task_title(ws, space, task_id);
+                let tag_suffix = render_tags(&entity_tags(space, task_id));
+                writeln!(out, "- [{}] {}{}", fmt_id(task_id), title, tag_suffix).unwrap();
+            }
+        }
+        writeln!(out, "Todo:").unwrap();
+        if todo.is_empty() {
+            writeln!(out, "- None").unwrap();
+        } else {
+            for (_key, task_id) in todo.into_iter().take(todo_limit) {
+                let title = task_title(ws, space, task_id);
+                let tag_suffix = render_tags(&entity_tags(space, task_id));
+                writeln!(out, "- [{}] {}{}", fmt_id(task_id), title, tag_suffix).unwrap();
+            }
+        }
+    }
+    out
+}
+
 /// Resolve a persona given as 32-char hex id or a relations label/alias
 /// (matched against the pre-normalized `label_norm` / `alias_norm` fields,
 /// same semantics as `message`).
@@ -554,53 +629,11 @@ fn cmd_show(
             .checkout(..)
             .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
 
-        let mut doing: Vec<(i128, Id)> = Vec::new();
-        let mut todo: Vec<(i128, Id)> = Vec::new();
-        for task_id in
-            find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
-        {
-            let (status, status_at) = task_latest_status(&compass_space, task_id)
-                .map(|(s, at)| (s.to_lowercase(), Some(interval_key(at))))
-                .unwrap_or_else(|| ("todo".to_string(), None));
-            let created_key: i128 = find!(s: IntervalValue, pattern!(&compass_space, [{ task_id @ metadata::created_at: ?s }]))
-                .next().map(interval_key).unwrap_or(0);
-            let sort_key = status_at.unwrap_or(created_key);
-            if status == "doing" {
-                doing.push((sort_key, task_id));
-            } else if status == "todo" {
-                todo.push((sort_key, task_id));
-            }
-        }
-
-        doing.sort_by(|a, b| b.0.cmp(&a.0));
-        todo.sort_by(|a, b| b.0.cmp(&a.0));
-
         println!();
-        println!("Compass:");
-        if doing.is_empty() && todo.is_empty() {
-            println!("- No goals.");
-        } else {
-            println!("Doing:");
-            if doing.is_empty() {
-                println!("- None");
-            } else {
-                for (_key, task_id) in doing.into_iter().take(doing_limit) {
-                    let title = task_title(&mut compass_ws, &compass_space, task_id);
-                    let tag_suffix = render_tags(&entity_tags(&compass_space, task_id));
-                    println!("- [{}] {}{}", fmt_id(task_id), title, tag_suffix);
-                }
-            }
-            println!("Todo:");
-            if todo.is_empty() {
-                println!("- None");
-            } else {
-                for (_key, task_id) in todo.into_iter().take(todo_limit) {
-                    let title = task_title(&mut compass_ws, &compass_space, task_id);
-                    let tag_suffix = render_tags(&entity_tags(&compass_space, task_id));
-                    println!("- [{}] {}{}", fmt_id(task_id), title, tag_suffix);
-                }
-            }
-        }
+        print!(
+            "{}",
+            render_compass_goals(&mut compass_ws, &compass_space, doing_limit, todo_limit)
+        );
 
         drop(compass_ws);
 
@@ -1749,6 +1782,79 @@ fn with_repo<T>(
     result
 }
 
+/// `orient wake` — assemble the full wake bundle a fresh face reads to come
+/// into itself: the memory cover (coarse → fine over ALL memories), then the
+/// cover-tagged wiki beliefs (the ambient always-true set), then the compass
+/// goals. READ-ONLY: it pulls and checks out, never writes to any branch.
+fn cmd_wake(
+    pile: &Path,
+    chars: usize,
+    doing_limit: usize,
+    todo_limit: usize,
+) -> Result<()> {
+    with_repo(pile, |repo| {
+        // (1) Memory cover — the same render `memory context` produces.
+        let memory_branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut memory_ws = repo
+            .pull(memory_branch_id)
+            .map_err(|e| anyhow!("pull memory workspace: {e:?}"))?;
+        let memory_space = memory_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout memory: {e:?}"))?;
+        print!(
+            "{}",
+            render_cover(&memory_space, &mut memory_ws, &CoverOpts::plain(chars))?
+        );
+        drop(memory_ws);
+
+        // (2) Cover-tagged wiki beliefs — the ambient always-true set.
+        println!();
+        println!("Beliefs (cover):");
+        let wiki_branch_id = repo
+            .ensure_branch(WIKI_BRANCH_NAME, None)
+            .map_err(|e| anyhow!("ensure wiki branch: {e:?}"))?;
+        let mut wiki_ws = repo
+            .pull(wiki_branch_id)
+            .map_err(|e| anyhow!("pull wiki workspace: {e:?}"))?;
+        let wiki_space = wiki_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout wiki: {e:?}"))?;
+        let beliefs = cover_fragments(&wiki_space, &mut wiki_ws);
+        if beliefs.is_empty() {
+            println!("- None");
+        } else {
+            for (title, content) in &beliefs {
+                println!("- {title}");
+                for line in content.lines() {
+                    println!("    {line}");
+                }
+            }
+        }
+        drop(wiki_ws);
+
+        // (3) Compass goals — exactly as the orient snapshot renders them.
+        println!();
+        let compass_branch_id = repo
+            .ensure_branch("compass", None)
+            .map_err(|e| anyhow!("ensure compass branch: {e:?}"))?;
+        let mut compass_ws = repo
+            .pull(compass_branch_id)
+            .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
+        let compass_space = compass_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
+        print!(
+            "{}",
+            render_compass_goals(&mut compass_ws, &compass_space, doing_limit, todo_limit)
+        );
+        drop(compass_ws);
+
+        Ok(())
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.command else {
@@ -1784,6 +1890,11 @@ fn main() -> Result<()> {
             todo_limit,
             poll_ms,
         ),
+        Command::Wake {
+            chars,
+            doing_limit,
+            todo_limit,
+        } => cmd_wake(&cli.pile, chars, doing_limit, todo_limit),
         Command::Poll { peek } => cmd_poll(&cli.pile, cli.persona.as_deref(), peek),
     }
 }
