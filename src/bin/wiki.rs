@@ -10,7 +10,6 @@ use hifitime::efmt::consts::ISO8601_DATE;
 use rand_core::OsRng;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
@@ -632,20 +631,6 @@ fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
     .collect()
 }
 
-
-fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
-    if let Some(path) = raw.strip_prefix('@') {
-        if path == "-" {
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .with_context(|| format!("read {label} from stdin"))?;
-            return Ok(value);
-        }
-        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
-    }
-    Ok(raw.to_string())
-}
 
 /// Format a `Lower` timestamp as ISO 8601 date (e.g. "2026-03-11").
 fn format_date(ts: Lower) -> String {
@@ -1396,7 +1381,7 @@ fn resolve_to_show(space: &TribleSet, id: Id, follow_latest: bool) -> Result<Id>
 // ── commands ───────────────────────────────────────────────────────────────
 
 fn cmd_fix_truncated(repo: &mut Repo, bid: Id, raw_input: String) -> Result<()> {
-    let input = load_value_or_file(&raw_input, "input")?;
+    let input = faculties::text_arg(&raw_input, "input")?;
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1918,8 +1903,8 @@ fn cmd_create(
     force: bool,
     id: Option<String>,
 ) -> Result<()> {
-    let title = load_value_or_file(&title, "title")?;
-    let content = load_value_or_file(&content, "content")?;
+    let title = faculties::text_arg(&title, "title")?;
+    let content = faculties::text_arg(&content, "content")?;
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     ensure_tag_vocabulary(repo, &mut ws)?;
@@ -1967,8 +1952,8 @@ fn cmd_edit(
     tags: Vec<String>,
     force: bool,
 ) -> Result<()> {
-    let content = content.map(|c| load_value_or_file(&c, "content")).transpose()?;
-    let new_title = new_title.map(|t| load_value_or_file(&t, "title")).transpose()?;
+    let content = content.map(|c| faculties::text_arg(&c, "content")).transpose()?;
+    let new_title = new_title.map(|t| faculties::text_arg(&t, "title")).transpose()?;
     if content.is_none() && new_title.is_none() && tags.is_empty() {
         bail!("nothing to change — provide content, --title, or --tag");
     }

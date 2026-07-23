@@ -1,5 +1,5 @@
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::message::{
@@ -10,8 +10,6 @@ use faculties::schemas::relations::{KIND_GROUP, groups_for_member};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
@@ -30,20 +28,6 @@ fn normalize_label(label: &str) -> Result<String> {
 
 fn normalize_lookup_key(label: &str) -> Result<String> {
     Ok(normalize_label(label)?.to_ascii_lowercase())
-}
-
-fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
-    if let Some(path) = raw.strip_prefix('@') {
-        if path == "-" {
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .with_context(|| format!("read {label} from stdin"))?;
-            return Ok(value);
-        }
-        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
-    }
-    Ok(raw.to_string())
 }
 
 #[derive(Parser)]
@@ -622,7 +606,7 @@ fn main() -> Result<()> {
                      usage: message send <TO> <TEXT> [--from <LABEL>]"
                 );
             };
-            let text = load_value_or_file(&text, "message text")?;
+            let text = faculties::text_arg(&text, "message text")?;
             cmd_send(
                 &cli.pile,
                 message_branch_id,

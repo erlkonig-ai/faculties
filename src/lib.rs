@@ -22,6 +22,44 @@ pub mod nomic;
 pub mod schemas;
 pub mod tokens;
 
+/// Resolve a free-text argument that may reference a file or stdin, so every
+/// faculty that takes prose content (`memory create`, `message send`,
+/// `wiki create/edit`, `compass note`, `status set`, …) shares one convention:
+///
+/// - `@-`         → read all of stdin
+/// - `@<path>`    → read the file at `<path>`
+/// - `@@<text>`   → the literal string `@<text>` (escape hatch for content that
+///                  genuinely begins with `@`, e.g. a memory summary opening
+///                  with an `@mention`)
+/// - anything else → the literal string, unchanged
+///
+/// `label` names the value in error messages (e.g. `"summary"`, `"message text"`).
+///
+/// This is the canonical resolver; faculties must call it rather than
+/// re-implementing the `@` prefix logic, so the interface stays uniform. The
+/// footgun this closes: passing `@-` as a plain positional argv (with the body
+/// on a heredoc) silently stores the literal string `"@-"` unless the faculty
+/// actually routes the argument through here.
+pub fn text_arg(raw: &str, label: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use std::io::Read;
+    if let Some(rest) = raw.strip_prefix("@@") {
+        return Ok(format!("@{rest}"));
+    }
+    if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {label} from stdin"))?;
+            return Ok(value);
+        }
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("read {label} from {path}"));
+    }
+    Ok(raw.to_string())
+}
+
 #[cfg(feature = "widgets")]
 pub mod widgets;
 

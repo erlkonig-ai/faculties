@@ -818,7 +818,16 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         summary_start_idx = 0;
     }
 
-    let summary_text: String = args[summary_start_idx..].join(" ");
+    // A single summary token may reference a file or stdin via the shared `@`
+    // convention (`@-`, `@path`, `@@literal`); multiple tokens are a literal
+    // space-joined summary, so every existing inline usage is unchanged. This
+    // closes the footgun where `@- <<HEREDOC` silently stored the string "@-".
+    let summary_tokens = &args[summary_start_idx..];
+    let summary_text: String = if summary_tokens.len() == 1 {
+        faculties::text_arg(&summary_tokens[0], "summary")?
+    } else {
+        summary_tokens.join(" ")
+    };
     if summary_text.is_empty() {
         bail!("summary text is required: memory create [<from>..<to>] <summary...>");
     }
