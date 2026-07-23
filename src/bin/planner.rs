@@ -17,7 +17,6 @@ use rand_core::OsRng;
 use rrule::{RRuleSet, Tz};
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
@@ -78,10 +77,10 @@ enum Command {
         /// (informational, doesn't block).
         #[arg(long)]
         transp: Option<String>,
-        /// Long-form description (use `@path` for file input or `@-` for stdin).
+        /// Long-form description. Use @path for file input or @- for stdin.
         #[arg(long)]
         description: Option<String>,
-        /// Initial note body. `@path` / `@-` like other faculties.
+        /// Initial note body. Use @path for file input or @- for stdin.
         #[arg(long)]
         note: Option<String>,
     },
@@ -107,7 +106,7 @@ enum Command {
     Note {
         /// Full 32-char hex event id.
         id: String,
-        /// Note body. `@path` / `@-` like other faculties.
+        /// Note body. Use @path for file input or @- for stdin.
         text: String,
     },
     /// Show an event with all properties + notes.
@@ -227,20 +226,6 @@ fn validate_short(label: &str, value: &str) -> Result<()> {
         bail!("{label} contains NUL bytes: {value}");
     }
     Ok(())
-}
-
-fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
-    if let Some(path) = raw.strip_prefix('@') {
-        if path == "-" {
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .with_context(|| format!("read {label} from stdin"))?;
-            return Ok(value);
-        }
-        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
-    }
-    Ok(raw.to_string())
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
@@ -471,10 +456,10 @@ fn cmd_add(
     }
 
     let description_body = description
-        .map(|raw| load_value_or_file(&raw, "description"))
+        .map(|raw| faculties::text_arg(&raw, "description"))
         .transpose()?;
     let note_body = note_text
-        .map(|raw| load_value_or_file(&raw, "note"))
+        .map(|raw| faculties::text_arg(&raw, "note"))
         .transpose()?;
 
     let resolved_event_id = with_repo(pile, |repo| {
@@ -714,7 +699,7 @@ fn cmd_note(
     id: String,
     text: String,
 ) -> Result<()> {
-    let body = load_value_or_file(&text, "note")?;
+    let body = faculties::text_arg(&text, "note")?;
     let event_ref = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)

@@ -54,7 +54,7 @@ struct Cli {
 enum Command {
     /// Set the current status for your window ($PERSONA)
     Set {
-        #[arg(help = "Status text, e.g. \"porting SigLIP\"")]
+        #[arg(help = "Status text, e.g. \"porting SigLIP\". Use @path for file input or @- for stdin.")]
         text: String,
     },
     /// Show the latest status of every window
@@ -214,6 +214,7 @@ fn latest_per_window(rows: Vec<StatusRow>) -> HashMap<Id, StatusRow> {
 // ── commands ──────────────────────────────────────────────────────────────────
 
 fn cmd_set(pile: &Path, branch: &str, relations_branch: &str, persona: Option<&str>, text: String) -> Result<()> {
+    let text = faculties::text_arg(&text, "status text")?;
     let text = text.trim().to_string();
     if text.is_empty() {
         bail!("status text is empty");

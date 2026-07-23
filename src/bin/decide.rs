@@ -6,7 +6,7 @@
 //! the *existence* of a resolved decision — the deliberation rule
 //! lives here, the trust contract is "is it resolved?" lives there.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::decide::{
@@ -15,8 +15,6 @@ use faculties::schemas::decide::{
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::HashSet;
-use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
@@ -49,7 +47,7 @@ enum Command {
     Propose {
         /// Short one-liner naming the decision.
         title: String,
-        /// Optional long-form context. `@path` / `@-` for stdin.
+        /// Optional long-form context. Use @path for file input or @- for stdin.
         #[arg(long)]
         context: Option<String>,
         /// Optional pointer to the entity this decision is about.
@@ -60,14 +58,14 @@ enum Command {
     Pro {
         /// Full 32-char hex decision id.
         decision: String,
-        /// Factor text. `@path` / `@-` accepted.
+        /// Factor text. Use @path for file input or @- for stdin.
         text: String,
     },
     /// Add an "against" factor — a reason not to, or a risk.
     Con {
         /// Full 32-char hex decision id.
         decision: String,
-        /// Factor text. `@path` / `@-` accepted.
+        /// Factor text. Use @path for file input or @- for stdin.
         text: String,
     },
     /// Resolve a decision with a free-form outcome.
@@ -78,7 +76,7 @@ enum Command {
     Resolve {
         /// Full 32-char hex decision id.
         decision: String,
-        /// Free-form outcome text. `@path` / `@-` accepted.
+        /// Free-form outcome text. Use @path for file input or @- for stdin.
         outcome: String,
         /// Bypass the ≥1 pro AND ≥1 con check. The absence of
         /// factors is the trace of the bypass; review forced
@@ -129,20 +127,6 @@ fn fmt_id(id: Id) -> String {
 fn resolve_decision_id(space: &TribleSet, input: &str) -> Result<Id> {
     let candidates = find!(d: Id, pattern!(space, [{ ?d @ metadata::tag: KIND_DECISION }]));
     faculties::resolve_id_prefix(input, candidates)
-}
-
-fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
-    if let Some(path) = raw.strip_prefix('@') {
-        if path == "-" {
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .with_context(|| format!("read {label} from stdin"))?;
-            return Ok(value);
-        }
-        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
-    }
-    Ok(raw.to_string())
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
@@ -309,7 +293,7 @@ fn cmd_propose(
             })
         })
         .transpose()?;
-    let context_text = context.as_deref().map(|s| load_value_or_file(s, "context")).transpose()?;
+    let context_text = context.as_deref().map(|s| faculties::text_arg(s, "context")).transpose()?;
 
     let decision_ref = with_repo(pile, |repo| {
         let mut ws = repo
@@ -346,7 +330,7 @@ fn cmd_factor(
     text: String,
     kind: Id,
 ) -> Result<()> {
-    let body = load_value_or_file(&text, "factor text")?;
+    let body = faculties::text_arg(&text, "factor text")?;
     if body.trim().is_empty() {
         bail!("factor text must not be empty");
     }
@@ -403,7 +387,7 @@ fn cmd_resolve(
     outcome: String,
     force: bool,
 ) -> Result<()> {
-    let outcome_text = load_value_or_file(&outcome, "outcome")?;
+    let outcome_text = faculties::text_arg(&outcome, "outcome")?;
     if outcome_text.trim().is_empty() {
         bail!("outcome must not be empty (use @- to pipe in stdin)");
     }

@@ -1351,7 +1351,7 @@ fn main() -> Result<()> {
             let title = load_value_or_file(&title, "goal title")?;
             let note = note
                 .as_deref()
-                .map(|value| load_value_or_file(value, "goal note"))
+                .map(|value| faculties::text_arg(value, "goal note"))
                 .transpose()?;
             cmd_add(
                 &cli.pile,
@@ -1383,7 +1383,7 @@ fn main() -> Result<()> {
             reference,
             supersedes,
         } => {
-            let note = load_value_or_file(&note, "goal note")?;
+            let note = faculties::text_arg(&note, "goal note")?;
             cmd_note(
                 &cli.pile,
                 &cli.branch,

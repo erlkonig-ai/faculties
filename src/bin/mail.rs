@@ -36,7 +36,6 @@ use rand_core::OsRng;
 use rust_pop3_client::{Pop3Connection, Pop3ConnectionFactory};
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::IntoBlob;
 use triblespace::core::metadata;
@@ -96,7 +95,7 @@ enum Command {
         to: String,
         /// Subject line.
         subject: String,
-        /// Body text. `@path` for file, `@-` for stdin.
+        /// Body text. Use @path for file input or @- for stdin.
         body: String,
         /// Relation hex prefix for CC (repeatable).
         #[arg(long)]
@@ -117,7 +116,7 @@ enum Command {
         /// Full 32-char hex entity id of the message to reply to
         /// (use `mail show` to find one).
         message: String,
-        /// Reply body. `@path` for file, `@-` for stdin.
+        /// Reply body. Use @path for file input or @- for stdin.
         body: String,
     },
     /// Transmit a drafted message. Refuses unless the draft's
@@ -276,20 +275,6 @@ fn resolve_message_id(space: &TribleSet, input: &str) -> Result<Id> {
     let messages = find!(e: Id, pattern!(space, [{ ?e @ metadata::tag: KIND_MESSAGE }]));
     let drafts = find!(e: Id, pattern!(space, [{ ?e @ metadata::tag: KIND_DRAFT }]));
     faculties::resolve_id_prefix(input, messages.chain(drafts))
-}
-
-fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
-    if let Some(path) = raw.strip_prefix('@') {
-        if path == "-" {
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .with_context(|| format!("read {label} from stdin"))?;
-            return Ok(value);
-        }
-        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
-    }
-    Ok(raw.to_string())
 }
 
 fn parse_iso8601(input: &str) -> Result<DateTime<Utc>> {
@@ -1172,7 +1157,7 @@ fn cmd_draft(
     bcc: Vec<String>,
     attach: Vec<PathBuf>,
 ) -> Result<()> {
-    let body_text = load_value_or_file(&body, "body")?;
+    let body_text = faculties::text_arg(&body, "body")?;
     let config = load_config()?;
 
     // Read each attachment off disk and store it in the files branch
@@ -1293,7 +1278,7 @@ fn cmd_reply(
     parent_hex: String,
     body: String,
 ) -> Result<()> {
-    let body_text = load_value_or_file(&body, "reply body")?;
+    let body_text = faculties::text_arg(&body, "reply body")?;
 
     // Pull parent's properties for thread headers.
     let (_parent_id, parent_msg_id, parent_subject, parent_from, parent_references) =

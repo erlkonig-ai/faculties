@@ -94,7 +94,7 @@ enum CommandMode {
     Send {
         /// Channel id (external Discord snowflake).
         channel_id: String,
-        /// Message body. Use `@path` / `@-` for file / stdin.
+        /// Message body. Use @path for file input or @- for stdin.
         text: String,
     },
     /// Pull recent messages into the pile, then print the newest
@@ -348,7 +348,7 @@ fn load_bot_token(config: &DiscordConfig) -> Result<String> {
 
 fn send(config: DiscordConfig, channel_id: String, raw_text: String) -> Result<()> {
     let token = load_bot_token(&config)?;
-    let text = load_value_or_file(&raw_text, "message text")?;
+    let text = faculties::text_arg(&raw_text, "message text")?;
     if text.trim().is_empty() {
         bail!("empty message body");
     }

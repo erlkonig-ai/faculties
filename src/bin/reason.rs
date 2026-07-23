@@ -5,8 +5,6 @@ use ed25519_dalek::SigningKey;
 use faculties::schemas::reason::{DEFAULT_BRANCH, KIND_REASON_ID, reason_schema};
 use hifitime::Epoch;
 use rand_core::OsRng;
-use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use triblespace::core::metadata;
@@ -68,20 +66,6 @@ fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
         bail!("invalid {label} '{trimmed}'");
     };
     Ok(Some(id))
-}
-
-fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
-    if let Some(path) = raw.strip_prefix('@') {
-        if path == "-" {
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .with_context(|| format!("read {label} from stdin"))?;
-            return Ok(value);
-        }
-        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
-    }
-    Ok(raw.to_string())
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
@@ -210,7 +194,7 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
-    let text = load_value_or_file(text_raw, "reason text")?;
+    let text = faculties::text_arg(text_raw, "reason text")?;
 
     let env_turn_id = std::env::var("TURN_ID").ok();
     let env_worker_id = std::env::var("WORKER_ID").ok();

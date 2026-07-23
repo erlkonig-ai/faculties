@@ -346,7 +346,7 @@ fn main() -> Result<()> {
         }
         CommandMode::Send { chat_id, text } => {
             let config = build_config(&cli)?;
-            let text = load_value_or_file(&text, "message text")?;
+            let text = faculties::text_arg(&text, "message text")?;
             send_message(config, &chat_id, &text)
         }
         CommandMode::Users { command } => {
