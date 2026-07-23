@@ -3158,7 +3158,9 @@ mod tests {
             build_context_cover(repo, None, 10_000, None, None, None, DEFAULT_SIM_THRESHOLD)
         })
         .expect("build context cover");
-        assert!(cover.starts_with("memory context — "));
+        // The status header now goes to stderr, not into the returned/ingested
+        // cover text (prefix-stability + ranges-are-the-drill-key de-noise).
+        assert!(!cover.contains("memory context — "));
         assert!(cover.contains("day one: built the state machine"));
         assert!(cover.contains("day two: wired the hooks"));
 

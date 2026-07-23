@@ -719,23 +719,28 @@ pub fn render_cover(
         }
         format!("coarse → fine; {}", parts.join("; "))
     };
-    writeln!(
-        out,
+    // The status header goes to STDERR, not into the returned cover buffer: the
+    // time-ranges are the drill key the wake ritual ingests, and this line's
+    // volatile counts (chunk/char totals) would perturb the otherwise
+    // prefix-stable cover on every call. Keep it visible to a human on stderr,
+    // out of the stored/ingested cover text.
+    eprintln!(
         "memory context — {} chunk(s), ~{} of {} characters ({mode})",
         cover.len(),
         used,
         budget_chars,
-    )?;
+    );
     for &i in &cover {
         let (s, e, id) = spans[i];
         let depth = (0..n).filter(|&j| j != i && strict_contains(j, i)).count();
         let indent = "  ".repeat(depth);
         writeln!(out)?;
+        // Ranges are the drill key (`memory <from>..<to>`); the opaque hex id is
+        // boot-theatre noise in the wake, so it stays out of the cover line.
         writeln!(
             out,
-            "{indent}{}  ({:x})",
+            "{indent}{}",
             format_time_range(key_to_epoch(s), key_to_epoch(e)),
-            id
         )?;
         if let Some(handle) = chunk_summary_handle(space, id) {
             let summary: View<str> = ws.get(handle).context("read chunk summary")?;
