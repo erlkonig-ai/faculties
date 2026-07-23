@@ -206,7 +206,7 @@ fn resolve_normalized_person_matches(relations_space: &TribleSet, key: &str) -> 
                 || exists!(pattern!(relations_space, [{ id @ relations_schema::alias_norm: key }]))
         })
         .collect();
-    // An entity tagged both person and group (e.g. liora-cc) appears twice.
+    // An entity tagged both person and group appears twice.
     matches.sort();
     matches.dedup();
     matches
