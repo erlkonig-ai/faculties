@@ -69,8 +69,11 @@ enum Command {
     },
     /// Assemble the full wake bundle: memory cover + cover-tagged beliefs + goals
     Wake {
-        /// CHARACTER budget for the memory cover
-        #[arg(long, default_value_t = 200_000)]
+        /// CHARACTER budget for the memory cover — the wake ritual is for
+        /// wholeness, so the default is generous (matches the SessionStart hook);
+        /// on a pile whose coarsest cover exceeds it, this errors with repair
+        /// instructions rather than dropping memories.
+        #[arg(long, default_value_t = 800_000)]
         chars: usize,
         /// Max doing goals to show
         #[arg(long, default_value_t = 5)]
