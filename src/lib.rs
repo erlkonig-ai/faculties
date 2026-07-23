@@ -16,6 +16,22 @@ pub const GIT_VERSION: &str = concat!(
     ")"
 );
 
+/// The directory holding the durable model piles and voice reference assets
+/// (`nomic_text.pile`, `qwen3tts.pile`, `ref_liora_v2_24k.wav`, …).
+///
+/// Resolution: the `FACULTIES_MODEL_DIR` environment variable overrides it;
+/// otherwise it defaults to `$HOME/.cache/faculties/models` (with `HOME`
+/// falling back to the current directory `.` when unset). This keeps the
+/// faculties off any one machine's absolute layout — callers `join` the
+/// specific filename onto it.
+pub fn model_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("FACULTIES_MODEL_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    let home = std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("."));
+    std::path::PathBuf::from(home).join(".cache/faculties/models")
+}
+
 pub mod memory_cover;
 #[cfg(feature = "local-embed")]
 pub mod nomic;

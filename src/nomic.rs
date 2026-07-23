@@ -45,10 +45,11 @@ use triblespace::prelude::*;
 pub const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
 pub const NOMIC_VISION_MODEL: &str = "nomic-ai/nomic-embed-vision-v1.5";
 
-/// Default model-pile paths; `NOMIC_TEXT_PILE` / `NOMIC_VISION_PILE` env vars
-/// override so the faculty isn't pinned to one machine's layout.
-pub const NOMIC_TEXT_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_text.pile";
-pub const NOMIC_VISION_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_vision.pile";
+/// Default model-pile filenames (resolved under [`crate::model_dir`]);
+/// `NOMIC_TEXT_PILE` / `NOMIC_VISION_PILE` env vars override the full path so
+/// the faculty isn't pinned to one machine's layout.
+pub const NOMIC_TEXT_PILE_FILE: &str = "nomic_text.pile";
+pub const NOMIC_VISION_PILE_FILE: &str = "nomic_vision.pile";
 
 pub mod attr {
     use triblespace::prelude::*;
@@ -61,16 +62,20 @@ pub mod attr {
     }
 }
 
-/// The text model pile path (env override, else the canonical default).
+/// The text model pile path (env override, else the model-dir default).
 pub fn text_pile() -> PathBuf {
-    PathBuf::from(std::env::var("NOMIC_TEXT_PILE").unwrap_or_else(|_| NOMIC_TEXT_PILE.to_string()))
+    match std::env::var_os("NOMIC_TEXT_PILE") {
+        Some(p) => PathBuf::from(p),
+        None => crate::model_dir().join(NOMIC_TEXT_PILE_FILE),
+    }
 }
 
-/// The vision model pile path (env override, else the canonical default).
+/// The vision model pile path (env override, else the model-dir default).
 pub fn vision_pile() -> PathBuf {
-    PathBuf::from(
-        std::env::var("NOMIC_VISION_PILE").unwrap_or_else(|_| NOMIC_VISION_PILE.to_string()),
-    )
+    match std::env::var_os("NOMIC_VISION_PILE") {
+        Some(p) => PathBuf::from(p),
+        None => crate::model_dir().join(NOMIC_VISION_PILE_FILE),
+    }
 }
 
 /// Open a model pile read/append. Mirrors the faculties' non-amputating open:

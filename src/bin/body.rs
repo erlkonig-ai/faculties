@@ -38,7 +38,9 @@ type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 const DEFAULT_DAEMON: &str = "http://localhost:8000";
-const DEFAULT_PYTHON: &str = "/Users/jp/Desktop/chatbot/liora/reachy-venv/bin/python";
+// The reachy venv's interpreter. `python3` resolves via PATH by default (set
+// `REACHY_PYTHON` to point at a specific venv); no machine-absolute path.
+const DEFAULT_PYTHON: &str = "python3";
 
 /// The embedded frame-grab shim — written to a temp file at runtime.
 const FRAME_SHIM: &str = include_str!("body_frame.py");

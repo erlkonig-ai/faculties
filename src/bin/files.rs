@@ -552,12 +552,14 @@ impl<T: mary::embed::LocalEmbedder> ImageEmbedder for T {
 #[cfg(feature = "local-embed")]
 fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
     const CLIP_MODEL: &str = "openai/clip-vit-base-patch32";
-    const DEFAULT_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/clip.pile";
-    let pile = std::env::var("CLIP_PILE").unwrap_or_else(|_| DEFAULT_PILE.to_string());
+    let pile = match std::env::var_os("CLIP_PILE") {
+        Some(p) => PathBuf::from(p),
+        None => faculties::model_dir().join("clip.pile"),
+    };
     let tok = mary::embed::hf_cache_resolve(CLIP_MODEL, "tokenizer.json")
         .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {CLIP_MODEL}"))?;
     let emb = mary::embed::load_clip_from_pile(
-        Path::new(&pile),
+        &pile,
         &tok,
         mary::embed::default_device(),
     )?;
@@ -621,13 +623,15 @@ type Mm7bEmbedder = mary::models::qwen2_5_vl::embedder::NomicMultimodalEmbedder<
 /// faculty isn't pinned to one machine's paths.
 #[cfg(all(feature = "local-embed", target_os = "macos"))]
 fn load_mm7b() -> Result<Mm7bEmbedder> {
-    const DEFAULT_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_mm7b.pile";
     const DEFAULT_TOKENIZER: &str = "/Users/jp/.cache/huggingface/hub/models--nomic-ai--nomic-embed-multimodal-7b/snapshots/1291f1b6ca07061b0329df9d5713c09b294be576/tokenizer.json";
-    let pile = std::env::var("NOMIC_MM7B_PILE").unwrap_or_else(|_| DEFAULT_PILE.to_string());
+    let pile = match std::env::var_os("NOMIC_MM7B_PILE") {
+        Some(p) => PathBuf::from(p),
+        None => faculties::model_dir().join("nomic_mm7b.pile"),
+    };
     let tok = std::env::var("NOMIC_MM7B_TOKENIZER").unwrap_or_else(|_| DEFAULT_TOKENIZER.to_string());
     eprintln!("files: loading nomic-embed-multimodal-7b (once, ~20s)…");
     mary::persist::load_nomic_mm7b_aliased_from_pile(
-        Path::new(&pile),
+        &pile,
         Path::new(&tok),
         mary::nn::backend::WgpuDevice::default(),
     )

@@ -106,17 +106,21 @@ fn main() -> anyhow::Result<()> {
     // WEIGHTS come only from the durable flux pile (write one with mary's
     // `flux_persist`); the model dir supplies configs + tokenizer. `FLUX_PILE`
     // overrides the per-variant default.
-    let default_pile = match variant {
-        ModelVariant::Klein => "/Users/jp/Desktop/chatbot/liora/models/flux_klein.pile",
-        ModelVariant::Dev => "/Users/jp/Desktop/chatbot/liora/models/flux_dev.pile",
+    let default_pile_file = match variant {
+        ModelVariant::Klein => "flux_klein.pile",
+        ModelVariant::Dev => "flux_dev.pile",
     };
-    let pile = std::env::var("FLUX_PILE").unwrap_or_else(|_| default_pile.to_string());
+    let pile = match std::env::var_os("FLUX_PILE") {
+        Some(p) => PathBuf::from(p),
+        None => faculties::model_dir().join(default_pile_file),
+    };
     anyhow::ensure!(
-        Path::new(&pile).exists(),
-        "flux weights pile not found at {pile} — write one with mary's flux_persist \
-         (or set FLUX_PILE)"
+        pile.exists(),
+        "flux weights pile not found at {} — write one with mary's flux_persist \
+         (or set FLUX_PILE)",
+        pile.display()
     );
-    eprintln!("imagine: weights pile → {pile}");
+    eprintln!("imagine: weights pile → {}", pile.display());
 
     // Step default: distilled Klein needs very few; Dev wants ~28.
     let steps = cli.steps.unwrap_or(match variant {
@@ -159,7 +163,7 @@ fn main() -> anyhow::Result<()> {
         cli.guidance,
         cli.seed,
         &model_dir,
-        Path::new(&pile),
+        &pile,
         None, // no LoRA
         &device,
     );

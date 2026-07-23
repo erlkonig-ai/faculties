@@ -72,15 +72,16 @@ const DEFAULT_DAEMON: &str = "http://localhost:8000";
 // mary as the voice-origin lineage); every utterance clones the v2 reference
 // kit: an 11.46 s clean-boundary clip (24 kHz render of `ref_liora_v2.wav`),
 // its EXACT transcript, and the clip's codec frames. Weights load from a
-// durable standalone pile; `QWEN3TTS_PILE` overrides the path.
+// durable standalone pile (under the faculties model dir); `QWEN3TTS_PILE`
+// overrides the path. The reference-kit assets live beside it in the model dir.
 #[cfg(feature = "voice")]
-const QWEN3TTS_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/qwen3tts.pile";
+const QWEN3TTS_PILE_FILE: &str = "qwen3tts.pile";
 #[cfg(feature = "voice")]
-const REF_WAV: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora_v2_24k.wav";
+const REF_WAV_FILE: &str = "ref_liora_v2_24k.wav";
 #[cfg(feature = "voice")]
-const REF_TXT_PATH: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora_v2.txt";
+const REF_TXT_FILE: &str = "ref_liora_v2.txt";
 #[cfg(feature = "voice")]
-const REF_CODE: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora_v2_code.npy";
+const REF_CODE_FILE: &str = "ref_liora_v2_code.npy";
 
 // Default routing policy, used when the pile holds no `route set` for a channel.
 // `say` lists ONLY private devices (the classifier rejects anything else anyway);
@@ -702,14 +703,21 @@ fn speak_and_play(
     out: &Path,
 ) -> Result<Spoken> {
     let sr = mary::speak::SpeakStream::SAMPLE_RATE;
-    let pile = std::env::var("QWEN3TTS_PILE").unwrap_or_else(|_| QWEN3TTS_PILE.to_string());
-    let ref_text = std::fs::read_to_string(REF_TXT_PATH)
-        .with_context(|| format!("read reference transcript {REF_TXT_PATH}"))?;
+    let model_dir = faculties::model_dir();
+    let pile = match std::env::var_os("QWEN3TTS_PILE") {
+        Some(p) => PathBuf::from(p),
+        None => model_dir.join(QWEN3TTS_PILE_FILE),
+    };
+    let ref_wav = model_dir.join(REF_WAV_FILE);
+    let ref_txt_path = model_dir.join(REF_TXT_FILE);
+    let ref_code = model_dir.join(REF_CODE_FILE);
+    let ref_text = std::fs::read_to_string(&ref_txt_path)
+        .with_context(|| format!("read reference transcript {}", ref_txt_path.display()))?;
     // Duration estimate for the adaptive prebuffer: the reference clip's
     // chars-per-second applied to the generated text (see
     // `estimate_audio_secs`). Read before t_call so TTFA stays a pure
     // synthesis measurement.
-    let (ref_samples, ref_sr) = mary::models::f5::wav::read_pcm16_mono(Path::new(REF_WAV));
+    let (ref_samples, ref_sr) = mary::models::f5::wav::read_pcm16_mono(&ref_wav);
     let est_secs = estimate_audio_secs(
         text.chars().count(),
         ref_samples.len() as f32 / ref_sr.max(1) as f32,
@@ -717,10 +725,10 @@ fn speak_and_play(
     );
     let t_call = std::time::Instant::now();
     let mut stream = mary::speak::synthesize_stream(
-        Path::new(&pile),
-        Path::new(REF_WAV),
+        &pile,
+        &ref_wav,
         ref_text.trim(),
-        Path::new(REF_CODE),
+        &ref_code,
         text,
     )?;
 
