@@ -478,6 +478,49 @@ enum Command {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
+    /// Mail-account management: store IMAP/SMTP credentials for one or more
+    /// mail addresses (encrypted with FACULTIES_SECRETS_PW), select which is
+    /// active. Read by the `mail` faculty and `orient` (with env fallback).
+    MailAccount {
+        #[command(subcommand)]
+        cmd: MailAccountCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MailAccountCmd {
+    /// Store (or replace) a mail account. The address is stored in
+    /// cleartext (the select key); the password + hosts are encrypted
+    /// with FACULTIES_SECRETS_PW. If this is the first account it becomes
+    /// active automatically. Re-adding the same address replaces it.
+    Add {
+        /// Full email address (e.g. toby@trible.space).
+        #[arg(long)]
+        address: String,
+        /// Server/app password (or @file / @- for stdin).
+        #[arg(long)]
+        password: String,
+        /// Display name on outgoing From (default: Toby Trible).
+        #[arg(long)]
+        from_name: Option<String>,
+        #[arg(long, default_value = "pop.migadu.com")]
+        pop3_host: String,
+        #[arg(long, default_value_t = 995)]
+        pop3_port: u16,
+        #[arg(long, default_value = "smtp.migadu.com")]
+        smtp_host: String,
+        #[arg(long, default_value_t = 465)]
+        smtp_port: u16,
+    },
+    /// List stored mail accounts (marks the active one). No password needed.
+    List,
+    /// Select which stored account is active (by address).
+    Use {
+        /// Address of an account to activate.
+        address: String,
+    },
+    /// Show the active account's decrypted config (needs FACULTIES_SECRETS_PW).
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -1196,6 +1239,155 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// ── mail accounts ─────────────────────────────────────────────────────────────
+// A mail account is a machine credential: address in cleartext (the select key),
+// server password + hosts locked with FACULTIES_SECRETS_PW. Crypto + resolution
+// live in `faculties::mail_account` so the `mail`/`orient` readers can't drift
+// from this writer.
+use faculties::mail_account::{self, MailAccount};
+use faculties::schemas::mail::{KIND_MAIL_ACCOUNT, KIND_MAIL_ACTIVE, mail_account as mail_attrs};
+
+/// The entity id for an account is derived from its address, so re-adding the
+/// same address converges to one entity (latest-wins on the `box`).
+fn account_id(address: &str) -> Id {
+    entity! { _ @ mail_attrs::address: address }
+        .root()
+        .expect("address derives a root id")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_mail_account_add(
+    pile: &Path,
+    branch: &str,
+    address: String,
+    password_raw: String,
+    from_name: Option<String>,
+    pop3_host: String,
+    pop3_port: u16,
+    smtp_host: String,
+    smtp_port: u16,
+) -> Result<()> {
+    let pw = mail_account::password()?;
+    let account = MailAccount {
+        address: address.clone(),
+        pass: String::from_utf8(load_value(&password_raw)?)
+            .context("mail password must be valid UTF-8")?
+            .trim_end_matches(['\n', '\r'])
+            .to_string(),
+        from_name: from_name.unwrap_or_else(|| mail_account::DEFAULT_FROM_NAME.into()),
+        pop3_host,
+        pop3_port,
+        smtp_host,
+        smtp_port,
+    };
+    let box_bytes = mail_account::seal_account(&pw, &account)?;
+
+    with_repo(pile, |repo| {
+        let branch_id = repo
+            .ensure_branch(branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let first = mail_account::list_addresses(&space).is_empty();
+
+        let now = instant_interval(now_epoch());
+        let acct_id = account_id(&address);
+        let box_h = put_bytes(&mut ws, box_bytes);
+        let mut change = TribleSet::new();
+        change += entity! { ExclusiveId::force_ref(&acct_id) @
+            metadata::tag: &KIND_MAIL_ACCOUNT,
+            metadata::created_at: now,
+            mail_attrs::address: address.as_str(),
+            mail_attrs::r#box: box_h,
+        };
+        // The first account is active by construction (a single-account
+        // setup needs no explicit `use`); mint the pointer anyway so the
+        // active address is explicit and stable if more are added later.
+        if first {
+            let ptr = ufoid();
+            change += entity! { &ptr @
+                metadata::tag: &KIND_MAIL_ACTIVE,
+                metadata::created_at: now,
+                mail_attrs::address: address.as_str(),
+            };
+        }
+        ws.commit(change, "secrets: mail-account add");
+        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        println!(
+            "mail account {} stored{}",
+            address,
+            if first { " (active)" } else { "" }
+        );
+        Ok(())
+    })
+}
+
+fn cmd_mail_account_list(pile: &Path, branch: &str) -> Result<()> {
+    with_repo(pile, |repo| {
+        let branch_id = repo
+            .ensure_branch(branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let addresses = mail_account::list_addresses(&space);
+        let active = mail_account::active_address(&space);
+        if addresses.is_empty() {
+            println!("(no mail accounts — `secrets mail-account add --address … --password …`)");
+        }
+        for a in addresses {
+            let mark = if active.as_deref() == Some(a.as_str()) {
+                "  [active]"
+            } else {
+                ""
+            };
+            println!("{a}{mark}");
+        }
+        Ok(())
+    })
+}
+
+fn cmd_mail_account_use(pile: &Path, branch: &str, address: String) -> Result<()> {
+    with_repo(pile, |repo| {
+        let branch_id = repo
+            .ensure_branch(branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        if !mail_account::list_addresses(&space).iter().any(|a| a == &address) {
+            bail!("no stored mail account for '{address}' (see `secrets mail-account list`)");
+        }
+        let now = instant_interval(now_epoch());
+        let ptr = ufoid();
+        let mut change = TribleSet::new();
+        change += entity! { &ptr @
+            metadata::tag: &KIND_MAIL_ACTIVE,
+            metadata::created_at: now,
+            mail_attrs::address: address.as_str(),
+        };
+        ws.commit(change, "secrets: mail-account use");
+        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        println!("active mail account → {address}");
+        Ok(())
+    })
+}
+
+fn cmd_mail_account_show(pile: &Path, branch: &str) -> Result<()> {
+    let account = with_repo(pile, |repo| {
+        mail_account::resolve_active_on_repo(repo, branch)
+    })?;
+    match account {
+        None => println!("(no active mail account)"),
+        Some(a) => {
+            println!("address:   {}", a.address);
+            println!("from_name: {}", a.from_name);
+            println!("pop3:      {}:{}", a.pop3_host, a.pop3_port);
+            println!("smtp:      {}:{}", a.smtp_host, a.smtp_port);
+            println!("password:  ({} bytes, hidden)", a.pass.len());
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -1227,6 +1419,23 @@ fn main() -> Result<()> {
                 cmd_secret_share(&cli.pile, &cli.branch, scope, name, r#as)
             }
             SecretCmd::List => cmd_secret_list(&cli.pile, &cli.branch),
+        },
+        Command::MailAccount { cmd } => match cmd {
+            MailAccountCmd::Add {
+                address,
+                password,
+                from_name,
+                pop3_host,
+                pop3_port,
+                smtp_host,
+                smtp_port,
+            } => cmd_mail_account_add(
+                &cli.pile, &cli.branch, address, password, from_name, pop3_host, pop3_port,
+                smtp_host, smtp_port,
+            ),
+            MailAccountCmd::List => cmd_mail_account_list(&cli.pile, &cli.branch),
+            MailAccountCmd::Use { address } => cmd_mail_account_use(&cli.pile, &cli.branch, address),
+            MailAccountCmd::Show => cmd_mail_account_show(&cli.pile, &cli.branch),
         },
     }
 }

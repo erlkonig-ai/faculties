@@ -54,6 +54,43 @@ pub const KIND_SPAM: Id = id_hex!("809C2F66A336C6D61140ABEFFA49513C");
 /// `decide::about: <draft-id>`) being resolved.
 pub const KIND_DRAFT: Id = id_hex!("C6A2C78ADD94CBEC207072FD3931017D");
 
+/// Marks a stored mail-account configuration entity. Lives on the
+/// **secrets** branch (written by `secrets mail-account add`, read by
+/// `mail`/`orient`). The account's server credentials + hosts/ports are
+/// serialized to JSON and password-locked into `mail_account::box`
+/// (argon2id-derived key + secretbox, keyed on `FACULTIES_SECRETS_PW`,
+/// the same envelope the secrets identity lockbox uses). The account
+/// **address** is a cleartext queryable key (`mail_account::address`) so
+/// the faculties can list/select accounts without the password.
+///
+/// Multiple accounts coexist (one entity each, keyed by address); the
+/// active one is named by a single latest-wins `KIND_MAIL_ACTIVE`
+/// pointer entity (`mail_account::address` = the active address).
+pub const KIND_MAIL_ACCOUNT: Id = id_hex!("BC1F0E3D5DB2DC2AD00AE42FCF3AD495");
+
+/// Latest-wins pointer to the active mail account: a small entity whose
+/// `mail_account::address` names which `KIND_MAIL_ACCOUNT` is active.
+/// `secrets mail-account use <address>` mints a fresh one; the newest by
+/// `metadata::created_at` wins (append-only-safe re-selection).
+pub const KIND_MAIL_ACTIVE: Id = id_hex!("792EC015AB18E82DBB001A30B4CA2C0A");
+
+/// Mail-account attributes (on the **secrets** branch).
+pub mod mail_account {
+    use super::*;
+    attributes! {
+        // The account's email address (e.g. "toby@trible.space"), in
+        // cleartext — the human/select key. Also carried by the
+        // KIND_MAIL_ACTIVE pointer to name the active account.
+        "7F0AE7B9E5D59E9DF7EB539AD75CEE6D" as address: inlineencodings::ShortString;
+        // Password-locked account body: `salt(16) ‖ nonce(24) ‖
+        // secretbox(json)` where json = {pass, from_name, pop3_host,
+        // pop3_port, smtp_host, smtp_port}. Same lockbox shape as the
+        // secrets identity key, keyed on FACULTIES_SECRETS_PW.
+        "7C878C936BCF83E1905C8FB58DEC29ED" as r#box:
+            inlineencodings::Handle<blobencodings::RawBytes>;
+    }
+}
+
 /// Message attributes — one per RFC 5322 header field we care
 /// about, plus the original raw bytes for round-trip fidelity.
 pub mod mail {

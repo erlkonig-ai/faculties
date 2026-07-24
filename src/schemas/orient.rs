@@ -64,12 +64,19 @@ pub mod orient_state {
         "6E6A761126C5101CC69BE185A4B4EC4C" as compass_head: inlineencodings::Handle<blobencodings::SimpleArchive>;
         "3A58593A230497DEC735E92381C4C522" as relations_head: inlineencodings::Handle<blobencodings::SimpleArchive>;
         "789078EA4AA95F7B7AD047FF23E04C60" as config_head: inlineencodings::Handle<blobencodings::SimpleArchive>;
+        // Mail branch head, watched so incoming mail wakes the persona's
+        // watcher (like a colony message). Optional — piles without a mail
+        // branch simply never carry it.
+        "86A4217C3D1C8FD7854208396FF4D4A7" as mail_head: inlineencodings::Handle<blobencodings::SimpleArchive>;
         // Persona-scoped view checkpoints: which zooid has seen what.
         // `wait` wakes on NEWS for the persona (a new unread message, a
         // goals change) rather than raw branch movement, so a persona's
         // own acks and sends don't wake its own watcher.
         "AE16414EE1D15DBAC9DF44F77A742E0A" as persona: inlineencodings::GenId;
         "174944957EC01DF2C10D470DBCE4263F" as unread_msg: inlineencodings::GenId;
+        // Unread MAIL message ids for the persona's mail identity at the
+        // checkpoint (growth against this set is news, exactly like unread_msg).
+        "850E03FC2C26ABF7FAC129903B60F069" as unread_mail: inlineencodings::GenId;
         "7D7D457CA0184919497E2585CF779125" as goals_view: inlineencodings::Handle<blobencodings::LongString>;
         // Sorted newly-seen note-id/goal-id lines for this checkpoint. Readers
         // union every persona checkpoint. Optional only so pre-notification

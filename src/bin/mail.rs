@@ -8,14 +8,18 @@
 //!
 //! Identity: outgoing mail signs as `"Toby Trible" <toby@trible.space>`.
 //!
-//! Env vars:
-//!   MAIL_USER       — full address (e.g. toby@trible.space)
-//!   MAIL_PASS       — Migadu app-password or main password
-//!   MAIL_FROM_NAME  — display name on outgoing From (default: Toby Trible)
-//!   MAIL_POP3_HOST  — default pop.migadu.com
-//!   MAIL_POP3_PORT  — default 995 (TLS)
-//!   MAIL_SMTP_HOST  — default smtp.migadu.com
-//!   MAIL_SMTP_PORT  — default 465 (TLS)
+//! Account config (resolved by `load_config`, in precedence order):
+//!   1. the **active mail account** in the `secrets` branch, if one is
+//!      configured (`secrets mail-account add/use`; unlocked with
+//!      FACULTIES_SECRETS_PW). Supports multiple accounts, one active.
+//!   2. the `MAIL_*` env vars below (compat / no-secrets setups):
+//!        MAIL_USER       — full address (e.g. toby@trible.space)
+//!        MAIL_PASS       — Migadu app-password or main password
+//!        MAIL_FROM_NAME  — display name on outgoing From (default: Toby Trible)
+//!        MAIL_POP3_HOST  — default pop.migadu.com
+//!        MAIL_POP3_PORT  — default 995 (TLS)
+//!        MAIL_SMTP_HOST  — default smtp.migadu.com
+//!        MAIL_SMTP_PORT  — default 465 (TLS)
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
@@ -198,9 +202,36 @@ struct MailConfig {
     smtp_port: u16,
 }
 
-fn load_config() -> Result<MailConfig> {
+/// Resolve the mail account: the active account stored in the **secrets**
+/// branch takes precedence; the `MAIL_*` env vars are the fallback (compat +
+/// no-secrets setups). This is the single choke point every command that
+/// needs credentials or the self-address goes through, so `secrets
+/// mail-account use <addr>` switches accounts everywhere at once.
+fn load_config(pile: &Path) -> Result<MailConfig> {
+    with_repo(pile, load_config_from_repo)
+}
+
+/// `load_config` against an already-open repo — used where a command is
+/// already inside a `with_repo` (avoids opening the pile file twice).
+fn load_config_from_repo(repo: &mut Repository<Pile>) -> Result<MailConfig> {
+    // Secrets-based account first. A configured-but-unlockable account is a
+    // real error (surfaced), not a silent env fallback.
+    if let Some(a) = faculties::mail_account::resolve_active_on_repo(repo, "secrets")? {
+        return Ok(MailConfig {
+            user: a.address,
+            pass: a.pass,
+            from_name: a.from_name,
+            pop3_host: a.pop3_host,
+            pop3_port: a.pop3_port,
+            smtp_host: a.smtp_host,
+            smtp_port: a.smtp_port,
+        });
+    }
+
+    // Env fallback (legacy / no-secrets setups).
     let user = std::env::var("MAIL_USER")
-        .context("MAIL_USER not set (e.g. toby@trible.space)")?;
+        .context("no active mail account in secrets and MAIL_USER not set \
+                  (configure with `secrets mail-account add`, or set MAIL_USER/MAIL_PASS)")?;
     let pass = std::env::var("MAIL_PASS").context("MAIL_PASS not set")?;
     let from_name = std::env::var("MAIL_FROM_NAME").unwrap_or_else(|_| DEFAULT_FROM_NAME.into());
     let pop3_host = std::env::var("MAIL_POP3_HOST").unwrap_or_else(|_| "pop.migadu.com".into());
@@ -836,7 +867,7 @@ fn cmd_fetch(
     files_branch_id: Id,
     relations_branch_id: Id,
 ) -> Result<()> {
-    let config = load_config()?;
+    let config = load_config(pile)?;
     eprintln!(
         "Connecting to {}:{} as {}...",
         config.pop3_host, config.pop3_port, config.user
@@ -1158,7 +1189,7 @@ fn cmd_draft(
     attach: Vec<PathBuf>,
 ) -> Result<()> {
     let body_text = faculties::text_arg(&body, "body")?;
-    let config = load_config()?;
+    let config = load_config(pile)?;
 
     // Read each attachment off disk and store it in the files branch
     // (via persist_message below); the draft references them so that
@@ -1364,7 +1395,7 @@ fn cmd_reply(
         format!("Re: {}", parent_subject)
     };
 
-    let config = load_config()?;
+    let config = load_config(pile)?;
     let seed = format!(
         "{}:{}:{}",
         config.user,
@@ -1474,7 +1505,7 @@ fn cmd_send(
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         resolve_message_id(&space, &draft_hex)
     })?;
-    let config = load_config()?;
+    let config = load_config(pile)?;
 
     // 1. Resolve the linked decision and check it's resolved.
     let decision_outcome = with_repo(pile, |repo| {
@@ -2037,7 +2068,7 @@ fn cmd_list(
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
         let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
         let reader_filter = if unread_only {
-            let config = load_config()?;
+            let config = load_config_from_repo(repo)?;
             find_self_persona(&rel_space, &config.user)
         } else {
             None
@@ -2218,7 +2249,7 @@ fn cmd_show(
     // can't resolve the local agent's relations entry (no MAIL_USER set
     // yet, or no auto-registered Toby entry — the user can still mark
     // explicitly with `mail read <id>` later).
-    if let Ok(config) = load_config() {
+    if let Ok(config) = load_config(pile) {
         let _ = with_repo(pile, |repo| {
             let mut rws = repo
                 .pull(relations_branch_id)
@@ -2239,7 +2270,7 @@ fn cmd_read(
     relations_branch_id: Id,
     message: String,
 ) -> Result<()> {
-    let config = load_config()?;
+    let config = load_config(pile)?;
     with_repo(pile, |repo| {
         let mut mws = repo
             .pull(mail_branch_id)

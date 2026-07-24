@@ -143,6 +143,9 @@ struct WatchedHeads {
     local: Option<CommitHandle>,
     compass: Option<CommitHandle>,
     relations: Option<CommitHandle>,
+    // Mail branch head — watched so incoming mail wakes the persona's
+    // watcher. `None` when the pile has no mail branch yet.
+    mail: Option<CommitHandle>,
 }
 
 fn now_epoch() -> Epoch {
@@ -254,13 +257,23 @@ fn load_reads(space: &TribleSet) -> HashMap<(Id, Id), i128> {
     reads
 }
 
-/// Resolve the mail-faculty self identity: the relations entry
-/// whose `email` attribute matches `$MAIL_USER` (case-folded).
-/// Returns None if `MAIL_USER` isn't set or if no relations entry
-/// has been auto-registered for it yet.
-fn find_mail_self(relations_space: &TribleSet) -> Option<(String, Id)> {
-    let user = std::env::var("MAIL_USER").ok()?;
-    let needle = user.trim().to_ascii_lowercase();
+/// The active mail address: the `secrets` active account's address if one
+/// is configured, else `$MAIL_USER`. This is the single resolution the
+/// mail snapshot and the mail-wake path both use, so `secrets mail-account
+/// use` changes what orient watches. Read-only; never writes.
+fn active_mail_address(repo: &mut Repository<Pile>) -> Option<String> {
+    if let Ok(Some(account)) = faculties::mail_account::resolve_active_on_repo(repo, "secrets") {
+        return Some(account.address);
+    }
+    std::env::var("MAIL_USER").ok()
+}
+
+/// Resolve the mail-faculty self identity: the relations entry whose
+/// `email` attribute matches the active mail address (case-folded).
+/// Returns None if no address is configured or no relations entry has been
+/// auto-registered for it yet.
+fn find_mail_self(relations_space: &TribleSet, address: &str) -> Option<(String, Id)> {
+    let needle = address.trim().to_ascii_lowercase();
     let id = find!(
         (id: Id, e: String),
         pattern!(relations_space, [{
@@ -274,7 +287,64 @@ fn find_mail_self(relations_space: &TribleSet) -> Option<(String, Id)> {
             None
         }
     })?;
-    Some((user, id))
+    Some((address.to_string(), id))
+}
+
+/// Unread MAIL for the local mail identity: messages in the mail branch
+/// not sent by us, not spam, and without a read-receipt by the mail-self
+/// relations entry. Empty (not an error) when no address is configured, no
+/// mail branch exists, or the self entry hasn't been auto-registered yet —
+/// mail simply doesn't wake the watcher until an account is set up. The
+/// inbox is shared: it is the same for every persona, so a new mail wakes
+/// every window's watcher (like a colony broadcast).
+fn load_mail_unread(
+    repo: &mut Repository<Pile>,
+    relations_branch_id: Id,
+) -> Result<BTreeSet<Id>> {
+    let Some(address) = active_mail_address(repo) else {
+        return Ok(BTreeSet::new());
+    };
+    let mut rws = repo
+        .pull(relations_branch_id)
+        .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+    let rel_space = rws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+    let Some((_addr, self_id)) = find_mail_self(&rel_space, &address) else {
+        return Ok(BTreeSet::new());
+    };
+    drop(rws);
+
+    let mail_branch_id = match repo.ensure_branch("mail", None) {
+        Ok(id) => id,
+        Err(_) => return Ok(BTreeSet::new()),
+    };
+    let mws = repo
+        .pull(mail_branch_id)
+        .map_err(|e| anyhow!("pull mail: {e:?}"))?;
+    let mail_space = {
+        let mut mws = mws;
+        mws.checkout(..).map_err(|e| anyhow!("checkout mail: {e:?}"))?
+    };
+    let unread: BTreeSet<Id> = find!(
+        (id: Id, from: Id),
+        pattern!(&mail_space, [{
+            ?id @
+            metadata::tag: KIND_MAIL_MESSAGE,
+            mail::from: ?from,
+        }])
+    )
+    .filter(|&(_, from)| from != self_id)
+    .filter(|&(id, _)| !exists!(pattern!(&mail_space, [{ id @ metadata::tag: &KIND_SPAM }])))
+    .filter(|&(id, _)| !exists!(pattern!(&mail_space, [{
+        _?r @
+        metadata::tag: KIND_READ_ID,
+        local::about_message: id,
+        local::reader: self_id,
+    }])))
+    .map(|(id, _)| id)
+    .collect();
+    Ok(unread)
 }
 
 /// Render the "Mail (unread inbox for ...)" section. Treats absence
@@ -286,6 +356,9 @@ fn render_unread_mail(
     message_limit: usize,
     now_key: i128,
 ) -> Result<()> {
+    // Resolve the active mail address (secrets active account → MAIL_USER).
+    let address = active_mail_address(repo);
+
     // Need a relations workspace to resolve the self identity.
     let mut rws = repo
         .pull(relations_branch_id)
@@ -294,14 +367,16 @@ fn render_unread_mail(
         .checkout(..)
         .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
 
-    let Some((user, self_id)) = find_mail_self(&rel_space) else {
-        // Either MAIL_USER isn't set or the auto-registration hasn't
-        // happened yet (no fetch/send has run). Either way, render
-        // a brief note rather than crashing.
+    let self_resolved = address
+        .as_deref()
+        .and_then(|a| find_mail_self(&rel_space, a));
+    let Some((user, self_id)) = self_resolved else {
+        // No address configured, or the auto-registration hasn't happened
+        // yet (no fetch/send has run). Render a brief note, don't crash.
         println!("Mail:");
-        match std::env::var("MAIL_USER") {
-            Ok(u) => println!("- No relations entry for {u} yet (run `mail fetch` or `mail send` once)"),
-            Err(_) => println!("- MAIL_USER env var not set; skipping"),
+        match address {
+            Some(u) => println!("- No relations entry for {u} yet (run `mail fetch` or `mail send` once)"),
+            None => println!("- No mail account configured (secrets mail-account add … / MAIL_USER); skipping"),
         }
         return Ok(());
     };
@@ -528,11 +603,13 @@ fn cmd_show(
         let orient_state_branch_id = repo
             .ensure_branch("orient-state", None)
             .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
+        let mail_branch_id = watched_mail_branch(repo);
         let current_heads = load_watched_heads(
             repo,
             local_branch_id,
             compass_branch_id,
             relations_branch_id,
+            mail_branch_id,
         )?;
 
         let mut local_ws = repo
@@ -738,16 +815,31 @@ fn cmd_show(
     })
 }
 
+/// The mail branch id to watch — `Some` only when a mail account is
+/// configured (secrets active account or `MAIL_USER`), so orient never
+/// creates a mail branch on piles that never use mail.
+fn watched_mail_branch(repo: &mut Repository<Pile>) -> Option<Id> {
+    if active_mail_address(repo).is_none() {
+        return None;
+    }
+    repo.ensure_branch("mail", None).ok()
+}
+
 fn load_watched_heads(
     repo: &mut Repository<Pile>,
     local_branch_id: Id,
     compass_branch_id: Id,
     relations_branch_id: Id,
+    mail_branch_id: Option<Id>,
 ) -> Result<WatchedHeads> {
     Ok(WatchedHeads {
         local: branch_head_by_id(repo, local_branch_id)?,
         compass: branch_head_by_id(repo, compass_branch_id)?,
         relations: branch_head_by_id(repo, relations_branch_id)?,
+        mail: match mail_branch_id {
+            Some(id) => branch_head_by_id(repo, id)?,
+            None => None,
+        },
     })
 }
 
@@ -758,6 +850,9 @@ fn load_watched_heads(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WatchedView {
     unread: BTreeSet<Id>,
+    // Unread MAIL for the persona's mail identity. Growth here is news,
+    // exactly like `unread` (colony messages) — a new mail wakes the watcher.
+    mail_unread: BTreeSet<Id>,
     goals_view: String,
     roster: BTreeSet<Id>,
     // Cumulative seen note ids mapped to their goal for compact wake text.
@@ -849,6 +944,11 @@ fn load_watched_view(
     compass_branch_id: Id,
     relations_branch_id: Id,
 ) -> Result<WatchedView> {
+    // Unread mail for the local mail identity (self-contained: it pulls
+    // and drops its own relations + mail workspaces). Done first so it holds
+    // no borrow across the rest of the view build.
+    let mail_unread = load_mail_unread(repo, relations_branch_id)?;
+
     let mut local_ws = repo
         .pull(local_branch_id)
         .map_err(|e| anyhow!("pull local workspace: {e:?}"))?;
@@ -980,6 +1080,7 @@ fn load_watched_view(
 
     Ok(WatchedView {
         unread,
+        mail_unread,
         goals_view: goal_lines.join("\n"),
         roster,
         notes,
@@ -994,6 +1095,9 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
     let mut reasons = Vec::new();
     for msg in new.unread.difference(&old.unread) {
         reasons.push(format!("new message [{}]", fmt_id(*msg)));
+    }
+    for mail in new.mail_unread.difference(&old.mail_unread) {
+        reasons.push(format!("new mail [{}]", fmt_id(*mail)));
     }
 
     let parse = |view: &str| -> HashMap<String, (String, String, String)> {
@@ -1086,6 +1190,7 @@ fn load_checkpoint_heads(
         local: load_optional_commit_head(&space, checkpoint_id, &orient_state::local_head),
         compass: load_optional_commit_head(&space, checkpoint_id, &orient_state::compass_head),
         relations: load_optional_commit_head(&space, checkpoint_id, &orient_state::relations_head),
+        mail: load_optional_commit_head(&space, checkpoint_id, &orient_state::mail_head),
     }))
 }
 
@@ -1149,6 +1254,11 @@ fn load_checkpoint_view(
         pattern!(&space, [{ checkpoint_id @ orient_state::unread_msg: ?msg }])
     )
     .collect();
+    let mail_unread: BTreeSet<Id> = find!(
+        msg: Id,
+        pattern!(&space, [{ checkpoint_id @ orient_state::unread_mail: ?msg }])
+    )
+    .collect();
     let goals_view = find!(
         h: TextHandle,
         pattern!(&space, [{ checkpoint_id @ orient_state::goals_view: ?h }])
@@ -1186,6 +1296,7 @@ fn load_checkpoint_view(
     Ok(Some(CheckpointView {
         view: WatchedView {
             unread,
+            mail_unread,
             goals_view,
             roster,
             notes,
@@ -1213,6 +1324,7 @@ fn save_checkpoint_heads(
         orient_state::local_head?: heads.local,
         orient_state::compass_head?: heads.compass,
         orient_state::relations_head?: heads.relations,
+        orient_state::mail_head?: heads.mail,
     };
     if let Some((persona_id, view, notes_delta)) = persona_view {
         let goals_handle = ws.put(view.goals_view.clone());
@@ -1226,6 +1338,7 @@ fn save_checkpoint_heads(
             orient_state::goals_view: goals_handle,
             orient_state::notes_view: notes_handle,
             orient_state::unread_msg*: view.unread.iter(),
+            orient_state::unread_mail*: view.mail_unread.iter(),
             orient_state::roster_member*: view.roster.iter(),
         };
     }
@@ -1385,6 +1498,10 @@ fn print_news_detail(
             }
         }
     }
+    let new_mail: Vec<Id> = new.mail_unread.difference(&old.mail_unread).copied().collect();
+    if !new_mail.is_empty() {
+        print_new_mail_detail(repo, relations_branch_id, &new_mail)?;
+    }
     let new_people: Vec<Id> = new.roster.difference(&old.roster).copied().collect();
     if !new_people.is_empty() {
         let mut rel_ws = repo
@@ -1397,6 +1514,64 @@ fn print_news_detail(
         for id in &new_people {
             println!("- {}", person_label(&mut rel_ws, &rel_space, *id));
         }
+    }
+    Ok(())
+}
+
+/// Print sender + subject for newly-arrived mail — the mail analogue of the
+/// "New messages:" section, so a woken watcher sees who mailed and about
+/// what without running `mail list`.
+fn print_new_mail_detail(
+    repo: &mut Repository<Pile>,
+    relations_branch_id: Id,
+    new_mail: &[Id],
+) -> Result<()> {
+    let mail_branch_id = match repo.ensure_branch("mail", None) {
+        Ok(id) => id,
+        Err(_) => return Ok(()),
+    };
+    let mut mws = repo
+        .pull(mail_branch_id)
+        .map_err(|e| anyhow!("pull mail: {e:?}"))?;
+    let mail_space = mws.checkout(..).map_err(|e| anyhow!("checkout mail: {e:?}"))?;
+    let mut rel_ws = repo
+        .pull(relations_branch_id)
+        .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+    let rel_space = rel_ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+
+    println!("\nNew mail:");
+    for id in new_mail {
+        let mail_id = *id;
+        // Sender: the relations name/email behind mail::from.
+        let from = find!(
+            f: Id,
+            pattern!(&mail_space, [{ mail_id @ mail::from: ?f }])
+        )
+        .next();
+        let from_label = from
+            .map(|fid| {
+                let name = person_label(&mut rel_ws, &rel_space, fid);
+                if name == fmt_id(fid) {
+                    // No name — fall back to the email address if we have one.
+                    find!(e: String, pattern!(&rel_space, [{ fid @ rel_attrs::email: ?e }]))
+                        .next()
+                        .unwrap_or(name)
+                } else {
+                    name
+                }
+            })
+            .unwrap_or_else(|| "?".into());
+        let subject_h = find!(
+            h: TextHandle,
+            pattern!(&mail_space, [{ mail_id @ mail::subject: ?h }])
+        )
+        .next();
+        let subject = subject_h
+            .and_then(|h| read_text(&mut mws, h).ok())
+            .unwrap_or_default();
+        println!("- {from_label} — {subject}");
     }
     Ok(())
 }
@@ -1516,11 +1691,13 @@ fn cmd_poll(pile: &Path, persona: Option<&str>, peek: bool) -> Result<()> {
             resolve_persona(&relations_space, input)?
         };
 
+        let mail_branch_id = watched_mail_branch(repo);
         let heads = load_watched_heads(
             repo,
             local_branch_id,
             compass_branch_id,
             relations_branch_id,
+            mail_branch_id,
         )?;
         match check_news_once(
             repo,
@@ -1582,12 +1759,15 @@ fn cmd_wait(
         let orient_state_branch_id = repo
             .ensure_branch("orient-state", None)
             .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
+        // Resolve the mail branch once; it's stable for the wait's lifetime.
+        let mail_branch_id = watched_mail_branch(repo);
 
         let mut baseline_heads = load_watched_heads(
             repo,
             local_branch_id,
             compass_branch_id,
             relations_branch_id,
+            mail_branch_id,
         )?;
 
         // With a persona, the wake condition is NEWS for that persona
@@ -1659,6 +1839,7 @@ fn cmd_wait(
                 local_branch_id,
                 compass_branch_id,
                 relations_branch_id,
+                mail_branch_id,
             )?;
             if current_heads == baseline_heads {
                 continue;
@@ -1914,6 +2095,7 @@ mod tests {
     fn view(goals_view: impl Into<String>) -> WatchedView {
         WatchedView {
             unread: BTreeSet::new(),
+            mail_unread: BTreeSet::new(),
             goals_view: goals_view.into(),
             roster: BTreeSet::new(),
             notes: BTreeMap::new(),
@@ -2003,6 +2185,20 @@ mod tests {
                 format!("new person [{person:x}]"),
             ]
         );
+    }
+
+    #[test]
+    fn new_mail_wakes_like_a_colony_message() {
+        // Growth of the mail-unread set is news, independent of the persona
+        // (incoming mail reaches every window — like a broadcast).
+        let me = ufoid().id;
+        let mail = ufoid().id;
+        let old = view("");
+        let mut new = view("");
+        new.mail_unread.insert(mail);
+        assert_eq!(view_news(&old, &new, me), [format!("new mail [{mail:x}]")]);
+        // Reading it (dropping from the unread set) is not news.
+        assert!(view_news(&new, &old, me).is_empty());
     }
 
     #[test]
@@ -2104,6 +2300,7 @@ mod tests {
             local: None,
             compass: None,
             relations: None,
+            mail: None,
         };
         let initial_delta = BTreeMap::from([(existing, goal)]);
         save_checkpoint_heads(
@@ -2154,6 +2351,95 @@ mod tests {
             loaded.view.notes,
             BTreeMap::from([(existing, goal), (concurrent, goal)])
         );
+        repo.close().unwrap();
+    }
+
+    // Env is process-global; serialize the two MAIL_USER-touching tests.
+    static MAIL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn new_incoming_mail_surfaces_as_unread_and_reading_clears_it() {
+        use faculties::schemas::mail::{mail as mail_attrs, KIND_MESSAGE as KIND_MAIL};
+        use faculties::schemas::orient::{local as read_attrs, KIND_READ_ID};
+        use faculties::schemas::relations::{relations as rel, KIND_PERSON_ID};
+
+        let _guard = MAIL_ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by MAIL_ENV_LOCK; no other thread reads env here.
+        unsafe { std::env::set_var("MAIL_USER", "self@example.com") };
+        // The active account resolves from secrets first; make sure no stray
+        // secrets password leaks a real account into this test.
+        unsafe { std::env::remove_var("FACULTIES_SECRETS_PW") };
+
+        let pile = TestPile::new();
+        let mut repo = open_repo(&pile.path).unwrap();
+        let relations_branch_id = repo.ensure_branch("relations", None).unwrap();
+        let mail_branch_id = repo.ensure_branch("mail", None).unwrap();
+
+        // The mail-self relations entry (matched by email), plus a sender.
+        let self_id = ufoid();
+        let sender_id = ufoid();
+        let mut rws = repo.pull(relations_branch_id).unwrap();
+        let mut change = TribleSet::new();
+        change += entity! { &self_id @
+            metadata::tag: &KIND_PERSON_ID,
+            rel::email: "self@example.com",
+        };
+        change += entity! { &sender_id @
+            metadata::tag: &KIND_PERSON_ID,
+            rel::email: "friend@example.com",
+        };
+        rws.commit(change, "seed relations");
+        repo.push(&mut rws).unwrap();
+
+        // An incoming mail from the sender to us.
+        let mail_id = ufoid();
+        let mut mws = repo.pull(mail_branch_id).unwrap();
+        let subject_h = mws.put("Hello there".to_string());
+        let mut change = TribleSet::new();
+        change += entity! { &mail_id @
+            metadata::tag: &KIND_MAIL,
+            mail_attrs::from: &sender_id.id,
+            mail_attrs::subject: subject_h,
+        };
+        mws.commit(change, "seed mail");
+        repo.push(&mut mws).unwrap();
+
+        // It shows up as unread mail (independent of persona).
+        let unread = load_mail_unread(&mut repo, relations_branch_id).unwrap();
+        assert!(unread.contains(&mail_id.id), "incoming mail should be unread");
+
+        // Mark it read by the self entry — it then drops out.
+        let read_id = ufoid();
+        let now = epoch_interval(now_epoch());
+        let mut mws = repo.pull(mail_branch_id).unwrap();
+        let mut change = TribleSet::new();
+        change += entity! { &read_id @
+            metadata::tag: &KIND_READ_ID,
+            read_attrs::about_message: &mail_id.id,
+            read_attrs::reader: &self_id.id,
+            read_attrs::read_at: now,
+        };
+        mws.commit(change, "mark read");
+        repo.push(&mut mws).unwrap();
+
+        let unread2 = load_mail_unread(&mut repo, relations_branch_id).unwrap();
+        assert!(!unread2.contains(&mail_id.id), "read mail should not be unread");
+
+        repo.close().unwrap();
+        // SAFETY: guarded by MAIL_ENV_LOCK.
+        unsafe { std::env::remove_var("MAIL_USER") };
+    }
+
+    #[test]
+    fn mail_unread_is_empty_without_a_configured_address() {
+        let _guard = MAIL_ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by MAIL_ENV_LOCK.
+        unsafe { std::env::remove_var("MAIL_USER") };
+        unsafe { std::env::remove_var("FACULTIES_SECRETS_PW") };
+        let pile = TestPile::new();
+        let mut repo = open_repo(&pile.path).unwrap();
+        let relations_branch_id = repo.ensure_branch("relations", None).unwrap();
+        assert!(load_mail_unread(&mut repo, relations_branch_id).unwrap().is_empty());
         repo.close().unwrap();
     }
 

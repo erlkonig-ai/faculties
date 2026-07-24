@@ -32,6 +32,7 @@ pub fn model_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".cache/faculties/models")
 }
 
+pub mod mail_account;
 pub mod memory_cover;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
