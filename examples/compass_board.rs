@@ -35,16 +35,16 @@ fn main(nb: &mut NotebookCtx) {
     nb.view(|ctx| {
         ctx.grid(|g| {
             g.full(|ctx| {
-                ctx.markdown(
-                    "# Compass Board\nKanban view of goals on a pile's compass branch.",
-                );
+                ctx.markdown("# Compass Board\nKanban view of goals on a pile's compass branch.");
             });
         });
     });
 
     nb.state("compass", CompassBoard::default(), move |ctx, board| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace(&branch) else { return };
+        let Some(mut ws) = st.workspace(&branch) else {
+            return;
+        };
         board.render(ctx, &mut ws);
         st.push(&mut ws);
     });

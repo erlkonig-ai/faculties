@@ -20,12 +20,12 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
@@ -112,9 +112,7 @@ impl PersonRow {
     fn secondary(&self) -> Option<String> {
         let primary = self.primary();
         let full = match (self.first_name.as_ref(), self.last_name.as_ref()) {
-            (Some(f), Some(l)) if !f.is_empty() && !l.is_empty() => {
-                Some(format!("{f} {l}"))
-            }
+            (Some(f), Some(l)) if !f.is_empty() && !l.is_empty() => Some(format!("{f} {l}")),
             _ => self.display_name.clone(),
         };
         match full {
@@ -261,11 +259,7 @@ impl RelationsViewer {
         Self::default()
     }
 
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-    ) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
@@ -276,7 +270,9 @@ impl RelationsViewer {
         }
 
         ctx.section("Relations", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
 
             let mut search = ctx.search();
             let needle = search.query().to_lowercase();
@@ -343,8 +339,7 @@ impl RelationsViewer {
                     } else {
                         None
                     };
-                    let is_focused =
-                        match_info.as_ref().map_or(false, |i| i.is_focused);
+                    let is_focused = match_info.as_ref().map_or(false, |i| i.is_focused);
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
@@ -392,12 +387,7 @@ fn person_matches_search(p: &PersonRow, needle: &str) -> bool {
 const STROKE_INSET: f32 = 1.0;
 const NAME_FONT_SIZE: f32 = 18.0;
 
-fn render_person(
-    ui: &mut egui::Ui,
-    person: &PersonRow,
-    search_needle: &str,
-    focused: bool,
-) {
+fn render_person(ui: &mut egui::Ui, person: &PersonRow, search_needle: &str, focused: bool) {
     let bubble_fill = ui.visuals().window_fill;
     let accent = person_color(person.id);
     let text_on_accent = colorhash::text_color_on(accent);
@@ -440,10 +430,7 @@ fn render_person(
                     ui.spacing_mut().item_spacing.y = 2.0;
 
                     let name_format = egui::TextFormat {
-                        font_id: egui::FontId::new(
-                            NAME_FONT_SIZE,
-                            egui::FontFamily::Proportional,
-                        ),
+                        font_id: egui::FontId::new(NAME_FONT_SIZE, egui::FontFamily::Proportional),
                         color: text_on_accent,
                         ..Default::default()
                     };

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::common;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use hifitime::Epoch;
 use serde_json::{Map, Value as JsonValue};
 use tracing::info_span;
@@ -110,14 +110,7 @@ fn import_copilot_path(
         parsed.records.len(),
         parse_start.elapsed()
     );
-    import_copilot_parsed_file(
-        path,
-        parsed,
-        repo,
-        &mut ws,
-        &mut catalog,
-        &mut catalog_head,
-    )
+    import_copilot_parsed_file(path, parsed, repo, &mut ws, &mut catalog, &mut catalog_head)
 }
 
 fn import_copilot_parsed_file(
@@ -145,10 +138,7 @@ fn import_copilot_parsed_file(
     let raw_root = {
         let raw_tree_start = Instant::now();
         println!("copilot phase raw-tree: {}", path.display());
-        let mut importer = JsonTreeImporter::<_>::new(
-            repo.storage_mut(),
-            None,
-        );
+        let mut importer = JsonTreeImporter::<_>::new(repo.storage_mut(), None);
         let fragment = importer
             .import_str(&raw)
             .context("import copilot raw json tree")?;
@@ -262,14 +252,7 @@ fn import_copilot_parsed_file(
     );
 
     let commit_start = Instant::now();
-    if common::commit_delta(
-        repo,
-        ws,
-        catalog,
-        catalog_head,
-        change,
-        "import copilot",
-    )? {
+    if common::commit_delta(repo, ws, catalog, catalog_head, change, "import copilot")? {
         stats.commits += 1;
     }
     println!(

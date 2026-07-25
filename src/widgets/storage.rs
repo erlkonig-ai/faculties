@@ -24,17 +24,17 @@
 
 use std::path::PathBuf;
 
-use GORBIE::prelude::CardCtx;
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{BlobStore, BlobStoreGet, PinStore, Repository, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
+use GORBIE::prelude::CardCtx;
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -209,21 +209,17 @@ impl StorageState {
         let ui = ctx.ui_mut();
         egui::Frame::NONE
             .fill(bar_bg)
-            .stroke(egui::Stroke::new(
-                1.0,
-                egui::Color32::from_black_alpha(40),
-            ))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_black_alpha(40)))
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     // Status dot.
-                    let (dot_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(10.0, 10.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().circle_filled(dot_rect.center(), 4.0, status_color);
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot_rect.center(), 4.0, status_color);
                     ui.label(
                         egui::RichText::new("PILE")
                             .small()
@@ -237,38 +233,25 @@ impl StorageState {
                     // TextField (auto-sizes to available_width), with
                     // OPEN placed on the right via right_to_left so
                     // the field flows up against the button.
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let open_btn = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new("OPEN")
-                                        .small()
-                                        .monospace()
-                                        .strong(),
-                                )
-                                .min_size(egui::vec2(52.0, 22.0)),
-                            );
-                            if open_btn.clicked() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let open_btn = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("OPEN").small().monospace().strong(),
+                            )
+                            .min_size(egui::vec2(52.0, 22.0)),
+                        );
+                        if open_btn.clicked() {
+                            reopen = true;
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let resp = ui.add(GORBIE::widgets::TextField::singleline(
+                                &mut self.pile_path_text,
+                            ));
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 reopen = true;
                             }
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    let resp = ui.add(
-                                        GORBIE::widgets::TextField::singleline(
-                                            &mut self.pile_path_text,
-                                        ),
-                                    );
-                                    if resp.lost_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                    {
-                                        reopen = true;
-                                    }
-                                },
-                            );
-                        },
-                    );
+                        });
+                    });
                 });
             });
         if reopen {
@@ -297,25 +280,18 @@ impl StorageState {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(
-                            egui::RichText::new("\u{26a0}")
-                                .small()
-                                .color(warn_fg),
-                        );
+                        ui.label(egui::RichText::new("\u{26a0}").small().color(warn_fg));
                         ui.label(
                             egui::RichText::new(toast.as_str())
                                 .monospace()
                                 .small()
                                 .color(warn_fg),
                         );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.small_button("\u{00d7}").clicked() {
-                                    dismiss_toast = true;
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("\u{00d7}").clicked() {
+                                dismiss_toast = true;
+                            }
+                        });
                     });
                 });
         }
@@ -328,8 +304,7 @@ impl StorageState {
     /// but exposed so callers can surface close failures.
     pub fn close(&mut self) -> Result<(), String> {
         if let Some(repo) = self.repo.take() {
-            repo.close()
-                .map_err(|e| format!("close pile: {e:?}"))?;
+            repo.close().map_err(|e| format!("close pile: {e:?}"))?;
         }
         Ok(())
     }
@@ -359,12 +334,7 @@ fn render_banner(ctx: &mut CardCtx<'_>, icon: &str, msg: &str, color: egui::Colo
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(egui::RichText::new(icon).small().color(color));
-                ui.label(
-                    egui::RichText::new(msg)
-                        .monospace()
-                        .small()
-                        .color(color),
-                );
+                ui.label(egui::RichText::new(msg).monospace().small().color(color));
             });
         });
 }

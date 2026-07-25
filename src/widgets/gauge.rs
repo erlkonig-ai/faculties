@@ -54,13 +54,11 @@ fn color_frame(ui: &egui::Ui) -> egui::Color32 {
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t).round().clamp(0.0, 255.0) as u8
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    egui::Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Tag taxonomy ─────────────────────────────────────────────────────
@@ -68,12 +66,7 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 /// Tag names the dashboard surfaces under "Epistemic Status". Order
 /// is the rendering order top-to-bottom, so the most-load-bearing
 /// (published) is first.
-const STATUS_TAGS: &[&str] = &[
-    "published",
-    "refuted",
-    "preprint",
-    "audit-warning",
-];
+const STATUS_TAGS: &[&str] = &["published", "refuted", "preprint", "audit-warning"];
 
 /// Tag names surfaced under "Content Type", same ordering policy:
 /// foundational claims first, derived/process tags after.
@@ -190,11 +183,7 @@ impl GaugeLive {
     }
 }
 
-fn resolve_tag_name(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    tag_id: Id,
-) -> Option<String> {
+fn resolve_tag_name(ws: &mut Workspace<Pile>, space: &TribleSet, tag_id: Id) -> Option<String> {
     let handle = find!(
         h: TextHandle,
         pattern!(space, [{ tag_id @ metadata::name: ?h }])
@@ -221,11 +210,7 @@ impl GaugeViewer {
         Self::default()
     }
 
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-    ) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
@@ -236,7 +221,9 @@ impl GaugeViewer {
         }
 
         ctx.section("Gauge", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
 
             ctx.grid(|g| {
                 g.full(|ctx| {
@@ -413,18 +400,12 @@ fn render_tag_row(
             ),
         );
         // Bar.
-        let (bar_rect, _) = ui.allocate_exact_size(
-            egui::vec2(bar_w, row_h),
-            egui::Sense::hover(),
-        );
+        let (bar_rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, row_h), egui::Sense::hover());
         let painter = ui.painter();
         painter.rect_filled(bar_rect, egui::CornerRadius::ZERO, frame);
-        let fill_w =
-            (count as f32 / max_in_section as f32).clamp(0.0, 1.0) * bar_rect.width();
-        let fill_rect = egui::Rect::from_min_size(
-            bar_rect.min,
-            egui::vec2(fill_w, bar_rect.height()),
-        );
+        let fill_w = (count as f32 / max_in_section as f32).clamp(0.0, 1.0) * bar_rect.width();
+        let fill_rect =
+            egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_rect.height()));
         painter.rect_filled(fill_rect, egui::CornerRadius::ZERO, bar_color);
         // Count.
         ui.add_sized(

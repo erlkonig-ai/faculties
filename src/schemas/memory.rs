@@ -95,8 +95,7 @@ pub mod comb {
     use triblespace::macros::{entity, find, pattern};
 
     fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
-        let (lower, _): (hifitime::Epoch, hifitime::Epoch) =
-            interval.try_from_inline().unwrap();
+        let (lower, _): (hifitime::Epoch, hifitime::Epoch) = interval.try_from_inline().unwrap();
         lower.to_tai_duration().total_nanoseconds()
     }
 

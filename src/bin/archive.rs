@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use hifitime::Epoch;
 use itertools::Itertools;
 use tracing::info_span;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
 use triblespace::core::patch::PATCH;
 use triblespace::core::repo::index_home::{
     set_index_frontier, strip_recipe_manifest, IndexHome, IndexKind, Manifest, SuccinctRollup,
@@ -28,32 +28,32 @@ use triblespace::prelude::*;
 use triblespace_search::index_bm25::{query_across, Bm25Rollup};
 use triblespace_search::tokens::hash_tokens;
 
+#[path = "importers/archive_import_agy.rs"]
+mod archive_import_agy;
 #[path = "importers/archive_import_chatgpt.rs"]
 mod archive_import_chatgpt;
+#[path = "importers/archive_import_claude_code.rs"]
+mod archive_import_claude_code;
+#[path = "importers/archive_import_claude_web.rs"]
+mod archive_import_claude_web;
 #[path = "importers/archive_import_codex.rs"]
 mod archive_import_codex;
 #[path = "importers/archive_import_copilot.rs"]
 mod archive_import_copilot;
 #[path = "importers/archive_import_gemini.rs"]
 mod archive_import_gemini;
-#[path = "importers/archive_import_claude_code.rs"]
-mod archive_import_claude_code;
-#[path = "importers/archive_import_claude_web.rs"]
-mod archive_import_claude_web;
-#[path = "importers/archive_import_agy.rs"]
-mod archive_import_agy;
 mod common {
     #![allow(dead_code)]
 
     use std::path::{Path, PathBuf};
 
-    use anyhow::{Context, Result, anyhow, bail};
+    use anyhow::{anyhow, bail, Context, Result};
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use itertools::Itertools;
     use rand_core::OsRng;
-    use rayon::ThreadPoolBuilder;
     use rayon::prelude::*;
+    use rayon::ThreadPoolBuilder;
 
     use tracing::info_span;
     use triblespace::core::blob::Blob;
@@ -1046,10 +1046,7 @@ struct RecentMessage {
     created_at: Inline<NsTAIInterval>,
 }
 
-fn load_longstring(
-    ws: &mut common::Ws,
-    handle: Inline<Handle<LongString>>,
-) -> Result<String> {
+fn load_longstring(ws: &mut common::Ws, handle: Inline<Handle<LongString>>) -> Result<String> {
     let view: View<str> = ws.get(handle).context("read longstring")?;
     Ok(view.to_string())
 }
@@ -1299,11 +1296,7 @@ fn message_record<P: TriblePattern>(
 /// The caller chooses the logical dataset (raw checkout or certified Succinct
 /// union). Only handles reachable from the selected message and its author or
 /// attachments are dereferenced here.
-fn print_message<P: TriblePattern>(
-    ws: &mut common::Ws,
-    catalog: &P,
-    message_id: Id,
-) -> Result<()> {
+fn print_message<P: TriblePattern>(ws: &mut common::Ws, catalog: &P, message_id: Id) -> Result<()> {
     let (message_id, name, role, created_at, content_handle, reply_to) =
         message_record(ws, catalog, message_id)?;
     let content = load_longstring(ws, content_handle)?;
@@ -1402,8 +1395,7 @@ fn write_cursor(
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull for cursor write: {e:?}"))?;
-    let change =
-        common::comb::advance_change(stream, persona, position, None, common::now_epoch());
+    let change = common::comb::advance_change(stream, persona, position, None, common::now_epoch());
     ws.commit(change, "archive replay cursor");
     common::push_workspace(repo, &mut ws)
 }
@@ -1631,7 +1623,13 @@ fn run_replay_standalone(
                 // Exclusive position one ns before the requested start, so
                 // the first batch includes messages at exactly <from>.
                 let position = from - hifitime::Duration::from_total_nanoseconds(1);
-                write_cursor(&mut repo, comb_branch_id, REPLAY_STREAM, persona, Some(position))?;
+                write_cursor(
+                    &mut repo,
+                    comb_branch_id,
+                    REPLAY_STREAM,
+                    persona,
+                    Some(position),
+                )?;
                 println!("replay started at {raw} (persona {persona})");
                 return Ok(());
             }
@@ -1651,7 +1649,8 @@ fn run_replay_standalone(
                 .map_err(|e| anyhow!("pull comb-state branch: {e:?}"))?;
             ws.checkout(..).context("checkout comb-state branch")?
         };
-        let Some((Some(position_key), _)) = common::comb::latest(&comb_catalog, REPLAY_STREAM, persona)
+        let Some((Some(position_key), _)) =
+            common::comb::latest(&comb_catalog, REPLAY_STREAM, persona)
         else {
             bail!("no active replay for persona {persona}: use `archive replay start <from>`");
         };
@@ -1675,7 +1674,10 @@ fn run_replay_standalone(
         };
         if stale {
             let total = build_replay_index(&mut repo, archive_branch_id, &head_key, &index_path)?;
-            eprintln!("replay index built: {total} message(s) at {}", index_path.display());
+            eprintln!(
+                "replay index built: {total} message(s) at {}",
+                index_path.display()
+            );
         }
 
         // Stream the index: filter, position, batch (extending through any
@@ -1717,10 +1719,14 @@ fn run_replay_standalone(
 
         let last_epoch =
             Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(last_key));
-        write_cursor(&mut repo, comb_branch_id, REPLAY_STREAM, persona, Some(last_epoch))?;
-        println!(
-            "— batch: {emitted} message(s); cursor → {last_epoch}; {remaining} remaining"
-        );
+        write_cursor(
+            &mut repo,
+            comb_branch_id,
+            REPLAY_STREAM,
+            persona,
+            Some(last_epoch),
+        )?;
+        println!("— batch: {emitted} message(s); cursor → {last_epoch}; {remaining} remaining");
         Ok(())
     })();
 
@@ -2276,16 +2282,16 @@ where
     // the same panic-to-error and ordered-publish contract.
     if max_in_flight == 1 || rayon::current_num_threads() == 1 {
         for (ordinal, &item) in items.iter().enumerate() {
-            let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prepare(item)
-            }))
-            .unwrap_or_else(|payload| {
-                Err(anyhow!(
-                    "archive index preparation worker panicked: {}",
-                    panic_payload(payload)
-                ))
-            })
-            .with_context(|| format!("prepare archive commit {}/{}", ordinal + 1, items.len()))?;
+            let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(item)))
+                .unwrap_or_else(|payload| {
+                    Err(anyhow!(
+                        "archive index preparation worker panicked: {}",
+                        panic_payload(payload)
+                    ))
+                })
+                .with_context(|| {
+                    format!("prepare archive commit {}/{}", ordinal + 1, items.len())
+                })?;
             publish(ordinal, item, prepared).with_context(|| {
                 format!("publish archive commit {}/{}", ordinal + 1, items.len())
             })?;
@@ -2307,15 +2313,14 @@ where
                 if cancelled.load(Ordering::Acquire) {
                     return;
                 }
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    prepare(item)
-                }))
-                .unwrap_or_else(|payload| {
-                    Err(anyhow!(
-                        "archive index preparation worker panicked: {}",
-                        panic_payload(payload)
-                    ))
-                });
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(item)))
+                        .unwrap_or_else(|payload| {
+                            Err(anyhow!(
+                                "archive index preparation worker panicked: {}",
+                                panic_payload(payload)
+                            ))
+                        });
                 // The receiver may disappear after the first ordered error.
                 // That is cancellation, not another worker failure.
                 let _ = sender.send((ordinal, outcome));
@@ -2749,8 +2754,7 @@ fn run_index_standalone(
 
                 let publish_elapsed = publish_started.elapsed();
                 let commit_work = prepare_elapsed + publish_elapsed;
-                let rate =
-                    (i + 1) as f64 / index_started.elapsed().as_secs_f64().max(f64::EPSILON);
+                let rate = (i + 1) as f64 / index_started.elapsed().as_secs_f64().max(f64::EPSILON);
                 if commit_work.as_secs() >= 5 {
                     eprintln!(
                         "  …{}/{} commit {:?} indexed and flushed in {:.1?} (prepare {:.1?}; carry/checkpoint {:.1?}; {prepared_tribles} tribles/{physical_shards} physical shard(s); {rate:.2} commits/s)",
@@ -2861,9 +2865,7 @@ fn main() -> Result<()> {
 
         return match &cmd {
             Command::List { limit } => run_list_standalone(repo, &pile_path, branch_id, *limit),
-            Command::Show { id } => {
-                run_show_standalone(repo, &pile_path, branch_id, id.clone())
-            }
+            Command::Show { id } => run_show_standalone(repo, &pile_path, branch_id, id.clone()),
             Command::Search { text, limit } => {
                 run_search_standalone(repo, &pile_path, branch_id, text.clone(), *limit)
             }
@@ -2874,8 +2876,7 @@ fn main() -> Result<()> {
     let branch_resolution_start = Instant::now();
     let branch_id = common::with_repo(&pile_path, |repo| {
         if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
+            return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
         }
         repo.ensure_branch(&cli.branch, None)
             .map_err(|e| anyhow!("ensure archive branch: {e:?}"))

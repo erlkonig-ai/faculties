@@ -99,7 +99,12 @@ fn open_model_repo(path: &Path) -> Result<Repository<Pile>> {
 /// The stored tokenizer.json handle on the model pile's `main` branch, if any.
 fn stored_tokenizer(
     repo: &mut Repository<Pile>,
-) -> Result<Option<(triblespace::core::repo::Workspace<Pile>, Inline<Handle<LongString>>)>> {
+) -> Result<
+    Option<(
+        triblespace::core::repo::Workspace<Pile>,
+        Inline<Handle<LongString>>,
+    )>,
+> {
     let branch_id = repo
         .lookup_branch("main")
         .map_err(|e| anyhow!("lookup main: {e:?}"))?
@@ -215,12 +220,9 @@ pub fn ingest_tokenizer_graph(pile_path: &Path) -> Result<()> {
             .get(handle)
             .map_err(|e| anyhow!("read tokenizer blob: {e:?}"))?;
 
-        let frag = mary::tokenizer::save_tokenizer_json(
-            json.as_bytes(),
-            NOMIC_TEXT_MODEL,
-            &mut ws.staged,
-        )
-        .map_err(|e| anyhow!("build tokenizer graph: {e}"))?;
+        let frag =
+            mary::tokenizer::save_tokenizer_json(json.as_bytes(), NOMIC_TEXT_MODEL, &mut ws.staged)
+                .map_err(|e| anyhow!("build tokenizer graph: {e}"))?;
         let root = frag
             .root()
             .ok_or_else(|| anyhow!("tokenizer fragment has no root"))?;
@@ -299,11 +301,21 @@ fn materialize_tokenizer(pile_path: &Path) -> Result<PathBuf> {
 pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
     let pile = text_pile();
     let device = mary::embed::default_device();
-    let keymap = mary::persist::load_keymap_from_pile(&pile)
-        .map_err(|e| anyhow!("load nomic text weights from pile {}: {e:?}", pile.display()))?;
+    let keymap = mary::persist::load_keymap_from_pile(&pile).map_err(|e| {
+        anyhow!(
+            "load nomic text weights from pile {}: {e:?}",
+            pile.display()
+        )
+    })?;
     match mary::persist::load_tokenizer_from_pile(&pile) {
-        Ok(tokenizer) => mary::embed::nomic_text_from_parts(keymap, tokenizer, device)
-            .map_err(|e| anyhow!("build nomic text embedder from pile {}: {e:?}", pile.display())),
+        Ok(tokenizer) => {
+            mary::embed::nomic_text_from_parts(keymap, tokenizer, device).map_err(|e| {
+                anyhow!(
+                    "build nomic text embedder from pile {}: {e:?}",
+                    pile.display()
+                )
+            })
+        }
         Err(err) => {
             eprintln!(
                 "memory: no tokenizer graph in {} ({err}); falling back to the stored \
@@ -312,7 +324,10 @@ pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::b
             );
             let tokenizer = materialize_tokenizer(&pile)?;
             mary::embed::load_nomic_text_from_keymap(keymap, &tokenizer, device).map_err(|e| {
-                anyhow!("load nomic text embedder from pile {}: {e:?}", pile.display())
+                anyhow!(
+                    "load nomic text embedder from pile {}: {e:?}",
+                    pile.display()
+                )
             })
         }
     }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::common;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use hifitime::Epoch;
 use serde_json::{Map, Value as JsonValue};
 use tracing::info_span;
@@ -133,10 +133,7 @@ fn import_codex_records(
         let raw_tree_start = Instant::now();
         println!("codex phase raw-tree: {}", path.display());
         let raw_payload = serde_json::to_string(&raw_records).context("serialize codex jsonl")?;
-        let mut importer = JsonTreeImporter::<_>::new(
-            repo.storage_mut(),
-            None,
-        );
+        let mut importer = JsonTreeImporter::<_>::new(repo.storage_mut(), None);
         let fragment = importer
             .import_str(&raw_payload)
             .context("import codex raw json tree")?;
@@ -277,14 +274,7 @@ fn import_codex_records(
     );
 
     let commit_start = Instant::now();
-    if common::commit_delta(
-        repo,
-        ws,
-        catalog,
-        catalog_head,
-        change,
-        "import codex",
-    )? {
+    if common::commit_delta(repo, ws, catalog, catalog_head, change, "import codex")? {
         stats.commits += 1;
     }
     println!(

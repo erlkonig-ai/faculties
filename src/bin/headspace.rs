@@ -1,17 +1,16 @@
-
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::headspace::{
-    CONFIG_BRANCH, DEFAULT_AUTHOR, DEFAULT_AUTHOR_ROLE, DEFAULT_BRANCH, DEFAULT_CHARS_PER_TOKEN,
-    DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
-    DEFAULT_MODEL, DEFAULT_BASE_URL, DEFAULT_POLL_MS, DEFAULT_STREAM, DEFAULT_SYSTEM_PROMPT,
-    KIND_CONFIG_ID, KIND_MODEL_PROFILE_ID, playground_config,
+    playground_config, CONFIG_BRANCH, DEFAULT_AUTHOR, DEFAULT_AUTHOR_ROLE, DEFAULT_BASE_URL,
+    DEFAULT_BRANCH, DEFAULT_CHARS_PER_TOKEN, DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
+    DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MODEL, DEFAULT_POLL_MS,
+    DEFAULT_STREAM, DEFAULT_SYSTEM_PROMPT, KIND_CONFIG_ID, KIND_MODEL_PROFILE_ID,
 };
 use hifitime::Epoch;
 use rand_core::OsRng;
@@ -351,10 +350,7 @@ fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
         "  context_safety_margin_tokens = {}",
         config.model.context_safety_margin_tokens
     );
-    println!(
-        "  chars_per_token = {}",
-        config.model.chars_per_token
-    );
+    println!("  chars_per_token = {}", config.model.chars_per_token);
     println!();
     println!("profiles:");
     print_profile_list(config)
@@ -383,10 +379,7 @@ fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
     lower.to_tai_duration().total_nanoseconds()
 }
 
-fn push_workspace(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
-) -> Result<()> {
+fn push_workspace(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>) -> Result<()> {
     while let Some(mut conflict) = repo
         .try_push(ws)
         .map_err(|err| anyhow!("push workspace: {err:?}"))?
@@ -594,13 +587,18 @@ fn load_latest_config(
     if let Some(id) = load_id_attr(catalog, config_id, &playground_config::persona_id) {
         config.persona_id = Some(id);
     }
-    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::active_model_profile_id) {
+    if let Some(id) = load_id_attr(
+        catalog,
+        config_id,
+        &playground_config::active_model_profile_id,
+    ) {
         config.model_profile_id = Some(id);
     }
     if let Some(model) = load_string_attr(ws, catalog, config_id, &playground_config::model_name)? {
         config.model.model = model;
     }
-    if let Some(url) = load_string_attr(ws, catalog, config_id, &playground_config::model_base_url)? {
+    if let Some(url) = load_string_attr(ws, catalog, config_id, &playground_config::model_base_url)?
+    {
         config.model.base_url = url;
     }
     if let Some(effort) = load_string_attr(
@@ -611,7 +609,8 @@ fn load_latest_config(
     )? {
         config.model.reasoning_effort = Some(effort);
     }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::model_api_key)? {
+    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::model_api_key)?
+    {
         config.model.api_key = Some(key);
     }
     if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::tavily_api_key)?
@@ -649,9 +648,12 @@ fn load_latest_config(
     {
         config.model.context_window_tokens = tokens;
     }
-    if let Some(tokens) =
-        load_u256_attr(catalog, config_id, &playground_config::model_max_output_tokens)
-            .and_then(u256be_to_u64)
+    if let Some(tokens) = load_u256_attr(
+        catalog,
+        config_id,
+        &playground_config::model_max_output_tokens,
+    )
+    .and_then(u256be_to_u64)
     {
         config.model.max_output_tokens = tokens;
     }
@@ -715,7 +717,8 @@ fn load_latest_model_profile(
     if let Some(model) = load_string_attr(ws, catalog, entry_id, &playground_config::model_name)? {
         mc.model = model;
     }
-    if let Some(url) = load_string_attr(ws, catalog, entry_id, &playground_config::model_base_url)? {
+    if let Some(url) = load_string_attr(ws, catalog, entry_id, &playground_config::model_base_url)?
+    {
         mc.base_url = url;
     }
     if let Some(effort) = load_string_attr(
@@ -743,9 +746,12 @@ fn load_latest_model_profile(
     {
         mc.context_window_tokens = tokens;
     }
-    if let Some(tokens) =
-        load_u256_attr(catalog, entry_id, &playground_config::model_max_output_tokens)
-            .and_then(u256be_to_u64)
+    if let Some(tokens) = load_u256_attr(
+        catalog,
+        entry_id,
+        &playground_config::model_max_output_tokens,
+    )
+    .and_then(u256be_to_u64)
     {
         mc.max_output_tokens = tokens;
     }
@@ -758,12 +764,9 @@ fn load_latest_model_profile(
     {
         mc.context_safety_margin_tokens = tokens;
     }
-    if let Some(chars) = load_u256_attr(
-        catalog,
-        entry_id,
-        &playground_config::model_chars_per_token,
-    )
-    .and_then(u256be_to_u64)
+    if let Some(chars) =
+        load_u256_attr(catalog, entry_id, &playground_config::model_chars_per_token)
+            .and_then(u256be_to_u64)
     {
         mc.chars_per_token = chars;
     }
@@ -821,7 +824,8 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let model_name_handle = ws.put(config.model.model.clone());
     let model_base_url = ws.put(config.model.base_url.clone());
     let model_stream: Inline<U256BE> = if config.model.stream { 1u64 } else { 0u64 }.to_inline();
-    let model_context_window_tokens: Inline<U256BE> = config.model.context_window_tokens.to_inline();
+    let model_context_window_tokens: Inline<U256BE> =
+        config.model.context_window_tokens.to_inline();
     let model_max_output_tokens: Inline<U256BE> = config.model.max_output_tokens.to_inline();
     let model_context_safety_margin_tokens: Inline<U256BE> =
         config.model.context_safety_margin_tokens.to_inline();

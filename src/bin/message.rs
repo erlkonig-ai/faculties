@@ -1,12 +1,11 @@
-
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::message::{
-    DEFAULT_BRANCH, DEFAULT_RELATIONS_BRANCH, KIND_MESSAGE_ID, KIND_PERSON_ID, KIND_READ_ID,
-    KIND_SPECS, is_inbox_message, local, relations_schema,
+    is_inbox_message, local, relations_schema, DEFAULT_BRANCH, DEFAULT_RELATIONS_BRANCH,
+    KIND_MESSAGE_ID, KIND_PERSON_ID, KIND_READ_ID, KIND_SPECS,
 };
-use faculties::schemas::relations::{KIND_GROUP, groups_for_member};
+use faculties::schemas::relations::{groups_for_member, KIND_GROUP};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
@@ -63,7 +62,10 @@ enum Command {
         /// Receiver label (person or group).
         to: String,
         /// Message text.
-        #[arg(value_name = "TEXT", help = "Message text. Use @path for file input or @- for stdin.")]
+        #[arg(
+            value_name = "TEXT",
+            help = "Message text. Use @path for file input or @- for stdin."
+        )]
         text: String,
         /// Sender label. Defaults to $PERSONA; pass explicitly for
         /// deliberate cross-persona sends or shells without PERSONA.
@@ -271,11 +273,7 @@ fn resolve_recipient_id(relations_space: &TribleSet, input: &str) -> Result<Id> 
     }
 }
 
-fn person_label(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    person_id: Id,
-) -> String {
+fn person_label(ws: &mut Workspace<Pile>, space: &TribleSet, person_id: Id) -> String {
     find!(h: TextHandle, pattern!(space, [{ person_id @ metadata::name: ?h }]))
         .next()
         .and_then(|h| load_text(ws, h).ok())
@@ -283,8 +281,8 @@ fn person_label(
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         // Avoid Drop warnings on early errors.
         let _ = pile.close();
@@ -303,10 +301,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo
@@ -338,10 +333,7 @@ fn ensure_metadata(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
 
     for (id, label) in KIND_SPECS {
         if !existing_kinds.contains(&id) {
-            let name_handle = label
-                .to_owned()
-                .to_blob()
-                .get_handle();
+            let name_handle = label.to_owned().to_blob().get_handle();
             change += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_handle };
             existing_kinds.insert(id);
         }
@@ -701,10 +693,7 @@ fn main() -> Result<()> {
         Command::Send { to, text, from } => {
             // Sender derivation: --from wins, else $PERSONA (clap env
             // fallback). A set-but-empty PERSONA counts as unset.
-            let Some(from) = from
-                .map(|f| f.trim().to_string())
-                .filter(|f| !f.is_empty())
-            else {
+            let Some(from) = from.map(|f| f.trim().to_string()).filter(|f| !f.is_empty()) else {
                 bail!(
                     "no sender: set $PERSONA or pass --from <label>\n\
                      usage: message send <TO> <TEXT> [--from <LABEL>]"
@@ -732,19 +721,11 @@ fn main() -> Result<()> {
             unread,
             limit,
         ),
-        Command::Ack { id, by } => cmd_ack(
-            &cli.pile,
-            message_branch_id,
-            relations_branch_id,
-            id,
-            by,
-        ),
-        Command::AckAll { by, from } => cmd_ack_all(
-            &cli.pile,
-            message_branch_id,
-            relations_branch_id,
-            by,
-            from,
-        ),
+        Command::Ack { id, by } => {
+            cmd_ack(&cli.pile, message_branch_id, relations_branch_id, id, by)
+        }
+        Command::AckAll { by, from } => {
+            cmd_ack_all(&cli.pile, message_branch_id, relations_branch_id, by, from)
+        }
     }
 }

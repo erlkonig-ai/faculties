@@ -127,7 +127,11 @@ fn note_metadata_is_stored_and_rendered_without_hiding_history() {
 fn empty_refs_and_supersedes_prefixes_are_rejected() {
     let pile = TestPile::new();
     let compass = env!("CARGO_BIN_EXE_compass");
-    let added = stdout(run(compass, &pile.path, &["add", "Ledger goal", "--note", "seed"]));
+    let added = stdout(run(
+        compass,
+        &pile.path,
+        &["add", "Ledger goal", "--note", "seed"],
+    ));
     let goal_id = id_after("Added goal ", &added);
     let first_note = id_after("Added note ", &added);
 
@@ -156,8 +160,16 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let compass = env!("CARGO_BIN_EXE_compass");
     let orient = env!("CARGO_BIN_EXE_orient");
 
-    stdout(run(relations, &pile.path, &["add", "me", "--affinity", "zooid"]));
-    stdout(run(relations, &pile.path, &["add", "peer", "--affinity", "zooid"]));
+    stdout(run(
+        relations,
+        &pile.path,
+        &["add", "me", "--affinity", "zooid"],
+    ));
+    stdout(run(
+        relations,
+        &pile.path,
+        &["add", "peer", "--affinity", "zooid"],
+    ));
     let added = stdout(run(
         compass,
         &pile.path,
@@ -171,19 +183,11 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let foreign = stdout(run(
         compass,
         &pile.path,
-        &[
-            "--persona",
-            "peer",
-            "note",
-            &goal_id,
-            "foreign observation",
-        ],
+        &["--persona", "peer", "note", &goal_id, "foreign observation"],
     ));
     let foreign_id = id_after("Added note ", &foreign);
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
-    assert!(news.contains(&format!(
-        "new note [{foreign_id}] on goal [{goal_id}]"
-    )));
+    assert!(news.contains(&format!("new note [{foreign_id}] on goal [{goal_id}]")));
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 
     stdout(run(
@@ -200,9 +204,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     ));
     let unattributed_id = id_after("Added note ", &unattributed);
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
-    assert!(news.contains(&format!(
-        "new note [{unattributed_id}] on goal [{goal_id}]"
-    )));
+    assert!(news.contains(&format!("new note [{unattributed_id}] on goal [{goal_id}]")));
 
     let unrelated = stdout(run(
         compass,

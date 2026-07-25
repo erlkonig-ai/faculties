@@ -1,11 +1,9 @@
-
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::relations::{
-    group_snapshot_fragment, resolve_group_head, DEFAULT_BRANCH, GroupHead, KIND_GROUP,
-    KIND_PERSON_ID, KIND_RETIRE_ID, KIND_UNRETIRE_ID, group, head_members, head_snapshot_of,
-    relations,
+    group, group_snapshot_fragment, head_members, head_snapshot_of, relations, resolve_group_head,
+    GroupHead, DEFAULT_BRANCH, KIND_GROUP, KIND_PERSON_ID, KIND_RETIRE_ID, KIND_UNRETIRE_ID,
 };
 use hifitime::Epoch;
 use rand_core::OsRng;
@@ -214,7 +212,6 @@ enum GroupCmd {
     },
 }
 
-
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
@@ -394,8 +391,7 @@ fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         // Avoid Drop warnings on early errors.
         let _ = pile.close();
@@ -414,10 +410,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
@@ -440,10 +433,7 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
     .collect();
     let mut change = TribleSet::new();
     if !existing.contains_key(&KIND_PERSON_ID) {
-        let name_handle = "person"
-            .to_owned()
-            .to_blob()
-            .get_handle();
+        let name_handle = "person".to_owned().to_blob().get_handle();
         change += entity! { ExclusiveId::force_ref(&KIND_PERSON_ID) @ metadata::name: name_handle };
     }
     Ok(change)
@@ -453,22 +443,26 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
 
 fn person_label(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ metadata::name: ?h }]))
-        .next().and_then(|h| read_text(ws, h).ok())
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
 }
 
 fn person_first_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ relations::first_name: ?h }]))
-        .next().and_then(|h| read_text(ws, h).ok())
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
 }
 
 fn person_last_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ relations::last_name: ?h }]))
-        .next().and_then(|h| read_text(ws, h).ok())
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
 }
 
 fn person_display_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ relations::display_name: ?h }]))
-        .next().and_then(|h| read_text(ws, h).ok())
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
 }
 
 fn person_affinity(space: &TribleSet, id: Id) -> Option<String> {
@@ -477,7 +471,8 @@ fn person_affinity(space: &TribleSet, id: Id) -> Option<String> {
 
 fn person_note(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ metadata::description: ?h }]))
-        .next().and_then(|h| read_text(ws, h).ok())
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
 }
 
 fn person_teams_user_id(space: &TribleSet, id: Id) -> Option<String> {
@@ -498,17 +493,20 @@ fn person_aliases(space: &TribleSet, id: Id) -> Vec<String> {
 
 fn person_company(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ relations::company: ?h }]))
-        .next().and_then(|h| read_text(ws, h).ok())
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
 }
 
 fn person_position(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ relations::position: ?h }]))
-        .next().and_then(|h| read_text(ws, h).ok())
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
 }
 
 fn person_profile_url(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
     find!(h: TextHandle, pattern!(space, [{ id @ relations::profile_url: ?h }]))
-        .next().and_then(|h| read_text(ws, h).ok())
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
 }
 
 fn person_sources(space: &TribleSet, id: Id) -> Vec<String> {
@@ -965,14 +963,25 @@ fn cmd_set_retired(
 
         let now = epoch_interval(now_epoch());
         let evt_id = ufoid();
-        let kind = if retired { &KIND_RETIRE_ID } else { &KIND_UNRETIRE_ID };
+        let kind = if retired {
+            &KIND_RETIRE_ID
+        } else {
+            &KIND_UNRETIRE_ID
+        };
         let mut change = TribleSet::new();
         change += entity! { &evt_id @
             metadata::tag: kind,
             relations::subject: &person_id,
             metadata::created_at: now,
         };
-        ws.commit(change, if retired { "relations retire" } else { "relations unretire" });
+        ws.commit(
+            change,
+            if retired {
+                "relations retire"
+            } else {
+                "relations unretire"
+            },
+        );
         repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
         Ok((person_id, label, true))
     })
@@ -1015,13 +1024,14 @@ fn resolve_group_id(space: &TribleSet, raw: &str) -> Result<Id> {
     // Name lookup resolves through the head snapshot: an anchor matches when
     // its current (un-superseded) snapshot carries this label_norm. A rename
     // supersedes the old name, so only the current name resolves.
-    let mut matches: Vec<Id> = find!(gid: Id, pattern!(space, [{ ?gid @ metadata::tag: &KIND_GROUP }]))
-        .filter(|&gid| {
-            head_snapshot_of(space, gid).is_some_and(|head| {
-                exists!(pattern!(space, [{ head @ relations::label_norm: key.as_str() }]))
+    let mut matches: Vec<Id> =
+        find!(gid: Id, pattern!(space, [{ ?gid @ metadata::tag: &KIND_GROUP }]))
+            .filter(|&gid| {
+                head_snapshot_of(space, gid).is_some_and(|head| {
+                    exists!(pattern!(space, [{ head @ relations::label_norm: key.as_str() }]))
+                })
             })
-        })
-        .collect();
+            .collect();
     matches.sort();
     matches.dedup();
     match matches.len() {
@@ -1320,7 +1330,10 @@ fn cmd_group_reconcile(
         Ok((gid, true))
     })?;
     if healed {
-        println!("Reconciled forked group {} into a single head.", fmt_id(gid));
+        println!(
+            "Reconciled forked group {} into a single head.",
+            fmt_id(gid)
+        );
     } else {
         println!("Group {} is not forked; nothing to reconcile.", fmt_id(gid));
     }
@@ -1346,8 +1359,7 @@ fn cmd_group_list(pile: &Path, branch_id: Id) -> Result<()> {
             // dropped from delivery/gating.
             match resolve_group_head(&space, gid) {
                 GroupHead::Unique(head) => {
-                    let label =
-                        person_label(&mut ws, &space, head).unwrap_or_else(|| fmt_id(gid));
+                    let label = person_label(&mut ws, &space, head).unwrap_or_else(|| fmt_id(gid));
                     let members = group_members(&space, gid);
                     println!("[{}] {label} — {} member(s)", fmt_id(gid), members.len());
                 }
@@ -1415,8 +1427,7 @@ fn main() -> Result<()> {
     };
     let branch_id = with_repo(&cli.pile, |repo| {
         if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
+            return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
         }
         repo.ensure_branch(&cli.branch, None)
             .map_err(|e| anyhow!("ensure relations branch: {e:?}"))
@@ -1493,9 +1504,11 @@ fn main() -> Result<()> {
             position,
             source,
         ),
-        Command::List { limit, all, retired } => {
-            cmd_list(&cli.pile, &cli.branch, branch_id, limit, all, retired)
-        }
+        Command::List {
+            limit,
+            all,
+            retired,
+        } => cmd_list(&cli.pile, &cli.branch, branch_id, limit, all, retired),
         Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
         Command::Retire { person } => cmd_retire(&cli.pile, branch_id, person),
         Command::Unretire { person } => cmd_unretire(&cli.pile, branch_id, person),
@@ -1634,7 +1647,13 @@ mod tests {
             let anchor = ufoid().id;
             let m1 = ufoid().id;
             let m2 = ufoid().id;
-            seed_legacy_group(pile.path(), b, anchor, Some(&format!("group-{i}")), &[m1, m2]);
+            seed_legacy_group(
+                pile.path(),
+                b,
+                anchor,
+                Some(&format!("group-{i}")),
+                &[m1, m2],
+            );
             anchors.push((anchor, sorted(vec![m1, m2])));
         }
         // Before migration each is a VISIBLE unmigrated legacy group (Missing),
@@ -1680,7 +1699,10 @@ mod tests {
         seed_legacy_group(pile.path(), b, anchor, None, &[ufoid().id]);
         // Fails LOUDLY rather than silently minting a nameless snapshot.
         let err = cmd_group_migrate(pile.path(), b).unwrap_err();
-        assert!(err.to_string().contains("no name"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("no name"),
+            "unexpected error: {err}"
+        );
         // Still visibly un-migrated (Missing), never a healthy zero-member group.
         assert_eq!(head(pile.path(), b, anchor), GroupHead::Missing);
     }
@@ -1710,14 +1732,24 @@ mod tests {
         // Rename: only the NEW name resolves; the anchor and membership persist.
         cmd_group_rename(pile.path(), b, "Crew".to_string(), "Squad".to_string()).expect("rename");
         assert!(resolve(pile.path(), b, "Crew").is_err());
-        assert_eq!(resolve(pile.path(), b, "Squad").expect("resolve squad"), anchor);
+        assert_eq!(
+            resolve(pile.path(), b, "Squad").expect("resolve squad"),
+            anchor
+        );
         assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
         assert_eq!(members(pile.path(), b, anchor), vec![bob]);
     }
 
     /// Commit one content-canonical snapshot of `anchor` (tagging the anchor).
     /// Two divergent no-predecessor snapshots of the same anchor produce a fork.
-    fn seed_snapshot(pile: &Path, branch_id: Id, anchor: Id, name: &str, members: &[Id], preds: &[Id]) {
+    fn seed_snapshot(
+        pile: &Path,
+        branch_id: Id,
+        anchor: Id,
+        name: &str,
+        members: &[Id],
+        preds: &[Id],
+    ) {
         with_repo(pile, |repo| {
             let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
             let handle = ws.put(name.to_string());
@@ -1776,6 +1808,9 @@ mod tests {
         cmd_group_reconcile(pile.path(), b, fmt_id(anchor), Some("gamma".to_string()))
             .expect("reconcile with explicit name");
         assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
-        assert_eq!(resolve(pile.path(), b, "gamma").expect("resolve gamma"), anchor);
+        assert_eq!(
+            resolve(pile.path(), b, "gamma").expect("resolve gamma"),
+            anchor
+        );
     }
 }

@@ -1,12 +1,11 @@
-
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::schemas::embeddings::{self, Embedding768};
 use ed25519_dalek::SigningKey;
+use faculties::schemas::embeddings::{self, Embedding768};
+use hifitime::efmt::consts::ISO8601_DATE;
+use hifitime::efmt::Formatter;
 use hifitime::Epoch;
 use itertools::Itertools;
-use hifitime::efmt::Formatter;
-use hifitime::efmt::consts::ISO8601_DATE;
 use rand_core::OsRng;
 use std::collections::HashMap;
 use std::fs;
@@ -298,7 +297,11 @@ fn tag_name(space: &TribleSet, ws: &mut Workspace<Pile>, id: Id) -> String {
 /// Format a list of tag IDs as a bracketed, comma-separated string of names.
 fn format_tags(space: &TribleSet, ws: &mut Workspace<Pile>, tags: &[Id]) -> String {
     let names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
-    if names.is_empty() { String::new() } else { format!(" [{}]", names.join(", ")) }
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", names.join(", "))
+    }
 }
 
 /// Find a tag ID by name, or mint a new one if it doesn't exist.
@@ -337,7 +340,8 @@ fn resolve_tags(
     names: &[String],
     change: &mut TribleSet,
 ) -> Vec<Id> {
-    names.iter()
+    names
+        .iter()
         .filter(|n| !n.trim().is_empty())
         .map(|n| resolve_tag(space, ws, n.trim(), change))
         .collect()
@@ -410,11 +414,7 @@ fn version_history_of(space: &TribleSet, fragment_id: Id) -> Vec<Id> {
 }
 
 /// Read title string for a version entity.
-fn read_title(
-    space: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    vid: Id,
-) -> Option<String> {
+fn read_title(space: &TribleSet, ws: &mut Workspace<Pile>, vid: Id) -> Option<String> {
     let (h,) = find!(
         (h: TextHandle),
         pattern!(space, [{ vid @ wiki::title: ?h }])
@@ -468,7 +468,10 @@ fn links_of(space: &TribleSet, vid: Id) -> Vec<Id> {
 fn prefix_to_range(hex_prefix: &str) -> Result<(Id, Id)> {
     let clean = hex_prefix.trim().to_lowercase();
     if clean.is_empty() || clean.len() > 32 {
-        bail!("invalid prefix length: expected 1-32 hex chars, got {}", clean.len());
+        bail!(
+            "invalid prefix length: expected 1-32 hex chars, got {}",
+            clean.len()
+        );
     }
     if !clean.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("invalid hex prefix '{clean}'");
@@ -489,8 +492,7 @@ fn resolve_prefix(space: &TribleSet, input: &str) -> Result<Id> {
     let trimmed = input.trim().to_lowercase();
     // Fast path: full 32-char hex ID.
     if trimmed.len() == 32 {
-        return Id::from_hex(&trimmed)
-            .ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}'"));
+        return Id::from_hex(&trimmed).ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}'"));
     }
     let (min, max) = prefix_to_range(&trimmed)?;
     let mut matches = Vec::new();
@@ -537,8 +539,7 @@ fn resolve_fragment_prefix(space: &TribleSet, input: &str) -> Result<Id> {
     let trimmed = input.trim().to_lowercase();
     // Fast path: full 32-char hex ID.
     if trimmed.len() == 32 {
-        return Id::from_hex(&trimmed)
-            .ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}'"));
+        return Id::from_hex(&trimmed).ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}'"));
     }
     let (min, max) = prefix_to_range(&trimmed)?;
     let frag_min_val: Inline<inlineencodings::GenId> = min.to_inline();
@@ -565,8 +566,6 @@ fn resolve_fragment_prefix(space: &TribleSet, input: &str) -> Result<Id> {
     }
 }
 
-
-
 /// Given an ID, resolve to the fragment it belongs to.
 /// Identity for fragment IDs, lookup for version IDs.
 fn to_fragment(space: &TribleSet, id: Id) -> Result<Id> {
@@ -586,11 +585,7 @@ fn to_fragment(space: &TribleSet, id: Id) -> Result<Id> {
 }
 
 /// Human-readable label for a link target (version or fragment).
-fn link_label(
-    space: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    id: Id,
-) -> String {
+fn link_label(space: &TribleSet, ws: &mut Workspace<Pile>, id: Id) -> String {
     if is_version(space, id) {
         let title = read_title(space, ws, id).unwrap_or_else(|| "?".into());
         let frag = version_fragment(space, id);
@@ -631,13 +626,11 @@ fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
     .collect()
 }
 
-
 /// Format a `Lower` timestamp as ISO 8601 date (e.g. "2026-03-11").
 fn format_date(ts: Lower) -> String {
     let epoch = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(ts.0));
     Formatter::new(epoch, ISO8601_DATE).to_string()
 }
-
 
 /// Extract outgoing link facts from a version's content and return them as a
 /// TribleSet rooted at `source_vid`. Everything — wiki edges, typed edges,
@@ -653,11 +646,7 @@ fn format_date(ts: Lower) -> String {
 ///   wiki:<type>:HEX32      → `wiki::links_to` + derived attribute named `<type>`
 ///   files:HEX32            → `wiki::references_file` (GenId, points to a file entity)
 ///   files:HEX64            → `wiki::references_file_content` (Blake3 content handle)
-fn extract_references(
-    content: &str,
-    space: &TribleSet,
-    source_vid: Id,
-) -> TribleSet {
+fn extract_references(content: &str, space: &TribleSet, source_vid: Id) -> TribleSet {
     use regex::Regex;
     let re = Regex::new(
         r#"#link\("([a-zA-Z_][a-zA-Z0-9_]*):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?)([0-9a-fA-F]{64}|[0-9a-fA-F]{32})"\)"#
@@ -671,18 +660,27 @@ fn extract_references(
 
         match (faculty, hex.len()) {
             ("wiki", 32) => {
-                let Some(target) = Id::from_hex(&hex) else { continue; };
-                if !is_version(space, target) && !is_fragment(space, target) { continue; }
-                if target == source_vid { continue; }
+                let Some(target) = Id::from_hex(&hex) else {
+                    continue;
+                };
+                if !is_version(space, target) && !is_fragment(space, target) {
+                    continue;
+                }
+                if target == source_vid {
+                    continue;
+                }
                 let eid = ExclusiveId::force_ref(&source_vid);
                 edges += entity! { eid @ wiki::links_to: &target };
                 if !type_prefix.is_empty() {
                     let type_name = type_prefix[..type_prefix.len() - 1].to_owned();
                     let name_handle = type_name.to_blob().get_handle();
-                    let attr = triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from(entity! {
-                        metadata::name: name_handle,
-                        metadata::value_encoding: <inlineencodings::GenId as triblespace::core::metadata::MetaDescribe>::id(),
-                    });
+                    let attr =
+                        triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from(
+                            entity! {
+                                metadata::name: name_handle,
+                                metadata::value_encoding: <inlineencodings::GenId as triblespace::core::metadata::MetaDescribe>::id(),
+                            },
+                        );
                     let eid = ExclusiveId::force_ref(&source_vid);
                     edges += entity! { eid @ attr: &target };
                 }
@@ -693,12 +691,15 @@ fn extract_references(
                 continue;
             }
             ("files", 32) => {
-                let Some(target) = Id::from_hex(&hex) else { continue; };
+                let Some(target) = Id::from_hex(&hex) else {
+                    continue;
+                };
                 let eid = ExclusiveId::force_ref(&source_vid);
                 edges += entity! { eid @ wiki::references_file: &target };
             }
             ("files", 64) => {
-                let Ok(hash) = inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(&hex) else {
+                let Ok(hash) = inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(&hex)
+                else {
                     continue;
                 };
                 let handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>> =
@@ -719,10 +720,7 @@ fn is_fragment(space: &TribleSet, id: Id) -> bool {
 type Repo = Repository<Pile>;
 
 /// Ensure all built-in tag/kind IDs have metadata::name entries.
-fn ensure_tag_vocabulary(
-    repo: &mut Repo,
-    ws: &mut Workspace<Pile>,
-) -> Result<()> {
+fn ensure_tag_vocabulary(repo: &mut Repo, ws: &mut Workspace<Pile>) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout for tag names: {e:?}"))?;
@@ -753,13 +751,13 @@ fn ensure_tag_vocabulary(
 // ── in-process typst validation ──────────────────────────────────────
 
 mod typst_validate {
-    use typst::foundations::{Bytes, Datetime};
-    use typst::text::{Font, FontBook};
-    use typst::syntax::{FileId, Source, VirtualPath};
     use typst::diag::FileResult;
+    use typst::foundations::{Bytes, Datetime};
+    use typst::layout::PagedDocument;
+    use typst::syntax::{FileId, Source, VirtualPath};
+    use typst::text::{Font, FontBook};
     use typst::utils::LazyHash;
     use typst::{Library, LibraryExt, World};
-    use typst::layout::PagedDocument;
 
     pub struct ValidateWorld {
         library: LazyHash<Library>,
@@ -785,52 +783,78 @@ mod typst_validate {
             match result.output {
                 Ok(_) => Ok(()),
                 Err(errors) => {
-                    let msgs: Vec<String> = errors.iter()
+                    let msgs: Vec<String> = errors
+                        .iter()
                         // Font errors are expected (minimal world has no fonts).
                         .filter(|e| !e.message.contains("no font"))
                         .map(|e| {
                             let mut msg = e.message.to_string();
                             if let Some(range) = self.source.range(e.span) {
                                 let line = self.source.text()[..range.start]
-                                    .chars().filter(|&c| c == '\n').count() + 1;
+                                    .chars()
+                                    .filter(|&c| c == '\n')
+                                    .count()
+                                    + 1;
                                 msg = format!("line {line}: {msg}");
                             }
                             msg
-                        }).collect();
-                    if msgs.is_empty() { Ok(()) } else { Err(msgs) }
+                        })
+                        .collect();
+                    if msgs.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(msgs)
+                    }
                 }
             }
         }
     }
 
     impl World for ValidateWorld {
-        fn library(&self) -> &LazyHash<Library> { &self.library }
-        fn book(&self) -> &LazyHash<FontBook> { &self.book }
-        fn main(&self) -> FileId { self.main_id }
+        fn library(&self) -> &LazyHash<Library> {
+            &self.library
+        }
+        fn book(&self) -> &LazyHash<FontBook> {
+            &self.book
+        }
+        fn main(&self) -> FileId {
+            self.main_id
+        }
         fn source(&self, id: FileId) -> FileResult<Source> {
             if id == self.main_id {
                 return Ok(self.source.clone());
             }
             // Resolve @preview/... package files from the local typst cache.
             if let Some(path) = package_file_path(&id) {
-                let bytes = std::fs::read(&path)
-                    .map_err(|_| typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))?;
-                let text = String::from_utf8(bytes)
-                    .map_err(|_| typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))?;
+                let bytes = std::fs::read(&path).map_err(|_| {
+                    typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into())
+                })?;
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into())
+                })?;
                 return Ok(Source::new(id, text));
             }
-            Err(typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))
+            Err(typst::diag::FileError::NotFound(
+                id.vpath().as_rootless_path().into(),
+            ))
         }
         fn file(&self, id: FileId) -> FileResult<Bytes> {
             if let Some(path) = package_file_path(&id) {
-                let bytes = std::fs::read(&path)
-                    .map_err(|_| typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))?;
+                let bytes = std::fs::read(&path).map_err(|_| {
+                    typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into())
+                })?;
                 return Ok(Bytes::new(bytes));
             }
-            Err(typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))
+            Err(typst::diag::FileError::NotFound(
+                id.vpath().as_rootless_path().into(),
+            ))
         }
-        fn font(&self, _index: usize) -> Option<Font> { None }
-        fn today(&self, _offset: Option<i64>) -> Option<Datetime> { None }
+        fn font(&self, _index: usize) -> Option<Font> {
+            None
+        }
+        fn today(&self, _offset: Option<i64>) -> Option<Datetime> {
+            None
+        }
     }
 
     /// Resolve a typst FileId pointing into a package (e.g.
@@ -847,10 +871,9 @@ mod typst_validate {
     /// cannot be determined.
     fn package_file_path(id: &FileId) -> Option<std::path::PathBuf> {
         let pkg = id.package()?;
-        let cache_root = dirs::cache_dir()
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
-            })?;
+        let cache_root = dirs::cache_dir().or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+        })?;
         let mut p = cache_root;
         p.push("typst");
         p.push("packages");
@@ -947,19 +970,18 @@ fn warn_bare_refs(content: &str) {
 fn lint_bare_brackets(line: &str, space: &TribleSet) -> String {
     use regex::Regex;
     // Match [wiki:HEX], [wiki:type:HEX], or [files:HEX] NOT followed by ( and NOT preceded by ") (inside a #link)
-    let re_bare = Regex::new(
-        r"\[(wiki|files):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]+)\]([^(]|$)"
-    ).unwrap();
+    let re_bare =
+        Regex::new(r"\[(wiki|files):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]+)\]([^(]|$)").unwrap();
     let mut result = String::new();
     let mut last_end = 0;
     for caps in re_bare.captures_iter(line) {
         let m = caps.get(0).unwrap();
         // Skip if preceded by ") — this is the [text] part of an existing #link("...")[text]
-        if m.start() > 0 && &line[m.start()-1..m.start()] == ")" {
+        if m.start() > 0 && &line[m.start() - 1..m.start()] == ")" {
             continue;
         }
         // Skip if preceded by a quote — inside #link("scheme:hex")
-        if m.start() > 1 && &line[m.start()-1..m.start()] == "\"" {
+        if m.start() > 1 && &line[m.start() - 1..m.start()] == "\"" {
             continue;
         }
         let scheme = &caps[1];
@@ -978,7 +1000,11 @@ fn lint_bare_brackets(line: &str, space: &TribleSet) -> String {
         last_end = m.end();
     }
     result.push_str(&line[last_end..]);
-    if result.is_empty() { line.to_string() } else { result }
+    if result.is_empty() {
+        line.to_string()
+    } else {
+        result
+    }
 }
 
 /// Split a reference tail into (type_prefix_with_colon, hex). For `reviews:HEX`
@@ -1003,7 +1029,8 @@ fn lint_web_links(line: &str) -> String {
         let text = &caps[1];
         let url = &caps[2];
         format!("#link(\"{url}\")[{text}]")
-    }).to_string()
+    })
+    .to_string()
 }
 
 fn lint_line(line: &str, space: &TribleSet) -> String {
@@ -1051,7 +1078,9 @@ fn lint_bold(line: &str) -> String {
             if let Some(&(_, '*')) = chars.peek() {
                 // Found **, look for closing ** while respecting escapes.
                 chars.next(); // consume second *
-                if chars.peek().is_none() { break; }
+                if chars.peek().is_none() {
+                    break;
+                }
                 let mut found_close = false;
                 let mut inner = String::new();
                 while let Some((_, ic)) = chars.next() {
@@ -1094,9 +1123,8 @@ fn lint_bold(line: &str) -> String {
 /// and `files:ID`. Expands short ID prefixes to full 32-char hex.
 fn lint_links(line: &str, space: &TribleSet) -> String {
     use regex::Regex;
-    let re = Regex::new(
-        r"\[([^\]]+)\]\((wiki|files):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]+)\)"
-    ).unwrap();
+    let re = Regex::new(r"\[([^\]]+)\]\((wiki|files):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]+)\)")
+        .unwrap();
     re.replace_all(line, |caps: &regex::Captures| {
         let text = &caps[1];
         let scheme = &caps[2];
@@ -1107,7 +1135,8 @@ fn lint_links(line: &str, space: &TribleSet) -> String {
             Err(_) => hex.to_lowercase(),
         };
         format!("#link(\"{scheme}:{type_prefix}{full_hex}\")[{text}]")
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// `---` alone on a line → removed (typst doesn't have horizontal rules by default)
@@ -1126,8 +1155,7 @@ fn lint_horizontal_rule(line: &str) -> String {
 fn try_expand_id(hex: &str, space: &TribleSet) -> Result<Id> {
     let clean = hex.trim().to_lowercase();
     if clean.len() == 32 {
-        return Id::from_hex(&clean)
-            .ok_or_else(|| anyhow::anyhow!("invalid hex"));
+        return Id::from_hex(&clean).ok_or_else(|| anyhow::anyhow!("invalid hex"));
     }
     if clean.len() < 4 {
         bail!("prefix too short");
@@ -1165,17 +1193,22 @@ fn validate_wiki_links(content: &str, space: &TribleSet, allow_dangling: bool) -
     let known_frags: std::collections::HashSet<Id> = find!(
         frag: Id,
         pattern!(space, [{ _?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
-    ).collect();
+    )
+    .collect();
     let known_versions: std::collections::HashSet<Id> = find!(
         vid: Id,
         pattern!(space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID }])
-    ).collect();
+    )
+    .collect();
 
     let mut errors = Vec::new();
     for caps in re.captures_iter(content) {
         let hex = &caps[1];
         if hex.len() != 32 {
-            errors.push(format!("truncated link wiki:{hex} ({} chars, expected 32)", hex.len()));
+            errors.push(format!(
+                "truncated link wiki:{hex} ({} chars, expected 32)",
+                hex.len()
+            ));
             continue;
         }
         let Some(id) = Id::from_hex(hex) else {
@@ -1248,12 +1281,16 @@ fn commit_version(
         let bad_links: Vec<Id> = find!(
             target: Id,
             pattern!(&edges, [{ version_id @ wiki::links_to: ?target }])
-        ).filter(|t| !is_version(space, *t)).collect();
+        )
+        .filter(|t| !is_version(space, *t))
+        .collect();
         if !bad_links.is_empty() {
             let ids: Vec<String> = bad_links.iter().map(|id| format!("{:x}", id)).collect();
-            bail!("link targets are fragments, not versions: {}. \
+            bail!(
+                "link targets are fragments, not versions: {}. \
                 Use version IDs for stable references, or pass --force to override.",
-                ids.join(", "));
+                ids.join(", ")
+            );
         }
     }
 
@@ -1275,21 +1312,23 @@ fn find_links(
     let vid = if is_version(space, id) {
         id
     } else {
-        latest_version_of(space, id)
-            .ok_or_else(|| anyhow::anyhow!("no versions for {}", id))?
+        latest_version_of(space, id).ok_or_else(|| anyhow::anyhow!("no versions for {}", id))?
     };
 
     // Outgoing: stored links_to on this version, with content-parse fallback.
     let mut outgoing = links_of(space, vid);
     if outgoing.is_empty() {
         if let Some(ch) = content_handle_of(space, vid) {
-            let content: View<str> = ws.get(ch)
+            let content: View<str> = ws
+                .get(ch)
                 .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
             let edges = extract_references(content.as_ref(), space, vid);
             outgoing = find!(
                 target: Id,
                 pattern!(&edges, [{ vid @ wiki::links_to: ?target }])
-            ).filter(|&t| t != id).collect();
+            )
+            .filter(|&t| t != id)
+            .collect();
         }
     }
     outgoing.sort();
@@ -1373,8 +1412,7 @@ fn resolve_to_show(space: &TribleSet, id: Id, follow_latest: bool) -> Result<Id>
         }
     } else {
         // Fragment — always show latest version.
-        latest_version_of(space, id)
-            .ok_or_else(|| anyhow::anyhow!("no versions for {}", id))
+        latest_version_of(space, id).ok_or_else(|| anyhow::anyhow!("no versions for {}", id))
     }
 }
 
@@ -1384,7 +1422,9 @@ fn cmd_fix_truncated(repo: &mut Repo, bid: Id, raw_input: String) -> Result<()> 
     let input = faculties::text_arg(&raw_input, "input")?;
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
     let mut resolved = 0u32;
     let mut ambiguous = 0u32;
@@ -1392,12 +1432,18 @@ fn cmd_fix_truncated(repo: &mut Repo, bid: Id, raw_input: String) -> Result<()> 
 
     for line in input.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         let Some((scheme, hex)) = line.split_once(':') else {
             eprintln!("SKIP: {line} (no scheme:prefix format)");
             continue;
         };
-        let full_len = if scheme == "wiki" { 32 } else if scheme == "files" { 64 } else {
+        let full_len = if scheme == "wiki" {
+            32
+        } else if scheme == "files" {
+            64
+        } else {
             eprintln!("SKIP: {line} (unknown scheme '{scheme}')");
             continue;
         };
@@ -1416,13 +1462,18 @@ fn cmd_fix_truncated(repo: &mut Repo, bid: Id, raw_input: String) -> Result<()> 
             }
         }
     }
-    eprintln!("{} resolved, {} ambiguous, {} already full", resolved, ambiguous, already_full);
+    eprintln!(
+        "{} resolved, {} ambiguous, {} already full",
+        resolved, ambiguous, already_full
+    );
     Ok(())
 }
 
 fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
     let latest = latest_versions(&space);
 
@@ -1431,7 +1482,8 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
     let all_version_ids: std::collections::HashSet<Id> = find!(
         vid: Id,
         pattern!(&space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID }])
-    ).collect();
+    )
+    .collect();
 
     // All fragments are typst — no markdown path
 
@@ -1462,7 +1514,8 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
             issues += 1;
             continue;
         };
-        let content: View<str> = ws.get(ch)
+        let content: View<str> = ws
+            .get(ch)
             .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
         let content_str = content.as_ref();
 
@@ -1480,7 +1533,10 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
                 _ => false,
             };
             if is_truncated {
-                eprintln!("TRUNCATED    {}  {}:{}  in {}", frag_hex, scheme, hex, title);
+                eprintln!(
+                    "TRUNCATED    {}  {}:{}  in {}",
+                    frag_hex, scheme, hex, title
+                );
                 issues += 1;
             }
         }
@@ -1511,7 +1567,10 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
                 if url.contains('<') {
                     continue;
                 }
-                eprintln!("MD_LINK      {}  [{}]({})  in {}", frag_hex, text, url, title);
+                eprintln!(
+                    "MD_LINK      {}  [{}]({})  in {}",
+                    frag_hex, text, url, title
+                );
                 issues += 1;
             }
         }
@@ -1519,7 +1578,10 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
         // Check: bare references — well-formed scheme:hex in prose that isn't a
         // link. Looks like a citation but creates no traversable edge.
         for (lineno, refstr) in bare_ref_warnings(content_str) {
-            eprintln!("BARE_REF     {}  {} (line {})  in {}", frag_hex, refstr, lineno, title);
+            eprintln!(
+                "BARE_REF     {}  {} (line {})  in {}",
+                frag_hex, refstr, lineno, title
+            );
             issues += 1;
         }
 
@@ -1527,7 +1589,9 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
         if try_compile {
             let world = typst_validate::ValidateWorld::new(content_str);
             match world.validate() {
-                Ok(()) => { compile_ok += 1; }
+                Ok(()) => {
+                    compile_ok += 1;
+                }
                 Err(errors) => {
                     let first = errors.first().map(|s| s.as_str()).unwrap_or("unknown");
                     eprintln!("TYPST_ERROR  {}  {}  {}", frag_hex, title, first);
@@ -1545,7 +1609,9 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
     let mut has_incoming: std::collections::HashSet<Id> = std::collections::HashSet::new();
     for (frag_id, (vid, _)) in &latest {
         let tags = tags_of(&space, *vid);
-        if tags.contains(&TAG_ARCHIVED_ID) { continue; }
+        if tags.contains(&TAG_ARCHIVED_ID) {
+            continue;
+        }
         let outgoing = links_of(&space, *vid);
         if !outgoing.is_empty() {
             has_outgoing.insert(*frag_id);
@@ -1561,7 +1627,9 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
     let mut orphans = 0u32;
     for (frag_id, (vid, _)) in &latest {
         let tags = tags_of(&space, *vid);
-        if tags.contains(&TAG_ARCHIVED_ID) { continue; }
+        if tags.contains(&TAG_ARCHIVED_ID) {
+            continue;
+        }
         if !has_outgoing.contains(frag_id) && !has_incoming.contains(frag_id) {
             let title = read_title(&space, &mut ws, *vid).unwrap_or_else(|| "?".into());
             eprintln!("ORPHAN       {}  {}", frag_id, title);
@@ -1587,7 +1655,9 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
     // Dry-run and check modes: single pull, no commits.
     if !do_fix {
         let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let latest = latest_versions(&space);
 
         let mut changed = 0u32;
@@ -1595,8 +1665,12 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
         let mut checked = 0u32;
 
         for (&frag_id, &(vid, _ts)) in &latest {
-            let Some(ch) = content_handle_of(&space, vid) else { continue; };
-            let Ok(content) = ws.get::<View<str>, _>(ch) else { continue; };
+            let Some(ch) = content_handle_of(&space, vid) else {
+                continue;
+            };
+            let Ok(content) = ws.get::<View<str>, _>(ch) else {
+                continue;
+            };
             let original = content.as_ref().to_string();
             checked += 1;
 
@@ -1647,7 +1721,9 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
 
     loop {
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let latest = latest_versions(&space);
 
         let mut change = TribleSet::new();
@@ -1658,8 +1734,12 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
         let mut checked = 0u32;
 
         for (&frag_id, &(vid, _ts)) in &latest {
-            let Some(ch) = content_handle_of(&space, vid) else { continue; };
-            let Ok(content) = ws.get::<View<str>, _>(ch) else { continue; };
+            let Some(ch) = content_handle_of(&space, vid) else {
+                continue;
+            };
+            let Ok(content) = ws.get::<View<str>, _>(ch) else {
+                continue;
+            };
             let original = content.as_ref().to_string();
             checked += 1;
 
@@ -1708,7 +1788,8 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
             };
             let mut all_tags = tag_ids;
             all_tags.push(KIND_VERSION_ID);
-            all_tags.sort(); all_tags.dedup();
+            all_tags.sort();
+            all_tags.dedup();
             let title_handle = ws.put(title.clone());
             let version = entity! { _ @
                 wiki::fragment: &frag_id,
@@ -1750,7 +1831,9 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
 fn cmd_export_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
     fs::create_dir_all(&dir).context("create output directory")?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let mut count = 0u32;
     let latest = latest_versions(&space);
     for (_frag_id, (vid, _)) in &latest {
@@ -1759,22 +1842,30 @@ fn cmd_export_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
         if tags.contains(&TAG_ARCHIVED_ID) {
             continue;
         }
-        let Some(ch) = content_handle_of(&space, *vid) else { continue };
-        let content: View<str> = ws.get(ch)
+        let Some(ch) = content_handle_of(&space, *vid) else {
+            continue;
+        };
+        let content: View<str> = ws
+            .get(ch)
             .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
         // Name by version ID so import-all can do CAS check.
         let path = dir.join(format!("{:x}.typ", vid));
-        fs::write(&path, content.as_ref())
-            .with_context(|| format!("write {}", path.display()))?;
+        fs::write(&path, content.as_ref()).with_context(|| format!("write {}", path.display()))?;
         count += 1;
     }
-    eprintln!("Exported {} fragments (version-addressed) to {}", count, dir.display());
+    eprintln!(
+        "Exported {} fragments (version-addressed) to {}",
+        count,
+        dir.display()
+    );
     Ok(())
 }
 
 fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     ensure_tag_vocabulary(repo, &mut ws)?;
 
     // Build version->fragment map for filename resolution.
@@ -1799,7 +1890,9 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
     // Parse version IDs from filenames and resolve to fragments.
     let mut work: Vec<(Id, Id, std::path::PathBuf)> = Vec::new(); // (frag_id, exported_vid, path)
     for entry in &entries {
-        let stem = entry.path().file_stem()
+        let stem = entry
+            .path()
+            .file_stem()
             .and_then(|s| s.to_str())
             .map(str::to_string);
         let Some(hex) = stem else { continue };
@@ -1808,7 +1901,10 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
             continue;
         };
         let Some(&frag_id) = vid_to_frag.get(&exported_vid) else {
-            eprintln!("skip {}: unknown version (not in wiki)", entry.path().display());
+            eprintln!(
+                "skip {}: unknown version (not in wiki)",
+                entry.path().display()
+            );
             continue;
         };
         work.push((frag_id, exported_vid, entry.path()));
@@ -1817,7 +1913,8 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
     // CAS loop: checkout -> check versions -> build changes -> commit -> try_push.
     // On conflict, take the new workspace and retry.
     loop {
-        let space = ws.checkout(..)
+        let space = ws
+            .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
         let curr_latest = latest_versions(&space);
@@ -1827,21 +1924,24 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
         let mut updated = 0u32;
 
         for (frag_id, exported_vid, path) in &work {
-            let still_latest = curr_latest.get(frag_id)
+            let still_latest = curr_latest
+                .get(frag_id)
                 .map_or(false, |(current, _)| *current == *exported_vid);
             if !still_latest {
                 eprintln!("CONFLICT {:x} — skipping", frag_id);
                 continue;
             }
 
-            let new_content = fs::read_to_string(path)
-                .with_context(|| format!("read {}", path.display()))?;
+            let new_content =
+                fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
 
             let existing_content = content_handle_of(&space, *exported_vid)
                 .and_then(|ch| ws.get::<View<str>, _>(ch).ok())
                 .map(|v| v.as_ref().to_string())
                 .unwrap_or_default();
-            if new_content == existing_content { continue; }
+            if new_content == existing_content {
+                continue;
+            }
 
             // Lint-fix then validate typst
             let new_content = lint_fix(&new_content, &space);
@@ -1853,13 +1953,15 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
             let tag_ids = tags_of(&space, *exported_vid);
             let title = read_title(&space, &mut ws, *exported_vid).unwrap_or_default();
             let content_handle = ws.put(new_content);
-            let content_text = ws.get::<View<str>, _>(content_handle)
+            let content_text = ws
+                .get::<View<str>, _>(content_handle)
                 .map_err(|e| anyhow::anyhow!("read: {e:?}"))?
                 .as_ref()
                 .to_string();
             let mut all_tags = tag_ids;
             all_tags.push(KIND_VERSION_ID);
-            all_tags.sort(); all_tags.dedup();
+            all_tags.sort();
+            all_tags.dedup();
             let title_handle = ws.put(title);
             let version = entity! { _ @
                 wiki::fragment: frag_id,
@@ -1882,7 +1984,11 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
         ws.commit(change, "wiki import-all");
         match repo.try_push(&mut ws) {
             Ok(None) => {
-                eprintln!("Imported: {} updated, {} total files", updated, entries.len());
+                eprintln!(
+                    "Imported: {} updated, {} total files",
+                    updated,
+                    entries.len()
+                );
                 return Ok(());
             }
             Ok(Some(conflict_ws)) => {
@@ -1908,7 +2014,9 @@ fn cmd_create(
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     ensure_tag_vocabulary(repo, &mut ws)?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let mut change = TribleSet::new();
     let tag_ids = resolve_tags(&space, &mut ws, &tags, &mut change);
 
@@ -1935,7 +2043,16 @@ fn cmd_create(
     };
     let content_handle = ws.put(content);
     let vid = commit_version(
-        repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki create", force,
+        repo,
+        &mut ws,
+        change,
+        fragment_id,
+        &title,
+        content_handle,
+        &tag_ids,
+        &space,
+        "wiki create",
+        force,
     )?;
 
     println!("fragment {}", fragment_id);
@@ -1952,14 +2069,20 @@ fn cmd_edit(
     tags: Vec<String>,
     force: bool,
 ) -> Result<()> {
-    let content = content.map(|c| faculties::text_arg(&c, "content")).transpose()?;
-    let new_title = new_title.map(|t| faculties::text_arg(&t, "title")).transpose()?;
+    let content = content
+        .map(|c| faculties::text_arg(&c, "content"))
+        .transpose()?;
+    let new_title = new_title
+        .map(|t| faculties::text_arg(&t, "title"))
+        .transpose()?;
     if content.is_none() && new_title.is_none() && tags.is_empty() {
         bail!("nothing to change — provide content, --title, or --tag");
     }
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
@@ -1973,9 +2096,8 @@ fn cmd_edit(
         resolve_tags(&space, &mut ws, &tags, &mut change)
     };
 
-    let title = new_title.unwrap_or_else(|| {
-        read_title(&space, &mut ws, prev_vid).unwrap_or_default()
-    });
+    let title =
+        new_title.unwrap_or_else(|| read_title(&space, &mut ws, prev_vid).unwrap_or_default());
     // Validate typst if tagged (either explicitly or inherited)
     let content_handle = match &content {
         Some(text) => {
@@ -1990,7 +2112,16 @@ fn cmd_edit(
             .ok_or_else(|| anyhow::anyhow!("no content on previous version"))?,
     };
     let vid = commit_version(
-        repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki edit", force,
+        repo,
+        &mut ws,
+        change,
+        fragment_id,
+        &title,
+        content_handle,
+        &tag_ids,
+        &space,
+        "wiki edit",
+        force,
     )?;
 
     println!("fragment {}", fragment_id);
@@ -2000,15 +2131,17 @@ fn cmd_edit(
 
 fn cmd_show(repo: &mut Repo, bid: Id, id: String, follow_latest: bool) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let parsed_id = resolve_prefix(&space, &id)?;
     let vid = resolve_to_show(&space, parsed_id, follow_latest)?;
-    let fragment_id = version_fragment(&space, vid)
-        .ok_or_else(|| anyhow::anyhow!("version has no fragment"))?;
+    let fragment_id =
+        version_fragment(&space, vid).ok_or_else(|| anyhow::anyhow!("version has no fragment"))?;
 
-    let content_h = content_handle_of(&space, vid)
-        .ok_or_else(|| anyhow::anyhow!("no content"))?;
-    let content: View<str> = ws.get(content_h)
+    let content_h = content_handle_of(&space, vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
+    let content: View<str> = ws
+        .get(content_h)
         .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
     let title = read_title(&space, &mut ws, vid).unwrap_or_default();
     let tags = tags_of(&space, vid);
@@ -2017,7 +2150,9 @@ fn cmd_show(repo: &mut Repo, bid: Id, id: String, follow_latest: bool) -> Result
     println!("# {title}");
     println!(
         "fragment: {}  version: {}  date: {}",
-        format!("{:x}", fragment_id), vid, format_date(created_at),
+        format!("{:x}", fragment_id),
+        vid,
+        format_date(created_at),
     );
     let tag_str = format_tags(&space, &mut ws, &tags);
     if !tag_str.is_empty() {
@@ -2047,12 +2182,14 @@ fn cmd_show(repo: &mut Repo, bid: Id, id: String, follow_latest: bool) -> Result
 
 fn cmd_export(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let parsed_id = resolve_prefix(&space, &id)?;
     let vid = resolve_to_show(&space, parsed_id, false)?;
-    let ch = content_handle_of(&space, vid)
-        .ok_or_else(|| anyhow::anyhow!("no content"))?;
-    let content: View<str> = ws.get(ch)
+    let ch = content_handle_of(&space, vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
+    let content: View<str> = ws
+        .get(ch)
         .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
     print!("{}", content.as_ref());
     Ok(())
@@ -2066,7 +2203,9 @@ fn cmd_diff(
     to: Option<usize>,
 ) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let history = version_history_of(&space, fragment_id);
@@ -2089,8 +2228,12 @@ fn cmd_diff(
 
     let old_ch = content_handle_of(&space, old_vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
     let new_ch = content_handle_of(&space, new_vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
-    let old_content: View<str> = ws.get(old_ch).map_err(|e| anyhow::anyhow!("read old content: {e:?}"))?;
-    let new_content: View<str> = ws.get(new_ch).map_err(|e| anyhow::anyhow!("read new content: {e:?}"))?;
+    let old_content: View<str> = ws
+        .get(old_ch)
+        .map_err(|e| anyhow::anyhow!("read old content: {e:?}"))?;
+    let new_content: View<str> = ws
+        .get(new_ch)
+        .map_err(|e| anyhow::anyhow!("read new content: {e:?}"))?;
 
     let old_title = read_title(&space, &mut ws, old_vid).unwrap_or_default();
     let new_title = read_title(&space, &mut ws, new_vid).unwrap_or_default();
@@ -2121,7 +2264,9 @@ fn cmd_diff(
 
 fn cmd_archive(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
@@ -2137,11 +2282,19 @@ fn cmd_archive(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
     ensure_tag_vocabulary(repo, &mut ws)?;
     let mut tags = prev_tags;
     tags.push(TAG_ARCHIVED_ID);
-    let prev_ch = content_handle_of(&space, prev_vid)
-        .ok_or_else(|| anyhow::anyhow!("no content"))?;
+    let prev_ch =
+        content_handle_of(&space, prev_vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
     commit_version(
-        repo, &mut ws, TribleSet::new(), fragment_id, &prev_title, prev_ch, &tags,
-        &space, "wiki archive", true,
+        repo,
+        &mut ws,
+        TribleSet::new(),
+        fragment_id,
+        &prev_title,
+        prev_ch,
+        &tags,
+        &space,
+        "wiki archive",
+        true,
     )?;
 
     println!("archived: {} ({})", prev_title, fragment_id);
@@ -2150,7 +2303,9 @@ fn cmd_archive(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
 
 fn cmd_restore(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
@@ -2163,12 +2318,23 @@ fn cmd_restore(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
         return Ok(());
     }
 
-    let tags: Vec<Id> = prev_tags.into_iter().filter(|t| *t != TAG_ARCHIVED_ID).collect();
-    let prev_ch = content_handle_of(&space, prev_vid)
-        .ok_or_else(|| anyhow::anyhow!("no content"))?;
+    let tags: Vec<Id> = prev_tags
+        .into_iter()
+        .filter(|t| *t != TAG_ARCHIVED_ID)
+        .collect();
+    let prev_ch =
+        content_handle_of(&space, prev_vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
     commit_version(
-        repo, &mut ws, TribleSet::new(), fragment_id, &prev_title, prev_ch, &tags,
-        &space, "wiki restore", true,
+        repo,
+        &mut ws,
+        TribleSet::new(),
+        fragment_id,
+        &prev_title,
+        prev_ch,
+        &tags,
+        &space,
+        "wiki restore",
+        true,
     )?;
 
     println!("restored: {} ({})", prev_title, fragment_id);
@@ -2181,7 +2347,9 @@ fn cmd_revert(repo: &mut Repo, bid: Id, id: String, to: usize) -> Result<()> {
     }
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let history = version_history_of(&space, fragment_id);
@@ -2190,27 +2358,41 @@ fn cmd_revert(repo: &mut Repo, bid: Id, id: String, to: usize) -> Result<()> {
     if idx >= history.len() {
         bail!(
             "fragment {} has {} version(s), cannot revert to v{to}",
-            format!("{:x}", fragment_id), history.len(),
+            format!("{:x}", fragment_id),
+            history.len(),
         );
     }
 
     let target_vid = history[idx];
     let target_title = read_title(&space, &mut ws, target_vid).unwrap_or_default();
-    let target_ch = content_handle_of(&space, target_vid)
-        .ok_or_else(|| anyhow::anyhow!("no content"))?;
+    let target_ch =
+        content_handle_of(&space, target_vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
     let target_tags = tags_of(&space, target_vid);
     let vid = commit_version(
-        repo, &mut ws, TribleSet::new(), fragment_id, &target_title, target_ch,
-        &target_tags, &space, "wiki revert", true,
+        repo,
+        &mut ws,
+        TribleSet::new(),
+        fragment_id,
+        &target_title,
+        target_ch,
+        &target_tags,
+        &space,
+        "wiki revert",
+        true,
     )?;
 
-    println!("reverted {} ({}) to v{to}: {}", fragment_id, vid, target_title);
+    println!(
+        "reverted {} ({}) to v{to}: {}",
+        fragment_id, vid, target_title
+    );
     Ok(())
 }
 
 fn cmd_links(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let resolved = resolve_prefix(&space, &id)?;
     let title = if is_version(&space, resolved) {
         read_title(&space, &mut ws, resolved).unwrap_or_else(|| "?".into())
@@ -2259,7 +2441,9 @@ fn cmd_list(
     show_all: bool,
 ) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     // A tag name that doesn't resolve to a tag entity matches zero fragments.
     // Silently dropping it (filter_map) would degrade the filter to "no
     // filter" and list everything — so unknown positive filters short-circuit
@@ -2291,27 +2475,37 @@ fn cmd_list(
     // the entity-core mechanism. The hex id is hashed from the
     // `(metadata::name, metadata::value_encoding)` pair so the same name
     // + schema produces the same attribute id deterministically.
-    let attr_from_name = |name: &str| -> triblespace::core::attribute::Attribute<inlineencodings::GenId> {
-        let name_handle = name.to_owned().to_blob().get_handle();
-        triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from(entity! {
-            metadata::name: name_handle,
-            metadata::value_encoding: <inlineencodings::GenId as triblespace::core::metadata::MetaDescribe>::id(),
-        })
-    };
-    let with_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<inlineencodings::GenId>)> =
-        with_backlink_type.iter()
-            .map(|name| (name.clone(), attr_from_name(name)))
-            .collect();
-    let without_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<inlineencodings::GenId>)> =
-        without_backlink_type.iter()
-            .map(|name| (name.clone(), attr_from_name(name)))
-            .collect();
-    let has_backlink_filter = !with_bl_ids.is_empty() || !without_bl_ids.is_empty()
-        || !with_bl_type_attrs.is_empty() || !without_bl_type_attrs.is_empty();
+    let attr_from_name =
+        |name: &str| -> triblespace::core::attribute::Attribute<inlineencodings::GenId> {
+            let name_handle = name.to_owned().to_blob().get_handle();
+            triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from(entity! {
+                metadata::name: name_handle,
+                metadata::value_encoding: <inlineencodings::GenId as triblespace::core::metadata::MetaDescribe>::id(),
+            })
+        };
+    let with_bl_type_attrs: Vec<(
+        String,
+        triblespace::core::attribute::Attribute<inlineencodings::GenId>,
+    )> = with_backlink_type
+        .iter()
+        .map(|name| (name.clone(), attr_from_name(name)))
+        .collect();
+    let without_bl_type_attrs: Vec<(
+        String,
+        triblespace::core::attribute::Attribute<inlineencodings::GenId>,
+    )> = without_backlink_type
+        .iter()
+        .map(|name| (name.clone(), attr_from_name(name)))
+        .collect();
+    let has_backlink_filter = !with_bl_ids.is_empty()
+        || !without_bl_ids.is_empty()
+        || !with_bl_type_attrs.is_empty()
+        || !without_bl_type_attrs.is_empty();
 
     let latest = latest_versions(&space);
 
-    let mut entries: Vec<(Id, Id, Lower)> = latest.into_iter()
+    let mut entries: Vec<(Id, Id, Lower)> = latest
+        .into_iter()
         .map(|(frag, (vid, ts))| (frag, vid, ts))
         .collect();
     entries.sort_by(|a, b| b.2.cmp(&a.2));
@@ -2339,7 +2533,10 @@ fn cmd_list(
             targets.push(*frag_id);
             targets.sort();
             targets.dedup();
-            let targets_slice = triblespace::core::query::sortedsliceconstraint::SortedSlice::new_unchecked(&targets);
+            let targets_slice =
+                triblespace::core::query::sortedsliceconstraint::SortedSlice::new_unchecked(
+                    &targets,
+                );
 
             let all_backlinks: Vec<Id> = find!(
                 src: Id,
@@ -2349,7 +2546,8 @@ fn cmd_list(
                         targets_slice.has(target),
                     )
                 )
-            ).collect();
+            )
+            .collect();
 
             let mut backlink_tags: Vec<Id> = Vec::new();
             for &source_vid in &all_backlinks {
@@ -2358,9 +2556,7 @@ fn cmd_list(
                 }
             }
 
-            if !with_bl_ids.is_empty()
-                && !with_bl_ids.iter().all(|t| backlink_tags.contains(t))
-            {
+            if !with_bl_ids.is_empty() && !with_bl_ids.iter().all(|t| backlink_tags.contains(t)) {
                 continue;
             }
             if !without_bl_ids.is_empty()
@@ -2373,26 +2569,34 @@ fn cmd_list(
             // derived-attribute edge of the given type pointing to *any* version
             // of this fragment (or to the fragment id itself)? Same single-pattern
             // trick — target constrained to the sorted target slice.
-            let check_type_target = |attr: &triblespace::core::attribute::Attribute<inlineencodings::GenId>| -> bool {
-                find!(
-                    src: Id,
-                    temp!((target),
-                        and!(
-                            pattern!(&space, [{ ?src @ attr: ?target }]),
-                            targets_slice.has(target),
+            let check_type_target =
+                |attr: &triblespace::core::attribute::Attribute<inlineencodings::GenId>| -> bool {
+                    find!(
+                        src: Id,
+                        temp!((target),
+                            and!(
+                                pattern!(&space, [{ ?src @ attr: ?target }]),
+                                targets_slice.has(target),
+                            )
                         )
                     )
-                ).any(|src| latest_vids.contains(&src))
-            };
+                    .any(|src| latest_vids.contains(&src))
+                };
             if !with_bl_type_attrs.is_empty() {
-                let all_present = with_bl_type_attrs.iter()
+                let all_present = with_bl_type_attrs
+                    .iter()
                     .all(|(_, attr)| check_type_target(attr));
-                if !all_present { continue; }
+                if !all_present {
+                    continue;
+                }
             }
             if !without_bl_type_attrs.is_empty() {
-                let any_present = without_bl_type_attrs.iter()
+                let any_present = without_bl_type_attrs
+                    .iter()
                     .any(|(_, attr)| check_type_target(attr));
-                if any_present { continue; }
+                if any_present {
+                    continue;
+                }
             }
         }
 
@@ -2407,7 +2611,11 @@ fn cmd_list(
 
         println!(
             "{}  {}  {}{}{}",
-            format!("{:x}", frag_id), format_date(*created_at), title, tag_str, ver_str,
+            format!("{:x}", frag_id),
+            format_date(*created_at),
+            title,
+            tag_str,
+            ver_str,
         );
 
         if let Some(ch) = content_handle_of(&space, *vid) {
@@ -2430,12 +2638,15 @@ fn cmd_list(
 
 fn cmd_history(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let history = version_history_of(&space, fragment_id);
 
-    let latest_title = history.last()
+    let latest_title = history
+        .last()
         .and_then(|vid| read_title(&space, &mut ws, *vid))
         .unwrap_or_else(|| "?".into());
     println!("# History: {} ({})", latest_title, fragment_id);
@@ -2447,7 +2658,11 @@ fn cmd_history(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
         let tags = tags_of(&space, *vid);
         println!(
             "  v{}  {}  {}  {}{}",
-            i + 1, vid, format_date(ts), title, format_tags(&space, &mut ws, &tags),
+            i + 1,
+            vid,
+            format_date(ts),
+            title,
+            format_tags(&space, &mut ws, &tags),
         );
     }
     Ok(())
@@ -2459,7 +2674,9 @@ fn cmd_tag_add(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<()>
         bail!("tag name cannot be empty");
     }
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
@@ -2478,11 +2695,19 @@ fn cmd_tag_add(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<()>
     let mut tags = prev_tags;
     tags.push(new_tag);
     let prev_title = read_title(&space, &mut ws, prev_vid).unwrap_or_default();
-    let prev_ch = content_handle_of(&space, prev_vid)
-        .ok_or_else(|| anyhow::anyhow!("no content"))?;
+    let prev_ch =
+        content_handle_of(&space, prev_vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
     commit_version(
-        repo, &mut ws, change, fragment_id, &prev_title, prev_ch, &tags,
-        &space, "wiki tag add", true,
+        repo,
+        &mut ws,
+        change,
+        fragment_id,
+        &prev_title,
+        prev_ch,
+        &tags,
+        &space,
+        "wiki tag add",
+        true,
     )?;
 
     println!("added #{name} to {} ({})", prev_title, fragment_id);
@@ -2495,7 +2720,9 @@ fn cmd_tag_remove(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<
         bail!("tag name cannot be empty");
     }
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
@@ -2511,11 +2738,19 @@ fn cmd_tag_remove(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<
 
     let tags: Vec<Id> = prev_tags.into_iter().filter(|t| *t != tag_id).collect();
     let prev_title = read_title(&space, &mut ws, prev_vid).unwrap_or_default();
-    let prev_ch = content_handle_of(&space, prev_vid)
-        .ok_or_else(|| anyhow::anyhow!("no content"))?;
+    let prev_ch =
+        content_handle_of(&space, prev_vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
     commit_version(
-        repo, &mut ws, TribleSet::new(), fragment_id, &prev_title, prev_ch, &tags,
-        &space, "wiki tag remove", true,
+        repo,
+        &mut ws,
+        TribleSet::new(),
+        fragment_id,
+        &prev_title,
+        prev_ch,
+        &tags,
+        &space,
+        "wiki tag remove",
+        true,
     )?;
 
     println!("removed #{name} from {} ({})", prev_title, fragment_id);
@@ -2524,7 +2759,9 @@ fn cmd_tag_remove(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<
 
 fn cmd_tag_list(repo: &mut Repo, bid: Id) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let mut counts: HashMap<Id, usize> = HashMap::new();
     for (tag_id,) in find!(
         (tag_id: Id),
@@ -2563,7 +2800,9 @@ fn cmd_tag_mint(repo: &mut Repo, bid: Id, name: String) -> Result<()> {
     }
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     if let Some(existing) = find_tag_by_name(&space, &mut ws, &name) {
         println!("tag '{}' already exists: {}", name, existing);
         return Ok(());
@@ -2600,10 +2839,12 @@ fn cmd_import(repo: &mut Repo, bid: Id, path: PathBuf, tags: Vec<String>) -> Res
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     ensure_tag_vocabulary(repo, &mut ws)?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     for file in &files {
-        let content = fs::read_to_string(file)
-            .with_context(|| format!("read {}", file.display()))?;
+        let content =
+            fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
 
         let title = content
             .lines()
@@ -2621,7 +2862,16 @@ fn cmd_import(repo: &mut Repo, bid: Id, path: PathBuf, tags: Vec<String>) -> Res
         let fragment_id = genid().id;
         let content_handle = ws.put(content);
         let vid = commit_version(
-            repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki import", true,
+            repo,
+            &mut ws,
+            change,
+            fragment_id,
+            &title,
+            content_handle,
+            &tag_ids,
+            &space,
+            "wiki import",
+            true,
         )?;
 
         println!("{}  {}  {}", fragment_id, vid, file.display());
@@ -2693,7 +2943,9 @@ fn cmd_embed(repo: &mut Repo, bid: Id) -> Result<()> {
     let emb = load_nomic_text_embedder()?;
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let latest = latest_versions(&space);
 
     let mut todo: Vec<(Id, TextHandle)> = Vec::new();
@@ -2715,7 +2967,9 @@ fn cmd_embed(repo: &mut Repo, bid: Id) -> Result<()> {
     let total = todo.len();
     let mut change = TribleSet::new();
     for (i, (vid, ch)) in todo.into_iter().enumerate() {
-        let content: View<str> = ws.get(ch).map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+        let content: View<str> = ws
+            .get(ch)
+            .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
         let v = l2_normalize(
             emb.embed_document(content.as_ref())
                 .map_err(|e| anyhow::anyhow!("embed {vid:x}: {e:?}"))?,
@@ -2727,7 +2981,8 @@ fn cmd_embed(repo: &mut Repo, bid: Id) -> Result<()> {
         }
     }
     ws.commit(change, "wiki embed");
-    repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.push(&mut ws)
+        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
     // Refresh the persisted HNSW segment so `wiki similar` queries the graph
     // instead of rebuilding it. Best-effort (soft state): warn on failure.
     if let Err(e) = embeddings::refresh_index(repo, bid) {
@@ -2754,7 +3009,9 @@ fn cmd_similar(repo: &mut Repo, bid: Id, query: String) -> Result<()> {
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let expected_head = ws.head();
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let latest = latest_versions(&space);
 
     // Map each current (non-archived) version to its fragment, and its
@@ -2775,41 +3032,38 @@ fn cmd_similar(repo: &mut Repo, bid: Id, query: String) -> Result<()> {
 
     // FAST PATH: attach the persisted HNSW segment(s) and query — no
     // gather-all-pairs, no rebuild. Translate result handles → version ids.
-    let ranked: Vec<(f32, Id)> = match embeddings::nearest_via_index(
-        repo.storage_mut(),
-        bid,
-        expected_head,
-        &qv,
-        0.0,
-    )
-    .map_err(|e| anyhow::anyhow!("hnsw index query: {e:?}"))?
-    {
-        Some(rows) => rows
-            .into_iter()
-            .filter_map(|(cos, raw)| by_handle.get(&raw).map(|vid| (cos, *vid)))
-            .collect(),
-        // FALLBACK: no HNSW segment yet — gather all pairs and rebuild once.
-        None => {
-            let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
-            for (&vid, _) in &vid_to_frag {
-                if let Some(h) = version_embedding_handle(&space, vid) {
-                    let v: View<[f32]> =
-                        ws.get(h).map_err(|e| anyhow::anyhow!("read embedding: {e:?}"))?;
-                    pairs.push((vid, v.as_ref().to_vec()));
+    let ranked: Vec<(f32, Id)> =
+        match embeddings::nearest_via_index(repo.storage_mut(), bid, expected_head, &qv, 0.0)
+            .map_err(|e| anyhow::anyhow!("hnsw index query: {e:?}"))?
+        {
+            Some(rows) => rows
+                .into_iter()
+                .filter_map(|(cos, raw)| by_handle.get(&raw).map(|vid| (cos, *vid)))
+                .collect(),
+            // FALLBACK: no HNSW segment yet — gather all pairs and rebuild once.
+            None => {
+                let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
+                for (&vid, _) in &vid_to_frag {
+                    if let Some(h) = version_embedding_handle(&space, vid) {
+                        let v: View<[f32]> = ws
+                            .get(h)
+                            .map_err(|e| anyhow::anyhow!("read embedding: {e:?}"))?;
+                        pairs.push((vid, v.as_ref().to_vec()));
+                    }
                 }
-            }
-            if pairs.is_empty() {
-                bail!("no fragment embeddings on this pile yet — run `wiki embed` first");
-            }
-            if pairs.len() < current {
-                eprintln!(
+                if pairs.is_empty() {
+                    bail!("no fragment embeddings on this pile yet — run `wiki embed` first");
+                }
+                if pairs.len() < current {
+                    eprintln!(
                     "note: {} current fragment(s) not yet embedded — run `wiki embed` to refresh",
                     current - pairs.len()
                 );
+                }
+                embeddings::nearest(&pairs, &qv, 0.0)
+                    .map_err(|e| anyhow::anyhow!("nearest: {e:?}"))?
             }
-            embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow::anyhow!("nearest: {e:?}"))?
-        }
-    };
+        };
     if ranked.is_empty() {
         println!("no matches.");
         return Ok(());
@@ -2837,7 +3091,9 @@ fn cmd_search(
     let query_lower = query.to_lowercase();
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let latest = latest_versions(&space);
 
     let mut hits: Vec<(Id, Id, Lower, String, Vec<Id>, Vec<String>)> = Vec::new();
@@ -2852,7 +3108,8 @@ fn cmd_search(
             Some(ch) => ch,
             None => continue,
         };
-        let content: View<str> = ws.get(ch)
+        let content: View<str> = ws
+            .get(ch)
             .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
         let content_str = content.as_ref();
 
@@ -2883,7 +3140,10 @@ fn cmd_search(
     for (frag_id, _vid, created_at, title, tags, context_lines) in &hits {
         println!(
             "{}  {}  {}{}",
-            format!("{:x}", frag_id), format_date(*created_at), title, format_tags(&space, &mut ws, tags),
+            format!("{:x}", frag_id),
+            format_date(*created_at),
+            title,
+            format_tags(&space, &mut ws, tags),
         );
         for line in context_lines {
             println!("    {}", line.trim());
@@ -2991,8 +3251,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let pile = Pile::open(&cli.pile)
-        .map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
+    let pile = Pile::open(&cli.pile).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
     let signing_key = SigningKey::generate(&mut OsRng);
     let mut repo = Repository::new(pile, signing_key, TribleSet::new())
         .map_err(|e| anyhow::anyhow!("create repo: {e:?}"))?;
@@ -3005,9 +3264,13 @@ fn main() -> Result<()> {
     };
 
     let result = match command {
-        Command::Create { title, content, tag, force, id } => {
-            cmd_create(&mut repo, branch_id, title, content, tag, force, id)
-        }
+        Command::Create {
+            title,
+            content,
+            tag,
+            force,
+            id,
+        } => cmd_create(&mut repo, branch_id, title, content, tag, force, id),
         Command::Edit {
             id,
             content,
@@ -3022,8 +3285,23 @@ fn main() -> Result<()> {
         Command::Restore { id } => cmd_restore(&mut repo, branch_id, id),
         Command::Revert { id, to } => cmd_revert(&mut repo, branch_id, id, to),
         Command::Links { id } => cmd_links(&mut repo, branch_id, id),
-        Command::List { tag, with_backlink_tag, without_backlink_tag, with_backlink_type, without_backlink_type, all } =>
-            cmd_list(&mut repo, branch_id, tag, with_backlink_tag, without_backlink_tag, with_backlink_type, without_backlink_type, all),
+        Command::List {
+            tag,
+            with_backlink_tag,
+            without_backlink_tag,
+            with_backlink_type,
+            without_backlink_type,
+            all,
+        } => cmd_list(
+            &mut repo,
+            branch_id,
+            tag,
+            with_backlink_tag,
+            without_backlink_tag,
+            with_backlink_type,
+            without_backlink_type,
+            all,
+        ),
         Command::History { id } => cmd_history(&mut repo, branch_id, id),
         Command::Tag { command: tag_cmd } => match tag_cmd {
             TagCommand::Add { id, name } => cmd_tag_add(&mut repo, branch_id, id, name),
@@ -3032,9 +3310,11 @@ fn main() -> Result<()> {
             TagCommand::Mint { name } => cmd_tag_mint(&mut repo, branch_id, name),
         },
         Command::Import { path, tag } => cmd_import(&mut repo, branch_id, path, tag),
-        Command::Search { query, context, all } => {
-            cmd_search(&mut repo, branch_id, query, context, all)
-        }
+        Command::Search {
+            query,
+            context,
+            all,
+        } => cmd_search(&mut repo, branch_id, query, context, all),
         Command::Embed => cmd_embed(&mut repo, branch_id),
         Command::Similar { query } => cmd_similar(&mut repo, branch_id, query),
         Command::Check { compile } => cmd_check(&mut repo, branch_id, compile),

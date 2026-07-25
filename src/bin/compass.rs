@@ -5,9 +5,7 @@ use faculties::schemas::compass::{
     board, latest_status_event, DEFAULT_STATUSES, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
 };
-use faculties::schemas::relations::{
-    active_person_ids, relations as rel_attrs, KIND_PERSON_ID,
-};
+use faculties::schemas::relations::{active_person_ids, relations as rel_attrs, KIND_PERSON_ID};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
@@ -325,8 +323,8 @@ fn resolve_note_id(input: &str, space: &TribleSet) -> Result<Id> {
     if trimmed.len() != 32 {
         bail!("supersedes requires a full 32-char note id: '{trimmed}'");
     }
-    let note_id = Id::from_hex(trimmed)
-        .ok_or_else(|| anyhow::anyhow!("invalid note id '{trimmed}'"))?;
+    let note_id =
+        Id::from_hex(trimmed).ok_or_else(|| anyhow::anyhow!("invalid note id '{trimmed}'"))?;
     if !all_note_ids(space).contains(&note_id) {
         bail!("supersedes target is not an existing note: '{trimmed}'");
     }
@@ -418,11 +416,7 @@ fn note_tags(space: &TribleSet, note_id: Id) -> Vec<String> {
     tags
 }
 
-fn note_references(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    note_id: Id,
-) -> Vec<String> {
+fn note_references(ws: &mut Workspace<Pile>, space: &TribleSet, note_id: Id) -> Vec<String> {
     let mut references: Vec<String> = find!(
         handle: TextHandle,
         pattern!(space, [{ note_id @ board::reference: ?handle }])
@@ -991,7 +985,10 @@ fn cmd_note(
     for tag in &tags {
         validate_short("tag", tag)?;
     }
-    if let Some(reference) = references.iter().find(|reference| reference.trim().is_empty()) {
+    if let Some(reference) = references
+        .iter()
+        .find(|reference| reference.trim().is_empty())
+    {
         bail!("reference must not be empty: {reference:?}");
     }
     references.extend(extract_reference_values(&note));

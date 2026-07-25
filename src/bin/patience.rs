@@ -1,8 +1,7 @@
-
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::patience::{DEFAULT_BRANCH, KIND_TIMEOUT_EXTENSION_ID, exec_schema};
+use faculties::schemas::patience::{exec_schema, DEFAULT_BRANCH, KIND_TIMEOUT_EXTENSION_ID};
 use hifitime::Epoch;
 use humantime::parse_duration;
 use rand_core::OsRng;
@@ -81,7 +80,8 @@ fn parse_timeout_ms(raw: &str) -> Result<u64> {
     if let Ok(ms) = trimmed.parse::<u64>() {
         return Ok(ms);
     }
-    let duration = parse_duration(trimmed).with_context(|| format!("invalid duration '{trimmed}'"))?;
+    let duration =
+        parse_duration(trimmed).with_context(|| format!("invalid duration '{trimmed}'"))?;
     let millis = duration.as_millis();
     if millis == 0 {
         bail!("duration must be greater than zero");
@@ -93,8 +93,7 @@ fn parse_timeout_ms(raw: &str) -> Result<u64> {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -112,10 +111,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
@@ -134,12 +130,10 @@ fn resolve_branch_id(
     branch_name: &str,
 ) -> Result<Id> {
     if let Some(hex) = explicit_hex {
-        return Id::from_hex(hex.trim())
-            .ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
+        return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
     }
     if let Ok(hex) = std::env::var("TRIBLESPACE_BRANCH_ID") {
-        return Id::from_hex(hex.trim())
-            .ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID"));
+        return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID"));
     }
     repo.ensure_branch(branch_name, None)
         .map_err(|e| anyhow!("ensure {branch_name} branch: {e:?}"))
@@ -174,12 +168,9 @@ fn append_timeout_extension(
 }
 
 fn shell_quote(word: &str) -> String {
-    if word
-        .chars()
-        .all(|ch| {
-            ch.is_ascii_alphanumeric() || std::matches!(ch, '_' | '-' | '.' | '/' | ':' | '=')
-        })
-    {
+    if word.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || std::matches!(ch, '_' | '-' | '.' | '/' | ':' | '=')
+    }) {
         return word.to_string();
     }
     format!("'{}'", word.replace('\'', "'\\''"))
@@ -222,24 +213,17 @@ fn main() -> Result<()> {
         resolve_branch_id(repo, cli.branch_id.as_deref(), &cli.branch)
     })?;
 
-    let request_id = parse_optional_hex_id(
-        cli.turn_id.as_deref().or(env_turn_id.as_deref()),
-        "turn id",
-    )?
-    .ok_or_else(|| anyhow!("missing turn id (pass --turn-id or set TURN_ID)"))?;
+    let request_id =
+        parse_optional_hex_id(cli.turn_id.as_deref().or(env_turn_id.as_deref()), "turn id")?
+            .ok_or_else(|| anyhow!("missing turn id (pass --turn-id or set TURN_ID)"))?;
     let worker_id = parse_optional_hex_id(
         cli.worker_id.as_deref().or(env_worker_id.as_deref()),
         "worker id",
     )?
     .ok_or_else(|| anyhow!("missing worker id (pass --worker-id or set WORKER_ID)"))?;
 
-    let event_id = append_timeout_extension(
-        &pile_path,
-        branch_id,
-        request_id,
-        worker_id,
-        timeout_ms,
-    )?;
+    let event_id =
+        append_timeout_extension(&pile_path, branch_id, request_id, worker_id, timeout_ms)?;
 
     eprintln!(
         "[{}] timeout extended by {} ms",

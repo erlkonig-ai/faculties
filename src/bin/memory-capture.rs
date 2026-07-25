@@ -23,11 +23,7 @@ fn resolve_pile_path() -> PathBuf {
     }
     std::env::var("PILE")
         .ok()
-        .or_else(|| {
-            std::env::args()
-                .skip(1)
-                .find(|a| !a.starts_with("--"))
-        })
+        .or_else(|| std::env::args().skip(1).find(|a| !a.starts_with("--")))
         .unwrap_or_else(|| "./self.pile".to_owned())
         .into()
 }

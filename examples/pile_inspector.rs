@@ -53,8 +53,7 @@ fn main(nb: &mut NotebookCtx) {
             let mut st = storage.read_mut(ctx);
             // Pull a fresh workspace per source each frame.
             let branch_names: &[&str] = &["compass", "message", "wiki"];
-            let mut pulled: Vec<(&str, Workspace<Pile>)> =
-                Vec::with_capacity(branch_names.len());
+            let mut pulled: Vec<(&str, Workspace<Pile>)> = Vec::with_capacity(branch_names.len());
             for name in branch_names {
                 if let Some(ws) = st.workspace(name) {
                     pulled.push((*name, ws));
@@ -68,7 +67,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("wiki", WikiViewer::default(), move |ctx, wiki| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("wiki") else { return };
+        let Some(mut ws) = st.workspace("wiki") else {
+            return;
+        };
         let mut files = st.workspace("files");
         wiki.render(ctx, &mut ws, files.as_mut());
         st.push(&mut ws);
@@ -76,14 +77,18 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("compass", CompassBoard::default(), move |ctx, compass| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("compass") else { return };
+        let Some(mut ws) = st.workspace("compass") else {
+            return;
+        };
         compass.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 
     nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("message") else { return };
+        let Some(mut ws) = st.workspace("message") else {
+            return;
+        };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);

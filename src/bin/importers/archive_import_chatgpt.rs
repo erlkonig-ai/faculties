@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::common;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value as JsonValue;
 use tracing::info_span;
 use triblespace::core::blob::Bytes;
@@ -96,14 +96,7 @@ fn import_chatgpt_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> R
         parsed.conversations.len(),
         parse_start.elapsed()
     );
-    import_chatgpt_parsed_file(
-        path,
-        parsed,
-        repo,
-        &mut ws,
-        &mut catalog,
-        &mut catalog_head,
-    )
+    import_chatgpt_parsed_file(path, parsed, repo, &mut ws, &mut catalog, &mut catalog_head)
 }
 
 fn import_chatgpt_parsed_file(
@@ -138,11 +131,7 @@ fn import_chatgpt_parsed_file(
         let convo_raw = serde_json::to_string(convo).context("serialize conversation json")?;
         let (raw_root, raw_fragment) = {
             let raw_tree_start = Instant::now();
-            let mut raw_importer =
-                JsonTreeImporter::<_>::new(
-                    repo.storage_mut(),
-                    None,
-                );
+            let mut raw_importer = JsonTreeImporter::<_>::new(repo.storage_mut(), None);
             let raw_fragment = raw_importer
                 .import_str(&convo_raw)
                 .with_context(|| format!("import json tree for conversation {convo_id}"))?;
@@ -364,14 +353,7 @@ fn import_chatgpt_parsed_file(
             stats.messages += 1;
         }
 
-        if common::commit_delta(
-            repo,
-            ws,
-            catalog,
-            catalog_head,
-            change,
-            "import chatgpt",
-        )? {
+        if common::commit_delta(repo, ws, catalog, catalog_head, change, "import chatgpt")? {
             stats.commits += 1;
         }
         stats.conversations += 1;
@@ -672,18 +654,18 @@ fn extract_message_text(message: &serde_json::Map<String, JsonValue>) -> Option<
             out.push_str(text);
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn attachment_data_handle(
     catalog: &TribleSet,
     attachment_id: Id,
-) -> Option<
-    Inline<
-        triblespace::prelude::inlineencodings::Handle<common::archive_schema::RawBytes,
-        >,
-    >,
-> {
+) -> Option<Inline<triblespace::prelude::inlineencodings::Handle<common::archive_schema::RawBytes>>>
+{
     find!(
         (handle: Inline<triblespace::prelude::inlineencodings::Handle<common::archive_schema::RawBytes>>),
         pattern!(catalog, [{ attachment_id @ common::archive::attachment_data: ?handle }])

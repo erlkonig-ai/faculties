@@ -15,8 +15,8 @@
 //! crypto and the resolution live so `secrets` (writer), `mail`, and
 //! `orient` (readers) can never drift.
 
-use anyhow::{Context, Result, bail};
-use dryoc::classic::crypto_pwhash::{PasswordHashAlgorithm, crypto_pwhash};
+use anyhow::{bail, Context, Result};
+use dryoc::classic::crypto_pwhash::{crypto_pwhash, PasswordHashAlgorithm};
 use dryoc::constants::{
     CRYPTO_PWHASH_MEMLIMIT_MODERATE, CRYPTO_PWHASH_OPSLIMIT_MODERATE, CRYPTO_PWHASH_SALTBYTES,
 };
@@ -31,7 +31,7 @@ use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
-use crate::schemas::mail::{KIND_MAIL_ACCOUNT, KIND_MAIL_ACTIVE, mail_account};
+use crate::schemas::mail::{mail_account, KIND_MAIL_ACCOUNT, KIND_MAIL_ACTIVE};
 
 type BytesHandle = Inline<Handle<RawBytes>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -69,9 +69,7 @@ struct AccountBody {
 pub fn password() -> Result<Vec<u8>> {
     std::env::var("FACULTIES_SECRETS_PW")
         .map(|s| s.into_bytes())
-        .map_err(|_| {
-            anyhow::anyhow!("set FACULTIES_SECRETS_PW to unlock the stored mail account")
-        })
+        .map_err(|_| anyhow::anyhow!("set FACULTIES_SECRETS_PW to unlock the stored mail account"))
 }
 
 fn derive_key(password: &[u8], salt: &[u8]) -> Key {
@@ -187,7 +185,11 @@ pub fn active_address(space: &TribleSet) -> Option<String> {
         return newest;
     }
     let all = list_addresses(space);
-    if all.len() == 1 { all.into_iter().next() } else { None }
+    if all.len() == 1 {
+        all.into_iter().next()
+    } else {
+        None
+    }
 }
 
 /// The `box` handle for a given account address, if the account exists.
@@ -209,10 +211,7 @@ fn box_handle_for(space: &TribleSet, address: &str) -> Option<BytesHandle> {
 /// callers can fall back to env vars), `Err` only when an account IS
 /// configured but can't be unlocked (wrong/missing password) — a real
 /// misconfiguration the operator should see, not a silent env fallback.
-pub fn resolve_active(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-) -> Result<Option<MailAccount>> {
+pub fn resolve_active(ws: &mut Workspace<Pile>, space: &TribleSet) -> Result<Option<MailAccount>> {
     let Some(address) = active_address(space) else {
         return Ok(None);
     };

@@ -21,19 +21,17 @@
 //!        MAIL_SMTP_HOST  — default smtp.migadu.com
 //!        MAIL_SMTP_PORT  — default 465 (TLS)
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::decide::{
-    KIND_DECISION, decide as decide_attrs,
-};
+use faculties::schemas::decide::{decide as decide_attrs, KIND_DECISION};
 use faculties::schemas::files::{file, KIND_FILE};
-use faculties::schemas::message::{local as read_attrs, KIND_READ_ID};
 use faculties::schemas::mail::{mail, KIND_DRAFT, KIND_MESSAGE, KIND_SPAM};
+use faculties::schemas::message::{local as read_attrs, KIND_READ_ID};
 use faculties::schemas::relations::{relations as rel_attrs, KIND_PERSON_ID};
 use hifitime::Epoch;
-use lettre::message::{Mailbox, MultiPart, SinglePart, header};
+use lettre::message::{header, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use rand_core::OsRng;
@@ -229,9 +227,10 @@ fn load_config_from_repo(repo: &mut Repository<Pile>) -> Result<MailConfig> {
     }
 
     // Env fallback (legacy / no-secrets setups).
-    let user = std::env::var("MAIL_USER")
-        .context("no active mail account in secrets and MAIL_USER not set \
-                  (configure with `secrets mail-account add`, or set MAIL_USER/MAIL_PASS)")?;
+    let user = std::env::var("MAIL_USER").context(
+        "no active mail account in secrets and MAIL_USER not set \
+                  (configure with `secrets mail-account add`, or set MAIL_USER/MAIL_PASS)",
+    )?;
     let pass = std::env::var("MAIL_PASS").context("MAIL_PASS not set")?;
     let from_name = std::env::var("MAIL_FROM_NAME").unwrap_or_else(|_| DEFAULT_FROM_NAME.into());
     let pop3_host = std::env::var("MAIL_POP3_HOST").unwrap_or_else(|_| "pop.migadu.com".into());
@@ -327,8 +326,8 @@ fn parse_iso8601(input: &str) -> Result<DateTime<Utc>> {
 use chrono::TimeZone;
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -345,10 +344,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo
@@ -378,13 +374,9 @@ fn mime_for_filename(name: &str) -> &'static str {
     let ext = lower.rsplit('.').next().unwrap_or("");
     match ext {
         "pdf" => "application/pdf",
-        "pptx" => {
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        }
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "ppt" => "application/vnd.ms-powerpoint",
-        "docx" => {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        }
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "doc" => "application/msword",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "png" => "image/png",
@@ -454,7 +446,9 @@ fn mark_read_if_unread(
     let mut ws = repo
         .pull(mail_branch_id)
         .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     if is_read(&space, message_id, reader_id) {
         return Ok(false);
     }
@@ -487,8 +481,8 @@ struct Address {
 fn parse_address(input: &str) -> Result<Address> {
     let trimmed = input.trim();
     // Use mailparse's address parser (handles RFC 5322 quoting/encoding).
-    let addrs = mailparse::addrparse(trimmed)
-        .with_context(|| format!("parse address '{}'", trimmed))?;
+    let addrs =
+        mailparse::addrparse(trimmed).with_context(|| format!("parse address '{}'", trimmed))?;
     let first = addrs
         .iter()
         .find_map(|a| match a {
@@ -566,10 +560,12 @@ fn resolve_relation_prefix(space: &TribleSet, prefix: &str) -> Result<Id> {
 fn relation_email_required(space: &TribleSet, id: Id) -> Result<String> {
     find!(e: String, pattern!(space, [{ id @ rel_attrs::email: ?e }]))
         .next()
-        .ok_or_else(|| anyhow::anyhow!(
-            "relation {id:x} has no email attribute set — \
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "relation {id:x} has no email attribute set — \
              `relations set {id:x} --email <addr>` to add one"
-        ))
+            )
+        })
 }
 
 /// Look up an optional display label for the relation (metadata::name).
@@ -654,7 +650,9 @@ fn resolve_or_register(
 // ── kind entities ─────────────────────────────────────────────────────────
 
 fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let existing: HashSet<Id> = find!(
         (kind: Id),
         pattern!(&space, [{ ?kind @ metadata::name: _?handle }])
@@ -751,9 +749,15 @@ fn parse_rfc5322(bytes: &[u8]) -> Result<ParsedMail> {
         });
 
     let from = get("From").and_then(|s| parse_address(&s).ok());
-    let to = get("To").map(|s| parse_address_list(&s).unwrap_or_default()).unwrap_or_default();
-    let cc = get("Cc").map(|s| parse_address_list(&s).unwrap_or_default()).unwrap_or_default();
-    let bcc = get("Bcc").map(|s| parse_address_list(&s).unwrap_or_default()).unwrap_or_default();
+    let to = get("To")
+        .map(|s| parse_address_list(&s).unwrap_or_default())
+        .unwrap_or_default();
+    let cc = get("Cc")
+        .map(|s| parse_address_list(&s).unwrap_or_default())
+        .unwrap_or_default();
+    let bcc = get("Bcc")
+        .map(|s| parse_address_list(&s).unwrap_or_default())
+        .unwrap_or_default();
     let subject = get("Subject").unwrap_or_default();
 
     let sent_at = get("Date")
@@ -918,7 +922,13 @@ fn cmd_fetch(
                     continue;
                 }
             };
-            ingest_message(repo, mail_branch_id, files_branch_id, relations_branch_id, parsed)?;
+            ingest_message(
+                repo,
+                mail_branch_id,
+                files_branch_id,
+                relations_branch_id,
+                parsed,
+            )?;
             ingested += 1;
         }
         Ok(())
@@ -955,8 +965,15 @@ fn ingest_message(
     relations_branch_id: Id,
     parsed: ParsedMail,
 ) -> Result<()> {
-    persist_message(repo, mail_branch_id, files_branch_id, relations_branch_id, parsed, false)
-        .map(|_| ())
+    persist_message(
+        repo,
+        mail_branch_id,
+        files_branch_id,
+        relations_branch_id,
+        parsed,
+        false,
+    )
+    .map(|_| ())
 }
 
 fn persist_message(
@@ -976,7 +993,9 @@ fn persist_message(
         let mut ws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
 
         let mut change = TribleSet::new();
         if let Some(addr) = &parsed.from {
@@ -1102,7 +1121,11 @@ fn persist_message(
 
         ws.commit(
             change,
-            if as_draft { "mail: draft" } else { "mail: ingest message" },
+            if as_draft {
+                "mail: draft"
+            } else {
+                "mail: ingest message"
+            },
         );
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push mail: {e:?}"))?;
@@ -1169,7 +1192,10 @@ fn mint_linked_decision(
 
 fn synthesize_message_id(local_part_seed: &str) -> String {
     let hash = blake3::hash(local_part_seed.as_bytes());
-    format!("<{}-toby@trible.space>", hex::encode(&hash.as_bytes()[..12]))
+    format!(
+        "<{}-toby@trible.space>",
+        hex::encode(&hash.as_bytes()[..12])
+    )
 }
 
 /// Compose a draft: persists the draft entity in the pile (no
@@ -1196,15 +1222,19 @@ fn cmd_draft(
     // `mail send` re-reads and attaches them automatically.
     let mut attachments: Vec<Attachment> = Vec::new();
     for path in &attach {
-        let bytes = fs::read(path)
-            .with_context(|| format!("read attachment {}", path.display()))?;
+        let bytes =
+            fs::read(path).with_context(|| format!("read attachment {}", path.display()))?;
         let filename = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
         let mime = mime_for_filename(&filename).to_string();
-        attachments.push(Attachment { filename, mime, bytes });
+        attachments.push(Attachment {
+            filename,
+            mime,
+            bytes,
+        });
     }
 
     let to_raw: Vec<String> = to
@@ -1219,7 +1249,9 @@ fn cmd_draft(
     let now = now_epoch();
     let seed = format!("{}:{}:{}", config.user, subject, now.to_tai_seconds());
     let message_id = synthesize_message_id(&seed);
-    let bare_id = message_id.trim_matches(|c| c == '<' || c == '>').to_string();
+    let bare_id = message_id
+        .trim_matches(|c| c == '<' || c == '>')
+        .to_string();
 
     let (draft_id, decision_id) = with_repo(pile, |repo| {
         // Resolve TO/CC/BCC from relation prefixes against the relations
@@ -1233,7 +1265,8 @@ fn cmd_draft(
             let mut ws = repo
                 .pull(relations_branch_id)
                 .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-            let space = ws.checkout(..)
+            let space = ws
+                .checkout(..)
                 .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
             let mut resolve = |raw: &str| -> Result<Address> {
                 let id = resolve_relation_prefix(&space, raw)?;
@@ -1241,7 +1274,8 @@ fn cmd_draft(
                 let name = relation_label(&mut ws, &space, id);
                 Ok(Address { name, email })
             };
-            let to_addrs: Vec<Address> = to_raw.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
+            let to_addrs: Vec<Address> =
+                to_raw.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
             let cc_addrs: Vec<Address> = cc.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
             let bcc_addrs: Vec<Address> = bcc.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
             (to_addrs, cc_addrs, bcc_addrs)
@@ -1283,7 +1317,10 @@ fn cmd_draft(
         Ok((draft_id, decision_id))
     })?;
     println!("Drafted {}", fmt_id(draft_id));
-    println!("Decision {} (deliberate with `decide pro/con/resolve`)", fmt_id(decision_id));
+    println!(
+        "Decision {} (deliberate with `decide pro/con/resolve`)",
+        fmt_id(decision_id)
+    );
     Ok(())
 }
 
@@ -1317,7 +1354,9 @@ fn cmd_reply(
             let mut ws = repo
                 .pull(mail_branch_id)
                 .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-            let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
             let parent_id = resolve_message_id(&space, &parent_hex)?;
             let msg_id_h: Option<TextHandle> = find!(
                 h: TextHandle,
@@ -1332,7 +1371,9 @@ fn cmd_reply(
                 pattern!(&space, [{ parent_id @ mail::subject: ?h }])
             )
             .next();
-            let subject = subject_h.and_then(|h| read_text(&mut ws, h)).unwrap_or_default();
+            let subject = subject_h
+                .and_then(|h| read_text(&mut ws, h))
+                .unwrap_or_default();
             let from_relation: Option<Id> = find!(
                 r: Id,
                 pattern!(&space, [{ parent_id @ mail::from: ?r }])
@@ -1403,7 +1444,9 @@ fn cmd_reply(
         now_epoch().to_tai_seconds()
     );
     let new_message_id = synthesize_message_id(&seed);
-    let bare_new_id = new_message_id.trim_matches(|c| c == '<' || c == '>').to_string();
+    let bare_new_id = new_message_id
+        .trim_matches(|c| c == '<' || c == '>')
+        .to_string();
 
     let now = now_epoch();
     let parsed = ParsedMail {
@@ -1444,8 +1487,15 @@ fn cmd_reply(
         )?;
         Ok((draft_id, decision_id))
     })?;
-    println!("Drafted reply {} (parent {})", fmt_id(draft_id), parent_msg_id);
-    println!("Decision {} (deliberate with `decide pro/con/resolve`)", fmt_id(decision_id));
+    println!(
+        "Drafted reply {} (parent {})",
+        fmt_id(draft_id),
+        parent_msg_id
+    );
+    println!(
+        "Decision {} (deliberate with `decide pro/con/resolve`)",
+        fmt_id(decision_id)
+    );
     Ok(())
 }
 
@@ -1466,11 +1516,7 @@ fn find_linked_decision(decide_space: &TribleSet, draft_id: Id) -> Option<Id> {
 }
 
 /// True iff the decision has both finished_at AND a non-empty outcome.
-fn decision_is_resolved(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    decision_id: Id,
-) -> bool {
+fn decision_is_resolved(ws: &mut Workspace<Pile>, space: &TribleSet, decision_id: Id) -> bool {
     let has_finished_at = find!(
         f: IntervalValue,
         pattern!(space, [{ decision_id @ metadata::finished_at: ?f }])
@@ -1502,7 +1548,9 @@ fn cmd_send(
         let mut ws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         resolve_message_id(&space, &draft_hex)
     })?;
     let config = load_config(pile)?;
@@ -1512,7 +1560,9 @@ fn cmd_send(
         let mut ws = repo
             .pull(decide_branch_id)
             .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
         let decision_id = find_linked_decision(&space, draft_id).ok_or_else(|| {
             anyhow::anyhow!(
                 "no decision linked to draft {} — has it already been sent, or was \
@@ -1536,7 +1586,9 @@ fn cmd_send(
             pattern!(&space, [{ decision_id @ decide_attrs::outcome: ?o }])
         )
         .next();
-        let outcome = outcome_h.and_then(|h| read_text(&mut ws, h)).unwrap_or_default();
+        let outcome = outcome_h
+            .and_then(|h| read_text(&mut ws, h))
+            .unwrap_or_default();
         Ok(outcome)
     })?;
 
@@ -1557,11 +1609,15 @@ fn cmd_send(
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout mail: {e:?}"))?;
+        let mail_space = mws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout mail: {e:?}"))?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let rel_space = rws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
 
         let already_sent = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
             .any(|t| t == KIND_MESSAGE);
@@ -1575,14 +1631,16 @@ fn cmd_send(
             bail!("no draft entity with id {}", fmt_id(draft_id));
         }
 
-        let message_id = find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::message_id: ?h }]))
-            .next()
-            .and_then(|h| read_text(&mut mws, h))
-            .ok_or_else(|| anyhow::anyhow!("draft missing message_id"))?;
-        let subject = find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::subject: ?h }]))
-            .next()
-            .and_then(|h| read_text(&mut mws, h))
-            .unwrap_or_default();
+        let message_id =
+            find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::message_id: ?h }]))
+                .next()
+                .and_then(|h| read_text(&mut mws, h))
+                .ok_or_else(|| anyhow::anyhow!("draft missing message_id"))?;
+        let subject =
+            find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::subject: ?h }]))
+                .next()
+                .and_then(|h| read_text(&mut mws, h))
+                .unwrap_or_default();
         let body = find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::body: ?h }]))
             .next()
             .and_then(|h| read_text(&mut mws, h))
@@ -1595,9 +1653,12 @@ fn cmd_send(
                 })
                 .collect()
         };
-        let to_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::to: ?r }])).collect();
-        let cc_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::cc: ?r }])).collect();
-        let bcc_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::bcc: ?r }])).collect();
+        let to_ids: Vec<Id> =
+            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::to: ?r }])).collect();
+        let cc_ids: Vec<Id> =
+            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::cc: ?r }])).collect();
+        let bcc_ids: Vec<Id> =
+            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::bcc: ?r }])).collect();
 
         let to_emails = resolve_emails(to_ids);
         let cc_emails = resolve_emails(cc_ids);
@@ -1607,8 +1668,10 @@ fn cmd_send(
         }
 
         // Look up message_id strings for in_reply_to / references entities.
-        let irt_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::in_reply_to: ?r }])).collect();
-        let ref_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::references: ?r }])).collect();
+        let irt_ids: Vec<Id> =
+            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::in_reply_to: ?r }])).collect();
+        let ref_ids: Vec<Id> =
+            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::references: ?r }])).collect();
         let mut resolve_msg_ids = |ids: Vec<Id>| -> Vec<String> {
             ids.into_iter()
                 .filter_map(|mid| {
@@ -1721,9 +1784,8 @@ fn cmd_send(
             let ct = header::ContentType::parse(mime_for_filename(name)).unwrap_or_else(|_| {
                 header::ContentType::parse("application/octet-stream").unwrap()
             });
-            multipart = multipart.singlepart(
-                lettre::message::Attachment::new(name.clone()).body(bytes.clone(), ct),
-            );
+            multipart = multipart
+                .singlepart(lettre::message::Attachment::new(name.clone()).body(bytes.clone(), ct));
         }
         builder
             .multipart(multipart)
@@ -1758,7 +1820,9 @@ fn cmd_discard(
         let mut ws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         resolve_message_id(&space, &draft_hex)
     })?;
     with_repo(pile, |repo| {
@@ -1766,7 +1830,9 @@ fn cmd_discard(
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mail_space = mws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let is_draft = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
             .any(|t| t == KIND_DRAFT);
         if !is_draft {
@@ -1775,7 +1841,10 @@ fn cmd_discard(
         let already_sent = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
             .any(|t| t == KIND_MESSAGE);
         if already_sent {
-            bail!("draft {} has already been sent — can't discard a sent message", fmt_id(draft_id));
+            bail!(
+                "draft {} has already been sent — can't discard a sent message",
+                fmt_id(draft_id)
+            );
         }
         drop(mws);
 
@@ -1783,10 +1852,11 @@ fn cmd_discard(
         let mut dws = repo
             .pull(decide_branch_id)
             .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
-        let space = dws.checkout(..).map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
-        let decision_id = find_linked_decision(&space, draft_id).ok_or_else(|| {
-            anyhow::anyhow!("no linked decision for draft {}", fmt_id(draft_id))
-        })?;
+        let space = dws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
+        let decision_id = find_linked_decision(&space, draft_id)
+            .ok_or_else(|| anyhow::anyhow!("no linked decision for draft {}", fmt_id(draft_id)))?;
         if decision_is_resolved(&mut dws, &space, decision_id) {
             bail!("linked decision {} already resolved", fmt_id(decision_id));
         }
@@ -1846,15 +1916,21 @@ fn cmd_outbox(
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mail_space = mws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let rel_space = rws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let mut dws = repo
             .pull(decide_branch_id)
             .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
-        let decide_space = dws.checkout(..).map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
+        let decide_space = dws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
 
         // Drafts not yet sent: KIND_DRAFT tag, NOT KIND_MESSAGE.
         let drafts: Vec<Id> = find!(
@@ -1873,11 +1949,13 @@ fn cmd_outbox(
         }
 
         for did in drafts {
-            let subject = find!(h: TextHandle, pattern!(&mail_space, [{ did @ mail::subject: ?h }]))
-                .next()
-                .and_then(|h| read_text(&mut mws, h))
-                .unwrap_or_default();
-            let to_id: Option<Id> = find!(r: Id, pattern!(&mail_space, [{ did @ mail::to: ?r }])).next();
+            let subject =
+                find!(h: TextHandle, pattern!(&mail_space, [{ did @ mail::subject: ?h }]))
+                    .next()
+                    .and_then(|h| read_text(&mut mws, h))
+                    .unwrap_or_default();
+            let to_id: Option<Id> =
+                find!(r: Id, pattern!(&mail_space, [{ did @ mail::to: ?r }])).next();
             let to_email = to_id
                 .and_then(|rid| {
                     find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
@@ -2062,11 +2140,15 @@ fn cmd_list(
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout mail: {e:?}"))?;
+        let mail_space = mws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout mail: {e:?}"))?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let rel_space = rws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
         let reader_filter = if unread_only {
             let config = load_config_from_repo(repo)?;
             find_self_persona(&rel_space, &config.user)
@@ -2095,10 +2177,7 @@ fn local_day_window() -> (Epoch, Epoch) {
         .from_local_datetime(&start)
         .unwrap()
         .with_timezone(&Utc);
-    let e_utc: DateTime<Utc> = Local
-        .from_local_datetime(&end)
-        .unwrap()
-        .with_timezone(&Utc);
+    let e_utc: DateTime<Utc> = Local.from_local_datetime(&end).unwrap().with_timezone(&Utc);
     (chrono_to_epoch(s_utc), chrono_to_epoch(e_utc))
 }
 
@@ -2110,10 +2189,7 @@ fn local_week_window() -> (Epoch, Epoch) {
         .from_local_datetime(&start)
         .unwrap()
         .with_timezone(&Utc);
-    let e_utc: DateTime<Utc> = Local
-        .from_local_datetime(&end)
-        .unwrap()
-        .with_timezone(&Utc);
+    let e_utc: DateTime<Utc> = Local.from_local_datetime(&end).unwrap().with_timezone(&Utc);
     (chrono_to_epoch(s_utc), chrono_to_epoch(e_utc))
 }
 
@@ -2123,12 +2199,24 @@ fn cmd_today(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|err| anyhow::anyhow!("pull mail: {err:?}"))?;
-        let mail_space = mws.checkout(..).map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
+        let mail_space = mws
+            .checkout(..)
+            .map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|err| anyhow::anyhow!("pull relations: {err:?}"))?;
-        let rel_space = rws.checkout(..).map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
-        let rows = collect_messages(&mut mws, &mail_space, &rel_space, Some((s, e)), false, false, None);
+        let rel_space = rws
+            .checkout(..)
+            .map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
+        let rows = collect_messages(
+            &mut mws,
+            &mail_space,
+            &rel_space,
+            Some((s, e)),
+            false,
+            false,
+            None,
+        );
         print_rows(&rows);
         Ok(())
     })
@@ -2140,12 +2228,24 @@ fn cmd_week(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result<
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|err| anyhow::anyhow!("pull mail: {err:?}"))?;
-        let mail_space = mws.checkout(..).map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
+        let mail_space = mws
+            .checkout(..)
+            .map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|err| anyhow::anyhow!("pull relations: {err:?}"))?;
-        let rel_space = rws.checkout(..).map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
-        let rows = collect_messages(&mut mws, &mail_space, &rel_space, Some((s, e)), false, false, None);
+        let rel_space = rws
+            .checkout(..)
+            .map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
+        let rows = collect_messages(
+            &mut mws,
+            &mail_space,
+            &rel_space,
+            Some((s, e)),
+            false,
+            false,
+            None,
+        );
         print_rows(&rows);
         Ok(())
     })
@@ -2161,12 +2261,16 @@ fn cmd_show(
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = mws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let id = resolve_message_id(&space, &message)?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let rel_space = rws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
         let subject = find!(h: TextHandle, pattern!(&space, [{ id @ mail::subject: ?h }]))
             .next()
@@ -2205,8 +2309,8 @@ fn cmd_show(
             .unwrap_or_default();
         let attachments: Vec<Id> =
             find!(a: Id, pattern!(&space, [{ id @ mail::attachment: ?a }])).collect();
-        let is_spam = find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }]))
-            .any(|t| t == KIND_SPAM);
+        let is_spam =
+            find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }])).any(|t| t == KIND_SPAM);
 
         println!("message {}", fmt_id(id));
         if !subject.is_empty() {
@@ -2225,7 +2329,10 @@ fn cmd_show(
             println!("  bcc:        {}", bcc_emails.join(", "));
         }
         if let Some(s) = sent_at {
-            println!("  sent_at:    {}", epoch_to_chrono_utc(s).format("%Y-%m-%d %H:%M UTC"));
+            println!(
+                "  sent_at:    {}",
+                epoch_to_chrono_utc(s).format("%Y-%m-%d %H:%M UTC")
+            );
         }
         println!("  message_id: {message_id}");
         if is_spam {
@@ -2254,7 +2361,9 @@ fn cmd_show(
             let mut rws = repo
                 .pull(relations_branch_id)
                 .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-            let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            let rel_space = rws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
             if let Some(self_id) = find_self_persona(&rel_space, &config.user) {
                 mark_read_if_unread(repo, mail_branch_id, resolved_id, self_id)?;
             }
@@ -2275,13 +2384,17 @@ fn cmd_read(
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mail_space = mws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let id = resolve_message_id(&mail_space, &message)?;
         drop(mws);
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let rel_space = rws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let self_id = find_self_persona(&rel_space, &config.user).ok_or_else(|| {
             anyhow::anyhow!(
                 "no relations entry for {} — send or receive at least one message first \
@@ -2309,12 +2422,16 @@ fn cmd_thread(
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = mws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let start = resolve_message_id(&space, &message)?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let rel_space = rws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
         // BFS over both in_reply_to and references edges, both directions
         // (ancestors and descendants).
@@ -2344,8 +2461,7 @@ fn cmd_thread(
         // predicted-but-unfetched parents are valid GenIds but have no
         // mail entity yet.
         ids.retain(|id| {
-            find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }]))
-                .any(|t| t == KIND_MESSAGE)
+            find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }])).any(|t| t == KIND_MESSAGE)
         });
 
         let rows: Vec<Row> = ids
@@ -2359,7 +2475,9 @@ fn cmd_thread(
                 let (sent_at, _) = unpack_interval(sent_at_iv?);
                 let subject_h: Option<TextHandle> =
                     find!(h: TextHandle, pattern!(&space, [{ id @ mail::subject: ?h }])).next();
-                let subject = subject_h.and_then(|h| read_text(&mut mws, h)).unwrap_or_default();
+                let subject = subject_h
+                    .and_then(|h| read_text(&mut mws, h))
+                    .unwrap_or_default();
                 let from_relation: Option<Id> =
                     find!(r: Id, pattern!(&space, [{ id @ mail::from: ?r }])).next();
                 let from_email = from_relation.and_then(|rid| {
@@ -2398,11 +2516,15 @@ fn cmd_search(
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = mws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let rel_space = rws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let ids: Vec<Id> =
             find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: KIND_MESSAGE }])).collect();
         let mut matches: Vec<Row> = Vec::new();
@@ -2425,7 +2547,8 @@ fn cmd_search(
                 pattern!(&space, [{ id @ mail::sent_at: ?t }])
             )
             .next();
-            let (sent_at, _) = unpack_interval(sent_at_iv.unwrap_or_else(|| instant_interval(now_epoch())));
+            let (sent_at, _) =
+                unpack_interval(sent_at_iv.unwrap_or_else(|| instant_interval(now_epoch())));
             let from_relation: Option<Id> =
                 find!(r: Id, pattern!(&space, [{ id @ mail::from: ?r }])).next();
             let from_email = from_relation.and_then(|rid| {
@@ -2456,7 +2579,9 @@ fn cmd_resolve(pile: &Path, mail_branch_id: Id, prefix: String) -> Result<()> {
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = mws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let mut matches: HashSet<Id> = HashSet::new();
         // Resolve over both messages and drafts — they share the
         // entity-id namespace and the user often wants either.
@@ -2484,10 +2609,7 @@ fn cmd_resolve(pile: &Path, mail_branch_id: Id, prefix: String) -> Result<()> {
 
 // ── main ──────────────────────────────────────────────────────────────────
 
-fn resolve_branch(
-    repo: &mut Repository<Pile>,
-    branch_name: &str,
-) -> Result<Id> {
+fn resolve_branch(repo: &mut Repository<Pile>, branch_name: &str) -> Result<Id> {
     repo.ensure_branch(branch_name, None)
         .map_err(|e| anyhow::anyhow!("ensure branch '{branch_name}': {e:?}"))
 }
@@ -2502,17 +2624,25 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cmd = cli.command.unwrap_or(Command::Today);
 
-    let (mail_branch, files_branch, relations_branch, decide_branch) = with_repo(&cli.pile, |repo| {
-        let m = resolve_branch(repo, &cli.branch)?;
-        let f = resolve_branch(repo, &cli.files_branch)?;
-        let r = resolve_branch(repo, &cli.relations_branch)?;
-        let d = resolve_branch(repo, &cli.decide_branch)?;
-        Ok((m, f, r, d))
-    })?;
+    let (mail_branch, files_branch, relations_branch, decide_branch) =
+        with_repo(&cli.pile, |repo| {
+            let m = resolve_branch(repo, &cli.branch)?;
+            let f = resolve_branch(repo, &cli.files_branch)?;
+            let r = resolve_branch(repo, &cli.relations_branch)?;
+            let d = resolve_branch(repo, &cli.decide_branch)?;
+            Ok((m, f, r, d))
+        })?;
 
     match cmd {
         Command::Fetch => cmd_fetch(&cli.pile, mail_branch, files_branch, relations_branch),
-        Command::Draft { to, subject, body, cc, bcc, attach } => cmd_draft(
+        Command::Draft {
+            to,
+            subject,
+            body,
+            cc,
+            bcc,
+            attach,
+        } => cmd_draft(
             &cli.pile,
             mail_branch,
             files_branch,
@@ -2542,15 +2672,17 @@ fn main() -> Result<()> {
             message,
             body,
         ),
-        Command::Discard { draft, force } => cmd_discard(
-            &cli.pile,
-            mail_branch,
-            decide_branch,
-            draft,
-            force,
-        ),
+        Command::Discard { draft, force } => {
+            cmd_discard(&cli.pile, mail_branch, decide_branch, draft, force)
+        }
         Command::Outbox => cmd_outbox(&cli.pile, mail_branch, relations_branch, decide_branch),
-        Command::List { from, to, spam, all, unread } => cmd_list(
+        Command::List {
+            from,
+            to,
+            spam,
+            all,
+            unread,
+        } => cmd_list(
             &cli.pile,
             mail_branch,
             relations_branch,
@@ -2582,8 +2714,20 @@ mod tests {
         // the Message-Id, so a reference resolves to the same id the message
         // materializes at. Whitespace is trimmed so header-quoted ids agree.
         let a = entity_id_for_message("<abc@example.com>");
-        assert_eq!(a, entity_id_for_message("<abc@example.com>"), "deterministic");
-        assert_eq!(a, entity_id_for_message("  <abc@example.com>  "), "trim-invariant");
-        assert_ne!(a, entity_id_for_message("<other@example.com>"), "message-id-bound");
+        assert_eq!(
+            a,
+            entity_id_for_message("<abc@example.com>"),
+            "deterministic"
+        );
+        assert_eq!(
+            a,
+            entity_id_for_message("  <abc@example.com>  "),
+            "trim-invariant"
+        );
+        assert_ne!(
+            a,
+            entity_id_for_message("<other@example.com>"),
+            "message-id-bound"
+        );
     }
 }

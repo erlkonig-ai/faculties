@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::common;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use hifitime::Epoch;
 use serde_json::Value as JsonValue;
 use std::str::FromStr;
@@ -32,11 +32,7 @@ struct MessageRecord {
     order: usize,
 }
 
-fn import_agy_path(
-    path: &Path,
-    repo: &mut common::Repo,
-    branch_id: Id,
-) -> Result<ImportStats> {
+fn import_agy_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
     let start = Instant::now();
     println!("agy phase pull: {}", path.display());
     let mut ws = repo
@@ -50,8 +46,7 @@ fn import_agy_path(
         let scan_start = Instant::now();
         println!("agy phase scan: {}", path.display());
         let mut paths = Vec::new();
-        collect_agy_files(path, &mut paths)
-            .with_context(|| format!("scan {}", path.display()))?;
+        collect_agy_files(path, &mut paths).with_context(|| format!("scan {}", path.display()))?;
         paths.sort();
         let total_files = paths.len();
         println!(
@@ -66,12 +61,23 @@ fn import_agy_path(
         let mut total = ImportStats::default();
         for (index, (file, parsed_records)) in parsed_files.into_iter().enumerate() {
             let file_start = Instant::now();
-            let raw_records = parsed_records.with_context(|| format!("parse {}", file.display()))?;
+            let raw_records =
+                parsed_records.with_context(|| format!("parse {}", file.display()))?;
             if raw_records.is_empty() {
                 continue;
             }
-            
-            let conv_id = file.parent().unwrap().parent().unwrap().parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
+
+            let conv_id = file
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
 
             let stats = import_agy_records(
                 &conv_id,
@@ -97,8 +103,18 @@ fn import_agy_path(
         }
         return Ok(total);
     }
-    
-    let conv_id = path.parent().unwrap().parent().unwrap().parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
+
+    let conv_id = path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let raw_records = parse_jsonl(path)?;
     import_agy_records(
         &conv_id,
@@ -131,9 +147,20 @@ fn import_agy_records(
     let raw_root = {
         let raw_payload = serde_json::to_string(&raw_records).context("serialize agy jsonl")?;
         let mut importer = JsonTreeImporter::<_>::new(repo.storage_mut(), None);
-        let fragment = importer.import_str(&raw_payload).context("import agy raw json tree")?;
-        let root = fragment.root().ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
-        if common::commit_delta(repo, ws, catalog, catalog_head, fragment.facts().clone(), "import agy json tree")? {
+        let fragment = importer
+            .import_str(&raw_payload)
+            .context("import agy raw json tree")?;
+        let root = fragment
+            .root()
+            .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
+        if common::commit_delta(
+            repo,
+            ws,
+            catalog,
+            catalog_head,
+            fragment.facts().clone(),
+            "import agy json tree",
+        )? {
             stats.commits += 1;
         }
         root
@@ -147,7 +174,7 @@ fn import_agy_records(
     let conversation_id_str = format!("agy:{}", conv_id);
 
     let mut message_ids: Vec<(Id, &MessageRecord)> = Vec::new();
-    
+
     // Pass 1: create message entities
     for msg in &messages {
         let source_message_id_handle = ws.put(msg.source_message_id.clone());
@@ -155,7 +182,9 @@ fn import_agy_records(
             common::import_schema::source_format: "agy",
             common::import_schema::source_message_id: source_message_id_handle,
         };
-        let message_id = message_fragment.root().expect("entity! must export a single root id");
+        let message_id = message_fragment
+            .root()
+            .expect("entity! must export a single root id");
         change += message_fragment;
         message_ids.push((message_id, msg));
     }
@@ -166,11 +195,15 @@ fn import_agy_records(
         common::import_schema::source_format: "agy",
         common::import_schema::source_conversation_id: ws.put(conversation_id_str.clone()),
     };
-    let conversation_id = conversation_fragment.root().expect("entity! must export a single root id");
+    let conversation_id = conversation_fragment
+        .root()
+        .expect("entity! must export a single root id");
     change += conversation_fragment;
 
     {
-        let conversation_entity = conversation_id.acquire().expect("entity! root ids should be acquired in current thread");
+        let conversation_entity = conversation_id
+            .acquire()
+            .expect("entity! root ids should be acquired in current thread");
         let msg_id_list: Vec<Id> = message_ids.iter().map(|(id, _)| *id).collect();
         change += entity! { &conversation_entity @
             common::import_schema::message*: msg_id_list,
@@ -181,7 +214,9 @@ fn import_agy_records(
     // Pass 3: attach content attributes
     let mut previous: Option<(Id, String)> = None;
     for (message_id, msg) in &message_ids {
-        let message_entity = message_id.acquire().expect("entity! root ids should be acquired in current thread");
+        let message_entity = message_id
+            .acquire()
+            .expect("entity! root ids should be acquired in current thread");
 
         let author_key = format!("{}::{}", msg.author, msg.role);
         let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
@@ -193,11 +228,14 @@ fn import_agy_records(
             id
         };
 
-        let created_at = common::epoch_interval(msg.created_at.unwrap_or_else(common::unknown_epoch));
+        let created_at =
+            common::epoch_interval(msg.created_at.unwrap_or_else(common::unknown_epoch));
         let content_handle = ws.put(msg.content.clone());
 
         let reply_to = previous.as_ref().map(|(parent_id, _)| *parent_id);
-        let source_parent_id = previous.as_ref().map(|(_, parent_source_id)| ws.put(parent_source_id.clone()));
+        let source_parent_id = previous
+            .as_ref()
+            .map(|(_, parent_source_id)| ws.put(parent_source_id.clone()));
 
         change += entity! { &message_entity @
             common::metadata::tag: common::archive::kind_message,
@@ -261,12 +299,18 @@ fn collect_messages(conv_id: &str, records: &[JsonValue]) -> Vec<MessageRecord> 
     for (ordinal, value) in records.iter().enumerate() {
         let source = value.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let step_index = value.get("step_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let step_index = value
+            .get("step_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
         let t = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        
-        let created_at_str = value.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+
+        let created_at_str = value
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let created_at = Epoch::from_str(created_at_str).ok();
-        
+
         let (role, author) = match source {
             "USER_EXPLICIT" | "USER_INPUT" => ("user", "user"),
             "MODEL" => {
@@ -276,29 +320,29 @@ fn collect_messages(conv_id: &str, records: &[JsonValue]) -> Vec<MessageRecord> 
                     // Tool responses in Antigravity are source=MODEL, type=TOOL_NAME
                     ("system", "system")
                 }
-            },
+            }
             "SYSTEM" => {
                 if t == "TOOL_CALL" || t == "TOOL_RESPONSE" || t == "SYSTEM_MESSAGE" {
                     ("system", "system")
                 } else {
                     continue;
                 }
-            },
+            }
             _ => continue,
         };
-        
+
         let content_to_store = if !content.is_empty() {
             content.to_string()
         } else {
             serde_json::to_string(value).unwrap_or_default()
         };
-        
+
         if content_to_store.is_empty() {
             continue;
         }
-        
+
         let source_msg_id = format!("agy:{}:{}:{}", conv_id, step_index, ordinal);
-        
+
         out.push(MessageRecord {
             conversation_id: conv_id.to_string(),
             source_message_id: source_msg_id,

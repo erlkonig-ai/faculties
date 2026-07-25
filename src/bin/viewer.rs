@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use faculties::widgets::{
     AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
     GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
-    RelationsViewer, StatusViewer, StorageState, TeamsViewer, TimelineSource,
-    TriageViewer, WikiViewer,
+    RelationsViewer, StatusViewer, StorageState, TeamsViewer, TimelineSource, TriageViewer,
+    WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
@@ -94,16 +94,24 @@ fn main(nb: &mut NotebookCtx) {
         st.top_bar(ctx);
     });
 
-    nb.state("headspace", HeadspaceViewer::default(), move |ctx, panel| {
-        let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("config") else { return };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
-    });
+    nb.state(
+        "headspace",
+        HeadspaceViewer::default(),
+        move |ctx, panel| {
+            let mut st = storage.read_mut(ctx);
+            let Some(mut ws) = st.workspace("config") else {
+                return;
+            };
+            panel.render(ctx, &mut ws);
+            st.push(&mut ws);
+        },
+    );
 
     nb.state("status", StatusViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("status") else { return };
+        let Some(mut ws) = st.workspace("status") else {
+            return;
+        };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);
@@ -136,10 +144,8 @@ fn main(nb: &mut NotebookCtx) {
             // → the corresponding source is skipped for the frame),
             // so e.g. an empty archive branch produces no archive
             // events without breaking the others.
-            let branch_names: &[&str] =
-                &["compass", "message", "wiki", "cognition", "archive"];
-            let mut pulled: Vec<(&str, Workspace<Pile>)> =
-                Vec::with_capacity(branch_names.len());
+            let branch_names: &[&str] = &["compass", "message", "wiki", "cognition", "archive"];
+            let mut pulled: Vec<(&str, Workspace<Pile>)> = Vec::with_capacity(branch_names.len());
             for name in branch_names {
                 if let Some(ws) = st.workspace(name) {
                     pulled.push((*name, ws));
@@ -153,14 +159,18 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("gauge", GaugeViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("wiki") else { return };
+        let Some(mut ws) = st.workspace("wiki") else {
+            return;
+        };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 
     nb.state("wiki", WikiViewer::default(), move |ctx, wiki| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("wiki") else { return };
+        let Some(mut ws) = st.workspace("wiki") else {
+            return;
+        };
         let mut files = st.workspace("files");
         wiki.render(ctx, &mut ws, files.as_mut());
         st.push(&mut ws);
@@ -168,21 +178,27 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("compass", CompassBoard::default(), move |ctx, compass| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("compass") else { return };
+        let Some(mut ws) = st.workspace("compass") else {
+            return;
+        };
         compass.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 
     nb.state("decide", DecidePanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("decide") else { return };
+        let Some(mut ws) = st.workspace("decide") else {
+            return;
+        };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 
     nb.state("mail", MailViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("mail") else { return };
+        let Some(mut ws) = st.workspace("mail") else {
+            return;
+        };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);
@@ -190,7 +206,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("planner", PlannerViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("planner") else { return };
+        let Some(mut ws) = st.workspace("planner") else {
+            return;
+        };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);
@@ -198,7 +216,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("message") else { return };
+        let Some(mut ws) = st.workspace("message") else {
+            return;
+        };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);
@@ -206,24 +226,34 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("discord", DiscordViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("discord") else { return };
+        let Some(mut ws) = st.workspace("discord") else {
+            return;
+        };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 
     nb.state("teams", TeamsViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("teams") else { return };
+        let Some(mut ws) = st.workspace("teams") else {
+            return;
+        };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 
-    nb.state("relations", RelationsViewer::default(), move |ctx, panel| {
-        let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("relations") else { return };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
-    });
+    nb.state(
+        "relations",
+        RelationsViewer::default(),
+        move |ctx, panel| {
+            let mut st = storage.read_mut(ctx);
+            let Some(mut ws) = st.workspace("relations") else {
+                return;
+            };
+            panel.render(ctx, &mut ws);
+            st.push(&mut ws);
+        },
+    );
 
     nb.state("memory", MemoryViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
@@ -237,21 +267,27 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("files", FilesViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("files") else { return };
+        let Some(mut ws) = st.workspace("files") else {
+            return;
+        };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 
     nb.state("triage", TriageViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("cognition") else { return };
+        let Some(mut ws) = st.workspace("cognition") else {
+            return;
+        };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 
     nb.state("atlas", AtlasViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("atlas") else { return };
+        let Some(mut ws) = st.workspace("atlas") else {
+            return;
+        };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });

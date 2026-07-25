@@ -41,25 +41,21 @@
 use std::collections::HashMap;
 
 use hifitime::{Duration as HifiDuration, Epoch};
-use GORBIE::card_ctx::GRID_ROW_MODULE;
-use GORBIE::prelude::CardCtx;
 use triblespace::core::id::Id;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{
-    ancestors, CommitHandle, CommitSelector, CommitSet, Workspace,
-};
-use triblespace::core::trible::TribleSet;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
+use triblespace::core::metadata;
+use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::{ancestors, CommitHandle, CommitSelector, CommitSet, Workspace};
+use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
 use triblespace::prelude::View;
+use GORBIE::card_ctx::GRID_ROW_MODULE;
+use GORBIE::prelude::CardCtx;
 
-use crate::schemas::compass::{
-    board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
-};
 use crate::schemas::archive::archive as archive_attrs;
+use crate::schemas::compass::{board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
 use crate::schemas::message::{local as local_attrs, KIND_MESSAGE_ID};
 use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
 use crate::schemas::wiki::{attrs as wiki_attrs, KIND_VERSION_ID};
@@ -135,7 +131,13 @@ fn truncate_to_chip_width(s: &str, max_px: f32, char_px: f32) -> String {
 fn preview(text: &str, max: usize) -> String {
     let flat: String = text
         .chars()
-        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let trimmed = flat.trim();
     if trimmed.chars().count() <= max {
@@ -173,10 +175,7 @@ fn text_on(fill: egui::Color32) -> egui::Color32 {
 #[derive(Clone, Debug)]
 pub enum TimelineSource {
     /// Plain commit bars (useful for arbitrary branches).
-    Commits {
-        label: String,
-        color: egui::Color32,
-    },
+    Commits { label: String, color: egui::Color32 },
     /// Compass — render goal status changes with the goal title and
     /// status-color pill.
     Compass { label: String },
@@ -303,9 +302,7 @@ impl MultiLive {
             match src {
                 TimelineSource::Commits { .. } => collect_commit_events(idx, ws, &mut out),
                 TimelineSource::Compass { .. } => collect_compass_events(idx, ws, &mut out),
-                TimelineSource::LocalMessages { .. } => {
-                    collect_local_events(idx, ws, &mut out)
-                }
+                TimelineSource::LocalMessages { .. } => collect_local_events(idx, ws, &mut out),
                 TimelineSource::Wiki { .. } => collect_wiki_events(idx, ws, &mut out),
                 TimelineSource::Reason { .. } => collect_reason_events(idx, ws, &mut out),
                 TimelineSource::Archive { .. } => collect_archive_events(idx, ws, &mut out),
@@ -322,11 +319,7 @@ impl MultiLive {
 /// Walk every commit reachable from HEAD and emit one Event per commit.
 /// Commits without `created_at` are skipped — they're merge commits by
 /// design and carry no author-time bits.
-fn collect_commit_events(
-    idx: usize,
-    ws: &mut Workspace<Pile>,
-    out: &mut Vec<Event>,
-) {
+fn collect_commit_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
     let Some(head) = ws.head() else {
         return;
     };
@@ -368,11 +361,7 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> String {
 
 /// Emit a Compass event per status-change entity. Also records "goal
 /// created" and "note" events so quiet boards still show up.
-fn collect_compass_events(
-    idx: usize,
-    ws: &mut Workspace<Pile>,
-    out: &mut Vec<Event>,
-) {
+fn collect_compass_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
     let space = match ws.checkout(..) {
         Ok(co) => co.into_facts(),
         Err(e) => {
@@ -472,11 +461,7 @@ fn collect_compass_events(
 }
 
 /// Emit a LocalMessages event per message.
-fn collect_local_events(
-    idx: usize,
-    ws: &mut Workspace<Pile>,
-    out: &mut Vec<Event>,
-) {
+fn collect_local_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
     let space = match ws.checkout(..) {
         Ok(co) => co.into_facts(),
         Err(e) => {
@@ -513,11 +498,7 @@ fn collect_local_events(
 }
 
 /// Emit a Wiki event per fragment-version.
-fn collect_wiki_events(
-    idx: usize,
-    ws: &mut Workspace<Pile>,
-    out: &mut Vec<Event>,
-) {
+fn collect_wiki_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
     let space = match ws.checkout(..) {
         Ok(co) => co.into_facts(),
         Err(e) => {
@@ -732,7 +713,11 @@ impl BranchTimeline {
             self.live = Some(MultiLive::refresh(&self.sources, workspaces));
         }
 
-        let events = self.live.as_ref().map(|l| l.events.clone()).unwrap_or_default();
+        let events = self
+            .live
+            .as_ref()
+            .map(|l| l.events.clone())
+            .unwrap_or_default();
         let sources = self.sources.clone();
         let viewport_height = self.viewport_height;
 
@@ -797,8 +782,7 @@ impl BranchTimeline {
                     .map(|p| (p.y - viewport_rect.top()).max(0.0))
                     .unwrap_or(viewport_height * 0.5);
 
-                let cursor_time =
-                    self.timeline_start - (cursor_rel_y as f64 * ns_per_px) as i128;
+                let cursor_time = self.timeline_start - (cursor_rel_y as f64 * ns_per_px) as i128;
 
                 // Scroll without a modifier → pan the timeline.
                 // Cmd/Ctrl + scroll OR native trackpad pinch → zoom
@@ -932,8 +916,7 @@ impl BranchTimeline {
             let first = (view_start / label_interval) * label_interval;
             let mut tick = first;
             while tick > view_end {
-                let y = viewport_rect.top()
-                    + ((view_start - tick) as f64 / ns_per_px) as f32;
+                let y = viewport_rect.top() + ((view_start - tick) as f64 / ns_per_px) as f32;
                 if y >= viewport_rect.top() && y <= viewport_rect.bottom() {
                     let label = format_time_marker(tick);
                     painter.text(
@@ -962,10 +945,9 @@ impl BranchTimeline {
                 .ctx()
                 .request_repaint_after(std::time::Duration::from_secs_f64(secs_per_px));
 
-            let y = viewport_rect.top()
-                + ((view_start - now) as f64 / ns_per_px) as f32;
+            let y = viewport_rect.top() + ((view_start - now) as f64 / ns_per_px) as f32;
             let now_color = egui::Color32::from_rgb(0xf7, 0xba, 0x0b); // RAL 1003
-            // Dashed line: short segments every 10px.
+                                                                       // Dashed line: short segments every 10px.
             let mut x = viewport_rect.left();
             let x_end = viewport_rect.right();
             while x < x_end {
@@ -990,8 +972,7 @@ impl BranchTimeline {
         // relies on the muted colors to recede against both the
         // viewport fill and the event chips.
         {
-            let visible_secs =
-                viewport_height as f64 * 60.0 / self.timeline_scale as f64;
+            let visible_secs = viewport_height as f64 * 60.0 / self.timeline_scale as f64;
             let span_label = format!("SPAN {}", format_span(visible_secs));
             let hint_label = "PINCH/\u{2318}+SCROLL \u{2192} ZOOM · DBL-CLICK \u{2192} NOW";
             let span_font = egui::FontId::monospace(10.0);
@@ -1001,16 +982,11 @@ impl BranchTimeline {
             let top = viewport_rect.top() + 6.0;
             let right = viewport_rect.right() - 8.0;
             let gap = 12.0;
-            let hint_galley =
-                painter.layout_no_wrap(hint_label.to_string(), hint_font, hint_color);
-            let span_galley =
-                painter.layout_no_wrap(span_label, span_font, span_color);
+            let hint_galley = painter.layout_no_wrap(hint_label.to_string(), hint_font, hint_color);
+            let span_galley = painter.layout_no_wrap(span_label, span_font, span_color);
             let hint_pos = egui::pos2(right - hint_galley.size().x, top);
             painter.galley(hint_pos, hint_galley, hint_color);
-            let span_pos = egui::pos2(
-                hint_pos.x - gap - span_galley.size().x,
-                top,
-            );
+            let span_pos = egui::pos2(hint_pos.x - gap - span_galley.size().x, top);
             painter.galley(span_pos, span_galley, span_color);
         }
 
@@ -1021,8 +997,8 @@ impl BranchTimeline {
         //      horizontal tick + dot on a thin vertical axis line).
         //   Otherwise → chip-style rows: wide chip with source pill +
         //      per-kind decoration + summary text.
-        let only_commits = sources.len() == 1
-            && matches!(sources[0], TimelineSource::Commits { .. });
+        let only_commits =
+            sources.len() == 1 && matches!(sources[0], TimelineSource::Commits { .. });
 
         let pointer_pos = ui.input(|i| i.pointer.hover_pos());
         let mut hover_label: Option<(egui::Pos2, String)> = None;
@@ -1074,8 +1050,7 @@ impl BranchTimeline {
                 if ev.ts_ns < view_end || ev.ts_ns > view_start {
                     continue;
                 }
-                let y =
-                    viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
+                let y = viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
                 let x1 = axis_x - 8.0;
                 let x2 = axis_x + 8.0;
                 painter.line_segment(
@@ -1089,8 +1064,7 @@ impl BranchTimeline {
                         && (p.y - y).abs() <= 4.0
                         && (p.x - axis_x).abs() <= 40.0
                     {
-                        let label =
-                            format!("{}  {}", ev.summary, format_time_marker(ev.ts_ns));
+                        let label = format!("{}  {}", ev.summary, format_time_marker(ev.ts_ns));
                         hover_label = Some((egui::pos2(axis_x - 12.0, y), label));
                         if viewport_response.clicked() {
                             clicked_event = Some((ev.kind, ev.entity_id));
@@ -1120,8 +1094,7 @@ impl BranchTimeline {
                 if ev.ts_ns < view_end || ev.ts_ns > view_start {
                     continue;
                 }
-                let y =
-                    viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
+                let y = viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
                 let src = &sources[ev.source_idx];
                 let src_color = src.color();
                 let src_label = src.label();
@@ -1214,77 +1187,62 @@ impl BranchTimeline {
                         )
                         .gap(12.0)
                         .show(|tip| {
-                                tip.set_max_width(360.0);
-                                // Header: colored source dot + source
-                                // label + timestamp on a single line.
-                                tip.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    let (dot_rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(8.0, 8.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(
-                                        dot_rect.center(),
-                                        4.0,
-                                        src_color_tip,
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(src_label.to_uppercase())
-                                            .small()
-                                            .monospace()
-                                            .strong()
-                                            .color(src_color_tip),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new("·")
-                                            .small()
-                                            .weak(),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(time_str)
-                                            .small()
-                                            .monospace()
-                                            .weak(),
-                                    );
-                                });
-                                // Optional status + from→to meta line.
-                                if status_label.is_some() || fromto_label.is_some() {
-                                    tip.horizontal_wrapped(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        if let Some(st) = status_label {
-                                            ui.label(
-                                                egui::RichText::new(st.to_uppercase())
-                                                    .small()
-                                                    .monospace()
-                                                    .strong(),
-                                            );
-                                        }
-                                        if let Some(ft) = fromto_label {
-                                            ui.label(
-                                                egui::RichText::new(ft)
-                                                    .small()
-                                                    .monospace()
-                                                    .weak(),
-                                            );
-                                        }
-                                    });
-                                }
-                                tip.separator();
-                                tip.add(egui::Label::new(summary).wrap());
-                                // Full canonical id at the bottom — the
-                                // chip strip itself omits ids to keep the
-                                // top-level view readable, so the hover
-                                // surface is where they live.
-                                tip.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(id_hex(ev.entity_id))
-                                            .monospace()
-                                            .small()
-                                            .weak(),
-                                    )
-                                    .wrap(),
+                            tip.set_max_width(360.0);
+                            // Header: colored source dot + source
+                            // label + timestamp on a single line.
+                            tip.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let (dot_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
                                 );
+                                ui.painter()
+                                    .circle_filled(dot_rect.center(), 4.0, src_color_tip);
+                                ui.label(
+                                    egui::RichText::new(src_label.to_uppercase())
+                                        .small()
+                                        .monospace()
+                                        .strong()
+                                        .color(src_color_tip),
+                                );
+                                ui.label(egui::RichText::new("·").small().weak());
+                                ui.label(egui::RichText::new(time_str).small().monospace().weak());
                             });
+                            // Optional status + from→to meta line.
+                            if status_label.is_some() || fromto_label.is_some() {
+                                tip.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    if let Some(st) = status_label {
+                                        ui.label(
+                                            egui::RichText::new(st.to_uppercase())
+                                                .small()
+                                                .monospace()
+                                                .strong(),
+                                        );
+                                    }
+                                    if let Some(ft) = fromto_label {
+                                        ui.label(
+                                            egui::RichText::new(ft).small().monospace().weak(),
+                                        );
+                                    }
+                                });
+                            }
+                            tip.separator();
+                            tip.add(egui::Label::new(summary).wrap());
+                            // Full canonical id at the bottom — the
+                            // chip strip itself omits ids to keep the
+                            // top-level view readable, so the hover
+                            // surface is where they live.
+                            tip.add(
+                                egui::Label::new(
+                                    egui::RichText::new(id_hex(ev.entity_id))
+                                        .monospace()
+                                        .small()
+                                        .weak(),
+                                )
+                                .wrap(),
+                            );
+                        });
                     }
                 }
             }
@@ -1312,10 +1270,18 @@ fn format_span(secs: f64) -> String {
     let s = secs.max(1.0);
     if s >= 86_400.0 {
         let d = s / 86_400.0;
-        if d >= 10.0 { format!("{d:.0}D") } else { format!("{d:.1}D") }
+        if d >= 10.0 {
+            format!("{d:.0}D")
+        } else {
+            format!("{d:.1}D")
+        }
     } else if s >= 3_600.0 {
         let h = s / 3_600.0;
-        if h >= 10.0 { format!("{h:.0}H") } else { format!("{h:.1}H") }
+        if h >= 10.0 {
+            format!("{h:.0}H")
+        } else {
+            format!("{h:.1}H")
+        }
     } else if s >= 60.0 {
         format!("{:.0}M", s / 60.0)
     } else {

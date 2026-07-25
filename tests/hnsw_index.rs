@@ -79,15 +79,10 @@ fn similar_via_persisted_index_returns_staged_nearest() {
         repo.push(&mut ws).expect("push contentless initial commit");
         let empty_head = ws.head();
         embeddings::refresh_index(&mut repo, branch_id).expect("certify empty HNSW index");
-        let empty = embeddings::nearest_via_index(
-            repo.storage_mut(),
-            branch_id,
-            empty_head,
-            &vecs[0],
-            0.0,
-        )
-        .expect("query certified empty index")
-        .expect("current empty index is present");
+        let empty =
+            embeddings::nearest_via_index(repo.storage_mut(), branch_id, empty_head, &vecs[0], 0.0)
+                .expect("query certified empty index")
+                .expect("current empty index is present");
         assert!(empty.is_empty());
 
         let mut ws = repo.pull(branch_id).expect("pull");

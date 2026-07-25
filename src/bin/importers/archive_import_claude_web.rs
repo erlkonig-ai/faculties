@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::common;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use hifitime::Epoch;
 use serde_json::Value as JsonValue;
 use tracing::info_span;
@@ -222,10 +222,7 @@ fn import_one_conversation(
         // include raw binary payloads). Identity = conversation/message/name.
         let mut attachment_ids = Vec::new();
         for attachment in collect_attachments(message) {
-            let source_id = format!(
-                "{}/{}/{}",
-                convo_uuid, msg_uuid, attachment.file_name
-            );
+            let source_id = format!("{}/{}/{}", convo_uuid, msg_uuid, attachment.file_name);
             let source_id_handle = ws.put(source_id);
             let attachment_fragment = entity! { _ @
                 common::metadata::tag: common::archive::kind_attachment,
@@ -258,9 +255,7 @@ fn import_one_conversation(
         }
 
         let (reply_to, source_parent_id) = match &previous {
-            Some((prev_id, prev_uuid)) => {
-                (Some(*prev_id), Some(ws.put(prev_uuid.clone())))
-            }
+            Some((prev_id, prev_uuid)) => (Some(*prev_id), Some(ws.put(prev_uuid.clone()))),
             None => (None, None),
         };
 
@@ -282,14 +277,7 @@ fn import_one_conversation(
         stats.messages += 1;
     }
 
-    if common::commit_delta(
-        repo,
-        ws,
-        catalog,
-        catalog_head,
-        change,
-        "import claude-web",
-    )? {
+    if common::commit_delta(repo, ws, catalog, catalog_head, change, "import claude-web")? {
         stats.commits += 1;
     }
     stats.conversations += 1;

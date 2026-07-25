@@ -18,19 +18,17 @@ use std::collections::HashMap;
 use GORBIE::prelude::CardCtx;
 
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
-use crate::schemas::decide::{
-    decide as decide_attrs, factor, KIND_CON, KIND_DECISION, KIND_PRO,
-};
+use crate::schemas::decide::{decide as decide_attrs, factor, KIND_CON, KIND_DECISION, KIND_PRO};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -112,7 +110,10 @@ enum Status {
 impl DecisionRow {
     fn status(&self) -> Status {
         let resolved = self.finished_at.is_some()
-            && self.outcome.as_ref().map_or(false, |s| !s.trim().is_empty());
+            && self
+                .outcome
+                .as_ref()
+                .map_or(false, |s| !s.trim().is_empty());
         if !resolved {
             Status::Proposed
         } else if self.pros.is_empty() && self.cons.is_empty() {
@@ -338,12 +339,10 @@ fn collect_factors(
 }
 
 fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h)
-        .ok()
-        .map(|v| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        })
+    ws.get::<View<str>, LongString>(h).ok().map(|v| {
+        let s: &str = v.as_ref();
+        s.to_string()
+    })
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -363,11 +362,7 @@ impl DecidePanel {
         Self::default()
     }
 
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-    ) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
@@ -385,9 +380,7 @@ impl DecidePanel {
             let resolved = live
                 .decisions
                 .iter()
-                .filter(|d| {
-                    matches!(d.status(), Status::Resolved | Status::Forced)
-                })
+                .filter(|d| matches!(d.status(), Status::Resolved | Status::Forced))
                 .count();
             let open = count - resolved;
 
@@ -452,14 +445,11 @@ impl DecidePanel {
                         continue;
                     }
                     let match_info = if search_active {
-                        Some(
-                            search.report(egui::Id::new(("decide_match", dec.id))),
-                        )
+                        Some(search.report(egui::Id::new(("decide_match", dec.id))))
                     } else {
                         None
                     };
-                    let is_focused =
-                        match_info.as_ref().map_or(false, |i| i.is_focused);
+                    let is_focused = match_info.as_ref().map_or(false, |i| i.is_focused);
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
@@ -471,10 +461,7 @@ impl DecidePanel {
                                     egui::pos2(ui.min_rect().left(), pre_y),
                                     egui::pos2(ui.min_rect().right(), post_y),
                                 );
-                                ui.scroll_to_rect(
-                                    rect,
-                                    Some(egui::Align::Center),
-                                );
+                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
                             }
                         }
                     });
@@ -532,12 +519,7 @@ fn status_label(status: Status) -> &'static str {
     }
 }
 
-fn render_decision(
-    ui: &mut egui::Ui,
-    dec: &DecisionRow,
-    search_needle: &str,
-    focused: bool,
-) {
+fn render_decision(ui: &mut egui::Ui, dec: &DecisionRow, search_needle: &str, focused: bool) {
     let frame_fill = ui.visuals().window_fill;
     let stroke_color = color_frame(ui);
     let status = dec.status();
@@ -552,24 +534,22 @@ fn render_decision(
     };
 
     ui.vertical(|ui| {
-    let frame_resp = egui::Frame::NONE
-        .fill(frame_fill)
-        .stroke(egui::Stroke::new(STROKE_INSET, stroke_color))
-        .shadow(egui::epaint::Shadow {
-            offset: [2, 2],
-            blur: 0,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(48),
-        })
-        .corner_radius(egui::CornerRadius::ZERO)
-        .inner_margin(inner_margin)
-        .show(ui, |ui| {
-            // Title row: title on the left, optional about → and age
-            // on the right (`Align::Min` cross-axis to avoid the
-            // frame-delayed cell sizing feedback loop).
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Min),
-                |ui| {
+        let frame_resp = egui::Frame::NONE
+            .fill(frame_fill)
+            .stroke(egui::Stroke::new(STROKE_INSET, stroke_color))
+            .shadow(egui::epaint::Shadow {
+                offset: [2, 2],
+                blur: 0,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(48),
+            })
+            .corner_radius(egui::CornerRadius::ZERO)
+            .inner_margin(inner_margin)
+            .show(ui, |ui| {
+                // Title row: title on the left, optional about → and age
+                // on the right (`Align::Min` cross-axis to avoid the
+                // frame-delayed cell sizing feedback loop).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if let Some(age) = format_relative_age(dec.created_at) {
                         ui.label(
                             egui::RichText::new(age)
@@ -580,70 +560,61 @@ fn render_decision(
                     }
                     if let Some(about) = dec.about {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "\u{2192} {}",
-                                id_hex(about)
-                            ))
-                            .monospace()
-                            .small()
-                            .color(color_muted(ui)),
+                            egui::RichText::new(format!("\u{2192} {}", id_hex(about)))
+                                .monospace()
+                                .small()
+                                .color(color_muted(ui)),
                         );
                     }
-                    ui.with_layout(
-                        egui::Layout::left_to_right(egui::Align::Min),
-                        |ui| {
-                            GORBIE::search::highlight_label(
-                                ui,
-                                &dec.title,
-                                search_needle,
-                                title_format(ui),
-                                focused,
-                            );
-                        },
-                    );
-                },
-            );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        GORBIE::search::highlight_label(
+                            ui,
+                            &dec.title,
+                            search_needle,
+                            title_format(ui),
+                            focused,
+                        );
+                    });
+                });
 
-            if let Some(context_text) = &dec.context {
-                ui.add_space(2.0);
-                GORBIE::search::highlight_label(
-                    ui,
-                    context_text,
-                    search_needle,
-                    body_format(ui, color_muted(ui)),
-                    focused,
-                );
-            }
-
-            ui.add_space(6.0);
-
-            ui.columns(2, |cols| {
-                render_factor_column(
-                    &mut cols[0],
-                    "PROS",
-                    color_pro(),
-                    &dec.pros,
-                    search_needle,
-                    focused,
-                );
-                render_factor_column(
-                    &mut cols[1],
-                    "CONS",
-                    color_con(),
-                    &dec.cons,
-                    search_needle,
-                    focused,
-                );
-            });
-
-            if let Some(outcome) = &dec.outcome {
-                if !outcome.trim().is_empty() {
-                    ui.add_space(6.0);
-                    ui.separator();
+                if let Some(context_text) = &dec.context {
                     ui.add_space(2.0);
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Min),
-                        |ui| {
+                    GORBIE::search::highlight_label(
+                        ui,
+                        context_text,
+                        search_needle,
+                        body_format(ui, color_muted(ui)),
+                        focused,
+                    );
+                }
+
+                ui.add_space(6.0);
+
+                ui.columns(2, |cols| {
+                    render_factor_column(
+                        &mut cols[0],
+                        "PROS",
+                        color_pro(),
+                        &dec.pros,
+                        search_needle,
+                        focused,
+                    );
+                    render_factor_column(
+                        &mut cols[1],
+                        "CONS",
+                        color_con(),
+                        &dec.cons,
+                        search_needle,
+                        focused,
+                    );
+                });
+
+                if let Some(outcome) = &dec.outcome {
+                    if !outcome.trim().is_empty() {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(2.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                             if let Some(age) = format_relative_age(dec.finished_at) {
                                 ui.label(
                                     egui::RichText::new(age)
@@ -652,34 +623,30 @@ fn render_decision(
                                         .color(color_muted(ui)),
                                 );
                             }
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Min),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new("OUTCOME")
-                                            .monospace()
-                                            .small()
-                                            .strong()
-                                            .color(color_resolved()),
-                                    );
-                                },
-                            );
-                        },
-                    );
-                    GORBIE::search::highlight_label(
-                        ui,
-                        outcome,
-                        search_needle,
-                        body_format(ui, ui.visuals().text_color()),
-                        focused,
-                    );
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                                ui.label(
+                                    egui::RichText::new("OUTCOME")
+                                        .monospace()
+                                        .small()
+                                        .strong()
+                                        .color(color_resolved()),
+                                );
+                            });
+                        });
+                        GORBIE::search::highlight_label(
+                            ui,
+                            outcome,
+                            search_needle,
+                            body_format(ui, ui.visuals().text_color()),
+                            focused,
+                        );
+                    }
                 }
-            }
-        });
+            });
 
-    // Left status stripe, compass-card idiom.
-    let outer = frame_resp.response.rect;
-    paint_status_stripe(ui.painter(), outer, stripe_color, stripe_label);
+        // Left status stripe, compass-card idiom.
+        let outer = frame_resp.response.rect;
+        paint_status_stripe(ui.painter(), outer, stripe_color, stripe_label);
     });
 }
 

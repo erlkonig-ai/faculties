@@ -34,13 +34,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::{OsRng, RngCore};
 
-use dryoc::classic::crypto_pwhash::{PasswordHashAlgorithm, crypto_pwhash};
+use dryoc::classic::crypto_pwhash::{crypto_pwhash, PasswordHashAlgorithm};
 use dryoc::classic::crypto_sign_ed25519::{
     crypto_sign_ed25519_pk_to_curve25519, crypto_sign_ed25519_sk_to_curve25519,
 };
@@ -102,9 +102,10 @@ mod schema {
 }
 
 use schema::{
-    KIND_GRANT, KIND_IDENTITY, KIND_SCOPE, KIND_SECRET, KIND_WRAP, grant_issuer, grant_object,
-    grant_relation, grant_retracted_at, grant_subject, identity_lockbox, identity_sign_pk, reaches,
-    scope_creator, secret_body, secret_name, secret_scope, wrap_dek, wrap_recipient, wrap_secret,
+    grant_issuer, grant_object, grant_relation, grant_retracted_at, grant_subject,
+    identity_lockbox, identity_sign_pk, reaches, scope_creator, secret_body, secret_name,
+    secret_scope, wrap_dek, wrap_recipient, wrap_secret, KIND_GRANT, KIND_IDENTITY, KIND_SCOPE,
+    KIND_SECRET, KIND_WRAP,
 };
 
 const DEFAULT_BRANCH: &str = "secrets";
@@ -218,7 +219,9 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
 fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
-    let close_res = repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
+    let close_res = repo
+        .close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
     if let Err(err) = close_res {
         if result.is_ok() {
             return Err(err);
@@ -241,11 +244,15 @@ fn fmt_id(id: Id) -> String {
 }
 
 fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| v.to_string())
+    ws.get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| v.to_string())
 }
 
 fn read_bytes(ws: &mut Workspace<Pile>, h: BytesHandle) -> Option<Vec<u8>> {
-    ws.get::<anybytes::Bytes, _>(h).ok().map(|b| b.as_ref().to_vec())
+    ws.get::<anybytes::Bytes, _>(h)
+        .ok()
+        .map(|b| b.as_ref().to_vec())
 }
 
 fn put_bytes(ws: &mut Workspace<Pile>, bytes: Vec<u8>) -> BytesHandle {
@@ -275,7 +282,10 @@ fn resolve_named(ws: &mut Workspace<Pile>, space: &TribleSet, kind: Id, input: &
     match named.as_slice() {
         [one] => Ok(*one),
         [] => bail!("no match for '{input}' (by id or name)"),
-        many => bail!("name '{input}' is ambiguous ({} matches — use the id)", many.len()),
+        many => bail!(
+            "name '{input}' is ambiguous ({} matches — use the id)",
+            many.len()
+        ),
     }
 }
 
@@ -601,7 +611,9 @@ fn load_value(raw: &str) -> Result<Vec<u8>> {
         if rest == "-" {
             use std::io::Read;
             let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .context("read stdin")?;
             Ok(buf)
         } else {
             std::fs::read(rest).with_context(|| format!("read {rest}"))
@@ -631,7 +643,10 @@ fn cmd_selftest() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     assert_eq!(opened.as_slice(), secret);
     assert!(
-        DryocBox::from_sealed_bytes(&wrap_a).unwrap().unseal_to_vec(&bob).is_err(),
+        DryocBox::from_sealed_bytes(&wrap_a)
+            .unwrap()
+            .unseal_to_vec(&bob)
+            .is_err(),
         "cross-open must fail"
     );
     println!("✓ envelope round-trip: alice opened, bob refused");
@@ -648,7 +663,9 @@ fn cmd_identity_init(pile: &Path, branch: &str, nickname: String) -> Result<()> 
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let id = ufoid();
         let now = instant_interval(now_epoch());
         let nick_h = ws.put(nickname.clone());
@@ -663,7 +680,8 @@ fn cmd_identity_init(pile: &Path, branch: &str, nickname: String) -> Result<()> 
             identity_lockbox: lock_h,
         };
         ws.commit(change, "secrets: identity init");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
         Ok(id.id)
     })?;
     println!("identity {} ({})", fmt_id(id), nickname);
@@ -676,8 +694,12 @@ fn cmd_identity_list(pile: &Path, branch: &str) -> Result<()> {
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let rows: Vec<(Id, TextHandle)> = find!(
             (e: Id, n: TextHandle),
             pattern!(&space, [{ ?e @ metadata::tag: KIND_IDENTITY, metadata::name: ?n }])
@@ -699,8 +721,12 @@ fn cmd_scope_create(pile: &Path, branch: &str, name: String, as_id: String) -> R
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let creator = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
         let now = instant_interval(now_epoch());
         let name_h = ws.put(name.clone());
@@ -713,8 +739,14 @@ fn cmd_scope_create(pile: &Path, branch: &str, name: String, as_id: String) -> R
             metadata::created_at: now,
         };
         ws.commit(change, "secrets: scope create");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        println!("scope {} ({})  root admin: {}", fmt_id(scope_id), name, fmt_id(creator));
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        println!(
+            "scope {} ({})  root admin: {}",
+            fmt_id(scope_id),
+            name,
+            fmt_id(creator)
+        );
         Ok(())
     })
 }
@@ -724,8 +756,12 @@ fn cmd_scope_list(pile: &Path, branch: &str) -> Result<()> {
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let rows: Vec<(Id, Id, TextHandle)> = find!(
             (s: Id, c: Id, n: TextHandle),
             pattern!(&space, [{ ?s @ metadata::tag: KIND_SCOPE, scope_creator: ?c, metadata::name: ?n }])
@@ -761,8 +797,12 @@ fn cmd_scope_members(pile: &Path, branch: &str, scope: String) -> Result<()> {
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
         let creator = scope_creator_of(&space, scope_id);
         let admins = effective_admins(&space, scope_id);
@@ -797,8 +837,12 @@ fn cmd_grant(
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let object_id = resolve_named(&mut ws, &space, KIND_SCOPE, &object)?;
         let subject_id = resolve_named(&mut ws, &space, KIND_IDENTITY, &subject)?;
         let issuer_id = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
@@ -832,7 +876,8 @@ fn cmd_grant(
             grant_issuer: &issuer_id,
         };
         ws.commit(change, "secrets: grant");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
         println!(
             "grant {}  {} --{}--> {}  (by {})",
             fmt_id(g.id),
@@ -850,8 +895,12 @@ fn cmd_revoke(pile: &Path, branch: &str, object: String, subject: String) -> Res
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let object_id = resolve_named(&mut ws, &space, KIND_SCOPE, &object)?;
         let subject_id = resolve_named(&mut ws, &space, KIND_IDENTITY, &subject)?;
         let grants: Vec<Id> = find!(
@@ -861,7 +910,11 @@ fn cmd_revoke(pile: &Path, branch: &str, object: String, subject: String) -> Res
         .filter(|g| grant_is_live(&space, *g))
         .collect();
         if grants.is_empty() {
-            bail!("no live grant for {} on {}", fmt_id(subject_id), fmt_id(object_id));
+            bail!(
+                "no live grant for {} on {}",
+                fmt_id(subject_id),
+                fmt_id(object_id)
+            );
         }
         let now = instant_interval(now_epoch());
         let mut change = TribleSet::new();
@@ -869,7 +922,8 @@ fn cmd_revoke(pile: &Path, branch: &str, object: String, subject: String) -> Res
             change += entity! { ExclusiveId::force_ref(g) @ grant_retracted_at: now };
         }
         ws.commit(change, "secrets: revoke");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
         println!(
             "revoked {} grant(s) for {} on {}",
             grants.len(),
@@ -946,15 +1000,20 @@ fn build_seal_change(
 ) -> Result<(TribleSet, Id, usize)> {
     let recipients = recipients_of(space, scope_id);
     if recipients.is_empty() {
-        bail!("scope {} has no live recipients; grant access first", fmt_id(scope_id));
+        bail!(
+            "scope {} has no live recipients; grant access first",
+            fmt_id(scope_id)
+        );
     }
     let mut recipient_keys: Vec<(Id, BoxPublicKey)> = Vec::new();
     for r in &recipients {
         let rid = *r;
-        let pk_h: BytesHandle = find!(h: BytesHandle, pattern!(space, [{ rid @ identity_sign_pk: ?h }]))
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("recipient {} has no signing key", fmt_id(*r)))?;
-        let pk = read_bytes(ws, pk_h).ok_or_else(|| anyhow::anyhow!("read pk for {}", fmt_id(*r)))?;
+        let pk_h: BytesHandle =
+            find!(h: BytesHandle, pattern!(space, [{ rid @ identity_sign_pk: ?h }]))
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("recipient {} has no signing key", fmt_id(*r)))?;
+        let pk =
+            read_bytes(ws, pk_h).ok_or_else(|| anyhow::anyhow!("read pk for {}", fmt_id(*r)))?;
         recipient_keys.push((*r, box_pk_from_ed25519(&pk)?));
     }
 
@@ -1007,13 +1066,24 @@ fn cmd_secret_add(
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
-        let (change, secret_id, n) = build_seal_change(&mut ws, &space, scope_id, &name, &plaintext)?;
+        let (change, secret_id, n) =
+            build_seal_change(&mut ws, &space, scope_id, &name, &plaintext)?;
         ws.commit(change, "secrets: secret add");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        println!("secret {} ({}) sealed to {} recipient(s)", fmt_id(secret_id), name, n);
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        println!(
+            "secret {} ({}) sealed to {} recipient(s)",
+            fmt_id(secret_id),
+            name,
+            n
+        );
         Ok(())
     })
 }
@@ -1023,8 +1093,12 @@ fn cmd_secret_rotate(pile: &Path, branch: &str, scope: Option<String>) -> Result
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let filter = scope
             .as_deref()
             .map(|s| resolve_named(&mut ws, &space, KIND_SCOPE, s))
@@ -1079,7 +1153,10 @@ fn cmd_secret_rotate(pile: &Path, branch: &str, scope: Option<String>) -> Result
         );
         for (sc, name, exposed) in findings {
             let scope_name = entity_name(&mut ws, &space, sc);
-            let who: Vec<String> = exposed.iter().map(|e| entity_name(&mut ws, &space, *e)).collect();
+            let who: Vec<String> = exposed
+                .iter()
+                .map(|e| entity_name(&mut ws, &space, *e))
+                .collect();
             println!("  {scope_name}/{name}  →  exposed to: {}", who.join(", "));
         }
         Ok(())
@@ -1098,8 +1175,12 @@ fn cmd_secret_get(
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
         let secret_id = latest_secret(&space, scope_id, &name)
             .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
@@ -1123,8 +1204,12 @@ fn cmd_secret_share(
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
         let secret_id = latest_secret(&space, scope_id, &name)
             .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
@@ -1164,7 +1249,10 @@ fn cmd_secret_share(
         )
         .map(|(_, r)| r)
         .collect();
-        let missing: Vec<Id> = recipients.into_iter().filter(|r| !existing.contains(r)).collect();
+        let missing: Vec<Id> = recipients
+            .into_iter()
+            .filter(|r| !existing.contains(r))
+            .collect();
         if missing.is_empty() {
             println!("already shared to all current recipients");
             return Ok(());
@@ -1174,9 +1262,12 @@ fn cmd_secret_share(
         let mut change = TribleSet::new();
         for r in &missing {
             let rid = *r;
-            let pk_h: BytesHandle = find!(h: BytesHandle, pattern!(&space, [{ rid @ identity_sign_pk: ?h }]))
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("recipient {} has no signing key", fmt_id(*r)))?;
+            let pk_h: BytesHandle =
+                find!(h: BytesHandle, pattern!(&space, [{ rid @ identity_sign_pk: ?h }]))
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("recipient {} has no signing key", fmt_id(*r))
+                    })?;
             let pk = read_bytes(&mut ws, pk_h).ok_or_else(|| anyhow::anyhow!("read pk"))?;
             let rx_pk = box_pk_from_ed25519(&pk)?;
             let sealed = DryocBox::seal_to_vecbox(&dek, &rx_pk)
@@ -1193,7 +1284,8 @@ fn cmd_secret_share(
             };
         }
         ws.commit(change, "secrets: secret share");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
         println!("shared to {} new recipient(s)", missing.len());
         Ok(())
     })
@@ -1204,8 +1296,12 @@ fn cmd_secret_list(pile: &Path, branch: &str) -> Result<()> {
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         // Group versions by (scope, name); show the newest of each.
         let rows: Vec<(Id, Id, TextHandle)> = find!(
             (s: Id, sc: Id, n: TextHandle),
@@ -1245,7 +1341,7 @@ fn hex(bytes: &[u8]) -> String {
 // live in `faculties::mail_account` so the `mail`/`orient` readers can't drift
 // from this writer.
 use faculties::mail_account::{self, MailAccount};
-use faculties::schemas::mail::{KIND_MAIL_ACCOUNT, KIND_MAIL_ACTIVE, mail_account as mail_attrs};
+use faculties::schemas::mail::{mail_account as mail_attrs, KIND_MAIL_ACCOUNT, KIND_MAIL_ACTIVE};
 
 /// The entity id for an account is derived from its address, so re-adding the
 /// same address converges to one entity (latest-wins on the `box`).
@@ -1286,8 +1382,12 @@ fn cmd_mail_account_add(
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let first = mail_account::list_addresses(&space).is_empty();
 
         let now = instant_interval(now_epoch());
@@ -1312,7 +1412,8 @@ fn cmd_mail_account_add(
             };
         }
         ws.commit(change, "secrets: mail-account add");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
         println!(
             "mail account {} stored{}",
             address,
@@ -1327,8 +1428,12 @@ fn cmd_mail_account_list(pile: &Path, branch: &str) -> Result<()> {
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let addresses = mail_account::list_addresses(&space);
         let active = mail_account::active_address(&space);
         if addresses.is_empty() {
@@ -1351,9 +1456,16 @@ fn cmd_mail_account_use(pile: &Path, branch: &str, address: String) -> Result<()
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        if !mail_account::list_addresses(&space).iter().any(|a| a == &address) {
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        if !mail_account::list_addresses(&space)
+            .iter()
+            .any(|a| a == &address)
+        {
             bail!("no stored mail account for '{address}' (see `secrets mail-account list`)");
         }
         let now = instant_interval(now_epoch());
@@ -1365,7 +1477,8 @@ fn cmd_mail_account_use(pile: &Path, branch: &str, address: String) -> Result<()
             mail_attrs::address: address.as_str(),
         };
         ws.commit(change, "secrets: mail-account use");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
         println!("active mail account → {address}");
         Ok(())
     })
@@ -1401,12 +1514,13 @@ fn main() -> Result<()> {
             ScopeCmd::List => cmd_scope_list(&cli.pile, &cli.branch),
             ScopeCmd::Members { scope } => cmd_scope_members(&cli.pile, &cli.branch, scope),
         },
-        Command::Grant { object, relation, subject, r#as } => {
-            cmd_grant(&cli.pile, &cli.branch, object, relation, subject, r#as)
-        }
-        Command::Revoke { object, subject } => {
-            cmd_revoke(&cli.pile, &cli.branch, object, subject)
-        }
+        Command::Grant {
+            object,
+            relation,
+            subject,
+            r#as,
+        } => cmd_grant(&cli.pile, &cli.branch, object, relation, subject, r#as),
+        Command::Revoke { object, subject } => cmd_revoke(&cli.pile, &cli.branch, object, subject),
         Command::Secret { cmd } => match cmd {
             SecretCmd::Add { scope, name, value } => {
                 cmd_secret_add(&cli.pile, &cli.branch, scope, name, value)
@@ -1430,11 +1544,20 @@ fn main() -> Result<()> {
                 smtp_host,
                 smtp_port,
             } => cmd_mail_account_add(
-                &cli.pile, &cli.branch, address, password, from_name, pop3_host, pop3_port,
-                smtp_host, smtp_port,
+                &cli.pile,
+                &cli.branch,
+                address,
+                password,
+                from_name,
+                pop3_host,
+                pop3_port,
+                smtp_host,
+                smtp_port,
             ),
             MailAccountCmd::List => cmd_mail_account_list(&cli.pile, &cli.branch),
-            MailAccountCmd::Use { address } => cmd_mail_account_use(&cli.pile, &cli.branch, address),
+            MailAccountCmd::Use { address } => {
+                cmd_mail_account_use(&cli.pile, &cli.branch, address)
+            }
             MailAccountCmd::Show => cmd_mail_account_show(&cli.pile, &cli.branch),
         },
     }
@@ -1469,7 +1592,9 @@ mod tests {
         let box_pk = box_pk_from_ed25519(&pk).unwrap();
         let box_kp = box_keypair_from_ed25519(&sk, &pk).unwrap();
         let msg = b"a 32-byte data key would go here";
-        let sealed = DryocBox::seal_to_vecbox(&msg[..], &box_pk).unwrap().to_vec();
+        let sealed = DryocBox::seal_to_vecbox(&msg[..], &box_pk)
+            .unwrap()
+            .to_vec();
         let opened = DryocBox::from_sealed_bytes(&sealed)
             .unwrap()
             .unseal_to_vec(&box_kp)
@@ -1495,7 +1620,11 @@ mod tests {
         let _v1 = add_version(&mut space, 2020);
         let v2 = add_version(&mut space, 2025);
         let v3_older = add_version(&mut space, 2023);
-        assert_eq!(latest_secret(&space, scope, "db"), Some(v2), "2025 is newest");
+        assert_eq!(
+            latest_secret(&space, scope, "db"),
+            Some(v2),
+            "2025 is newest"
+        );
         assert_eq!(secret_versions(&space, scope, "db"), 3);
         assert_eq!(latest_secret(&space, scope, "absent"), None);
         let _ = v3_older;
@@ -1511,7 +1640,7 @@ mod tests {
     fn mk_scope(space: &mut TribleSet, creator: &Id) -> Id {
         let s = ufoid().id;
         *space += entity! { ExclusiveId::force_ref(&s) @
-            metadata::tag: &KIND_SCOPE, scope_creator: creator };
+        metadata::tag: &KIND_SCOPE, scope_creator: creator };
         s
     }
     fn mk_grant(space: &mut TribleSet, scope: &Id, iss: &Id, rel: &str, subj: &Id) -> Id {
@@ -1527,7 +1656,7 @@ mod tests {
     }
     fn retract(space: &mut TribleSet, g: &Id) {
         *space += entity! { ExclusiveId::force_ref(g) @
-            grant_retracted_at: instant_interval(now_epoch()) };
+        grant_retracted_at: instant_interval(now_epoch()) };
     }
 
     #[test]
@@ -1548,7 +1677,10 @@ mod tests {
         assert_eq!(admins.len(), 1);
         assert!(admins.contains(&alice));
         assert!(!admins.contains(&bob), "bob was removed");
-        assert!(!admins.contains(&mallory), "confederate-add by a removed admin is inert");
+        assert!(
+            !admins.contains(&mallory),
+            "confederate-add by a removed admin is inert"
+        );
     }
 
     #[test]
@@ -1591,7 +1723,10 @@ mod tests {
         mk_grant(&mut space, &s, &alice, "admin", &bob);
         mk_grant(&mut space, &s, &bob, "admin", &carol); // branch A
         mk_grant(&mut space, &s, &bob, "admin", &dave); // branch B
-        assert_eq!(effective_admins(&space, s), HashSet::from([alice, bob, carol, dave]));
+        assert_eq!(
+            effective_admins(&space, s),
+            HashSet::from([alice, bob, carol, dave])
+        );
     }
 
     #[test]
@@ -1607,7 +1742,7 @@ mod tests {
         for r in [alice, bob] {
             let w = ufoid().id;
             space += entity! { ExclusiveId::force_ref(&w) @
-                metadata::tag: &KIND_WRAP, wrap_secret: &secret_v1, wrap_recipient: &r };
+            metadata::tag: &KIND_WRAP, wrap_secret: &secret_v1, wrap_recipient: &r };
         }
         let holders = wrap_holders(&space, secret_v1);
         assert_eq!(holders, {
@@ -1617,7 +1752,10 @@ mod tests {
         });
         // current recipients after bob's revocation = {alice}
         let current: HashSet<Id> = HashSet::from([alice]);
-        let exposed: Vec<Id> = holders.into_iter().filter(|h| !current.contains(h)).collect();
+        let exposed: Vec<Id> = holders
+            .into_iter()
+            .filter(|h| !current.contains(h))
+            .collect();
         assert_eq!(exposed, vec![bob]);
     }
 
@@ -1643,7 +1781,7 @@ mod tests {
         let mut space = TribleSet::new();
         // scope rooted at alice
         space += entity! { ExclusiveId::force_ref(&sid) @
-            metadata::tag: &KIND_SCOPE, scope_creator: &aid };
+        metadata::tag: &KIND_SCOPE, scope_creator: &aid };
         let grant = |space: &mut TribleSet, iss: &Id, rel: &str, subj: &Id| -> Id {
             let g = ufoid().id;
             *space += entity! { ExclusiveId::force_ref(&g) @
@@ -1661,16 +1799,22 @@ mod tests {
 
         let admins = effective_admins(&space, sid);
         assert!(admins.contains(&aid) && admins.contains(&bid) && admins.contains(&cid));
-        assert!(!admins.contains(&eid), "dave isn't an admin, so eve must not be");
+        assert!(
+            !admins.contains(&eid),
+            "dave isn't an admin, so eve must not be"
+        );
         assert!(!admins.contains(&did));
 
         // Transitive strong removal: retract bob's admin -> bob AND carol drop.
         space += entity! { ExclusiveId::force_ref(&g_bob) @
-            grant_retracted_at: instant_interval(now_epoch()) };
+        grant_retracted_at: instant_interval(now_epoch()) };
         let admins2 = effective_admins(&space, sid);
         assert!(admins2.contains(&aid));
         assert!(!admins2.contains(&bid), "bob's admin was retracted");
-        assert!(!admins2.contains(&cid), "carol's admin chained through bob -> gone");
+        assert!(
+            !admins2.contains(&cid),
+            "carol's admin chained through bob -> gone"
+        );
         assert_eq!(admins2.len(), 1);
     }
 
@@ -1681,7 +1825,9 @@ mod tests {
         let a = ufoid().id;
         let b = ufoid().id;
         let id = |c: Id, name: &'static str| {
-            scope_fragment(c, name.to_blob().get_handle()).root().unwrap()
+            scope_fragment(c, name.to_blob().get_handle())
+                .root()
+                .unwrap()
         };
         assert_eq!(id(a, "prod"), id(a, "prod")); // idempotent creation
         assert_ne!(id(a, "prod"), id(b, "prod")); // creator-bound
@@ -1735,11 +1881,9 @@ mod tests {
         let carol_kp =
             box_keypair_from_ed25519(&carol.secret_key.to_vec(), &carol.public_key.to_vec())
                 .unwrap();
-        assert!(
-            DryocBox::from_sealed_bytes(&wraps[0])
-                .unwrap()
-                .unseal_to_vec(&carol_kp)
-                .is_err()
-        );
+        assert!(DryocBox::from_sealed_bytes(&wraps[0])
+            .unwrap()
+            .unseal_to_vec(&carol_kp)
+            .is_err());
     }
 }

@@ -81,13 +81,11 @@ fn import_color(id: Id) -> egui::Color32 {
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t).round().clamp(0.0, 255.0) as u8
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    egui::Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Row struct ───────────────────────────────────────────────────────
@@ -226,11 +224,7 @@ impl FilesLive {
         // Sort newest first, then clamp to MAX_IMPORTS so a long
         // history doesn't blow up the card count.
         let mut imports: Vec<ImportRow> = by_id.into_values().collect();
-        imports.sort_by(|a, b| {
-            b.imported_at
-                .cmp(&a.imported_at)
-                .then(b.id.cmp(&a.id))
-        });
+        imports.sort_by(|a, b| b.imported_at.cmp(&a.imported_at).then(b.id.cmp(&a.id)));
         imports.truncate(MAX_IMPORTS);
 
         FilesLive {
@@ -327,11 +321,7 @@ impl FilesViewer {
         Self::default()
     }
 
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-    ) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
@@ -349,7 +339,9 @@ impl FilesViewer {
         let mut open_root: Option<Id> = None;
 
         ctx.section("Files", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
 
             ctx.grid(|g| {
                 let shown = live.imports.len();
@@ -363,18 +355,14 @@ impl FilesViewer {
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
                     let summary = match (shown < live.total, newest_age.as_deref()) {
-                        (true, Some(age)) => format!(
-                            "SHOWING {shown} OF {} IMPORTS · NEWEST {age}",
-                            live.total
-                        ),
+                        (true, Some(age)) => {
+                            format!("SHOWING {shown} OF {} IMPORTS · NEWEST {age}", live.total)
+                        }
                         (false, Some(age)) => format!(
                             "{shown} IMPORT{} · NEWEST {age}",
                             if shown == 1 { "" } else { "S" }
                         ),
-                        (_, None) => format!(
-                            "{shown} IMPORT{}",
-                            if shown == 1 { "" } else { "S" }
-                        ),
+                        (_, None) => format!("{shown} IMPORT{}", if shown == 1 { "" } else { "S" }),
                     };
                     ui.label(
                         egui::RichText::new(summary)
@@ -555,11 +543,9 @@ fn render_import_card(
 
                     ui.horizontal(|ui| {
                         let header = match row.imported_at {
-                            Some(t) => format!(
-                                "{} · {}",
-                                format_date(t.date_naive()),
-                                format_time(t),
-                            ),
+                            Some(t) => {
+                                format!("{} · {}", format_date(t.date_naive()), format_time(t),)
+                            }
                             None => "(no timestamp)".to_string(),
                         };
                         ui.label(
@@ -593,23 +579,20 @@ fn render_import_card(
                         // `Align::Min` cross-axis: Center would feed
                         // the frame-delayed cell-sizing loop.
                         if row.root.is_some() {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Min),
-                                |ui| {
-                                    let btn = ui.add(
-                                        egui::Button::new(
-                                            egui::RichText::new("OPEN \u{2197}") // ↗
-                                                .monospace()
-                                                .small()
-                                                .strong(),
-                                        )
-                                        .min_size(egui::vec2(56.0, 18.0)),
-                                    );
-                                    if btn.clicked() {
-                                        *open_root = row.root;
-                                    }
-                                },
-                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                let btn = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("OPEN \u{2197}") // ↗
+                                            .monospace()
+                                            .small()
+                                            .strong(),
+                                    )
+                                    .min_size(egui::vec2(56.0, 18.0)),
+                                );
+                                if btn.clicked() {
+                                    *open_root = row.root;
+                                }
+                            });
                         }
                     });
 

@@ -68,13 +68,11 @@ fn author_color(id: Id) -> egui::Color32 {
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t).round().clamp(0.0, 255.0) as u8
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    egui::Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Row structs ──────────────────────────────────────────────────────
@@ -277,7 +275,9 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
 fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
     let secs = (ns / 1_000_000_000) as i64;
     let nanos = ((ns % 1_000_000_000) as u32).min(999_999_999);
-    Utc.timestamp_opt(secs, nanos).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_opt(secs, nanos)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 fn id_hex(id: Id) -> String {
@@ -376,11 +376,7 @@ impl DiscordViewer {
         Self::default()
     }
 
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-    ) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
@@ -391,7 +387,9 @@ impl DiscordViewer {
         }
 
         ctx.section("Discord", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
             let now = Utc::now();
 
             ctx.grid(|g| {
@@ -446,10 +444,12 @@ impl DiscordViewer {
                             );
                             ui.add_space(2.0);
                             ui.label(
-                                egui::RichText::new("run `discord read` to ingest channels visible to the bot.")
-                                    .monospace()
-                                    .small()
-                                    .color(color_muted(ui)),
+                                egui::RichText::new(
+                                    "run `discord read` to ingest channels visible to the bot.",
+                                )
+                                .monospace()
+                                .small()
+                                .color(color_muted(ui)),
                             );
                         });
                         ui.add_space(16.0);
@@ -554,14 +554,11 @@ fn render_message_card(
                     });
 
                     // Author chip + content first line.
-                    let author_label = msg
-                        .author_name
-                        .clone()
-                        .unwrap_or_else(|| {
-                            msg.author_id
-                                .map(short_hex)
-                                .unwrap_or_else(|| "?".to_string())
-                        });
+                    let author_label = msg.author_name.clone().unwrap_or_else(|| {
+                        msg.author_id
+                            .map(short_hex)
+                            .unwrap_or_else(|| "?".to_string())
+                    });
                     let author_fill = msg
                         .author_id
                         .map(author_color)
@@ -594,12 +591,8 @@ fn render_message_card(
                     })
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        let rest: String = msg
-                            .content
-                            .lines()
-                            .skip(1)
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        let rest: String =
+                            msg.content.lines().skip(1).collect::<Vec<_>>().join("\n");
                         ui.label(
                             egui::RichText::new(truncate_to(rest.trim(), 200))
                                 .size(13.0)
@@ -645,4 +638,3 @@ fn render_author_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
             );
         });
 }
-

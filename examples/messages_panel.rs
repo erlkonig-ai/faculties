@@ -45,7 +45,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace(&branch) else { return };
+        let Some(mut ws) = st.workspace(&branch) else {
+            return;
+        };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);

@@ -38,9 +38,7 @@ use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{NsTAIInterval, U256BE};
 use triblespace::prelude::View;
 
-use crate::schemas::headspace::{
-    playground_config, KIND_CONFIG_ID, KIND_MODEL_PROFILE_ID,
-};
+use crate::schemas::headspace::{playground_config, KIND_CONFIG_ID, KIND_MODEL_PROFILE_ID};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -69,13 +67,11 @@ fn profile_color(id: Id) -> egui::Color32 {
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t).round().clamp(0.0, 255.0) as u8
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    egui::Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Row structs ──────────────────────────────────────────────────────
@@ -196,10 +192,7 @@ fn load_active_config(_ws: &mut Workspace<Pile>, space: &TribleSet) -> ActiveCon
 /// latest per `model_profile_id`, and load its attributes. The
 /// catalog stores append-only revisions per profile id; the latest
 /// `metadata::updated_at` is the live row.
-fn load_profiles(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-) -> HashMap<Id, ModelProfile> {
+fn load_profiles(ws: &mut Workspace<Pile>, space: &TribleSet) -> HashMap<Id, ModelProfile> {
     // Map profile_id → (entry_id, updated_at key) — pick the latest.
     let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
     for (entry_id, profile_id, updated_at) in find!(
@@ -271,15 +264,14 @@ fn load_profiles(
 
         // U256BE numerics — extracted to u64 when the upper 24 bytes
         // are zero (i.e. the value really fits a u64).
-        p.stream =
-            find_u64(space, entry_id, |id| {
-                find!(
-                    v: Inline<U256BE>,
-                    pattern!(space, [{ id @ playground_config::model_stream: ?v }])
-                )
-                .next()
-            })
-            .map(|n| n != 0);
+        p.stream = find_u64(space, entry_id, |id| {
+            find!(
+                v: Inline<U256BE>,
+                pattern!(space, [{ id @ playground_config::model_stream: ?v }])
+            )
+            .next()
+        })
+        .map(|n| n != 0);
         p.context_window_tokens = find_u64(space, entry_id, |id| {
             find!(
                 v: Inline<U256BE>,
@@ -381,11 +373,7 @@ impl HeadspaceViewer {
         Self::default()
     }
 
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-    ) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
@@ -396,7 +384,9 @@ impl HeadspaceViewer {
         }
 
         ctx.section("Headspace", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
 
             ctx.grid(|g| {
                 // Header line — total profile count + persona summary.
@@ -475,11 +465,7 @@ impl HeadspaceViewer {
 
 // ── Active-profile hero card ────────────────────────────────────────
 
-fn render_active_card(
-    ui: &mut egui::Ui,
-    p: &ModelProfile,
-    persona_id: Option<Id>,
-) {
+fn render_active_card(ui: &mut egui::Ui, p: &ModelProfile, persona_id: Option<Id>) {
     let bubble_fill = ui.visuals().window_fill;
     let accent = profile_color(p.id);
     let text_on_accent = colorhash::text_color_on(accent);
@@ -669,10 +655,7 @@ fn render_token_budget(
     let input_w = (bar_rect.width() - used_w).max(0.0);
 
     // Input segment (accent — what the agent has to work with).
-    let input_rect = egui::Rect::from_min_size(
-        bar_rect.min,
-        egui::vec2(input_w, bar_height),
-    );
+    let input_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(input_w, bar_height));
     painter.rect_filled(input_rect, egui::CornerRadius::ZERO, accent);
 
     // Max-output segment (muted accent — reserved for the reply).
@@ -722,10 +705,8 @@ fn render_other_profile_card(ui: &mut egui::Ui, p: &ModelProfile) {
 
             ui.horizontal(|ui| {
                 // 8-px swatch indicating profile colour identity.
-                let (swatch, _) = ui.allocate_exact_size(
-                    egui::vec2(10.0, 10.0),
-                    egui::Sense::hover(),
-                );
+                let (swatch, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 ui.painter()
                     .rect_filled(swatch, egui::CornerRadius::ZERO, accent);
                 ui.add_space(4.0);
@@ -743,12 +724,7 @@ fn render_other_profile_card(ui: &mut egui::Ui, p: &ModelProfile) {
                             .small()
                             .color(body_muted),
                     );
-                    ui.label(
-                        egui::RichText::new(m)
-                            .monospace()
-                            .small()
-                            .color(body_muted),
-                    );
+                    ui.label(egui::RichText::new(m).monospace().small().color(body_muted));
                 }
             });
             ui.label(
