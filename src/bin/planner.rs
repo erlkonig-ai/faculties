@@ -5,13 +5,11 @@
 //! `.ics` ingest so meeting invites land directly in the pile
 //! without a manual data-entry round-trip.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::planner::{
-    DEFAULT_BRANCH, KIND_EVENT_ID, KIND_NOTE_ID, event, note,
-};
+use faculties::schemas::planner::{event, note, DEFAULT_BRANCH, KIND_EVENT_ID, KIND_NOTE_ID};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use rrule::{RRuleSet, Tz};
@@ -120,9 +118,7 @@ enum Command {
         id: String,
     },
     /// Resolve a hex prefix to a full 32-char event id.
-    Resolve {
-        prefix: String,
-    },
+    Resolve { prefix: String },
     /// Ingest one or more `.ics` calendar files. Each VEVENT becomes
     /// an event entity (decomposed into tribles); the original UID is
     /// preserved so re-ingesting the same file is idempotent.
@@ -229,8 +225,8 @@ fn validate_short(label: &str, value: &str) -> Result<()> {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -247,10 +243,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo
@@ -313,12 +306,9 @@ fn event_location(space: &TribleSet, id: Id) -> Option<String> {
     find!(s: String, pattern!(space, [{ id @ event::location: ?s }])).next()
 }
 
-fn event_ical_uid(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    id: Id,
-) -> Option<String> {
-    let h: TextHandle = find!(h: TextHandle, pattern!(space, [{ id @ event::ical_uid: ?h }])).next()?;
+fn event_ical_uid(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
+    let h: TextHandle =
+        find!(h: TextHandle, pattern!(space, [{ id @ event::ical_uid: ?h }])).next()?;
     read_text(ws, h)
 }
 
@@ -352,7 +342,11 @@ fn occurrences_in_window(
     // No RRULE: single occurrence; check overlap with window.
     let Some(rrule) = rrule_str else {
         let overlaps = !(base_end < win_start || base_start > win_end);
-        return if overlaps { vec![(base_start, base_end)] } else { vec![] };
+        return if overlaps {
+            vec![(base_start, base_end)]
+        } else {
+            vec![]
+        };
     };
 
     // Build an RRuleSet from `DTSTART:...` + the rule string. The rrule
@@ -383,7 +377,9 @@ fn occurrences_in_window(
 // ── kind entity (planner branch) ──────────────────────────────────────────
 
 fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let existing: HashSet<Id> = find!(
         (kind: Id),
         pattern!(&space, [{ ?kind @ metadata::name: _?handle }])
@@ -392,7 +388,11 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
     .collect();
     let mut change = TribleSet::new();
     let label = |id: Id| -> &'static str {
-        if id == KIND_EVENT_ID { "planner-event" } else { "planner-note" }
+        if id == KIND_EVENT_ID {
+            "planner-event"
+        } else {
+            "planner-note"
+        }
     };
     for kind in [KIND_EVENT_ID, KIND_NOTE_ID] {
         if !existing.contains(&kind) {
@@ -440,7 +440,10 @@ fn cmd_add(
 
     if let Some(s) = &status {
         let upper = s.to_uppercase();
-        if !matches!(upper.as_str(), STATUS_CONFIRMED | STATUS_TENTATIVE | STATUS_CANCELLED) {
+        if !matches!(
+            upper.as_str(),
+            STATUS_CONFIRMED | STATUS_TENTATIVE | STATUS_CANCELLED
+        ) {
             bail!("--status must be one of confirmed/tentative/cancelled");
         }
         validate_short("status", &upper)?;
@@ -471,8 +474,14 @@ fn cmd_add(
         let event_ref = event_id.id;
         let now = (now_epoch(), now_epoch()).try_to_inline().unwrap();
 
-        let status_str = status.as_deref().map(str::to_uppercase).unwrap_or_else(|| STATUS_CONFIRMED.to_string());
-        let transp_str = transp.as_deref().map(str::to_uppercase).unwrap_or_else(|| TRANSP_OPAQUE.to_string());
+        let status_str = status
+            .as_deref()
+            .map(str::to_uppercase)
+            .unwrap_or_else(|| STATUS_CONFIRMED.to_string());
+        let transp_str = transp
+            .as_deref()
+            .map(str::to_uppercase)
+            .unwrap_or_else(|| TRANSP_OPAQUE.to_string());
         let synth_uid = format!("{:x}@triblespace", event_ref);
 
         let description_handle: Option<TextHandle> =
@@ -624,11 +633,12 @@ fn cmd_list(
         .unwrap_or_else(|| Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0));
 
     with_repo(pile, |repo| {
-        
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let occs = collect_occurrences(&mut ws, &space, (win_start, win_end), show_cancelled);
         print_occurrences(&occs);
         Ok(())
@@ -639,15 +649,26 @@ fn cmd_today(pile: &Path, _branch_name: &str, branch_id: Id) -> Result<()> {
     let now = chrono::Local::now();
     let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
     let end = start + chrono::Duration::days(1);
-    let win_start = chrono_to_epoch(now.timezone().from_local_datetime(&start).unwrap().with_timezone(&Utc));
-    let win_end = chrono_to_epoch(now.timezone().from_local_datetime(&end).unwrap().with_timezone(&Utc));
+    let win_start = chrono_to_epoch(
+        now.timezone()
+            .from_local_datetime(&start)
+            .unwrap()
+            .with_timezone(&Utc),
+    );
+    let win_end = chrono_to_epoch(
+        now.timezone()
+            .from_local_datetime(&end)
+            .unwrap()
+            .with_timezone(&Utc),
+    );
 
     with_repo(pile, |repo| {
-        
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let occs = collect_occurrences(&mut ws, &space, (win_start, win_end), false);
         print_occurrences(&occs);
         Ok(())
@@ -658,15 +679,26 @@ fn cmd_week(pile: &Path, _branch_name: &str, branch_id: Id) -> Result<()> {
     let now = chrono::Local::now();
     let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
     let end = start + chrono::Duration::days(7);
-    let win_start = chrono_to_epoch(now.timezone().from_local_datetime(&start).unwrap().with_timezone(&Utc));
-    let win_end = chrono_to_epoch(now.timezone().from_local_datetime(&end).unwrap().with_timezone(&Utc));
+    let win_start = chrono_to_epoch(
+        now.timezone()
+            .from_local_datetime(&start)
+            .unwrap()
+            .with_timezone(&Utc),
+    );
+    let win_end = chrono_to_epoch(
+        now.timezone()
+            .from_local_datetime(&end)
+            .unwrap()
+            .with_timezone(&Utc),
+    );
 
     with_repo(pile, |repo| {
-        
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let occs = collect_occurrences(&mut ws, &space, (win_start, win_end), false);
         print_occurrences(&occs);
         Ok(())
@@ -678,11 +710,12 @@ fn cmd_next(pile: &Path, _branch_name: &str, branch_id: Id) -> Result<()> {
     let far = Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0);
 
     with_repo(pile, |repo| {
-        
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let occs = collect_occurrences(&mut ws, &space, (now, far), false);
         let upcoming: Vec<_> = occs.into_iter().filter(|o| o.end >= now).take(1).collect();
         print_occurrences(&upcoming);
@@ -704,7 +737,9 @@ fn cmd_note(
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let event_ref = resolve_event_id(&id, &space)?;
 
         let note_id = ufoid();
@@ -728,17 +763,14 @@ fn cmd_note(
     Ok(())
 }
 
-fn cmd_show(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
-    id: String,
-) -> Result<()> {
+fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let event_ref = resolve_event_id(&id, &space)?;
 
         let summary = event_summary(&mut ws, &space, event_ref);
@@ -802,17 +834,14 @@ fn cmd_show(
     })
 }
 
-fn cmd_cancel(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
-    id: String,
-) -> Result<()> {
+fn cmd_cancel(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
     let event_ref = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let event_ref = resolve_event_id(&id, &space)?;
         let mut change = TribleSet::new();
         change += entity! { ExclusiveId::force_ref(&event_ref) @
@@ -827,18 +856,14 @@ fn cmd_cancel(
     Ok(())
 }
 
-fn cmd_resolve(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
-    prefix: String,
-) -> Result<()> {
+fn cmd_resolve(pile: &Path, _branch_name: &str, branch_id: Id, prefix: String) -> Result<()> {
     with_repo(pile, |repo| {
-        
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let id = resolve_event_id(&prefix, &space)?;
         println!("{}", fmt_id(id));
         Ok(())
@@ -847,12 +872,7 @@ fn cmd_resolve(
 
 // ── ingest .ics ───────────────────────────────────────────────────────────
 
-fn cmd_ingest(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
-    files: Vec<PathBuf>,
-) -> Result<()> {
+fn cmd_ingest(pile: &Path, _branch_name: &str, branch_id: Id, files: Vec<PathBuf>) -> Result<()> {
     if files.is_empty() {
         bail!("no files supplied");
     }
@@ -861,11 +881,12 @@ fn cmd_ingest(
     let mut skipped_dup = 0usize;
 
     with_repo(pile, |repo| {
-        
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
         // Collect existing UIDs so re-ingest is idempotent. Each
         // UID lives as a Handle<LongString> so we dereference one
@@ -901,22 +922,21 @@ fn cmd_ingest(
                     }
                     let event_id = ufoid();
                     let now = (now_epoch(), now_epoch()).try_to_inline().unwrap();
-                    let interval = make_interval(
-                        chrono_to_epoch(ievt.dtstart),
-                        chrono_to_epoch(ievt.dtend),
-                    );
+                    let interval =
+                        make_interval(chrono_to_epoch(ievt.dtstart), chrono_to_epoch(ievt.dtend));
                     let summary = ievt.summary.clone().unwrap_or_else(|| "(untitled)".into());
                     let summary_short = truncate_for_short(&summary);
-                    let description_handle = ievt
-                        .description
-                        .as_deref()
-                        .map(|d| ws.put(d.to_string()));
+                    let description_handle =
+                        ievt.description.as_deref().map(|d| ws.put(d.to_string()));
                     let location_short = ievt.location.as_deref().map(truncate_for_short);
                     let synth_uid = ievt
                         .uid
                         .clone()
                         .unwrap_or_else(|| format!("{:x}@triblespace", event_id.id));
-                    let status = ievt.status.clone().unwrap_or_else(|| STATUS_CONFIRMED.into());
+                    let status = ievt
+                        .status
+                        .clone()
+                        .unwrap_or_else(|| STATUS_CONFIRMED.into());
                     let transp = ievt.transp.clone().unwrap_or_else(|| TRANSP_OPAQUE.into());
                     let uid_handle: TextHandle = ws.put(synth_uid);
 
@@ -943,9 +963,7 @@ fn cmd_ingest(
         Ok(())
     })?;
 
-    println!(
-        "ingested {imported} of {total} events ({skipped_dup} duplicates skipped by UID)"
-    );
+    println!("ingested {imported} of {total} events ({skipped_dup} duplicates skipped by UID)");
     Ok(())
 }
 
@@ -984,7 +1002,9 @@ fn parse_ical_event(event: &ical::parser::ical::component::IcalEvent) -> Result<
                     .params
                     .as_ref()
                     .and_then(|ps| {
-                        ps.iter().find(|(k, _)| k == "VALUE").map(|(_, vs)| vs.clone())
+                        ps.iter()
+                            .find(|(k, _)| k == "VALUE")
+                            .map(|(_, vs)| vs.clone())
                     })
                     .map(|vs| vs.iter().any(|v| v == "DATE"))
                     .unwrap_or(false);
@@ -999,8 +1019,7 @@ fn parse_ical_event(event: &ical::parser::ical::component::IcalEvent) -> Result<
         }
     }
 
-    let dtstart_str =
-        dtstart_raw.ok_or_else(|| anyhow::anyhow!("VEVENT missing DTSTART"))?;
+    let dtstart_str = dtstart_raw.ok_or_else(|| anyhow::anyhow!("VEVENT missing DTSTART"))?;
     let dtstart = parse_ical_datetime(&dtstart_str, dtstart_is_date)?;
     let dtend = if let Some(s) = dtend_raw {
         parse_ical_datetime(&s, dtstart_is_date)?
@@ -1057,15 +1076,35 @@ fn main() -> Result<()> {
     let cmd = cli.command.unwrap_or(Command::Today);
     let branch_id_hex = cli.branch_id.as_deref();
 
-    let branch_id = with_repo(&cli.pile, |repo| resolve_branch(repo, &cli.branch, branch_id_hex))?;
+    let branch_id = with_repo(&cli.pile, |repo| {
+        resolve_branch(repo, &cli.branch, branch_id_hex)
+    })?;
 
     match cmd {
-        Command::Add { summary, from, to, rrule, location, status, transp, description, note } => {
-            cmd_add(
-                &cli.pile, &cli.branch, branch_id,
-                summary, from, to, rrule, location, status, transp, description, note,
-            )
-        }
+        Command::Add {
+            summary,
+            from,
+            to,
+            rrule,
+            location,
+            status,
+            transp,
+            description,
+            note,
+        } => cmd_add(
+            &cli.pile,
+            &cli.branch,
+            branch_id,
+            summary,
+            from,
+            to,
+            rrule,
+            location,
+            status,
+            transp,
+            description,
+            note,
+        ),
         Command::List { from, to, all } => {
             cmd_list(&cli.pile, &cli.branch, branch_id, from, to, all)
         }

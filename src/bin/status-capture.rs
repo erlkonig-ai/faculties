@@ -20,11 +20,7 @@ fn resolve_pile_path() -> PathBuf {
     }
     std::env::var("PILE")
         .ok()
-        .or_else(|| {
-            std::env::args()
-                .skip(1)
-                .find(|a| !a.starts_with("--"))
-        })
+        .or_else(|| std::env::args().skip(1).find(|a| !a.starts_with("--")))
         .unwrap_or_else(|| "./self.pile".to_owned())
         .into()
 }
@@ -39,7 +35,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("status", StatusViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("status") else { return };
+        let Some(mut ws) = st.workspace("status") else {
+            return;
+        };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
         st.push(&mut ws);

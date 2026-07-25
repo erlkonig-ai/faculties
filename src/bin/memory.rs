@@ -1,16 +1,14 @@
-
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::memory::{
-    DEFAULT_ARCHIVE_BRANCH, DEFAULT_COGNITION_BRANCH, DEFAULT_MEMORY_BRANCH, KIND_ARCHIVE_MESSAGE,
-    KIND_CHUNK_ID, KIND_EXEC_RESULT, KIND_RETRACTION, KIND_SEARCH_INDEX, archive_import_schema,
-    archive_schema,
-    comb, ctx, search_index,
-};
 use faculties::schemas::embeddings::{self, Embedding768};
+use faculties::schemas::memory::{
+    archive_import_schema, archive_schema, comb, ctx, search_index, DEFAULT_ARCHIVE_BRANCH,
+    DEFAULT_COGNITION_BRANCH, DEFAULT_MEMORY_BRANCH, KIND_ARCHIVE_MESSAGE, KIND_CHUNK_ID,
+    KIND_EXEC_RESULT, KIND_RETRACTION, KIND_SEARCH_INDEX,
+};
 // The context-cover renderer and its chunk accessors live in the lib module
 // `faculties::memory_cover` so `orient wake` can assemble the same cover
 // in-process. Re-import the pieces this binary still uses elsewhere.
@@ -22,9 +20,6 @@ use faculties::memory_cover::{
 };
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
-use triblespace_search::bm25::BM25Builder;
-use triblespace_search::succinct::SuccinctBM25Index;
-use triblespace_search::tokens::hash_tokens;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use triblespace::core::blob::Bytes;
@@ -35,6 +30,9 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
+use triblespace_search::bm25::BM25Builder;
+use triblespace_search::succinct::SuccinctBM25Index;
+use triblespace_search::tokens::hash_tokens;
 
 #[derive(Parser)]
 #[command(
@@ -172,11 +170,7 @@ fn parse_time_range(s: &str) -> Result<(Epoch, Epoch)> {
 /// that matches the query's width. This replaces a "narrowest strict
 /// container, else max raw overlap" rule that let an oversized root shadow
 /// every finer cover (raw overlap also favours wide chunks).
-fn find_chunk_by_time_range(
-    space: &TribleSet,
-    query_start: Epoch,
-    query_end: Epoch,
-) -> Option<Id> {
+fn find_chunk_by_time_range(space: &TribleSet, query_start: Epoch, query_end: Epoch) -> Option<Id> {
     let query_start_ns = query_start.to_tai_duration().total_nanoseconds();
     let query_end_ns = query_end.to_tai_duration().total_nanoseconds();
 
@@ -189,10 +183,16 @@ fn find_chunk_by_time_range(
         }
         let start_val = chunk_start_at(space, chunk_id);
         let end_val = chunk_end_at(space, chunk_id);
-        let (Some(start_v), Some(end_v)) = (start_val, end_val) else { continue };
+        let (Some(start_v), Some(end_v)) = (start_val, end_val) else {
+            continue;
+        };
 
-        let chunk_start = epoch_from_interval(start_v).to_tai_duration().total_nanoseconds();
-        let chunk_end = epoch_end_from_interval(end_v).to_tai_duration().total_nanoseconds();
+        let chunk_start = epoch_from_interval(start_v)
+            .to_tai_duration()
+            .total_nanoseconds();
+        let chunk_end = epoch_end_from_interval(end_v)
+            .to_tai_duration()
+            .total_nanoseconds();
 
         if chunk_start > query_end_ns || chunk_end < query_start_ns {
             continue;
@@ -359,12 +359,18 @@ fn cmd_import_tokenizer(args: &[String]) -> Result<()> {
     let [path] = args else {
         bail!("usage: memory import-tokenizer <path/to/tokenizer.json>");
     };
-    nomic::import_tokenizer(&nomic::text_pile(), Path::new(path), nomic::NOMIC_TEXT_MODEL)
+    nomic::import_tokenizer(
+        &nomic::text_pile(),
+        Path::new(path),
+        nomic::NOMIC_TEXT_MODEL,
+    )
 }
 
 #[cfg(not(feature = "local-embed"))]
 fn cmd_import_tokenizer(_args: &[String]) -> Result<()> {
-    bail!("`memory import-tokenizer` needs the local embedder — rebuild with --features local-embed");
+    bail!(
+        "`memory import-tokenizer` needs the local embedder — rebuild with --features local-embed"
+    );
 }
 
 /// `memory ingest-tokenizer` — build the canonical tokenizer GRAPH in the
@@ -380,7 +386,9 @@ fn cmd_ingest_tokenizer(args: &[String]) -> Result<()> {
 
 #[cfg(not(feature = "local-embed"))]
 fn cmd_ingest_tokenizer(_args: &[String]) -> Result<()> {
-    bail!("`memory ingest-tokenizer` needs the local embedder — rebuild with --features local-embed");
+    bail!(
+        "`memory ingest-tokenizer` needs the local embedder — rebuild with --features local-embed"
+    );
 }
 
 /// `memory embed` — embed every live chunk summary that lacks a vector and
@@ -479,7 +487,8 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
             }
         }
         ws.commit(change, "memory embed");
-        repo.push(&mut ws).map_err(|e| anyhow!("push failed: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push failed: {e:?}"))?;
         // Refresh the persisted HNSW segment so `memory similar` queries the
         // graph instead of rebuilding it. Best-effort: the segment is soft
         // state (recomputable from the commit chain), so a failure here warns
@@ -487,9 +496,7 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
         if let Err(e) = embeddings::refresh_index(repo, branch_id) {
             eprintln!("memory: warning: HNSW index refresh failed (similar will fall back): {e:#}");
         }
-        println!(
-            "embedded {n_text} text + {n_image} image chunk(s) into the shared nomic space."
-        );
+        println!("embedded {n_text} text + {n_image} image chunk(s) into the shared nomic space.");
         Ok(())
     })
 }
@@ -801,7 +808,9 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
     }
     let args = &filtered[..];
     if args.is_empty() {
-        bail!("summary text is required: memory create [--lens <theme>] [<from>..<to>] <summary...>");
+        bail!(
+            "summary text is required: memory create [--lens <theme>] [<from>..<to>] <summary...>"
+        );
     }
 
     // If the first argument looks like a time range, parse it.
@@ -842,10 +851,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             }
         };
         let chunk_id = create_chunk(repo, &summary_text, range, lens.as_deref())?;
-        println!(
-            "range: {}",
-            format_time_range(range.0, range.1)
-        );
+        println!("range: {}", format_time_range(range.0, range.1));
         println!("id: {chunk_id:x}");
         Ok(())
     })
@@ -894,8 +900,7 @@ fn create_chunk(
     let summary_handle = ws.put(summary_text.to_owned());
     let lens_handle = lens.map(|theme| ws.put(theme.to_owned()));
     let chunk_id = ufoid();
-    let now = Epoch::now()
-        .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
     let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
 
     let mut change = TribleSet::new();
@@ -990,8 +995,7 @@ fn create_image_chunk(
         .map_err(|e| anyhow!("pull memory branch for write: {e:?}"))?;
     let image_handle = ws.put::<RawBytes, _>(bytes.to_vec());
     let chunk_id = ufoid();
-    let now = Epoch::now()
-        .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
     let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
 
     let mut change = TribleSet::new();
@@ -1035,7 +1039,10 @@ fn comb_catalog(repo: &mut Repository<Pile>) -> Result<(Id, TribleSet)> {
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull comb-state branch: {e:?}"))?;
-    let catalog = ws.checkout(..).context("checkout comb-state branch")?.into_facts();
+    let catalog = ws
+        .checkout(..)
+        .context("checkout comb-state branch")?
+        .into_facts();
     Ok((branch_id, catalog))
 }
 
@@ -1047,8 +1054,7 @@ fn comb_advance(
     position: Option<Epoch>,
     grain: Option<&str>,
 ) -> Result<()> {
-    let now = Epoch::now()
-        .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
     let change = comb::advance_change(stream, persona, position, grain, now);
     let mut ws = repo
         .pull(branch_id)
@@ -1058,7 +1064,6 @@ fn comb_advance(
         .map_err(|e| anyhow!("push failed: {e:?}"))?;
     Ok(())
 }
-
 
 /// `memory consolidate start <ts> | stop | <ts> <summary...>`
 ///
@@ -1084,7 +1089,14 @@ fn cmd_consolidate(pile_path: &Path, args: &[String]) -> Result<()> {
                     bail!("usage: memory consolidate start <YYYY-MM-DDTHH:MM:SS>");
                 };
                 let edge = parse_tai_timestamp(raw)?;
-                comb_advance(repo, comb_branch, CONSOLIDATE_STREAM, &persona, Some(edge), None)?;
+                comb_advance(
+                    repo,
+                    comb_branch,
+                    CONSOLIDATE_STREAM,
+                    &persona,
+                    Some(edge),
+                    None,
+                )?;
                 println!("consolidation edge set to {raw} (persona {persona})");
                 Ok(())
             }
@@ -1180,7 +1192,14 @@ fn cmd_replay(pile_path: &Path, args: &[String]) -> Result<()> {
                 Ok(())
             }
             Some("stop") => {
-                comb_advance(repo, comb_branch, MEMORY_REPLAY_STREAM, &persona, None, None)?;
+                comb_advance(
+                    repo,
+                    comb_branch,
+                    MEMORY_REPLAY_STREAM,
+                    &persona,
+                    None,
+                    None,
+                )?;
                 println!("memory replay stopped (persona {persona})");
                 Ok(())
             }
@@ -1218,9 +1237,10 @@ fn cmd_replay(pile_path: &Path, args: &[String]) -> Result<()> {
                     if superseded.contains(&chunk_id) {
                         continue;
                     }
-                    let (Some(s), Some(e)) =
-                        (chunk_start_at(&space, chunk_id), chunk_end_at(&space, chunk_id))
-                    else {
+                    let (Some(s), Some(e)) = (
+                        chunk_start_at(&space, chunk_id),
+                        chunk_end_at(&space, chunk_id),
+                    ) else {
                         continue;
                     };
                     let (sk, ek) = (interval_key(s), interval_key(e));
@@ -1245,7 +1265,9 @@ fn cmd_replay(pile_path: &Path, args: &[String]) -> Result<()> {
                 batch.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
                 let total = batch.len();
                 if total == 0 {
-                    println!("memory replay complete at grain {grain_raw}: nothing after the cursor.");
+                    println!(
+                        "memory replay complete at grain {grain_raw}: nothing after the cursor."
+                    );
                     return Ok(());
                 }
                 let take = count.min(total);
@@ -1253,8 +1275,7 @@ fn cmd_replay(pile_path: &Path, args: &[String]) -> Result<()> {
                 for (sk, ek, chunk_id) in batch.iter().take(take) {
                     let summary = match chunk_summary_handle(&space, *chunk_id) {
                         Some(handle) => {
-                            let view: View<str> =
-                                ws.get(handle).context("read chunk summary")?;
+                            let view: View<str> = ws.get(handle).context("read chunk summary")?;
                             view.trim_end().to_string()
                         }
                         None => String::new(),
@@ -1352,8 +1373,8 @@ fn cmd_retract(pile_path: &Path, args: &[String]) -> Result<()> {
             .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
         let space = ws.checkout(..).context("checkout memory branch")?;
 
-        let old = resolve_chunk_id(&space, &args[0])
-            .map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
+        let old =
+            resolve_chunk_id(&space, &args[0]).map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
 
         let tombstone = ufoid();
         let mut change = TribleSet::new();
@@ -1464,16 +1485,15 @@ fn cmd_respan(pile_path: &Path, args: &[String]) -> Result<()> {
             .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
         let space = ws.checkout(..).context("checkout memory branch")?;
 
-        let old = resolve_chunk_id(&space, &args[0])
-            .map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
+        let old =
+            resolve_chunk_id(&space, &args[0]).map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
         let summary_handle = chunk_summary_handle(&space, old)
             .ok_or_else(|| anyhow!("chunk {old:x} has no summary"))?;
 
-        let start_at: Inline<NsTAIInterval> =
-            (range_start, range_start).try_to_inline().unwrap();
+        let start_at: Inline<NsTAIInterval> = (range_start, range_start).try_to_inline().unwrap();
         let end_at: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
-        let now = Epoch::now()
-            .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+        let now =
+            Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
         let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
 
         let new_chunk = ufoid();
@@ -1491,10 +1511,7 @@ fn cmd_respan(pile_path: &Path, args: &[String]) -> Result<()> {
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push failed: {e:?}"))?;
 
-        println!(
-            "range: {}",
-            format_time_range(range_start, range_end)
-        );
+        println!("range: {}", format_time_range(range_start, range_end));
         println!("id: {:x} (supersedes {old:x})", new_chunk.id);
         Ok(())
     })
@@ -1637,8 +1654,11 @@ fn cmd_list(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
             Some((raw, grain_ns)) => {
                 // The layer at this zoom: width <= grain, maximal among fitting
                 // (not contained in a wider chunk that also fits) — matches `replay`.
-                let fitting: Vec<(i128, i128, Id)> =
-                    chunks.iter().copied().filter(|(s, e, _)| e - s <= grain_ns).collect();
+                let fitting: Vec<(i128, i128, Id)> = chunks
+                    .iter()
+                    .copied()
+                    .filter(|(s, e, _)| e - s <= grain_ns)
+                    .collect();
                 let mut layer: Vec<(i128, i128, Id)> = fitting
                     .iter()
                     .copied()
@@ -1767,9 +1787,9 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
                 let raw = args.get(i + 1).ok_or_else(|| {
                     anyhow!("{flag} needs a number, e.g. `memory context --chars 80000`")
                 })?;
-                budget_chars = raw.parse().map_err(|_| {
-                    anyhow!("{flag} expects a positive integer, got `{raw}`")
-                })?;
+                budget_chars = raw
+                    .parse()
+                    .map_err(|_| anyhow!("{flag} expects a positive integer, got `{raw}`"))?;
                 chars_explicit = true;
                 i += 2;
                 continue;
@@ -1932,8 +1952,7 @@ fn cover_write_state(
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create cover state dir {}", dir.display()))?;
     let text_path = dir.join(COVER_TEXT_FILE);
-    std::fs::write(&text_path, cover)
-        .with_context(|| format!("write {}", text_path.display()))?;
+    std::fs::write(&text_path, cover).with_context(|| format!("write {}", text_path.display()))?;
     let total_chars = cover.chars().count();
     let cursor = CoverCursor {
         offset: 0,
@@ -1957,8 +1976,8 @@ fn cover_read_state(dir: &Path) -> Result<Option<(String, CoverCursor)>> {
         .with_context(|| format!("read {}", text_path.display()))?;
     let raw = std::fs::read_to_string(&cursor_path)
         .with_context(|| format!("read {}", cursor_path.display()))?;
-    let cursor: CoverCursor = serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", cursor_path.display()))?;
+    let cursor: CoverCursor =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", cursor_path.display()))?;
     if cursor.chunk_chars == 0 {
         bail!(
             "corrupt cover cursor {} (chunk_chars is 0) — rerun `memory cover start`",
@@ -2115,8 +2134,8 @@ fn cmd_cover(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> 
                     DEFAULT_SIM_THRESHOLD,
                 )
             })?;
-            let now = Epoch::now()
-                .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+            let now =
+                Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
             let (chunks, total) = cover_write_state(&dir, &cover, chunk_chars, fmt_epoch(now))?;
             println!(
                 "cover: generated {chunks} chunks (~{chunk_chars} chars each, {total} chars total); run 'memory cover continue'"
@@ -2198,8 +2217,11 @@ fn cmd_check(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> 
         let global_end = all.iter().map(|(_, e, _)| *e).max().unwrap();
 
         // Coverage at this zoom: intervals of chunks with width <= grain.
-        let mut covering: Vec<(i128, i128)> =
-            all.iter().filter(|(s, e, _)| e - s <= grain_ns).map(|(s, e, _)| (*s, *e)).collect();
+        let mut covering: Vec<(i128, i128)> = all
+            .iter()
+            .filter(|(s, e, _)| e - s <= grain_ns)
+            .map(|(s, e, _)| (*s, *e))
+            .collect();
         covering.sort_by_key(|(s, _)| *s);
 
         // Sweep for holes in [global_start, global_end].
@@ -2319,7 +2341,12 @@ fn cmd_density(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
                 subtree[p] += subtree[i];
             }
         }
-        let leaf_kids = |i: usize| children[i].iter().filter(|&&c| children[c].is_empty()).count();
+        let leaf_kids = |i: usize| {
+            children[i]
+                .iter()
+                .filter(|&&c| children[c].is_empty())
+                .count()
+        };
 
         // Non-leaf spans (forks worth inspecting: >= 2 children), optionally
         // restricted to a coarseness zoom.
@@ -2387,8 +2414,11 @@ fn cmd_density(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
         // crowd out the genuinely recent forks here.)
         let newest_end = spans.iter().map(|(_, e, _)| *e).max().unwrap();
         let recent_cutoff = newest_end - parse_grain("2w").unwrap_or(0);
-        let mut recent: Vec<usize> =
-            forks.iter().copied().filter(|&i| spans[i].0 >= recent_cutoff).collect();
+        let mut recent: Vec<usize> = forks
+            .iter()
+            .copied()
+            .filter(|&i| spans[i].0 >= recent_cutoff)
+            .collect();
         recent.sort_by(|&a, &b| spans[b].1.cmp(&spans[a].1));
         println!("\nRecent edge (forks starting within 2w, newest first):");
         if recent.is_empty() {
@@ -2430,16 +2460,16 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
             find_chunk_by_time_range(&space, start, end)
                 .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
         } else {
-            resolve_chunk_id(&space, raw)
-                .map_err(|e| invalid_memory_id_error(raw, e))?
+            resolve_chunk_id(&space, raw).map_err(|e| invalid_memory_id_error(raw, e))?
         };
 
         // Print structural metadata.
-        if let (Some(start_v), Some(end_v)) = (chunk_start_at(&space, chunk_id), chunk_end_at(&space, chunk_id)) {
-            let range = format_time_range(
-                epoch_from_interval(start_v),
-                epoch_end_from_interval(end_v),
-            );
+        if let (Some(start_v), Some(end_v)) = (
+            chunk_start_at(&space, chunk_id),
+            chunk_end_at(&space, chunk_id),
+        ) {
+            let range =
+                format_time_range(epoch_from_interval(start_v), epoch_end_from_interval(end_v));
             println!("range: {}", range);
         }
         println!("id: {:x}", chunk_id);
@@ -2451,27 +2481,23 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
         if !outgoing.is_empty() {
             let refs: Vec<String> = outgoing
                 .iter()
-                .map(|cid| {
-                    match (chunk_start_at(&space, *cid), chunk_end_at(&space, *cid)) {
+                .map(
+                    |cid| match (chunk_start_at(&space, *cid), chunk_end_at(&space, *cid)) {
                         (Some(s), Some(e)) => format!(
                             "{} ({:x})",
-                            format_time_range(
-                                epoch_from_interval(s),
-                                epoch_end_from_interval(e)
-                            ),
+                            format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)),
                             cid
                         ),
                         _ => format!("{cid:x}"),
-                    }
-                })
+                    },
+                )
                 .collect();
             println!("references: {}", refs.join(", "));
         }
         let superseded_set = superseded_ids(&space);
-        let incoming: Vec<Id> =
-            find!(s: Id, pattern!(&space, [{ ?s @ ctx::reference: chunk_id }]))
-                .filter(|s| !superseded_set.contains(s))
-                .collect();
+        let incoming: Vec<Id> = find!(s: Id, pattern!(&space, [{ ?s @ ctx::reference: chunk_id }]))
+            .filter(|s| !superseded_set.contains(s))
+            .collect();
         if !incoming.is_empty() {
             let ids: Vec<String> = incoming.iter().map(|s| format!("{s:x}")).collect();
             println!("referenced_by: {}", ids.join(", "));
@@ -2516,7 +2542,9 @@ fn print_archive_meta(
             archive_msg_id @
             archive_schema::author: ?author_id,
         }])
-    ).next() {
+    )
+    .next()
+    {
         // Try to resolve author name.
         let author_name: Option<String> = find!(
             (name: Inline<Handle<LongString>>),
@@ -2524,8 +2552,12 @@ fn print_archive_meta(
                 archive_msg_id @
                 archive_schema::author_name: ?name,
             }])
-        ).next().and_then(|(name_handle,)| {
-            ws.get::<View<str>, LongString>(name_handle).ok().map(|v| v.as_ref().to_string())
+        )
+        .next()
+        .and_then(|(name_handle,)| {
+            ws.get::<View<str>, LongString>(name_handle)
+                .ok()
+                .map(|v| v.as_ref().to_string())
         });
         match author_name {
             Some(name) => println!("  author: {} ({:x})", name, author_id),
@@ -2540,7 +2572,9 @@ fn print_archive_meta(
             archive_msg_id @
             archive_import_schema::source_format: ?fmt,
         }])
-    ).next() {
+    )
+    .next()
+    {
         println!("  source_format: {}", fmt);
     }
 
@@ -2551,7 +2585,9 @@ fn print_archive_meta(
             archive_msg_id @
             archive_import_schema::source_conversation_id: ?conv,
         }])
-    ).next() {
+    )
+    .next()
+    {
         if let Ok(view) = ws.get::<View<str>, LongString>(conv_handle) {
             println!("  conversation: {}", view.as_ref());
         }
@@ -2766,7 +2802,6 @@ fn cmd_provenance(pile_path: &Path, args: &[String]) -> Result<()> {
 // show / turn subcommands
 // ---------------------------------------------------------------------------
 
-
 fn print_chunk(ws: &mut Workspace<Pile>, space: &TribleSet, chunk_id: Id) -> Result<()> {
     if let Some(handle) = chunk_summary_handle(space, chunk_id) {
         let summary: View<str> = ws.get(handle).context("read chunk summary")?;
@@ -2841,16 +2876,35 @@ fn print_turn_facets(ws: &mut Workspace<Pile>, space: &TribleSet, raw: &str) -> 
     turn_matches.dedup();
 
     let first_turn = turn_matches[0].0;
-    if turn_matches.iter().any(|(turn_id, _)| *turn_id != first_turn) {
+    if turn_matches
+        .iter()
+        .any(|(turn_id, _)| *turn_id != first_turn)
+    {
         bail!("multiple turn_id values match prefix '{prefix}' (use a longer prefix)");
     }
 
     let mut chunk_ids: Vec<Id> = turn_matches.iter().map(|(_, cid)| *cid).collect();
     chunk_ids.sort_unstable_by(|a, b| {
-        let a_width = chunk_end_at(space, *a).map(|v| epoch_end_from_interval(v).to_tai_duration().total_nanoseconds()).unwrap_or(0)
-            - chunk_start_at(space, *a).map(|v| epoch_from_interval(v).to_tai_duration().total_nanoseconds()).unwrap_or(0);
-        let b_width = chunk_end_at(space, *b).map(|v| epoch_end_from_interval(v).to_tai_duration().total_nanoseconds()).unwrap_or(0)
-            - chunk_start_at(space, *b).map(|v| epoch_from_interval(v).to_tai_duration().total_nanoseconds()).unwrap_or(0);
+        let a_width = chunk_end_at(space, *a)
+            .map(|v| {
+                epoch_end_from_interval(v)
+                    .to_tai_duration()
+                    .total_nanoseconds()
+            })
+            .unwrap_or(0)
+            - chunk_start_at(space, *a)
+                .map(|v| epoch_from_interval(v).to_tai_duration().total_nanoseconds())
+                .unwrap_or(0);
+        let b_width = chunk_end_at(space, *b)
+            .map(|v| {
+                epoch_end_from_interval(v)
+                    .to_tai_duration()
+                    .total_nanoseconds()
+            })
+            .unwrap_or(0)
+            - chunk_start_at(space, *b)
+                .map(|v| epoch_from_interval(v).to_tai_duration().total_nanoseconds())
+                .unwrap_or(0);
         a_width.cmp(&b_width).then(a.cmp(b))
     });
 
@@ -2946,8 +3000,7 @@ fn sniff_image_ext(b: &[u8]) -> &'static str {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -2963,10 +3016,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
@@ -3011,10 +3061,7 @@ mod tests {
 
     impl TestStateDir {
         fn new() -> Self {
-            Self(
-                std::env::temp_dir()
-                    .join(format!("faculties-memory-cover-state-{}", ufoid().id)),
-            )
+            Self(std::env::temp_dir().join(format!("faculties-memory-cover-state-{}", ufoid().id)))
         }
 
         fn path(&self) -> &Path {

@@ -5,7 +5,7 @@
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::gauge::{WIKI_BRANCH_NAME, wiki};
+use faculties::schemas::gauge::{wiki, WIKI_BRANCH_NAME};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::HashMap;
@@ -143,11 +143,7 @@ fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
     .collect()
 }
 
-fn tag_name(
-    space: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    tag_id: Id,
-) -> String {
+fn tag_name(space: &TribleSet, ws: &mut Workspace<Pile>, tag_id: Id) -> String {
     let results: Vec<_> = find!(
         h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
         pattern!(space, [{ &tag_id @ metadata::name: ?h }])
@@ -343,11 +339,7 @@ fn cmd_quality(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_hubs(
-    space: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    top: usize,
-) -> Result<()> {
+fn cmd_hubs(space: &TribleSet, ws: &mut Workspace<Pile>, top: usize) -> Result<()> {
     let latest = latest_versions(space);
 
     // Build version->fragment and fragment->title maps

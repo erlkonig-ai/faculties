@@ -15,11 +15,11 @@
 //!   status list                  — latest status of every window
 //!   status show <window> [--limit N]
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::relations::relations as rel_attrs;
-use faculties::schemas::status::{DEFAULT_BRANCH, KIND_STATUS_UPDATE, status};
+use faculties::schemas::status::{status, DEFAULT_BRANCH, KIND_STATUS_UPDATE};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::HashMap;
@@ -54,7 +54,9 @@ struct Cli {
 enum Command {
     /// Set the current status for your window ($PERSONA)
     Set {
-        #[arg(help = "Status text, e.g. \"porting SigLIP\". Use @path for file input or @- for stdin.")]
+        #[arg(
+            help = "Status text, e.g. \"porting SigLIP\". Use @path for file input or @- for stdin."
+        )]
         text: String,
     },
     /// Show the latest status of every window
@@ -141,7 +143,11 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
 }
 
 /// Resolve a window (relations label or hex id) to its persona id.
-fn resolve_window_id(repo: &mut Repository<Pile>, relations_branch_id: Id, input: &str) -> Result<Id> {
+fn resolve_window_id(
+    repo: &mut Repository<Pile>,
+    relations_branch_id: Id,
+    input: &str,
+) -> Result<Id> {
     let trimmed = input.trim();
     if let Some(id) = Id::from_hex(trimmed) {
         return Ok(id);
@@ -149,7 +155,9 @@ fn resolve_window_id(repo: &mut Repository<Pile>, relations_branch_id: Id, input
     let mut ws = repo
         .pull(relations_branch_id)
         .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
     let key = trimmed.to_ascii_lowercase();
     let matches: Vec<Id> = find!(
         person_id: Id,
@@ -213,7 +221,13 @@ fn latest_per_window(rows: Vec<StatusRow>) -> HashMap<Id, StatusRow> {
 
 // ── commands ──────────────────────────────────────────────────────────────────
 
-fn cmd_set(pile: &Path, branch: &str, relations_branch: &str, persona: Option<&str>, text: String) -> Result<()> {
+fn cmd_set(
+    pile: &Path,
+    branch: &str,
+    relations_branch: &str,
+    persona: Option<&str>,
+    text: String,
+) -> Result<()> {
     let text = faculties::text_arg(&text, "status text")?;
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -230,7 +244,9 @@ fn cmd_set(pile: &Path, branch: &str, relations_branch: &str, persona: Option<&s
             .ensure_branch(relations_branch, None)
             .map_err(|e| anyhow!("ensure relations branch: {e:?}"))?;
         let window = resolve_window_id(repo, relations_branch_id, persona)?;
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull status: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull status: {e:?}"))?;
         let now = epoch_interval(now_epoch());
         let handle = ws.put(text.clone());
         let change = entity! { ufoid() @
@@ -240,7 +256,8 @@ fn cmd_set(pile: &Path, branch: &str, relations_branch: &str, persona: Option<&s
             metadata::created_at: now,
         };
         ws.commit(change, "status set");
-        repo.push(&mut ws).map_err(|e| anyhow!("push status: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push status: {e:?}"))?;
         println!("{} → {text}", fmt_id(window));
         Ok(())
     })
@@ -255,14 +272,20 @@ fn cmd_list(pile: &Path, branch: &str, relations_branch: &str) -> Result<()> {
             .ensure_branch(relations_branch, None)
             .map_err(|e| anyhow!("ensure relations branch: {e:?}"))?;
 
-        let mut status_ws = repo.pull(branch_id).map_err(|e| anyhow!("pull status: {e:?}"))?;
-        let status_space = status_ws.checkout(..).map_err(|e| anyhow!("checkout status: {e:?}"))?;
+        let mut status_ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull status: {e:?}"))?;
+        let status_space = status_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout status: {e:?}"))?;
         let latest = latest_per_window(load_status_rows(&status_space));
 
         let mut rel_ws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rel_ws.checkout(..).map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+        let rel_space = rel_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
 
         if latest.is_empty() {
             println!("No statuses set yet.");
@@ -286,7 +309,13 @@ fn cmd_list(pile: &Path, branch: &str, relations_branch: &str) -> Result<()> {
     })
 }
 
-fn cmd_show(pile: &Path, branch: &str, relations_branch: &str, window: String, limit: usize) -> Result<()> {
+fn cmd_show(
+    pile: &Path,
+    branch: &str,
+    relations_branch: &str,
+    window: String,
+    limit: usize,
+) -> Result<()> {
     with_repo(pile, |repo| {
         let branch_id = repo
             .ensure_branch(branch, None)
@@ -296,12 +325,18 @@ fn cmd_show(pile: &Path, branch: &str, relations_branch: &str, window: String, l
             .map_err(|e| anyhow!("ensure relations branch: {e:?}"))?;
         let window_id = resolve_window_id(repo, relations_branch_id, &window)?;
 
-        let mut status_ws = repo.pull(branch_id).map_err(|e| anyhow!("pull status: {e:?}"))?;
-        let status_space = status_ws.checkout(..).map_err(|e| anyhow!("checkout status: {e:?}"))?;
+        let mut status_ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull status: {e:?}"))?;
+        let status_space = status_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout status: {e:?}"))?;
         let mut rel_ws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rel_ws.checkout(..).map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+        let rel_space = rel_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
         let label = window_label(&mut rel_ws, &rel_space, window_id);
 
         let mut rows: Vec<StatusRow> = load_status_rows(&status_space)

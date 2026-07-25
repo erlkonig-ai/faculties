@@ -80,13 +80,11 @@ fn chunk_color(id: Id) -> egui::Color32 {
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t).round().clamp(0.0, 255.0) as u8
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    egui::Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Row struct ───────────────────────────────────────────────────────
@@ -328,11 +326,7 @@ impl MemoryViewer {
         Self::default()
     }
 
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-    ) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
@@ -343,22 +337,18 @@ impl MemoryViewer {
         }
 
         ctx.section("Memory", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
 
             ctx.grid(|g| {
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
                     let shown = live.chunks.len();
                     let label = if shown < live.total {
-                        format!(
-                            "SHOWING {shown} OF {} CHUNKS (NEWEST FIRST)",
-                            live.total
-                        )
+                        format!("SHOWING {shown} OF {} CHUNKS (NEWEST FIRST)", live.total)
                     } else {
-                        format!(
-                            "{shown} CHUNK{}",
-                            if shown == 1 { "" } else { "S" }
-                        )
+                        format!("{shown} CHUNK{}", if shown == 1 { "" } else { "S" })
                     };
                     ui.label(
                         egui::RichText::new(label)
@@ -503,17 +493,13 @@ fn render_chunk_card(ui: &mut egui::Ui, chunk: &ChunkRow) {
                     // is the right tool for full reads.
                     let rest = body_rest(&chunk.summary, 180);
                     if !rest.is_empty() {
-                        ui.label(
-                            egui::RichText::new(rest)
-                                .size(13.0)
-                                .color(body_text),
-                        );
+                        ui.label(egui::RichText::new(rest).size(13.0).color(body_text));
                     }
 
                     // Provenance row — small mono chips for any
                     // anchored exec-result / archive-message ids.
-                    let has_provenance = chunk.about_exec_result.is_some()
-                        || chunk.about_archive_message.is_some();
+                    let has_provenance =
+                        chunk.about_exec_result.is_some() || chunk.about_archive_message.is_some();
                     if has_provenance {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
@@ -567,8 +553,7 @@ fn body_rest(text: &str, max_chars: usize) -> String {
         return String::new();
     }
     if trimmed.chars().count() > max_chars {
-        let truncated: String =
-            trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+        let truncated: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{truncated}…")
     } else {
         trimmed.to_string()

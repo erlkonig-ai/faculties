@@ -440,7 +440,10 @@ mod tests {
         space += fb;
         let mut expected = vec![s_a, s_b];
         expected.sort();
-        assert_eq!(resolve_group_head(&space, anchor), GroupHead::Forked(expected));
+        assert_eq!(
+            resolve_group_head(&space, anchor),
+            GroupHead::Forked(expected)
+        );
         assert!(head_members(&space, anchor).is_empty());
         assert!(groups_for_member(&space, m1).is_empty());
     }

@@ -19,13 +19,13 @@
 //! as the sound's direction-of-arrival sweeping across the array. `feel` hears
 //! your hand as a sound travelling over the head.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::body::{BODY_BRANCH_NAME, KIND_CAPTURE, KIND_INTENT, capture, intent};
-use hifitime::Epoch;
-use hifitime::efmt::Formatter;
+use faculties::schemas::body::{capture, intent, BODY_BRANCH_NAME, KIND_CAPTURE, KIND_INTENT};
 use hifitime::efmt::consts::ISO8601;
+use hifitime::efmt::Formatter;
+use hifitime::Epoch;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
 use std::process::Command as PCommand;
@@ -327,7 +327,11 @@ fn set_target(
     if let Some(by) = body_yaw {
         req.insert("target_body_yaw".into(), serde_json::json!(by));
     }
-    daemon_post_json(daemon, "/api/move/set_target", &serde_json::Value::Object(req))
+    daemon_post_json(
+        daemon,
+        "/api/move/set_target",
+        &serde_json::Value::Object(req),
+    )
 }
 
 /// Grab one native-resolution camera frame to `out_png` via the embedded
@@ -355,9 +359,14 @@ fn grab_frame(python: &str, out_png: &Path) -> Result<(u64, u64)> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let output = child.wait_with_output().context("collect frame shim output")?;
+    let output = child
+        .wait_with_output()
+        .context("collect frame shim output")?;
     if !output.status.success() {
-        bail!("frame grab failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        bail!(
+            "frame grab failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     let dims = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(dims
@@ -373,10 +382,17 @@ fn read_state(daemon: &str) -> Result<[f64; 9]> {
     let s = daemon_get(daemon, "/api/state/full")?;
     let h = &s["head_pose"];
     let g = |v: &serde_json::Value, k: &str| v[k].as_f64().unwrap_or(0.0);
-    let ant = s["antennas_position"].as_array().cloned().unwrap_or_default();
+    let ant = s["antennas_position"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     Ok([
-        g(h, "x"), g(h, "y"), g(h, "z"),
-        g(h, "roll"), g(h, "pitch"), g(h, "yaw"),
+        g(h, "x"),
+        g(h, "y"),
+        g(h, "z"),
+        g(h, "roll"),
+        g(h, "pitch"),
+        g(h, "yaw"),
         s["body_yaw"].as_f64().unwrap_or(0.0),
         ant.first().and_then(|v| v.as_f64()).unwrap_or(0.0),
         ant.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -384,8 +400,8 @@ fn read_state(daemon: &str) -> Result<[f64; 9]> {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -418,7 +434,9 @@ fn with_body<T>(
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull body workspace: {e:?}"))?;
     let result = f(&mut repo, &mut ws);
-    let close_res = repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
+    let close_res = repo
+        .close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
     if let Err(err) = close_res {
         if result.is_ok() {
             return Err(err);
@@ -434,11 +452,11 @@ fn with_body<T>(
 #[allow(dead_code)]
 struct Felt {
     samples: usize,
-    sweeps: usize,        // count of >SWEEP_DEG moves within a ~SWEEP_WIN window
-    angle_min: f64,       // degrees
+    sweeps: usize,  // count of >SWEEP_DEG moves within a ~SWEEP_WIN window
+    angle_min: f64, // degrees
     angle_max: f64,
-    max_speed: f64,       // deg/s
-    head_deflect: f64,    // rad, max yaw/roll/pitch range
+    max_speed: f64,    // deg/s
+    head_deflect: f64, // rad, max yaw/roll/pitch range
     speech_ticks: usize,
     signature_json: String,
 }
@@ -553,10 +571,22 @@ fn feel_window(daemon: &str, secs: f64) -> Felt {
     Felt {
         samples: a_series.len(),
         sweeps,
-        angle_min: if angle_min.is_finite() { angle_min } else { 0.0 },
-        angle_max: if angle_max.is_finite() { angle_max } else { 0.0 },
+        angle_min: if angle_min.is_finite() {
+            angle_min
+        } else {
+            0.0
+        },
+        angle_max: if angle_max.is_finite() {
+            angle_max
+        } else {
+            0.0
+        },
         max_speed,
-        head_deflect: if head_deflect.is_finite() { head_deflect } else { 0.0 },
+        head_deflect: if head_deflect.is_finite() {
+            head_deflect
+        } else {
+            0.0
+        },
         speech_ticks,
         signature_json,
     }
@@ -731,22 +761,36 @@ fn cmd_pose(daemon: &str) -> Result<()> {
     let hp = &state["head_pose"];
     let f = |k: &str| hp[k].as_f64().unwrap_or(f64::NAN);
     println!("head pose:");
-    println!("  position   x={:+.4} y={:+.4} z={:+.4} (m)", f("x"), f("y"), f("z"));
+    println!(
+        "  position   x={:+.4} y={:+.4} z={:+.4} (m)",
+        f("x"),
+        f("y"),
+        f("z")
+    );
     println!(
         "  rotation   roll={:+.4} pitch={:+.4} yaw={:+.4} (rad)",
-        f("roll"), f("pitch"), f("yaw")
+        f("roll"),
+        f("pitch"),
+        f("yaw")
     );
     if let Some(by) = state["body_yaw"].as_f64() {
         println!("body yaw:    {by:+.4} rad");
     }
     if let Some(ant) = state["antennas_position"].as_array() {
-        let vals: Vec<String> = ant.iter().map(|v| format!("{:+.4}", v.as_f64().unwrap_or(f64::NAN))).collect();
+        let vals: Vec<String> = ant
+            .iter()
+            .map(|v| format!("{:+.4}", v.as_f64().unwrap_or(f64::NAN)))
+            .collect();
         println!("antennas:    [{}] rad", vals.join(", "));
     }
     // live mic-array direction-of-arrival (the touch/sound sense)
     if let Ok(d) = daemon_get(daemon, "/api/state/doa") {
         if let Some(a) = d["angle"].as_f64() {
-            let sp = if d["speech_detected"].as_bool().unwrap_or(false) { " (speech)" } else { "" };
+            let sp = if d["speech_detected"].as_bool().unwrap_or(false) {
+                " (speech)"
+            } else {
+                ""
+            };
             println!("audio dir:   {:.0}°{sp}", a.to_degrees());
         }
     }
@@ -792,9 +836,14 @@ fn cmd_look(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let output = child.wait_with_output().context("collect frame shim output")?;
+    let output = child
+        .wait_with_output()
+        .context("collect frame shim output")?;
     if !output.status.success() {
-        bail!("frame grab failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        bail!(
+            "frame grab failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     let dims = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let (w, h) = dims
@@ -806,7 +855,9 @@ fn cmd_look(
     let nbytes = bytes.len();
     let _ = std::fs::remove_file(&out_png);
 
-    let pose_json = daemon_get(daemon, "/api/state/full").map(|v| v.to_string()).unwrap_or_default();
+    let pose_json = daemon_get(daemon, "/api/state/full")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
 
     let frame_h: RawHandle = ws.put::<blobencodings::RawBytes, _>(bytes);
     let pose_h: TextHandle = ws.put(pose_json);
@@ -838,7 +889,9 @@ fn cmd_look(
 }
 
 fn cmd_list(ws: &mut Workspace<Pile>) -> Result<()> {
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let mut rows: Vec<(i128, Id, String, String)> = Vec::new();
     for (cid, modality, created) in find!(
         (c: Id, m: String, t: Inline<inlineencodings::NsTAIInterval>),
@@ -868,14 +921,20 @@ fn cmd_list(ws: &mut Workspace<Pile>) -> Result<()> {
     }
     for (k, cid, modality, note) in rows {
         let when = format_time(k);
-        let suffix = if note.is_empty() { String::new() } else { format!("  — {note}") };
+        let suffix = if note.is_empty() {
+            String::new()
+        } else {
+            format!("  — {note}")
+        };
         println!("{}  {:<6}  {when}{suffix}", &fmt_id(cid)[..12], modality);
     }
     Ok(())
 }
 
 fn cmd_get(ws: &mut Workspace<Pile>, id: &str, output: Option<&str>) -> Result<()> {
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let needle = id.to_lowercase();
     let cap_id = find!(
         (c: Id),
@@ -898,7 +957,9 @@ fn cmd_get(ws: &mut Workspace<Pile>, id: &str, output: Option<&str>) -> Result<(
 
     if output == Some("@-") {
         use std::io::Write;
-        std::io::stdout().write_all(bytes.as_ref()).context("write to stdout")?;
+        std::io::stdout()
+            .write_all(bytes.as_ref())
+            .context("write to stdout")?;
     } else {
         let out_path = output
             .map(PathBuf::from)
@@ -1018,26 +1079,44 @@ fn main() -> Result<()> {
             daemon_post(&daemon, "/api/move/play/goto_sleep")?;
             println!("going to sleep");
         }
-        Some(Command::Feel { secs, loop_, keep, respond, note }) => {
-            with_body(&pile, branch, |repo, ws| {
-                cmd_feel(repo, ws, &daemon, secs, loop_, keep, respond, note.as_deref())
-            })?
-        }
+        Some(Command::Feel {
+            secs,
+            loop_,
+            keep,
+            respond,
+            note,
+        }) => with_body(&pile, branch, |repo, ws| {
+            cmd_feel(
+                repo,
+                ws,
+                &daemon,
+                secs,
+                loop_,
+                keep,
+                respond,
+                note.as_deref(),
+            )
+        })?,
         Some(Command::Gesture { name }) => cmd_gesture(&daemon, &name)?,
-        Some(Command::Intent { text }) => with_body(&pile, branch, |repo, ws| cmd_intent(repo, ws, text.as_deref()))?,
+        Some(Command::Intent { text }) => with_body(&pile, branch, |repo, ws| {
+            cmd_intent(repo, ws, text.as_deref())
+        })?,
         Some(Command::Observe { frame, no_frame }) => {
             cmd_observe(&daemon, &python, frame.as_deref(), no_frame)?
         }
-        Some(Command::Act { pose, duration, dt, now }) => {
-            cmd_act(&daemon, &pose, duration, dt, now)?
-        }
-        Some(Command::Look { note }) => {
-            with_body(&pile, branch, |repo, ws| cmd_look(repo, ws, &daemon, &python, note.as_deref()))?
-        }
+        Some(Command::Act {
+            pose,
+            duration,
+            dt,
+            now,
+        }) => cmd_act(&daemon, &pose, duration, dt, now)?,
+        Some(Command::Look { note }) => with_body(&pile, branch, |repo, ws| {
+            cmd_look(repo, ws, &daemon, &python, note.as_deref())
+        })?,
         Some(Command::List) => with_body(&pile, branch, |_repo, ws| cmd_list(ws))?,
-        Some(Command::Get { id, output }) => {
-            with_body(&pile, branch, |_repo, ws| cmd_get(ws, &id, output.as_deref()))?
-        }
+        Some(Command::Get { id, output }) => with_body(&pile, branch, |_repo, ws| {
+            cmd_get(ws, &id, output.as_deref())
+        })?,
     }
     Ok(())
 }

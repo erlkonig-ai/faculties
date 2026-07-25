@@ -38,13 +38,13 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::{Epoch, TimeScale};
 use rand_core::OsRng;
 use reqwest::blocking::Client;
-use serde_json::{Value as JsonValue, json};
+use serde_json::{json, Value as JsonValue};
 
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
@@ -54,10 +54,10 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use faculties::schemas::archive::archive;
-use faculties::schemas::discord::{DEFAULT_BRANCH, DEFAULT_LOG_BRANCH, discord};
-use faculties::schemas::teams::{FILES_BRANCH_NAME, file_schema};
-use file_schema::KIND_FILE;
+use faculties::schemas::discord::{discord, DEFAULT_BRANCH, DEFAULT_LOG_BRANCH};
+use faculties::schemas::teams::{file_schema, FILES_BRANCH_NAME};
 use file_schema::file;
+use file_schema::KIND_FILE;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
@@ -197,8 +197,7 @@ fn build_config(cli: &Cli) -> Result<DiscordConfig> {
     let log_branch = DEFAULT_LOG_BRANCH.to_string();
     let branch_id = with_repo(&pile_path, |repo| {
         if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
+            return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
         }
         repo.ensure_branch(&branch, None)
             .map_err(|e| anyhow!("ensure discord branch: {e:?}"))
@@ -265,7 +264,8 @@ fn log_event(config: &DiscordConfig, level: &str, message: &str) -> Result<()> {
             archive::content: message_handle,
         };
         ws.commit(change, &format!("discord {level}"));
-        repo.push(&mut ws).map_err(|e| anyhow!("push logs: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push logs: {e:?}"))?;
         Ok(())
     })
 }
@@ -481,8 +481,7 @@ fn pull_channel(
     // cursor we get the most-recent `fetch_limit` messages (in
     // reverse order), which we normalise below.
     let client = build_client()?;
-    let mut url =
-        format!("{DISCORD_API_BASE}/channels/{channel_id}/messages?limit={fetch_limit}");
+    let mut url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages?limit={fetch_limit}");
     if let Some(c) = cursor.as_deref() {
         url.push_str(&format!("&after={c}"));
     }
@@ -650,11 +649,7 @@ fn print_history(config: &DiscordConfig, options: &ReadOptions) -> Result<()> {
             Some(id_str) => {
                 let external_handle = ws.put(id_str.to_string());
                 let id_frag = entity! { _ @ discord::channel_id: external_handle };
-                Some(
-                    id_frag
-                        .root()
-                        .ok_or_else(|| anyhow!("channel id rooted"))?,
-                )
+                Some(id_frag.root().ok_or_else(|| anyhow!("channel id rooted"))?)
             }
             None => None,
         };
@@ -803,7 +798,10 @@ struct HistoryRow {
     edited_at: Option<Inline<NsTAIInterval>>,
 }
 
-fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result<Vec<IncomingMessage>> {
+fn parse_messages(
+    messages: Vec<JsonValue>,
+    channel_external_id: &str,
+) -> Result<Vec<IncomingMessage>> {
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
         let raw_json = serde_json::to_string(&message).context("serialize message json")?;
@@ -817,10 +815,7 @@ fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let author = message
-            .get("author")
-            .cloned()
-            .unwrap_or(JsonValue::Null);
+        let author = message.get("author").cloned().unwrap_or(JsonValue::Null);
         let author_external_id = author
             .get("id")
             .and_then(|v| v.as_str())
@@ -926,9 +921,7 @@ fn build_ingest_change(
             let id_frag = entity! { _ @
                 discord::channel_id: external_handle,
             };
-            let channel_id = id_frag
-                .root()
-                .ok_or_else(|| anyhow!("channel id rooted"))?;
+            let channel_id = id_frag.root().ok_or_else(|| anyhow!("channel id rooted"))?;
             change += id_frag;
             change += entity! { ExclusiveId::force_ref(&channel_id) @
                 metadata::tag: discord::kind_channel,
@@ -941,9 +934,7 @@ fn build_ingest_change(
             let id_frag = entity! { _ @
                 discord::user_id: external_handle,
             };
-            let author_id = id_frag
-                .root()
-                .ok_or_else(|| anyhow!("author id rooted"))?;
+            let author_id = id_frag.root().ok_or_else(|| anyhow!("author id rooted"))?;
             change += id_frag;
             let mut author_facts = entity! { ExclusiveId::force_ref(&author_id) @
                 metadata::tag: archive::kind_author,
@@ -965,9 +956,7 @@ fn build_ingest_change(
         let id_frag = entity! { _ @
             discord::message_id: external_handle,
         };
-        let message_id = id_frag
-            .root()
-            .ok_or_else(|| anyhow!("message id rooted"))?;
+        let message_id = id_frag.root().ok_or_else(|| anyhow!("message id rooted"))?;
         message_ids.insert(message.external_id.clone(), message_id);
 
         let content_handle = ws.put(message.content.clone());
@@ -1029,10 +1018,7 @@ fn build_ingest_change(
                     let _ = log_event(
                         config,
                         "error",
-                        &format!(
-                            "attachment fetch failed ({}): {err:?}",
-                            source.url
-                        ),
+                        &format!("attachment fetch failed ({}): {err:?}", source.url),
                     );
                     continue;
                 }
@@ -1060,7 +1046,10 @@ fn build_ingest_change(
 
 // ── per-channel cursor ───────────────────────────────────────────
 
-fn load_channel_cursor(config: &DiscordConfig, channel_external_id: &str) -> Result<Option<String>> {
+fn load_channel_cursor(
+    config: &DiscordConfig,
+    channel_external_id: &str,
+) -> Result<Option<String>> {
     with_repo(&config.pile_path, |repo| {
         let mut ws = repo
             .pull(config.branch_id)
@@ -1076,9 +1065,7 @@ fn load_channel_cursor(config: &DiscordConfig, channel_external_id: &str) -> Res
             metadata::tag: discord::kind_cursor,
             discord::channel_id: external_handle,
         };
-        let cursor_id = id_frag
-            .root()
-            .ok_or_else(|| anyhow!("cursor id rooted"))?;
+        let cursor_id = id_frag.root().ok_or_else(|| anyhow!("cursor id rooted"))?;
 
         for (_cur, handle) in find!(
             (cur: Id, handle: Inline<Handle<LongString>>),
@@ -1091,9 +1078,7 @@ fn load_channel_cursor(config: &DiscordConfig, channel_external_id: &str) -> Res
             // find! doesn't let us filter by cursor_id in-macro
             // without rebinding, so check match manually:
             if _cur == cursor_id {
-                let view: View<str> = ws
-                    .get(handle)
-                    .map_err(|e| anyhow!("get cursor: {e:?}"))?;
+                let view: View<str> = ws.get(handle).map_err(|e| anyhow!("get cursor: {e:?}"))?;
                 return Ok(Some(view.to_string()));
             }
         }
@@ -1120,9 +1105,7 @@ fn store_channel_cursor(
             metadata::tag: discord::kind_cursor,
             discord::channel_id: external_handle,
         };
-        let cursor_id = id_frag
-            .root()
-            .ok_or_else(|| anyhow!("cursor id rooted"))?;
+        let cursor_id = id_frag.root().ok_or_else(|| anyhow!("cursor id rooted"))?;
 
         let snowflake_handle = ws.put(snowflake.to_string());
         let mut change = id_frag;
@@ -1212,10 +1195,10 @@ fn list_channels(config: DiscordConfig, guild_filter: Option<String>) -> Result<
         }
         // Stable order: categories first, then text/announce/forum, then voice.
         rows.sort_by_key(|(kind, _, _, _)| match kind {
-            4 => 0,   // category
+            4 => 0,     // category
             0 | 5 => 1, // text / announcement
-            15 => 2,  // forum
-            _ => 3,   // voice, stage, thread, ...
+            15 => 2,    // forum
+            _ => 3,     // voice, stage, thread, ...
         });
 
         for (_, id, name, kind_label) in rows {
@@ -1293,8 +1276,8 @@ fn compare_snowflakes(a: &str, b: &str) -> std::cmp::Ordering {
 fn parse_iso8601(value: &str) -> Result<Inline<NsTAIInterval>> {
     // Discord timestamps look like `2026-04-22T09:12:34.567000+00:00`.
     // hifitime's Epoch::from_gregorian_str handles RFC3339.
-    let epoch = Epoch::from_gregorian_str(value)
-        .map_err(|e| anyhow!("parse iso8601 '{value}': {e}"))?;
+    let epoch =
+        Epoch::from_gregorian_str(value).map_err(|e| anyhow!("parse iso8601 '{value}': {e}"))?;
     Ok(epoch_interval(epoch))
 }
 
@@ -1325,8 +1308,7 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
                 .with_context(|| format!("read {label} from stdin"))?;
             return Ok(value);
         }
-        return fs::read_to_string(path)
-            .with_context(|| format!("read {label} from {path}"));
+        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
     }
     Ok(raw.to_string())
 }

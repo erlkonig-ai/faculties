@@ -27,7 +27,6 @@
 //! panel.render(ctx, cognition_ws);
 //! ```
 
-
 use chrono::{DateTime, TimeZone, Timelike, Utc};
 use hifitime::Epoch;
 
@@ -48,9 +47,8 @@ use triblespace::prelude::View;
 
 use crate::schemas::triage::{
     exec as exec_attrs, model_chat as model_attrs, reason as reason_attrs,
-    KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID,
-    KIND_MODEL_IN_PROGRESS_ID, KIND_MODEL_REQUEST_ID, KIND_MODEL_RESULT_ID,
-    KIND_REASON_EVENT_ID,
+    KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID, KIND_MODEL_IN_PROGRESS_ID,
+    KIND_MODEL_REQUEST_ID, KIND_MODEL_RESULT_ID, KIND_REASON_EVENT_ID,
 };
 
 type TextHandle = Inline<Handle<LongString>>;
@@ -105,13 +103,11 @@ fn color_error() -> egui::Color32 {
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t).round().clamp(0.0, 255.0) as u8
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    egui::Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Data ─────────────────────────────────────────────────────────────
@@ -260,11 +256,7 @@ fn collect_queue(
     counts
 }
 
-fn collect_exec_results(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    out: &mut Vec<EventRow>,
-) {
+fn collect_exec_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut Vec<EventRow>) {
     // Each exec result has: about_request → command_text,
     // exit_code, stdout/stderr/error handles, created_at.
     // For the timeline we just need the result entity + its
@@ -299,8 +291,7 @@ fn collect_exec_results(
             )
             .next()
         });
-        let command =
-            command_handle.and_then(|h| read_text(ws, h));
+        let command = command_handle.and_then(|h| read_text(ws, h));
         let error_handle = find!(
             h: TextHandle,
             pattern!(space, [{ id @ exec_attrs::error: ?h }])
@@ -311,7 +302,9 @@ fn collect_exec_results(
         let summary = command
             .clone()
             .map(|c| first_line(&c, 80))
-            .or(error_text.clone().map(|e| format!("error: {}", first_line(&e, 60))))
+            .or(error_text
+                .clone()
+                .map(|e| format!("error: {}", first_line(&e, 60))))
             .unwrap_or_else(|| "(exec result)".to_string());
 
         let detail = match exit {
@@ -331,11 +324,7 @@ fn collect_exec_results(
     }
 }
 
-fn collect_model_results(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    out: &mut Vec<EventRow>,
-) {
+fn collect_model_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut Vec<EventRow>) {
     for (id, ts) in find!(
         (id: Id, ts: (i128, i128)),
         pattern!(space, [{
@@ -378,7 +367,9 @@ fn collect_model_results(
         let summary = output_text
             .as_ref()
             .map(|t| first_line(t, 80))
-            .or(error_text.clone().map(|e| format!("error: {}", first_line(&e, 60))))
+            .or(error_text
+                .clone()
+                .map(|e| format!("error: {}", first_line(&e, 60))))
             .unwrap_or_else(|| "(model result)".to_string());
 
         let detail = match (input_tokens, output_tokens) {
@@ -399,11 +390,7 @@ fn collect_model_results(
     }
 }
 
-fn collect_reason_events(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    out: &mut Vec<EventRow>,
-) {
+fn collect_reason_events(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut Vec<EventRow>) {
     for (id, ts) in find!(
         (id: Id, ts: (i128, i128)),
         pattern!(space, [{
@@ -453,7 +440,9 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
 fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
     let secs = (ns / 1_000_000_000) as i64;
     let nanos = ((ns % 1_000_000_000) as u32).min(999_999_999);
-    Utc.timestamp_opt(secs, nanos).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_opt(secs, nanos)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 fn now_tai_ns() -> i128 {
@@ -532,11 +521,7 @@ impl TriageViewer {
         Self::default()
     }
 
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-    ) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
@@ -624,11 +609,7 @@ impl TriageViewer {
 
 // ── Queue-counts dashboard ──────────────────────────────────────────
 
-fn render_queues_card(
-    ui: &mut egui::Ui,
-    exec: &QueueCounts,
-    model: &QueueCounts,
-) {
+fn render_queues_card(ui: &mut egui::Ui, exec: &QueueCounts, model: &QueueCounts) {
     let bubble_fill = ui.visuals().window_fill;
     let body_text = colorhash::text_color_on(bubble_fill);
     let body_muted = mix(body_text, bubble_fill, 0.30);
@@ -690,12 +671,7 @@ fn render_queue_row(
         if counts.stale_in_progress > 0 {
             // Stale items are surfaced in error red so they catch
             // the eye — the user probably wants to triage them.
-            render_count_colored(
-                ui,
-                "STALE",
-                counts.stale_in_progress,
-                color_error(),
-            );
+            render_count_colored(ui, "STALE", counts.stale_in_progress, color_error());
         }
         render_count(ui, "DONE", counts.results, text, muted);
     });
@@ -710,12 +686,7 @@ fn render_count(
 ) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
-        ui.label(
-            egui::RichText::new(label)
-                .monospace()
-                .small()
-                .color(muted),
-        );
+        ui.label(egui::RichText::new(label).monospace().small().color(muted));
         ui.label(
             egui::RichText::new(format!("{n}"))
                 .monospace()
@@ -725,12 +696,7 @@ fn render_count(
     });
 }
 
-fn render_count_colored(
-    ui: &mut egui::Ui,
-    label: &str,
-    n: usize,
-    color: egui::Color32,
-) {
+fn render_count_colored(ui: &mut egui::Ui, label: &str, n: usize, color: egui::Color32) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         ui.label(
@@ -753,7 +719,11 @@ fn render_count_colored(
 
 fn render_event_card(ui: &mut egui::Ui, ev: &EventRow, now: DateTime<Utc>) {
     let bubble_fill = ui.visuals().window_fill;
-    let accent = if ev.is_error { color_error() } else { ev.kind.color() };
+    let accent = if ev.is_error {
+        color_error()
+    } else {
+        ev.kind.color()
+    };
     let text_on_accent = colorhash::text_color_on(accent);
     let body_muted = {
         let body_text = colorhash::text_color_on(bubble_fill);

@@ -63,13 +63,11 @@ fn entry_color(id: Id) -> egui::Color32 {
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t).round().clamp(0.0, 255.0) as u8
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    egui::Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Row struct ───────────────────────────────────────────────────────
@@ -238,11 +236,7 @@ impl AtlasViewer {
         Self::default()
     }
 
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-    ) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
         let head = ws.head();
         let need_refresh = match self.live.as_ref() {
             None => true,
@@ -253,7 +247,9 @@ impl AtlasViewer {
         }
 
         ctx.section("Atlas", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
 
             let mut search = ctx.search();
             let needle = search.query().to_lowercase();
@@ -315,17 +311,11 @@ impl AtlasViewer {
 
                 for entry in visible {
                     let match_info = if search_active {
-                        Some(
-                            search.report(egui::Id::new((
-                                "atlas_match",
-                                entry.id,
-                            ))),
-                        )
+                        Some(search.report(egui::Id::new(("atlas_match", entry.id))))
                     } else {
                         None
                     };
-                    let is_focused =
-                        match_info.as_ref().map_or(false, |i| i.is_focused);
+                    let is_focused = match_info.as_ref().map_or(false, |i| i.is_focused);
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
@@ -337,10 +327,7 @@ impl AtlasViewer {
                                     egui::pos2(ui.min_rect().left(), pre_y),
                                     egui::pos2(ui.min_rect().right(), post_y),
                                 );
-                                ui.scroll_to_rect(
-                                    rect,
-                                    Some(egui::Align::Center),
-                                );
+                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
                             }
                         }
                     });
@@ -402,10 +389,7 @@ fn render_entry_card(
                             &entry.name,
                             search_needle,
                             egui::TextFormat {
-                                font_id: egui::FontId::new(
-                                    16.0,
-                                    egui::FontFamily::Proportional,
-                                ),
+                                font_id: egui::FontId::new(16.0, egui::FontFamily::Proportional),
                                 color: text_on_accent,
                                 ..Default::default()
                             },
@@ -458,8 +442,7 @@ fn render_entry_card(
                             desc,
                             search_needle,
                             egui::TextFormat {
-                                font_id: egui::TextStyle::Body
-                                    .resolve(ui.style()),
+                                font_id: egui::TextStyle::Body.resolve(ui.style()),
                                 color: body_muted,
                                 ..Default::default()
                             },
@@ -469,8 +452,7 @@ fn render_entry_card(
 
                     if !entry.tags.is_empty() {
                         ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing =
-                                egui::vec2(4.0, 4.0);
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                             for tag_id in &entry.tags {
                                 let label = name_by_id
                                     .get(tag_id)

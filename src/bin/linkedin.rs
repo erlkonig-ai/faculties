@@ -29,10 +29,10 @@
 //!   linkedin review [--limit N]
 //!   linkedin resolve <id-a> <id-b> --same | --distinct
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::relations::{DEFAULT_BRANCH, KIND_PERSON_ID, relations};
+use faculties::schemas::relations::{relations, DEFAULT_BRANCH, KIND_PERSON_ID};
 use rand_core::OsRng;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -137,7 +137,11 @@ impl Conn {
     }
     fn email_key(&self) -> Option<String> {
         let e = self.email.trim().to_ascii_lowercase();
-        if e.is_empty() { None } else { Some(e) }
+        if e.is_empty() {
+            None
+        } else {
+            Some(e)
+        }
     }
     fn url_key(&self) -> Option<String> {
         normalize_url(&self.url)
@@ -163,19 +167,26 @@ fn normalize_url(url: &str) -> Option<String> {
         s = rest.to_string();
     }
     let trimmed = s.trim_end_matches('/').to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn name_key(name: &str) -> Option<String> {
     let k = name.trim().to_ascii_lowercase();
-    if k.is_empty() { None } else { Some(k) }
+    if k.is_empty() {
+        None
+    } else {
+        Some(k)
+    }
 }
 
 // ── repo plumbing (mirrors mail.rs / relations.rs) ──────────────────────────
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -259,7 +270,11 @@ fn build_lookup(ws: &mut Workspace<Pile>, space: &TribleSet) -> Lookup {
         }
     }
 
-    Lookup { by_url, by_email, by_name }
+    Lookup {
+        by_url,
+        by_email,
+        by_name,
+    }
 }
 
 // ── emitting person facts ───────────────────────────────────────────────────
@@ -301,7 +316,8 @@ fn emit_person(ws: &mut Workspace<Pile>, change: &mut TribleSet, id: Id, conn: &
             };
             let norm = name.to_ascii_lowercase();
             if norm.len() <= 32 {
-                *change += entity! { ExclusiveId::force_ref(&id) @ relations::label_norm: norm.as_str() };
+                *change +=
+                    entity! { ExclusiveId::force_ref(&id) @ relations::label_norm: norm.as_str() };
             }
             let dh = ws.put(name);
             *change += entity! { ExclusiveId::force_ref(&id) @ relations::display_name: dh };
@@ -324,7 +340,11 @@ fn cmd_import(pile: &Path, branch_id: Id, snapshot: &Path, dry_run: bool) -> Res
         .map_err(|e| anyhow!("read snapshot {}: {e}", snapshot.display()))?;
     let conns: Vec<Conn> =
         serde_json::from_str(&raw).map_err(|e| anyhow!("parse snapshot JSON: {e}"))?;
-    println!("Read {} connection records from {}", conns.len(), snapshot.display());
+    println!(
+        "Read {} connection records from {}",
+        conns.len(),
+        snapshot.display()
+    );
     ingest(pile, branch_id, &conns, dry_run)
 }
 
@@ -333,8 +353,12 @@ fn cmd_import(pile: &Path, branch_id: Id, snapshot: &Path, dry_run: bool) -> Res
 fn ingest(pile: &Path, branch_id: Id, conns: &[Conn], dry_run: bool) -> Result<()> {
     let (created, enriched_url, merged_email, skipped, ambiguous_pairs, committed) =
         with_repo(pile, |repo| {
-            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull relations: {e:?}"))?;
-            let space = ws.checkout(..).map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
             let mut look = build_lookup(&mut ws, &space);
 
             let mut change = TribleSet::new();
@@ -408,17 +432,28 @@ fn ingest(pile: &Path, branch_id: Id, conns: &[Conn], dry_run: bool) -> Result<(
                 false
             } else {
                 ws.commit(change, "linkedin: import connections");
-                repo.push(&mut ws).map_err(|e| anyhow!("push relations: {e:?}"))?;
+                repo.push(&mut ws)
+                    .map_err(|e| anyhow!("push relations: {e:?}"))?;
                 true
             };
-            Ok((created, enriched_url, merged_email, skipped, ambiguous, committed))
+            Ok((
+                created,
+                enriched_url,
+                merged_email,
+                skipped,
+                ambiguous,
+                committed,
+            ))
         })?;
 
     println!();
     println!("  new people:        {created}");
     println!("  merged by email:   {merged_email}   (enriched existing mail/booth contacts)");
     println!("  matched by url:    {enriched_url}   (idempotent re-import)");
-    println!("  needs review:      {}   (name collision, kept distinct)", ambiguous_pairs.len());
+    println!(
+        "  needs review:      {}   (name collision, kept distinct)",
+        ambiguous_pairs.len()
+    );
     if skipped > 0 {
         println!("  skipped:           {skipped}   (identity-less junk rows)");
     }
@@ -568,16 +603,24 @@ fn describe(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
 
 fn edge_exists(space: &TribleSet, a: Id, b: Id) -> bool {
     let has = |x: Id, y: Id| {
-        find!((), pattern!(space, [{ x @ relations::same_as: y }])).next().is_some()
-            || find!((), pattern!(space, [{ x @ relations::distinct_from: y }])).next().is_some()
+        find!((), pattern!(space, [{ x @ relations::same_as: y }]))
+            .next()
+            .is_some()
+            || find!((), pattern!(space, [{ x @ relations::distinct_from: y }]))
+                .next()
+                .is_some()
     };
     has(a, b) || has(b, a)
 }
 
 fn cmd_review(pile: &Path, branch_id: Id, limit: usize) -> Result<()> {
     with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
 
         let pairs: Vec<(Id, Id)> = find!(
             (a: Id, b: Id),
@@ -645,8 +688,12 @@ fn cmd_resolve(
         bail!("pass exactly one of --same / --distinct");
     }
     with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
         let a = resolve_person_id(&space, id_a)?;
         let b = resolve_person_id(&space, id_b)?;
         if a == b {
@@ -663,7 +710,8 @@ fn cmd_resolve(
         }
         let verdict = if same { "same_as" } else { "distinct_from" };
         ws.commit(change, "linkedin: identity verdict");
-        repo.push(&mut ws).map_err(|e| anyhow!("push relations: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push relations: {e:?}"))?;
         println!("Recorded {verdict}: {} ↔ {}", fmt_id(a), fmt_id(b));
         Ok(())
     })
@@ -684,12 +732,18 @@ fn main() -> Result<()> {
         Command::Import { snapshot, dry_run } => {
             cmd_import(&cli.pile, branch_id, &snapshot, dry_run)
         }
-        Command::Pull { token, domain, api_version, dry_run } => {
-            cmd_pull(&cli.pile, branch_id, &token, &domain, &api_version, dry_run)
-        }
+        Command::Pull {
+            token,
+            domain,
+            api_version,
+            dry_run,
+        } => cmd_pull(&cli.pile, branch_id, &token, &domain, &api_version, dry_run),
         Command::Review { limit } => cmd_review(&cli.pile, branch_id, limit),
-        Command::Resolve { id_a, id_b, same, distinct } => {
-            cmd_resolve(&cli.pile, branch_id, &id_a, &id_b, same, distinct)
-        }
+        Command::Resolve {
+            id_a,
+            id_b,
+            same,
+            distinct,
+        } => cmd_resolve(&cli.pile, branch_id, &id_a, &id_b, same, distinct),
     }
 }

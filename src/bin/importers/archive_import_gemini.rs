@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::common;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use hifitime::{Duration, Epoch};
 use scraper::{Html, Selector};
 use tracing::info_span;
@@ -205,14 +205,7 @@ fn import_gemini_parsed_file(
     );
 
     let commit_start = Instant::now();
-    if common::commit_delta(
-        repo,
-        ws,
-        catalog,
-        catalog_head,
-        change,
-        "import gemini",
-    )? {
+    if common::commit_delta(repo, ws, catalog, catalog_head, change, "import gemini")? {
         stats.commits += 1;
     }
     println!(

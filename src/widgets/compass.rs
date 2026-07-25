@@ -26,19 +26,19 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use GORBIE::prelude::CardCtx;
-use GORBIE::themes::colorhash;
-use GORBIE::widgets::ChoiceToggle;
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
+use GORBIE::prelude::CardCtx;
+use GORBIE::themes::colorhash;
+use GORBIE::widgets::ChoiceToggle;
 
 use crate::schemas::compass::{
     board as compass, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
@@ -149,7 +149,6 @@ fn tag_color(tag: &str) -> egui::Color32 {
     colorhash::ral_categorical(tag.as_bytes())
 }
 
-
 /// Truncate `s` at char boundary to `max` chars, appending `…` if cut.
 /// Char-aware so multibyte sequences don't panic on slice.
 fn truncate_inline(s: &str, max: usize) -> String {
@@ -224,7 +223,6 @@ impl CompassLive {
         notes.sort_by(|a, b| b.at.cmp(&a.at));
         notes
     }
-
 }
 
 // ── Tree layout ──────────────────────────────────────────────────────
@@ -362,8 +360,7 @@ fn produce_items(
             for (id, status, sort_at) in sorted {
                 by_status.entry(status).or_default().push((id, sort_at));
             }
-            let mut columns: Vec<String> =
-                DEFAULT_STATUSES.iter().map(|s| s.to_string()).collect();
+            let mut columns: Vec<String> = DEFAULT_STATUSES.iter().map(|s| s.to_string()).collect();
             let mut extras: Vec<String> = by_status
                 .keys()
                 .filter(|s| !DEFAULT_STATUSES.contains(&s.as_str()))
@@ -603,11 +600,10 @@ impl CompassBoard {
                     if *count == 0 {
                         continue;
                     }
-                    let (dot, _) = ui.allocate_exact_size(
-                        egui::vec2(8.0, 8.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().circle_filled(dot.center(), 3.5, status_color(status));
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot.center(), 3.5, status_color(status));
                     ui.label(
                         egui::RichText::new(status.to_uppercase())
                             .monospace()
@@ -715,12 +711,8 @@ impl CompassBoard {
                     continue;
                 };
                 let base = status_color(&item.status);
-                let edge_color = egui::Color32::from_rgba_unmultiplied(
-                    base.r(),
-                    base.g(),
-                    base.b(),
-                    200,
-                );
+                let edge_color =
+                    egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 200);
                 let higher_id = item.id;
                 for (lower,) in find!(
                     (lower: Id),
@@ -835,11 +827,7 @@ fn render_goal_card(
                             color: ui.visuals().text_color(),
                             ..Default::default()
                         };
-                        let job = GORBIE::search::highlight_match(
-                            v.as_ref(),
-                            search_needle,
-                            base,
-                        );
+                        let job = GORBIE::search::highlight_match(v.as_ref(), search_needle, base);
                         ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
                     }
                 }
@@ -880,12 +868,9 @@ fn render_goal_card(
                 )
                 .count();
                 if note_count > 0 {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            render_chip(ui, &format!("{note_count}n"), color_muted(ui));
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        render_chip(ui, &format!("{note_count}n"), color_muted(ui));
+                    });
                 }
             });
 
@@ -1005,10 +990,8 @@ fn render_goal_card(
                                         .color(color_muted(ui)),
                                 );
                                 ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&note.body).small(),
-                                    )
-                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                    egui::Label::new(egui::RichText::new(&note.body).small())
+                                        .wrap_mode(egui::TextWrapMode::Wrap),
                                 );
                             });
                         // Paint a 2-px status-colored accent on the
@@ -1016,10 +999,7 @@ fn render_goal_card(
                         let r = note_resp.response.rect;
                         let painter = ui.painter();
                         painter.rect_filled(
-                            egui::Rect::from_min_size(
-                                r.min,
-                                egui::vec2(2.0, r.height()),
-                            ),
+                            egui::Rect::from_min_size(r.min, egui::vec2(2.0, r.height())),
                             0.0,
                             status_col,
                         );
@@ -1087,8 +1067,7 @@ fn render_goal_card(
     // glyphs (avoids text overflowing into the card body).
     let stripe_font = egui::FontId::monospace(9.0);
     let stripe_text_color = colorhash::text_color_on(stripe_color);
-    let galley =
-        painter.layout_no_wrap(status.to_uppercase(), stripe_font, stripe_text_color);
+    let galley = painter.layout_no_wrap(status.to_uppercase(), stripe_font, stripe_text_color);
     if galley.size().x + 6.0 <= frame_rect.height() {
         // egui's `TextShape::angle` rotates the galley around `pos`.
         // For angle = +π/2 (vertices x ↦ -y, y ↦ x in screen-space),
@@ -1166,11 +1145,7 @@ fn draw_priority_edge(
 fn render_empty_state(ui: &mut egui::Ui, glyph: &str, headline: &str, hint: Option<&str>) {
     ui.add_space(16.0);
     ui.vertical_centered(|ui| {
-        ui.label(
-            egui::RichText::new(glyph)
-                .size(28.0)
-                .color(color_muted(ui)),
-        );
+        ui.label(egui::RichText::new(glyph).size(28.0).color(color_muted(ui)));
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(headline)
@@ -1181,11 +1156,7 @@ fn render_empty_state(ui: &mut egui::Ui, glyph: &str, headline: &str, hint: Opti
         );
         if let Some(h) = hint {
             ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(h)
-                    .small()
-                    .color(color_muted(ui)),
-            );
+            ui.label(egui::RichText::new(h).small().color(color_muted(ui)));
         }
     });
     ui.add_space(16.0);
@@ -1199,7 +1170,9 @@ fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
     // tall enough for its glyphs.
     let text_color = colorhash::text_color_on(fill);
     let font = egui::TextStyle::Small.resolve(ui.style());
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font, text_color);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, text_color);
     const PAD_X: f32 = 5.0;
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(galley.size().x + PAD_X * 2.0, galley.size().y),

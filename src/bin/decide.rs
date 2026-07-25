@@ -6,11 +6,11 @@
 //! the *existence* of a resolved decision — the deliberation rule
 //! lives here, the trust contract is "is it resolved?" lives there.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::decide::{
-    DEFAULT_BRANCH, KIND_CON, KIND_DECISION, KIND_PRO, decide as decide_attrs, factor,
+    decide as decide_attrs, factor, DEFAULT_BRANCH, KIND_CON, KIND_DECISION, KIND_PRO,
 };
 use hifitime::Epoch;
 use rand_core::OsRng;
@@ -99,9 +99,7 @@ enum Command {
         decision: String,
     },
     /// Resolve a hex prefix to a full 32-char decision id.
-    ResolveId {
-        prefix: String,
-    },
+    ResolveId { prefix: String },
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -130,8 +128,8 @@ fn resolve_decision_id(space: &TribleSet, input: &str) -> Result<Id> {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -148,10 +146,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo
@@ -189,11 +184,7 @@ fn count_factors(space: &TribleSet, decision_id: Id, factor_kind: Id) -> usize {
 /// A resolved decision has BOTH `metadata::finished_at` and a
 /// non-empty `decide::outcome`. We treat absence-of-either as
 /// "still open."
-fn is_resolved(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    decision_id: Id,
-) -> bool {
+fn is_resolved(ws: &mut Workspace<Pile>, space: &TribleSet, decision_id: Id) -> bool {
     let has_finished_at = find!(
         f: IntervalValue,
         pattern!(space, [{ decision_id @ metadata::finished_at: ?f }])
@@ -211,11 +202,7 @@ fn is_resolved(
     has_finished_at && has_outcome
 }
 
-fn decision_title(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    decision_id: Id,
-) -> String {
+fn decision_title(ws: &mut Workspace<Pile>, space: &TribleSet, decision_id: Id) -> String {
     find!(
         h: TextHandle,
         pattern!(space, [{ decision_id @ metadata::name: ?h }])
@@ -237,7 +224,9 @@ fn decision_created_at(space: &TribleSet, decision_id: Id) -> Option<Epoch> {
 // ── kind entities ─────────────────────────────────────────────────────────
 
 fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let existing: HashSet<Id> = find!(
         (k: Id),
         pattern!(&space, [{ ?k @ metadata::name: _?handle }])
@@ -293,7 +282,10 @@ fn cmd_propose(
             })
         })
         .transpose()?;
-    let context_text = context.as_deref().map(|s| faculties::text_arg(s, "context")).transpose()?;
+    let context_text = context
+        .as_deref()
+        .map(|s| faculties::text_arg(s, "context"))
+        .transpose()?;
 
     let decision_ref = with_repo(pile, |repo| {
         let mut ws = repo
@@ -303,7 +295,8 @@ fn cmd_propose(
         let decision_ref = decision_id.id;
         let now = instant_interval(now_epoch());
         let title_handle = ws.put(title.clone());
-        let context_handle: Option<TextHandle> = context_text.as_deref().map(|c| ws.put(c.to_string()));
+        let context_handle: Option<TextHandle> =
+            context_text.as_deref().map(|c| ws.put(c.to_string()));
 
         let mut change = TribleSet::new();
         change += ensure_kind_entities(&mut ws)?;
@@ -339,7 +332,9 @@ fn cmd_factor(
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         // Sanity-check the decision exists and isn't already resolved.
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let decision_id = resolve_decision_id(&space, &decision_hex)?;
         let exists = find!(
             d: Id,
@@ -369,7 +364,11 @@ fn cmd_factor(
         };
         ws.commit(
             change,
-            if kind == KIND_PRO { "decide: pro" } else { "decide: con" },
+            if kind == KIND_PRO {
+                "decide: pro"
+            } else {
+                "decide: con"
+            },
         );
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
@@ -395,7 +394,9 @@ fn cmd_resolve(
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let decision_id = resolve_decision_id(&space, &decision_hex)?;
         let exists = find!(
             d: Id,
@@ -449,10 +450,7 @@ struct DecisionRow {
     outcome_preview: Option<String>,
 }
 
-fn collect_decisions(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-) -> Vec<DecisionRow> {
+fn collect_decisions(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<DecisionRow> {
     let ids: Vec<Id> = find!(
         d: Id,
         pattern!(space, [{ ?d @ metadata::tag: KIND_DECISION }])
@@ -488,7 +486,13 @@ fn collect_decisions(
             }
         })
         .collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.created_at.map(|e| e.to_tai_seconds() as i128).unwrap_or(0)));
+    rows.sort_by_key(|r| {
+        std::cmp::Reverse(
+            r.created_at
+                .map(|e| e.to_tai_seconds() as i128)
+                .unwrap_or(0),
+        )
+    });
     rows
 }
 
@@ -497,7 +501,9 @@ fn cmd_list(pile: &Path, branch_id: Id, all: bool, forced_only: bool) -> Result<
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let rows = collect_decisions(&mut ws, &space);
         let filtered: Vec<&DecisionRow> = rows
             .iter()
@@ -555,7 +561,9 @@ fn cmd_show(pile: &Path, branch_id: Id, decision_hex: String) -> Result<()> {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let decision_id = resolve_decision_id(&space, &decision_hex)?;
 
         let title = decision_title(&mut ws, &space, decision_id);
@@ -649,7 +657,9 @@ fn cmd_resolve_id(pile: &Path, branch_id: Id, prefix: String) -> Result<()> {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let matches: Vec<Id> = find!(
             d: Id,
             pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
@@ -671,7 +681,10 @@ fn cmd_resolve_id(pile: &Path, branch_id: Id, prefix: String) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cmd = cli.command.unwrap_or(Command::List { all: false, forced: false });
+    let cmd = cli.command.unwrap_or(Command::List {
+        all: false,
+        forced: false,
+    });
     let branch_id_hex = cli.branch_id.as_deref();
     let branch_id = with_repo(&cli.pile, |repo| {
         if let Some(hex) = branch_id_hex {
@@ -687,18 +700,22 @@ fn main() -> Result<()> {
     })?;
 
     match cmd {
-        Command::Propose { title, context, about } => {
-            cmd_propose(&cli.pile, branch_id, title, context, about)
-        }
+        Command::Propose {
+            title,
+            context,
+            about,
+        } => cmd_propose(&cli.pile, branch_id, title, context, about),
         Command::Pro { decision, text } => {
             cmd_factor(&cli.pile, branch_id, decision, text, KIND_PRO)
         }
         Command::Con { decision, text } => {
             cmd_factor(&cli.pile, branch_id, decision, text, KIND_CON)
         }
-        Command::Resolve { decision, outcome, force } => {
-            cmd_resolve(&cli.pile, branch_id, decision, outcome, force)
-        }
+        Command::Resolve {
+            decision,
+            outcome,
+            force,
+        } => cmd_resolve(&cli.pile, branch_id, decision, outcome, force),
         Command::List { all, forced } => cmd_list(&cli.pile, branch_id, all, forced),
         Command::Show { decision } => cmd_show(&cli.pile, branch_id, decision),
         Command::ResolveId { prefix } => cmd_resolve_id(&cli.pile, branch_id, prefix),

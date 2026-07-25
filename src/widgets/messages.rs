@@ -25,18 +25,18 @@
 
 use std::collections::HashMap;
 
-use GORBIE::prelude::CardCtx;
-use GORBIE::themes::colorhash;
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
+use GORBIE::prelude::CardCtx;
+use GORBIE::themes::colorhash;
 
 use crate::schemas::message::{local, KIND_MESSAGE_ID, KIND_READ_ID};
 use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
@@ -199,10 +199,7 @@ struct MessagesLive {
 impl MessagesLive {
     /// Refresh cached fact spaces + people map from the provided
     /// workspaces.
-    fn refresh(
-        ws: &mut Workspace<Pile>,
-        relations_ws: Option<&mut Workspace<Pile>>,
-    ) -> Self {
+    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
         let space = ws
             .checkout(..)
             .map(|co| co.into_facts())
@@ -325,7 +322,6 @@ impl MessagesLive {
 
         by_id.into_values().collect()
     }
-
 }
 
 /// Build the people map by scanning the relations fact space.
@@ -497,7 +493,9 @@ impl MessagesPanel {
 
         let filter = &mut self.filter;
         ctx.section("Messages", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
 
             // Pre-materialize everything the UI closure needs.
             let mut messages = live.messages(ws);
@@ -530,11 +528,7 @@ impl MessagesPanel {
             // Inbox stats: messages addressed to an operator (a human
             // per the relations `operator` affinity); unread = the
             // recipient hasn't filed a read receipt yet.
-            let is_inbox = |m: &MessageRow| {
-                live.people
-                    .get(&m.to)
-                    .map_or(false, |p| p.is_operator)
-            };
+            let is_inbox = |m: &MessageRow| live.people.get(&m.to).map_or(false, |p| p.is_operator);
             let inbox_total = messages.iter().filter(|m| is_inbox(m)).count();
             let inbox_unread = messages
                 .iter()
@@ -568,24 +562,15 @@ impl MessagesPanel {
                         if inbox_total > 0 {
                             let all_label = format!("ALL {count}");
                             let inbox_label = if inbox_unread > 0 {
-                                format!(
-                                    "\u{1F4E5} INBOX {inbox_total} · {inbox_unread} NEW"
-                                )
+                                format!("\u{1F4E5} INBOX {inbox_total} · {inbox_unread} NEW")
                             } else {
                                 format!("\u{1F4E5} INBOX {inbox_total}")
                             };
-                            if render_filter_chip(
-                                ui,
-                                &all_label,
-                                *filter == StreamFilter::All,
-                            ) {
+                            if render_filter_chip(ui, &all_label, *filter == StreamFilter::All) {
                                 *filter = StreamFilter::All;
                             }
-                            if render_filter_chip(
-                                ui,
-                                &inbox_label,
-                                *filter == StreamFilter::Inbox,
-                            ) {
+                            if render_filter_chip(ui, &inbox_label, *filter == StreamFilter::Inbox)
+                            {
                                 *filter = StreamFilter::Inbox;
                             }
                         } else {
@@ -603,14 +588,11 @@ impl MessagesPanel {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        egui::RichText::new(format!(
-                                            "LAST {}",
-                                            age.to_uppercase()
-                                        ))
-                                        .monospace()
-                                        .small()
-                                        .strong()
-                                        .color(color_muted(ui)),
+                                        egui::RichText::new(format!("LAST {}", age.to_uppercase()))
+                                            .monospace()
+                                            .small()
+                                            .strong()
+                                            .color(color_muted(ui)),
                                     );
                                 },
                             );
@@ -620,11 +602,7 @@ impl MessagesPanel {
 
                 if messages.is_empty() {
                     g.full(|ctx| {
-                        render_messages_empty_state(
-                            ctx.ui_mut(),
-                            "No messages yet.",
-                            None,
-                        );
+                        render_messages_empty_state(ctx.ui_mut(), "No messages yet.", None);
                     });
                     return;
                 }
@@ -646,8 +624,7 @@ impl MessagesPanel {
                     } else {
                         None
                     };
-                    let is_focused =
-                        match_info.as_ref().map_or(false, |i| i.is_focused);
+                    let is_focused = match_info.as_ref().map_or(false, |i| i.is_focused);
                     let inbox_unread_msg = msg_is_inbox && !msg.read_by(msg.to);
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
@@ -669,10 +646,7 @@ impl MessagesPanel {
                                     egui::pos2(ui.min_rect().left(), pre_y),
                                     egui::pos2(ui.min_rect().right(), post_y),
                                 );
-                                ui.scroll_to_rect(
-                                    msg_rect,
-                                    Some(egui::Align::Center),
-                                );
+                                ui.scroll_to_rect(msg_rect, Some(egui::Align::Center));
                             }
                         }
                     });
@@ -689,11 +663,7 @@ impl MessagesPanel {
 
 /// True if the message's body, sender display name, or recipient
 /// display name contains the (lowercased) needle.
-fn message_matches_search(
-    msg: &MessageRow,
-    names: &HashMap<Id, String>,
-    needle: &str,
-) -> bool {
+fn message_matches_search(msg: &MessageRow, names: &HashMap<Id, String>, needle: &str) -> bool {
     if msg.body.to_lowercase().contains(needle) {
         return true;
     }
@@ -781,42 +751,38 @@ fn render_message(
     const STROKE_INSET: f32 = 1.0;
 
     ui.vertical(|ui| {
-    let inner_margin = egui::Margin {
-        left: (STROKE_INSET + STRIPE_WIDTH + STRIPE_GAP) as i8,
-        right: (STROKE_INSET + STRIPE_WIDTH + STRIPE_GAP) as i8,
-        top: 6,
-        bottom: 6,
-    };
-    let frame_resp = egui::Frame::NONE
-        .fill(bubble_fill)
-        .stroke(egui::Stroke::new(STROKE_INSET, color_frame(ui)))
-        // Hard offset shadow + sharp corners: same paper-card idiom
-        // compass goals use, giving the bubble physical "lift" instead
-        // of a backlit LCD look.
-        .shadow(egui::epaint::Shadow {
-            offset: [2, 2],
-            blur: 0,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(48),
-        })
-        .corner_radius(egui::CornerRadius::ZERO)
-        .inner_margin(inner_margin)
-        .show(ui, |ui| {
-            // Header row: just the age, right-aligned. Sender/recipient
-            // are conveyed via the colored side stripes painted after
-            // the Frame returns — no need for in-header chips.
-            //
-            // `Align::Min` on the cross-axis (top) so the layout
-            // doesn't try to fill the cell's available_rect.height —
-            // with frame-delayed cell sizing, that fill would feed
-            // back into next frame's larger cell, growing forever.
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Min),
-                |ui| {
+        let inner_margin = egui::Margin {
+            left: (STROKE_INSET + STRIPE_WIDTH + STRIPE_GAP) as i8,
+            right: (STROKE_INSET + STRIPE_WIDTH + STRIPE_GAP) as i8,
+            top: 6,
+            bottom: 6,
+        };
+        let frame_resp = egui::Frame::NONE
+            .fill(bubble_fill)
+            .stroke(egui::Stroke::new(STROKE_INSET, color_frame(ui)))
+            // Hard offset shadow + sharp corners: same paper-card idiom
+            // compass goals use, giving the bubble physical "lift" instead
+            // of a backlit LCD look.
+            .shadow(egui::epaint::Shadow {
+                offset: [2, 2],
+                blur: 0,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(48),
+            })
+            .corner_radius(egui::CornerRadius::ZERO)
+            .inner_margin(inner_margin)
+            .show(ui, |ui| {
+                // Header row: just the age, right-aligned. Sender/recipient
+                // are conveyed via the colored side stripes painted after
+                // the Frame returns — no need for in-header chips.
+                //
+                // `Align::Min` on the cross-axis (top) so the layout
+                // doesn't try to fill the cell's available_rect.height —
+                // with frame-delayed cell sizing, that fill would feed
+                // back into next frame's larger cell, growing forever.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     let (age, hover) = match msg.created_at {
-                        Some(k) => {
-                            (format_age_key(now, k), Some(format_timestamp_key(k)))
-                        }
+                        Some(k) => (format_age_key(now, k), Some(format_timestamp_key(k))),
                         None => ("-".to_string(), None),
                     };
                     let resp = ui.label(
@@ -834,146 +800,134 @@ fn render_message(
                     // age. NEW (RAL 1003) only while the operator
                     // hasn't read-receipted; 📥 marks operator mail
                     // permanently so it stands out in the ALL stream.
-                    ui.with_layout(
-                        egui::Layout::left_to_right(egui::Align::Min),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            if is_inbox {
-                                render_badge(
-                                    ui,
-                                    "\u{1F4E5} INBOX",
-                                    egui::Color32::from_rgb(0x23, 0x7f, 0x52), // RAL 6032
-                                );
-                            }
-                            if is_unread {
-                                render_badge(
-                                    ui,
-                                    "NEW",
-                                    egui::Color32::from_rgb(0xf7, 0xba, 0x0b), // RAL 1003
-                                );
-                            }
-                        },
-                    );
-                },
-            );
-
-            ui.add_space(2.0);
-
-            // Body. When a search is active, occurrences of the needle
-            // are underlined inline; the bar's focused match gets a
-            // second underline overlay via `highlight_label`.
-            let base = egui::TextFormat {
-                font_id: egui::TextStyle::Body.resolve(ui.style()),
-                color: ui.visuals().text_color(),
-                ..Default::default()
-            };
-            GORBIE::search::highlight_label(
-                ui,
-                &msg.body,
-                search_needle,
-                base,
-                focused,
-            );
-
-            // Read receipts — compact "✓✓ NameA · NameB · 2h" line in
-            // the may-green accent. Newest receipt's age is used as the
-            // overall age; individual ages show on hover.
-            if !msg.reads.is_empty() {
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.label(
-                        egui::RichText::new("\u{2713}\u{2713}")
-                            .small()
-                            .color(color_read()),
-                    );
-                    let mut first = true;
-                    for (reader, ts) in &msg.reads {
-                        if !first {
-                            ui.label(
-                                egui::RichText::new("\u{00b7}")
-                                    .small()
-                                    .color(color_muted(ui)),
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if is_inbox {
+                            render_badge(
+                                ui,
+                                "\u{1F4E5} INBOX",
+                                egui::Color32::from_rgb(0x23, 0x7f, 0x52), // RAL 6032
                             );
                         }
-                        first = false;
-                        let name = names
-                            .get(reader)
-                            .cloned()
-                            .unwrap_or_else(|| id_hex(*reader));
-                        // Tint each reader name with its own person
-                        // color so the reader list matches the
-                        // sender/recipient chips above.
-                        let response = ui.label(
-                            egui::RichText::new(name)
-                                .small()
-                                .color(person_color(*reader)),
-                        );
-                        response.on_hover_text(format!(
-                            "read {} · {}",
-                            format_age_key(now, *ts),
-                            format_timestamp_key(*ts),
-                        ));
-                    }
-                    // Newest-reader age as a trailing muted suffix.
-                    if let Some((_, newest_ts)) =
-                        msg.reads.iter().max_by_key(|(_, t)| *t)
-                    {
+                        if is_unread {
+                            render_badge(
+                                ui,
+                                "NEW",
+                                egui::Color32::from_rgb(0xf7, 0xba, 0x0b), // RAL 1003
+                            );
+                        }
+                    });
+                });
+
+                ui.add_space(2.0);
+
+                // Body. When a search is active, occurrences of the needle
+                // are underlined inline; the bar's focused match gets a
+                // second underline overlay via `highlight_label`.
+                let base = egui::TextFormat {
+                    font_id: egui::TextStyle::Body.resolve(ui.style()),
+                    color: ui.visuals().text_color(),
+                    ..Default::default()
+                };
+                GORBIE::search::highlight_label(ui, &msg.body, search_needle, base, focused);
+
+                // Read receipts — compact "✓✓ NameA · NameB · 2h" line in
+                // the may-green accent. Newest receipt's age is used as the
+                // overall age; individual ages show on hover.
+                if !msg.reads.is_empty() {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
                         ui.label(
-                            egui::RichText::new(format!(
-                                "\u{00b7} {}",
-                                format_age_key(now, *newest_ts)
-                            ))
+                            egui::RichText::new("\u{2713}\u{2713}")
+                                .small()
+                                .color(color_read()),
+                        );
+                        let mut first = true;
+                        for (reader, ts) in &msg.reads {
+                            if !first {
+                                ui.label(
+                                    egui::RichText::new("\u{00b7}")
+                                        .small()
+                                        .color(color_muted(ui)),
+                                );
+                            }
+                            first = false;
+                            let name = names
+                                .get(reader)
+                                .cloned()
+                                .unwrap_or_else(|| id_hex(*reader));
+                            // Tint each reader name with its own person
+                            // color so the reader list matches the
+                            // sender/recipient chips above.
+                            let response = ui.label(
+                                egui::RichText::new(name)
+                                    .small()
+                                    .color(person_color(*reader)),
+                            );
+                            response.on_hover_text(format!(
+                                "read {} · {}",
+                                format_age_key(now, *ts),
+                                format_timestamp_key(*ts),
+                            ));
+                        }
+                        // Newest-reader age as a trailing muted suffix.
+                        if let Some((_, newest_ts)) = msg.reads.iter().max_by_key(|(_, t)| *t) {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "\u{00b7} {}",
+                                    format_age_key(now, *newest_ts)
+                                ))
+                                .small()
+                                .color(color_muted(ui)),
+                            );
+                        }
+                    });
+                }
+
+                // Short id footer.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(id_hex(msg.id))
+                            .monospace()
                             .small()
                             .color(color_muted(ui)),
-                        );
-                    }
+                    );
                 });
-            }
-
-            // Short id footer.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(id_hex(msg.id))
-                        .monospace()
-                        .small()
-                        .color(color_muted(ui)),
-                );
             });
-        });
 
-    // ── Sender / recipient stripes (compass-card idiom) ─────────────
-    //
-    // After the Frame has measured + painted, lay two colored stripes
-    // along the bubble's left and right edges (inset by the stroke so
-    // the 1px outline draws around them). Each stripe carries the
-    // person's monospace name rotated 90° — sender top-down on the
-    // left, recipient bottom-up on the right — so the bubble reads
-    // like an envelope: FROM ➝ TO without any in-body chips eating
-    // the header.
-    let outer = frame_resp.response.rect;
-    let from_name = names
-        .get(&msg.from)
-        .cloned()
-        .unwrap_or_else(|| id_hex(msg.from));
-    let to_name = names
-        .get(&msg.to)
-        .cloned()
-        .unwrap_or_else(|| id_hex(msg.to));
-    paint_party_stripe(
-        ui.painter(),
-        outer,
-        StripeSide::Left,
-        from_color,
-        &from_name.to_uppercase(),
-    );
-    paint_party_stripe(
-        ui.painter(),
-        outer,
-        StripeSide::Right,
-        to_color,
-        &to_name.to_uppercase(),
-    );
+        // ── Sender / recipient stripes (compass-card idiom) ─────────────
+        //
+        // After the Frame has measured + painted, lay two colored stripes
+        // along the bubble's left and right edges (inset by the stroke so
+        // the 1px outline draws around them). Each stripe carries the
+        // person's monospace name rotated 90° — sender top-down on the
+        // left, recipient bottom-up on the right — so the bubble reads
+        // like an envelope: FROM ➝ TO without any in-body chips eating
+        // the header.
+        let outer = frame_resp.response.rect;
+        let from_name = names
+            .get(&msg.from)
+            .cloned()
+            .unwrap_or_else(|| id_hex(msg.from));
+        let to_name = names
+            .get(&msg.to)
+            .cloned()
+            .unwrap_or_else(|| id_hex(msg.to));
+        paint_party_stripe(
+            ui.painter(),
+            outer,
+            StripeSide::Left,
+            from_color,
+            &from_name.to_uppercase(),
+        );
+        paint_party_stripe(
+            ui.painter(),
+            outer,
+            StripeSide::Right,
+            to_color,
+            &to_name.to_uppercase(),
+        );
     });
 }
 
@@ -1071,11 +1025,7 @@ fn render_messages_empty_state(ui: &mut egui::Ui, headline: &str, hint: Option<&
         );
         if let Some(h) = hint {
             ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(h)
-                    .small()
-                    .color(color_muted(ui)),
-            );
+            ui.label(egui::RichText::new(h).small().color(color_muted(ui)));
         }
     });
     ui.add_space(24.0);

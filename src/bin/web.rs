@@ -1,12 +1,11 @@
-
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::web::{CONFIG_BRANCH_ID, CONFIG_KIND_ID, config_schema, web_schema};
+use faculties::schemas::web::{config_schema, web_schema, CONFIG_BRANCH_ID, CONFIG_KIND_ID};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use reqwest::blocking::Client;
@@ -71,7 +70,6 @@ enum Command {
         max_characters: usize,
     },
 }
-
 
 #[derive(Clone, Debug, Default)]
 struct ApiKeys {
@@ -144,7 +142,9 @@ fn cmd_search(
         .context("build http client")?;
 
     let results = match provider {
-        Provider::Tavily => tavily_search(&client, keys.tavily.as_deref().unwrap(), query, max_results)?,
+        Provider::Tavily => {
+            tavily_search(&client, keys.tavily.as_deref().unwrap(), query, max_results)?
+        }
         Provider::Exa => exa_search(&client, keys.exa.as_deref().unwrap(), query, max_results)?,
         Provider::Auto => unreachable!("choose_provider resolves Auto"),
     };
@@ -172,9 +172,7 @@ fn cmd_fetch(
         .context("build http client")?;
 
     let content = match provider {
-        Provider::Tavily => {
-            tavily_extract(&client, keys.tavily.as_deref().unwrap(), url)?
-        }
+        Provider::Tavily => tavily_extract(&client, keys.tavily.as_deref().unwrap(), url)?,
         Provider::Exa => exa_contents(&client, keys.exa.as_deref().unwrap(), url, max_characters)?,
         Provider::Auto => unreachable!("choose_provider resolves Auto"),
     };
@@ -243,7 +241,9 @@ fn load_config_snapshot(pile_path: &Path) -> Result<ConfigSnapshot> {
             let mut ws = repo
                 .pull(CONFIG_BRANCH_ID)
                 .map_err(|e| anyhow!("pull config: {e:?}"))?;
-            let space = ws.checkout(..).map_err(|e| anyhow!("checkout config: {e:?}"))?;
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow!("checkout config: {e:?}"))?;
             match latest_config_id(&space)? {
                 Some(config_id) => {
                     if debug {
@@ -274,8 +274,7 @@ fn load_config_snapshot(pile_path: &Path) -> Result<ConfigSnapshot> {
 fn resolve_branch_id(cli: &Cli) -> Result<Id> {
     with_repo(&cli.pile, |repo| {
         if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
+            return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
         }
         if let Ok(hex) = std::env::var("TRIBLESPACE_BRANCH_ID") {
             return Id::from_hex(hex.trim())
@@ -315,8 +314,7 @@ fn load_string_attr(
     space: &TribleSet,
     entity: Id,
     attr: &Attribute<Handle<LongString>>,
-) -> Result<Option<String>>
-{
+) -> Result<Option<String>> {
     let handle = match find!(
         (handle: Inline<Handle<LongString>>),
         pattern!(space, [{ entity @ attr: ?handle }])
@@ -349,7 +347,11 @@ fn print_search_results(provider: Provider, query: &str, results: &[SearchResult
     println!("results: {}", results.len());
     println!();
     for (idx, r) in results.iter().enumerate() {
-        println!("[{}] {}", idx + 1, r.title.as_deref().unwrap_or("<no title>"));
+        println!(
+            "[{}] {}",
+            idx + 1,
+            r.title.as_deref().unwrap_or("<no title>")
+        );
         println!("url: {}", r.url);
         if let Some(snippet) = r.snippet.as_deref().filter(|s| !s.is_empty()) {
             println!("snippet: {}", snippet.trim());
@@ -366,8 +368,12 @@ fn store_search(
     results: &[SearchResult],
 ) -> Result<()> {
     with_repo(&cli.pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull web ws: {e:?}"))?;
-        let catalog = ws.checkout(..).map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull web ws: {e:?}"))?;
+        let catalog = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
 
         let provider_str = match provider {
             Provider::Tavily => "tavily",
@@ -422,10 +428,20 @@ fn store_search(
     })
 }
 
-fn store_fetch(cli: &Cli, branch_id: Id, provider: Provider, url: &str, content: &str) -> Result<()> {
+fn store_fetch(
+    cli: &Cli,
+    branch_id: Id,
+    provider: Provider,
+    url: &str,
+    content: &str,
+) -> Result<()> {
     with_repo(&cli.pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull web ws: {e:?}"))?;
-        let catalog = ws.checkout(..).map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull web ws: {e:?}"))?;
+        let catalog = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
 
         let provider_str = match provider {
             Provider::Tavily => "tavily",
@@ -488,7 +504,12 @@ struct TavilyResult {
     content: String,
 }
 
-fn tavily_search(client: &Client, api_key: &str, query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
+fn tavily_search(
+    client: &Client,
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>> {
     let resp: TavilySearchResponse = client
         .post("https://api.tavily.com/search")
         .header(CONTENT_TYPE, "application/json")
@@ -577,7 +598,12 @@ struct ExaResult {
     text: String,
 }
 
-fn exa_search(client: &Client, api_key: &str, query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
+fn exa_search(
+    client: &Client,
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>> {
     let resp: ExaSearchResponse = client
         .post("https://api.exa.ai/search")
         .header(CONTENT_TYPE, "application/json")
@@ -618,7 +644,12 @@ struct ExaContentsResult {
     text: String,
 }
 
-fn exa_contents(client: &Client, api_key: &str, url: &str, max_characters: usize) -> Result<String> {
+fn exa_contents(
+    client: &Client,
+    api_key: &str,
+    url: &str,
+    max_characters: usize,
+) -> Result<String> {
     let resp: ExaContentsResponse = client
         .post("https://api.exa.ai/contents")
         .header(CONTENT_TYPE, "application/json")
@@ -646,8 +677,7 @@ fn exa_contents(client: &Client, api_key: &str, url: &str, max_characters: usize
 // --- Pile helpers ---
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         // Avoid Drop warnings on early errors.
         let _ = pile.close();
@@ -666,10 +696,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));

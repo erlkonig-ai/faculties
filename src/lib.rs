@@ -70,8 +70,7 @@ pub fn text_arg(raw: &str, label: &str) -> anyhow::Result<String> {
                 .with_context(|| format!("read {label} from stdin"))?;
             return Ok(value);
         }
-        return std::fs::read_to_string(path)
-            .with_context(|| format!("read {label} from {path}"));
+        return std::fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
     }
     Ok(raw.to_string())
 }
@@ -95,10 +94,7 @@ pub mod widgets;
 /// Each faculty wraps this with a kind-specific helper that knows its
 /// own `KIND_*` tags. The wrapper is what command handlers should call;
 /// the goal is that every faculty command accepts prefixes uniformly.
-pub fn resolve_id_prefix<I>(
-    input: &str,
-    candidates: I,
-) -> anyhow::Result<triblespace::core::id::Id>
+pub fn resolve_id_prefix<I>(input: &str, candidates: I) -> anyhow::Result<triblespace::core::id::Id>
 where
     I: IntoIterator<Item = triblespace::core::id::Id>,
 {

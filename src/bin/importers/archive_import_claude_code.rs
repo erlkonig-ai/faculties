@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::common;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use hifitime::Epoch;
 use serde_json::Value as JsonValue;
 use tracing::info_span;
@@ -139,10 +139,7 @@ fn import_claude_code_records(
         let raw_tree_start = Instant::now();
         let raw_payload =
             serde_json::to_string(&raw_records).context("serialize claude-code jsonl")?;
-        let mut importer = JsonTreeImporter::<_>::new(
-            repo.storage_mut(),
-            None,
-        );
+        let mut importer = JsonTreeImporter::<_>::new(repo.storage_mut(), None);
         let fragment = importer
             .import_str(&raw_payload)
             .context("import claude-code raw json tree")?;
@@ -173,7 +170,10 @@ fn import_claude_code_records(
         path.display(),
         messages.len(),
         {
-            let mut ids: Vec<&str> = messages.iter().map(|m| m.conversation_id.as_str()).collect();
+            let mut ids: Vec<&str> = messages
+                .iter()
+                .map(|m| m.conversation_id.as_str())
+                .collect();
             ids.sort_unstable();
             ids.dedup();
             ids.len()
@@ -518,10 +518,7 @@ fn extract_user_content(message: &serde_json::Map<String, JsonValue>) -> Option<
                     .get("tool_use_id")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("unknown");
-                let result_text = obj
-                    .get("content")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("");
+                let result_text = obj.get("content").and_then(JsonValue::as_str).unwrap_or("");
                 let is_error = obj
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
@@ -581,9 +578,8 @@ fn extract_assistant_content(message: &serde_json::Map<String, JsonValue>) -> Op
                     .get("name")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("unknown_tool");
-                let input_summary = summarize_tool_input(
-                    obj.get("input").and_then(JsonValue::as_object),
-                );
+                let input_summary =
+                    summarize_tool_input(obj.get("input").and_then(JsonValue::as_object));
                 parts.push(format!("[tool_use {tool_name}] {input_summary}"));
             }
             _ => {}

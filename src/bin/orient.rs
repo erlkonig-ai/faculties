@@ -5,16 +5,16 @@ use chrono::{
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::compass::latest_status_event;
-use faculties::schemas::memory::DEFAULT_MEMORY_BRANCH;
-use faculties::schemas::wiki::{cover_fragments, WIKI_BRANCH_NAME};
 use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
+use faculties::schemas::memory::DEFAULT_MEMORY_BRANCH;
 use faculties::schemas::message::is_inbox_message;
 use faculties::schemas::orient::{
     board, local, orient_state, KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_NOTE_ID,
     KIND_ORIENT_CHECKPOINT_ID, KIND_READ_ID, KIND_STATUS_ID,
 };
 use faculties::schemas::relations::{groups_for_member, relations as rel_attrs};
-use faculties::schemas::status::{KIND_STATUS_UPDATE, status as status_attrs};
+use faculties::schemas::status::{status as status_attrs, KIND_STATUS_UPDATE};
+use faculties::schemas::wiki::{cover_fragments, WIKI_BRANCH_NAME};
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -171,11 +171,7 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn person_label(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    person_id: Id,
-) -> String {
+fn person_label(ws: &mut Workspace<Pile>, space: &TribleSet, person_id: Id) -> String {
     find!(h: TextHandle, pattern!(space, [{ person_id @ metadata::name: ?h }]))
         .next()
         .and_then(|h| read_text(ws, h).ok())
@@ -212,11 +208,7 @@ fn load_message_ids(space: &TribleSet) -> Vec<MessageRow> {
     messages
 }
 
-fn resolve_message_body(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    msg_id: Id,
-) -> String {
+fn resolve_message_body(ws: &mut Workspace<Pile>, space: &TribleSet, msg_id: Id) -> String {
     find!(h: TextHandle, pattern!(space, [{ msg_id @ local::body: ?h }]))
         .next()
         .and_then(|h| read_text(ws, h).ok())
@@ -300,7 +292,9 @@ fn render_unread_mail(
         // a brief note rather than crashing.
         println!("Mail:");
         match std::env::var("MAIL_USER") {
-            Ok(u) => println!("- No relations entry for {u} yet (run `mail fetch` or `mail send` once)"),
+            Ok(u) => {
+                println!("- No relations entry for {u} yet (run `mail fetch` or `mail send` once)")
+            }
             Err(_) => println!("- MAIL_USER env var not set; skipping"),
         }
         return Ok(());
@@ -317,7 +311,9 @@ fn render_unread_mail(
     let mut mws = repo
         .pull(mail_branch_id)
         .map_err(|e| anyhow!("pull mail: {e:?}"))?;
-    let mail_space = mws.checkout(..).map_err(|e| anyhow!("checkout mail: {e:?}"))?;
+    let mail_space = mws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout mail: {e:?}"))?;
 
     let mut rows: Vec<(i128, Id, Option<Id>, String)> = find!(
         (id: Id, from: Id, sent_at: IntervalValue, subject_h: TextHandle),
@@ -331,12 +327,14 @@ fn render_unread_mail(
     )
     .filter(|&(_, from, _, _)| from != self_id)
     .filter(|&(id, _, _, _)| !exists!(pattern!(&mail_space, [{ id @ metadata::tag: &KIND_SPAM }])))
-    .filter(|&(id, _, _, _)| !exists!(pattern!(&mail_space, [{
-        _?r @
-        metadata::tag: KIND_READ_ID,
-        local::about_message: id,
-        local::reader: self_id,
-    }])))
+    .filter(|&(id, _, _, _)| {
+        !exists!(pattern!(&mail_space, [{
+            _?r @
+            metadata::tag: KIND_READ_ID,
+            local::about_message: id,
+            local::reader: self_id,
+        }]))
+    })
     .map(|(id, from, sent_at, subject_h)| {
         let subject = read_text(&mut mws, subject_h).unwrap_or_default();
         (interval_key(sent_at), id, Some(from), subject)
@@ -366,11 +364,7 @@ fn render_unread_mail(
     Ok(())
 }
 
-fn task_title(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    task_id: Id,
-) -> String {
+fn task_title(ws: &mut Workspace<Pile>, space: &TribleSet, task_id: Id) -> String {
     find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
         .next()
         .and_then(|h| read_text(ws, h).ok())
@@ -409,8 +403,7 @@ fn visible_notes(
             continue;
         }
         let directly_addressed = entity_tags(space, note_id).iter().any(|tag| {
-            tag.eq_ignore_ascii_case("colony")
-                || persona_keys.contains(&tag.to_ascii_lowercase())
+            tag.eq_ignore_ascii_case("colony") || persona_keys.contains(&tag.to_ascii_lowercase())
         });
         if directly_addressed || relevant_goals.contains(&goal_id) {
             insert_note_goal(&mut notes, note_id, goal_id);
@@ -441,8 +434,11 @@ fn render_compass_goals(
         let (status, status_at) = task_latest_status(space, task_id)
             .map(|(s, at)| (s.to_lowercase(), Some(interval_key(at))))
             .unwrap_or_else(|| ("todo".to_string(), None));
-        let created_key: i128 = find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }]))
-            .next().map(interval_key).unwrap_or(0);
+        let created_key: i128 =
+            find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }]))
+                .next()
+                .map(interval_key)
+                .unwrap_or(0);
         let sort_key = status_at.unwrap_or(created_key);
         if status == "doing" {
             doing.push((sort_key, task_id));
@@ -791,10 +787,7 @@ fn union_note_views(target: &mut BTreeMap<Id, Id>, source: &BTreeMap<Id, Id>) {
     }
 }
 
-fn newly_seen_notes(
-    visible: &BTreeMap<Id, Id>,
-    seen: &BTreeMap<Id, Id>,
-) -> BTreeMap<Id, Id> {
+fn newly_seen_notes(visible: &BTreeMap<Id, Id>, seen: &BTreeMap<Id, Id>) -> BTreeMap<Id, Id> {
     visible
         .iter()
         .filter(|(note_id, _)| !seen.contains_key(*note_id))
@@ -831,11 +824,7 @@ fn parse_notes_view(text: &str) -> Result<BTreeMap<Id, Id>> {
 /// Canonicalize a current visibility snapshot against the cumulative seen
 /// history. A legacy checkpoint has no note baseline, so all notes visible at
 /// upgrade time become seen without producing news.
-fn carry_seen_notes(
-    seen: &mut WatchedView,
-    current: &mut WatchedView,
-    has_notes_view: bool,
-) {
+fn carry_seen_notes(seen: &mut WatchedView, current: &mut WatchedView, has_notes_view: bool) {
     if !has_notes_view {
         seen.notes = current.notes.clone();
     }
@@ -911,9 +900,7 @@ fn load_watched_view(
     // c = colony-tagged.
     let mut goal_lines = Vec::new();
     let mut relevant_goals = HashSet::new();
-    for id in
-        find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
-    {
+    for id in find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
         let authored_status = exists!(pattern!(&compass_space, [{
             _?evt @
             metadata::tag: &KIND_STATUS_ID,
@@ -932,9 +919,7 @@ fn load_watched_view(
         let persona_tagged = tags
             .iter()
             .any(|tag| persona_keys.contains(&tag.to_ascii_lowercase()));
-        let colony_tagged = tags
-            .iter()
-            .any(|tag| tag.eq_ignore_ascii_case("colony"));
+        let colony_tagged = tags.iter().any(|tag| tag.eq_ignore_ascii_case("colony"));
         let mut flags = String::new();
         if involved {
             flags.push('i');
@@ -971,12 +956,7 @@ fn load_watched_view(
     // note itself carries a persona/colony attention tag. Own attributed
     // notes remain quiet; absence of attribution is deliberately not treated
     // as ownership.
-    let notes = visible_notes(
-        &compass_space,
-        persona_id,
-        &persona_keys,
-        &relevant_goals,
-    );
+    let notes = visible_notes(&compass_space, persona_id, &persona_keys, &relevant_goals);
 
     Ok(WatchedView {
         unread,
@@ -1236,10 +1216,7 @@ fn save_checkpoint_heads(
     Ok(())
 }
 
-fn branch_head_by_id(
-    repo: &mut Repository<Pile>,
-    branch_id: Id,
-) -> Result<Option<CommitHandle>> {
+fn branch_head_by_id(repo: &mut Repository<Pile>, branch_id: Id) -> Result<Option<CommitHandle>> {
     repo.storage_mut()
         .head(branch_id)
         .map_err(|e| anyhow!("branch head {:x}: {e:?}", branch_id))
@@ -1750,8 +1727,7 @@ fn render_tags(tags: &[String]) -> String {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         // Avoid Drop warnings on early errors.
         let _ = pile.close();
@@ -1769,10 +1745,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
@@ -1789,12 +1762,7 @@ fn with_repo<T>(
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
 /// goals. READ-ONLY: it pulls and checks out, never writes to any branch.
-fn cmd_wake(
-    pile: &Path,
-    chars: usize,
-    doing_limit: usize,
-    todo_limit: usize,
-) -> Result<()> {
+fn cmd_wake(pile: &Path, chars: usize, doing_limit: usize, todo_limit: usize) -> Result<()> {
     with_repo(pile, |repo| {
         // (1) Memory cover — the same render `memory context` produces.
         let memory_branch_id = repo

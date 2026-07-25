@@ -21,12 +21,12 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
@@ -164,10 +164,7 @@ struct MailLive {
 }
 
 impl MailLive {
-    fn refresh(
-        ws: &mut Workspace<Pile>,
-        relations_ws: Option<&mut Workspace<Pile>>,
-    ) -> Self {
+    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
         let space = ws
             .checkout(..)
             .map(|co| co.into_facts())
@@ -391,7 +388,12 @@ fn collect_mails(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<MailRow> {
             if row.parent_in_pile.is_some() {
                 continue;
             }
-            if let Some(parent) = parents.iter().rev().copied().find(|p| known_ids.contains(p)) {
+            if let Some(parent) = parents
+                .iter()
+                .rev()
+                .copied()
+                .find(|p| known_ids.contains(p))
+            {
                 row.parent_in_pile = Some(parent);
             }
         }
@@ -428,11 +430,7 @@ fn flatten_threaded(mails: &[MailRow]) -> Vec<(usize, &MailRow)> {
     }
 
     let mut out: Vec<(usize, &MailRow)> = Vec::with_capacity(mails.len());
-    let mut stack: Vec<(usize, usize)> = roots
-        .iter()
-        .rev()
-        .map(|&i| (i, 0usize))
-        .collect();
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&i| (i, 0usize)).collect();
     while let Some((idx, depth)) = stack.pop() {
         out.push((depth, &mails[idx]));
         if let Some(kids) = children.get(&mails[idx].id) {
@@ -445,10 +443,7 @@ fn flatten_threaded(mails: &[MailRow]) -> Vec<(usize, &MailRow)> {
     out
 }
 
-fn build_people(
-    rspace: &TribleSet,
-    rws: &mut Workspace<Pile>,
-) -> HashMap<Id, Person> {
+fn build_people(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, Person> {
     let person_ids: Vec<Id> = find!(
         (pid: Id,),
         pattern!(rspace, [{ ?pid @ metadata::tag: KIND_PERSON_ID }])
@@ -570,7 +565,9 @@ impl MailViewer {
         }
 
         ctx.section("Mail", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
 
             let total = live.mails.len();
             let drafts = live.mails.iter().filter(|m| m.is_draft).count();
@@ -661,8 +658,7 @@ impl MailViewer {
                     } else {
                         None
                     };
-                    let is_focused =
-                        match_info.as_ref().map_or(false, |i| i.is_focused);
+                    let is_focused = match_info.as_ref().map_or(false, |i| i.is_focused);
                     let indent_cols = depth.min(3) as u32;
                     let width_cols = 12 - indent_cols;
                     if indent_cols > 0 {
@@ -727,7 +723,11 @@ fn render_mail(
         .from
         .map(person_color)
         .unwrap_or_else(|| color_muted(ui));
-    let primary_recipient = mail.to.first().copied().or_else(|| mail.cc.first().copied());
+    let primary_recipient = mail
+        .to
+        .first()
+        .copied()
+        .or_else(|| mail.cc.first().copied());
     let to_color = primary_recipient
         .map(person_color)
         .unwrap_or_else(|| color_muted(ui));
@@ -740,26 +740,24 @@ fn render_mail(
     };
 
     ui.vertical(|ui| {
-    let frame_resp = egui::Frame::NONE
-        .fill(bubble_fill)
-        .stroke(egui::Stroke::new(STROKE_INSET, color_frame(ui)))
-        .shadow(egui::epaint::Shadow {
-            offset: [2, 2],
-            blur: 0,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(48),
-        })
-        .corner_radius(egui::CornerRadius::ZERO)
-        .inner_margin(inner_margin)
-        .show(ui, |ui| {
-            // Top row: status badges (DRAFT / SPAM / RE / +N CC),
-            // attachment count, and sent-at age — all right-aligned
-            // so the subject heading owns the left side of the row.
-            // `Align::Min` cross-axis avoids the frame-delayed cell
-            // sizing feedback we hit on the messages widget.
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Min),
-                |ui| {
+        let frame_resp = egui::Frame::NONE
+            .fill(bubble_fill)
+            .stroke(egui::Stroke::new(STROKE_INSET, color_frame(ui)))
+            .shadow(egui::epaint::Shadow {
+                offset: [2, 2],
+                blur: 0,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(48),
+            })
+            .corner_radius(egui::CornerRadius::ZERO)
+            .inner_margin(inner_margin)
+            .show(ui, |ui| {
+                // Top row: status badges (DRAFT / SPAM / RE / +N CC),
+                // attachment count, and sent-at age — all right-aligned
+                // so the subject heading owns the left side of the row.
+                // `Align::Min` cross-axis avoids the frame-delayed cell
+                // sizing feedback we hit on the messages widget.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if let Some(age) = format_relative_age(mail.sent_at) {
                         ui.label(
                             egui::RichText::new(age)
@@ -799,60 +797,59 @@ fn render_mail(
                     if mail.is_spam {
                         render_badge(ui, "SPAM", color_spam());
                     }
-                },
-            );
+                });
 
-            ui.add_space(2.0);
+                ui.add_space(2.0);
 
-            // Subject (heading).
-            let subject_text = if mail.subject.trim().is_empty() {
-                "(no subject)".to_string()
-            } else {
-                mail.subject.clone()
-            };
-            GORBIE::search::highlight_label(
-                ui,
-                &subject_text,
-                search_needle,
-                heading_format(ui),
-                focused,
-            );
+                // Subject (heading).
+                let subject_text = if mail.subject.trim().is_empty() {
+                    "(no subject)".to_string()
+                } else {
+                    mail.subject.clone()
+                };
+                GORBIE::search::highlight_label(
+                    ui,
+                    &subject_text,
+                    search_needle,
+                    heading_format(ui),
+                    focused,
+                );
 
-            ui.add_space(4.0);
+                ui.add_space(4.0);
 
-            // Body.
-            GORBIE::search::highlight_label(
-                ui,
-                &mail.body,
-                search_needle,
-                body_format(ui, ui.visuals().text_color()),
-                focused,
-            );
-        });
+                // Body.
+                GORBIE::search::highlight_label(
+                    ui,
+                    &mail.body,
+                    search_needle,
+                    body_format(ui, ui.visuals().text_color()),
+                    focused,
+                );
+            });
 
-    // Left / right stripes — sender + first recipient, compass idiom.
-    let outer = frame_resp.response.rect;
-    let from_label = mail
-        .from
-        .map(|id| live.display(id))
-        .unwrap_or_else(|| "(no sender)".into());
-    paint_party_stripe(
-        ui.painter(),
-        outer,
-        StripeSide::Left,
-        from_color,
-        &from_label.to_uppercase(),
-    );
-    let to_label = primary_recipient
-        .map(|id| live.display(id))
-        .unwrap_or_else(|| "(no recipient)".into());
-    paint_party_stripe(
-        ui.painter(),
-        outer,
-        StripeSide::Right,
-        to_color,
-        &to_label.to_uppercase(),
-    );
+        // Left / right stripes — sender + first recipient, compass idiom.
+        let outer = frame_resp.response.rect;
+        let from_label = mail
+            .from
+            .map(|id| live.display(id))
+            .unwrap_or_else(|| "(no sender)".into());
+        paint_party_stripe(
+            ui.painter(),
+            outer,
+            StripeSide::Left,
+            from_color,
+            &from_label.to_uppercase(),
+        );
+        let to_label = primary_recipient
+            .map(|id| live.display(id))
+            .unwrap_or_else(|| "(no recipient)".into());
+        paint_party_stripe(
+            ui.painter(),
+            outer,
+            StripeSide::Right,
+            to_color,
+            &to_label.to_uppercase(),
+        );
     });
 }
 

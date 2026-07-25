@@ -1,4 +1,3 @@
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
@@ -8,7 +7,7 @@ use std::thread;
 use std::time::Duration as StdDuration;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
@@ -16,10 +15,10 @@ use hifitime::{Epoch, TimeScale};
 use rand_core::OsRng;
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
-use serde_json::{Value as JsonValue, json};
 use serde::Deserialize;
-use triblespace::core::metadata;
+use serde_json::{json, Value as JsonValue};
 use triblespace::core::blob::Bytes;
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::id_hex;
@@ -41,12 +40,12 @@ const TEAMS_BACKFILL_AUTHOR_ID: Id = id_hex!("64A9492F3B2368A0DAB5FAF3277132C2")
 #[allow(dead_code)]
 const TEAMS_UNKNOWN_AUTHOR_ID: Id = id_hex!("04217F0E5F75F57B8A7CBFD824D5FF31");
 
-use faculties::schemas::archive::{RawBytes, archive};
+use faculties::schemas::archive::{archive, RawBytes};
 use faculties::schemas::teams::{
-    DEFAULT_BRANCH, DEFAULT_DELTA_URL, DEFAULT_LOG_BRANCH, FILES_BRANCH_NAME, file_schema, teams,
+    file_schema, teams, DEFAULT_BRANCH, DEFAULT_DELTA_URL, DEFAULT_LOG_BRANCH, FILES_BRANCH_NAME,
 };
-use file_schema::KIND_FILE;
 use file_schema::file;
+use file_schema::KIND_FILE;
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
@@ -69,8 +68,7 @@ struct Cli {
     /// Command that outputs a bearer token. Use @path for file input or @- for stdin.
     #[arg(
         long,
-        default_value =
-            "az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv"
+        default_value = "az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv"
     )]
     token_command: String,
     #[command(subcommand)]
@@ -128,10 +126,16 @@ enum CommandMode {
         #[arg(long)]
         client_id: String,
         /// Azure app client secret (stored in the pile).
-        #[arg(long, help = "Azure app client secret (stored in the pile). Use @path for file input or @- for stdin.")]
+        #[arg(
+            long,
+            help = "Azure app client secret (stored in the pile). Use @path for file input or @- for stdin."
+        )]
         client_secret: Option<String>,
         /// Space-delimited scopes (defaults to chat + presence + user read + offline_access).
-        #[arg(long, help = "Space-delimited scopes. Use @path for file input or @- for stdin.")]
+        #[arg(
+            long,
+            help = "Space-delimited scopes. Use @path for file input or @- for stdin."
+        )]
         scopes: Option<String>,
     },
 }
@@ -180,7 +184,12 @@ impl PresenceAvailability {
 enum PresenceActivity {
     #[value(name = "Available", alias = "available")]
     Available,
-    #[value(name = "InACall", alias = "in-a-call", alias = "inacall", alias = "call")]
+    #[value(
+        name = "InACall",
+        alias = "in-a-call",
+        alias = "inacall",
+        alias = "call"
+    )]
     InACall,
     #[value(
         name = "InAConferenceCall",
@@ -248,7 +257,10 @@ enum ChatCommand {
         #[arg(long)]
         group: bool,
         /// Optional group chat topic.
-        #[arg(long, help = "Optional group chat topic. Use @path for file input or @- for stdin.")]
+        #[arg(
+            long,
+            help = "Optional group chat topic. Use @path for file input or @- for stdin."
+        )]
         topic: Option<String>,
     },
 }
@@ -352,23 +364,36 @@ fn main() -> Result<()> {
         CommandMode::Users { command } => {
             let config = build_config(&cli)?;
             match command {
-                UsersCommand::List { prefix, limit } => list_users(config, prefix.as_deref(), limit),
+                UsersCommand::List { prefix, limit } => {
+                    list_users(config, prefix.as_deref(), limit)
+                }
             }
         }
         CommandMode::Presence { command } => {
             let config = build_config(&cli)?;
             match command {
-                PresenceCommand::Set { availability, activity, duration_mins, session_id } => {
-                    set_presence_status(config, availability, activity, duration_mins, session_id)
-                }
+                PresenceCommand::Set {
+                    availability,
+                    activity,
+                    duration_mins,
+                    session_id,
+                } => set_presence_status(config, availability, activity, duration_mins, session_id),
                 PresenceCommand::Get { user_ids } => get_presence(config, user_ids),
             }
         }
         CommandMode::Chat { command } => {
             let config = build_config(&cli)?;
             match command {
-                ChatCommand::Invite { chat_id, user_id, owner } => invite_to_chat(config, &chat_id, &user_id, owner),
-                ChatCommand::Create { user_ids, group, topic } => {
+                ChatCommand::Invite {
+                    chat_id,
+                    user_id,
+                    owner,
+                } => invite_to_chat(config, &chat_id, &user_id, owner),
+                ChatCommand::Create {
+                    user_ids,
+                    group,
+                    topic,
+                } => {
                     let topic = topic
                         .as_deref()
                         .map(|value| load_value_or_file(value, "chat topic"))
@@ -380,13 +405,42 @@ fn main() -> Result<()> {
         CommandMode::Attachments { command } => {
             let config = build_config(&cli)?;
             match command {
-                AttachmentsCommand::List { chat_id, message_id, limit, descending } => {
-                    list_attachments(config, AttachmentListOptions { chat_id, message_id, limit, descending })
-                }
-                AttachmentsCommand::Backfill { chat_id, message_id, limit, descending } => {
-                    backfill_attachments(config, AttachmentBackfillOptions { chat_id, message_id, limit, descending })
-                }
-                AttachmentsCommand::Export { source_id, chat_id, message_id, out_dir, filename, overwrite } => {
+                AttachmentsCommand::List {
+                    chat_id,
+                    message_id,
+                    limit,
+                    descending,
+                } => list_attachments(
+                    config,
+                    AttachmentListOptions {
+                        chat_id,
+                        message_id,
+                        limit,
+                        descending,
+                    },
+                ),
+                AttachmentsCommand::Backfill {
+                    chat_id,
+                    message_id,
+                    limit,
+                    descending,
+                } => backfill_attachments(
+                    config,
+                    AttachmentBackfillOptions {
+                        chat_id,
+                        message_id,
+                        limit,
+                        descending,
+                    },
+                ),
+                AttachmentsCommand::Export {
+                    source_id,
+                    chat_id,
+                    message_id,
+                    out_dir,
+                    filename,
+                    overwrite,
+                } => {
                     let out_dir = out_dir.unwrap_or_else(|| PathBuf::from("./attachments"));
                     export_attachment(
                         config,
@@ -418,7 +472,13 @@ fn main() -> Result<()> {
                 .as_deref()
                 .map(|value| load_value_or_file_trimmed(value, "client secret"))
                 .transpose()?;
-            login_device_code(&config, &tenant, &client_id, client_secret.as_deref(), &scopes)
+            login_device_code(
+                &config,
+                &tenant,
+                &client_id,
+                client_secret.as_deref(),
+                &scopes,
+            )
         }
     }
 }
@@ -435,7 +495,9 @@ fn with_repo<T>(
 
 fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
     let pile_path = cli.pile.clone();
-    let branch = std::env::var("TRIBLESPACE_BRANCH").ok().unwrap_or_else(|| cli.branch.clone());
+    let branch = std::env::var("TRIBLESPACE_BRANCH")
+        .ok()
+        .unwrap_or_else(|| cli.branch.clone());
     let log_branch = std::env::var("TRIBLESPACE_LOG_BRANCH")
         .ok()
         .unwrap_or_else(|| DEFAULT_LOG_BRANCH.to_string());
@@ -496,7 +558,9 @@ where
     let mut repo = repo;
     let result = f(&mut repo);
     let pile = repo.into_storage();
-    let close_res = pile.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
+    let close_res = pile
+        .close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
     if let Err(err) = close_res {
         if result.is_ok() {
             return Err(err);
@@ -507,7 +571,8 @@ where
 }
 
 fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<()> {
-    let (repo, branch_id) = open_repo_for_branch_id(&config.pile_path, config.log_branch_id, "logs")?;
+    let (repo, branch_id) =
+        open_repo_for_branch_id(&config.pile_path, config.log_branch_id, "logs")?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
@@ -563,8 +628,9 @@ fn pull_once_with_cache(
 
         let (messages, new_cursor) = fetch_delta_messages(&token, &start_url)?;
         let index = CatalogIndex::build(&catalog);
-    let incoming = parse_messages(messages)?;
-    let (mut change, files_change) = build_ingest_change(&mut ws, &catalog, &index, incoming, &token, config)?;
+        let incoming = parse_messages(messages)?;
+        let (mut change, files_change) =
+            build_ingest_change(&mut ws, &catalog, &index, incoming, &token, config)?;
         if let Some(cursor_change) =
             build_cursor_change(&mut ws, &catalog, cursor_state.as_ref(), new_cursor)?
         {
@@ -578,7 +644,8 @@ fn pull_once_with_cache(
 
         // Commit file entities to the files branch.
         if !files_change.is_empty() {
-            let files_branch_id = repo.ensure_branch(FILES_BRANCH_NAME, None)
+            let files_branch_id = repo
+                .ensure_branch(FILES_BRANCH_NAME, None)
                 .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
             let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
             files_ws.commit(files_change, "teams attachment files");
@@ -646,9 +713,9 @@ fn load_app_config_from_pile(config: &TeamsBridgeConfig) -> Result<AppConfig> {
         );
     };
 
-    let tenant = config_data.tenant.ok_or_else(|| {
-        anyhow::anyhow!("missing tenant in Teams config; re-run teams.rs login")
-    })?;
+    let tenant = config_data
+        .tenant
+        .ok_or_else(|| anyhow::anyhow!("missing tenant in Teams config; re-run teams.rs login"))?;
     let client_id = config_data.client_id.ok_or_else(|| {
         anyhow::anyhow!("missing client id in Teams config; re-run teams.rs login")
     })?;
@@ -657,9 +724,9 @@ fn load_app_config_from_pile(config: &TeamsBridgeConfig) -> Result<AppConfig> {
             "missing client secret in Teams config; re-run teams.rs login with --client-secret"
         )
     })?;
-    let user_id = config_data.user_id.ok_or_else(|| {
-        anyhow::anyhow!("missing user id in Teams config; re-run teams.rs login")
-    })?;
+    let user_id = config_data
+        .user_id
+        .ok_or_else(|| anyhow::anyhow!("missing user id in Teams config; re-run teams.rs login"))?;
 
     Ok(AppConfig {
         tenant,
@@ -977,10 +1044,7 @@ fn find_optional_value<S: InlineEncoding>(
     .map(|(value,)| value)
 }
 
-fn load_chat_map(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-) -> Result<HashMap<Id, String>> {
+fn load_chat_map(ws: &mut Workspace<Pile>, catalog: &TribleSet) -> Result<HashMap<Id, String>> {
     let mut map = HashMap::new();
     for (chat_id, handle) in find!(
         (chat: Id, chat_id: Inline<Handle<LongString>>),
@@ -1011,10 +1075,7 @@ fn load_message_external_map(
     Ok(map)
 }
 
-fn load_author_map(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-) -> Result<HashMap<Id, String>> {
+fn load_author_map(ws: &mut Workspace<Pile>, catalog: &TribleSet) -> Result<HashMap<Id, String>> {
     let mut map = HashMap::new();
     for (author_id, handle) in find!(
         (author: Id, name: Inline<Handle<LongString>>),
@@ -1076,10 +1137,7 @@ fn build_token_change(
         .token_type
         .as_ref()
         .map(|token_type| ws.put(token_type.to_owned()));
-    let scope_handle = token
-        .scope
-        .as_ref()
-        .map(|scope| ws.put(scope.to_owned()));
+    let scope_handle = token.scope.as_ref().map(|scope| ws.put(scope.to_owned()));
 
     change += entity! { &token_id @
         metadata::tag: teams::kind_token,
@@ -1143,10 +1201,7 @@ fn build_config_change(
     Ok(change.difference(catalog))
 }
 
-fn load_longstring(
-    ws: &mut Workspace<Pile>,
-    handle: Inline<Handle<LongString>>,
-) -> Result<String> {
+fn load_longstring(ws: &mut Workspace<Pile>, handle: Inline<Handle<LongString>>) -> Result<String> {
     let view: View<str> = map_err_debug(ws.get(handle), "load longstring")?;
     Ok(view.to_string())
 }
@@ -1171,8 +1226,7 @@ fn login_device_code(
     } else {
         println!(
             "Visit {} and enter code {} to authenticate.",
-            device.verification_uri,
-            device.user_code
+            device.verification_uri, device.user_code
         );
     }
 
@@ -1192,9 +1246,7 @@ fn login_device_code(
     };
     store_token_in_pile(config, &token)?;
     let existing = load_config_from_pile(config)?.unwrap_or_default();
-    let merged_secret = client_secret
-        .map(str::to_owned)
-        .or(existing.client_secret);
+    let merged_secret = client_secret.map(str::to_owned).or(existing.client_secret);
     let config_data = TeamsConfigData {
         tenant: Some(tenant.to_owned()),
         client_id: Some(client_id.to_owned()),
@@ -1217,10 +1269,7 @@ fn login_device_code(
 
 fn request_device_code(tenant: &str, client_id: &str, scopes: &str) -> Result<DeviceCodeResponse> {
     let url = format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode");
-    let params = [
-        ("client_id", client_id),
-        ("scope", scopes),
-    ];
+    let params = [("client_id", client_id), ("scope", scopes)];
     let client = Client::new();
     let resp = client
         .post(url)
@@ -1232,7 +1281,8 @@ fn request_device_code(tenant: &str, client_id: &str, scopes: &str) -> Result<De
     if !status.is_success() {
         bail!("device code request failed: status={status} body={body}");
     }
-    let parsed: DeviceCodeResponse = serde_json::from_str(&body).context("parse device code response")?;
+    let parsed: DeviceCodeResponse =
+        serde_json::from_str(&body).context("parse device code response")?;
     Ok(parsed)
 }
 
@@ -1284,7 +1334,8 @@ fn poll_device_token(
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
         if status.is_success() {
-            let token: TokenResponse = serde_json::from_str(&body).context("parse token response")?;
+            let token: TokenResponse =
+                serde_json::from_str(&body).context("parse token response")?;
             return Ok(token);
         }
 
@@ -1457,8 +1508,8 @@ fn send_message(config: TeamsBridgeConfig, chat_id: &str, text: &str) -> Result<
 
 fn list_users(config: TeamsBridgeConfig, prefix: Option<&str>, limit: usize) -> Result<()> {
     let token = get_delegated_token(&config)?;
-    let mut url = reqwest::Url::parse("https://graph.microsoft.com/v1.0/users")
-        .context("parse users url")?;
+    let mut url =
+        reqwest::Url::parse("https://graph.microsoft.com/v1.0/users").context("parse users url")?;
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("$select", "id,displayName,mail,userPrincipalName");
@@ -1493,7 +1544,10 @@ fn list_users(config: TeamsBridgeConfig, prefix: Option<&str>, limit: usize) -> 
         .unwrap_or_default();
 
     for user in users {
-        let id = user.get("id").and_then(JsonValue::as_str).unwrap_or("unknown");
+        let id = user
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown");
         let name = user
             .get("displayName")
             .and_then(JsonValue::as_str)
@@ -1522,7 +1576,9 @@ fn set_presence_status(
         bail!("duration-mins must be between 5 and 240");
     }
     let config_data = load_config_from_pile(&config)?.ok_or_else(|| {
-        anyhow::anyhow!("missing Teams config; run teams.rs login --client-id <app-id> --tenant <tenant-id>")
+        anyhow::anyhow!(
+            "missing Teams config; run teams.rs login --client-id <app-id> --tenant <tenant-id>"
+        )
     })?;
     let user_id = config_data
         .user_id
@@ -1577,7 +1633,8 @@ fn get_presence(config: TeamsBridgeConfig, user_ids: Vec<String>) -> Result<()> 
     if !status.is_success() {
         bail!("get presence failed: status={status} body={response_body}");
     }
-    let json_body: JsonValue = serde_json::from_str(&response_body).context("parse presence json")?;
+    let json_body: JsonValue =
+        serde_json::from_str(&response_body).context("parse presence json")?;
     let presences = json_body
         .get("value")
         .and_then(JsonValue::as_array)
@@ -1585,7 +1642,10 @@ fn get_presence(config: TeamsBridgeConfig, user_ids: Vec<String>) -> Result<()> 
         .unwrap_or_default();
 
     for presence in presences {
-        let id = presence.get("id").and_then(JsonValue::as_str).unwrap_or("unknown");
+        let id = presence
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown");
         let availability = presence
             .get("availability")
             .and_then(JsonValue::as_str)
@@ -1627,7 +1687,12 @@ fn ensure_presence_combo(availability: &str, activity: &str) -> Result<()> {
     }
 }
 
-fn invite_to_chat(config: TeamsBridgeConfig, chat_id: &str, user_id: &str, owner: bool) -> Result<()> {
+fn invite_to_chat(
+    config: TeamsBridgeConfig,
+    chat_id: &str,
+    user_id: &str,
+    owner: bool,
+) -> Result<()> {
     let token = get_delegated_token(&config)?;
     let url = format!("https://graph.microsoft.com/v1.0/chats/{chat_id}/members");
     let roles = if owner { vec!["owner"] } else { Vec::new() };
@@ -1662,7 +1727,9 @@ fn create_chat(
         bail!("chat-create requires at least one user id");
     }
     let config_data = load_config_from_pile(&config)?.ok_or_else(|| {
-        anyhow::anyhow!("missing Teams config; run teams.rs login --client-id <app-id> --tenant <tenant-id>")
+        anyhow::anyhow!(
+            "missing Teams config; run teams.rs login --client-id <app-id> --tenant <tenant-id>"
+        )
     })?;
     let self_id = config_data
         .user_id
@@ -1723,7 +1790,10 @@ fn create_chat(
     }
     let json_body: JsonValue =
         serde_json::from_str(&response_body).context("parse create chat response")?;
-    let chat_id = json_body.get("id").and_then(JsonValue::as_str).unwrap_or("unknown");
+    let chat_id = json_body
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("unknown");
     println!("{chat_id}");
     Ok(())
 }
@@ -1942,7 +2012,6 @@ fn open_pile(path: &PathBuf) -> Result<Pile> {
     Ok(pile)
 }
 
-
 fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -> Result<()> {
     let mut app_token_cache = None;
     pull_once_with_cache(&config, &mut app_token_cache)?;
@@ -2021,7 +2090,11 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                 chat_id,
                 created_at,
                 created_at_key: interval_key(created_at),
-                source_id: find_optional_handle(&catalog, attachment_id, &archive::attachment_source_id),
+                source_id: find_optional_handle(
+                    &catalog,
+                    attachment_id,
+                    &archive::attachment_source_id,
+                ),
                 source_pointer: find_optional_handle(
                     &catalog,
                     attachment_id,
@@ -2070,8 +2143,13 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                 .name
                 .map(|handle| load_longstring(&mut ws, handle))
                 .transpose()?;
-            let mime = row.mime.map(|value| String::try_from_inline(&value).unwrap());
-            let size = row.size.and_then(u256_to_u128).map(|value| value.to_string());
+            let mime = row
+                .mime
+                .map(|value| String::try_from_inline(&value).unwrap());
+            let size = row
+                .size
+                .and_then(u256_to_u128)
+                .map(|value| value.to_string());
             let timestamp = format_interval(row.created_at);
 
             let size_display = size.unwrap_or_else(|| "-".to_string());
@@ -2095,7 +2173,10 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
     })
 }
 
-fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOptions) -> Result<()> {
+fn backfill_attachments(
+    config: TeamsBridgeConfig,
+    options: AttachmentBackfillOptions,
+) -> Result<()> {
     let mut app_token_cache = None;
     let (token, _app_config) = get_app_token(&config, &mut app_token_cache)?;
     pull_once_with_cache(&config, &mut app_token_cache)?;
@@ -2260,7 +2341,13 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
             // and `raw_json` are not used by the new `ensure_attachments` —
             // they were kept in the stub only to satisfy the old IncomingMessage
             // shape. The backfill only needs `message_id` + the attachments list.
-            let _ = (created_at, &content, &chat_external_id, &message_external_id, &raw_json);
+            let _ = (
+                created_at,
+                &content,
+                &chat_external_id,
+                &message_external_id,
+                &raw_json,
+            );
             let before = change.len();
             ensure_attachments(
                 &mut ws,
@@ -2388,7 +2475,9 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
         }
 
         if candidates.len() > 1 {
-            println!("Multiple attachments matched. Use --chat-id or --message-id to disambiguate:");
+            println!(
+                "Multiple attachments matched. Use --chat-id or --message-id to disambiguate:"
+            );
             for candidate in &candidates {
                 let chat = chat_map
                     .get(&candidate.chat_id)
@@ -2398,7 +2487,10 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
                     .get(&candidate.message_id)
                     .cloned()
                     .unwrap_or_else(|| format!("{}", candidate.message_id));
-                println!("- chat={chat} message={message} attachment={}", candidate.source_id);
+                println!(
+                    "- chat={chat} message={message} attachment={}",
+                    candidate.source_id
+                );
             }
             return Ok(());
         }
@@ -2433,8 +2525,10 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
             bail!("output file exists: {} (use --overwrite)", path.display());
         }
 
-        let bytes: Bytes =
-            map_err_debug(ws.get::<Bytes, RawBytes>(candidate.data_handle), "load attachment bytes")?;
+        let bytes: Bytes = map_err_debug(
+            ws.get::<Bytes, RawBytes>(candidate.data_handle),
+            "load attachment bytes",
+        )?;
         fs::write(&path, bytes.as_ref())
             .with_context(|| format!("write attachment {}", path.display()))?;
         println!("{}", path.display());
@@ -2924,15 +3018,13 @@ fn build_ingest_change(
             // or fall back to the unknown-author singleton if Teams did not
             // provide one.
             let author_id = match message.author_external_id.as_deref() {
-                Some(ext) if !ext.trim().is_empty() => {
-                    ensure_author(
-                        ws,
-                        &mut change,
-                        index,
-                        ext,
-                        message.author_display_name.as_deref(),
-                    )?
-                }
+                Some(ext) if !ext.trim().is_empty() => ensure_author(
+                    ws,
+                    &mut change,
+                    index,
+                    ext,
+                    message.author_display_name.as_deref(),
+                )?,
                 _ => TEAMS_UNKNOWN_AUTHOR_ID,
             };
 
@@ -2973,8 +3065,8 @@ fn build_ingest_change(
                 };
             } else {
                 // Fill in missing metadata for existing messages when possible.
-                let message_chat = (!index.message_chat_set.contains(&message_id))
-                    .then_some(chat_id);
+                let message_chat =
+                    (!index.message_chat_set.contains(&message_id)).then_some(chat_id);
                 let message_raw = (!index.message_raw_set.contains(&message_id))
                     .then(|| ws.put(message.raw_json.clone()));
                 let message_created_at = (!index.message_created_at_set.contains(&message_id))
@@ -2983,7 +3075,7 @@ fn build_ingest_change(
                     .then(|| ws.put(message.content.clone()));
                 let message_reply_to = (predecessor.is_some()
                     && !index.reply_to_set.contains(&message_id))
-                    .then_some(predecessor.unwrap());
+                .then_some(predecessor.unwrap());
 
                 if message_chat.is_some()
                     || message_raw.is_some()
@@ -3122,7 +3214,9 @@ fn ensure_attachments(
             .unwrap_or("attachment");
         let name_handle: Inline<inlineencodings::Handle<blobencodings::LongString>> =
             ws.put(name_str.to_owned());
-        let mime = content_type.as_deref().unwrap_or("application/octet-stream");
+        let mime = content_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
 
         *files_change += entity! { ExclusiveId::force_ref(&attachment_id) @
             metadata::tag: &KIND_FILE,
@@ -3390,8 +3484,6 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
     Ok(load_value_or_file(raw, label)?.trim().to_string())
 }
-
-
 
 fn u256_to_u128(value: Inline<U256BE>) -> Option<u128> {
     let raw = value.raw;

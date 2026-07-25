@@ -46,15 +46,15 @@
 //! device — else the text fallback). The say-privacy invariant is enforced at
 //! resolution AND re-asserted per device name before any sound.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::voice::{
-    CHANNEL_SAY, CHANNEL_SHOUT, KIND_ROUTE, KIND_UTTERANCE, VOICE_BRANCH_NAME, route, utterance,
+    route, utterance, CHANNEL_SAY, CHANNEL_SHOUT, KIND_ROUTE, KIND_UTTERANCE, VOICE_BRANCH_NAME,
 };
-use hifitime::Epoch;
-use hifitime::efmt::Formatter;
 use hifitime::efmt::consts::ISO8601;
+use hifitime::efmt::Formatter;
+use hifitime::Epoch;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
@@ -87,8 +87,11 @@ const REF_CODE_FILE: &str = "ref_voice_v2_code.npy";
 // `say` lists ONLY private devices (the classifier rejects anything else anyway);
 // `shout` is the public broadcast ladder.
 const DEFAULT_SAY_DEVICES: &[&str] = &["AirPods Max", "AirPods Pro", "AirPods", "Headphones"];
-const DEFAULT_SHOUT_DEVICES: &[&str] =
-    &["Reachy Mini Audio", "Studio Display Speakers", "MacBook Pro Speakers"];
+const DEFAULT_SHOUT_DEVICES: &[&str] = &[
+    "Reachy Mini Audio",
+    "Studio Display Speakers",
+    "MacBook Pro Speakers",
+];
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 #[derive(Parser)]
@@ -234,8 +237,19 @@ fn classify(name: &str) -> DeviceClass {
         return DeviceClass::Speaker;
     }
     const PRIVATE_HINTS: &[&str] = &[
-        "airpods", "headphone", "headset", "earbud", "earphone", "earpod", "ear pod",
-        "in-ear", "beats", "buds", " wf-", " wh-", "powerbeats",
+        "airpods",
+        "headphone",
+        "headset",
+        "earbud",
+        "earphone",
+        "earpod",
+        "ear pod",
+        "in-ear",
+        "beats",
+        "buds",
+        " wf-",
+        " wh-",
+        "powerbeats",
     ];
     if PRIVATE_HINTS.iter().any(|h| n.contains(h)) {
         return DeviceClass::Private;
@@ -274,7 +288,9 @@ fn detect_output_devices() -> Result<Vec<AudioDevice>> {
         .output_devices()
         .context("enumerate audio output devices (cpal)")?
     {
-        let Ok(desc) = dev.description() else { continue };
+        let Ok(desc) = dev.description() else {
+            continue;
+        };
         let name = desc.name().to_string();
         if name.is_empty() {
             continue;
@@ -325,7 +341,11 @@ fn open_named_sink(name: &str) -> Result<(rodio::MixerDeviceSink, rodio::Player)
     let device = host
         .output_devices()
         .context("enumerate audio output devices (cpal)")?
-        .find(|d| d.description().map(|desc| desc.name() == name).unwrap_or(false))
+        .find(|d| {
+            d.description()
+                .map(|desc| desc.name() == name)
+                .unwrap_or(false)
+        })
         .with_context(|| format!("output device '{name}' not found (disconnected?)"))?;
     let mut sink = rodio::DeviceSinkBuilder::from_device(device)
         .and_then(|b| b.open_stream())
@@ -358,7 +378,10 @@ fn play_on_reachy(daemon: &str, wav: &Path) -> Result<()> {
         .send()
         .context("Reachy play_sound")?;
     if !resp.status().is_success() {
-        bail!("Reachy play_sound failed: {}", resp.text().unwrap_or_default());
+        bail!(
+            "Reachy play_sound failed: {}",
+            resp.text().unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -463,8 +486,8 @@ fn route_shout(prefs: &[String], devices: &[AudioDevice], daemon_up: bool) -> Ro
 // ── pile plumbing ───────────────────────────────────────────────────────────
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -497,7 +520,9 @@ fn with_voice<T>(
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull voice workspace: {e:?}"))?;
     let result = f(&mut repo, &mut ws);
-    let close_res = repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
+    let close_res = repo
+        .close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
     if let Err(err) = close_res {
         if result.is_ok() {
             return Err(err);
@@ -514,7 +539,9 @@ fn with_voice<T>(
 /// the read sees one current policy). Falls back to the baked-in defaults when
 /// the pile holds no policy for the channel.
 fn load_route(ws: &mut Workspace<Pile>, channel: &str) -> Result<Vec<String>> {
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     // (set-generation key, priority, device) for this channel.
     let mut rows: Vec<(i128, u64, String)> = Vec::new();
     for (dev, prio, updated) in find!(
@@ -724,13 +751,8 @@ fn speak_and_play(
         ref_text.trim().chars().count(),
     );
     let t_call = std::time::Instant::now();
-    let mut stream = mary::speak::synthesize_stream(
-        &pile,
-        &ref_wav,
-        ref_text.trim(),
-        &ref_code,
-        text,
-    )?;
+    let mut stream =
+        mary::speak::synthesize_stream(&pile, &ref_wav, ref_text.trim(), &ref_code, text)?;
 
     let mut samples: Vec<f32> = Vec::new();
     let played: Result<()> = match routed {
@@ -741,9 +763,15 @@ fn speak_and_play(
             }
             Ok(())
         }
-        Routed::Devices(ladder) => {
-            stream_to_device(&mut stream, &mut samples, t_call, channel, ladder, sr, est_secs)
-        }
+        Routed::Devices(ladder) => stream_to_device(
+            &mut stream,
+            &mut samples,
+            t_call,
+            channel,
+            ladder,
+            sr,
+            est_secs,
+        ),
         Routed::Text(_) => Ok(()), // handled by the caller; nothing to play
     };
 
@@ -859,8 +887,7 @@ fn stream_to_device(
         // rebuffer the remaining deficit at the freshly measured rate.
         if started && rebuffer_from.is_none() && player.empty() {
             player.pause();
-            let target =
-                prebuffer_target_secs((est_secs - secs(appended)).max(0.0), prod_rate);
+            let target = prebuffer_target_secs((est_secs - secs(appended)).max(0.0), prod_rate);
             println!(
                 "  [stream] underrun at {:.1}s — rebuffering {:.1}s (synthesis at {:.2}x realtime)",
                 secs(appended),
@@ -933,8 +960,7 @@ fn stream_to_device(
     // stream (a device dying mid-play stops consuming; sleeping forever would
     // resurrect the silent-failure class).
     let audio_secs = appended as f32 / sr as f32;
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs_f32(audio_secs + 5.0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f32(audio_secs + 5.0);
     while !player.empty() {
         if std::time::Instant::now() > deadline {
             bail!("playback stalled on '{device}' ({audio_secs:.1}s of audio never drained)");
@@ -1058,7 +1084,11 @@ fn unique_voice_tmp() -> Result<PathBuf> {
             std::process::id(),
             u64::from_le_bytes(r)
         ));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(_) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
@@ -1076,12 +1106,19 @@ fn cmd_route(ws: &mut Workspace<Pile>, daemon: &str) -> Result<()> {
     let devices = detect_output_devices()?;
     let daemon_up = reachy_reachable(daemon);
 
-    println!("Reachy daemon: {}", if daemon_up { "reachable" } else { "down" });
+    println!(
+        "Reachy daemon: {}",
+        if daemon_up { "reachable" } else { "down" }
+    );
     println!();
 
     println!("connected output devices:");
     for d in &devices {
-        let def = if d.is_default_output { "  [default output]" } else { "" };
+        let def = if d.is_default_output {
+            "  [default output]"
+        } else {
+            ""
+        };
         println!("  {:<28} {}{def}", d.name, d.class().label());
     }
     println!();
@@ -1133,7 +1170,11 @@ fn cmd_devices() -> Result<()> {
         return Ok(());
     }
     for d in &devices {
-        let def = if d.is_default_output { "  [default output]" } else { "" };
+        let def = if d.is_default_output {
+            "  [default output]"
+        } else {
+            ""
+        };
         println!("{:<28} {}{def}", d.name, d.class().label());
     }
     Ok(())
@@ -1157,11 +1198,9 @@ fn main() -> Result<()> {
             cmd_speak(repo, ws, &daemon, CHANNEL_SHOUT, &text, dry_run)
         })?,
         Some(Command::Route) => with_voice(&pile, branch, |_repo, ws| cmd_route(ws, &daemon))?,
-        Some(Command::RouteSet { channel, devices }) => {
-            with_voice(&pile, branch, |repo, ws| {
-                cmd_route_set(repo, ws, &channel, &devices)
-            })?
-        }
+        Some(Command::RouteSet { channel, devices }) => with_voice(&pile, branch, |repo, ws| {
+            cmd_route_set(repo, ws, &channel, &devices)
+        })?,
         Some(Command::Devices) => cmd_devices()?,
     }
     Ok(())
@@ -1216,10 +1255,7 @@ mod tests {
 
     #[test]
     fn say_never_ladders_a_speaker_even_when_the_policy_lists_one() {
-        let devices = [
-            dev("MacBook Pro Speakers", true),
-            dev("AirPods Max", false),
-        ];
+        let devices = [dev("MacBook Pro Speakers", true), dev("AirPods Max", false)];
         // A (mis)configured policy that puts a speaker FIRST cannot make it play:
         // the ladder holds only the private device.
         let l = ladder(route_say(
@@ -1295,11 +1331,7 @@ mod tests {
             dev("Reachy Mini Audio", false),
         ];
         // Reachy below a local match is not a streaming-sink candidate.
-        let l = ladder(route_shout(
-            &prefs(&["MacBook", "Reachy"]),
-            &devices,
-            true,
-        ));
+        let l = ladder(route_shout(&prefs(&["MacBook", "Reachy"]), &devices, true));
         assert_eq!(l, vec!["MacBook Pro Speakers"]);
     }
 

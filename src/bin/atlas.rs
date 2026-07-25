@@ -1,8 +1,7 @@
-
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
@@ -67,7 +66,8 @@ fn main() -> Result<()> {
 
 fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
     with_repo(pile, |repo| {
-        let branch_id = repo.ensure_branch(branch, None)
+        let branch_id = repo
+            .ensure_branch(branch, None)
             .map_err(|e| anyhow!("ensure atlas branch: {e:?}"))?;
         let mut ws = repo
             .pull(branch_id)
@@ -127,7 +127,8 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
 
 fn cmd_show(pile: &Path, branch: &str, prefix: &str) -> Result<()> {
     with_repo(pile, |repo| {
-        let branch_id = repo.ensure_branch(branch, None)
+        let branch_id = repo
+            .ensure_branch(branch, None)
             .map_err(|e| anyhow!("ensure atlas branch: {e:?}"))?;
         let mut ws = repo
             .pull(branch_id)
@@ -258,8 +259,7 @@ fn fmt_id(id: Id) -> String {
 }
 
 fn open_repo(pile_path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
+    let mut pile = Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -277,10 +277,7 @@ fn open_repo(pile_path: &Path) -> Result<Repository<Pile>> {
         .map_err(|e| anyhow!("create repository: {e:?}"))
 }
 
-fn with_repo<T>(
-    pile_path: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile_path: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile_path)?;
     let result = f(&mut repo);
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));

@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 
 use triblespace::core::metadata;
@@ -55,10 +55,7 @@ pub fn chunk_image_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<Raw
 /// would otherwise print.
 pub fn chunk_span_str(space: &TribleSet, id: Id) -> String {
     match (chunk_start_at(space, id), chunk_end_at(space, id)) {
-        (Some(s), Some(e)) => format_time_range(
-            epoch_from_interval(s),
-            epoch_end_from_interval(e),
-        ),
+        (Some(s), Some(e)) => format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)),
         _ => "?".to_string(),
     }
 }
@@ -91,10 +88,7 @@ pub fn superseded_ids(space: &TribleSet) -> HashSet<Id> {
 
 /// The stored shared-space embedding handle for a chunk, if it has been embedded.
 #[cfg(feature = "local-embed")]
-pub fn chunk_embedding_handle(
-    space: &TribleSet,
-    id: Id,
-) -> Option<Inline<Handle<Embedding768>>> {
+pub fn chunk_embedding_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<Embedding768>>> {
     find!(
         h: Inline<Handle<Embedding768>>,
         pattern!(space, [{ id @ embeddings::attr::embedding: ?h }])
@@ -596,7 +590,12 @@ pub fn render_cover(
     // Completeness is invariant — never drop a memory to fit. If even this
     // overflows, the hierarchy lacks a coarse-enough apex; tell the caller
     // how to raise one instead of silently losing the past.
-    roots.sort_by(|&a, &b| spans[a].0.cmp(&spans[b].0).then(spans[b].1.cmp(&spans[a].1)));
+    roots.sort_by(|&a, &b| {
+        spans[a]
+            .0
+            .cmp(&spans[b].0)
+            .then(spans[b].1.cmp(&spans[a].1))
+    });
     let mut cost_cache: Vec<Option<usize>> = vec![None; n];
     let mut used = 0usize;
     for &i in &roots {
@@ -639,8 +638,13 @@ pub fn render_cover(
             }
             let mut kids_cost = 0usize;
             for &k in &children[i] {
-                kids_cost = kids_cost
-                    .saturating_add(context_chunk_cost(ws, space, &spans, &mut cost_cache, k)?);
+                kids_cost = kids_cost.saturating_add(context_chunk_cost(
+                    ws,
+                    space,
+                    &spans,
+                    &mut cost_cache,
+                    k,
+                )?);
             }
             let pcost = context_chunk_cost(ws, space, &spans, &mut cost_cache, i)?;
             let extra = kids_cost.saturating_sub(pcost);
@@ -693,19 +697,18 @@ pub fn render_cover(
         // Recompute the character tally honestly over what actually survived.
         used = 0;
         for &i in &cover {
-            used = used.saturating_add(context_chunk_cost(
-                ws,
-                space,
-                &spans,
-                &mut cost_cache,
-                i,
-            )?);
+            used = used.saturating_add(context_chunk_cost(ws, space, &spans, &mut cost_cache, i)?);
         }
     }
 
     // Emit coarse → fine: time order, indented by containment depth, each
     // chunk's span header followed by its summary content.
-    cover.sort_by(|&a, &b| spans[a].0.cmp(&spans[b].0).then(spans[b].1.cmp(&spans[a].1)));
+    cover.sort_by(|&a, &b| {
+        spans[a]
+            .0
+            .cmp(&spans[b].0)
+            .then(spans[b].1.cmp(&spans[a].1))
+    });
     let mode = {
         let mut parts = vec![match about {
             Some(q) => format!("most detail on memories about \"{q}\""),

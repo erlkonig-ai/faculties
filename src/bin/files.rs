@@ -1,14 +1,13 @@
-
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::embeddings;
 use faculties::schemas::files::{
-    FILES_BRANCH_NAME, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE, file, page,
+    file, page, FILES_BRANCH_NAME, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
 };
-use hifitime::Epoch;
-use hifitime::efmt::Formatter;
 use hifitime::efmt::consts::ISO8601_DATE;
+use hifitime::efmt::Formatter;
+use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::BTreeMap;
 use std::fs;
@@ -263,11 +262,7 @@ fn human_size(bytes: u64) -> String {
 
 // ── query helpers ────────────────────────────────────────────────────────
 
-fn read_name(
-    space: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    eid: Id,
-) -> Option<String> {
+fn read_name(space: &TribleSet, ws: &mut Workspace<Pile>, eid: Id) -> Option<String> {
     let (h,) = find!(
         (h: TextHandle),
         pattern!(space, [{ eid @ file::name: ?h }])
@@ -353,11 +348,7 @@ fn imported_at_of(space: &TribleSet, eid: Id) -> Option<i128> {
     .map(|(ts,)| interval_key(ts))
 }
 
-fn source_path_of(
-    space: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    eid: Id,
-) -> Option<String> {
+fn source_path_of(space: &TribleSet, ws: &mut Workspace<Pile>, eid: Id) -> Option<String> {
     let (h,) = find!(
         (h: TextHandle),
         pattern!(space, [{ eid @ file::source_path: ?h }])
@@ -401,18 +392,15 @@ fn resolve_entity(space: &TribleSet, input: &str) -> Result<Id> {
             .next()
             .ok_or_else(|| anyhow::anyhow!("no file with content hash '{trimmed}'"))
         }
-        n => bail!(
-            "expected 32-char hex id or 64-char hex hash, got {n} chars: '{trimmed}'"
-        ),
+        n => bail!("expected 32-char hex id or 64-char hex hash, got {n} chars: '{trimmed}'"),
     }
 }
-
 
 // ── repo helpers ─────────────────────────────────────────────────────────
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -432,10 +420,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
 fn with_files<T>(
     pile: &Path,
     explicit_branch: Option<&str>,
-    f: impl FnOnce(
-        &mut Repository<Pile>,
-        &mut Workspace<Pile>,
-    ) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile>, &mut Workspace<Pile>) -> Result<T>,
 ) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let branch_id = if let Some(hex) = explicit_branch {
@@ -477,8 +462,7 @@ fn print_fs_tree(
     child_prefix: &str,
     stats: &mut TreeStats,
 ) -> Result<()> {
-    let meta = fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
+    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(".");
 
     if meta.is_file() {
@@ -491,9 +475,7 @@ fn print_fs_tree(
         stats.dirs += 1;
         let mut dirs: Vec<(String, PathBuf)> = Vec::new();
         let mut files: Vec<(String, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(path)
-            .with_context(|| format!("read dir {}", path.display()))?
-        {
+        for entry in fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))? {
             let entry = entry?;
             let ename = entry.file_name().to_string_lossy().to_string();
             if ename.starts_with('.') {
@@ -558,11 +540,7 @@ fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
     };
     let tok = mary::embed::hf_cache_resolve(CLIP_MODEL, "tokenizer.json")
         .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {CLIP_MODEL}"))?;
-    let emb = mary::embed::load_clip_from_pile(
-        &pile,
-        &tok,
-        mary::embed::default_device(),
-    )?;
+    let emb = mary::embed::load_clip_from_pile(&pile, &tok, mary::embed::default_device())?;
     Ok(Box::new(emb))
 }
 
@@ -617,7 +595,8 @@ fn embed_text_query(text: &str) -> Result<Vec<f32>> {
 // only; gated behind `local-embed`.
 
 #[cfg(all(feature = "local-embed", target_os = "macos"))]
-type Mm7bEmbedder = mary::models::qwen2_5_vl::embedder::NomicMultimodalEmbedder<mary::nn::backend::B>;
+type Mm7bEmbedder =
+    mary::models::qwen2_5_vl::embedder::NomicMultimodalEmbedder<mary::nn::backend::B>;
 
 /// Default weights pile + tokenizer for the 7b, overridable via env so the
 /// faculty isn't pinned to one machine's paths.
@@ -628,7 +607,8 @@ fn load_mm7b() -> Result<Mm7bEmbedder> {
         Some(p) => PathBuf::from(p),
         None => faculties::model_dir().join("nomic_mm7b.pile"),
     };
-    let tok = std::env::var("NOMIC_MM7B_TOKENIZER").unwrap_or_else(|_| DEFAULT_TOKENIZER.to_string());
+    let tok =
+        std::env::var("NOMIC_MM7B_TOKENIZER").unwrap_or_else(|_| DEFAULT_TOKENIZER.to_string());
     eprintln!("files: loading nomic-embed-multimodal-7b (once, ~20s)…");
     mary::persist::load_nomic_mm7b_aliased_from_pile(
         &pile,
@@ -698,18 +678,19 @@ fn build_tree(
     stats: &mut TreeStats,
     embedder: &mut Option<Box<dyn ImageEmbedder>>,
 ) -> Result<Fragment> {
-    let meta = fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
+    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
 
     if meta.is_file() {
-        let bytes = fs::read(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
         stats.bytes += bytes.len() as u64;
         let mime = mime_override.unwrap_or_else(|| infer_mime(path));
         // Embed BEFORE the bytes are moved into the blob store.
         let emb_handle = embed_image_on_add(ws, embedder, mime, &bytes)?;
         let content_h: FileHandle = ws.put::<blobencodings::RawBytes, _>(bytes);
-        let name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("unnamed");
+        let name_str = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed");
         let name_h: TextHandle = ws.put(name_str.to_string());
 
         stats.files += 1;
@@ -728,9 +709,7 @@ fn build_tree(
     } else if meta.is_dir() {
         // Collect children sorted by name for deterministic ordering.
         let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
-        for entry in fs::read_dir(path)
-            .with_context(|| format!("read dir {}", path.display()))?
-        {
+        for entry in fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
             // Skip hidden files and common noise.
@@ -770,16 +749,22 @@ fn cmd_add(
     tags: &[String],
     dry_run: bool,
 ) -> Result<()> {
-    let abs_path = fs::canonicalize(path)
-        .with_context(|| format!("canonicalize {}", path.display()))?;
+    let abs_path =
+        fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
 
     if dry_run {
-        let mut stats = TreeStats { files: 0, dirs: 0, bytes: 0 };
+        let mut stats = TreeStats {
+            files: 0,
+            dirs: 0,
+            bytes: 0,
+        };
         print_fs_tree(&abs_path, "", "", &mut stats)?;
         println!();
         println!(
             "Would import: {} files, {} dirs, {}",
-            stats.files, stats.dirs, human_size(stats.bytes),
+            stats.files,
+            stats.dirs,
+            human_size(stats.bytes),
         );
         if !tags.is_empty() {
             println!("Tags: {}", tags.join(", "));
@@ -789,7 +774,11 @@ fn cmd_add(
 
     let source = abs_path.to_string_lossy().to_string();
 
-    let mut stats = TreeStats { files: 0, dirs: 0, bytes: 0 };
+    let mut stats = TreeStats {
+        files: 0,
+        dirs: 0,
+        bytes: 0,
+    };
     let mut embedder: Option<Box<dyn ImageEmbedder>> = None;
     let tree = build_tree(ws, &abs_path, mime_override, &mut stats, &mut embedder)?;
     let root_id = tree.root().expect("tree has a root");
@@ -814,8 +803,7 @@ fn cmd_add(
     }
 
     ws.commit(change, "files add");
-    repo.push(ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
 
     if stats.dirs > 0 {
         println!(
@@ -827,7 +815,9 @@ fn cmd_add(
         );
     } else {
         // Single file — show the content hash.
-        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let h = content_handle_of(&space, root_id)
             .ok_or_else(|| anyhow::anyhow!("missing content handle"))?;
         let hash = handle_hex(h);
@@ -879,13 +869,15 @@ fn cmd_fetch(
         );
     }
 
-    let guessed_name = name_override
-        .map(str::to_owned)
-        .or_else(|| {
-            let before_query = url.split('?').next().unwrap_or(url);
-            let last = before_query.rsplit('/').next()?.trim();
-            if last.is_empty() { None } else { Some(last.to_owned()) }
-        });
+    let guessed_name = name_override.map(str::to_owned).or_else(|| {
+        let before_query = url.split('?').next().unwrap_or(url);
+        let last = before_query.rsplit('/').next()?.trim();
+        if last.is_empty() {
+            None
+        } else {
+            Some(last.to_owned())
+        }
+    });
     let mime = mime_override
         .map(str::to_owned)
         .or(header_mime)
@@ -1004,10 +996,7 @@ fn resolve_one_prefix(space: &TribleSet, needle: &str) -> Result<String, String>
     }
 }
 
-fn cmd_resolve(
-    ws: &mut Workspace<Pile>,
-    input: &str,
-) -> Result<()> {
+fn cmd_resolve(ws: &mut Workspace<Pile>, input: &str) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1016,26 +1005,28 @@ fn cmd_resolve(
     if let Some(path) = input.strip_prefix('@') {
         let content = if path == "-" {
             let mut buf = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                .context("read stdin")?;
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
             buf
         } else {
-            fs::read_to_string(path)
-                .with_context(|| format!("read {path}"))?
+            fs::read_to_string(path).with_context(|| format!("read {path}"))?
         };
         let mut resolved = 0u32;
         let mut ambiguous = 0u32;
         let mut already_full = 0u32;
         for line in content.lines() {
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let prefix = line.strip_prefix("files:").unwrap_or(line);
             if prefix.len() >= 64 {
                 already_full += 1;
                 continue;
             }
             let needle = prefix.to_lowercase();
-            if needle.len() < 4 { continue; }
+            if needle.len() < 4 {
+                continue;
+            }
             match resolve_one_prefix(&space, &needle) {
                 Ok(full) => {
                     println!("{}\tfiles:{}", line, full);
@@ -1047,7 +1038,10 @@ fn cmd_resolve(
                 }
             }
         }
-        eprintln!("{} resolved, {} ambiguous, {} already full", resolved, ambiguous, already_full);
+        eprintln!(
+            "{} resolved, {} ambiguous, {} already full",
+            resolved, ambiguous, already_full
+        );
         return Ok(());
     }
 
@@ -1065,10 +1059,7 @@ fn cmd_resolve(
     }
 }
 
-fn cmd_show(
-    ws: &mut Workspace<Pile>,
-    id: &str,
-) -> Result<()> {
+fn cmd_show(ws: &mut Workspace<Pile>, id: &str) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1076,20 +1067,27 @@ fn cmd_show(
 
     if is_file(&space, eid) {
         let h = content_handle_of(&space, eid).unwrap();
-        let size = ws.get::<anybytes::Bytes, _>(h)
+        let size = ws
+            .get::<anybytes::Bytes, _>(h)
             .map(|b| b.len() as u64)
             .unwrap_or(0);
         println!("Type:     file");
         println!("Hash:     {}", handle_hex(h));
         println!("Entity:   {}", fmt_id(eid));
-        println!("Name:     {}", read_name(&space, ws, eid).unwrap_or("?".into()));
+        println!(
+            "Name:     {}",
+            read_name(&space, ws, eid).unwrap_or("?".into())
+        );
         println!("MIME:     {}", read_mime(&space, eid).unwrap_or("?".into()));
         println!("Size:     {}", human_size(size));
     } else if is_directory(&space, eid) {
         let children = children_of(&space, eid);
         println!("Type:     directory");
         println!("Entity:   {}", fmt_id(eid));
-        println!("Name:     {}", read_name(&space, ws, eid).unwrap_or("?".into()));
+        println!(
+            "Name:     {}",
+            read_name(&space, ws, eid).unwrap_or("?".into())
+        );
         println!("Children: {}", children.len());
     } else if is_import(&space, eid) {
         let root = root_of(&space, eid);
@@ -1118,11 +1116,7 @@ fn cmd_show(
     Ok(())
 }
 
-fn cmd_get(
-    ws: &mut Workspace<Pile>,
-    id: &str,
-    output: Option<&str>,
-) -> Result<()> {
+fn cmd_get(ws: &mut Workspace<Pile>, id: &str, output: Option<&str>) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1140,12 +1134,14 @@ fn cmd_get(
     if is_file(&space, target) {
         let h = content_handle_of(&space, target)
             .ok_or_else(|| anyhow::anyhow!("no content for file"))?;
-        let bytes: anybytes::Bytes = ws.get::<anybytes::Bytes, _>(h)
+        let bytes: anybytes::Bytes = ws
+            .get::<anybytes::Bytes, _>(h)
             .map_err(|e| anyhow::anyhow!("get blob: {e:?}"))?;
 
         if to_stdout {
             use std::io::Write;
-            std::io::stdout().write_all(bytes.as_ref())
+            std::io::stdout()
+                .write_all(bytes.as_ref())
                 .context("write to stdout")?;
         } else {
             let out_path = if let Some(p) = output {
@@ -1156,19 +1152,32 @@ fn cmd_get(
             };
             fs::write(&out_path, bytes.as_ref())
                 .with_context(|| format!("write {}", out_path.display()))?;
-            eprintln!("Wrote {} ({})", out_path.display(), human_size(bytes.len() as u64));
+            eprintln!(
+                "Wrote {} ({})",
+                out_path.display(),
+                human_size(bytes.len() as u64)
+            );
         }
     } else if is_directory(&space, target) {
         if to_stdout {
             bail!("cannot write directory to stdout");
         }
         let dir_name = read_name(&space, ws, target).unwrap_or_else(|| "extracted".into());
-        let out_dir = output.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&dir_name));
-        let mut stats = TreeStats { files: 0, dirs: 0, bytes: 0 };
+        let out_dir = output
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&dir_name));
+        let mut stats = TreeStats {
+            files: 0,
+            dirs: 0,
+            bytes: 0,
+        };
         extract_tree(&space, ws, target, &out_dir, &mut stats)?;
         eprintln!(
             "Extracted to {} ({} files, {} dirs, {})",
-            out_dir.display(), stats.files, stats.dirs, human_size(stats.bytes),
+            out_dir.display(),
+            stats.files,
+            stats.dirs,
+            human_size(stats.bytes),
         );
     } else {
         bail!("entity is not a file, directory, or import");
@@ -1185,17 +1194,16 @@ fn extract_tree(
     stats: &mut TreeStats,
 ) -> Result<()> {
     if is_file(space, id) {
-        let h = content_handle_of(space, id)
-            .ok_or_else(|| anyhow::anyhow!("no content for file"))?;
-        let bytes: anybytes::Bytes = ws.get::<anybytes::Bytes, _>(h)
+        let h =
+            content_handle_of(space, id).ok_or_else(|| anyhow::anyhow!("no content for file"))?;
+        let bytes: anybytes::Bytes = ws
+            .get::<anybytes::Bytes, _>(h)
             .map_err(|e| anyhow::anyhow!("get blob: {e:?}"))?;
-        fs::write(dest, bytes.as_ref())
-            .with_context(|| format!("write {}", dest.display()))?;
+        fs::write(dest, bytes.as_ref()).with_context(|| format!("write {}", dest.display()))?;
         stats.files += 1;
         stats.bytes += bytes.len() as u64;
     } else if is_directory(space, id) {
-        fs::create_dir_all(dest)
-            .with_context(|| format!("mkdir {}", dest.display()))?;
+        fs::create_dir_all(dest).with_context(|| format!("mkdir {}", dest.display()))?;
         stats.dirs += 1;
         for cid in children_of(space, id) {
             let cname = read_name(space, ws, cid).unwrap_or_else(|| fmt_id(cid));
@@ -1226,18 +1234,14 @@ fn cmd_tag(
 
     let change = entity! { ExclusiveId::force_ref(&eid) @ file::tag: tag_name };
     ws.commit(change, "files tag");
-    repo.push(ws)
-        .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
 
     let name = read_name(&space, ws, eid).unwrap_or_else(|| fmt_id(eid));
     println!("Tagged {name} with '{tag_name}'");
     Ok(())
 }
 
-fn cmd_search(
-    ws: &mut Workspace<Pile>,
-    query: &str,
-) -> Result<()> {
+fn cmd_search(ws: &mut Workspace<Pile>, query: &str) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1281,9 +1285,7 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_imports(
-    ws: &mut Workspace<Pile>,
-) -> Result<()> {
+fn cmd_imports(ws: &mut Workspace<Pile>) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1308,7 +1310,11 @@ fn cmd_imports(
     }
 
     for (ts, eid, src, tags) in &imports {
-        let date = if *ts > 0 { format_date(*ts) } else { "?".into() };
+        let date = if *ts > 0 {
+            format_date(*ts)
+        } else {
+            "?".into()
+        };
         let src_str = src.as_deref().unwrap_or("?");
         let tag_str = if tags.is_empty() {
             String::new()
@@ -1321,11 +1327,7 @@ fn cmd_imports(
     Ok(())
 }
 
-fn cmd_tree(
-    ws: &mut Workspace<Pile>,
-    id: &str,
-    max_depth: Option<usize>,
-) -> Result<()> {
+fn cmd_tree(ws: &mut Workspace<Pile>, id: &str, max_depth: Option<usize>) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1386,10 +1388,13 @@ fn print_tree(
             let connector = if last { "└── " } else { "├── " };
             let continuation = if last { "    " } else { "│   " };
             print_tree(
-                space, ws, cid,
+                space,
+                ws,
+                cid,
                 &format!("{child_prefix}{connector}"),
                 &format!("{child_prefix}{continuation}"),
-                max_depth, depth + 1,
+                max_depth,
+                depth + 1,
             );
         }
     } else {
@@ -1397,11 +1402,7 @@ fn print_tree(
     }
 }
 
-fn cmd_diff(
-    ws: &mut Workspace<Pile>,
-    left_id: &str,
-    right_id: &str,
-) -> Result<()> {
+fn cmd_diff(ws: &mut Workspace<Pile>, left_id: &str, right_id: &str) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1471,7 +1472,11 @@ fn diff_tree(
         let lname = read_name(space, ws, left).unwrap_or_else(|| "?".into());
         let lsize = file_size(space, ws, left);
         let rsize = file_size(space, ws, right);
-        println!("  ~ {path}{lname}  ({} → {})", human_size(lsize), human_size(rsize));
+        println!(
+            "  ~ {path}{lname}  ({} → {})",
+            human_size(lsize),
+            human_size(rsize)
+        );
         stats.modified += 1;
         return;
     }
@@ -1509,34 +1514,28 @@ fn diff_tree(
                 let (_rname, rid) = ri.next().unwrap();
                 print_diff_added(space, ws, *rid, &sub, stats);
             }
-            (Some((lname, _)), Some((rname, _))) => {
-                match lname.cmp(rname) {
-                    std::cmp::Ordering::Less => {
-                        let (lname, lid) = li.next().unwrap();
-                        print_diff_removed(space, ws, *lid, &sub, stats);
-                        let _ = lname;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        let (rname, rid) = ri.next().unwrap();
-                        print_diff_added(space, ws, *rid, &sub, stats);
-                        let _ = rname;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        let (_lname, lid) = li.next().unwrap();
-                        let (_rname, rid) = ri.next().unwrap();
-                        diff_tree(space, ws, *lid, *rid, &sub, stats);
-                    }
+            (Some((lname, _)), Some((rname, _))) => match lname.cmp(rname) {
+                std::cmp::Ordering::Less => {
+                    let (lname, lid) = li.next().unwrap();
+                    print_diff_removed(space, ws, *lid, &sub, stats);
+                    let _ = lname;
                 }
-            }
+                std::cmp::Ordering::Greater => {
+                    let (rname, rid) = ri.next().unwrap();
+                    print_diff_added(space, ws, *rid, &sub, stats);
+                    let _ = rname;
+                }
+                std::cmp::Ordering::Equal => {
+                    let (_lname, lid) = li.next().unwrap();
+                    let (_rname, rid) = ri.next().unwrap();
+                    diff_tree(space, ws, *lid, *rid, &sub, stats);
+                }
+            },
         }
     }
 }
 
-fn named_children(
-    space: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    id: Id,
-) -> BTreeMap<String, Id> {
+fn named_children(space: &TribleSet, ws: &mut Workspace<Pile>, id: Id) -> BTreeMap<String, Id> {
     let mut map = BTreeMap::new();
     for cid in children_of(space, id) {
         let name = read_name(space, ws, cid).unwrap_or_else(|| fmt_id(cid));
@@ -1545,11 +1544,7 @@ fn named_children(
     map
 }
 
-fn file_size(
-    space: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    id: Id,
-) -> u64 {
+fn file_size(space: &TribleSet, ws: &mut Workspace<Pile>, id: Id) -> u64 {
     content_handle_of(space, id)
         .and_then(|h| ws.get::<anybytes::Bytes, _>(h).ok())
         .map(|b| b.len() as u64)
@@ -1616,11 +1611,7 @@ fn read_embedding(ws: &mut Workspace<Pile>, h: EmbHandle) -> Result<Vec<f32>> {
 /// path: both coexist. Idempotent — already-embedded files are skipped unless
 /// `--force`. Identical bytes (duplicate imports) are embedded once and the
 /// vector fanned out to every entity that shares the content.
-fn cmd_embed7b(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
-    force: bool,
-) -> Result<()> {
+fn cmd_embed7b(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>, force: bool) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1755,9 +1746,7 @@ fn render_pdf_pages(bytes: &[u8], dpi: u32, max_pages: usize) -> Result<Vec<(usi
         cmd.arg("-l").arg(max_pages.to_string());
     }
     cmd.arg(&in_pdf).arg(&prefix);
-    let out = cmd
-        .output()
-        .with_context(|| "spawn pdftoppm")?;
+    let out = cmd.output().with_context(|| "spawn pdftoppm")?;
     if !out.status.success() {
         let _ = fs::remove_dir_all(&dir);
         bail!(
@@ -1775,8 +1764,14 @@ fn render_pdf_pages(bytes: &[u8], dpi: u32, max_pages: usize) -> Result<Vec<(usi
         if path.extension().and_then(|e| e.to_str()) != Some("png") {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-        let num = stem.rsplit('-').next().and_then(|d| d.parse::<usize>().ok());
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let num = stem
+            .rsplit('-')
+            .next()
+            .and_then(|d| d.parse::<usize>().ok());
         if let Some(n) = num {
             let data = fs::read(&path).with_context(|| format!("read page {path:?}"))?;
             pages.push((n, data));
@@ -1931,7 +1926,10 @@ fn cmd_embed7b_pdf(
             pages_embedded += 1;
         }
         pdfs_done += 1;
-        eprintln!("  {hash}: {this_pages} pages → {} entities", this_pages * eids.len());
+        eprintln!(
+            "  {hash}: {this_pages} pages → {} entities",
+            this_pages * eids.len()
+        );
     }
 
     if change.is_empty() {
@@ -1944,7 +1942,11 @@ fn cmd_embed7b_pdf(
 
     println!(
         "7b-embedded {pages_embedded} pages across {pdfs_done} PDFs (of {pending_pdfs} pending){}",
-        if failed > 0 { format!(", {failed} failures") } else { String::new() },
+        if failed > 0 {
+            format!(", {failed} failures")
+        } else {
+            String::new()
+        },
     );
     Ok(())
 }
@@ -2165,61 +2167,72 @@ fn main() -> Result<()> {
     let branch = cli.branch_id.as_deref();
 
     match command {
-        Command::Add { path, mime, tag, dry_run } => {
-            with_files(pile, branch, |repo, ws| {
-                cmd_add(repo, ws, &path, mime.as_deref(), &tag, dry_run)
-            })
-        }
-        Command::List { tag, mime } => {
-            with_files(pile, branch, |_repo, ws| {
-                cmd_list(ws, &tag, mime.as_deref())
-            })
-        }
-        Command::Show { id } => {
-            with_files(pile, branch, |_repo, ws| cmd_show(ws, &id))
-        }
-        Command::Get { id, output } => {
-            with_files(pile, branch, |_repo, ws| {
-                cmd_get(ws, &id, output.as_deref())
-            })
-        }
+        Command::Add {
+            path,
+            mime,
+            tag,
+            dry_run,
+        } => with_files(pile, branch, |repo, ws| {
+            cmd_add(repo, ws, &path, mime.as_deref(), &tag, dry_run)
+        }),
+        Command::List { tag, mime } => with_files(pile, branch, |_repo, ws| {
+            cmd_list(ws, &tag, mime.as_deref())
+        }),
+        Command::Show { id } => with_files(pile, branch, |_repo, ws| cmd_show(ws, &id)),
+        Command::Get { id, output } => with_files(pile, branch, |_repo, ws| {
+            cmd_get(ws, &id, output.as_deref())
+        }),
         Command::Tag { id, name } => {
             with_files(pile, branch, |repo, ws| cmd_tag(repo, ws, &id, &name))
         }
-        Command::Fetch { url, mime, name, tag, max_bytes } => {
-            with_files(pile, branch, |repo, ws| {
-                cmd_fetch(repo, ws, &url, mime.as_deref(), name.as_deref(), &tag, max_bytes)
-            })
-        }
-        Command::Search { query } => {
-            with_files(pile, branch, |_repo, ws| cmd_search(ws, &query))
-        }
-        Command::Similar { id, text, floor, limit, tag, mm7b } => {
-            with_files(pile, branch, |_repo, ws| {
-                cmd_similar(ws, id.as_deref(), text.as_deref(), floor, limit, &tag, mm7b)
-            })
-        }
-        Command::Embed7b { force, pdf, dpi, limit, max_pages } => {
-            with_files(pile, branch, |repo, ws| {
-                if pdf {
-                    cmd_embed7b_pdf(repo, ws, force, dpi, limit, max_pages)
-                } else {
-                    cmd_embed7b(repo, ws, force)
-                }
-            })
-        }
-        Command::Imports => {
-            with_files(pile, branch, |_repo, ws| cmd_imports(ws))
-        }
+        Command::Fetch {
+            url,
+            mime,
+            name,
+            tag,
+            max_bytes,
+        } => with_files(pile, branch, |repo, ws| {
+            cmd_fetch(
+                repo,
+                ws,
+                &url,
+                mime.as_deref(),
+                name.as_deref(),
+                &tag,
+                max_bytes,
+            )
+        }),
+        Command::Search { query } => with_files(pile, branch, |_repo, ws| cmd_search(ws, &query)),
+        Command::Similar {
+            id,
+            text,
+            floor,
+            limit,
+            tag,
+            mm7b,
+        } => with_files(pile, branch, |_repo, ws| {
+            cmd_similar(ws, id.as_deref(), text.as_deref(), floor, limit, &tag, mm7b)
+        }),
+        Command::Embed7b {
+            force,
+            pdf,
+            dpi,
+            limit,
+            max_pages,
+        } => with_files(pile, branch, |repo, ws| {
+            if pdf {
+                cmd_embed7b_pdf(repo, ws, force, dpi, limit, max_pages)
+            } else {
+                cmd_embed7b(repo, ws, force)
+            }
+        }),
+        Command::Imports => with_files(pile, branch, |_repo, ws| cmd_imports(ws)),
         Command::Tree { id, depth } => {
             with_files(pile, branch, |_repo, ws| cmd_tree(ws, &id, depth))
         }
-        Command::Resolve { input } => {
-            with_files(pile, branch, |_repo, ws| cmd_resolve(ws, &input))
-        }
+        Command::Resolve { input } => with_files(pile, branch, |_repo, ws| cmd_resolve(ws, &input)),
         Command::Diff { left, right } => {
             with_files(pile, branch, |_repo, ws| cmd_diff(ws, &left, &right))
         }
     }
 }
-

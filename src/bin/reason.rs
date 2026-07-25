@@ -1,8 +1,7 @@
-
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::reason::{DEFAULT_BRANCH, KIND_REASON_ID, reason_schema};
+use faculties::schemas::reason::{reason_schema, DEFAULT_BRANCH, KIND_REASON_ID};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
@@ -34,7 +33,10 @@ struct Cli {
     #[arg(long)]
     worker_id: Option<String>,
     /// Free-form reasoning text.
-    #[arg(value_name = "TEXT", help = "Free-form reasoning text. Use @path for file input or @- for stdin.")]
+    #[arg(
+        value_name = "TEXT",
+        help = "Free-form reasoning text. Use @path for file input or @- for stdin."
+    )]
     text: Option<String>,
     /// Optional command to run after logging the reason (pass after `--`).
     #[arg(
@@ -69,8 +71,7 @@ fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(match err {
@@ -88,10 +89,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile>> {
         .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(
-    pile: &Path,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
@@ -110,12 +108,10 @@ fn resolve_branch_id(
     branch_name: &str,
 ) -> Result<Id> {
     if let Some(hex) = explicit_hex {
-        return Id::from_hex(hex.trim())
-            .ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
+        return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
     }
     if let Ok(hex) = std::env::var("TRIBLESPACE_BRANCH_ID") {
-        return Id::from_hex(hex.trim())
-            .ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID"));
+        return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID"));
     }
     repo.ensure_branch(branch_name, None)
         .map_err(|e| anyhow!("ensure {branch_name} branch: {e:?}"))
@@ -154,12 +150,9 @@ fn append_reason(
 }
 
 fn shell_quote(word: &str) -> String {
-    if word
-        .chars()
-        .all(|ch| {
-            ch.is_ascii_alphanumeric() || std::matches!(ch, '_' | '-' | '.' | '/' | ':' | '=')
-        })
-    {
+    if word.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || std::matches!(ch, '_' | '-' | '.' | '/' | ':' | '=')
+    }) {
         return word.to_string();
     }
     format!("'{}'", word.replace('\'', "'\\''"))
@@ -203,36 +196,25 @@ fn main() -> Result<()> {
         resolve_branch_id(repo, cli.branch_id.as_deref(), &cli.branch)
     })?;
 
-    let turn_id = parse_optional_hex_id(cli.turn_id.as_deref().or(env_turn_id.as_deref()), "turn id")?;
-    let worker_id =
-        parse_optional_hex_id(cli.worker_id.as_deref().or(env_worker_id.as_deref()), "worker id")?;
+    let turn_id =
+        parse_optional_hex_id(cli.turn_id.as_deref().or(env_turn_id.as_deref()), "turn id")?;
+    let worker_id = parse_optional_hex_id(
+        cli.worker_id.as_deref().or(env_worker_id.as_deref()),
+        "worker id",
+    )?;
 
     if text.trim().is_empty() {
         bail!("reason text is empty");
     }
 
     if cli.command.is_empty() {
-        let reason_id = append_reason(
-            &pile_path,
-            branch_id,
-            turn_id,
-            worker_id,
-            &text,
-            None,
-        )?;
+        let reason_id = append_reason(&pile_path, branch_id, turn_id, worker_id, &text, None)?;
         println!("reason_id: {reason_id:x}");
         return Ok(());
     }
 
     let command_text = render_command(&cli.command);
-    let reason_id = append_reason(
-        &pile_path,
-        branch_id,
-        turn_id,
-        worker_id,
-        &text,
-        None,
-    )?;
+    let reason_id = append_reason(&pile_path, branch_id, turn_id, worker_id, &text, None)?;
     let action_event_id = append_reason(
         &pile_path,
         branch_id,

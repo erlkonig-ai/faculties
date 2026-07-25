@@ -93,7 +93,10 @@ impl TryFromBlob<Embedding768> for View<[f32]> {
     fn try_from_blob(b: Blob<Embedding768>) -> Result<Self, Self::Error> {
         let floats = b.bytes.len() / 4;
         if floats != DIM {
-            return Err(EmbeddingDimError::WrongLen { expected: DIM, got: floats });
+            return Err(EmbeddingDimError::WrongLen {
+                expected: DIM,
+                got: floats,
+            });
         }
         b.bytes.view().map_err(EmbeddingDimError::View)
     }
@@ -161,7 +164,10 @@ impl TryFromBlob<Embedding3584> for View<[f32]> {
     fn try_from_blob(b: Blob<Embedding3584>) -> Result<Self, Self::Error> {
         let floats = b.bytes.len() / 4;
         if floats != DIM_3584 {
-            return Err(EmbeddingDimError::WrongLen { expected: DIM_3584, got: floats });
+            return Err(EmbeddingDimError::WrongLen {
+                expected: DIM_3584,
+                got: floats,
+            });
         }
         b.bytes.view().map_err(EmbeddingDimError::View)
     }
@@ -201,7 +207,11 @@ pub mod attr_mm7b {
 /// space. Self-match and any domain filtering are the caller's job. No
 /// pile/workspace dependency, so it's unit-testable with synthetic vectors and
 /// shared by every faculty that searches the space (files, memory, …).
-pub fn nearest(pairs: &[(Id, Vec<f32>)], query: &[f32], floor: f32) -> anyhow::Result<Vec<(f32, Id)>> {
+pub fn nearest(
+    pairs: &[(Id, Vec<f32>)],
+    query: &[f32],
+    floor: f32,
+) -> anyhow::Result<Vec<(f32, Id)>> {
     type LocalHandle = Inline<inlineencodings::Handle<Embedding>>;
     if pairs.is_empty() {
         return Ok(Vec::new());
@@ -574,7 +584,13 @@ mod tests {
         let blob = <Embedding768 as Encodes<Vec<f32>>>::encode(wrong);
         let err = <View<[f32]> as TryFromBlob<Embedding768>>::try_from_blob(blob);
         assert!(
-            matches!(err, Err(EmbeddingDimError::WrongLen { expected: 768, got: 512 })),
+            matches!(
+                err,
+                Err(EmbeddingDimError::WrongLen {
+                    expected: 768,
+                    got: 512
+                })
+            ),
             "wrong dimension is rejected on read"
         );
     }
@@ -593,7 +609,13 @@ mod tests {
         let blob = <Embedding3584 as Encodes<Vec<f32>>>::encode(wrong);
         let err = <View<[f32]> as TryFromBlob<Embedding3584>>::try_from_blob(blob);
         assert!(
-            matches!(err, Err(EmbeddingDimError::WrongLen { expected: 3584, got: 768 })),
+            matches!(
+                err,
+                Err(EmbeddingDimError::WrongLen {
+                    expected: 3584,
+                    got: 768
+                })
+            ),
             "wrong dimension is rejected on read"
         );
     }
@@ -626,7 +648,10 @@ mod tests {
 
         // floor excludes the orthogonal vector b (cosine 0) but keeps a and c.
         let high = nearest(&pairs, &query, 0.5).unwrap();
-        assert!(high.iter().all(|(_, id)| *id != b), "floor drops orthogonal b");
+        assert!(
+            high.iter().all(|(_, id)| *id != b),
+            "floor drops orthogonal b"
+        );
         assert!(high.iter().any(|(_, id)| *id == a), "floor keeps near a");
     }
 

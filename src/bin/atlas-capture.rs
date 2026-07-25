@@ -20,11 +20,7 @@ fn resolve_pile_path() -> PathBuf {
     }
     std::env::var("PILE")
         .ok()
-        .or_else(|| {
-            std::env::args()
-                .skip(1)
-                .find(|a| !a.starts_with("--"))
-        })
+        .or_else(|| std::env::args().skip(1).find(|a| !a.starts_with("--")))
         .unwrap_or_else(|| "./self.pile".to_owned())
         .into()
 }
@@ -39,7 +35,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("atlas", AtlasViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("atlas") else { return };
+        let Some(mut ws) = st.workspace("atlas") else {
+            return;
+        };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });

@@ -101,13 +101,11 @@ fn person_color(id: Id) -> egui::Color32 {
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t).round().clamp(0.0, 255.0) as u8
+        ((x as f32) * (1.0 - t) + (y as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    egui::Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Time helpers ─────────────────────────────────────────────────────
@@ -126,9 +124,7 @@ fn current_week_monday() -> NaiveDate {
 
 fn is_all_day(start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
     let dur = (end - start).num_seconds();
-    start.time() == NaiveTime::from_hms_opt(0, 0, 0).unwrap()
-        && dur > 0
-        && dur % 86_400 == 0
+    start.time() == NaiveTime::from_hms_opt(0, 0, 0).unwrap() && dur > 0 && dur % 86_400 == 0
 }
 
 fn format_day_header(date: NaiveDate) -> String {
@@ -248,10 +244,7 @@ struct PlannerLive {
 }
 
 impl PlannerLive {
-    fn refresh(
-        ws: &mut Workspace<Pile>,
-        relations_ws: Option<&mut Workspace<Pile>>,
-    ) -> Self {
+    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
         let space = ws
             .checkout(..)
             .map(|co| co.into_facts())
@@ -413,8 +406,10 @@ fn build_people(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, Pe
     .map(|(pid,)| pid)
     .collect();
 
-    let mut people: HashMap<Id, Person> =
-        person_ids.into_iter().map(|p| (p, Person::default())).collect();
+    let mut people: HashMap<Id, Person> = person_ids
+        .into_iter()
+        .map(|p| (p, Person::default()))
+        .collect();
 
     for (pid, alias) in find!(
         (p: Id, a: String),
@@ -603,20 +598,13 @@ const HOUR_END: u32 = 22;
 const PX_PER_HOUR: f32 = 18.0;
 const HOUR_LABEL_WIDTH: f32 = 36.0;
 
-fn render_week_grid(
-    ui: &mut egui::Ui,
-    live: &PlannerLive,
-    monday: NaiveDate,
-    today: NaiveDate,
-) {
+fn render_week_grid(ui: &mut egui::Ui, live: &PlannerLive, monday: NaiveDate, today: NaiveDate) {
     let width = ui.available_width();
     let hours_visible = (HOUR_END - HOUR_START) as f32;
     let grid_height = DAY_HEADER_HEIGHT + ALL_DAY_HEIGHT + hours_visible * PX_PER_HOUR;
 
-    let (rect, _resp) = ui.allocate_exact_size(
-        egui::vec2(width, grid_height),
-        egui::Sense::hover(),
-    );
+    let (rect, _resp) =
+        ui.allocate_exact_size(egui::vec2(width, grid_height), egui::Sense::hover());
 
     let painter = ui.painter().clone();
     let bubble_fill = ui.visuals().window_fill;
@@ -778,14 +766,10 @@ fn render_week_grid(
             );
             paint_event_block(&painter, block_rect, event, true);
         } else {
-            let start_hour_f =
-                event.start.hour() as f32 + (event.start.minute() as f32) / 60.0;
-            let end_hour_f =
-                event.end.hour() as f32 + (event.end.minute() as f32) / 60.0;
-            let top_y = hour_grid_top
-                + (start_hour_f - HOUR_START as f32) * PX_PER_HOUR;
-            let bot_y = hour_grid_top
-                + (end_hour_f - HOUR_START as f32) * PX_PER_HOUR;
+            let start_hour_f = event.start.hour() as f32 + (event.start.minute() as f32) / 60.0;
+            let end_hour_f = event.end.hour() as f32 + (event.end.minute() as f32) / 60.0;
+            let top_y = hour_grid_top + (start_hour_f - HOUR_START as f32) * PX_PER_HOUR;
+            let bot_y = hour_grid_top + (end_hour_f - HOUR_START as f32) * PX_PER_HOUR;
             let top_y = top_y.max(hour_grid_top);
             // Enforce a minimum 14-pt block height so very short
             // events don't render as invisible slivers.
@@ -877,8 +861,13 @@ fn paint_event_block(
 
     if is_all_day_block || rect.height() < 28.0 {
         // Single line: just summary (truncated to width).
-        let galley =
-            ellipsized_galley(painter, &event.summary, &summary_font, text_color, text_rect.width());
+        let galley = ellipsized_galley(
+            painter,
+            &event.summary,
+            &summary_font,
+            text_color,
+            text_rect.width(),
+        );
         painter.galley(text_rect.min, galley, text_color);
     } else {
         // Two lines: time on top, summary below.
@@ -889,8 +878,13 @@ fn paint_event_block(
             mono_font,
             text_color,
         );
-        let galley =
-            ellipsized_galley(painter, &event.summary, &summary_font, text_color, text_rect.width());
+        let galley = ellipsized_galley(
+            painter,
+            &event.summary,
+            &summary_font,
+            text_color,
+            text_rect.width(),
+        );
         painter.galley(
             egui::pos2(text_rect.min.x, text_rect.min.y + 11.0),
             galley,
@@ -903,11 +897,7 @@ fn paint_event_block(
 /// are 4 px apart so the pattern reads at the small block sizes the
 /// week grid uses. Clipped to the rect so the painter doesn't bleed
 /// over the gridlines.
-fn paint_diagonal_hatch(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    stripe_color: egui::Color32,
-) {
+fn paint_diagonal_hatch(painter: &egui::Painter, rect: egui::Rect, stripe_color: egui::Color32) {
     let stripe = egui::Stroke::new(1.0, stripe_color);
     let step = 5.0;
     // Sweep diagonals from x = rect.left - rect.height (so they
@@ -946,8 +936,7 @@ fn ellipsized_galley(
     let char_count = text.chars().count().max(1);
     let approx_char_width = galley.size().x / char_count as f32;
     let max_chars = ((max_width / approx_char_width) - 1.0).max(1.0) as usize;
-    let truncated: String =
-        text.chars().take(max_chars).collect::<String>() + "…";
+    let truncated: String = text.chars().take(max_chars).collect::<String>() + "…";
     painter.layout_no_wrap(truncated, font.clone(), color)
 }
 
@@ -1088,8 +1077,7 @@ fn render_event_card(ui: &mut egui::Ui, event: &EventRow, live: &PlannerLive) {
                         if event.organizer.is_some() || !event.attendees.is_empty() {
                             ui.add_space(2.0);
                             ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing =
-                                    egui::vec2(4.0, 4.0);
+                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                                 if let Some(org) = event.organizer {
                                     render_attendee_chip(
                                         ui,
@@ -1136,10 +1124,7 @@ fn render_day_section_header(ui: &mut egui::Ui, label: &str, is_today: bool) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(3.0, 14.0),
-            egui::Sense::hover(),
-        );
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::ZERO, strip_color);
         let text_color = if is_today {
@@ -1158,12 +1143,7 @@ fn render_day_section_header(ui: &mut egui::Ui, label: &str, is_today: bool) {
     ui.add_space(2.0);
 }
 
-fn render_attendee_chip(
-    ui: &mut egui::Ui,
-    label: &str,
-    fill: egui::Color32,
-    is_organizer: bool,
-) {
+fn render_attendee_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32, is_organizer: bool) {
     let text = colorhash::text_color_on(fill);
     let display = if is_organizer {
         format!("\u{25CE} {label}") // ◎ = organizer marker

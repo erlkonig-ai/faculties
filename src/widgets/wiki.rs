@@ -27,19 +27,19 @@ use std::collections::{BTreeMap, HashSet};
 
 use cubecl::prelude::*;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-use GORBIE::prelude::CardCtx;
-use GORBIE::themes::colorhash;
 use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::{Blake3, Handle};
+use triblespace::core::inline::{Inline, TryToInline};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
-use triblespace::core::inline::encodings::hash::{Blake3, Handle};
-use triblespace::core::inline::{TryToInline, Inline};
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::{RawBytes, LongString};
+use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::View;
+use GORBIE::prelude::CardCtx;
+use GORBIE::themes::colorhash;
 
 use crate::schemas::files::{file, KIND_FILE};
 use crate::schemas::wiki::{attrs as wiki, KIND_VERSION_ID, TAG_ARCHIVED_ID};
@@ -77,10 +77,7 @@ struct WikiLive {
 impl WikiLive {
     /// Refresh cached fact spaces from the provided workspaces. Pulls
     /// fresh `TribleSet`s via `checkout(..)`.
-    fn refresh(
-        wiki_ws: &mut Workspace<Pile>,
-        files_ws: Option<&mut Workspace<Pile>>,
-    ) -> Self {
+    fn refresh(wiki_ws: &mut Workspace<Pile>, files_ws: Option<&mut Workspace<Pile>>) -> Self {
         let wiki_space = wiki_ws
             .checkout(..)
             .map(|co| co.into_facts())
@@ -122,11 +119,7 @@ impl WikiLive {
             .unwrap_or_default()
     }
 
-    fn file_text(
-        &self,
-        files_ws: Option<&mut Workspace<Pile>>,
-        h: TextHandle,
-    ) -> String {
+    fn file_text(&self, files_ws: Option<&mut Workspace<Pile>>, h: TextHandle) -> String {
         files_ws
             .and_then(|ws| ws.get::<View<str>, LongString>(h).ok())
             .map(|v| {
@@ -666,9 +659,7 @@ impl WikiGraph {
             }
         }
         if unresolved > 0 {
-            eprintln!(
-                "[wiki] graph: {unresolved} link targets could not be resolved to fragments"
-            );
+            eprintln!("[wiki] graph: {unresolved} link targets could not be resolved to fragments");
         }
 
         // Compute per-node degree for size scaling in the render pass.
@@ -706,8 +697,7 @@ impl WikiGraph {
         // Per-node degree for the symmetric attraction weight. Base of
         // 1.0 (matches the old `degree` starting value) keeps isolated
         // nodes at deg=1 and avoids a divide-by-zero in sqrt(deg*deg).
-        let degrees_flat: Vec<f32> =
-            nodes.iter().map(|nd| 1.0 + nd.degree as f32).collect();
+        let degrees_flat: Vec<f32> = nodes.iter().map(|nd| 1.0 + nd.degree as f32).collect();
 
         let pos_handle = client.create_from_slice(f32::as_bytes(&pos_flat));
         let vel_handle = client.create_from_slice(f32::as_bytes(&vel_flat));
@@ -793,7 +783,11 @@ impl WikiGraph {
             angular += dx * vy - dy * vx; // cross product = angular contribution
             inertia += r_sq;
         }
-        let omega = if inertia > 1.0 { angular / inertia } else { 0.0 };
+        let omega = if inertia > 1.0 {
+            angular / inertia
+        } else {
+            0.0
+        };
 
         // Read back velocities up-front so we can compute the mean
         // (= the system's linear momentum / mass) alongside the
@@ -984,10 +978,8 @@ impl WikiGraph {
         // versions hit a `hit_test.rs:365` panic with click_and_drag
         // adjacent to clickers; the upstream fix in 0.34.x lets us
         // use the proper sense again.
-        let (response, painter) = ui.allocate_painter(
-            egui::vec2(available.x, h),
-            egui::Sense::click_and_drag(),
-        );
+        let (response, painter) =
+            ui.allocate_painter(egui::vec2(available.x, h), egui::Sense::click_and_drag());
         let rect = response.rect;
         let center = rect.center();
 
@@ -1082,8 +1074,7 @@ impl WikiGraph {
             }
             match &self.polylines {
                 Some(polys) => {
-                    let pts: Vec<egui::Pos2> =
-                        polys[e_idx].iter().map(|&p| to_screen(p)).collect();
+                    let pts: Vec<egui::Pos2> = polys[e_idx].iter().map(|&p| to_screen(p)).collect();
                     painter.add(egui::Shape::line(pts, edge_stroke));
                 }
                 None => {
@@ -1110,8 +1101,8 @@ impl WikiGraph {
             // counter. We use `frag_id.with("graph_node")` as the
             // match id to avoid colliding with text-level matches for
             // the same fragment (e.g. wiki:id in a meta row).
-            let is_match = !needle_lower.is_empty()
-                && node.label.to_lowercase().contains(&needle_lower);
+            let is_match =
+                !needle_lower.is_empty() && node.label.to_lowercase().contains(&needle_lower);
             let _match_info = if is_match {
                 let frag_bytes: &[u8] = node.frag_id.as_ref();
                 let id = egui::Id::new(("wiki_graph_node", frag_bytes));
@@ -1141,15 +1132,11 @@ impl WikiGraph {
                 // instead — keeps labels on-screen and reduces the
                 // "labels all pile up at the right edge" look on
                 // dense graphs.
-                let galley = painter.layout_no_wrap(
-                    node.label.clone(),
-                    font_id.clone(),
-                    label_color,
-                );
+                let galley =
+                    painter.layout_no_wrap(node.label.clone(), font_id.clone(), label_color);
                 let right_anchor = pos + egui::vec2(r + 4.0, 0.0);
-                let right_rect = egui::Align2::LEFT_CENTER.anchor_rect(
-                    egui::Rect::from_min_size(right_anchor, galley.size()),
-                );
+                let right_rect = egui::Align2::LEFT_CENTER
+                    .anchor_rect(egui::Rect::from_min_size(right_anchor, galley.size()));
                 let label_rect = if right_rect.right() <= rect.right() - 2.0 {
                     right_rect
                 } else {
@@ -1158,15 +1145,10 @@ impl WikiGraph {
                     // `rect.min`; passing `left_anchor` directly puts
                     // the label's right edge just left of the node.
                     let left_anchor = pos - egui::vec2(r + 4.0, 0.0);
-                    egui::Align2::RIGHT_CENTER.anchor_rect(
-                        egui::Rect::from_min_size(left_anchor, galley.size()),
-                    )
+                    egui::Align2::RIGHT_CENTER
+                        .anchor_rect(egui::Rect::from_min_size(left_anchor, galley.size()))
                 };
-                painter.rect_filled(
-                    label_rect.expand2(egui::vec2(3.0, 1.0)),
-                    2.0,
-                    label_bg,
-                );
+                painter.rect_filled(label_rect.expand2(egui::vec2(3.0, 1.0)), 2.0, label_bg);
                 painter.galley(label_rect.min, galley, label_color);
             }
 
@@ -1197,16 +1179,11 @@ impl WikiGraph {
             let top = rect.top() + 6.0;
             let right = rect.right() - 8.0;
             let gap = 12.0;
-            let hint_galley =
-                painter.layout_no_wrap(hint_label.to_string(), hint_font, hint_color);
-            let meta_galley =
-                painter.layout_no_wrap(meta_label, meta_font, meta_color);
+            let hint_galley = painter.layout_no_wrap(hint_label.to_string(), hint_font, hint_color);
+            let meta_galley = painter.layout_no_wrap(meta_label, meta_font, meta_color);
             let hint_pos = egui::pos2(right - hint_galley.size().x, top);
             painter.galley(hint_pos, hint_galley, hint_color);
-            let meta_pos = egui::pos2(
-                hint_pos.x - gap - meta_galley.size().x,
-                top,
-            );
+            let meta_pos = egui::pos2(hint_pos.x - gap - meta_galley.size().x, top);
             painter.galley(meta_pos, meta_galley, meta_color);
         }
 

@@ -34,9 +34,7 @@ fn main(nb: &mut NotebookCtx) {
     nb.view(|ctx| {
         ctx.grid(|g| {
             g.full(|ctx| {
-                ctx.markdown(
-                    "# Branch Timeline\nPan/zoom time axis of commits on a pile branch.",
-                );
+                ctx.markdown("# Branch Timeline\nPan/zoom time axis of commits on a pile branch.");
             });
         });
     });

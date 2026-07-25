@@ -88,10 +88,7 @@ struct StatusLive {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl StatusLive {
-    fn refresh(
-        ws: &mut Workspace<Pile>,
-        relations_ws: Option<&mut Workspace<Pile>>,
-    ) -> Self {
+    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
         let space = ws
             .checkout(..)
             .map(|co| co.into_facts())
@@ -332,7 +329,9 @@ impl StatusViewer {
         }
 
         ctx.section("Status", |ctx| {
-            let Some(live) = self.live.as_ref() else { return };
+            let Some(live) = self.live.as_ref() else {
+                return;
+            };
             let now = now_tai_ns();
 
             ctx.grid(|g| {
@@ -414,7 +413,8 @@ fn render_status_row(ui: &mut egui::Ui, w: &WindowStatus, now: i128) {
         ui.spacing_mut().item_spacing.x = 6.0;
         // Decorative identity dot (NOT the handle — the name is).
         let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-        ui.painter().rect_filled(dot, egui::CornerRadius::ZERO, accent);
+        ui.painter()
+            .rect_filled(dot, egui::CornerRadius::ZERO, accent);
         ui.label(
             egui::RichText::new(&w.name)
                 .monospace()
@@ -423,17 +423,14 @@ fn render_status_row(ui: &mut egui::Ui, w: &WindowStatus, now: i128) {
                 .color(ui.visuals().text_color()),
         );
         // Age, right-aligned.
-        ui.with_layout(
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                ui.label(
-                    egui::RichText::new(age_label(now, w.at_ns))
-                        .monospace()
-                        .small()
-                        .color(muted),
-                );
-            },
-        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(age_label(now, w.at_ns))
+                    .monospace()
+                    .small()
+                    .color(muted),
+            );
+        });
     });
 
     // Status text, indented under the name. Must WRAP to the row
@@ -464,9 +461,6 @@ fn render_status_row(ui: &mut egui::Ui, w: &WindowStatus, now: i128) {
     ui.add_space(4.0);
     let sep_y = ui.cursor().min.y;
     let x = ui.min_rect().x_range();
-    ui.painter().hline(
-        x,
-        sep_y,
-        egui::Stroke::new(1.0, color_frame(ui)),
-    );
+    ui.painter()
+        .hline(x, sep_y, egui::Stroke::new(1.0, color_frame(ui)));
 }
