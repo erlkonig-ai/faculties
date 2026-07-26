@@ -142,7 +142,8 @@ pub mod content_fact {
         /// IDENTITY-CORE (when bytes not held). The asset *reference* — "an
         /// image was here" — is itself the content-fact until bytes arrive.
         "91FB71A7D25EC34E208DA622DD680481" as pub asset_pointer: Handle<LongString>;
-        /// IDENTITY-CORE (with `asset_pointer`). Claimed media type.
+        /// IDENTITY-CORE (when known). Media type — accompanies `blob` (decoded
+        /// inline media) as well as `asset_pointer` (claimed by the reference).
         "FBDE96ECC5E3CC4D8E96A59AB372C72D" as pub asset_mime: ShortString;
         /// IDENTITY-CORE (with `asset_pointer`). Claimed byte size.
         "2CF092F132FA9110BA10B1B1482831DB" as pub asset_size: U256BE;
