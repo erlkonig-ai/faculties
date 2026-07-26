@@ -78,6 +78,7 @@ mod common {
     use triblespace_gpu::WgpuWaveletFreeze;
 
     pub use faculties::schemas::archive::{self as archive_schema, archive, import_schema};
+    pub use faculties::schemas::blockdag::{block, content_fact};
     pub use faculties::schemas::memory::comb;
 
     pub type Repo = Repository<Pile>;
@@ -137,6 +138,81 @@ mod common {
 
     fn acquire_or_force(id: Id) -> ExclusiveId {
         id.acquire().unwrap_or_else(|| ExclusiveId::force(id))
+    }
+
+    /// Parse `paths` in parallel and hand each result to `consume` AS IT
+    /// ARRIVES, never holding more than `in_flight` parsed files at once.
+    ///
+    /// `parse_paths_parallel` collects every parsed file into one `Vec` before
+    /// the caller sees any of them, so peak memory scales with the CORPUS, not
+    /// with the work in progress. On 2026-07-26 a cold import of ~/.claude
+    /// (3205 files, 6.8 GB of JSON, one file 2.0 GB) reached 57.9 GB resident
+    /// and drove the machine into hard swapping — all before the first commit
+    /// was written.
+    ///
+    /// Here rayon parses into a BOUNDED channel: when the sequential consumer
+    /// falls behind, `send` blocks and the parser threads idle. That is
+    /// backpressure rather than batching, so there are no batch-boundary
+    /// stalls — parsing continues while the consumer commits, and peak memory
+    /// is `in_flight + threads` parsed files regardless of corpus size.
+    ///
+    /// The consumer stays sequential because committing needs `&mut Workspace`.
+    pub fn parse_paths_streaming<T, F, C>(
+        label: &str,
+        paths: &[PathBuf],
+        in_flight: usize,
+        parse_one: F,
+        mut consume: C,
+    ) -> Result<()>
+    where
+        T: Send,
+        F: Fn(&Path) -> Result<T> + Send + Sync,
+        C: FnMut(usize, PathBuf, Result<T>) -> Result<()>,
+    {
+        let _span = info_span!("streaming_parse", label = label, files = paths.len()).entered();
+        let total_files = paths.len();
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let parser_pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .with_context(|| format!("build {label} parser thread pool"))?;
+        let parse_start = std::time::Instant::now();
+        println!(
+            "{label} phase parse: {total_files} file(s) using {threads} thread(s), \
+             at most {in_flight} in flight"
+        );
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(PathBuf, Result<T>)>(in_flight.max(1));
+        let parse_ref = &parse_one;
+        std::thread::scope(|scope| -> Result<()> {
+            scope.spawn(move || {
+                parser_pool.install(|| {
+                    paths.par_iter().for_each(|path| {
+                        let _file_span = info_span!(
+                            "parse_file",
+                            label = label,
+                            path = %path.display()
+                        )
+                        .entered();
+                        let parsed = parse_ref(path.as_path());
+                        // A closed receiver means the consumer errored out; stop quietly.
+                        let _ = tx.send((path.to_path_buf(), parsed));
+                    });
+                });
+            });
+            // Sequential consumer: owns &mut Workspace, so commits stay ordered.
+            let mut index = 0usize;
+            while let Ok((path, parsed)) = rx.recv() {
+                consume(index, path, parsed)?;
+                index += 1;
+            }
+            Ok(())
+        })?;
+
+        println!("{label} phase parse: done in {:?}", parse_start.elapsed());
+        Ok(())
     }
 
     pub fn parse_paths_parallel<T, F>(
