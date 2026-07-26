@@ -15,13 +15,17 @@
 //! import reached 57.9 GB resident, 2026-07-26).
 //!
 //! Phase 1 delivered the core block/content-fact projection with a strict
-//! two-pass `entity!` discipline. Phase 2 (this file) adds the
-//! tool-correlator → [`content_fact::responds_to`] edge, image/media
-//! content-facts (inline base64 → [`content_fact::blob`], other sources →
-//! the keep-the-pointer branch of the resolution law), and the
-//! `author`/`experiencer` roster links via [`RosterIndex`]. Cross-file
-//! `previous` edges remain unresolved BY DESIGN — they are counted and
-//! logged instead (see the analysis at the `previous` resolution site in
+//! two-pass `entity!` discipline. Phase 2 added the tool-correlator →
+//! [`content_fact::responds_to`] edge, image/media content-facts (inline
+//! base64 → [`content_fact::blob`], other sources → the keep-the-pointer
+//! branch of the resolution law), and the `author`/`experiencer` roster
+//! links via [`RosterIndex`]. Phase 3 (this file) resolves cross-file
+//! `previous` edges deterministically: a cheap parallel PRE-SCAN reads only
+//! `uuid`/`parentUuid` per line, [`compute_waves`] partitions the corpus
+//! into dependency-ordered waves from that pre-scan alone, and each wave
+//! projects in parallel against a read-only [`UuidSnapshot`] of everything
+//! earlier waves defined — so block ids never depend on scheduling (see the
+//! determinism argument at the `previous` resolution site in
 //! [`project_record`]).
 
 use std::collections::{HashMap, HashSet};
@@ -49,6 +53,12 @@ struct ImportStats {
     content_facts: usize,
     commits: usize,
     resolution: ProjectionStats,
+    /// Files projected per dependency-ordered wave (directory imports only;
+    /// empty for a single-file import).
+    wave_files: Vec<usize>,
+    /// Files whose external refs never became resolvable (truly dangling or
+    /// cyclic) — projected in the final pass after all waves.
+    final_pass_files: usize,
 }
 
 /// Reference-resolution counters for one projection (per file, then summed).
@@ -58,13 +68,18 @@ struct ProjectionStats {
     /// `tool_result` correlators with no preceding `tool_use` in the same
     /// file — the `responds_to` edge is dropped.
     dangling_correlators: usize,
-    /// `parentUuid`s naming no line in this file at all (cross-file or
-    /// out-of-order) — the `previous` edge is dropped; see the cross-file
-    /// analysis at the resolution site in [`project_record`].
+    /// `parentUuid`s that resolved nowhere — neither in this file nor in the
+    /// wave snapshot. After phase 3 this means the uuid is defined in no file
+    /// at all (truly dangling) or only inside a mutual-reference cycle
+    /// projected in the final pass; the `previous` edge is dropped.
     cross_file_parents: usize,
-    /// `parentUuid`s naming a non-dialogue line (system/progress/…) in this
-    /// file — the parent projects no block, so the edge has no target.
+    /// `parentUuid`s naming a non-dialogue line (system/progress/…) — in this
+    /// file or, via the wave snapshot, in an earlier wave's file — the parent
+    /// projects no block, so the edge has no target.
     skipped_parents: usize,
+    /// Cross-file `previous` edges resolved through the wave snapshot
+    /// (phase 3). A success counter, not a gap — excluded from [`Self::total`].
+    cross_file_resolved: usize,
     /// Image sources that could not be projected (bad base64, missing data
     /// or pointer).
     undecodable_images: usize,
@@ -77,6 +92,7 @@ impl ProjectionStats {
         self.dangling_correlators += other.dangling_correlators;
         self.cross_file_parents += other.cross_file_parents;
         self.skipped_parents += other.skipped_parents;
+        self.cross_file_resolved += other.cross_file_resolved;
         self.undecodable_images += other.undecodable_images;
         self.invariant_breaches += other.invariant_breaches;
     }
@@ -90,10 +106,18 @@ impl ProjectionStats {
     }
 }
 
-/// One projected file: its self-contained fragment plus resolution counters.
+/// One projected file: its self-contained fragment, resolution counters, and
+/// the uuid exports the wave scheduler merges into the global
+/// [`UuidSnapshot`] after the file's wave completes.
 struct Projected {
     fragment: Fragment,
     stats: ProjectionStats,
+    /// Every dialogue-line uuid this file defined → its block id.
+    uuid_to_block: HashMap<String, Id>,
+    /// Every non-dialogue (system/progress/…) uuid this file defined — a
+    /// cross-file `parentUuid` into one of these classifies as
+    /// skipped-parent, not dangling.
+    skipped_uuids: HashSet<String>,
 }
 
 /// Label → participant-entity index over a `relations` roster snapshot.
@@ -181,24 +205,130 @@ fn import_claude_code_path(
             path.display(),
             scan_start.elapsed()
         );
-        let mut total = ImportStats::default();
-        let total_files = paths.len();
-        // Bounded in-flight parses. `parse_paths_streaming` runs the whole
-        // per-file projection (scan + `entity!`) on the parser threads and
-        // hands each finished `Fragment` to the sequential committer as it
-        // arrives, never holding more than PARSE_IN_FLIGHT projected files at
-        // once. Kept small deliberately — a single transcript can be 2 GB.
-        const PARSE_IN_FLIGHT: usize = 4;
-        common::parse_paths_streaming(
-            "claude-code",
+        return import_directory_waves(
             &paths,
+            roster,
+            repo,
+            &mut ws,
+            &mut catalog,
+            &mut catalog_head,
+        );
+    }
+
+    let parse_start = Instant::now();
+    println!("claude-code phase parse: {}", path.display());
+    let projected = parse_jsonl(path, roster, None)?;
+    println!(
+        "claude-code phase parse: projected {} trible(s) in {:?}",
+        projected.fragment.facts().len(),
+        parse_start.elapsed()
+    );
+    let Projected {
+        fragment,
+        stats: resolution,
+        ..
+    } = projected;
+    import_claude_code_records(
+        path,
+        fragment,
+        resolution,
+        repo,
+        &mut ws,
+        &mut catalog,
+        &mut catalog_head,
+    )
+}
+
+/// Directory import via the phase-3 WAVE-FIXPOINT scheduler — the
+/// dependency-ordered projection the phase-2 analysis called for.
+///
+/// 1. PRE-SCAN (parallel, cheap): every file yields its defined uuids and
+///    external refs ([`prescan_file`]).
+/// 2. [`compute_waves`] partitions the corpus into waves from the pre-scan
+///    alone; wave 1 = files with no external refs.
+/// 3. Each wave projects in parallel through the existing bounded-backpressure
+///    machinery ([`common::parse_paths_streaming`]) against a READ-ONLY
+///    [`UuidSnapshot`] frozen for the whole wave; the sequential committer
+///    commits each file as its projection arrives, exactly as before. After
+///    the wave, every file's uuid exports merge into the snapshot in sorted
+///    path order (first binding wins), so the merge — like the partition — is
+///    independent of within-wave completion order.
+/// 4. Files that never become eligible (refs to uuids defined nowhere, or
+///    mutual-reference cycles) project LAST with the final snapshot; their
+///    unresolved refs count as truly dangling.
+fn import_directory_waves(
+    paths: &[PathBuf],
+    roster: Option<&RosterIndex>,
+    repo: &mut common::Repo,
+    ws: &mut common::Ws,
+    catalog: &mut TribleSet,
+    catalog_head: &mut Option<common::CommitHandle>,
+) -> Result<ImportStats> {
+    // ── pre-scan: uuid definitions/references only ──────────────────────
+    let prescan_start = Instant::now();
+    let prescanned = common::parse_paths_parallel("claude-code pre-scan", paths, prescan_file)?;
+    let mut prescans = Vec::with_capacity(prescanned.len());
+    for (file, res) in prescanned {
+        prescans.push(res.with_context(|| format!("pre-scan {}", file.display()))?);
+    }
+    let (waves, unresolvable) = compute_waves(&prescans);
+    drop(prescans);
+    println!(
+        "claude-code phase schedule: {} wave(s){} in {:?}",
+        waves.len(),
+        if unresolvable.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} file(s) deferred to the final pass",
+                unresolvable.len()
+            )
+        },
+        prescan_start.elapsed()
+    );
+
+    let mut total = ImportStats::default();
+    total.wave_files = waves.iter().map(Vec::len).collect();
+    total.final_pass_files = unresolvable.len();
+    let total_files = paths.len();
+    let wave_count = waves.len();
+    let mut files_done = 0usize;
+    let mut snapshot = UuidSnapshot::default();
+
+    let mut passes: Vec<(String, Vec<usize>)> = waves
+        .into_iter()
+        .enumerate()
+        .map(|(i, wave)| (format!("wave {}/{wave_count}", i + 1), wave))
+        .collect();
+    if !unresolvable.is_empty() {
+        passes.push(("final pass".to_string(), unresolvable));
+    }
+
+    // Bounded in-flight parses. `parse_paths_streaming` runs the whole
+    // per-file projection (scan + `entity!`) on the parser threads and hands
+    // each finished `Fragment` to the sequential committer as it arrives,
+    // never holding more than PARSE_IN_FLIGHT projected files at once. Kept
+    // small deliberately — a single transcript can be 2 GB.
+    const PARSE_IN_FLIGHT: usize = 4;
+    for (pass_label, indices) in passes {
+        let wave_paths: Vec<PathBuf> = indices.iter().map(|&i| paths[i].clone()).collect();
+        println!("claude-code {pass_label}: {} file(s)", wave_paths.len());
+        // Uuid exports of this wave's files, merged only AFTER the wave — a
+        // projection consults exactly its wave's frozen snapshot.
+        let mut wave_exports: Vec<(PathBuf, HashMap<String, Id>, HashSet<String>)> =
+            Vec::with_capacity(wave_paths.len());
+        let snapshot_ref = &snapshot;
+        let stream_label = format!("claude-code {pass_label}");
+        common::parse_paths_streaming(
+            &stream_label,
+            &wave_paths,
             PARSE_IN_FLIGHT,
-            |file: &Path| parse_jsonl(file, roster),
-            |index, file, parsed| {
-                let processed = index + 1;
+            |file: &Path| parse_jsonl(file, roster, Some(snapshot_ref)),
+            |_, file, parsed| {
+                files_done += 1;
                 let file_start = Instant::now();
                 println!(
-                    "claude-code file {processed}/{total_files}: {}",
+                    "claude-code file {files_done}/{total_files} ({pass_label}): {}",
                     file.display()
                 );
                 let projected = parsed.with_context(|| format!("parse {}", file.display()))?;
@@ -206,25 +336,33 @@ fn import_claude_code_path(
                     projected.stats.cross_file_parents + projected.stats.skipped_parents;
                 if dangling > 0 {
                     eprintln!(
-                        "claude-code: {} dangling parentUuid(s) in {} \
-                         ({} cross-file/out-of-order, {} to skipped lines) — previous edges dropped",
+                        "claude-code: {} unresolved parentUuid(s) in {} \
+                         ({} truly dangling, {} to skipped lines) — previous edges dropped",
                         dangling,
                         file.display(),
                         projected.stats.cross_file_parents,
                         projected.stats.skipped_parents,
                     );
                 }
-                if projected.fragment.facts().is_empty() {
-                    total.resolution.absorb(projected.stats);
+                let Projected {
+                    fragment,
+                    stats: resolution,
+                    uuid_to_block,
+                    skipped_uuids,
+                } = projected;
+                wave_exports.push((file.clone(), uuid_to_block, skipped_uuids));
+                if fragment.facts().is_empty() {
+                    total.resolution.absorb(resolution);
                     return Ok(());
                 }
                 let stats = import_claude_code_records(
                     &file,
-                    projected,
+                    fragment,
+                    resolution,
                     repo,
-                    &mut ws,
-                    &mut catalog,
-                    &mut catalog_head,
+                    ws,
+                    catalog,
+                    catalog_head,
                 )
                 .with_context(|| format!("import {}", file.display()))?;
                 total.files += stats.files;
@@ -234,31 +372,23 @@ fn import_claude_code_path(
                 total.resolution.absorb(stats.resolution);
                 println!(
                     "claude-code progress files {}/{} (blocks {}, content-facts {}, commits {}) in {:?}",
-                    processed, total_files, total.blocks, total.content_facts, total.commits,
+                    files_done, total_files, total.blocks, total.content_facts, total.commits,
                     file_start.elapsed()
                 );
                 Ok(())
             },
         )?;
-        return Ok(total);
+        // Deterministic merge: sorted path order, first binding wins — never
+        // the order the parser threads happened to finish in.
+        wave_exports.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, uuid_to_block, skipped_uuids) in wave_exports {
+            for (uuid, block) in uuid_to_block {
+                snapshot.blocks.entry(uuid).or_insert(block);
+            }
+            snapshot.skipped.extend(skipped_uuids);
+        }
     }
-
-    let parse_start = Instant::now();
-    println!("claude-code phase parse: {}", path.display());
-    let projected = parse_jsonl(path, roster)?;
-    println!(
-        "claude-code phase parse: projected {} trible(s) in {:?}",
-        projected.fragment.facts().len(),
-        parse_start.elapsed()
-    );
-    import_claude_code_records(
-        path,
-        projected,
-        repo,
-        &mut ws,
-        &mut catalog,
-        &mut catalog_head,
-    )
+    Ok(total)
 }
 
 /// Stage a projected file's blobs into the workspace and commit its facts.
@@ -269,13 +399,13 @@ fn import_claude_code_path(
 /// store into the staging area and commits the delta.
 fn import_claude_code_records(
     _path: &Path,
-    projected: Projected,
+    fragment: Fragment,
+    resolution: ProjectionStats,
     repo: &mut common::Repo,
     ws: &mut common::Ws,
     catalog: &mut TribleSet,
     catalog_head: &mut Option<common::CommitHandle>,
 ) -> Result<ImportStats> {
-    let Projected { fragment, stats: resolution } = projected;
     let mut stats = ImportStats {
         files: 1,
         resolution,
@@ -317,6 +447,117 @@ fn import_claude_code_records(
 }
 
 // ---------------------------------------------------------------------------
+// Wave scheduling — deterministic cross-file `previous` (phase 3)
+// ---------------------------------------------------------------------------
+
+/// Read-only cross-file uuid resolutions a projection may consult, frozen for
+/// one whole wave. Grows only BETWEEN waves (deterministic merge in
+/// [`import_directory_waves`]), never during one.
+#[derive(Debug, Default)]
+struct UuidSnapshot {
+    /// uuid → block id, for every dialogue line earlier waves projected.
+    blocks: HashMap<String, Id>,
+    /// uuids earlier waves defined but skipped (non-dialogue lines) — a
+    /// `parentUuid` into one of these is a skipped-parent, not dangling.
+    skipped: HashSet<String>,
+}
+
+/// Pre-scanned uuid surface of one file: every line uuid it defines
+/// (dialogue or not) and every `parentUuid` naming no uuid defined in the
+/// same file.
+#[derive(Debug, Default)]
+struct PreScan {
+    defined: HashSet<String>,
+    external_refs: HashSet<String>,
+}
+
+/// Partition file indices into dependency-ordered waves, purely from the
+/// pre-scan.
+///
+/// A file is eligible for the next wave when every external ref names a uuid
+/// DEFINED by a file scheduled in an earlier wave — whether that line
+/// projects a block or is a skipped non-dialogue line; the snapshot
+/// classification at projection time distinguishes the two. Wave 1 = files
+/// with no external refs. Files that never become eligible (refs to uuids
+/// defined in no file, or mutual-reference cycles — cycle members are never
+/// eligible because each waits on the other, so the loop terminates instead
+/// of deadlocking) are returned separately for the final pass. No projection
+/// output and no scheduling order feeds back into the partition.
+fn compute_waves(prescans: &[PreScan]) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let mut scheduled_defs: HashSet<&str> = HashSet::new();
+    let mut remaining: Vec<usize> = (0..prescans.len()).collect();
+    let mut waves: Vec<Vec<usize>> = Vec::new();
+    loop {
+        let (eligible, rest): (Vec<usize>, Vec<usize>) =
+            std::mem::take(&mut remaining).into_iter().partition(|&i| {
+                prescans[i]
+                    .external_refs
+                    .iter()
+                    .all(|r| scheduled_defs.contains(r.as_str()))
+            });
+        if eligible.is_empty() {
+            return (waves, rest);
+        }
+        for &i in &eligible {
+            scheduled_defs.extend(prescans[i].defined.iter().map(String::as_str));
+        }
+        waves.push(eligible);
+        remaining = rest;
+    }
+}
+
+/// Cheap pre-scan of one file: only `uuid`/`parentUuid` per line.
+fn prescan_file(path: &Path) -> Result<PreScan> {
+    let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = Bytes::from_source(data);
+    prescan_jsonl(&bytes).with_context(|| format!("pre-scan {}", path.display()))
+}
+
+/// The projecting-scanner's cheap path: per line, parse only `uuid` and
+/// `parentUuid`, [`sc::skip_value`] everything else (message bodies
+/// included — nothing is materialized).
+fn prescan_jsonl(bytes: &Bytes) -> Result<PreScan> {
+    let mut defined: HashSet<String> = HashSet::new();
+    let mut refs: HashSet<String> = HashSet::new();
+    for_each_jsonl_line(bytes, |line| {
+        let (uuid, parent) = prescan_record(line)
+            .map_err(|e| anyhow!("pre-scan claude-code jsonl record: {e}"))?;
+        if let Some(uuid) = uuid {
+            defined.insert(uuid);
+        }
+        if let Some(parent) = parent {
+            refs.insert(parent);
+        }
+        Ok(())
+    })?;
+    let external_refs = refs
+        .into_iter()
+        .filter(|r| !defined.contains(r))
+        .collect();
+    Ok(PreScan {
+        defined,
+        external_refs,
+    })
+}
+
+/// Scan one record for `(uuid, parentUuid)`, skipping every other value.
+fn prescan_record(line: &mut Bytes) -> Result<(Option<String>, Option<String>), sc::ScanError> {
+    let mut ids: (Option<String>, Option<String>) = (None, None);
+    sc::object(line, &mut ids, |ids, key, value| {
+        let key = key
+            .view::<str>()
+            .map_err(|_| scan_syntax("invalid utf-8 key"))?;
+        match key.as_ref() {
+            "uuid" => ids.0 = parse_opt_str(value)?,
+            "parentUuid" => ids.1 = parse_opt_str(value)?,
+            _ => sc::skip_value(value)?,
+        }
+        Ok(ids)
+    })?;
+    Ok(ids)
+}
+
+// ---------------------------------------------------------------------------
 // Parsing + projection
 // ---------------------------------------------------------------------------
 
@@ -325,19 +566,59 @@ fn import_claude_code_records(
 ///
 /// Runs on the parser threads of [`common::parse_paths_streaming`]. The
 /// projection is content-addressed and side-effect-free — no workspace, no
-/// pile — so it is safe to run off the committing thread.
-fn parse_jsonl(path: &Path, roster: Option<&RosterIndex>) -> Result<Projected> {
+/// pile, and the wave `snapshot` is read-only — so it is safe to run off the
+/// committing thread.
+fn parse_jsonl(
+    path: &Path,
+    roster: Option<&RosterIndex>,
+    snapshot: Option<&UuidSnapshot>,
+) -> Result<Projected> {
     let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let bytes = Bytes::from_source(data);
-    project_jsonl(&bytes, roster).with_context(|| format!("project {}", path.display()))
+    project_jsonl(&bytes, roster, snapshot).with_context(|| format!("project {}", path.display()))
+}
+
+/// Split `bytes` into JSONL lines — trimming ASCII whitespace (including a
+/// trailing `\r`) so the scanner sees the record's opening `{` as the first
+/// byte — and hand each non-empty line to `f`. Shared by the full projection
+/// and the pre-scan.
+fn for_each_jsonl_line<F>(bytes: &Bytes, mut f: F) -> Result<()>
+where
+    F: FnMut(&mut Bytes) -> Result<()>,
+{
+    let raw = bytes.as_ref();
+    let len = raw.len();
+    let mut start = 0usize;
+    for i in 0..=len {
+        let is_boundary = i == len || raw[i] == b'\n';
+        if !is_boundary {
+            continue;
+        }
+        if i > start {
+            let seg = &raw[start..i];
+            let first = seg.iter().position(|c| !c.is_ascii_whitespace());
+            let last = seg.iter().rposition(|c| !c.is_ascii_whitespace());
+            if let (Some(a), Some(z)) = (first, last) {
+                let mut line = bytes.slice((start + a)..(start + z + 1));
+                f(&mut line)?;
+            }
+        }
+        start = i + 1;
+    }
+    Ok(())
 }
 
 /// Core projection: fold each JSONL line into the accumulating fragment.
 ///
 /// Streams line-by-line — at most one [`RawRecord`] is alive at a time — so
 /// peak memory is the raw file plus the growing fragment, never a per-record
-/// dynamic JSON tree.
-fn project_jsonl(bytes: &Bytes, roster: Option<&RosterIndex>) -> Result<Projected> {
+/// dynamic JSON tree. `snapshot` is the wave scheduler's read-only cross-file
+/// uuid map (None for a single-file import).
+fn project_jsonl(
+    bytes: &Bytes,
+    roster: Option<&RosterIndex>,
+    snapshot: Option<&UuidSnapshot>,
+) -> Result<Projected> {
     let mut frag = Fragment::empty();
     let mut stats = ProjectionStats::default();
     // uuid → block id, so a record's `parentUuid` resolves to `block::previous`.
@@ -353,39 +634,28 @@ fn project_jsonl(bytes: &Bytes, roster: Option<&RosterIndex>) -> Result<Projecte
     // `unresolved_correlator_is_counted_not_edged` in the tests.
     let mut correlator_to_cf: HashMap<String, Id> = HashMap::new();
 
-    let raw = bytes.as_ref();
-    let len = raw.len();
-    let mut start = 0usize;
-    for i in 0..=len {
-        let is_boundary = i == len || raw[i] == b'\n';
-        if !is_boundary {
-            continue;
-        }
-        if i > start {
-            // Trim ASCII whitespace (including a trailing `\r`) so the scanner
-            // sees the record's opening `{` as the first byte.
-            let seg = &raw[start..i];
-            let first = seg.iter().position(|c| !c.is_ascii_whitespace());
-            let last = seg.iter().rposition(|c| !c.is_ascii_whitespace());
-            if let (Some(a), Some(z)) = (first, last) {
-                let mut line = bytes.slice((start + a)..(start + z + 1));
-                let record = scan_record(&mut line)
-                    .map_err(|e| anyhow!("scan claude-code jsonl record: {e}"))?;
-                project_record(
-                    &record,
-                    &mut frag,
-                    &mut uuid_to_block,
-                    &mut skipped_uuids,
-                    &mut correlator_to_cf,
-                    roster,
-                    &mut stats,
-                );
-            }
-        }
-        start = i + 1;
-    }
+    for_each_jsonl_line(bytes, |line| {
+        let record =
+            scan_record(line).map_err(|e| anyhow!("scan claude-code jsonl record: {e}"))?;
+        project_record(
+            &record,
+            &mut frag,
+            &mut uuid_to_block,
+            &mut skipped_uuids,
+            &mut correlator_to_cf,
+            snapshot,
+            roster,
+            &mut stats,
+        );
+        Ok(())
+    })?;
 
-    Ok(Projected { fragment: frag, stats })
+    Ok(Projected {
+        fragment: frag,
+        stats,
+        uuid_to_block,
+        skipped_uuids,
+    })
 }
 
 /// Project one scanned record into the fragment (identity-core pass, then the
@@ -396,6 +666,7 @@ fn project_record(
     uuid_to_block: &mut HashMap<String, Id>,
     skipped_uuids: &mut HashSet<String>,
     correlator_to_cf: &mut HashMap<String, Id>,
+    snapshot: Option<&UuidSnapshot>,
     roster: Option<&RosterIndex>,
     stats: &mut ProjectionStats,
 ) {
@@ -510,29 +781,35 @@ fn project_record(
 
     // Block identity core: {previous?, timestamp, contains-<cf ids>}.
     //
-    // Cross-file `previous` (counted, NOT resolved — analysis 2026-07-26):
-    // `uuid_to_block` is per-file, so a `parentUuid` into another transcript
-    // drops the edge. Resolving it later is NOT a clean incremental fix:
-    // `previous` is identity-core, so re-projecting a late-resolving child
-    // re-mints its block id AND every descendant's id (the Merkle cascade),
-    // while the orphan lineage is already committed — an append-only pile
-    // would then hold BOTH lineages forever, forking identity for the same
-    // source records. Worse, `parse_paths_streaming` completes files in a
-    // racy order, so which parents "have been seen" when a child commits
-    // would depend on scheduling — block ids would differ run to run,
-    // destroying the convergence guarantee. A correct design needs a
-    // dependency-ordered projection (pre-scan uuid definitions/references,
-    // topo-order the files, share one uuid map); that is a supervisor-level
-    // pipeline restructuring, so here the misses are counted and logged —
-    // a correct count beats a wrong edge.
+    // Cross-file `previous` (phase 3 — the dependency-ordered projection the
+    // 2026-07-26 analysis called for): the local map resolves same-file
+    // parents; on a miss, the wave scheduler's read-only `snapshot` resolves
+    // cross-file parents. `previous` is identity-core, so this MUST be
+    // deterministic — and it is, because a file only enters a wave once
+    // every external ref's DEFINING file projected in an EARLIER wave
+    // ([`compute_waves`]), so the snapshot a projection consults is frozen
+    // per wave and never a function of within-wave completion order: block
+    // ids converge run to run. Remaining misses classify as skipped (the
+    // parent line projects no block — locally or in the snapshot's
+    // defined-but-skipped set) or truly dangling (`cross_file_parents`: the
+    // uuid is defined in no file, or only inside a mutual-reference cycle
+    // projected in the final pass). A correct count beats a wrong edge.
     let timestamp =
         common::epoch_interval(record.timestamp.unwrap_or_else(common::unknown_epoch));
     let previous = match record.parent_uuid.as_ref() {
         None => None,
         Some(parent) => {
-            let resolved = uuid_to_block.get(parent).copied();
+            let resolved = uuid_to_block.get(parent).copied().or_else(|| {
+                let cross = snapshot.and_then(|s| s.blocks.get(parent).copied());
+                if cross.is_some() {
+                    stats.cross_file_resolved += 1;
+                }
+                cross
+            });
             if resolved.is_none() {
-                if skipped_uuids.contains(parent) {
+                if skipped_uuids.contains(parent)
+                    || snapshot.is_some_and(|s| s.skipped.contains(parent))
+                {
                     stats.skipped_parents += 1;
                 } else {
                     stats.cross_file_parents += 1;
@@ -1089,12 +1366,32 @@ pub fn import_into_archive(
                 "Imported {} file(s), {} block(s), {} content-fact(s) in {} new commit(s).",
                 stats.files, stats.blocks, stats.content_facts, stats.commits
             );
+            if !stats.wave_files.is_empty() {
+                let per_wave = stats
+                    .wave_files
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+");
+                println!(
+                    "Waves: {} ({} file(s) per wave), {} file(s) in the final pass.",
+                    stats.wave_files.len(),
+                    per_wave,
+                    stats.final_pass_files,
+                );
+            }
             let r = stats.resolution;
+            if r.cross_file_resolved > 0 {
+                println!(
+                    "Cross-file previous edge(s) resolved: {}.",
+                    r.cross_file_resolved
+                );
+            }
             if r.total() > 0 {
                 println!(
                     "Resolution gaps: {} dangling tool correlator(s), \
-                     {} cross-file/out-of-order parentUuid(s), \
-                     {} parentUuid(s) into skipped lines, \
+                     {} truly dangling parentUuid(s), \
+                     {} parentUuid(s) into skipped lines (incl. cross-file), \
                      {} undecodable image(s), \
                      {} author/experiencer invariant breach(es).",
                     r.dangling_correlators,
@@ -1139,7 +1436,7 @@ mod tests {
 
     fn project_with(sample: &str, roster: Option<&RosterIndex>) -> Projected {
         let bytes = Bytes::from_source(sample.as_bytes().to_vec());
-        project_jsonl(&bytes, roster).expect("projection succeeds")
+        project_jsonl(&bytes, roster, None).expect("projection succeeds")
     }
 
     fn resolve_payload(frag: &Fragment, handle: Inline<Handle<LongString>>) -> String {
@@ -1621,5 +1918,165 @@ mod tests {
         let frag = &projected.fragment;
         assert_eq!(previous_of(frag, find_block(frag, "parent was skipped")), None);
         assert_eq!(previous_of(frag, find_block(frag, "parent in another file")), None);
+    }
+
+    // ── phase 3: cross-file waves ───────────────────────────────────────
+
+    /// In-memory mirror of [`import_directory_waves`] (no pile, no commit):
+    /// pre-scan every sample, [`compute_waves`], project wave-by-wave against
+    /// the growing snapshot — merging each wave's exports in sorted-name
+    /// order with first-binding-wins, exactly the production merge — then
+    /// project the never-eligible remainder as the final pass. Returns the
+    /// per-name projections, the waves (as sorted name lists), and the
+    /// final-pass names.
+    fn project_waves(
+        files: &[(&str, &str)],
+    ) -> (HashMap<String, Projected>, Vec<Vec<String>>, Vec<String>) {
+        let prescans: Vec<PreScan> = files
+            .iter()
+            .map(|(_, sample)| {
+                prescan_jsonl(&Bytes::from_source(sample.as_bytes().to_vec()))
+                    .expect("pre-scan succeeds")
+            })
+            .collect();
+        let (waves, unresolvable) = compute_waves(&prescans);
+        let final_pass = waves.len();
+        let mut snapshot = UuidSnapshot::default();
+        let mut projections: HashMap<String, Projected> = HashMap::new();
+        let mut wave_names: Vec<Vec<String>> = Vec::new();
+        let mut final_names: Vec<String> = Vec::new();
+        for (pass, indices) in waves
+            .iter()
+            .chain(std::iter::once(&unresolvable))
+            .enumerate()
+        {
+            let mut exports: Vec<(String, HashMap<String, Id>, HashSet<String>)> = Vec::new();
+            for &i in indices {
+                let (name, sample) = files[i];
+                let projected = project_jsonl(
+                    &Bytes::from_source(sample.as_bytes().to_vec()),
+                    None,
+                    Some(&snapshot),
+                )
+                .expect("projection succeeds");
+                exports.push((
+                    name.to_string(),
+                    projected.uuid_to_block.clone(),
+                    projected.skipped_uuids.clone(),
+                ));
+                projections.insert(name.to_string(), projected);
+            }
+            // Production merge: sorted name order, first binding wins.
+            exports.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut names: Vec<String> = Vec::new();
+            for (name, uuid_to_block, skipped_uuids) in exports {
+                names.push(name);
+                for (uuid, block) in uuid_to_block {
+                    snapshot.blocks.entry(uuid).or_insert(block);
+                }
+                snapshot.skipped.extend(skipped_uuids);
+            }
+            if pass == final_pass {
+                final_names = names;
+            } else {
+                wave_names.push(names);
+            }
+        }
+        (projections, wave_names, final_names)
+    }
+
+    fn all_block_ids(projections: &HashMap<String, Projected>) -> HashSet<Id> {
+        projections
+            .values()
+            .flat_map(|p| block_ids(&p.fragment))
+            .collect()
+    }
+
+    const FILE_A: &str = r#"{"type":"user","uuid":"a-u1","parentUuid":null,"timestamp":"2026-03-01T15:34:01.542Z","message":{"role":"user","content":"root in file A"}}"#;
+    const FILE_B: &str = r#"{"type":"user","uuid":"b-u1","parentUuid":"a-u1","timestamp":"2026-03-01T15:35:00.000Z","message":{"role":"user","content":"continues in file B"}}"#;
+
+    #[test]
+    fn cross_file_previous_resolves_through_wave_snapshot() {
+        let (projections, waves, finals) = project_waves(&[("a", FILE_A), ("b", FILE_B)]);
+        // A has no external refs → wave 1; B depends on A → wave 2.
+        assert_eq!(
+            waves,
+            vec![vec!["a".to_string()], vec!["b".to_string()]],
+            "dependency-ordered waves"
+        );
+        assert!(finals.is_empty(), "nothing unresolvable");
+
+        let a = &projections["a"];
+        let b = &projections["b"];
+        let a_block = find_block(&a.fragment, "root in file A");
+        let b_block = find_block(&b.fragment, "continues in file B");
+        assert_eq!(
+            previous_of(&b.fragment, b_block),
+            Some(a_block),
+            "B's root chains onto A's block across files"
+        );
+        assert_eq!(b.stats.cross_file_resolved, 1, "the resolved-edge counter");
+        assert_eq!(b.stats.cross_file_parents, 0);
+        assert_eq!(a.stats.cross_file_resolved, 0);
+    }
+
+    #[test]
+    fn wave_projection_is_presentation_order_independent() {
+        // DETERMINISM: the block-id set must not depend on the order the
+        // files are presented in (production sorts paths, but the scheduler
+        // itself must not care — the partition and the sorted-name merge are
+        // both order-free).
+        let forward = project_waves(&[("a", FILE_A), ("b", FILE_B)]);
+        let reverse = project_waves(&[("b", FILE_B), ("a", FILE_A)]);
+        assert_eq!(all_block_ids(&forward.0), all_block_ids(&reverse.0));
+        assert_eq!(forward.1, reverse.1, "identical wave partition");
+    }
+
+    #[test]
+    fn mutual_cycle_lands_in_final_pass_counted_dangling() {
+        let a = r#"{"type":"user","uuid":"a-u1","parentUuid":"b-u1","timestamp":"2026-03-01T15:34:01.000Z","message":{"role":"user","content":"cycle half a"}}"#;
+        let b = r#"{"type":"user","uuid":"b-u1","parentUuid":"a-u1","timestamp":"2026-03-01T15:34:02.000Z","message":{"role":"user","content":"cycle half b"}}"#;
+        let (projections, waves, finals) = project_waves(&[("a", a), ("b", b)]);
+        // Neither file is ever eligible — no deadlock, both in the final pass.
+        assert!(waves.is_empty(), "a cycle produces no eligible wave");
+        assert_eq!(finals, vec!["a".to_string(), "b".to_string()]);
+        for (name, projected) in &projections {
+            assert_eq!(
+                projected.stats.cross_file_parents, 1,
+                "{name}: cycle ref counted truly dangling"
+            );
+            assert_eq!(projected.stats.cross_file_resolved, 0);
+            assert_eq!(projected.stats.skipped_parents, 0);
+            for block in block_ids(&projected.fragment) {
+                assert_eq!(
+                    previous_of(&projected.fragment, block),
+                    None,
+                    "{name}: no fabricated previous edge"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cross_file_ref_to_skipped_line_counts_as_skipped() {
+        // File A holds ONLY a system line (projects no block — its fragment
+        // is empty, but its skipped uuid still merges into the snapshot).
+        let a = r#"{"type":"system","uuid":"a-sys1","parentUuid":null,"timestamp":"2026-03-01T15:34:00.000Z","content":"ignored"}"#;
+        let b = r#"{"type":"user","uuid":"b-u1","parentUuid":"a-sys1","timestamp":"2026-03-01T15:34:01.000Z","message":{"role":"user","content":"child of a skipped line"}}"#;
+        let (projections, waves, finals) = project_waves(&[("a", a), ("b", b)]);
+        // The DEFINING file is known from the pre-scan, so B waits for A and
+        // classifies against the snapshot — never the final pass.
+        assert_eq!(waves, vec![vec!["a".to_string()], vec!["b".to_string()]]);
+        assert!(finals.is_empty());
+
+        let b = &projections["b"];
+        assert_eq!(b.stats.skipped_parents, 1, "cross-file-skipped, not dangling");
+        assert_eq!(b.stats.cross_file_parents, 0);
+        assert_eq!(b.stats.cross_file_resolved, 0);
+        assert_eq!(
+            previous_of(&b.fragment, find_block(&b.fragment, "child of a skipped line")),
+            None,
+            "a skipped parent projects no block, so no edge"
+        );
     }
 }
