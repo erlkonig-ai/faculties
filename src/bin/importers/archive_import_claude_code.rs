@@ -1339,6 +1339,7 @@ pub fn import_into_archive(
     pile_path: &Path,
     branch_name: &str,
     branch_id: Id,
+    roster: Option<&RosterIndex>,
 ) -> Result<()> {
     let _span = info_span!(
         "claude_code_import",
@@ -1349,9 +1350,9 @@ pub fn import_into_archive(
     .entered();
     let import_start = Instant::now();
     let (mut repo, branch_id) = common::open_repo_for_write(pile_path, branch_id, branch_name)?;
-    // Roster wiring (label → participant links on blocks) is the caller's
-    // job; until then blocks keep only the raw source_author label.
-    let res = import_claude_code_path(path, &mut repo, branch_id, None);
+    // Roster from the caller: when present, blocks get typed author/
+    // experiencer links; when None, only the raw source_author label.
+    let res = import_claude_code_path(path, &mut repo, branch_id, roster);
     tracing::info!(
         ok = res.is_ok(),
         elapsed_ms = import_start.elapsed().as_millis() as u64,

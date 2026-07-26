@@ -85,6 +85,39 @@ mod common {
     pub type Ws = Workspace<Pile>;
     pub type CommitHandle = Inline<Handle<SimpleArchive>>;
 
+    /// Load the `relations` roster from a pile and build the claude-code
+    /// importer's label → participant index. Read path only: ephemeral
+    /// key, no commits; the repository is closed before returning.
+    pub fn load_roster_index(
+        path: &Path,
+        face: Option<&str>,
+    ) -> Result<crate::archive_import_claude_code::RosterIndex> {
+        let pile: Pile = Pile::open(path)
+            .map_err(|e| anyhow!("open roster pile {}: {e:?}", path.display()))?;
+        let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+            .map_err(|e| anyhow!("open roster repository: {e:?}"))?;
+        let result = (|repo: &mut Repo| -> Result<_> {
+            let branch_id = repo
+                .lookup_branch("relations")
+                .map_err(|e| anyhow!("lookup relations branch: {e:?}"))?
+                .ok_or_else(|| anyhow!("no `relations` branch in {}", path.display()))?;
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+            let facts = ws
+                .checkout(..)
+                .context("checkout relations")?
+                .into_facts();
+            Ok(crate::archive_import_claude_code::RosterIndex::build(
+                &facts, face,
+            ))
+        })(&mut repo);
+        let close = repo.close().map_err(|e| anyhow!("close roster pile: {e:?}"));
+        let idx = result?;
+        close?;
+        Ok(idx)
+    }
+
     /// Bound the transient six-PATCH view used while freezing one physical
     /// SuccinctArchive leaf. A larger source commit is still one *logical*
     /// commit leaf; all of its physical shards land atomically before its
@@ -783,6 +816,15 @@ enum Command {
         source: ImportSource,
         /// Optional path override for this source (or backup root for `all`).
         path: Option<PathBuf>,
+        /// Pile holding the `relations` roster branch — enables typed
+        /// author/experiencer links on imported blocks (claude-code only
+        /// so far). Without it, blocks keep raw source-author labels.
+        #[arg(long)]
+        roster_pile: Option<PathBuf>,
+        /// The importing window's own roster label (e.g. `liora-cc`) —
+        /// author and experiencer of every `out` block.
+        #[arg(long)]
+        face: Option<String>,
     },
     /// List the most recent messages through the Succinct index.
     List {
@@ -951,6 +993,7 @@ fn run_import_jobs(
     pile_path: &Path,
     branch_name: &str,
     branch_id: Id,
+    roster: Option<&archive_import_claude_code::RosterIndex>,
 ) -> Result<()> {
     let all_start = Instant::now();
     let jobs = resolve_import_jobs(source, path)?;
@@ -1034,6 +1077,7 @@ fn run_import_jobs(
                 pile_path,
                 branch_name,
                 branch_id,
+                roster,
             ),
             ImportSource::ClaudeWeb => archive_import_claude_web::import_into_archive(
                 &job.path,
@@ -2961,8 +3005,25 @@ fn main() -> Result<()> {
         elapsed_ms = branch_resolution_start.elapsed().as_millis() as u64,
         "command branch resolution complete"
     );
-    if let Command::Import { source, path } = cmd {
-        return run_import_jobs(source, path.as_deref(), &pile_path, &cli.branch, branch_id);
+    if let Command::Import {
+        source,
+        path,
+        roster_pile,
+        face,
+    } = cmd
+    {
+        let roster = match roster_pile {
+            Some(rp) => Some(common::load_roster_index(&rp, face.as_deref())?),
+            None => None,
+        };
+        return run_import_jobs(
+            source,
+            path.as_deref(),
+            &pile_path,
+            &cli.branch,
+            branch_id,
+            roster.as_ref(),
+        );
     }
     if let Command::Replay {
         action,
