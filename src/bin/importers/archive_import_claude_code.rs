@@ -1,3 +1,25 @@
+//! Claude Code (`.claude` JSONL) importer — block-DAG projection.
+//!
+//! Each JSONL record becomes one **block** in the perception/action DAG
+//! ([`faculties::schemas::blockdag`]); each content block inside a record's
+//! `message.content` becomes a **content-fact** owned by that block via
+//! [`block::contains`]. `parentUuid` resolves to [`block::previous`]; the
+//! record `type` (`user`/`assistant`) plus the content block type set each
+//! content-fact's [`content_fact::direction`] (the training loss mask).
+//!
+//! The projection is a *streaming projection*: it scans only the fields it
+//! needs out of each JSONL line with [`triblespace::core::import::scanner`]
+//! and never materializes a `serde_json::Value` tree. This replaces the old
+//! `serde_json::Value` + `MessageRecord` + `JsonTreeImporter` path (which
+//! allocated several times the source size per record — a cold `~/.claude`
+//! import reached 57.9 GB resident, 2026-07-26).
+//!
+//! Phase 1 (this file) delivers the core block/content-fact projection with a
+//! strict two-pass `entity!` discipline. Deferred pieces are marked
+//! `// TODO(phase2):` — image/media content-facts, the tool-correlator →
+//! `responds_to` edge, and `author`/`experiencer` roster entity links (phase 1
+//! keeps only the raw [`import_schema::source_author`] label).
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,31 +28,18 @@ use std::time::Instant;
 use crate::common;
 use anyhow::{anyhow, Context, Result};
 use hifitime::Epoch;
-use serde_json::Value as JsonValue;
 use tracing::info_span;
-use triblespace::core::import::json_tree::JsonTreeImporter;
+use triblespace::core::blob::Bytes;
+use triblespace::core::import::scanner as sc;
+use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::*;
 
 #[derive(Debug, Default, Clone)]
 struct ImportStats {
     files: usize,
-    conversations: usize,
-    messages: usize,
+    blocks: usize,
+    content_facts: usize,
     commits: usize,
-}
-
-/// A parsed message from a Claude Code JSONL conversation.
-#[derive(Debug, Clone)]
-struct MessageRecord {
-    conversation_id: String,
-    source_message_id: String,
-    parent_source_id: Option<String>,
-    role: String,
-    author: String,
-    model: Option<String>,
-    content: String,
-    created_at: Option<Epoch>,
-    order: usize,
 }
 
 fn import_claude_code_path(
@@ -62,33 +71,32 @@ fn import_claude_code_path(
         );
         let mut total = ImportStats::default();
         let total_files = paths.len();
-        // Bounded in-flight parses. The old `parse_paths_parallel` collected
-        // EVERY parsed file before the first commit, so peak memory tracked the
-        // corpus: 3205 files / 6.8 GB of JSON reached 57.9 GB resident and swapped
-        // the machine (2026-07-26). Streaming with backpressure keeps at most a
-        // handful of parsed files alive while committing proceeds in parallel.
-        // Kept small deliberately — a single transcript here can be 2 GB.
+        // Bounded in-flight parses. `parse_paths_streaming` runs the whole
+        // per-file projection (scan + `entity!`) on the parser threads and
+        // hands each finished `Fragment` to the sequential committer as it
+        // arrives, never holding more than PARSE_IN_FLIGHT projected files at
+        // once. Kept small deliberately — a single transcript can be 2 GB.
         const PARSE_IN_FLIGHT: usize = 4;
         common::parse_paths_streaming(
             "claude-code",
             &paths,
             PARSE_IN_FLIGHT,
             parse_jsonl,
-            |index, file, parsed_records| {
+            |index, file, parsed_fragment| {
                 let processed = index + 1;
                 let file_start = Instant::now();
                 println!(
                     "claude-code file {processed}/{total_files}: {}",
                     file.display()
                 );
-                let raw_records =
-                    parsed_records.with_context(|| format!("parse {}", file.display()))?;
-                if raw_records.is_empty() {
+                let fragment =
+                    parsed_fragment.with_context(|| format!("parse {}", file.display()))?;
+                if fragment.facts().is_empty() {
                     return Ok(());
                 }
                 let stats = import_claude_code_records(
                     &file,
-                    raw_records,
+                    fragment,
                     repo,
                     &mut ws,
                     &mut catalog,
@@ -96,12 +104,12 @@ fn import_claude_code_path(
                 )
                 .with_context(|| format!("import {}", file.display()))?;
                 total.files += stats.files;
-                total.conversations += stats.conversations;
-                total.messages += stats.messages;
+                total.blocks += stats.blocks;
+                total.content_facts += stats.content_facts;
                 total.commits += stats.commits;
                 println!(
-                    "claude-code progress files {}/{} (conversations {}, messages {}, commits {}) in {:?}",
-                    processed, total_files, total.conversations, total.messages, total.commits,
+                    "claude-code progress files {}/{} (blocks {}, content-facts {}, commits {}) in {:?}",
+                    processed, total_files, total.blocks, total.content_facts, total.commits,
                     file_start.elapsed()
                 );
                 Ok(())
@@ -112,15 +120,15 @@ fn import_claude_code_path(
 
     let parse_start = Instant::now();
     println!("claude-code phase parse: {}", path.display());
-    let raw_records = parse_jsonl(path)?;
+    let fragment = parse_jsonl(path)?;
     println!(
-        "claude-code phase parse: {} line record(s) in {:?}",
-        raw_records.len(),
+        "claude-code phase parse: projected {} trible(s) in {:?}",
+        fragment.facts().len(),
         parse_start.elapsed()
     );
     import_claude_code_records(
         path,
-        raw_records,
+        fragment,
         repo,
         &mut ws,
         &mut catalog,
@@ -128,9 +136,15 @@ fn import_claude_code_path(
     )
 }
 
+/// Stage a projected file's blobs into the workspace and commit its facts.
+///
+/// The heavy work (scan + content-addressed `entity!` projection) already
+/// happened in [`parse_jsonl`] on a parser thread; this sequential step owns
+/// `&mut Workspace`, so it only merges the fragment's self-contained blob
+/// store into the staging area and commits the delta.
 fn import_claude_code_records(
-    path: &Path,
-    raw_records: Vec<JsonValue>,
+    _path: &Path,
+    fragment: Fragment,
     repo: &mut common::Repo,
     ws: &mut common::Ws,
     catalog: &mut TribleSet,
@@ -141,224 +155,487 @@ fn import_claude_code_records(
         ..ImportStats::default()
     };
 
-    if raw_records.is_empty() {
-        return Ok(stats);
-    }
-
-    // Store the raw JSON tree for provenance.
-    let raw_root = {
-        let raw_tree_start = Instant::now();
-        let raw_payload =
-            serde_json::to_string(&raw_records).context("serialize claude-code jsonl")?;
-        let mut importer = JsonTreeImporter::<_>::new(repo.storage_mut(), None);
-        let fragment = importer
-            .import_str(&raw_payload)
-            .context("import claude-code raw json tree")?;
-        let root = fragment
-            .root()
-            .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
-        if common::commit_delta(
-            repo,
-            ws,
-            catalog,
-            catalog_head,
-            fragment.facts().clone(),
-            "import claude-code json tree",
-        )? {
-            stats.commits += 1;
-        }
-        println!(
-            "claude-code phase raw-tree: done in {:?}",
-            raw_tree_start.elapsed()
-        );
-        root
-    };
-
-    let semantic_start = Instant::now();
-    let messages = collect_messages(&raw_records);
-    println!(
-        "claude-code {}: parsed {} message(s) across {} conversation(s)",
-        path.display(),
-        messages.len(),
-        {
-            let mut ids: Vec<&str> = messages
-                .iter()
-                .map(|m| m.conversation_id.as_str())
-                .collect();
-            ids.sort_unstable();
-            ids.dedup();
-            ids.len()
-        }
-    );
-
-    // Group by conversation (sessionId).
-    let by_conversation: Vec<(String, Vec<MessageRecord>)> = {
-        let mut map: HashMap<String, Vec<MessageRecord>> = HashMap::new();
-        for msg in messages {
-            map.entry(msg.conversation_id.clone())
-                .or_default()
-                .push(msg);
-        }
-        let mut pairs: Vec<_> = map.into_iter().collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        pairs
-    };
-
-    let mut change = TribleSet::new();
-    let mut author_cache: HashMap<String, Id> = HashMap::new();
-    let total_conversations = by_conversation.len();
-
-    for (index, (conversation_id_str, mut convo_messages)) in
-        by_conversation.into_iter().enumerate()
     {
-        convo_messages.sort_by_key(|m| m.order);
-
-        // --- Pass 1: create message entities (identity = source_format + source_message_id). ---
-        // Message IDs are content-derived and stable across re-imports.
-        let mut uuid_to_message_id: HashMap<String, Id> = HashMap::new();
-        let mut message_ids: Vec<(Id, &MessageRecord)> = Vec::new();
-
-        for msg in &convo_messages {
-            let source_message_id_handle = ws.put(msg.source_message_id.clone());
-            let message_fragment = entity! { _ @
-                common::import_schema::source_format: "claude-code",
-                common::import_schema::source_message_id: source_message_id_handle,
-            };
-            let message_id = message_fragment
-                .root()
-                .expect("entity! must export a single root id");
-            change += message_fragment;
-            uuid_to_message_id.insert(msg.source_message_id.clone(), message_id);
-            message_ids.push((message_id, msg));
-        }
-
-        // --- Pass 2: create conversation entity (identity = format + session id). ---
-        // The conversation is a stable g-set: message edges accumulate monotonically.
-        let conversation_fragment = entity! { _ @
-            common::metadata::tag: common::import_schema::kind_conversation,
-            common::import_schema::source_format: "claude-code",
-            common::import_schema::source_conversation_id: ws.put(conversation_id_str.clone()),
-        };
-        let conversation_id = conversation_fragment
-            .root()
-            .expect("entity! must export a single root id");
-        change += conversation_fragment;
-
-        // Attach message edges and raw provenance as non-identity attributes.
-        {
-            let conversation_entity = conversation_id
-                .acquire()
-                .expect("entity! root ids should be acquired in current thread");
-            let msg_id_list: Vec<Id> = message_ids.iter().map(|(id, _)| *id).collect();
-            change += entity! { &conversation_entity @
-                common::import_schema::message*: msg_id_list,
-                common::import_schema::source_raw_root: raw_root,
-            };
-        }
-
-        // --- Pass 3: attach content attributes to messages. ---
-        for (message_id, msg) in &message_ids {
-            let message_entity = message_id
-                .acquire()
-                .expect("entity! root ids should be acquired in current thread");
-
-            let author_key = format!("{}::{}", msg.author, msg.role);
-            let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
-                id
-            } else {
-                let (id, author_change) =
-                    common::ensure_author(ws, catalog, &msg.author, &msg.role)?;
-                change += author_change;
-                author_cache.insert(author_key, id);
-                id
-            };
-
-            let created_at =
-                common::epoch_interval(msg.created_at.unwrap_or_else(common::unknown_epoch));
-            let content_handle = ws.put(msg.content.clone());
-
-            // Resolve reply_to from parentUuid.
-            let reply_to = msg
-                .parent_source_id
-                .as_ref()
-                .and_then(|parent| uuid_to_message_id.get(parent).copied());
-            let source_parent_id = msg
-                .parent_source_id
-                .as_ref()
-                .map(|parent| ws.put(parent.clone()));
-
-            let model_handle = msg.model.as_ref().map(|m| ws.put(m.clone()));
-
-            change += entity! { &message_entity @
-                common::metadata::tag: common::archive::kind_message,
-                common::archive::author: author_id,
-                common::archive::content: content_handle,
-                common::metadata::created_at: created_at,
-                common::archive::author_model?: model_handle,
-                common::import_schema::source_author: ws.put(msg.author.clone()),
-                common::import_schema::source_role: ws.put(msg.role.clone()),
-                common::import_schema::source_created_at: created_at,
-                common::archive::reply_to?: reply_to,
-                common::import_schema::source_parent_id?: source_parent_id,
-            };
-
-            stats.messages += 1;
-        }
-
-        stats.conversations += 1;
-        let processed = index + 1;
-        if processed % 50 == 0 || processed == total_conversations {
-            println!(
-                "claude-code progress conversations {}/{} (messages {}, staged commits {})",
-                processed, total_conversations, stats.messages, stats.commits
-            );
-        }
+        let facts = fragment.facts();
+        stats.blocks = find!(
+            (block: Id),
+            pattern!(facts, [{ ?block @ common::metadata::tag: common::block::KIND }])
+        )
+        .count();
+        stats.content_facts = find!(
+            (cf: Id),
+            pattern!(facts, [{ ?cf @ common::metadata::tag: common::content_fact::KIND }])
+        )
+        .count();
     }
 
-    println!(
-        "claude-code phase semantic-build: {} conversation(s), {} message(s) in {:?}",
-        stats.conversations,
-        stats.messages,
-        semantic_start.elapsed()
-    );
+    // The projection put every referenced payload/label/signature blob into
+    // the fragment's own MemoryBlobStore; merge them into the workspace's
+    // staging area so the commit ships them alongside the facts.
+    let (facts, blobs) = fragment.into_facts_and_blobs();
+    ws.staged.union(blobs);
 
-    let commit_start = Instant::now();
     if common::commit_delta(
         repo,
         ws,
         catalog,
         catalog_head,
-        change,
-        "import claude-code",
+        facts,
+        "import claude-code block-dag",
     )? {
         stats.commits += 1;
     }
-    println!(
-        "claude-code phase semantic-commit: done in {:?} (total commits {})",
-        commit_start.elapsed(),
-        stats.commits
-    );
 
     Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
-// Parsing
+// Parsing + projection
 // ---------------------------------------------------------------------------
 
-fn parse_jsonl(path: &Path) -> Result<Vec<JsonValue>> {
-    let raw_text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut records = Vec::new();
-    for (line_idx, line) in raw_text.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+/// Read a `.claude` JSONL file and project it onto the block-DAG schema,
+/// returning a self-contained [`Fragment`] (facts + the blobs they reference).
+///
+/// Runs on the parser threads of [`common::parse_paths_streaming`]. The
+/// projection is content-addressed and side-effect-free — no workspace, no
+/// pile — so it is safe to run off the committing thread.
+fn parse_jsonl(path: &Path) -> Result<Fragment> {
+    let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = Bytes::from_source(data);
+    project_jsonl(&bytes).with_context(|| format!("project {}", path.display()))
+}
+
+/// Core projection: fold each JSONL line into the accumulating fragment.
+///
+/// Streams line-by-line — at most one [`RawRecord`] is alive at a time — so
+/// peak memory is the raw file plus the growing fragment, never a per-record
+/// dynamic JSON tree.
+fn project_jsonl(bytes: &Bytes) -> Result<Fragment> {
+    let mut frag = Fragment::empty();
+    // uuid → block id, so a record's `parentUuid` resolves to `block::previous`.
+    let mut uuid_to_block: HashMap<String, Id> = HashMap::new();
+    // vendor tool correlator (`toolu_…`) → tool_call content-fact id. Built now,
+    // consumed by the phase-2 `responds_to` edge resolution.
+    let mut correlator_to_cf: HashMap<String, Id> = HashMap::new();
+
+    let raw = bytes.as_ref();
+    let len = raw.len();
+    let mut start = 0usize;
+    for i in 0..=len {
+        let is_boundary = i == len || raw[i] == b'\n';
+        if !is_boundary {
             continue;
         }
-        let value: JsonValue = serde_json::from_str(trimmed)
-            .with_context(|| format!("parse jsonl line {}", line_idx + 1))?;
-        records.push(value);
+        if i > start {
+            // Trim ASCII whitespace (including a trailing `\r`) so the scanner
+            // sees the record's opening `{` as the first byte.
+            let seg = &raw[start..i];
+            let first = seg.iter().position(|c| !c.is_ascii_whitespace());
+            let last = seg.iter().rposition(|c| !c.is_ascii_whitespace());
+            if let (Some(a), Some(z)) = (first, last) {
+                let mut line = bytes.slice((start + a)..(start + z + 1));
+                let record = scan_record(&mut line)
+                    .map_err(|e| anyhow!("scan claude-code jsonl record: {e}"))?;
+                project_record(&record, &mut frag, &mut uuid_to_block, &mut correlator_to_cf);
+            }
+        }
+        start = i + 1;
     }
-    Ok(records)
+
+    Ok(frag)
+}
+
+/// Project one scanned record into the fragment (identity-core pass, then the
+/// non-identity pass) for both its content-facts and the block itself.
+fn project_record(
+    record: &RawRecord,
+    frag: &mut Fragment,
+    uuid_to_block: &mut HashMap<String, Id>,
+    correlator_to_cf: &mut HashMap<String, Id>,
+) {
+    // Only user/assistant records are blocks. `user` is perceived (`in`),
+    // `assistant` is produced (`out`); other line types (system, progress,
+    // file-history-snapshot, …) are skipped — they carry no dialogue.
+    let record_direction = match record.record_type.as_str() {
+        "user" => common::content_fact::direction::in_,
+        "assistant" => common::content_fact::direction::out_,
+        _ => return,
+    };
+
+    let mut contained: Vec<Id> = Vec::new();
+    for block in &record.blocks {
+        let (modality, direction) = match block.kind {
+            BlockKind::Text => (common::content_fact::modality::text, record_direction),
+            BlockKind::Thinking => (
+                common::content_fact::modality::thinking,
+                common::content_fact::direction::out_,
+            ),
+            BlockKind::ToolUse => (
+                common::content_fact::modality::tool_call,
+                common::content_fact::direction::out_,
+            ),
+            BlockKind::ToolResult => (
+                common::content_fact::modality::tool_result,
+                common::content_fact::direction::in_,
+            ),
+            // TODO(phase2): image/media content-facts. An `image` block becomes
+            // a content-fact keyed by `content_fact::blob` (inline base64 bytes)
+            // or `content_fact::asset_pointer` + `asset_mime`/`asset_size` (a
+            // `file_<id>.dat` reference), with `resolved_to` attaching bytes
+            // that arrive later. Skipped for now.
+            BlockKind::Image => continue,
+            BlockKind::Other => continue,
+        };
+        if block.payload.trim().is_empty() {
+            continue;
+        }
+
+        // Pass 1 — identity core (`_` mints the content-derived id).
+        let payload = frag.put::<LongString, _>(block.payload.clone());
+        let cf = entity! { _ @
+            common::content_fact::modality:  modality,
+            common::content_fact::direction: direction,
+            common::content_fact::payload:   payload,
+        };
+        let cf_id = cf
+            .root()
+            .expect("content_fact entity! must export a single root id");
+        *frag += cf;
+
+        // Pass 2 — non-identity facts on the same content-fact id.
+        let signature = block
+            .signature
+            .as_ref()
+            .map(|s| frag.put::<LongString, _>(s.clone()));
+        let cf_entity = ExclusiveId::force(cf_id);
+        *frag += entity! { &cf_entity @
+            common::metadata::tag:          common::content_fact::KIND,
+            common::content_fact::signature?: signature,
+        };
+        // TODO(phase2): when this is a `tool_result`, resolve `block.correlator`
+        // against `correlator_to_cf` and attach
+        // `content_fact::responds_to: <tool_call cf id>` (non-identity edge,
+        // distinct from `block::previous`). The correlator string is then
+        // dropped — it never enters the content-address.
+
+        if let BlockKind::ToolUse = block.kind {
+            if let Some(correlator) = &block.correlator {
+                correlator_to_cf.insert(correlator.clone(), cf_id);
+            }
+        }
+
+        contained.push(cf_id);
+    }
+
+    // Block identity core: {previous?, timestamp, contains-<cf ids>}.
+    let timestamp =
+        common::epoch_interval(record.timestamp.unwrap_or_else(common::unknown_epoch));
+    let previous = record
+        .parent_uuid
+        .as_ref()
+        .and_then(|parent| uuid_to_block.get(parent).copied());
+    let block = entity! { _ @
+        common::block::timestamp: timestamp,
+        common::block::previous?: previous,
+        common::block::contains*: contained,
+    };
+    let block_id = block
+        .root()
+        .expect("block entity! must export a single root id");
+    *frag += block;
+
+    // Block non-identity pass: kind tag + raw author label. Roster links are
+    // phase 2.
+    let author_label = match record.record_type.as_str() {
+        "assistant" => record
+            .model
+            .clone()
+            .unwrap_or_else(|| "assistant".to_string()),
+        other => other.to_string(),
+    };
+    let source_author = frag.put::<LongString, _>(author_label);
+    let block_entity = ExclusiveId::force(block_id);
+    *frag += entity! { &block_entity @
+        common::metadata::tag:                  common::block::KIND,
+        common::import_schema::source_author:   source_author,
+        common::import_schema::source_created_at: timestamp,
+        // TODO(phase2): block::author / block::experiencer — link to the
+        // `relations` roster once the participant is rosterable (the invariant
+        // `direction = out ⟺ author == experiencer` is checked there).
+        // TODO(phase2): retain `sessionId` / `parentUuid` as source-id
+        // provenance if a raw-record round-trip is wanted.
+    };
+
+    if let Some(uuid) = &record.uuid {
+        uuid_to_block.insert(uuid.clone(), block_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming scan — project only the fields the block-DAG needs
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct RawRecord {
+    record_type: String,
+    uuid: Option<String>,
+    parent_uuid: Option<String>,
+    timestamp: Option<Epoch>,
+    /// `message.model` (assistant records) — the raw author label.
+    model: Option<String>,
+    blocks: Vec<RawBlock>,
+}
+
+struct RawBlock {
+    kind: BlockKind,
+    /// Rendered-to-text payload: `text`/`thinking` verbatim, tool_use `input`
+    /// as raw JSON, tool_result `content` as its textual content.
+    payload: String,
+    /// Vendor tool correlator: `id` (`toolu_…`) on tool_use, `tool_use_id` on
+    /// tool_result. Used to build the phase-2 `responds_to` edge.
+    correlator: Option<String>,
+    /// Claude's `thinking.signature` attestation (thinking blocks only).
+    signature: Option<String>,
+}
+
+enum BlockKind {
+    Text,
+    Thinking,
+    ToolUse,
+    ToolResult,
+    Image,
+    Other,
+}
+
+/// Fields of a single `message.content` block, gathered order-independently.
+#[derive(Default)]
+struct BlockAccum {
+    btype: String,
+    text: Option<String>,
+    thinking: Option<String>,
+    signature: Option<String>,
+    tool_id: Option<String>,
+    tool_use_id: Option<String>,
+    input_raw: Option<String>,
+    tool_result_content: Option<String>,
+}
+
+/// Fields projected out of the nested `message` object.
+#[derive(Default)]
+struct MessagePart {
+    model: Option<String>,
+    blocks: Vec<RawBlock>,
+}
+
+fn scan_syntax(message: &str) -> sc::ScanError {
+    sc::ScanError::Syntax(message.to_owned())
+}
+
+/// Decode a scanned JSON string to an owned `String`.
+fn bytes_to_string(bytes: Bytes) -> Result<String, sc::ScanError> {
+    Ok(bytes
+        .view::<str>()
+        .map_err(|_| scan_syntax("invalid utf-8 string"))?
+        .as_ref()
+        .to_owned())
+}
+
+/// Parse a string value, or `None` for `null` / any non-string value (which is
+/// skipped without materializing).
+fn parse_opt_str(bytes: &mut Bytes) -> Result<Option<String>, sc::ScanError> {
+    if bytes.first().copied() == Some(b'"') {
+        Ok(Some(bytes_to_string(sc::parse_string(bytes)?)?))
+    } else {
+        sc::skip_value(bytes)?;
+        Ok(None)
+    }
+}
+
+/// Capture the raw JSON bytes of the value at the cursor (used to render a
+/// tool_use `input` object to text losslessly), advancing past it.
+fn capture_raw_json(bytes: &mut Bytes) -> Result<String, sc::ScanError> {
+    let before = bytes.clone();
+    sc::skip_value(bytes)?;
+    let consumed = before.len() - bytes.len();
+    let raw = before.slice(0..consumed);
+    Ok(String::from_utf8_lossy(raw.as_ref()).into_owned())
+}
+
+fn scan_record(line: &mut Bytes) -> Result<RawRecord, sc::ScanError> {
+    let mut record = RawRecord::default();
+    sc::object(line, &mut record, |record, key, value| {
+        let key = key
+            .view::<str>()
+            .map_err(|_| scan_syntax("invalid utf-8 key"))?;
+        match key.as_ref() {
+            "type" => record.record_type = parse_opt_str(value)?.unwrap_or_default(),
+            "uuid" => record.uuid = parse_opt_str(value)?,
+            "parentUuid" => record.parent_uuid = parse_opt_str(value)?,
+            "timestamp" => {
+                record.timestamp = parse_opt_str(value)?
+                    .as_deref()
+                    .and_then(parse_iso_timestamp)
+            }
+            "message" => {
+                let part = scan_message(value)?;
+                record.model = part.model;
+                record.blocks = part.blocks;
+            }
+            _ => sc::skip_value(value)?,
+        }
+        Ok(record)
+    })?;
+    Ok(record)
+}
+
+fn scan_message(bytes: &mut Bytes) -> Result<MessagePart, sc::ScanError> {
+    let mut part = MessagePart::default();
+    sc::object(bytes, &mut part, |part, key, value| {
+        let key = key
+            .view::<str>()
+            .map_err(|_| scan_syntax("invalid utf-8 key"))?;
+        match key.as_ref() {
+            "model" => part.model = parse_opt_str(value)?,
+            "content" => part.blocks = scan_content(value)?,
+            _ => sc::skip_value(value)?,
+        }
+        Ok(part)
+    })?;
+    Ok(part)
+}
+
+/// `message.content` is either a plain string (one text block) or an array of
+/// content blocks.
+fn scan_content(bytes: &mut Bytes) -> Result<Vec<RawBlock>, sc::ScanError> {
+    let mut blocks: Vec<RawBlock> = Vec::new();
+    match bytes.first().copied() {
+        Some(b'"') => {
+            let text = bytes_to_string(sc::parse_string(bytes)?)?;
+            blocks.push(RawBlock {
+                kind: BlockKind::Text,
+                payload: text,
+                correlator: None,
+                signature: None,
+            });
+        }
+        Some(b'[') => {
+            sc::array(bytes, &mut blocks, |blocks, element| {
+                blocks.push(scan_content_block(element)?);
+                Ok(blocks)
+            })?;
+        }
+        _ => sc::skip_value(bytes)?,
+    }
+    Ok(blocks)
+}
+
+fn scan_content_block(bytes: &mut Bytes) -> Result<RawBlock, sc::ScanError> {
+    let mut accum = BlockAccum::default();
+    sc::object(bytes, &mut accum, |accum, key, value| {
+        let key = key
+            .view::<str>()
+            .map_err(|_| scan_syntax("invalid utf-8 key"))?;
+        match key.as_ref() {
+            "type" => accum.btype = parse_opt_str(value)?.unwrap_or_default(),
+            "text" => accum.text = parse_opt_str(value)?,
+            "thinking" => accum.thinking = parse_opt_str(value)?,
+            "signature" => accum.signature = parse_opt_str(value)?,
+            "id" => accum.tool_id = parse_opt_str(value)?,
+            "tool_use_id" => accum.tool_use_id = parse_opt_str(value)?,
+            "input" => accum.input_raw = Some(capture_raw_json(value)?),
+            "content" => accum.tool_result_content = Some(scan_tool_result_content(value)?),
+            _ => sc::skip_value(value)?,
+        }
+        Ok(accum)
+    })?;
+    Ok(build_block(accum))
+}
+
+fn build_block(accum: BlockAccum) -> RawBlock {
+    match accum.btype.as_str() {
+        "text" => RawBlock {
+            kind: BlockKind::Text,
+            payload: accum.text.unwrap_or_default(),
+            correlator: None,
+            signature: None,
+        },
+        "thinking" => RawBlock {
+            kind: BlockKind::Thinking,
+            payload: accum.thinking.unwrap_or_default(),
+            correlator: None,
+            signature: accum.signature,
+        },
+        "tool_use" => RawBlock {
+            kind: BlockKind::ToolUse,
+            payload: accum.input_raw.unwrap_or_default(),
+            correlator: accum.tool_id,
+            signature: None,
+        },
+        "tool_result" => RawBlock {
+            kind: BlockKind::ToolResult,
+            payload: accum.tool_result_content.unwrap_or_default(),
+            correlator: accum.tool_use_id,
+            signature: None,
+        },
+        "image" => RawBlock {
+            kind: BlockKind::Image,
+            payload: String::new(),
+            correlator: None,
+            signature: None,
+        },
+        _ => RawBlock {
+            kind: BlockKind::Other,
+            payload: String::new(),
+            correlator: None,
+            signature: None,
+        },
+    }
+}
+
+/// A `tool_result` `content` field is a string, or an array of `{type,text}`
+/// blocks, or (rarely) some other JSON — captured raw as a fallback.
+fn scan_tool_result_content(bytes: &mut Bytes) -> Result<String, sc::ScanError> {
+    match bytes.first().copied() {
+        Some(b'"') => bytes_to_string(sc::parse_string(bytes)?),
+        Some(b'[') => {
+            let mut parts: Vec<String> = Vec::new();
+            sc::array(bytes, &mut parts, |parts, element| {
+                if let Some(text) = extract_block_text(element)? {
+                    if !text.is_empty() {
+                        parts.push(text);
+                    }
+                }
+                Ok(parts)
+            })?;
+            Ok(parts.join("\n\n"))
+        }
+        _ => capture_raw_json(bytes),
+    }
+}
+
+/// Extract a `text` field from one content block (or a bare string element).
+fn extract_block_text(bytes: &mut Bytes) -> Result<Option<String>, sc::ScanError> {
+    match bytes.first().copied() {
+        Some(b'"') => Ok(Some(bytes_to_string(sc::parse_string(bytes)?)?)),
+        Some(b'{') => {
+            let mut text: Option<String> = None;
+            sc::object(bytes, &mut text, |text, key, value| {
+                let key = key
+                    .view::<str>()
+                    .map_err(|_| scan_syntax("invalid utf-8 key"))?;
+                match key.as_ref() {
+                    "text" => *text = parse_opt_str(value)?,
+                    _ => sc::skip_value(value)?,
+                }
+                Ok(text)
+            })?;
+            Ok(text)
+        }
+        _ => {
+            sc::skip_value(bytes)?;
+            Ok(None)
+        }
+    }
 }
 
 fn collect_jsonl_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -376,273 +653,6 @@ fn collect_jsonl_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Message extraction
-// ---------------------------------------------------------------------------
-
-/// Extract importable messages from Claude Code JSONL records.
-///
-/// Claude Code stores conversations as JSONL with these line types:
-/// - `user`: user messages (content is string or content blocks)
-/// - `assistant`: model responses (content blocks: text, thinking, tool_use)
-/// - `system`, `progress`, `file-history-snapshot`, `queue-operation`: metadata (skipped)
-///
-/// We import `user` and `assistant` lines. For assistant messages, we build a
-/// composite content string that includes thinking blocks (as `reason "..."`
-/// synthetic notation) and text blocks. Tool use blocks are included as
-/// `<tool-name> <args-summary>` so they're visible in memory summaries.
-fn collect_messages(records: &[JsonValue]) -> Vec<MessageRecord> {
-    let mut out = Vec::new();
-    for (idx, record) in records.iter().enumerate() {
-        let Some(object) = record.as_object() else {
-            continue;
-        };
-        let record_type = object.get("type").and_then(JsonValue::as_str).unwrap_or("");
-        match record_type {
-            "user" => {
-                if let Some(msg) = extract_user_message(object, idx) {
-                    out.push(msg);
-                }
-            }
-            "assistant" => {
-                if let Some(msg) = extract_assistant_message(object, idx) {
-                    out.push(msg);
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-fn extract_user_message(
-    object: &serde_json::Map<String, JsonValue>,
-    order: usize,
-) -> Option<MessageRecord> {
-    let session_id = object.get("sessionId").and_then(JsonValue::as_str)?;
-    let uuid = object.get("uuid").and_then(JsonValue::as_str)?;
-    let parent_uuid = object
-        .get("parentUuid")
-        .and_then(JsonValue::as_str)
-        .map(str::to_string);
-    let timestamp = object
-        .get("timestamp")
-        .and_then(JsonValue::as_str)
-        .and_then(parse_iso_timestamp);
-
-    let message = object.get("message").and_then(JsonValue::as_object)?;
-    let content = extract_user_content(message)?;
-    if content.trim().is_empty() {
-        return None;
-    }
-
-    Some(MessageRecord {
-        conversation_id: session_id.to_string(),
-        source_message_id: uuid.to_string(),
-        parent_source_id: parent_uuid,
-        role: "user".to_string(),
-        author: "user".to_string(),
-        model: None,
-        content,
-        created_at: timestamp,
-        order,
-    })
-}
-
-fn extract_assistant_message(
-    object: &serde_json::Map<String, JsonValue>,
-    order: usize,
-) -> Option<MessageRecord> {
-    let session_id = object.get("sessionId").and_then(JsonValue::as_str)?;
-    let uuid = object.get("uuid").and_then(JsonValue::as_str)?;
-    let parent_uuid = object
-        .get("parentUuid")
-        .and_then(JsonValue::as_str)
-        .map(str::to_string);
-    let timestamp = object
-        .get("timestamp")
-        .and_then(JsonValue::as_str)
-        .and_then(parse_iso_timestamp);
-
-    let message = object.get("message").and_then(JsonValue::as_object)?;
-    let model = message
-        .get("model")
-        .and_then(JsonValue::as_str)
-        .map(str::to_string);
-    let content = extract_assistant_content(message)?;
-    if content.trim().is_empty() {
-        return None;
-    }
-
-    let author = model.as_deref().unwrap_or("assistant").to_string();
-
-    Some(MessageRecord {
-        conversation_id: session_id.to_string(),
-        source_message_id: uuid.to_string(),
-        parent_source_id: parent_uuid,
-        role: "assistant".to_string(),
-        author,
-        model,
-        content,
-        created_at: timestamp,
-        order,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Content extraction
-// ---------------------------------------------------------------------------
-
-/// Extract text content from a user message.
-///
-/// User messages have either:
-/// - `content: "string"` (plain text)
-/// - `content: [{ type: "text", text: "..." }, { type: "tool_result", content: "...", tool_use_id: "..." }]`
-fn extract_user_content(message: &serde_json::Map<String, JsonValue>) -> Option<String> {
-    let content = message.get("content")?;
-
-    // Simple string content.
-    if let Some(text) = content.as_str() {
-        return Some(text.to_string());
-    }
-
-    // Content block array.
-    let blocks = content.as_array()?;
-    let mut parts = Vec::new();
-    for block in blocks {
-        let Some(obj) = block.as_object() else {
-            continue;
-        };
-        let block_type = obj.get("type").and_then(JsonValue::as_str).unwrap_or("");
-        match block_type {
-            "text" => {
-                if let Some(text) = obj.get("text").and_then(JsonValue::as_str) {
-                    if !text.trim().is_empty() {
-                        parts.push(text.to_string());
-                    }
-                }
-            }
-            "tool_result" => {
-                let tool_id = obj
-                    .get("tool_use_id")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("unknown");
-                let result_text = obj.get("content").and_then(JsonValue::as_str).unwrap_or("");
-                let is_error = obj
-                    .get("is_error")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
-                let status = if is_error { "error" } else { "ok" };
-                // Truncate long tool results for the archive content.
-                let truncated = truncate(result_text, 2000);
-                parts.push(format!("[tool_result {tool_id} {status}] {truncated}"));
-            }
-            _ => {}
-        }
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n\n"))
-    }
-}
-
-/// Extract composite content from an assistant message.
-///
-/// Assistant content blocks:
-/// - `thinking`: extended thinking (mapped to `reason "..."` notation)
-/// - `text`: response text
-/// - `tool_use`: tool invocations (mapped to `<tool> <input-summary>` notation)
-fn extract_assistant_content(message: &serde_json::Map<String, JsonValue>) -> Option<String> {
-    let blocks = message.get("content").and_then(JsonValue::as_array)?;
-    let mut parts = Vec::new();
-
-    for block in blocks {
-        let Some(obj) = block.as_object() else {
-            continue;
-        };
-        let block_type = obj.get("type").and_then(JsonValue::as_str).unwrap_or("");
-        match block_type {
-            "thinking" => {
-                if let Some(thinking) = obj.get("thinking").and_then(JsonValue::as_str) {
-                    let trimmed = thinking.trim();
-                    if !trimmed.is_empty() {
-                        // Represent thinking as reason notation for archive content.
-                        let truncated = truncate(trimmed, 4000);
-                        parts.push(format!("[thinking] {truncated}"));
-                    }
-                }
-            }
-            "text" => {
-                if let Some(text) = obj.get("text").and_then(JsonValue::as_str) {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        parts.push(trimmed.to_string());
-                    }
-                }
-            }
-            "tool_use" => {
-                let tool_name = obj
-                    .get("name")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("unknown_tool");
-                let input_summary =
-                    summarize_tool_input(obj.get("input").and_then(JsonValue::as_object));
-                parts.push(format!("[tool_use {tool_name}] {input_summary}"));
-            }
-            _ => {}
-        }
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n\n"))
-    }
-}
-
-/// Produce a short summary of tool input parameters.
-fn summarize_tool_input(input: Option<&serde_json::Map<String, JsonValue>>) -> String {
-    let Some(input) = input else {
-        return String::new();
-    };
-
-    // For common tools, extract the most informative field.
-    if let Some(path) = input.get("file_path").and_then(JsonValue::as_str) {
-        return path.to_string();
-    }
-    if let Some(command) = input.get("command").and_then(JsonValue::as_str) {
-        return truncate(command, 200);
-    }
-    if let Some(pattern) = input.get("pattern").and_then(JsonValue::as_str) {
-        return format!("pattern={pattern}");
-    }
-    if let Some(query) = input.get("query").and_then(JsonValue::as_str) {
-        return truncate(query, 200);
-    }
-    if let Some(prompt) = input.get("prompt").and_then(JsonValue::as_str) {
-        return truncate(prompt, 200);
-    }
-
-    // Fallback: list keys.
-    let keys: Vec<&str> = input.keys().map(String::as_str).collect();
-    if keys.is_empty() {
-        String::new()
-    } else {
-        keys.join(", ")
-    }
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
-    } else {
-        let truncated: String = text.chars().take(max_chars).collect();
-        format!("{truncated}...")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -690,8 +700,8 @@ pub fn import_into_archive(
     match (res, close_res) {
         (Ok(stats), Ok(())) => {
             println!(
-                "Imported {} file(s), {} conversation(s), {} message(s) in {} new commit(s).",
-                stats.files, stats.conversations, stats.messages, stats.commits
+                "Imported {} file(s), {} block(s), {} content-fact(s) in {} new commit(s).",
+                stats.files, stats.blocks, stats.content_facts, stats.commits
             );
             Ok(())
         }
@@ -701,5 +711,193 @@ pub fn import_into_archive(
             eprintln!("warning: close pile after error: {close_err:#}");
             Err(err)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — projection only, no pile (in-memory fragment + query-back).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use triblespace::prelude::inlineencodings::Handle;
+
+    /// A tiny synthetic `.claude` conversation: user → assistant (thinking +
+    /// text + tool_use) → user (tool_result), plus a `system` line that must be
+    /// ignored.
+    const SAMPLE: &str = r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T15:34:01.542Z","sessionId":"s1","message":{"role":"user","content":"hello there"}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-03-01T15:34:05.000Z","sessionId":"s1","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"thinking","thinking":"let me think","signature":"sig-abc"},{"type":"text","text":"hi!"},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","uuid":"u2","parentUuid":"a1","timestamp":"2026-03-01T15:34:06.000Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1\nfile2","is_error":false}]}}
+{"type":"system","uuid":"sys1","parentUuid":"u2","timestamp":"2026-03-01T15:34:07.000Z","content":"ignored"}"#;
+
+    fn project(sample: &str) -> Fragment {
+        let bytes = Bytes::from_source(sample.as_bytes().to_vec());
+        project_jsonl(&bytes).expect("projection succeeds")
+    }
+
+    fn resolve_payload(frag: &Fragment, handle: Inline<Handle<LongString>>) -> String {
+        let mut blobs = frag.blobs().clone();
+        let reader = blobs.reader().expect("blob reader");
+        let view: View<str> = reader
+            .get::<View<str>, LongString>(handle)
+            .expect("payload bytes present");
+        view.as_ref().to_owned()
+    }
+
+    fn block_ids(frag: &Fragment) -> Vec<Id> {
+        find!(
+            (block: Id),
+            pattern!(frag.facts(), [{ ?block @ common::metadata::tag: common::block::KIND }])
+        )
+        .map(|(block,)| block)
+        .collect()
+    }
+
+    fn block_payloads(frag: &Fragment, block: Id) -> Vec<String> {
+        find!(
+            (cf: Id, payload: Inline<Handle<LongString>>),
+            pattern!(frag.facts(), [
+                { block @ common::block::contains: ?cf },
+                { ?cf @ common::content_fact::payload: ?payload },
+            ])
+        )
+        .map(|(_cf, payload)| resolve_payload(frag, payload))
+        .collect()
+    }
+
+    fn block_directions(frag: &Fragment, block: Id) -> Vec<Id> {
+        find!(
+            (cf: Id, direction: Id),
+            pattern!(frag.facts(), [
+                { block @ common::block::contains: ?cf },
+                { ?cf @ common::content_fact::direction: ?direction },
+            ])
+        )
+        .map(|(_cf, direction)| direction)
+        .collect()
+    }
+
+    fn previous_of(frag: &Fragment, block: Id) -> Option<Id> {
+        find!(
+            (prev: Id),
+            pattern!(frag.facts(), [{ block @ common::block::previous: ?prev }])
+        )
+        .map(|(prev,)| prev)
+        .next()
+    }
+
+    fn find_block(frag: &Fragment, needle: &str) -> Id {
+        block_ids(frag)
+            .into_iter()
+            .find(|&block| block_payloads(frag, block).iter().any(|p| p.contains(needle)))
+            .unwrap_or_else(|| panic!("no block contains payload {needle:?}"))
+    }
+
+    #[test]
+    fn projects_one_block_per_user_or_assistant_record() {
+        let frag = project(SAMPLE);
+        // u1, a1, u2 → 3 blocks; the `system` line is ignored.
+        assert_eq!(block_ids(&frag).len(), 3);
+        // 1 (u1 text) + 3 (a1 thinking/text/tool_use) + 1 (u2 tool_result).
+        let content_facts = find!(
+            (cf: Id),
+            pattern!(frag.facts(), [{ ?cf @ common::metadata::tag: common::content_fact::KIND }])
+        )
+        .count();
+        assert_eq!(content_facts, 5);
+    }
+
+    #[test]
+    fn previous_edges_chain_through_parent_uuid() {
+        let frag = project(SAMPLE);
+        let u1 = find_block(&frag, "hello there");
+        let a1 = find_block(&frag, "hi!");
+        let u2 = find_block(&frag, "file1");
+
+        assert_eq!(previous_of(&frag, u1), None, "root record has no previous");
+        assert_eq!(previous_of(&frag, a1), Some(u1));
+        assert_eq!(previous_of(&frag, u2), Some(a1));
+    }
+
+    #[test]
+    fn direction_follows_record_and_block_type() {
+        let frag = project(SAMPLE);
+        let u1 = find_block(&frag, "hello there");
+        let a1 = find_block(&frag, "hi!");
+        let u2 = find_block(&frag, "file1");
+
+        let in_ = common::content_fact::direction::in_;
+        let out_ = common::content_fact::direction::out_;
+
+        assert!(block_directions(&frag, u1).iter().all(|&d| d == in_));
+        assert!(block_directions(&frag, a1).iter().all(|&d| d == out_));
+        assert!(block_directions(&frag, u2).iter().all(|&d| d == in_));
+    }
+
+    #[test]
+    fn modality_and_payload_projected_per_content_block() {
+        let frag = project(SAMPLE);
+        let facts: Vec<(Id, Inline<Handle<LongString>>)> = find!(
+            (modality: Id, payload: Inline<Handle<LongString>>),
+            pattern!(frag.facts(), [{ _?cf @
+                common::content_fact::modality: ?modality,
+                common::content_fact::payload:  ?payload,
+            }])
+        )
+        .collect();
+
+        let payload_for = |wanted: Id| -> Option<String> {
+            facts
+                .iter()
+                .find(|(modality, _)| *modality == wanted)
+                .map(|(_, payload)| resolve_payload(&frag, *payload))
+        };
+
+        assert_eq!(
+            payload_for(common::content_fact::modality::tool_call).as_deref(),
+            Some(r#"{"command":"ls"}"#),
+            "tool_use input rendered to raw-json text"
+        );
+        assert_eq!(
+            payload_for(common::content_fact::modality::thinking).as_deref(),
+            Some("let me think")
+        );
+        assert_eq!(
+            payload_for(common::content_fact::modality::tool_result).as_deref(),
+            Some("file1\nfile2")
+        );
+
+        let texts: HashSet<String> = facts
+            .iter()
+            .filter(|(modality, _)| *modality == common::content_fact::modality::text)
+            .map(|(_, payload)| resolve_payload(&frag, *payload))
+            .collect();
+        assert!(texts.contains("hello there"));
+        assert!(texts.contains("hi!"));
+    }
+
+    #[test]
+    fn thinking_signature_is_non_identity_annotation() {
+        let frag = project(SAMPLE);
+        // The thinking content-fact carries its signature; find it and resolve.
+        let signature = find!(
+            (sig: Inline<Handle<LongString>>),
+            pattern!(frag.facts(), [{ _?cf @
+                common::content_fact::modality:  common::content_fact::modality::thinking,
+                common::content_fact::signature: ?sig,
+            }])
+        )
+        .map(|(sig,)| resolve_payload(&frag, sig))
+        .next();
+        assert_eq!(signature.as_deref(), Some("sig-abc"));
+    }
+
+    #[test]
+    fn reprojection_is_content_addressed_stable() {
+        let first: HashSet<Id> = block_ids(&project(SAMPLE)).into_iter().collect();
+        let second: HashSet<Id> = block_ids(&project(SAMPLE)).into_iter().collect();
+        assert_eq!(first, second, "re-projecting the same input yields identical block ids");
     }
 }
