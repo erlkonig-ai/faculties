@@ -62,40 +62,51 @@ fn import_claude_code_path(
         );
         let mut total = ImportStats::default();
         let total_files = paths.len();
-        let parsed_files: Vec<(PathBuf, Result<Vec<JsonValue>>)> =
-            common::parse_paths_parallel("claude-code", &paths, parse_jsonl)?;
-
-        for (index, (file, parsed_records)) in parsed_files.into_iter().enumerate() {
-            let processed = index + 1;
-            let file_start = Instant::now();
-            println!(
-                "claude-code file {processed}/{total_files}: {}",
-                file.display()
-            );
-            let raw_records =
-                parsed_records.with_context(|| format!("parse {}", file.display()))?;
-            if raw_records.is_empty() {
-                continue;
-            }
-            let stats = import_claude_code_records(
-                &file,
-                raw_records,
-                repo,
-                &mut ws,
-                &mut catalog,
-                &mut catalog_head,
-            )
-            .with_context(|| format!("import {}", file.display()))?;
-            total.files += stats.files;
-            total.conversations += stats.conversations;
-            total.messages += stats.messages;
-            total.commits += stats.commits;
-            println!(
-                "claude-code progress files {}/{} (conversations {}, messages {}, commits {}) in {:?}",
-                processed, total_files, total.conversations, total.messages, total.commits,
-                file_start.elapsed()
-            );
-        }
+        // Bounded in-flight parses. The old `parse_paths_parallel` collected
+        // EVERY parsed file before the first commit, so peak memory tracked the
+        // corpus: 3205 files / 6.8 GB of JSON reached 57.9 GB resident and swapped
+        // the machine (2026-07-26). Streaming with backpressure keeps at most a
+        // handful of parsed files alive while committing proceeds in parallel.
+        // Kept small deliberately — a single transcript here can be 2 GB.
+        const PARSE_IN_FLIGHT: usize = 4;
+        common::parse_paths_streaming(
+            "claude-code",
+            &paths,
+            PARSE_IN_FLIGHT,
+            parse_jsonl,
+            |index, file, parsed_records| {
+                let processed = index + 1;
+                let file_start = Instant::now();
+                println!(
+                    "claude-code file {processed}/{total_files}: {}",
+                    file.display()
+                );
+                let raw_records =
+                    parsed_records.with_context(|| format!("parse {}", file.display()))?;
+                if raw_records.is_empty() {
+                    return Ok(());
+                }
+                let stats = import_claude_code_records(
+                    &file,
+                    raw_records,
+                    repo,
+                    &mut ws,
+                    &mut catalog,
+                    &mut catalog_head,
+                )
+                .with_context(|| format!("import {}", file.display()))?;
+                total.files += stats.files;
+                total.conversations += stats.conversations;
+                total.messages += stats.messages;
+                total.commits += stats.commits;
+                println!(
+                    "claude-code progress files {}/{} (conversations {}, messages {}, commits {}) in {:?}",
+                    processed, total_files, total.conversations, total.messages, total.commits,
+                    file_start.elapsed()
+                );
+                Ok(())
+            },
+        )?;
         return Ok(total);
     }
 
