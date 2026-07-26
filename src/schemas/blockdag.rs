@@ -163,7 +163,7 @@ pub mod content_fact {
     /// Kind tag for content-fact entities (applied via `metadata::tag`).
     pub const KIND: Id = id_hex!("C29DDE04AD573274192D1AB86BA5B0A3");
 
-    /// Reified modality tag entities. A new modality gets both directions for
+    /// Reified modality tag entities. A new modality gets every direction for
     /// free — direction is a separate axis, never doubled into the vocabulary.
     pub mod modality {
         use super::*;
@@ -173,6 +173,12 @@ pub mod content_fact {
         pub const tool_call: Id = id_hex!("A4B7EC585B0906BFFC42464015E2903C");
         pub const tool_result: Id = id_hex!("09A663D69EBDEC15ED329EC5CB7AF445");
         pub const thinking: Id = id_hex!("293748A40FE28BDC888C1AF336F60D5C");
+        /// A channel event that is none of the above — an API timeout, a
+        /// permission-mode change, a file-history snapshot. Payload is the
+        /// event's raw source JSON, verbatim: save it all, refine later
+        /// (a refined re-projection mints sibling entities — the re-export
+        /// honesty property — never mutates these).
+        pub const event: Id = id_hex!("2F13E9308B0760AAFBAC4B1FF959154C");
     }
 
     /// Reified direction tag entities. `(text "ok", in_)` and `(text "ok", out_)`
@@ -183,5 +189,17 @@ pub mod content_fact {
         pub const in_: Id = id_hex!("1452B759336E0DEF96E78937D6E7F15D");
         /// Produced by the being (its reply, thinking, a tool call).
         pub const out_: Id = id_hex!("39990F231B5FDB6F0FF4DB55616A2939");
+        /// Happened in the channel, neither perceived nor produced by the
+        /// experiencer — an API timeout, harness state, a progress tick.
+        /// Ambient events shape the conversation even unperceived (JP,
+        /// 2026-07-26: save it all), so they are blocks in the chain, not
+        /// dropped plumbing — dropping them fragmented 47k previous-edges.
+        /// Explicit third tag rather than an absent one: absence never
+        /// carries meaning. For training, loss is computed only on `out`;
+        /// `in` and `ambient` are both masked. Ambient blocks carry no
+        /// `author` (a timeout has none) — legal because author is
+        /// non-identity. The invariant refines to: `author == experiencer`
+        /// ⟺ `direction = out`, evaluated only where author exists.
+        pub const ambient: Id = id_hex!("0EE490D68C82C4F734D15222C8F2AF5D");
     }
 }

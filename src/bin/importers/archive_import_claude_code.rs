@@ -635,10 +635,14 @@ fn project_jsonl(
     let mut correlator_to_cf: HashMap<String, Id> = HashMap::new();
 
     for_each_jsonl_line(bytes, |line| {
+        // Keep the raw line (cheap Arc-clone of the mmap slice) — ambient
+        // records store it verbatim as their event payload.
+        let raw_line = line.clone();
         let record =
             scan_record(line).map_err(|e| anyhow!("scan claude-code jsonl record: {e}"))?;
         project_record(
             &record,
+            &raw_line,
             &mut frag,
             &mut uuid_to_block,
             &mut skipped_uuids,
@@ -662,6 +666,7 @@ fn project_jsonl(
 /// non-identity pass) for both its content-facts and the block itself.
 fn project_record(
     record: &RawRecord,
+    raw_line: &Bytes,
     frag: &mut Fragment,
     uuid_to_block: &mut HashMap<String, Id>,
     skipped_uuids: &mut HashSet<String>,
@@ -670,21 +675,20 @@ fn project_record(
     roster: Option<&RosterIndex>,
     stats: &mut ProjectionStats,
 ) {
-    // Only user/assistant records are blocks. `user` is perceived (`in`),
-    // `assistant` is produced (`out`); other line types (system, progress,
-    // file-history-snapshot, …) are skipped — they carry no dialogue. Their
-    // uuids are still recorded so a child's `parentUuid` into one of them is
-    // classified as skipped-parent, not cross-file.
+    // EVERY record is a block. `user` is perceived (`in`), `assistant` is
+    // produced (`out`), and every other record type — progress, system,
+    // file-history-snapshot, attachment, queue-operation, … — is an
+    // `ambient` channel event (JP 2026-07-26: save it all — an API timeout
+    // shapes the conversation even unperceived, and dropping these
+    // fragmented 47k previous-chains in the first real import). The
+    // `skipped_uuids` machinery remains only for lines that fail to
+    // project at all.
     let record_direction = match record.record_type.as_str() {
         "user" => common::content_fact::direction::in_,
         "assistant" => common::content_fact::direction::out_,
-        _ => {
-            if let Some(uuid) = &record.uuid {
-                skipped_uuids.insert(uuid.clone());
-            }
-            return;
-        }
+        _ => common::content_fact::direction::ambient,
     };
+    let is_ambient = record_direction == common::content_fact::direction::ambient;
 
     let mut contained: Vec<Id> = Vec::new();
     for block in &record.blocks {
@@ -779,6 +783,29 @@ fn project_record(
         }
     }
 
+    if is_ambient {
+        // One event content-fact carrying the record's raw source JSON,
+        // verbatim — nothing dropped, nothing interpreted. A later, richer
+        // projection (e.g. attachment → asset facts) mints sibling entities
+        // under the re-export honesty property; it never mutates these.
+        let payload = frag.put::<LongString, _>(
+            String::from_utf8_lossy(raw_line.as_ref()).into_owned(),
+        );
+        let cf = entity! { _ @
+            common::content_fact::modality:  common::content_fact::modality::event,
+            common::content_fact::direction: common::content_fact::direction::ambient,
+            common::content_fact::payload:   payload,
+        };
+        let cf_id = cf
+            .root()
+            .expect("content_fact entity! must export a single root id");
+        *frag += cf;
+        *frag += entity! { &ExclusiveId::force(cf_id) @
+            common::metadata::tag: common::content_fact::KIND,
+        };
+        contained.push(cf_id);
+    }
+
     // Block identity core: {previous?, timestamp, contains-<cf ids>}.
     //
     // Cross-file `previous` (phase 3 — the dependency-ordered projection the
@@ -840,9 +867,12 @@ fn project_record(
     let is_out = record_direction == common::content_fact::direction::out_;
     let (author, experiencer) = match roster {
         // Out-blocks are the being's own production: author = experiencer =
-        // its face entity. In-blocks: the external participant authored what
-        // the face experienced.
+        // its face entity. Ambient events belong to the face's stream but
+        // nobody authored them — author stays absent (legal: non-identity).
+        // In-blocks: the external participant authored what the face
+        // experienced.
         Some(roster) if is_out => (roster.face(), roster.face()),
+        Some(roster) if is_ambient => (None, roster.face()),
         Some(roster) => (roster.resolve(&author_label), roster.face()),
         None => (None, None),
     };
@@ -858,11 +888,15 @@ fn project_record(
             );
         }
     }
-    let source_author = frag.put::<LongString, _>(author_label);
+    // Ambient events carry no author claim — writing the record type as a
+    // source_author label would fabricate one. The raw type is queryable
+    // from the event payload.
+    let source_author =
+        (!is_ambient).then(|| frag.put::<LongString, _>(author_label));
     let block_entity = ExclusiveId::force(block_id);
     *frag += entity! { &block_entity @
         common::metadata::tag:                  common::block::KIND,
-        common::import_schema::source_author:   source_author,
+        common::import_schema::source_author?:  source_author,
         common::import_schema::source_created_at: timestamp,
         common::block::author?:                 author,
         common::block::experiencer?:            experiencer,
@@ -1499,17 +1533,26 @@ mod tests {
     }
 
     #[test]
-    fn projects_one_block_per_user_or_assistant_record() {
+    fn every_record_projects_a_block() {
         let frag = project(SAMPLE);
-        // u1, a1, u2 → 3 blocks; the `system` line is ignored.
-        assert_eq!(block_ids(&frag).len(), 3);
-        // 1 (u1 text) + 3 (a1 thinking/text/tool_use) + 1 (u2 tool_result).
+        // u1, a1, u2 dialogue blocks + sys1 as an ambient event block —
+        // save it all: channel events shape the conversation even
+        // unperceived, and they hold the previous-chain together.
+        assert_eq!(block_ids(&frag).len(), 4);
+        // 1 (u1 text) + 3 (a1 thinking/text/tool_use) + 1 (u2 tool_result)
+        // + 1 (sys1 ambient event).
         let content_facts = find!(
             (cf: Id),
             pattern!(frag.facts(), [{ ?cf @ common::metadata::tag: common::content_fact::KIND }])
         )
         .count();
-        assert_eq!(content_facts, 5);
+        assert_eq!(content_facts, 6);
+        // The ambient event fact carries the raw source JSON verbatim and
+        // the event modality.
+        let sys = find_block(&frag, r#""type":"system""#);
+        let dirs = block_directions(&frag, sys);
+        assert!(!dirs.is_empty());
+        assert!(dirs.iter().all(|&d| d == common::content_fact::direction::ambient));
     }
 
     #[test]
@@ -1909,15 +1952,22 @@ mod tests {
     #[test]
     fn dangling_parent_uuids_are_counted_by_class() {
         let sample = r#"{"type":"system","uuid":"sys1","parentUuid":null,"timestamp":"2026-03-01T15:34:00.000Z","content":"ignored"}
-{"type":"user","uuid":"u1","parentUuid":"sys1","timestamp":"2026-03-01T15:34:01.000Z","message":{"role":"user","content":"parent was skipped"}}
+{"type":"user","uuid":"u1","parentUuid":"sys1","timestamp":"2026-03-01T15:34:01.000Z","message":{"role":"user","content":"parent was a system line"}}
 {"type":"user","uuid":"u2","parentUuid":"ghost","timestamp":"2026-03-01T15:34:02.000Z","message":{"role":"user","content":"parent in another file"}}"#;
         let projected = project_with(sample, None);
-        assert_eq!(projected.stats.skipped_parents, 1);
+        // The system line is now an ambient BLOCK, so u1's parent resolves
+        // through the ordinary local map — nothing is skipped anymore.
+        assert_eq!(projected.stats.skipped_parents, 0);
         assert_eq!(projected.stats.cross_file_parents, 1);
 
-        // Neither block fabricates a `previous` edge.
         let frag = &projected.fragment;
-        assert_eq!(previous_of(frag, find_block(frag, "parent was skipped")), None);
+        let sys = find_block(frag, r#""type":"system""#);
+        assert_eq!(
+            previous_of(frag, find_block(frag, "parent was a system line")),
+            Some(sys),
+            "ambient parent holds the chain together"
+        );
+        // A truly unknown parent still fabricates no edge.
         assert_eq!(previous_of(frag, find_block(frag, "parent in another file")), None);
     }
 
@@ -2059,25 +2109,26 @@ mod tests {
     }
 
     #[test]
-    fn cross_file_ref_to_skipped_line_counts_as_skipped() {
-        // File A holds ONLY a system line (projects no block — its fragment
-        // is empty, but its skipped uuid still merges into the snapshot).
+    fn cross_file_ref_to_ambient_line_resolves() {
+        // File A holds ONLY a system line — now an ambient block, so file
+        // B's cross-file parent resolves through the wave snapshot.
         let a = r#"{"type":"system","uuid":"a-sys1","parentUuid":null,"timestamp":"2026-03-01T15:34:00.000Z","content":"ignored"}"#;
-        let b = r#"{"type":"user","uuid":"b-u1","parentUuid":"a-sys1","timestamp":"2026-03-01T15:34:01.000Z","message":{"role":"user","content":"child of a skipped line"}}"#;
+        let b = r#"{"type":"user","uuid":"b-u1","parentUuid":"a-sys1","timestamp":"2026-03-01T15:34:01.000Z","message":{"role":"user","content":"child of an ambient line"}}"#;
         let (projections, waves, finals) = project_waves(&[("a", a), ("b", b)]);
-        // The DEFINING file is known from the pre-scan, so B waits for A and
-        // classifies against the snapshot — never the final pass.
+        // B waits for A (the defining file) and resolves against its wave's
+        // snapshot — never the final pass.
         assert_eq!(waves, vec![vec!["a".to_string()], vec!["b".to_string()]]);
         assert!(finals.is_empty());
 
+        let a_block = block_ids(&projections["a"].fragment)[0];
         let b = &projections["b"];
-        assert_eq!(b.stats.skipped_parents, 1, "cross-file-skipped, not dangling");
+        assert_eq!(b.stats.cross_file_resolved, 1, "resolved, not skipped");
+        assert_eq!(b.stats.skipped_parents, 0);
         assert_eq!(b.stats.cross_file_parents, 0);
-        assert_eq!(b.stats.cross_file_resolved, 0);
         assert_eq!(
-            previous_of(&b.fragment, find_block(&b.fragment, "child of a skipped line")),
-            None,
-            "a skipped parent projects no block, so no edge"
+            previous_of(&b.fragment, find_block(&b.fragment, "child of an ambient line")),
+            Some(a_block),
+            "the ambient parent block anchors the cross-file edge"
         );
     }
 }
