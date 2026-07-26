@@ -32,7 +32,10 @@
 //!     content_fact::direction: content_fact::direction::in_,
 //!     content_fact::payload:   text_handle,
 //! };
-//! let cf_id = cf.root().expect("single root id");
+//! // `.root()` yields an `Id`; `entity!{ &id @ … }` wants an `ExclusiveId`
+//! // (an `Id` does not `AsRef<ExclusiveId>`), so wrap it — `force` is the
+//! // check-free constructor, correct for a deterministic content-derived id.
+//! let cf_id = ExclusiveId::force(cf.root().expect("single root id"));
 //! change += cf;
 //! // pass 2 — non-identity facts on the *same* entity id
 //! change += entity! { &cf_id @ metadata::tag: content_fact::KIND };
@@ -43,7 +46,7 @@
 //!     block::previous:  parent_id,   // omit on a conversation's first block
 //!     block::contains:  cf_id,
 //! };
-//! let block_id = block.root().expect("single root id");
+//! let block_id = ExclusiveId::force(block.root().expect("single root id"));
 //! change += block;
 //! change += entity! { &block_id @
 //!     metadata::tag:      block::KIND,
