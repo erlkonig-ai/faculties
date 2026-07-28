@@ -780,6 +780,11 @@ fn cmd_show(
             }
         }
 
+        // The ambient always-true set. Cheap (a handful of fragments) and it
+        // belongs in the snapshot for the same reason the colony does: it is
+        // context you are wrong without, not news you might have missed.
+        print_beliefs(repo)?;
+
         let persona_view = match effective_persona {
             Some(persona_id) => {
                 let view = load_watched_view(
@@ -1947,6 +1952,42 @@ fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>)
     result
 }
 
+/// Render the cover-tagged wiki fragments — the ambient always-true set.
+///
+/// Shared by `show` and `wake` because it is one *role*, not two similar
+/// blocks: "what this window should believe before it does anything." The
+/// two commands differ in what they wrap it in, never in what a belief is.
+///
+/// `show` carries it because `show` is the command that actually gets run at
+/// session start. `wake` renders a full memory cover first — ~800k characters
+/// on this pile — which is more than a session opens with, so beliefs that
+/// live only in `wake` reach nobody.
+fn print_beliefs(repo: &mut Repository<Pile>) -> Result<()> {
+    println!();
+    println!("Beliefs (cover):");
+    let wiki_branch_id = repo
+        .ensure_branch(WIKI_BRANCH_NAME, None)
+        .map_err(|e| anyhow!("ensure wiki branch: {e:?}"))?;
+    let mut wiki_ws = repo
+        .pull(wiki_branch_id)
+        .map_err(|e| anyhow!("pull wiki workspace: {e:?}"))?;
+    let wiki_space = wiki_ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout wiki: {e:?}"))?;
+    let beliefs = cover_fragments(&wiki_space, &mut wiki_ws);
+    if beliefs.is_empty() {
+        println!("- None");
+    } else {
+        for (title, content) in &beliefs {
+            println!("- {title}");
+            for line in content.lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `orient wake` — assemble the full wake bundle a fresh face reads to come
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
@@ -1970,29 +2011,7 @@ fn cmd_wake(pile: &Path, chars: usize, doing_limit: usize, todo_limit: usize) ->
         drop(memory_ws);
 
         // (2) Cover-tagged wiki beliefs — the ambient always-true set.
-        println!();
-        println!("Beliefs (cover):");
-        let wiki_branch_id = repo
-            .ensure_branch(WIKI_BRANCH_NAME, None)
-            .map_err(|e| anyhow!("ensure wiki branch: {e:?}"))?;
-        let mut wiki_ws = repo
-            .pull(wiki_branch_id)
-            .map_err(|e| anyhow!("pull wiki workspace: {e:?}"))?;
-        let wiki_space = wiki_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout wiki: {e:?}"))?;
-        let beliefs = cover_fragments(&wiki_space, &mut wiki_ws);
-        if beliefs.is_empty() {
-            println!("- None");
-        } else {
-            for (title, content) in &beliefs {
-                println!("- {title}");
-                for line in content.lines() {
-                    println!("    {line}");
-                }
-            }
-        }
-        drop(wiki_ws);
+        print_beliefs(repo)?;
 
         // (3) Compass goals — exactly as the orient snapshot renders them.
         println!();
