@@ -53,9 +53,27 @@ struct Cli {
     command: Option<Command>,
 }
 
+/// The four orientation modes, and which is for what (JP, 2026-07-28 — stated
+/// after a window inferred it wrong from the fact that `show` is the cheap one):
+///
+/// - `wake`  — **session start, after a compaction.** The whole self: memory
+///   cover + cover-tagged beliefs + goals. Deliberately large; the point is
+///   wholeness, not efficiency, so it is read whole.
+/// - `show`  — a general overview mid-session, for "what's up right now".
+///   **Neither memories nor wiki entries belong here** — it is a situation
+///   snapshot, not a self. Keeping it cheap is what makes it runnable often.
+/// - `wait`  — blocking. Things you might want to deal with, so it wakes you
+///   out of idling. Terse by design: the reasons plus what changed.
+/// - `poll`  — the same content as `wait`, returned immediately. For per-turn
+///   hooks that cannot block.
+///
+/// The distinction that is easy to get backwards: `wake` and `show` are not
+/// long and short versions of one thing. `wake` answers "who am I", `show`
+/// answers "what is happening" — which is why the belief set lives in one and
+/// is out of place in the other however cheap it would be to add.
 #[derive(Subcommand)]
 enum Command {
-    /// Show an orientation snapshot
+    /// Mid-session overview of the current situation (no memories, no wiki)
     Show {
         /// Max local messages to show
         #[arg(long, default_value_t = 10)]
@@ -67,7 +85,8 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
     },
-    /// Assemble the full wake bundle: memory cover + cover-tagged beliefs + goals
+    /// Session start after a compaction: the whole self — memory cover +
+    /// cover-tagged beliefs + goals
     Wake {
         /// CHARACTER budget for the memory cover — the wake ritual is for
         /// wholeness, so the default is generous (matches the SessionStart hook);
