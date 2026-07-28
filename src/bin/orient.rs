@@ -439,7 +439,27 @@ fn render_compass_goals(
                 .next()
                 .map(interval_key)
                 .unwrap_or(0);
-        let sort_key = status_at.unwrap_or(created_key);
+        // Rank by when the goal was last *touched*, not when its status was
+        // last declared. A goal accumulating notes is being worked on even
+        // if nobody remembered to move it, and forgetting to move it is the
+        // common case — a status is declared, activity is derived, and only
+        // the derived one is reliably true. Without this, a session's
+        // "where was I?" can miss the goal that holds the whole session.
+        let note_key: Option<i128> = find!(
+            at: IntervalValue,
+            pattern!(space, [{ _?note @
+                metadata::tag: &KIND_NOTE_ID,
+                board::task: &task_id,
+                metadata::created_at: ?at
+            }])
+        )
+        .map(interval_key)
+        .max();
+        let sort_key = status_at
+            .into_iter()
+            .chain(note_key)
+            .max()
+            .unwrap_or(created_key);
         if status == "doing" {
             doing.push((sort_key, task_id));
         } else if status == "todo" {
