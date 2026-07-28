@@ -60,6 +60,10 @@ enum Command {
         /// Show done goals too
         #[arg(long)]
         all: bool,
+        /// Show goals with no activity for 30 days, which are folded into a
+        /// count by default
+        #[arg(long)]
+        stale: bool,
         /// Filter by tag (repeatable, shows goals matching any)
         #[arg(long)]
         tag: Vec<String>,
@@ -397,6 +401,33 @@ fn is_ancestor(space: &TribleSet, from: Id, to: Id) -> bool {
 }
 
 /// Count notes for a task.
+/// When this goal last moved: the most recent of a status change or a note.
+///
+/// Staleness is *derived*, never declared. Nobody has to remember to mark a
+/// goal abandoned — the pile already records every time it was touched, so
+/// the board can simply read what is there. That matters because the
+/// alternative, asking each session to tidy up at the end, is a separate
+/// obligation, and separate obligations are exactly what the ledger
+/// principle says will not happen: on the day this was written the board
+/// held 106 goals in `doing`, around 70% of them untouched for over a month.
+fn task_last_activity(space: &TribleSet, task_id: Id) -> Option<i128> {
+    let status_at = latest_status_event(space, task_id).map(|(_, _, at)| interval_key(at));
+    let note_at = find!(
+        at: IntervalValue,
+        pattern!(space, [{ _?evt @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &task_id,
+            metadata::created_at: ?at
+        }])
+    )
+    .map(interval_key)
+    .max();
+    match (status_at, note_at) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 fn note_count(space: &TribleSet, task_id: Id) -> usize {
     find!(
         _n: TextHandle,
@@ -508,7 +539,12 @@ fn render_board(
     status_filter: &[String],
     tag_filter: &[String],
     show_done: bool,
+    show_stale: bool,
 ) {
+    // A goal untouched for this long is not in progress, whatever column it
+    // sits in. Read, never declared — see `task_last_activity`.
+    const STALE_AFTER_NS: i128 = 30 * 24 * 60 * 60 * 1_000_000_000;
+    let now_key = interval_key(epoch_interval(now_epoch()));
     let goal_ids = all_goal_ids(space);
     let mut priority_edges = active_priority_edges(space);
     // Implicit: children must be done before parents → child > parent
@@ -555,6 +591,7 @@ fn render_board(
             sort_key,
             note_count: notes,
             parent,
+            last_activity: task_last_activity(space, task_id),
         });
     }
 
@@ -579,8 +616,28 @@ fn render_board(
 
     for status in ordered_statuses {
         let rows = columns.remove(&status).unwrap_or_default();
+        let total = rows.len();
+        // Fold the untouched out of the way rather than deleting them: they
+        // stay addressable by id, and nobody has to have remembered to tidy.
+        let (rows, folded): (Vec<TaskRow>, Vec<TaskRow>) = if show_stale {
+            (rows, Vec::new())
+        } else {
+            rows.into_iter().partition(|r| {
+                r.last_activity
+                    .is_none_or(|at| now_key - at < STALE_AFTER_NS)
+            })
+        };
         println!();
-        println!("== {} ({}) ==", status.to_uppercase(), rows.len());
+        if folded.is_empty() {
+            println!("== {} ({}) ==", status.to_uppercase(), total);
+        } else {
+            println!(
+                "== {} ({} active, {} untouched 30d+ — `--stale` to show) ==",
+                status.to_uppercase(),
+                rows.len(),
+                folded.len()
+            );
+        }
         let ordered = order_rows(rows, &priority_edges);
         for (row, depth) in ordered {
             let indent = "  ".repeat(depth);
@@ -606,6 +663,8 @@ struct TaskRow {
     sort_key: i128,
     note_count: usize,
     parent: Option<Id>,
+    /// Most recent status change or note; `None` when neither exists.
+    last_activity: Option<i128>,
 }
 
 #[derive(Debug)]
@@ -905,6 +964,7 @@ fn cmd_list(
     status_filter: Vec<String>,
     tag_filter: Vec<String>,
     show_done: bool,
+    show_stale: bool,
 ) -> Result<()> {
     let status_filter: Vec<String> = status_filter.into_iter().map(normalize_status).collect();
     for status in &status_filter {
@@ -918,7 +978,14 @@ fn cmd_list(
         let space = ws
             .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        render_board(&mut ws, &space, &status_filter, &tag_filter, show_done);
+        render_board(
+            &mut ws,
+            &space,
+            &status_filter,
+            &tag_filter,
+            show_done,
+            show_stale,
+        );
         Ok(())
     })
 }
@@ -1362,9 +1429,12 @@ fn main() -> Result<()> {
                 cli.persona.as_deref(),
             )
         }
-        Command::List { status, tag, all } => {
-            cmd_list(&cli.pile, &cli.branch, branch_id, status, tag, all)
-        }
+        Command::List {
+            status,
+            tag,
+            all,
+            stale,
+        } => cmd_list(&cli.pile, &cli.branch, branch_id, status, tag, all, stale),
         Command::Move { id, status } => cmd_move(
             &cli.pile,
             &cli.branch,
