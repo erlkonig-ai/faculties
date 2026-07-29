@@ -34,6 +34,7 @@ pub fn model_dir() -> std::path::PathBuf {
 
 pub mod files;
 pub mod memory_cover;
+pub mod migrations;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
 pub mod schemas;

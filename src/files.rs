@@ -141,8 +141,30 @@ where
     Blobs: BlobStore,
     T: triblespace::core::blob::IntoBlob<RawBytes>,
 {
+    // Validate before mutating the workspace. `stage_content_handle` repeats
+    // normalization deliberately so both public entry points retain the same
+    // strict contract when called independently.
     let media_type = normalize_media_type(media_type)?;
     let content = workspace.put::<RawBytes, _>(bytes);
+    stage_content_handle(workspace, content, name, &media_type)
+}
+
+/// Stage a canonical file record around content already present in the pile.
+///
+/// This is the migration/import counterpart to [`stage`]: the raw bytes remain
+/// addressed by the same handle, while the leaf name and media-type entity are
+/// canonicalized through the exact same constructor. It intentionally accepts
+/// no provenance or source path, because those are not part of file identity.
+pub fn stage_content_handle<Blobs>(
+    workspace: &mut Workspace<Blobs>,
+    content: ContentHandle,
+    name: impl Into<String>,
+    media_type: &str,
+) -> Result<Fragment>
+where
+    Blobs: BlobStore,
+{
+    let media_type = normalize_media_type(media_type)?;
     let name = workspace.put::<LongString, _>(leaf_name(&name.into()));
     let media_type_name = workspace.put::<LongString, _>(media_type);
     let media_type = entity! {
@@ -159,6 +181,34 @@ where
         file::name: name,
         file::media_type*: media_type,
     })
+}
+
+/// Build a self-contained canonical file fragment around an existing content
+/// handle without writing to a workspace.
+///
+/// The returned fragment carries the newly addressed leaf-name and media-type
+/// name blobs. This is the dry-run-safe constructor for migrations: committing
+/// the fragment later absorbs those blobs into the destination workspace.
+pub fn fragment_content_handle(
+    content: ContentHandle,
+    name: impl Into<String>,
+    media_type: &str,
+) -> Result<Fragment> {
+    let media_type = normalize_media_type(media_type)?;
+    let mut result = Fragment::empty();
+    let name = result.put::<LongString, _>(leaf_name(&name.into()));
+    let media_type_name = result.put::<LongString, _>(media_type);
+    let media_type = entity! {
+        metadata::tag: &KIND_MEDIA_TYPE,
+        metadata::name: media_type_name,
+    };
+    result += entity! {
+        metadata::tag: &KIND_FILE,
+        file::content: content,
+        file::name: name,
+        file::media_type*: media_type,
+    };
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -220,6 +270,40 @@ mod tests {
 
         assert_eq!(left.root(), right.root());
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn existing_content_handle_uses_the_same_canonical_constructor() {
+        let mut workspace = workspace();
+        let content = workspace.put::<RawBytes, _>(b"same bytes".to_vec());
+        let from_handle = stage_content_handle(
+            &mut workspace,
+            content,
+            "nested/report.txt",
+            "TEXT/PLAIN; charset=utf-8",
+        )
+        .unwrap();
+        let from_bytes = stage(
+            &mut workspace,
+            b"same bytes".to_vec(),
+            "report.txt",
+            "text/plain",
+        )
+        .unwrap();
+
+        assert_eq!(from_handle, from_bytes);
+    }
+
+    #[test]
+    fn self_contained_handle_fragment_matches_and_carries_its_blobs() {
+        let mut workspace = workspace();
+        let content = workspace.put::<RawBytes, _>(b"same bytes".to_vec());
+        let self_contained = fragment_content_handle(content, "report.txt", "text/plain").unwrap();
+        let staged =
+            stage_content_handle(&mut workspace, content, "report.txt", "text/plain").unwrap();
+
+        assert_eq!(self_contained.facts(), staged.facts());
+        assert!(!self_contained.blobs().is_empty());
     }
 
     #[test]
