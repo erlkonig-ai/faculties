@@ -37,6 +37,7 @@ pub mod memory_cover;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
 pub mod schemas;
+pub mod secret_pw;
 pub mod tokens;
 
 /// Resolve a free-text argument that may reference a file or stdin, so every

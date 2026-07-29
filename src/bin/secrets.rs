@@ -290,9 +290,7 @@ fn resolve_named(ws: &mut Workspace<Pile>, space: &TribleSet, kind: Id, input: &
 }
 
 fn password() -> Result<Vec<u8>> {
-    std::env::var("FACULTIES_SECRETS_PW")
-        .map(|s| s.into_bytes())
-        .map_err(|_| anyhow::anyhow!("set FACULTIES_SECRETS_PW to the identity password"))
+    faculties::secret_pw::read("the identity password")
 }
 
 // ── enumerate (the engine does the work) ──────────────────────────────────────

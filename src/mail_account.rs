@@ -67,9 +67,7 @@ struct AccountBody {
 /// Read `FACULTIES_SECRETS_PW` — the password that locks/unlocks account
 /// bodies (the same one the secrets faculty uses).
 pub fn password() -> Result<Vec<u8>> {
-    std::env::var("FACULTIES_SECRETS_PW")
-        .map(|s| s.into_bytes())
-        .map_err(|_| anyhow::anyhow!("set FACULTIES_SECRETS_PW to unlock the stored mail account"))
+    crate::secret_pw::read("unlock the stored mail account")
 }
 
 fn derive_key(password: &[u8], salt: &[u8]) -> Key {
