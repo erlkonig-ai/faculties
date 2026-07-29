@@ -10,7 +10,7 @@
 //! panel.render(ctx, teams_ws);
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 
@@ -94,8 +94,6 @@ struct TeamsLive {
     chats: HashMap<Id, Chat>,
     total_messages: usize,
     chat_count: usize,
-    presentation_name: Option<String>,
-    presentation_boundary: Option<String>,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
@@ -110,7 +108,6 @@ impl TeamsLive {
                 TribleSet::new()
             });
         let cached_head = ws.head();
-        let (presentation_name, presentation_boundary) = load_presentation_context(ws, &space);
 
         let mut chats: HashMap<Id, Chat> = HashMap::new();
         for (cid,) in find!(
@@ -198,8 +195,6 @@ impl TeamsLive {
             chats,
             total_messages,
             chat_count,
-            presentation_name,
-            presentation_boundary,
         }
     }
 
@@ -209,69 +204,6 @@ impl TeamsLive {
             None => format!("chat:{}", short_hex(cid)),
         }
     }
-
-    fn section_title(&self) -> String {
-        match self
-            .presentation_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            Some(name) => format!("Teams · {name} · WORK"),
-            None => "Teams · CONTEXT UNSET".to_string(),
-        }
-    }
-}
-
-fn load_presentation_context(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-) -> (Option<String>, Option<String>) {
-    let mut context_ids = find!(
-        (config: Id),
-        pattern!(space, [{ ?config @ metadata::tag: &teams_attrs::kind_context }])
-    )
-    .into_iter()
-    .map(|(config_id,)| config_id)
-    .collect::<Vec<_>>();
-    context_ids.sort_unstable();
-    context_ids.dedup();
-    let superseded = find!(
-        (predecessor: Id),
-        pattern!(space, [{
-            _?successor @
-            metadata::tag: &teams_attrs::kind_context,
-            metadata::supersedes: ?predecessor,
-        }])
-    )
-    .into_iter()
-    .map(|(predecessor,)| predecessor)
-    .collect::<HashSet<_>>();
-    let latest = context_ids
-        .iter()
-        .copied()
-        .filter(|context_id| !superseded.contains(context_id))
-        .max()
-        .or_else(|| context_ids.into_iter().max());
-
-    let Some(config_id) = latest else {
-        return (None, None);
-    };
-    let name = find!(
-        (handle: TextHandle),
-        pattern!(space, [{ config_id @ metadata::name: ?handle }])
-    )
-    .into_iter()
-    .next()
-    .and_then(|(handle,)| read_text(ws, handle));
-    let boundary = find!(
-        (handle: TextHandle),
-        pattern!(space, [{ config_id @ metadata::description: ?handle }])
-    )
-    .into_iter()
-    .next()
-    .and_then(|(handle,)| read_text(ws, handle));
-    (name, boundary)
 }
 
 fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
@@ -397,52 +329,11 @@ impl TeamsViewer {
             self.live = Some(TeamsLive::refresh(ws));
         }
 
-        let section_title = self
-            .live
-            .as_ref()
-            .map(TeamsLive::section_title)
-            .unwrap_or_else(|| "Teams · CONTEXT UNSET".to_string());
-        ctx.section(&section_title, |ctx| {
+        ctx.section("Teams", |ctx| {
             let Some(live) = self.live.as_ref() else { return };
             let now = Utc::now();
 
             ctx.grid(|g| {
-                g.full(|ctx| {
-                    let ui = ctx.ui_mut();
-                    let identity = live
-                        .presentation_name
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or("CONTEXT UNSET");
-                    ui.label(
-                        egui::RichText::new(format!("PRESENT AS {identity} · PROFESSIONAL WORK"))
-                            .monospace()
-                            .strong()
-                            .small(),
-                    );
-                    if let Some(boundary) = live
-                        .presentation_boundary
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|boundary| !boundary.is_empty())
-                    {
-                        ui.label(
-                            egui::RichText::new(boundary)
-                                .monospace()
-                                .small()
-                                .color(color_muted(ui)),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("BOUNDARY UNSET")
-                                .monospace()
-                                .small()
-                                .color(color_muted(ui)),
-                        );
-                    }
-                });
-
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
                     let shown = live.messages.len();

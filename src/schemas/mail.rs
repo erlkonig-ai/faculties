@@ -17,10 +17,10 @@
 //! no patching.
 //!
 //! Attachments live in the `files` faculty (`KIND_FILE`,
-//! `file::content` / `file::name` / `file::mime`); the mail
-//! message references them via `mail::attachment: GenId` so
-//! attachment dedup (BLAKE3 over file bytes) is automatic
-//! across mail and the rest of the pile.
+//! `file::content` / `file::name` / `file::media_type`); the mail
+//! message references them via `mail::attachment: GenId`. Identical canonical
+//! file records (kind + bytes + leaf name + MIME) converge across faculties,
+//! while the raw byte blob is content-addressed independently.
 //!
 //! Spam is a kind tag (`metadata::tag: &KIND_SPAM`) rather than
 //! a boolean attribute — matches the canonical kind-marker

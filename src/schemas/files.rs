@@ -14,6 +14,13 @@ pub const FILES_BRANCH_NAME: &str = "files";
 
 // ── kinds ────────────────────────────────────────────────────────────────
 pub const KIND_FILE: Id = id_hex!("1F9C9DCA69504452F318BA11E81D47D1");
+/// A normalized IANA media type such as `text/plain` or `image/png`.
+///
+/// Media-type entities are intrinsic records carrying this marker plus their
+/// full normalized name in `metadata::name`. Files point at them through
+/// `file::media_type`, so long vendor types remain lossless and equal types
+/// converge across every producer.
+pub const KIND_MEDIA_TYPE: Id = id_hex!("C0DA01871FCB60E8D7F0B5AC5CF4F960");
 pub const KIND_DIRECTORY: Id = id_hex!("58CDFCBA4E4B91979766D50FB18777B5");
 pub const KIND_IMPORT: Id = id_hex!("89655D039A90634F09207BFEB5BE65AD");
 /// A rasterized PDF page — the retrieval unit for `application/pdf` in the
@@ -31,8 +38,8 @@ pub mod file {
         "C1E3A12230595280F22ABEB8733D082C" as content: inlineencodings::Handle<blobencodings::RawBytes>;
         // file/directory: name (filename or dirname)
         "AA6AB6F5E68F3A9D95681251C2B9DAFA" as name: inlineencodings::Handle<blobencodings::LongString>;
-        // file leaf: MIME type
-        "BFE2C88ECD13D56F80967C343FC072EE" as mime: inlineencodings::ShortString;
+        // file leaf: canonical media-type entity
+        "B300DAE46621BF56D11621BAD9C66BA5" as media_type: inlineencodings::GenId;
         // import: timestamp
         "3765160CC1A96BE38302B344718E4C49" as imported_at: inlineencodings::NsTAIInterval;
         // TODO: migrate to metadata::tag (GenId) — should use canonical tag

@@ -7,7 +7,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{GenId, Handle};
+use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
 use triblespace::prelude::*;
 
 pub const DEFAULT_BRANCH: &str = "teams";
@@ -23,6 +23,12 @@ pub mod teams {
         "B6089037C04529F55D2A2D1A668DBE95" as pub chat_id: Handle<LongString>;
         "02D2C105E35BD5DD6CF7A1F1B74BA686" as pub message_id: Handle<LongString>;
         "1DE123824D5BDA58F92CD002FCFB2BFF" as pub message_raw: Handle<LongString>;
+        /// Logical Teams message that owns an attachment. Together with the
+        /// attachment kind and source-local id, this forms its intrinsic key.
+        "617A66047DCBBDDED1BC5167336FADE0" as pub attachment_message: GenId;
+        /// Graph collection that supplied an attachment id (`attachment` or
+        /// `hosted-content`). The two collections have independent id scopes.
+        "E0FC3B5C541A7DA9C56158D41B322623" as pub attachment_kind: ShortString;
         "5820C49A7A8B4ADBCA4637E3AE2499EB" as pub user_id: Handle<LongString>;
         "57AABA4FBA3A5EC6EF28DC80CD6E0919" as pub delta_link: Handle<LongString>;
         "438A29922F91F873A69C3856AA7A553F" as pub access_token: Handle<LongString>;
@@ -57,24 +63,4 @@ pub mod teams {
     /// Tag for the professional presentation context shown at the Teams boundary.
     #[allow(non_upper_case_globals)]
     pub const kind_context: Id = id_hex!("F2FB22C36519673BFF3BFE77DB005F6F");
-}
-
-// ── Files branch schema (shared with files.rs faculty) ───────────────────
-pub const FILES_BRANCH_NAME: &str = "files";
-
-pub mod file_schema {
-    use triblespace::macros::id_hex;
-    use triblespace::prelude::*;
-
-    #[allow(non_upper_case_globals)]
-    pub const KIND_FILE: Id = id_hex!("1F9C9DCA69504452F318BA11E81D47D1");
-
-    pub mod file {
-        use triblespace::prelude::*;
-        attributes! {
-            "C1E3A12230595280F22ABEB8733D082C" as pub content: inlineencodings::Handle<blobencodings::RawBytes>;
-            "AA6AB6F5E68F3A9D95681251C2B9DAFA" as pub name: inlineencodings::Handle<blobencodings::LongString>;
-            "BFE2C88ECD13D56F80967C343FC072EE" as pub mime: inlineencodings::ShortString;
-        }
-    }
 }
