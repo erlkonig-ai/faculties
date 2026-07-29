@@ -30,8 +30,8 @@ use faculties::schemas::files::{file, KIND_FILE};
 use faculties::mail_account::{self, MailAccount};
 use faculties::pile_cli::{instant_interval, load_value, now_epoch, put_bytes, with_repo};
 use faculties::schemas::mail::{
-    mail, mail_account as mail_attrs, KIND_DRAFT, KIND_MAIL_ACCOUNT, KIND_MAIL_ACTIVE,
-    KIND_MESSAGE, KIND_SPAM,
+    mail, mail_account as mail_attrs, KIND_DRAFT, KIND_MAIL_ACCOUNT, KIND_MESSAGE, KIND_RECEIVED,
+    KIND_SENT, KIND_SPAM,
 };
 use faculties::schemas::message::{local as read_attrs, KIND_READ_ID};
 use faculties::schemas::relations::{relations as rel_attrs, KIND_PERSON_ID};
@@ -75,6 +75,17 @@ struct Cli {
     /// Branch name for decide (deliberation gate for outbound mail)
     #[arg(long, default_value = "decide")]
     decide_branch: String,
+
+    /// Who is acting — the persona label, as in every other faculty.
+    ///
+    /// This is the identity that stamps read receipts. It is deliberately
+    /// NOT derived from a mail address: an address is a credential for an
+    /// external service, and deriving identity from one made `self`
+    /// underivable without a mailbox, made every auto-registered
+    /// correspondent a candidate for `self`, and turned one window with two
+    /// addresses into two identities.
+    #[arg(long, env = "PERSONA", value_name = "LABEL")]
+    persona: Option<String>,
 
     /// Branch holding the encrypted mail accounts.
     ///
@@ -209,6 +220,22 @@ enum Command {
     Account {
         #[command(subcommand)]
         cmd: AccountCmd,
+    },
+    /// Tag pre-existing mail with its direction (one-shot migration).
+    ///
+    /// Direction became an asserted tag (KIND_RECEIVED / KIND_SENT); mail
+    /// written before that carries neither, so it is invisible to the
+    /// unread queries rather than misclassified. This applies the old
+    /// inference ONCE, as a migration — which is the right use for it, as
+    /// opposed to a permanent query: an entity that was ever a draft was
+    /// composed here and, if it has `sent_at`, was sent; anything else
+    /// tagged KIND_MESSAGE arrived.
+    ///
+    /// Reports what it would do and changes nothing unless `--apply`.
+    Backfill {
+        /// Actually write the tags. Without this, dry run.
+        #[arg(long)]
+        apply: bool,
     },
     Resolve { prefix: String },
 }
@@ -478,6 +505,20 @@ fn mime_for_filename(name: &str) -> &'static str {
 /// Find a relations entry whose `email` attribute matches the
 /// provided address (case-folded). Used to resolve "the local
 /// agent's identity" — i.e. who we are when marking messages read.
+/// The acting identity: `$PERSONA` resolved against relations.
+///
+/// Read receipts are stamped with this. `mail` shares `KIND_READ_ID` with
+/// `message`, so a receipt is `(about_message, reader)` in ONE relation
+/// across both faculties — which means `reader` has to be the same identity
+/// in both, or a single window appears as two different readers. `message`
+/// has always used the persona; deriving mail's from an address is what
+/// made them disagree.
+fn self_persona_id(relations_space: &TribleSet, persona: Option<&str>) -> Option<Id> {
+    let label = persona?;
+    faculties::schemas::relations::person_id_for_label(relations_space, label)
+}
+
+#[allow(dead_code)]
 fn find_self_persona(relations_space: &TribleSet, email: &str) -> Option<Id> {
     let needle = email.trim().to_ascii_lowercase();
     find!(
@@ -526,6 +567,17 @@ fn mark_read_if_unread(
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    // Read-state belongs to mail that ARRIVED. A sent message has no
+    // concept of being read — that is a fact about the recipient, which we
+    // do not have — so a receipt on one is a category error, not a no-op.
+    // Refused rather than silently ignored: a stored receipt on outbound
+    // mail would be a false claim in the pile, and the pile is append-only.
+    if !exists!(pattern!(&space, [{ message_id @ metadata::tag: &KIND_RECEIVED }])) {
+        anyhow::bail!(
+            "{} is not received mail — only arriving mail has a read state",
+            fmt_id(message_id)
+        );
+    }
     if is_read(&space, message_id, reader_id) {
         return Ok(false);
     }
@@ -1188,6 +1240,9 @@ fn persist_message(
             change += entity! { ExclusiveId::force_ref(&entity_id) @
                 mail::sent_at: sent_at_iv,
                 mail::raw: raw_handle,
+                // Direction, asserted where it is known. `cmd_fetch` is the
+                // only `as_draft = false` caller, so this branch IS arrival.
+                metadata::tag: &KIND_RECEIVED,
             };
         }
         if parsed.is_spam {
@@ -1229,6 +1284,9 @@ fn mark_sent(
     let sent_iv = instant_interval(sent_at);
     let change = entity! { ExclusiveId::force_ref(&draft_id) @
         metadata::tag: &KIND_MESSAGE,
+        // It left. KIND_DRAFT says "composed here" and stays; only this
+        // says "transmitted", so an unsent draft is never mistaken for one.
+        metadata::tag: &KIND_SENT,
         mail::sent_at: sent_iv,
         mail::raw: raw_handle,
     };
@@ -2124,6 +2182,18 @@ fn collect_messages(
             continue;
         }
         if let Some(reader_id) = unread_only {
+            // Unread applies to mail that ARRIVED. Asked positively: an
+            // entity is inbound because it carries KIND_RECEIVED, not
+            // because it lacks some other tag and not because of who sent
+            // it. Mail predating the direction tags needs the backfill.
+            let received = find!(
+                t: Id,
+                pattern!(space, [{ id @ metadata::tag: ?t }])
+            )
+            .any(|t| t == KIND_RECEIVED);
+            if !received {
+                continue;
+            }
             if is_read(space, id, reader_id) {
                 continue;
             }
@@ -2191,6 +2261,7 @@ fn cmd_list(
     pile: &Path,
     mail_branch_id: Id,
     relations_branch_id: Id,
+    persona: Option<String>,
     from: Option<String>,
     to: Option<String>,
     spam_only: bool,
@@ -2226,9 +2297,10 @@ fn cmd_list(
         let rel_space = rws
             .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        // Identity comes from the persona, not from a mail account, so
+        // listing unread needs no account configured at all.
         let reader_filter = if unread_only {
-            let config = load_config_from_repo(repo)?;
-            find_self_persona(&rel_space, &config.user)
+            self_persona_id(&rel_space, persona.as_deref())
         } else {
             None
         };
@@ -2332,6 +2404,7 @@ fn cmd_show(
     pile: &Path,
     mail_branch_id: Id,
     relations_branch_id: Id,
+    persona: Option<String>,
     message: String,
 ) -> Result<()> {
     let resolved_id = with_repo(pile, |repo| {
@@ -2441,7 +2514,7 @@ fn cmd_show(
             let rel_space = rws
                 .checkout(..)
                 .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            if let Some(self_id) = find_self_persona(&rel_space, &config.user) {
+            if let Some(self_id) = self_persona_id(&rel_space, persona.as_deref()) {
                 mark_read_if_unread(repo, mail_branch_id, resolved_id, self_id)?;
             }
             Ok(())
@@ -2454,9 +2527,9 @@ fn cmd_read(
     pile: &Path,
     mail_branch_id: Id,
     relations_branch_id: Id,
+    persona: Option<String>,
     message: String,
 ) -> Result<()> {
-    let config = load_config(pile)?;
     with_repo(pile, |repo| {
         let mut mws = repo
             .pull(mail_branch_id)
@@ -2472,11 +2545,11 @@ fn cmd_read(
         let rel_space = rws
             .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let self_id = find_self_persona(&rel_space, &config.user).ok_or_else(|| {
+        let self_id = self_persona_id(&rel_space, persona.as_deref()).ok_or_else(|| {
             anyhow::anyhow!(
-                "no relations entry for {} — send or receive at least one message first \
-                 so the auto-registration mints your entry",
-                config.user
+                "no relations entry for persona {:?} — set PERSONA (or --persona) to a \
+                 label that exists in relations",
+                persona.as_deref().unwrap_or("<unset>")
             )
         })?;
         let now_new = mark_read_if_unread(repo, mail_branch_id, id, self_id)?;
@@ -2763,19 +2836,32 @@ fn main() -> Result<()> {
             &cli.pile,
             mail_branch,
             relations_branch,
+            cli.persona.clone(),
             from,
             to,
             spam,
             all,
             unread,
         ),
-        Command::Read { message } => cmd_read(&cli.pile, mail_branch, relations_branch, message),
+        Command::Read { message } => cmd_read(
+            &cli.pile,
+            mail_branch,
+            relations_branch,
+            cli.persona.clone(),
+            message,
+        ),
         Command::Today => cmd_today(&cli.pile, mail_branch, relations_branch),
         Command::Week => cmd_week(&cli.pile, mail_branch, relations_branch),
         Command::Thread { message } => {
             cmd_thread(&cli.pile, mail_branch, relations_branch, message)
         }
-        Command::Show { message } => cmd_show(&cli.pile, mail_branch, relations_branch, message),
+        Command::Show { message } => cmd_show(
+            &cli.pile,
+            mail_branch,
+            relations_branch,
+            cli.persona.clone(),
+            message,
+        ),
         Command::Search { query } => cmd_search(&cli.pile, mail_branch, relations_branch, query),
         Command::Account { cmd } => match cmd {
             AccountCmd::Add {
@@ -2800,6 +2886,7 @@ fn main() -> Result<()> {
             AccountCmd::List => cmd_account_list(&cli.pile, &cli.secrets_branch),
             AccountCmd::Show => cmd_account_show(&cli.pile, &cli.secrets_branch),
         },
+        Command::Backfill { apply } => cmd_backfill(&cli.pile, mail_branch, apply),
         Command::Resolve { prefix } => cmd_resolve(&cli.pile, mail_branch, prefix),
     }
 }
@@ -2877,8 +2964,6 @@ fn cmd_account_add(
         let space = ws
             .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let first = mail_account::list_addresses(&space).is_empty();
-
         let now = instant_interval(now_epoch());
         let acct_id = account_id(&address);
         let box_h = put_bytes(&mut ws, box_bytes);
@@ -2889,25 +2974,10 @@ fn cmd_account_add(
             mail_attrs::address: address.as_str(),
             mail_attrs::r#box: box_h,
         };
-        // The first account is active by construction (a single-account
-        // setup needs no explicit `use`); mint the pointer anyway so the
-        // active address is explicit and stable if more are added later.
-        if first {
-            let ptr = ufoid();
-            change += entity! { &ptr @
-                metadata::tag: &KIND_MAIL_ACTIVE,
-                metadata::created_at: now,
-                mail_attrs::address: address.as_str(),
-            };
-        }
         ws.commit(change, "secrets: mail-account add");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        println!(
-            "mail account {} stored{}",
-            address,
-            if first { " (active)" } else { "" }
-        );
+        println!("mail account {address} stored");
         Ok(())
     })
 }
@@ -2953,4 +3023,58 @@ fn cmd_account_show(pile: &Path, branch: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One-shot direction migration. See `Command::Backfill`.
+fn cmd_backfill(pile: &Path, mail_branch_id: Id, apply: bool) -> Result<()> {
+    with_repo(pile, |repo| {
+        let mut ws = repo
+            .pull(mail_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout mail: {e:?}"))?;
+
+        let mut to_received = Vec::new();
+        let mut to_sent = Vec::new();
+        let mut already = 0usize;
+        for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: KIND_MESSAGE }])) {
+            let tags: Vec<Id> = find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }])).collect();
+            if tags.contains(&KIND_RECEIVED) || tags.contains(&KIND_SENT) {
+                already += 1;
+            } else if tags.contains(&KIND_DRAFT) {
+                // Composed here AND carries KIND_MESSAGE => it was sent.
+                to_sent.push(id);
+            } else {
+                to_received.push(id);
+            }
+        }
+
+        println!(
+            "{} already tagged | {} -> received | {} -> sent",
+            already,
+            to_received.len(),
+            to_sent.len()
+        );
+        if !apply {
+            println!("(dry run — pass --apply to write)");
+            return Ok(());
+        }
+        if to_received.is_empty() && to_sent.is_empty() {
+            return Ok(());
+        }
+
+        let mut change = TribleSet::new();
+        for id in &to_received {
+            change += entity! { ExclusiveId::force_ref(id) @ metadata::tag: &KIND_RECEIVED };
+        }
+        for id in &to_sent {
+            change += entity! { ExclusiveId::force_ref(id) @ metadata::tag: &KIND_SENT };
+        }
+        ws.commit(change, "mail: backfill direction tags");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push backfill: {e:?}"))?;
+        println!("tagged {} received, {} sent", to_received.len(), to_sent.len());
+        Ok(())
+    })
 }

@@ -42,6 +42,35 @@ pub const KIND_MESSAGE: Id = id_hex!("4426CEA53841F34E8D3C0913818F340F");
 /// `--spam` or `--all` to surface them.
 pub const KIND_SPAM: Id = id_hex!("809C2F66A336C6D61140ABEFFA49513C");
 
+/// Tag marker for mail that ARRIVED — set by `mail fetch` at the moment
+/// the message is decomposed into tribles.
+///
+/// # Why direction is asserted, not inferred
+///
+/// Sent mail keeps its `KIND_DRAFT` tag (see below), so for a while
+/// direction was read as "`KIND_MESSAGE` and not `KIND_DRAFT`". That
+/// encodes a fact as an ABSENCE, which this substrate is the wrong shape
+/// for: the store is append-only and queries are monotone, so a negation is
+/// only meaningful under a closed-world reading of one snapshot. It also
+/// silently misclassifies any message that enters by a third path — an
+/// import, a migration, a future gateway — as received, because it happens
+/// not to be a draft.
+///
+/// The earlier formulation was worse still: direction was derived from
+/// IDENTITY, by asking whether the sender's address matched one of ours.
+/// That made a question about a message depend on who was asking.
+///
+/// Minted 2026-07-29 with `trible genid`.
+pub const KIND_RECEIVED: Id = id_hex!("A8005F5F8119C6EEACEAFD5AF75A88CF");
+
+/// Tag marker for mail that WAS TRANSMITTED — set by `mail send` alongside
+/// the send-time facts. Distinct from [`KIND_DRAFT`], which marks a message
+/// as *composed here*: an unsent draft is outbound but not sent, and only
+/// this tag says it left.
+///
+/// Minted 2026-07-29 with `trible genid`.
+pub const KIND_SENT: Id = id_hex!("E08FE75911353992E604DA7A4507AB56");
+
 /// Tag marker for outbound messages that haven't been transmitted
 /// yet. `mail draft` mints a KIND_DRAFT entity with all the
 /// normal `mail::*` attributes (subject, body, to, cc, bcc); a

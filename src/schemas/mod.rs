@@ -12,6 +12,7 @@ pub mod gauge;
 pub mod headspace;
 pub mod mail;
 pub mod memory;
+pub mod migrations;
 pub mod message;
 pub mod orient;
 pub mod patience;

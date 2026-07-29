@@ -5,7 +5,9 @@ use chrono::{
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::compass::latest_status_event;
-use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
+use faculties::schemas::mail::{
+    mail, KIND_RECEIVED, KIND_SPAM,
+};
 use faculties::schemas::memory::DEFAULT_MEMORY_BRANCH;
 use faculties::schemas::message::is_inbox_message;
 use faculties::schemas::orient::{
@@ -281,33 +283,6 @@ fn mail_addresses(repo: &mut Repository<Pile>) -> Vec<String> {
     std::env::var("MAIL_USER").ok().into_iter().collect()
 }
 
-/// Resolve the mail-faculty self identity: the relations entry whose
-/// `email` attribute matches the active mail address (case-folded).
-/// Returns None if no address is configured or no relations entry has been
-/// auto-registered for it yet.
-fn find_mail_self(relations_space: &TribleSet, address: &str) -> Option<(String, Id)> {
-    let needle = address.trim().to_ascii_lowercase();
-    // KIND_PERSON_ID is required, matching `mail`'s `find_self_persona`
-    // byte for byte. Without the tag this matcher is strictly broader than
-    // the one that WRITES read receipts, so any entity carrying an `email`
-    // attribute — a contact, a lead, an imported org — could resolve as
-    // *self* here and never there. "Who am I" must not have two answers.
-    let id = find!(
-        (id: Id, e: String),
-        pattern!(relations_space, [{
-            ?id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID,
-                  rel_attrs::email: ?e,
-        }])
-    )
-    .find_map(|(id, e)| {
-        if e.to_ascii_lowercase() == needle {
-            Some(id)
-        } else {
-            None
-        }
-    })?;
-    Some((address.to_string(), id))
-}
 
 /// Unread MAIL for the local mail identity: messages in the mail branch
 /// not sent by us, not spam, and without a read-receipt by the mail-self
@@ -316,28 +291,17 @@ fn find_mail_self(relations_space: &TribleSet, address: &str) -> Option<(String,
 /// mail simply doesn't wake the watcher until an account is set up. The
 /// inbox is shared: it is the same for every persona, so a new mail wakes
 /// every window's watcher (like a colony broadcast).
-fn load_mail_unread(repo: &mut Repository<Pile>, relations_branch_id: Id) -> Result<BTreeSet<Id>> {
-    let addresses = mail_addresses(repo);
-    if addresses.is_empty() {
+fn load_mail_unread(
+    repo: &mut Repository<Pile>,
+    _relations_branch_id: Id,
+    reader_id: Option<Id>,
+) -> Result<BTreeSet<Id>> {
+    // Identity is the persona, not a mail address, and direction is a tag
+    // on the message. Neither question needs the relations branch or an
+    // account to be configured.
+    let Some(reader_id) = reader_id else {
         return Ok(BTreeSet::new());
-    }
-    let mut rws = repo
-        .pull(relations_branch_id)
-        .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-    let rel_space = rws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-    // "Self" is every relations entry matching ANY configured address: with
-    // no active account, a window's identity is the set of mailboxes it
-    // reads, not one of them.
-    let self_ids: BTreeSet<Id> = addresses
-        .iter()
-        .filter_map(|a| find_mail_self(&rel_space, a).map(|(_, id)| id))
-        .collect();
-    if self_ids.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    drop(rws);
+    };
 
     // lookup, not ensure: a read path must never create the branch it reads
     // (`ensure_branch` is check-then-create, and a concurrent loser leaves
@@ -354,31 +318,26 @@ fn load_mail_unread(repo: &mut Repository<Pile>, relations_branch_id: Id) -> Res
         mws.checkout(..)
             .map_err(|e| anyhow!("checkout mail: {e:?}"))?
     };
+    // Ask the engine for RECEIVED mail, rather than for every message and
+    // then discarding most of it in Rust. The sender is not projected at
+    // all: it was only ever read to answer "is this mine", which direction
+    // now answers without reference to identity.
     let unread: BTreeSet<Id> = find!(
-        (id: Id, from: Id),
+        id: Id,
         pattern!(&mail_space, [{
-            ?id @
-            metadata::tag: KIND_MAIL_MESSAGE,
-            mail::from: ?from,
+            ?id @ metadata::tag: KIND_RECEIVED,
         }])
     )
-    // Not from any of my own addresses…
-    .filter(|&(_, from)| !self_ids.contains(&from))
-    .filter(|&(id, _)| !exists!(pattern!(&mail_space, [{ id @ metadata::tag: &KIND_SPAM }])))
-    // …and not yet read by any of them. Read by one identity is read: the
-    // addresses belong to one window, so re-waking on a message it has
-    // already seen under another address would be pure noise.
-    .filter(|&(id, _)| {
-        !self_ids.iter().any(|&reader| {
-            exists!(pattern!(&mail_space, [{
-                _?r @
-                metadata::tag: KIND_READ_ID,
-                local::about_message: id,
-                local::reader: reader,
-            }]))
-        })
+    .filter(|&id| !exists!(pattern!(&mail_space, [{ id @ metadata::tag: &KIND_SPAM }])))
+    // …and not yet read by me.
+    .filter(|&id| {
+        !exists!(pattern!(&mail_space, [{
+            _?r @
+            metadata::tag: KIND_READ_ID,
+            local::about_message: id,
+            local::reader: reader_id,
+        }]))
     })
-    .map(|(id, _)| id)
     .collect();
     Ok(unread)
 }
@@ -389,44 +348,18 @@ fn load_mail_unread(repo: &mut Repository<Pile>, relations_branch_id: Id) -> Res
 fn render_unread_mail(
     repo: &mut Repository<Pile>,
     relations_branch_id: Id,
+    persona: Option<(String, Id)>,
     message_limit: usize,
     now_key: i128,
 ) -> Result<()> {
-    // Every configured address (secrets accounts → MAIL_USER fallback).
-    let addresses = mail_addresses(repo);
-
-    // Need a relations workspace to resolve the self identities.
-    let mut rws = repo
-        .pull(relations_branch_id)
-        .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-    let rel_space = rws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-
-    let resolved: Vec<(String, Id)> = addresses
-        .iter()
-        .filter_map(|a| find_mail_self(&rel_space, a))
-        .collect();
-    if resolved.is_empty() {
-        // No address configured, or the auto-registration hasn't happened
-        // yet (no fetch/send has run). Render a brief note, don't crash.
+    // Identity is the persona — the same one every other faculty uses. No
+    // mail account need be configured, no address matched, no relations
+    // workspace opened just to ask who we are.
+    let Some((user, reader_id)) = persona else {
         println!("Mail:");
-        if addresses.is_empty() {
-            println!("- No mail account configured (mail account add … / MAIL_USER); skipping");
-        } else {
-            println!(
-                "- No relations entry for {} yet (run `mail fetch` or `mail send` once)",
-                addresses.join(", ")
-            );
-        }
+        println!("- No persona set (PERSONA / --persona); skipping");
         return Ok(());
-    }
-    let user = resolved
-        .iter()
-        .map(|(u, _)| u.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let self_ids: BTreeSet<Id> = resolved.iter().map(|(_, id)| *id).collect();
+    };
 
     // lookup, not ensure: rendering a snapshot must not create a branch.
     let mail_branch_id = match repo.lookup_branch("mail") {
@@ -444,27 +377,37 @@ fn render_unread_mail(
         .checkout(..)
         .map_err(|e| anyhow!("checkout mail: {e:?}"))?;
 
+    // Relations, for rendering SENDERS — resolving a correspondent's
+    // address for display is an ordinary lookup. It is only the *self*
+    // question that must not be asked this way.
+    let mut rws = repo
+        .pull(relations_branch_id)
+        .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+    let rel_space = rws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+
+    // RECEIVED is the constraint, in the pattern. Sent mail is not merely
+    // uninteresting here — it has no concept of "read" at all, so asking
+    // whether it is unread is a category error, not a filter.
     let mut rows: Vec<(i128, Id, Option<Id>, String)> = find!(
         (id: Id, from: Id, sent_at: IntervalValue, subject_h: TextHandle),
         pattern!(&mail_space, [{
             ?id @
-            metadata::tag: KIND_MAIL_MESSAGE,
+            metadata::tag: KIND_RECEIVED,
             mail::from: ?from,
             mail::sent_at: ?sent_at,
             mail::subject: ?subject_h,
         }])
     )
-    .filter(|&(_, from, _, _)| !self_ids.contains(&from))
     .filter(|&(id, _, _, _)| !exists!(pattern!(&mail_space, [{ id @ metadata::tag: &KIND_SPAM }])))
     .filter(|&(id, _, _, _)| {
-        !self_ids.iter().any(|&reader| {
-            exists!(pattern!(&mail_space, [{
-                _?r @
-                metadata::tag: KIND_READ_ID,
-                local::about_message: id,
-                local::reader: reader,
-            }]))
-        })
+        !exists!(pattern!(&mail_space, [{
+            _?r @
+            metadata::tag: KIND_READ_ID,
+            local::about_message: id,
+            local::reader: reader_id,
+        }]))
     })
     .map(|(id, from, sent_at, subject_h)| {
         let subject = read_text(&mut mws, subject_h).unwrap_or_default();
@@ -751,8 +694,10 @@ fn cmd_show(
 
         drop(local_ws);
 
-        // ── Mail (unread inbox for the address in $MAIL_USER) ────
-        render_unread_mail(repo, relations_branch_id, message_limit, now_key)?;
+        // ── Mail (unread inbox for $PERSONA) ────
+        let mail_persona = effective_persona
+            .map(|id| (persona.unwrap_or("me").to_string(), id));
+        render_unread_mail(repo, relations_branch_id, mail_persona, message_limit, now_key)?;
 
         let mut compass_ws = repo
             .pull(compass_branch_id)
@@ -994,7 +939,7 @@ fn load_watched_view(
     // Unread mail for the local mail identity (self-contained: it pulls
     // and drops its own relations + mail workspaces). Done first so it holds
     // no borrow across the rest of the view build.
-    let mail_unread = load_mail_unread(repo, relations_branch_id)?;
+    let mail_unread = load_mail_unread(repo, relations_branch_id, Some(persona_id))?;
 
     let mut local_ws = repo
         .pull(local_branch_id)
@@ -2391,7 +2336,9 @@ mod tests {
 
     #[test]
     fn new_incoming_mail_surfaces_as_unread_and_reading_clears_it() {
-        use faculties::schemas::mail::{mail as mail_attrs, KIND_MESSAGE as KIND_MAIL};
+        use faculties::schemas::mail::{
+            mail as mail_attrs, KIND_MESSAGE as KIND_MAIL, KIND_RECEIVED as KIND_RCV,
+        };
         use faculties::schemas::orient::{local as read_attrs, KIND_READ_ID};
         use faculties::schemas::relations::{relations as rel, KIND_PERSON_ID};
 
@@ -2430,14 +2377,18 @@ mod tests {
         let mut change = TribleSet::new();
         change += entity! { &mail_id @
             metadata::tag: &KIND_MAIL,
+            // Direction is asserted at write time; without it this is not
+            // received mail and has no read state.
+            metadata::tag: &KIND_RCV,
             mail_attrs::from: &sender_id.id,
             mail_attrs::subject: subject_h,
         };
         mws.commit(change, "seed mail");
         repo.push(&mut mws).unwrap();
 
-        // It shows up as unread mail (independent of persona).
-        let unread = load_mail_unread(&mut repo, relations_branch_id).unwrap();
+        // Unread is now PER-PERSONA: the reader is the identity asking,
+        // not whoever happens to own a mail address.
+        let unread = load_mail_unread(&mut repo, relations_branch_id, Some(self_id.id)).unwrap();
         assert!(
             unread.contains(&mail_id.id),
             "incoming mail should be unread"
@@ -2457,7 +2408,8 @@ mod tests {
         mws.commit(change, "mark read");
         repo.push(&mut mws).unwrap();
 
-        let unread2 = load_mail_unread(&mut repo, relations_branch_id).unwrap();
+        let unread2 =
+            load_mail_unread(&mut repo, relations_branch_id, Some(self_id.id)).unwrap();
         assert!(
             !unread2.contains(&mail_id.id),
             "read mail should not be unread"
@@ -2477,7 +2429,8 @@ mod tests {
         let pile = TestPile::new();
         let mut repo = open_repo(&pile.path).unwrap();
         let relations_branch_id = repo.ensure_branch("relations", None).unwrap();
-        assert!(load_mail_unread(&mut repo, relations_branch_id)
+        // No reader identity => nothing is unread for anyone.
+        assert!(load_mail_unread(&mut repo, relations_branch_id, None)
             .unwrap()
             .is_empty());
         repo.close().unwrap();

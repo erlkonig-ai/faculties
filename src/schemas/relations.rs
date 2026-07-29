@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use triblespace::core::metadata;
-use triblespace::macros::{find, id_hex, pattern};
+use triblespace::macros::{exists, find, id_hex, pattern};
 use triblespace::prelude::*;
 
 pub const DEFAULT_BRANCH: &str = "relations";
@@ -309,6 +309,39 @@ pub mod relations {
         // See KIND_RETIRE_ID / KIND_UNRETIRE_ID above.
         "C9D3F48C660DADBDBFA32F30F595415A" as subject: inlineencodings::GenId;
     }
+}
+
+/// The person id for a persona label (or alias), case-folded.
+///
+/// # Why this belongs here and not in a faculty
+///
+/// This is the colony's "who am I" resolution: `$PERSONA` is a label, and
+/// every faculty that attributes an action needs the id behind it. It lived
+/// privately inside `message`, so `mail` answered the same question a
+/// different way — by matching a MAIL ADDRESS against relations entries.
+/// That entangled identity with a credential for an external service:
+/// self became underivable without a mailbox, any auto-registered
+/// correspondent carrying an `email` became a candidate for *self*, and one
+/// window with two addresses became two identities.
+///
+/// Identity is the persona. A mail account is a resource, not a definition.
+///
+/// Persons only — a group is not a self, so groups are deliberately absent
+/// here even though `message`'s recipient resolution accepts them.
+pub fn person_id_for_label(space: &TribleSet, label: &str) -> Option<Id> {
+    let key = label.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    find!(
+        id: Id,
+        pattern!(space, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])
+    )
+    .find(|&id| {
+        let key = key.as_str();
+        exists!(pattern!(space, [{ id @ relations::label_norm: key }]))
+            || exists!(pattern!(space, [{ id @ relations::alias_norm: key }]))
+    })
 }
 
 #[cfg(test)]
