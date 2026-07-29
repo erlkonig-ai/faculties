@@ -81,11 +81,38 @@ enum Command {
     },
 }
 
-/// One branch's share of a plan: what to write, and the commit the plan was
-/// computed against.
+/// How a branch's facts relate to what is already there.
+///
+/// # Why this is explicit and has no default
+///
+/// A migration may hand back either a REPLACEMENT for a branch's content or
+/// ADDITIONS to it, and the two are indistinguishable as `TribleSet`s. The
+/// media-type migration returns replacements for the files and reference
+/// branches and additions for wiki — wiki must be append-only, because file
+/// ids live in literal prose and a wiki version is a citable immutable
+/// object, so rewriting history in place silently invalidates every exact
+/// version citation.
+///
+/// Committing additions AS content would delete the wiki history in one
+/// apply while looking entirely successful: the new heads are correct, the
+/// counts match the report, and everything downstream of the latest
+/// versions resolves. Nothing an obvious check looks at would be wrong.
+///
+/// So there is no default and no uniform commit path. Append is the unusual
+/// case, which is exactly why a uniform path gets it wrong.
+enum Mode {
+    /// The facts are the branch's new content.
+    Replace,
+    /// The facts are committed atop the pinned lineage.
+    Append,
+}
+
+/// One branch's share of a plan: what to write, how it relates to what is
+/// there, and the commit the plan was computed against.
 struct BranchChange {
     branch: &'static str,
     role: &'static str,
+    mode: Mode,
     /// The branch head at planning time. `None` = the branch does not exist
     /// yet, which is itself a pin: it must still not exist at apply.
     pinned: Option<Id>,
@@ -137,6 +164,7 @@ fn plan_mail_direction(repo: &mut Repository<Pile>) -> Result<Plan> {
             changes: vec![BranchChange {
                 branch: "mail",
                 role: "target",
+                mode: Mode::Append,
                 pinned: None,
                 change: TribleSet::new(),
                 detail: "no mail branch — nothing to migrate".into(),
@@ -169,6 +197,9 @@ fn plan_mail_direction(repo: &mut Repository<Pile>) -> Result<Plan> {
         changes: vec![BranchChange {
             branch: "mail",
             role: "target",
+            // Direction tags are added to existing messages; the branch's
+            // other content must survive untouched.
+            mode: Mode::Append,
             pinned: Some(branch_id),
             change,
             detail: format!("{already} already tagged | {recv} -> received | {sent} -> sent"),
@@ -280,7 +311,23 @@ fn cmd_run(cli: &Cli, name: &str, apply: bool) -> Result<()> {
             let mut ws = repo
                 .pull(branch_id)
                 .map_err(|e| anyhow::anyhow!("pull {}: {e:?}", c.branch))?;
-            ws.commit(c.change, &format!("migration: {}", m.name));
+            let facts = match c.mode {
+                // `commit` is already additive over the pulled lineage.
+                Mode::Append => c.change,
+                // A replacement is not expressible as an additive commit
+                // over an append-only branch: it would union with the very
+                // content it is meant to supersede. Building it needs an
+                // isolated output lineage and a cut-over, which the
+                // multi-branch path will own. Refusing beats writing a
+                // union and calling it a replacement.
+                Mode::Replace => bail!(
+                    "branch {:?} needs a REPLACEMENT snapshot; the runner cannot yet build \
+                     isolated output lineages, and committing a replacement additively \
+                     would union it with the content it supersedes",
+                    c.branch
+                ),
+            };
+            ws.commit(facts, &format!("migration: {}", m.name));
             repo.push(&mut ws)
                 .map_err(|e| anyhow::anyhow!("push {}: {e:?}", c.branch))?;
             println!("  {} migrated", c.branch);
