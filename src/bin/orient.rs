@@ -270,13 +270,15 @@ fn load_reads(space: &TribleSet) -> HashMap<(Id, Id), i128> {
 
 /// The active mail address: the `secrets` active account's address if one
 /// is configured, else `$MAIL_USER`. This is the single resolution the
-/// mail snapshot and the mail-wake path both use, so `secrets mail-account
+/// mail snapshot and the mail-wake path both use, so `mail account
 /// use` changes what orient watches. Read-only; never writes.
-fn active_mail_address(repo: &mut Repository<Pile>) -> Option<String> {
-    if let Ok(Some(account)) = faculties::mail_account::resolve_active_on_repo(repo, "secrets") {
-        return Some(account.address);
+fn mail_addresses(repo: &mut Repository<Pile>) -> Vec<String> {
+    if let Ok(accounts) = faculties::mail_account::resolve_all_on_repo(repo, "secrets") {
+        if !accounts.is_empty() {
+            return accounts.into_iter().map(|a| a.address).collect();
+        }
     }
-    std::env::var("MAIL_USER").ok()
+    std::env::var("MAIL_USER").ok().into_iter().collect()
 }
 
 /// Resolve the mail-faculty self identity: the relations entry whose
@@ -285,10 +287,16 @@ fn active_mail_address(repo: &mut Repository<Pile>) -> Option<String> {
 /// auto-registered for it yet.
 fn find_mail_self(relations_space: &TribleSet, address: &str) -> Option<(String, Id)> {
     let needle = address.trim().to_ascii_lowercase();
+    // KIND_PERSON_ID is required, matching `mail`'s `find_self_persona`
+    // byte for byte. Without the tag this matcher is strictly broader than
+    // the one that WRITES read receipts, so any entity carrying an `email`
+    // attribute — a contact, a lead, an imported org — could resolve as
+    // *self* here and never there. "Who am I" must not have two answers.
     let id = find!(
         (id: Id, e: String),
         pattern!(relations_space, [{
-            ?id @ rel_attrs::email: ?e,
+            ?id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID,
+                  rel_attrs::email: ?e,
         }])
     )
     .find_map(|(id, e)| {
@@ -309,23 +317,34 @@ fn find_mail_self(relations_space: &TribleSet, address: &str) -> Option<(String,
 /// inbox is shared: it is the same for every persona, so a new mail wakes
 /// every window's watcher (like a colony broadcast).
 fn load_mail_unread(repo: &mut Repository<Pile>, relations_branch_id: Id) -> Result<BTreeSet<Id>> {
-    let Some(address) = active_mail_address(repo) else {
+    let addresses = mail_addresses(repo);
+    if addresses.is_empty() {
         return Ok(BTreeSet::new());
-    };
+    }
     let mut rws = repo
         .pull(relations_branch_id)
         .map_err(|e| anyhow!("pull relations: {e:?}"))?;
     let rel_space = rws
         .checkout(..)
         .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-    let Some((_addr, self_id)) = find_mail_self(&rel_space, &address) else {
+    // "Self" is every relations entry matching ANY configured address: with
+    // no active account, a window's identity is the set of mailboxes it
+    // reads, not one of them.
+    let self_ids: BTreeSet<Id> = addresses
+        .iter()
+        .filter_map(|a| find_mail_self(&rel_space, a).map(|(_, id)| id))
+        .collect();
+    if self_ids.is_empty() {
         return Ok(BTreeSet::new());
-    };
+    }
     drop(rws);
 
-    let mail_branch_id = match repo.ensure_branch("mail", None) {
-        Ok(id) => id,
-        Err(_) => return Ok(BTreeSet::new()),
+    // lookup, not ensure: a read path must never create the branch it reads
+    // (`ensure_branch` is check-then-create, and a concurrent loser leaves
+    // two branches with one name, which breaks name lookup permanently).
+    let mail_branch_id = match repo.lookup_branch("mail") {
+        Ok(Some(id)) => id,
+        _ => return Ok(BTreeSet::new()),
     };
     let mws = repo
         .pull(mail_branch_id)
@@ -343,15 +362,21 @@ fn load_mail_unread(repo: &mut Repository<Pile>, relations_branch_id: Id) -> Res
             mail::from: ?from,
         }])
     )
-    .filter(|&(_, from)| from != self_id)
+    // Not from any of my own addresses…
+    .filter(|&(_, from)| !self_ids.contains(&from))
     .filter(|&(id, _)| !exists!(pattern!(&mail_space, [{ id @ metadata::tag: &KIND_SPAM }])))
+    // …and not yet read by any of them. Read by one identity is read: the
+    // addresses belong to one window, so re-waking on a message it has
+    // already seen under another address would be pure noise.
     .filter(|&(id, _)| {
-        !exists!(pattern!(&mail_space, [{
-            _?r @
-            metadata::tag: KIND_READ_ID,
-            local::about_message: id,
-            local::reader: self_id,
-        }]))
+        !self_ids.iter().any(|&reader| {
+            exists!(pattern!(&mail_space, [{
+                _?r @
+                metadata::tag: KIND_READ_ID,
+                local::about_message: id,
+                local::reader: reader,
+            }]))
+        })
     })
     .map(|(id, _)| id)
     .collect();
@@ -367,10 +392,10 @@ fn render_unread_mail(
     message_limit: usize,
     now_key: i128,
 ) -> Result<()> {
-    // Resolve the active mail address (secrets active account → MAIL_USER).
-    let address = active_mail_address(repo);
+    // Every configured address (secrets accounts → MAIL_USER fallback).
+    let addresses = mail_addresses(repo);
 
-    // Need a relations workspace to resolve the self identity.
+    // Need a relations workspace to resolve the self identities.
     let mut rws = repo
         .pull(relations_branch_id)
         .map_err(|e| anyhow!("pull relations: {e:?}"))?;
@@ -378,27 +403,35 @@ fn render_unread_mail(
         .checkout(..)
         .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
 
-    let self_resolved = address
-        .as_deref()
-        .and_then(|a| find_mail_self(&rel_space, a));
-    let Some((user, self_id)) = self_resolved else {
+    let resolved: Vec<(String, Id)> = addresses
+        .iter()
+        .filter_map(|a| find_mail_self(&rel_space, a))
+        .collect();
+    if resolved.is_empty() {
         // No address configured, or the auto-registration hasn't happened
         // yet (no fetch/send has run). Render a brief note, don't crash.
         println!("Mail:");
-        match address {
-            Some(u) => {
-                println!("- No relations entry for {u} yet (run `mail fetch` or `mail send` once)")
-            }
-            None => println!(
-                "- No mail account configured (secrets mail-account add … / MAIL_USER); skipping"
-            ),
+        if addresses.is_empty() {
+            println!("- No mail account configured (mail account add … / MAIL_USER); skipping");
+        } else {
+            println!(
+                "- No relations entry for {} yet (run `mail fetch` or `mail send` once)",
+                addresses.join(", ")
+            );
         }
         return Ok(());
-    };
+    }
+    let user = resolved
+        .iter()
+        .map(|(u, _)| u.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let self_ids: BTreeSet<Id> = resolved.iter().map(|(_, id)| *id).collect();
 
-    let mail_branch_id = match repo.ensure_branch("mail", None) {
-        Ok(id) => id,
-        Err(_) => {
+    // lookup, not ensure: rendering a snapshot must not create a branch.
+    let mail_branch_id = match repo.lookup_branch("mail") {
+        Ok(Some(id)) => id,
+        _ => {
             println!("Mail (unread for {user}):");
             println!("- mail branch not present yet");
             return Ok(());
@@ -421,15 +454,17 @@ fn render_unread_mail(
             mail::subject: ?subject_h,
         }])
     )
-    .filter(|&(_, from, _, _)| from != self_id)
+    .filter(|&(_, from, _, _)| !self_ids.contains(&from))
     .filter(|&(id, _, _, _)| !exists!(pattern!(&mail_space, [{ id @ metadata::tag: &KIND_SPAM }])))
     .filter(|&(id, _, _, _)| {
-        !exists!(pattern!(&mail_space, [{
-            _?r @
-            metadata::tag: KIND_READ_ID,
-            local::about_message: id,
-            local::reader: self_id,
-        }]))
+        !self_ids.iter().any(|&reader| {
+            exists!(pattern!(&mail_space, [{
+                _?r @
+                metadata::tag: KIND_READ_ID,
+                local::about_message: id,
+                local::reader: reader,
+            }]))
+        })
     })
     .map(|(id, from, sent_at, subject_h)| {
         let subject = read_text(&mut mws, subject_h).unwrap_or_default();
@@ -836,10 +871,12 @@ fn cmd_show(
 /// configured (secrets active account or `MAIL_USER`), so orient never
 /// creates a mail branch on piles that never use mail.
 fn watched_mail_branch(repo: &mut Repository<Pile>) -> Option<Id> {
-    if active_mail_address(repo).is_none() {
+    if mail_addresses(repo).is_empty() {
         return None;
     }
-    repo.ensure_branch("mail", None).ok()
+    // lookup, not ensure: the watcher must not create the mail branch as a
+    // side effect of deciding whether to watch it.
+    repo.lookup_branch("mail").ok().flatten()
 }
 
 fn load_watched_heads(

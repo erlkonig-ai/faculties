@@ -36,6 +36,7 @@ pub mod mail_account;
 pub mod memory_cover;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
+pub mod pile_cli;
 pub mod schemas;
 pub mod secret_pw;
 pub mod tokens;

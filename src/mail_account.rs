@@ -10,10 +10,13 @@
 //! it is the *operator's own* credential, unlocked by the same operator
 //! with the same password, so the sharing/authz layer buys nothing.
 //!
-//! The active account is named by a latest-wins `KIND_MAIL_ACTIVE`
-//! pointer (`mail_account::address`). This module is the single place the
-//! crypto and the resolution live so `secrets` (writer), `mail`, and
-//! `orient` (readers) can never drift.
+//! There is deliberately NO active-account pointer. Reading is total —
+//! `mail fetch` and `orient` drain every configured mailbox — and only
+//! sending pins one address, explicitly, because a `From:` header has to
+//! be a single identity. Ambient latest-wins state is a single-writer
+//! assumption, and this pile has several writers. This module is the
+//! single place the crypto and the resolution live so `mail` (writer)
+//! and `orient` (reader) can never drift.
 
 use anyhow::{bail, Context, Result};
 use dryoc::classic::crypto_pwhash::{crypto_pwhash, PasswordHashAlgorithm};
@@ -31,7 +34,7 @@ use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
-use crate::schemas::mail::{mail_account, KIND_MAIL_ACCOUNT, KIND_MAIL_ACTIVE};
+use crate::schemas::mail::{mail_account, KIND_MAIL_ACCOUNT};
 
 type BytesHandle = Inline<Handle<RawBytes>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -116,7 +119,7 @@ fn unlock(password: &[u8], lockbox: &[u8]) -> Result<Vec<u8>> {
 
 /// Encode + password-lock a full account into the `box` bytes. The
 /// address is returned separately (it is stored cleartext on the entity).
-/// Shared by `secrets mail-account add` so the lockbox format is defined
+/// Shared by `mail account add` so the lockbox format is defined
 /// once.
 pub fn seal_account(pw: &[u8], account: &MailAccount) -> Result<Vec<u8>> {
     let body = AccountBody {
@@ -145,11 +148,6 @@ fn open_account(pw: &[u8], address: String, box_bytes: &[u8]) -> Result<MailAcco
     })
 }
 
-fn interval_start(iv: IntervalValue) -> i128 {
-    let (start, _): (i128, i128) = iv.try_from_inline().unwrap();
-    start
-}
-
 /// Every stored account's cleartext address (no password needed) — the
 /// list/select view. Sorted, deduped.
 pub fn list_addresses(space: &TribleSet) -> Vec<String> {
@@ -162,32 +160,6 @@ pub fn list_addresses(space: &TribleSet) -> Vec<String> {
     out.sort();
     out.dedup();
     out
-}
-
-/// The address named by the newest active-pointer, if any (no password
-/// needed). If no pointer was ever set but exactly one account exists,
-/// that account is implicitly active — a single-account setup needs no
-/// explicit `use`.
-pub fn active_address(space: &TribleSet) -> Option<String> {
-    let newest = find!(
-        (e: Id, a: String, t: IntervalValue),
-        pattern!(space, [{
-            ?e @ metadata::tag: KIND_MAIL_ACTIVE,
-            mail_account::address: ?a,
-            metadata::created_at: ?t,
-        }])
-    )
-    .max_by_key(|(_, _, t)| interval_start(*t))
-    .map(|(_, a, _)| a);
-    if newest.is_some() {
-        return newest;
-    }
-    let all = list_addresses(space);
-    if all.len() == 1 {
-        all.into_iter().next()
-    } else {
-        None
-    }
 }
 
 /// The `box` handle for a given account address, if the account exists.
@@ -204,18 +176,17 @@ fn box_handle_for(space: &TribleSet, address: &str) -> Option<BytesHandle> {
     .map(|(_, h)| h)
 }
 
-/// Resolve + decrypt the active account from an already-checked-out
-/// secrets space. Returns `Ok(None)` when no account is configured (so
-/// callers can fall back to env vars), `Err` only when an account IS
-/// configured but can't be unlocked (wrong/missing password) — a real
-/// misconfiguration the operator should see, not a silent env fallback.
-pub fn resolve_active(ws: &mut Workspace<Pile>, space: &TribleSet) -> Result<Option<MailAccount>> {
-    let Some(address) = active_address(space) else {
-        return Ok(None);
-    };
-    let Some(h) = box_handle_for(space, &address) else {
-        // Active pointer names an address with no stored account — treat
-        // as unconfigured rather than erroring the whole faculty.
+/// Resolve + decrypt one named account from an already-checked-out secrets
+/// space.
+///
+/// This is the *pinned* path, for operations that must act as exactly one
+/// identity — sending. Reading never picks; see [`resolve_all`].
+pub fn resolve_one(
+    ws: &mut Workspace<Pile>,
+    space: &TribleSet,
+    address: &str,
+) -> Result<Option<MailAccount>> {
+    let Some(h) = box_handle_for(space, address) else {
         return Ok(None);
     };
     let box_bytes = ws
@@ -224,20 +195,68 @@ pub fn resolve_active(ws: &mut Workspace<Pile>, space: &TribleSet) -> Result<Opt
         .as_ref()
         .to_vec();
     let pw = password()?;
-    Ok(Some(open_account(&pw, address, &box_bytes)?))
+    Ok(Some(open_account(&pw, address.to_string(), &box_bytes)?))
+}
+
+/// Resolve + decrypt EVERY stored account.
+///
+/// # Why reading never picks one
+///
+/// There is deliberately no "active account". An active pointer is
+/// latest-wins ambient state, which is a single-writer assumption inside a
+/// pile that several zooids write concurrently — whoever ran `add` last
+/// silently redirects everyone else's `fetch` and everyone else's `orient`
+/// news. The failure is invisible: mail still arrives, just into the wrong
+/// window, and nothing errors.
+///
+/// So reading is total (every configured mailbox is drained, which is what
+/// a colony wants — each window keeps its own address and all of them are
+/// seen) and only *sending* pins an identity, explicitly, because a
+/// `From:` header genuinely has to be one address.
+///
+/// An account that cannot be unlocked is an error rather than a skip: a
+/// silently-dropped mailbox reads exactly like an empty one.
+pub fn resolve_all(ws: &mut Workspace<Pile>, space: &TribleSet) -> Result<Vec<MailAccount>> {
+    let addresses = list_addresses(space);
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pw = password()?;
+    let mut out = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let Some(h) = box_handle_for(space, &address) else {
+            continue;
+        };
+        let box_bytes = ws
+            .get::<anybytes::Bytes, RawBytes>(h)
+            .map_err(|e| anyhow::anyhow!("read mail-account box for {address}: {e:?}"))?
+            .as_ref()
+            .to_vec();
+        out.push(open_account(&pw, address, &box_bytes)?);
+    }
+    Ok(out)
 }
 
 /// Convenience for the readers (`mail`, `orient`): open the secrets branch
-/// on an existing repo, resolve the active account. `secrets_branch` names
-/// the branch (default "secrets"). Returns `Ok(None)` if the branch/pointer
-/// is absent so the caller can fall back to env config.
-pub fn resolve_active_on_repo(
+/// on an existing repo and decrypt every stored account.
+///
+/// Returns an empty vec when the branch is absent, so callers can fall back
+/// to env config.
+///
+/// Uses `lookup_branch`, NOT `ensure_branch`: a reader must never create the
+/// branch it is reading. `ensure_branch` is check-then-create with no
+/// atomicity, so two zooids reading concurrently against a fresh pile could
+/// each mint a different branch id for the same name — after which every
+/// name-based lookup fails with `NameConflict`, permanently, while both
+/// branches hold real data. A read path has no business risking that.
+pub fn resolve_all_on_repo(
     repo: &mut Repository<Pile>,
     secrets_branch: &str,
-) -> Result<Option<MailAccount>> {
-    let branch_id = match repo.ensure_branch(secrets_branch, None) {
-        Ok(id) => id,
-        Err(_) => return Ok(None),
+) -> Result<Vec<MailAccount>> {
+    let branch_id = match repo.lookup_branch(secrets_branch) {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(Vec::new()),
+        Err(_) => return Ok(Vec::new()),
     };
     let mut ws = repo
         .pull(branch_id)
@@ -245,7 +264,7 @@ pub fn resolve_active_on_repo(
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout secrets: {e:?}"))?;
-    resolve_active(&mut ws, &space)
+    resolve_all(&mut ws, &space)
 }
 
 #[cfg(test)]
@@ -274,54 +293,6 @@ mod tests {
         // distinct salts => distinct boxes for the same account+password
         let sealed2 = seal_account(b"correct horse", &acct).unwrap();
         assert_ne!(sealed, sealed2);
-    }
-
-    #[test]
-    fn active_falls_back_to_the_single_account() {
-        // No explicit pointer, exactly one account => that one is active.
-        let e = ufoid().id;
-        let mut space = TribleSet::new();
-        space += entity! { ExclusiveId::force_ref(&e) @
-            metadata::tag: &KIND_MAIL_ACCOUNT,
-            mail_account::address: "solo@example.com",
-        };
-        assert_eq!(active_address(&space).as_deref(), Some("solo@example.com"));
-    }
-
-    #[test]
-    fn explicit_pointer_selects_among_many_latest_wins() {
-        let (a, b) = (ufoid().id, ufoid().id);
-        let mut space = TribleSet::new();
-        for (e, addr) in [(a, "a@x.com"), (b, "b@x.com")] {
-            space += entity! { ExclusiveId::force_ref(&e) @
-                metadata::tag: &KIND_MAIL_ACCOUNT,
-                mail_account::address: addr,
-            };
-        }
-        // Two accounts, no pointer => ambiguous, none active.
-        assert_eq!(active_address(&space), None);
-        // Older pointer -> a, newer pointer -> b: newest wins.
-        let older = ufoid().id;
-        let newer = ufoid().id;
-        let t_old: IntervalValue = {
-            let e = hifitime::Epoch::from_gregorian_utc(2026, 1, 1, 0, 0, 0, 0);
-            (e, e).try_to_inline().unwrap()
-        };
-        let t_new: IntervalValue = {
-            let e = hifitime::Epoch::from_gregorian_utc(2026, 6, 1, 0, 0, 0, 0);
-            (e, e).try_to_inline().unwrap()
-        };
-        space += entity! { ExclusiveId::force_ref(&older) @
-            metadata::tag: &KIND_MAIL_ACTIVE,
-            mail_account::address: "a@x.com",
-            metadata::created_at: t_old,
-        };
-        space += entity! { ExclusiveId::force_ref(&newer) @
-            metadata::tag: &KIND_MAIL_ACTIVE,
-            mail_account::address: "b@x.com",
-            metadata::created_at: t_new,
-        };
-        assert_eq!(active_address(&space).as_deref(), Some("b@x.com"));
     }
 
     #[test]
