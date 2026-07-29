@@ -13,6 +13,7 @@
 //! to imports or source-specific occurrence entities instead.
 
 use anyhow::{anyhow, Result};
+use std::path::Path;
 use triblespace::core::metadata;
 use triblespace::core::repo::{BlobStore, Workspace};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
@@ -24,6 +25,54 @@ use crate::schemas::files::{file, KIND_FILE, KIND_MEDIA_TYPE};
 pub type ContentHandle = Inline<Handle<RawBytes>>;
 pub type NameHandle = Inline<Handle<LongString>>;
 pub const DEFAULT_MEDIA_TYPE: &str = "application/octet-stream";
+
+/// Best-effort media type inferred from a filename extension.
+///
+/// This table is shared because media type participates in canonical file
+/// identity: two faculties must not classify the same named bytes differently
+/// merely because they each grew their own extension mapping. Extensions are
+/// ASCII-case-insensitive.
+pub fn infer_media_type(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "txt" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "rs" => "text/x-rust",
+        "py" => "text/x-python",
+        "js" => "application/javascript",
+        "ts" => "application/typescript",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "tar" => "application/x-tar",
+        "gz" | "gzip" => "application/gzip",
+        "zip" => "application/zip",
+        "wasm" => "application/wasm",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => DEFAULT_MEDIA_TYPE,
+    }
+}
 
 /// Reduce a source-provided name to the path-independent leaf used by file
 /// identity. Both separator styles are recognized so records converge across
@@ -261,6 +310,16 @@ mod tests {
             normalize_media_type_or_default("not a media type"),
             DEFAULT_MEDIA_TYPE
         );
+    }
+
+    #[test]
+    fn media_type_inference_is_case_insensitive_and_shared() {
+        assert_eq!(infer_media_type(Path::new("README.MD")), "text/markdown");
+        assert_eq!(
+            infer_media_type(Path::new("deck.PPTX")),
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        );
+        assert_eq!(infer_media_type(Path::new("unknown")), DEFAULT_MEDIA_TYPE);
     }
 
     #[test]

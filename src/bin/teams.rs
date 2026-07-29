@@ -3672,23 +3672,6 @@ fn ensure_attachments(
             };
         }
         *change += att_id_frag;
-        if !index.attachments.contains(&attachment_id) {
-            *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                metadata::tag: archive::kind_attachment,
-            };
-        }
-
-        if let Some(name) = source
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            let name = ws.put(name.to_owned());
-            *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                archive::attachment_name: name,
-            };
-        }
         if let Some(linked_files) = index.attachment_files.get(&attachment_id) {
             if linked_files.len() != 1 {
                 bail!(
@@ -3707,6 +3690,27 @@ fn ensure_attachments(
 
         if !added.insert(attachment_id) {
             continue;
+        }
+
+        // Occurrence metadata is the immutable first snapshot. Source-side
+        // edits belong in explicit revision entities; appending a changed name
+        // here would make readers choose arbitrarily between simultaneous
+        // values.
+        if !index.attachments.contains(&attachment_id) {
+            *change += entity! { ExclusiveId::force_ref(&attachment_id) @
+                metadata::tag: archive::kind_attachment,
+            };
+            if let Some(name) = source
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                let name = ws.put(name.to_owned());
+                *change += entity! { ExclusiveId::force_ref(&attachment_id) @
+                    archive::attachment_name: name,
+                };
+            }
         }
 
         let mut content_type = source.content_type.clone();
@@ -4525,6 +4529,39 @@ mod tests {
         );
         let files_catalog = test_branch_catalog(&pile.path, FILES_BRANCH_NAME);
         assert_eq!(file_entity_ids(&files_catalog).len(), 1);
+    }
+
+    #[test]
+    fn attachment_occurrence_name_is_an_immutable_first_snapshot() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        let first = graph_message(
+            "chat-a",
+            "1",
+            "2026-07-29T10:00:00Z",
+            "A",
+            vec![inline_attachment("attachment-1", "first.bin", b"same")],
+        );
+        let renamed = graph_message(
+            "chat-a",
+            "1",
+            "2026-07-29T10:00:00Z",
+            "A",
+            vec![inline_attachment("attachment-1", "renamed.bin", b"same")],
+        );
+
+        ingest_test_batch(&config, vec![first], true, true);
+        assert_eq!(
+            ingest_test_batch(&config, vec![renamed], true, true),
+            (0, 0)
+        );
+        let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
+        let names = find!(
+            (attachment: Id, name: Inline<Handle<LongString>>),
+            pattern!(&teams_catalog, [{ ?attachment @ archive::attachment_name: ?name }])
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1);
     }
 
     #[test]

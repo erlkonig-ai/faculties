@@ -333,30 +333,6 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
         .map(|view| view.to_string())
 }
 
-/// Best-effort media type from a filename extension. Used when a local
-/// attachment is first staged and as a fallback for malformed file records.
-fn mime_for_filename(name: &str) -> &'static str {
-    let lower = name.to_ascii_lowercase();
-    let ext = lower.rsplit('.').next().unwrap_or("");
-    match ext {
-        "pdf" => "application/pdf",
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "ppt" => "application/vnd.ms-powerpoint",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "doc" => "application/msword",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "txt" | "md" => "text/plain",
-        "csv" => "text/csv",
-        "json" => "application/json",
-        "zip" => "application/zip",
-        _ => "application/octet-stream",
-    }
-}
-
 // ── read tracking ─────────────────────────────────────────────────────────
 //
 // Re-uses the KIND_READ_ID + about_message/reader/read_at schema from
@@ -1184,7 +1160,7 @@ fn cmd_draft(
             .and_then(|s| s.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
-        let mime = mime_for_filename(&filename).to_string();
+        let mime = file_capability::infer_media_type(path).to_string();
         attachments.push(Attachment {
             filename,
             mime,
@@ -1666,28 +1642,36 @@ fn cmd_send(
             .map_err(|e| anyhow::anyhow!("checkout files: {e:?}"))?;
         let mut out: Vec<(String, String, Vec<u8>)> = Vec::new();
         for &fid in &attrs.attachment_ids {
-            let content_h: Option<FileHandle> =
-                find!(h: FileHandle, pattern!(&space, [{ fid @ file::content: ?h }])).next();
-            let name_h: Option<TextHandle> =
-                find!(h: TextHandle, pattern!(&space, [{ fid @ file::name: ?h }])).next();
-            if let Some(ch) = content_h {
-                let bytes: anybytes::Bytes = ws
-                    .get::<anybytes::Bytes, _>(ch)
-                    .map_err(|e| anyhow::anyhow!("read attachment blob: {e:?}"))?;
-                let name = name_h
-                    .and_then(|h| read_text(&mut ws, h))
-                    .unwrap_or_else(|| "attachment.bin".into());
-                let media_type_handle =
-                    file_capability::media_type_name_handle(&space, fid).ok_or_else(|| {
+            let content_h: FileHandle =
+                find!(h: FileHandle, pattern!(&space, [{ fid @ file::content: ?h }]))
+                    .next()
+                    .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "attachment file {fid:x} has no canonical media-type entity; rebuild the files branch"
+                            "attachment file {fid:x} has no canonical content; rebuild the files branch"
                         )
                     })?;
-                let media_type = read_text(&mut ws, media_type_handle).ok_or_else(|| {
-                    anyhow::anyhow!("read media type for attachment file {fid:x}")
+            let name_h: TextHandle =
+                find!(h: TextHandle, pattern!(&space, [{ fid @ file::name: ?h }]))
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "attachment file {fid:x} has no canonical name; rebuild the files branch"
+                        )
+                    })?;
+            let bytes: anybytes::Bytes = ws
+                .get::<anybytes::Bytes, _>(content_h)
+                .map_err(|e| anyhow::anyhow!("read attachment blob {fid:x}: {e:?}"))?;
+            let name = read_text(&mut ws, name_h)
+                .ok_or_else(|| anyhow::anyhow!("read name for attachment file {fid:x}"))?;
+            let media_type_handle =
+                file_capability::media_type_name_handle(&space, fid).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "attachment file {fid:x} has no canonical media-type entity; rebuild the files branch"
+                    )
                 })?;
-                out.push((name, media_type, bytes.as_ref().to_vec()));
-            }
+            let media_type = read_text(&mut ws, media_type_handle)
+                .ok_or_else(|| anyhow::anyhow!("read media type for attachment file {fid:x}"))?;
+            out.push((name, media_type, bytes.as_ref().to_vec()));
         }
         Ok(out)
     })?;

@@ -217,35 +217,6 @@ fn handle_hex(h: FileHandle) -> String {
     inlineencodings::Hash::<inlineencodings::Blake3>::to_hex(&hash)
 }
 
-fn infer_mime(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
-        "pdf" => "application/pdf",
-        "json" => "application/json",
-        "toml" => "application/toml",
-        "yaml" | "yml" => "application/yaml",
-        "xml" => "application/xml",
-        "csv" => "text/csv",
-        "txt" => "text/plain",
-        "md" | "markdown" => "text/markdown",
-        "rs" => "text/x-rust",
-        "py" => "text/x-python",
-        "js" => "application/javascript",
-        "ts" => "application/typescript",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "webp" => "image/webp",
-        "tar" => "application/x-tar",
-        "gz" | "gzip" => "application/gzip",
-        "zip" => "application/zip",
-        "wasm" => "application/wasm",
-        _ => "application/octet-stream",
-    }
-}
-
 fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -468,7 +439,7 @@ fn print_fs_tree(
         let size = meta.len();
         stats.bytes += size;
         stats.files += 1;
-        let mime = infer_mime(path);
+        let mime = file_capability::infer_media_type(path);
         println!("{prefix}{name}  ({mime}, {})", human_size(size));
     } else if meta.is_dir() {
         stats.dirs += 1;
@@ -682,7 +653,7 @@ fn build_tree(
     if meta.is_file() {
         let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
         stats.bytes += bytes.len() as u64;
-        let mime = mime_override.unwrap_or_else(|| infer_mime(path));
+        let mime = mime_override.unwrap_or_else(|| file_capability::infer_media_type(path));
         // Embed BEFORE the bytes are moved into the blob store.
         let emb_handle = embed_image_on_add(ws, embedder, mime, &bytes)?;
         let name_str = path
@@ -876,7 +847,7 @@ fn cmd_fetch(
         .unwrap_or_else(|| {
             guessed_name
                 .as_deref()
-                .map(|n| infer_mime(Path::new(n)))
+                .map(|n| file_capability::infer_media_type(Path::new(n)))
                 .unwrap_or("application/octet-stream")
                 .to_string()
         });
