@@ -38,6 +38,57 @@ pub mod migration {
     }
 }
 
+/// Tag marking a *run manifest*: one immutable record of a single migration
+/// run across however many branches it touched.
+///
+/// # Why completeness is not per-branch
+///
+/// The obvious design records "migration X applied" on each branch it
+/// touched, so any branch can answer "am I current?". Under partial failure
+/// that answer is a lie assembled from true statements: branch A cut over,
+/// branch B did not, and A truthfully reports itself migrated while
+/// cross-branch referential integrity is broken. Completeness is a property
+/// of the RUN, which no single branch has access to.
+///
+/// So the manifest names the whole vector — every pinned source commit,
+/// every intended output commit, each branch's role — and is
+/// content-addressed. The identical blob is attached to every participating
+/// head, so there are no copies to reconcile, only one fact referenced from
+/// several places. A reader may DISCOVER the run from any participant, but
+/// may call it complete only after resolving the entire vector and finding
+/// it matches.
+///
+/// If a cutover fails halfway the manifest stays truthful: it remains
+/// evidence of an incomplete run, which an applied-flag cannot express.
+/// (Design settled with liora-gpt, 2026-07-29.)
+///
+/// Minted 2026-07-29 with `trible genid`.
+pub const KIND_RUN_MANIFEST: Id = id_hex!("2D284967A061668798453DBD05131541");
+
+pub mod run {
+    use triblespace::prelude::*;
+
+    attributes! {
+        /// The run manifest an entity belongs to — the shared handle every
+        /// participating head carries.
+        "BB8EE6267FA7EDF7D601F4740B882627" as pub manifest: inlineencodings::GenId;
+        /// A branch this run touched, and the commit its content was pinned
+        /// at when the plan was computed. Re-checked at apply: if the branch
+        /// has moved, the plan describes a state that no longer exists and
+        /// must be refused rather than applied to a moved target.
+        ///
+        /// This names a CONTENT COMMIT, never a branch-metadata handle —
+        /// the manifest is attached to those same heads, so naming their
+        /// metadata would be a self-reference cycle.
+        "BC9E3081276313BAAC0EB8D5CF1E4EB4" as pub pinned_source: inlineencodings::GenId;
+        /// The content commit this run intends the branch to end at.
+        "C67FA6996E9FBD16F53E1BB38E8C2F34" as pub intended_output: inlineencodings::GenId;
+        /// What the branch is to this run — the local role, which is what
+        /// makes a single participating head legible on its own.
+        "ADD5D2AEDDFB923273DCFAD6F0E26D79" as pub role: inlineencodings::ShortString;
+    }
+}
+
 /// Ids of every migration recorded as applied to `space`.
 pub fn applied_ids(space: &TribleSet) -> std::collections::HashSet<Id> {
     find!(

@@ -221,22 +221,6 @@ enum Command {
         #[command(subcommand)]
         cmd: AccountCmd,
     },
-    /// Tag pre-existing mail with its direction (one-shot migration).
-    ///
-    /// Direction became an asserted tag (KIND_RECEIVED / KIND_SENT); mail
-    /// written before that carries neither, so it is invisible to the
-    /// unread queries rather than misclassified. This applies the old
-    /// inference ONCE, as a migration — which is the right use for it, as
-    /// opposed to a permanent query: an entity that was ever a draft was
-    /// composed here and, if it has `sent_at`, was sent; anything else
-    /// tagged KIND_MESSAGE arrived.
-    ///
-    /// Reports what it would do and changes nothing unless `--apply`.
-    Backfill {
-        /// Actually write the tags. Without this, dry run.
-        #[arg(long)]
-        apply: bool,
-    },
     Resolve { prefix: String },
 }
 
@@ -2185,7 +2169,8 @@ fn collect_messages(
             // Unread applies to mail that ARRIVED. Asked positively: an
             // entity is inbound because it carries KIND_RECEIVED, not
             // because it lacks some other tag and not because of who sent
-            // it. Mail predating the direction tags needs the backfill.
+            // it. Mail predating the direction tags needs
+            // `migrations run mail-direction --apply`.
             let received = find!(
                 t: Id,
                 pattern!(space, [{ id @ metadata::tag: ?t }])
@@ -2886,7 +2871,6 @@ fn main() -> Result<()> {
             AccountCmd::List => cmd_account_list(&cli.pile, &cli.secrets_branch),
             AccountCmd::Show => cmd_account_show(&cli.pile, &cli.secrets_branch),
         },
-        Command::Backfill { apply } => cmd_backfill(&cli.pile, mail_branch, apply),
         Command::Resolve { prefix } => cmd_resolve(&cli.pile, mail_branch, prefix),
     }
 }
@@ -3025,56 +3009,3 @@ fn cmd_account_show(pile: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// One-shot direction migration. See `Command::Backfill`.
-fn cmd_backfill(pile: &Path, mail_branch_id: Id, apply: bool) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout mail: {e:?}"))?;
-
-        let mut to_received = Vec::new();
-        let mut to_sent = Vec::new();
-        let mut already = 0usize;
-        for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: KIND_MESSAGE }])) {
-            let tags: Vec<Id> = find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }])).collect();
-            if tags.contains(&KIND_RECEIVED) || tags.contains(&KIND_SENT) {
-                already += 1;
-            } else if tags.contains(&KIND_DRAFT) {
-                // Composed here AND carries KIND_MESSAGE => it was sent.
-                to_sent.push(id);
-            } else {
-                to_received.push(id);
-            }
-        }
-
-        println!(
-            "{} already tagged | {} -> received | {} -> sent",
-            already,
-            to_received.len(),
-            to_sent.len()
-        );
-        if !apply {
-            println!("(dry run — pass --apply to write)");
-            return Ok(());
-        }
-        if to_received.is_empty() && to_sent.is_empty() {
-            return Ok(());
-        }
-
-        let mut change = TribleSet::new();
-        for id in &to_received {
-            change += entity! { ExclusiveId::force_ref(id) @ metadata::tag: &KIND_RECEIVED };
-        }
-        for id in &to_sent {
-            change += entity! { ExclusiveId::force_ref(id) @ metadata::tag: &KIND_SENT };
-        }
-        ws.commit(change, "mail: backfill direction tags");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push backfill: {e:?}"))?;
-        println!("tagged {} received, {} sent", to_received.len(), to_sent.len());
-        Ok(())
-    })
-}
