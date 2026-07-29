@@ -71,6 +71,9 @@ struct Cli {
         default_value = "az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv"
     )]
     token_command: String,
+    /// Explicit external presentation identity for Teams mutations.
+    #[arg(long = "as", global = true)]
+    present_as: Option<String>,
     #[command(subcommand)]
     command: Option<CommandMode>,
 }
@@ -117,6 +120,16 @@ enum CommandMode {
         #[command(subcommand)]
         command: AttachmentsCommand,
     },
+    /// Configure or inspect the professional Teams presentation context.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
+    /// Inspect Teams authentication state without printing credentials.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Interactive device-code login to cache a delegated token.
     Login {
         /// Tenant id or domain (default: common).
@@ -138,6 +151,26 @@ enum CommandMode {
         )]
         scopes: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ContextCommand {
+    /// Set the identity and privacy boundary used for professional Teams work.
+    Set {
+        /// Name to present externally (for example, Bulti).
+        present_as: String,
+        /// Work-context reminder shown before Teams activity.
+        #[arg(long)]
+        boundary: String,
+    },
+    /// Show the current professional Teams presentation context.
+    Show,
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Show safe authentication metadata and token liveness (never secrets/tokens).
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -324,6 +357,7 @@ struct TeamsBridgeConfig {
     branch: String,
     branch_id: Id,
     log_branch_id: Id,
+    presentation_context: TeamsPresentationContext,
     delta_url: String,
     token: Option<String>,
     token_command: String,
@@ -331,6 +365,7 @@ struct TeamsBridgeConfig {
 
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    let requested_as = cli.present_as.clone();
     let Some(mode) = cli.command.take() else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -346,6 +381,7 @@ fn main() -> Result<()> {
             descending,
         } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
             read_messages(
                 config,
                 ReadOptions {
@@ -358,11 +394,13 @@ fn main() -> Result<()> {
         }
         CommandMode::Send { chat_id, text } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), true)?;
             let text = faculties::text_arg(&text, "message text")?;
             send_message(config, &chat_id, &text)
         }
         CommandMode::Users { command } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
             match command {
                 UsersCommand::List { prefix, limit } => {
                     list_users(config, prefix.as_deref(), limit)
@@ -377,8 +415,14 @@ fn main() -> Result<()> {
                     activity,
                     duration_mins,
                     session_id,
-                } => set_presence_status(config, availability, activity, duration_mins, session_id),
-                PresenceCommand::Get { user_ids } => get_presence(config, user_ids),
+                } => {
+                    prepare_teams_context(&config, requested_as.as_deref(), true)?;
+                    set_presence_status(config, availability, activity, duration_mins, session_id)
+                }
+                PresenceCommand::Get { user_ids } => {
+                    prepare_teams_context(&config, requested_as.as_deref(), false)?;
+                    get_presence(config, user_ids)
+                }
             }
         }
         CommandMode::Chat { command } => {
@@ -388,12 +432,16 @@ fn main() -> Result<()> {
                     chat_id,
                     user_id,
                     owner,
-                } => invite_to_chat(config, &chat_id, &user_id, owner),
+                } => {
+                    prepare_teams_context(&config, requested_as.as_deref(), true)?;
+                    invite_to_chat(config, &chat_id, &user_id, owner)
+                }
                 ChatCommand::Create {
                     user_ids,
                     group,
                     topic,
                 } => {
+                    prepare_teams_context(&config, requested_as.as_deref(), true)?;
                     let topic = topic
                         .as_deref()
                         .map(|value| load_value_or_file(value, "chat topic"))
@@ -404,6 +452,7 @@ fn main() -> Result<()> {
         }
         CommandMode::Attachments { command } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
             match command {
                 AttachmentsCommand::List {
                     chat_id,
@@ -456,6 +505,26 @@ fn main() -> Result<()> {
                 }
             }
         }
+        CommandMode::Context { command } => {
+            let config = build_config(&cli)?;
+            match command {
+                ContextCommand::Set {
+                    present_as,
+                    boundary,
+                } => {
+                    let context = store_context_in_pile(&config, &present_as, &boundary)?;
+                    show_context(&context)
+                }
+                ContextCommand::Show => show_context(&config.presentation_context),
+            }
+        }
+        CommandMode::Auth { command } => {
+            let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
+            match command {
+                AuthCommand::Status => show_auth_status(&config),
+            }
+        }
         CommandMode::Login {
             tenant,
             client_id,
@@ -463,6 +532,7 @@ fn main() -> Result<()> {
             scopes,
         } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
             let scopes = scopes
                 .as_deref()
                 .map(|value| load_value_or_file(value, "scopes"))
@@ -501,36 +571,35 @@ fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
     let log_branch = std::env::var("TRIBLESPACE_LOG_BRANCH")
         .ok()
         .unwrap_or_else(|| DEFAULT_LOG_BRANCH.to_string());
-    let branch_id = with_repo(&pile_path, |repo| {
-        if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"));
-        }
-        repo.ensure_branch(&branch, None)
-            .map_err(|e| anyhow::anyhow!("ensure teams branch: {e:?}"))
-    })?;
-    let log_branch_id = with_repo(&pile_path, |repo| {
-        repo.ensure_branch(&log_branch, None)
-            .map_err(|e| anyhow::anyhow!("ensure logs branch: {e:?}"))
+    let (branch_id, log_branch_id, presentation_context) = with_repo(&pile_path, |repo| {
+        let branch_id = if let Some(hex) = cli.branch_id.as_deref() {
+            Id::from_hex(hex.trim()).ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"))?
+        } else {
+            repo.ensure_branch(&branch, None)
+                .map_err(|e| anyhow::anyhow!("ensure teams branch: {e:?}"))?
+        };
+        let log_branch_id = repo
+            .ensure_branch(&log_branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure logs branch: {e:?}"))?;
+        let presentation_context = load_context_from_repo(repo, branch_id)?;
+        Ok((branch_id, log_branch_id, presentation_context))
     })?;
     let delta_url = std::env::var("TEAMS_DELTA_URL")
         .ok()
         .unwrap_or_else(|| cli.delta_url.clone());
     let token = cli
         .token
-        .as_deref()
-        .map(|value| load_value_or_file_trimmed(value, "token"))
-        .transpose()?
+        .clone()
         .or_else(|| std::env::var("TEAMS_TOKEN").ok());
     let token_command = std::env::var("TEAMS_TOKEN_COMMAND")
         .ok()
         .unwrap_or_else(|| cli.token_command.clone());
-    let token_command = load_value_or_file_trimmed(&token_command, "token command")?;
     Ok(TeamsBridgeConfig {
         pile_path,
         branch,
         branch_id,
         log_branch_id,
+        presentation_context,
         delta_url,
         token,
         token_command,
@@ -678,6 +747,12 @@ struct TeamsConfigData {
     user_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TeamsPresentationContext {
+    name: Option<String>,
+    boundary: Option<String>,
+}
+
 fn get_app_token(
     config: &TeamsBridgeConfig,
     app_token_cache: &mut Option<AppTokenCache>,
@@ -747,7 +822,12 @@ fn resolve_delta_url(template: &str, user_id: &str) -> Result<String> {
 }
 
 fn get_delegated_token(config: &TeamsBridgeConfig) -> Result<String> {
-    if let Some(token) = config.token.as_ref() {
+    if let Some(token) = config
+        .token
+        .as_deref()
+        .map(|value| load_value_or_file_trimmed(value, "token"))
+        .transpose()?
+    {
         let token = token.trim();
         if !token.is_empty() {
             return Ok(token.to_owned());
@@ -758,8 +838,8 @@ fn get_delegated_token(config: &TeamsBridgeConfig) -> Result<String> {
         return Ok(token);
     }
 
-    let cmd = config
-        .token_command
+    let token_command = load_value_or_file_trimmed(&config.token_command, "token command")?;
+    let cmd = token_command
         .split_whitespace()
         .map(str::to_string)
         .collect::<Vec<_>>();
@@ -833,6 +913,12 @@ struct ConfigState {
     client_id: Option<Inline<Handle<LongString>>>,
     client_secret: Option<Inline<Handle<LongString>>>,
     user_id: Option<Inline<Handle<LongString>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextState {
+    presentation_name: Option<Inline<Handle<LongString>>>,
+    presentation_boundary: Option<Inline<Handle<LongString>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -932,13 +1018,213 @@ fn load_config_from_pile(config: &TeamsBridgeConfig) -> Result<Option<TeamsConfi
             Some(handle) => Some(load_longstring(&mut ws, handle)?),
             None => None,
         };
-
         Ok(Some(TeamsConfigData {
             tenant,
             client_id,
             client_secret,
             user_id,
         }))
+    })
+}
+
+fn load_context_from_repo(
+    repo: &mut Repository<Pile>,
+    branch_id: Id,
+) -> Result<TeamsPresentationContext> {
+    let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
+    let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+    let Some(state) = latest_context_state(&catalog) else {
+        return Ok(TeamsPresentationContext::default());
+    };
+
+    let name = state
+        .presentation_name
+        .map(|handle| load_longstring(&mut ws, handle))
+        .transpose()?;
+    let boundary = state
+        .presentation_boundary
+        .map(|handle| load_longstring(&mut ws, handle))
+        .transpose()?;
+    Ok(TeamsPresentationContext { name, boundary })
+}
+
+fn store_context_in_pile(
+    config: &TeamsBridgeConfig,
+    presentation_name: &str,
+    presentation_boundary: &str,
+) -> Result<TeamsPresentationContext> {
+    let presentation_name = presentation_name.trim();
+    if presentation_name.is_empty() {
+        bail!("Teams presentation name must not be empty");
+    }
+    let presentation_boundary = presentation_boundary.trim();
+    if presentation_boundary.is_empty() {
+        bail!("Teams presentation boundary must not be empty");
+    }
+
+    let (repo, branch_id) =
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
+    with_repo_close(repo, |repo| {
+        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+        let supersedes = current_context_head_ids(&catalog);
+        let context_id = ufoid();
+        let created_at = epoch_interval(now_epoch());
+        let name_handle = ws.put(presentation_name.to_owned());
+        let boundary_handle = ws.put(presentation_boundary.to_owned());
+        let mut change = TribleSet::new();
+        change += entity! { &context_id @
+            metadata::tag: teams::kind_context,
+            metadata::created_at: created_at,
+            metadata::supersedes*: supersedes,
+            metadata::name: name_handle,
+            metadata::description: boundary_handle,
+        };
+
+        ws.commit(change.difference(&catalog), "teams professional context");
+        map_err_debug(repo.push(&mut ws), "push workspace")?;
+        Ok(TeamsPresentationContext {
+            name: Some(presentation_name.to_owned()),
+            boundary: Some(presentation_boundary.to_owned()),
+        })
+    })
+}
+
+fn print_context_banner(context: &TeamsPresentationContext) {
+    match context
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => eprintln!("TEAMS · PRESENT AS {name} · PROFESSIONAL WORK CONTEXT"),
+        None => eprintln!("TEAMS · CONTEXT UNSET"),
+    }
+    match context
+        .boundary
+        .as_deref()
+        .map(str::trim)
+        .filter(|boundary| !boundary.is_empty())
+    {
+        Some(boundary) => eprintln!("BOUNDARY · {boundary}"),
+        None => eprintln!("BOUNDARY · UNSET"),
+    }
+}
+
+fn prepare_teams_context(
+    config: &TeamsBridgeConfig,
+    requested_as: Option<&str>,
+    require_explicit_identity: bool,
+) -> Result<TeamsPresentationContext> {
+    let context = config.presentation_context.clone();
+    print_context_banner(&context);
+    if !require_explicit_identity {
+        return Ok(context);
+    }
+
+    let Some(configured_name) = context
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        bail!("outward Teams mutations require a configured context; run `teams context set`");
+    };
+    if context
+        .boundary
+        .as_deref()
+        .map(str::trim)
+        .filter(|boundary| !boundary.is_empty())
+        .is_none()
+    {
+        bail!("outward Teams mutations require a configured work boundary");
+    }
+    let Some(requested_as) = requested_as.map(str::trim).filter(|name| !name.is_empty()) else {
+        bail!("outward Teams mutations require `--as {configured_name}`");
+    };
+    if requested_as != configured_name {
+        bail!(
+            "Teams presentation mismatch: configured as {configured_name}, requested --as {requested_as}"
+        );
+    }
+    Ok(context)
+}
+
+fn show_context(context: &TeamsPresentationContext) -> Result<()> {
+    match context.name.as_deref() {
+        Some(name) => println!("present_as: {name}"),
+        None => println!("present_as: (unset)"),
+    }
+    println!("context: professional/work-only");
+    match context.boundary.as_deref() {
+        Some(boundary) => println!("boundary: {boundary}"),
+        None => println!("boundary: (unset)"),
+    }
+    Ok(())
+}
+
+fn show_auth_status(config: &TeamsBridgeConfig) -> Result<()> {
+    let (repo, branch_id) =
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
+    with_repo_close(repo, |repo| {
+        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+
+        if let Some(state) = latest_config_state(&catalog) {
+            let tenant = state
+                .tenant
+                .map(|handle| load_longstring(&mut ws, handle))
+                .transpose()?;
+            let client_id = state
+                .client_id
+                .map(|handle| load_longstring(&mut ws, handle))
+                .transpose()?;
+            println!("tenant: {}", tenant.as_deref().unwrap_or("(unset)"));
+            println!("client_id: {}", client_id.as_deref().unwrap_or("(unset)"));
+            println!(
+                "app_client_secret: {}",
+                if state.client_secret.is_some() {
+                    "configured (validity not checked)"
+                } else {
+                    "not configured"
+                }
+            );
+            println!(
+                "user_identity: {}",
+                if state.user_id.is_some() {
+                    "configured"
+                } else {
+                    "not configured"
+                }
+            );
+        } else {
+            println!("tenant: (unset)");
+            println!("client_id: (unset)");
+            println!("app_client_secret: not configured");
+            println!("user_identity: not configured");
+        }
+
+        if let Some(token) = latest_token_state(&catalog) {
+            let now_key = interval_key(epoch_interval(now_epoch()));
+            let access_state = if token.expires_at_key > now_key + 30 * 1_000_000_000 {
+                "locally unexpired"
+            } else {
+                "locally expired"
+            };
+            println!("delegated_access_token: {access_state}");
+            println!(
+                "delegated_refresh_token: {}",
+                if token.refresh_token.is_some() {
+                    "configured (validity not checked)"
+                } else {
+                    "not configured"
+                }
+            );
+        } else {
+            println!("delegated_access_token: not configured");
+            println!("delegated_refresh_token: not configured");
+        }
+        Ok(())
     })
 }
 
@@ -1014,6 +1300,51 @@ fn latest_config_state(catalog: &TribleSet) -> Option<ConfigState> {
         }
     }
     best
+}
+
+fn latest_context_state(catalog: &TribleSet) -> Option<ContextState> {
+    let context_id = current_context_head_ids(catalog).into_iter().max()?;
+    Some(ContextState {
+        presentation_name: find_optional_handle(catalog, context_id, &metadata::name),
+        presentation_boundary: find_optional_handle(catalog, context_id, &metadata::description),
+    })
+}
+
+fn current_context_head_ids(catalog: &TribleSet) -> Vec<Id> {
+    let mut context_ids = find!(
+        (context: Id),
+        pattern!(catalog, [{ ?context @ metadata::tag: teams::kind_context }])
+    )
+    .into_iter()
+    .map(|(context_id,)| context_id)
+    .collect::<Vec<_>>();
+    context_ids.sort_unstable();
+    context_ids.dedup();
+
+    let superseded = find!(
+        (predecessor: Id),
+        pattern!(catalog, [{
+            _?successor @
+            metadata::tag: teams::kind_context,
+            metadata::supersedes: ?predecessor,
+        }])
+    )
+    .into_iter()
+    .map(|(predecessor,)| predecessor)
+    .collect::<HashSet<_>>();
+    let heads = context_ids
+        .iter()
+        .copied()
+        .filter(|context_id| !superseded.contains(context_id))
+        .collect::<Vec<_>>();
+
+    // A malformed cyclic history should not make the safety context disappear.
+    // Deterministically fall back to the maximal known context id.
+    if heads.is_empty() && !context_ids.is_empty() {
+        context_ids.into_iter().max().into_iter().collect()
+    } else {
+        heads
+    }
 }
 
 fn find_optional_handle(
@@ -3493,4 +3824,160 @@ fn u256_to_u128(value: Inline<U256BE>) -> Option<u128> {
     let mut buf = [0u8; 16];
     buf.copy_from_slice(&raw[16..]);
     Some(u128::from_be_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestPile {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestPile {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let sequence = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "faculties-teams-context-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("test.pile");
+            fs::File::create(&path).unwrap();
+            Self { dir, path }
+        }
+
+        fn config(&self) -> TeamsBridgeConfig {
+            let branch_id = ensure_test_branch(&self.path, DEFAULT_BRANCH);
+            let log_branch_id = ensure_test_branch(&self.path, DEFAULT_LOG_BRANCH);
+            TeamsBridgeConfig {
+                pile_path: self.path.clone(),
+                branch: DEFAULT_BRANCH.to_string(),
+                branch_id,
+                log_branch_id,
+                presentation_context: TeamsPresentationContext::default(),
+                delta_url: DEFAULT_DELTA_URL.to_string(),
+                token: None,
+                token_command: "unused".to_string(),
+            }
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn ensure_test_branch(path: &Path, name: &str) -> Id {
+        with_repo(&path.to_path_buf(), |repo| {
+            repo.ensure_branch(name, None)
+                .map_err(|err| anyhow::anyhow!("ensure test branch: {err:?}"))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn context_update_preserves_authentication_snapshot() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        let initial = TeamsConfigData {
+            tenant: Some("tenant.example".to_string()),
+            client_id: Some("client-id".to_string()),
+            client_secret: Some("secret-value".to_string()),
+            user_id: Some("user-id".to_string()),
+        };
+        store_config_in_pile(&config, &initial).unwrap();
+
+        store_context_in_pile(&config, "Bulti", "Work-only boundary").unwrap();
+
+        let loaded = load_config_from_pile(&config).unwrap().unwrap();
+        assert_eq!(loaded.tenant, initial.tenant);
+        assert_eq!(loaded.client_id, initial.client_id);
+        assert_eq!(loaded.client_secret, initial.client_secret);
+        assert_eq!(loaded.user_id, initial.user_id);
+        let context = with_repo(&config.pile_path, |repo| {
+            load_context_from_repo(repo, config.branch_id)
+        })
+        .unwrap();
+        assert_eq!(context.name.as_deref(), Some("Bulti"));
+        assert_eq!(context.boundary.as_deref(), Some("Work-only boundary"));
+    }
+
+    #[test]
+    fn context_supersession_ignores_future_wall_clock_values() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        with_repo(&config.pile_path, |repo| {
+            let mut ws = map_err_debug(repo.pull(config.branch_id), "pull test workspace")?;
+            let catalog = map_err_debug(ws.checkout(..), "checkout test workspace")?.into_facts();
+            let context_id = ufoid();
+            let name = ws.put("Future identity".to_string());
+            let boundary = ws.put("Future boundary".to_string());
+            let future = epoch_interval(Epoch::from_gregorian_utc(2099, 1, 1, 0, 0, 0, 0));
+            let change = entity! { &context_id @
+                metadata::tag: teams::kind_context,
+                metadata::created_at: future,
+                metadata::name: name,
+                metadata::description: boundary,
+            };
+            ws.commit(change.difference(&catalog), "future-dated test context");
+            map_err_debug(repo.push(&mut ws), "push test workspace")?;
+            Ok(())
+        })
+        .unwrap();
+
+        store_context_in_pile(&config, "Bulti", "Current boundary").unwrap();
+        let context = with_repo(&config.pile_path, |repo| {
+            load_context_from_repo(repo, config.branch_id)
+        })
+        .unwrap();
+        assert_eq!(context.name.as_deref(), Some("Bulti"));
+        assert_eq!(context.boundary.as_deref(), Some("Current boundary"));
+    }
+
+    #[test]
+    fn outward_mutations_require_the_configured_identity() {
+        let pile = TestPile::new();
+        let mut config = pile.config();
+        store_context_in_pile(&config, "Bulti", "Work-only boundary").unwrap();
+        config.presentation_context = TeamsPresentationContext {
+            name: Some("Bulti".to_string()),
+            boundary: Some("Work-only boundary".to_string()),
+        };
+
+        let missing = prepare_teams_context(&config, None, true).unwrap_err();
+        assert!(missing.to_string().contains("--as Bulti"));
+
+        let mismatch = prepare_teams_context(&config, Some("Liora"), true).unwrap_err();
+        assert!(mismatch.to_string().contains("presentation mismatch"));
+
+        prepare_teams_context(&config, Some("Bulti"), true).unwrap();
+    }
+
+    #[test]
+    fn context_command_accepts_global_identity_argument_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "teams",
+            "--pile",
+            "test.pile",
+            "send",
+            "--as",
+            "Bulti",
+            "chat-id",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(cli.present_as.as_deref(), Some("Bulti"));
+        assert!(matches!(cli.command, Some(CommandMode::Send { .. })));
+    }
 }

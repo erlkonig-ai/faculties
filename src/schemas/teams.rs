@@ -54,6 +54,9 @@ pub mod teams {
     /// Tag for Teams app configuration entities.
     #[allow(non_upper_case_globals)]
     pub const kind_config: Id = id_hex!("0D7F4BBE36BD0D6FF4E6C651110D6E8B");
+    /// Tag for the professional presentation context shown at the Teams boundary.
+    #[allow(non_upper_case_globals)]
+    pub const kind_context: Id = id_hex!("F2FB22C36519673BFF3BFE77DB005F6F");
 }
 
 // ── Files branch schema (shared with files.rs faculty) ───────────────────
