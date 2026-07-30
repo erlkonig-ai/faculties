@@ -23,29 +23,19 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
-/// Author entity used by the teams faculty when writing its own log entries.
-/// Singleton — same id across every faculty run.
-const TEAMS_LOG_AUTHOR_ID: Id = id_hex!("5E9B01A9D7C9BB6D765F8C96A83D2E60");
-/// Author entity used for attachment backfill rows (there is no real author
-/// for these; the attachments-only backfill is a faculty action, not a user
-/// message). Singleton.
-#[allow(dead_code)]
-const TEAMS_BACKFILL_AUTHOR_ID: Id = id_hex!("64A9492F3B2368A0DAB5FAF3277132C2");
 /// Fallback author id used when Teams delivers a message with no `from.user.id`.
-/// Mapping every anonymous message to the same id keeps the graph small and
-/// lets us eventually merge/correct them later if the upstream data improves.
-#[allow(dead_code)]
+/// Mapping anonymous messages to one explicit subject keeps missing identity
+/// distinct from any source-assigned user. Later correction belongs in the
+/// message-revision model rather than additive mutation of the first snapshot.
 const TEAMS_UNKNOWN_AUTHOR_ID: Id = id_hex!("04217F0E5F75F57B8A7CBFD824D5FF31");
 
+use faculties::files as file_capability;
 use faculties::schemas::archive::{archive, RawBytes};
-use faculties::schemas::teams::{
-    file_schema, teams, DEFAULT_BRANCH, DEFAULT_DELTA_URL, DEFAULT_LOG_BRANCH, FILES_BRANCH_NAME,
-};
-use file_schema::file;
-use file_schema::KIND_FILE;
+use faculties::schemas::files::{file, FILES_BRANCH_NAME, KIND_FILE, KIND_MEDIA_TYPE};
+use faculties::schemas::teams::{teams, DEFAULT_BRANCH, DEFAULT_DELTA_URL};
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
@@ -71,6 +61,9 @@ struct Cli {
         default_value = "az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv"
     )]
     token_command: String,
+    /// Explicit external presentation identity for Teams mutations.
+    #[arg(long = "as", global = true)]
+    present_as: Option<String>,
     #[command(subcommand)]
     command: Option<CommandMode>,
 }
@@ -117,6 +110,16 @@ enum CommandMode {
         #[command(subcommand)]
         command: AttachmentsCommand,
     },
+    /// Configure or inspect the professional Teams presentation context.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
+    /// Inspect Teams authentication state without printing credentials.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Interactive device-code login to cache a delegated token.
     Login {
         /// Tenant id or domain (default: common).
@@ -138,6 +141,26 @@ enum CommandMode {
         )]
         scopes: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ContextCommand {
+    /// Set the identity and privacy boundary used for professional Teams work.
+    Set {
+        /// Name to present externally (for example, Bulti).
+        present_as: String,
+        /// Work-context reminder shown before Teams activity.
+        #[arg(long)]
+        boundary: String,
+    },
+    /// Show the current professional Teams presentation context.
+    Show,
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Show safe authentication metadata and token liveness (never secrets/tokens).
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -323,7 +346,7 @@ struct TeamsBridgeConfig {
     pile_path: PathBuf,
     branch: String,
     branch_id: Id,
-    log_branch_id: Id,
+    presentation_context: TeamsPresentationContext,
     delta_url: String,
     token: Option<String>,
     token_command: String,
@@ -331,6 +354,7 @@ struct TeamsBridgeConfig {
 
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    let requested_as = cli.present_as.clone();
     let Some(mode) = cli.command.take() else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -346,6 +370,7 @@ fn main() -> Result<()> {
             descending,
         } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
             read_messages(
                 config,
                 ReadOptions {
@@ -358,11 +383,13 @@ fn main() -> Result<()> {
         }
         CommandMode::Send { chat_id, text } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), true)?;
             let text = faculties::text_arg(&text, "message text")?;
             send_message(config, &chat_id, &text)
         }
         CommandMode::Users { command } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
             match command {
                 UsersCommand::List { prefix, limit } => {
                     list_users(config, prefix.as_deref(), limit)
@@ -377,8 +404,14 @@ fn main() -> Result<()> {
                     activity,
                     duration_mins,
                     session_id,
-                } => set_presence_status(config, availability, activity, duration_mins, session_id),
-                PresenceCommand::Get { user_ids } => get_presence(config, user_ids),
+                } => {
+                    prepare_teams_context(&config, requested_as.as_deref(), true)?;
+                    set_presence_status(config, availability, activity, duration_mins, session_id)
+                }
+                PresenceCommand::Get { user_ids } => {
+                    prepare_teams_context(&config, requested_as.as_deref(), false)?;
+                    get_presence(config, user_ids)
+                }
             }
         }
         CommandMode::Chat { command } => {
@@ -388,12 +421,16 @@ fn main() -> Result<()> {
                     chat_id,
                     user_id,
                     owner,
-                } => invite_to_chat(config, &chat_id, &user_id, owner),
+                } => {
+                    prepare_teams_context(&config, requested_as.as_deref(), true)?;
+                    invite_to_chat(config, &chat_id, &user_id, owner)
+                }
                 ChatCommand::Create {
                     user_ids,
                     group,
                     topic,
                 } => {
+                    prepare_teams_context(&config, requested_as.as_deref(), true)?;
                     let topic = topic
                         .as_deref()
                         .map(|value| load_value_or_file(value, "chat topic"))
@@ -404,6 +441,7 @@ fn main() -> Result<()> {
         }
         CommandMode::Attachments { command } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
             match command {
                 AttachmentsCommand::List {
                     chat_id,
@@ -456,6 +494,26 @@ fn main() -> Result<()> {
                 }
             }
         }
+        CommandMode::Context { command } => {
+            let config = build_config(&cli)?;
+            match command {
+                ContextCommand::Set {
+                    present_as,
+                    boundary,
+                } => {
+                    let context = store_context_in_pile(&config, &present_as, &boundary)?;
+                    show_context(&context)
+                }
+                ContextCommand::Show => show_context(&config.presentation_context),
+            }
+        }
+        CommandMode::Auth { command } => {
+            let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
+            match command {
+                AuthCommand::Status => show_auth_status(&config),
+            }
+        }
         CommandMode::Login {
             tenant,
             client_id,
@@ -463,6 +521,7 @@ fn main() -> Result<()> {
             scopes,
         } => {
             let config = build_config(&cli)?;
+            prepare_teams_context(&config, requested_as.as_deref(), false)?;
             let scopes = scopes
                 .as_deref()
                 .map(|value| load_value_or_file(value, "scopes"))
@@ -498,39 +557,31 @@ fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
     let branch = std::env::var("TRIBLESPACE_BRANCH")
         .ok()
         .unwrap_or_else(|| cli.branch.clone());
-    let log_branch = std::env::var("TRIBLESPACE_LOG_BRANCH")
-        .ok()
-        .unwrap_or_else(|| DEFAULT_LOG_BRANCH.to_string());
-    let branch_id = with_repo(&pile_path, |repo| {
-        if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"));
-        }
-        repo.ensure_branch(&branch, None)
-            .map_err(|e| anyhow::anyhow!("ensure teams branch: {e:?}"))
-    })?;
-    let log_branch_id = with_repo(&pile_path, |repo| {
-        repo.ensure_branch(&log_branch, None)
-            .map_err(|e| anyhow::anyhow!("ensure logs branch: {e:?}"))
+    let (branch_id, presentation_context) = with_repo(&pile_path, |repo| {
+        let branch_id = if let Some(hex) = cli.branch_id.as_deref() {
+            Id::from_hex(hex.trim()).ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"))?
+        } else {
+            repo.ensure_branch(&branch, None)
+                .map_err(|e| anyhow::anyhow!("ensure teams branch: {e:?}"))?
+        };
+        let presentation_context = load_context_from_repo(repo, branch_id)?;
+        Ok((branch_id, presentation_context))
     })?;
     let delta_url = std::env::var("TEAMS_DELTA_URL")
         .ok()
         .unwrap_or_else(|| cli.delta_url.clone());
     let token = cli
         .token
-        .as_deref()
-        .map(|value| load_value_or_file_trimmed(value, "token"))
-        .transpose()?
+        .clone()
         .or_else(|| std::env::var("TEAMS_TOKEN").ok());
     let token_command = std::env::var("TEAMS_TOKEN_COMMAND")
         .ok()
         .unwrap_or_else(|| cli.token_command.clone());
-    let token_command = load_value_or_file_trimmed(&token_command, "token command")?;
     Ok(TeamsBridgeConfig {
         pile_path,
         branch,
         branch_id,
-        log_branch_id,
+        presentation_context,
         delta_url,
         token,
         token_command,
@@ -570,43 +621,6 @@ where
     result
 }
 
-fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<()> {
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.log_branch_id, "logs")?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-
-        let mut change = TribleSet::new();
-        let author_name = ws.put("teams".to_string());
-        let author_role = ws.put("faculty".to_string());
-        change += entity! { ExclusiveId::force_ref(&TEAMS_LOG_AUTHOR_ID) @
-            metadata::tag: archive::kind_author,
-            archive::author_name: author_name,
-            archive::author_role: author_role,
-        };
-
-        let log_id = ufoid();
-        let content = format!("[{}] {}", level.trim(), message.trim());
-        let content_handle = ws.put(content);
-        let created_at = epoch_interval(now_epoch());
-        change += entity! { &log_id @
-            metadata::tag: teams::kind_log,
-            archive::author: TEAMS_LOG_AUTHOR_ID,
-            metadata::created_at: created_at,
-            archive::content: content_handle,
-        };
-
-        let change = change.difference(&catalog);
-        if change.is_empty() {
-            return Ok(());
-        }
-        ws.commit(change, "teams log");
-        map_err_debug(repo.push(&mut ws), "push workspace")?;
-        Ok(())
-    })
-}
-
 fn pull_once_with_cache(
     config: &TeamsBridgeConfig,
     app_token_cache: &mut Option<AppTokenCache>,
@@ -617,39 +631,53 @@ fn pull_once_with_cache(
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+        validate_message_identity_lineage(&catalog)?;
+        let files_branch_id = repo
+            .ensure_branch(FILES_BRANCH_NAME, None)
+            .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
+        let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
+        let files_catalog =
+            map_err_debug(files_ws.checkout(..), "checkout files workspace")?.into_facts();
+        let existing_files = file_entity_ids(&files_catalog);
         let cursor_state = load_cursor_from_space(&mut ws, &catalog)?;
-        let start_url = match cursor_state.as_ref() {
-            Some(cursor) if cursor.url.contains("/me/") => {
-                resolve_delta_url(&config.delta_url, &app_config.user_id)?
-            }
-            Some(cursor) => cursor.url.clone(),
-            None => resolve_delta_url(&config.delta_url, &app_config.user_id)?,
+        let base_url = resolve_delta_url(&config.delta_url, &app_config.user_id)?;
+        let (start_url, using_saved_cursor) = match cursor_state.as_ref() {
+            Some(cursor) if cursor.url.contains("/me/") => (base_url.clone(), false),
+            Some(cursor) => (cursor.url.clone(), true),
+            None => (base_url.clone(), false),
         };
 
-        let (messages, new_cursor) = fetch_delta_messages(&token, &start_url)?;
+        let (messages, new_cursor) =
+            fetch_delta_with_cursor_recovery(&token, &start_url, &base_url, using_saved_cursor)?;
         let index = CatalogIndex::build(&catalog);
         let incoming = parse_messages(messages)?;
-        let (mut change, files_change) =
-            build_ingest_change(&mut ws, &catalog, &index, incoming, &token, config)?;
+        let (mut change, files_change) = build_ingest_change(
+            &mut ws,
+            &mut files_ws,
+            &catalog,
+            &index,
+            &existing_files,
+            incoming,
+            &token,
+        )?;
         if let Some(cursor_change) =
             build_cursor_change(&mut ws, &catalog, cursor_state.as_ref(), new_cursor)?
         {
             change += cursor_change;
         }
 
+        // File blobs are staged in the files workspace. Publish them before
+        // advancing Teams facts and the delta cursor: a later Teams failure is
+        // safely replayable against an already-present content-addressed file.
+        let files_change = files_change.difference(&files_catalog);
+        if !files_change.is_empty() {
+            files_ws.commit(files_change, "teams attachment files");
+            map_err_debug(repo.push(&mut files_ws), "push files workspace")?;
+        }
+
         if !change.is_empty() {
             ws.commit(change, "teams ingest");
             map_err_debug(repo.push(&mut ws), "push workspace")?;
-        }
-
-        // Commit file entities to the files branch.
-        if !files_change.is_empty() {
-            let files_branch_id = repo
-                .ensure_branch(FILES_BRANCH_NAME, None)
-                .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
-            let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
-            files_ws.commit(files_change, "teams attachment files");
-            map_err_debug(repo.push(&mut files_ws), "push files workspace")?;
         }
 
         Ok(())
@@ -676,6 +704,12 @@ struct TeamsConfigData {
     client_id: Option<String>,
     client_secret: Option<String>,
     user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TeamsPresentationContext {
+    name: Option<String>,
+    boundary: Option<String>,
 }
 
 fn get_app_token(
@@ -747,7 +781,12 @@ fn resolve_delta_url(template: &str, user_id: &str) -> Result<String> {
 }
 
 fn get_delegated_token(config: &TeamsBridgeConfig) -> Result<String> {
-    if let Some(token) = config.token.as_ref() {
+    if let Some(token) = config
+        .token
+        .as_deref()
+        .map(|value| load_value_or_file_trimmed(value, "token"))
+        .transpose()?
+    {
         let token = token.trim();
         if !token.is_empty() {
             return Ok(token.to_owned());
@@ -758,8 +797,8 @@ fn get_delegated_token(config: &TeamsBridgeConfig) -> Result<String> {
         return Ok(token);
     }
 
-    let cmd = config
-        .token_command
+    let token_command = load_value_or_file_trimmed(&config.token_command, "token command")?;
+    let cmd = token_command
         .split_whitespace()
         .map(str::to_string)
         .collect::<Vec<_>>();
@@ -833,6 +872,12 @@ struct ConfigState {
     client_id: Option<Inline<Handle<LongString>>>,
     client_secret: Option<Inline<Handle<LongString>>>,
     user_id: Option<Inline<Handle<LongString>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextState {
+    presentation_name: Option<Inline<Handle<LongString>>>,
+    presentation_boundary: Option<Inline<Handle<LongString>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -932,13 +977,213 @@ fn load_config_from_pile(config: &TeamsBridgeConfig) -> Result<Option<TeamsConfi
             Some(handle) => Some(load_longstring(&mut ws, handle)?),
             None => None,
         };
-
         Ok(Some(TeamsConfigData {
             tenant,
             client_id,
             client_secret,
             user_id,
         }))
+    })
+}
+
+fn load_context_from_repo(
+    repo: &mut Repository<Pile>,
+    branch_id: Id,
+) -> Result<TeamsPresentationContext> {
+    let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
+    let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+    let Some(state) = latest_context_state(&catalog) else {
+        return Ok(TeamsPresentationContext::default());
+    };
+
+    let name = state
+        .presentation_name
+        .map(|handle| load_longstring(&mut ws, handle))
+        .transpose()?;
+    let boundary = state
+        .presentation_boundary
+        .map(|handle| load_longstring(&mut ws, handle))
+        .transpose()?;
+    Ok(TeamsPresentationContext { name, boundary })
+}
+
+fn store_context_in_pile(
+    config: &TeamsBridgeConfig,
+    presentation_name: &str,
+    presentation_boundary: &str,
+) -> Result<TeamsPresentationContext> {
+    let presentation_name = presentation_name.trim();
+    if presentation_name.is_empty() {
+        bail!("Teams presentation name must not be empty");
+    }
+    let presentation_boundary = presentation_boundary.trim();
+    if presentation_boundary.is_empty() {
+        bail!("Teams presentation boundary must not be empty");
+    }
+
+    let (repo, branch_id) =
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
+    with_repo_close(repo, |repo| {
+        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+        let supersedes = current_context_head_ids(&catalog);
+        let context_id = ufoid();
+        let created_at = epoch_interval(now_epoch());
+        let name_handle = ws.put(presentation_name.to_owned());
+        let boundary_handle = ws.put(presentation_boundary.to_owned());
+        let mut change = TribleSet::new();
+        change += entity! { &context_id @
+            metadata::tag: teams::kind_context,
+            metadata::created_at: created_at,
+            metadata::supersedes*: supersedes,
+            metadata::name: name_handle,
+            metadata::description: boundary_handle,
+        };
+
+        ws.commit(change.difference(&catalog), "teams professional context");
+        map_err_debug(repo.push(&mut ws), "push workspace")?;
+        Ok(TeamsPresentationContext {
+            name: Some(presentation_name.to_owned()),
+            boundary: Some(presentation_boundary.to_owned()),
+        })
+    })
+}
+
+fn print_context_banner(context: &TeamsPresentationContext) {
+    match context
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => eprintln!("TEAMS · PRESENT AS {name} · PROFESSIONAL WORK CONTEXT"),
+        None => eprintln!("TEAMS · CONTEXT UNSET"),
+    }
+    match context
+        .boundary
+        .as_deref()
+        .map(str::trim)
+        .filter(|boundary| !boundary.is_empty())
+    {
+        Some(boundary) => eprintln!("BOUNDARY · {boundary}"),
+        None => eprintln!("BOUNDARY · UNSET"),
+    }
+}
+
+fn prepare_teams_context(
+    config: &TeamsBridgeConfig,
+    requested_as: Option<&str>,
+    require_explicit_identity: bool,
+) -> Result<TeamsPresentationContext> {
+    let context = config.presentation_context.clone();
+    print_context_banner(&context);
+    if !require_explicit_identity {
+        return Ok(context);
+    }
+
+    let Some(configured_name) = context
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        bail!("outward Teams mutations require a configured context; run `teams context set`");
+    };
+    if context
+        .boundary
+        .as_deref()
+        .map(str::trim)
+        .filter(|boundary| !boundary.is_empty())
+        .is_none()
+    {
+        bail!("outward Teams mutations require a configured work boundary");
+    }
+    let Some(requested_as) = requested_as.map(str::trim).filter(|name| !name.is_empty()) else {
+        bail!("outward Teams mutations require `--as {configured_name}`");
+    };
+    if requested_as != configured_name {
+        bail!(
+            "Teams presentation mismatch: configured as {configured_name}, requested --as {requested_as}"
+        );
+    }
+    Ok(context)
+}
+
+fn show_context(context: &TeamsPresentationContext) -> Result<()> {
+    match context.name.as_deref() {
+        Some(name) => println!("present_as: {name}"),
+        None => println!("present_as: (unset)"),
+    }
+    println!("context: professional/work-only");
+    match context.boundary.as_deref() {
+        Some(boundary) => println!("boundary: {boundary}"),
+        None => println!("boundary: (unset)"),
+    }
+    Ok(())
+}
+
+fn show_auth_status(config: &TeamsBridgeConfig) -> Result<()> {
+    let (repo, branch_id) =
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
+    with_repo_close(repo, |repo| {
+        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+
+        if let Some(state) = latest_config_state(&catalog) {
+            let tenant = state
+                .tenant
+                .map(|handle| load_longstring(&mut ws, handle))
+                .transpose()?;
+            let client_id = state
+                .client_id
+                .map(|handle| load_longstring(&mut ws, handle))
+                .transpose()?;
+            println!("tenant: {}", tenant.as_deref().unwrap_or("(unset)"));
+            println!("client_id: {}", client_id.as_deref().unwrap_or("(unset)"));
+            println!(
+                "app_client_secret: {}",
+                if state.client_secret.is_some() {
+                    "configured (validity not checked)"
+                } else {
+                    "not configured"
+                }
+            );
+            println!(
+                "user_identity: {}",
+                if state.user_id.is_some() {
+                    "configured"
+                } else {
+                    "not configured"
+                }
+            );
+        } else {
+            println!("tenant: (unset)");
+            println!("client_id: (unset)");
+            println!("app_client_secret: not configured");
+            println!("user_identity: not configured");
+        }
+
+        if let Some(token) = latest_token_state(&catalog) {
+            let now_key = interval_key(epoch_interval(now_epoch()));
+            let access_state = if token.expires_at_key > now_key + 30 * 1_000_000_000 {
+                "locally unexpired"
+            } else {
+                "locally expired"
+            };
+            println!("delegated_access_token: {access_state}");
+            println!(
+                "delegated_refresh_token: {}",
+                if token.refresh_token.is_some() {
+                    "configured (validity not checked)"
+                } else {
+                    "not configured"
+                }
+            );
+        } else {
+            println!("delegated_access_token: not configured");
+            println!("delegated_refresh_token: not configured");
+        }
+        Ok(())
     })
 }
 
@@ -1016,6 +1261,51 @@ fn latest_config_state(catalog: &TribleSet) -> Option<ConfigState> {
     best
 }
 
+fn latest_context_state(catalog: &TribleSet) -> Option<ContextState> {
+    let context_id = current_context_head_ids(catalog).into_iter().max()?;
+    Some(ContextState {
+        presentation_name: find_optional_handle(catalog, context_id, &metadata::name),
+        presentation_boundary: find_optional_handle(catalog, context_id, &metadata::description),
+    })
+}
+
+fn current_context_head_ids(catalog: &TribleSet) -> Vec<Id> {
+    let mut context_ids = find!(
+        (context: Id),
+        pattern!(catalog, [{ ?context @ metadata::tag: teams::kind_context }])
+    )
+    .into_iter()
+    .map(|(context_id,)| context_id)
+    .collect::<Vec<_>>();
+    context_ids.sort_unstable();
+    context_ids.dedup();
+
+    let superseded = find!(
+        (predecessor: Id),
+        pattern!(catalog, [{
+            _?successor @
+            metadata::tag: teams::kind_context,
+            metadata::supersedes: ?predecessor,
+        }])
+    )
+    .into_iter()
+    .map(|(predecessor,)| predecessor)
+    .collect::<HashSet<_>>();
+    let heads = context_ids
+        .iter()
+        .copied()
+        .filter(|context_id| !superseded.contains(context_id))
+        .collect::<Vec<_>>();
+
+    // A malformed cyclic history should not make the safety context disappear.
+    // Deterministically fall back to the maximal known context id.
+    if heads.is_empty() && !context_ids.is_empty() {
+        context_ids.into_iter().max().into_iter().collect()
+    } else {
+        heads
+    }
+}
+
 fn find_optional_handle(
     catalog: &TribleSet,
     entity: Id,
@@ -1037,6 +1327,16 @@ fn find_optional_value<S: InlineEncoding>(
 ) -> Option<Inline<S>> {
     find!(
         (value: Inline<S>),
+        pattern!(catalog, [{ entity @ attribute: ?value }])
+    )
+    .into_iter()
+    .next()
+    .map(|(value,)| value)
+}
+
+fn find_optional_id(catalog: &TribleSet, entity: Id, attribute: &Attribute<GenId>) -> Option<Id> {
+    find!(
+        (value: Id),
         pattern!(catalog, [{ entity @ attribute: ?value }])
     )
     .into_iter()
@@ -1433,10 +1733,12 @@ fn fetch_delta_messages(token: &str, start_url: &str) -> Result<(Vec<JsonValue>,
             continue;
         }
 
-        break delta.delta_link;
+        break delta.delta_link.ok_or_else(|| {
+            anyhow::anyhow!("Teams delta response ended without @odata.deltaLink")
+        })?;
     };
 
-    Ok((messages, cursor))
+    Ok((messages, Some(cursor)))
 }
 
 struct DeltaPage {
@@ -1445,18 +1747,62 @@ struct DeltaPage {
     delta_link: Option<String>,
 }
 
+#[derive(Debug)]
+struct DeltaCursorExpired;
+
+impl std::fmt::Display for DeltaCursorExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Teams delta cursor expired")
+    }
+}
+
+impl std::error::Error for DeltaCursorExpired {}
+
+fn fetch_delta_with_cursor_recovery(
+    token: &str,
+    start_url: &str,
+    base_url: &str,
+    using_saved_cursor: bool,
+) -> Result<(Vec<JsonValue>, Option<String>)> {
+    match fetch_delta_messages(token, start_url) {
+        Ok(result) => Ok(result),
+        Err(err) if using_saved_cursor && err.downcast_ref::<DeltaCursorExpired>().is_some() => {
+            eprintln!("Teams delta cursor expired; restarting sync from the base endpoint.");
+            fetch_delta_messages(token, base_url)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn fetch_delta_page(client: &Client, token: &str, url: &str) -> Result<DeltaPage> {
+    let safe_url = url_without_query(url);
     let resp = client
         .get(url)
         .bearer_auth(token)
         .send()
-        .with_context(|| format!("GET {url}"))?;
+        .map_err(|err| anyhow::anyhow!("GET {safe_url}: {}", err.without_url()))?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .with_context(|| format!("read response body for {url}"))?;
+    let body = resp.text().map_err(|err| {
+        anyhow::anyhow!("read response body for {safe_url}: {}", err.without_url())
+    })?;
+    let graph_error_code = serde_json::from_str::<JsonValue>(&body)
+        .ok()
+        .and_then(|json| {
+            json.pointer("/error/code")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        });
+    if status.as_u16() == 410
+        || (status.is_client_error() && graph_error_code.as_deref() == Some("syncStateNotFound"))
+    {
+        return Err(DeltaCursorExpired.into());
+    }
     if !status.is_success() {
-        bail!("GET {url} failed: status={status} body={body}");
+        bail!(
+            "GET {} failed: status={status} graph_error={}",
+            url_without_query(url),
+            graph_error_code.as_deref().unwrap_or("unknown"),
+        );
     }
 
     let json: JsonValue = serde_json::from_str(&body).context("parse delta json")?;
@@ -1479,6 +1825,10 @@ fn fetch_delta_page(client: &Client, token: &str, url: &str) -> Result<DeltaPage
         next_link,
         delta_link,
     })
+}
+
+fn url_without_query(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(base, _)| base)
 }
 
 fn send_message(config: TeamsBridgeConfig, chat_id: &str, text: &str) -> Result<()> {
@@ -1851,9 +2201,10 @@ struct AttachmentExportCandidate {
     message_id: Id,
     chat_id: Id,
     source_id: String,
+    source_kind: Option<String>,
     data_handle: Inline<Handle<RawBytes>>,
     name: Option<Inline<Handle<LongString>>>,
-    mime: Option<Inline<ShortString>>,
+    media_type: Option<Inline<Handle<LongString>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1864,10 +2215,30 @@ struct AttachmentRow {
     created_at: Inline<NsTAIInterval>,
     created_at_key: i128,
     source_id: Option<Inline<Handle<LongString>>>,
+    source_kind: Option<Inline<ShortString>>,
     source_pointer: Option<Inline<Handle<LongString>>>,
     name: Option<Inline<Handle<LongString>>>,
-    mime: Option<Inline<ShortString>>,
+    media_type: Option<Inline<Handle<LongString>>>,
     size: Option<Inline<U256BE>>,
+}
+
+fn attachment_reference(source_kind: Option<&str>, source_id: &str) -> String {
+    match source_kind {
+        Some(kind @ ("attachment" | "hosted-content")) => format!("{kind}:{source_id}"),
+        _ => source_id.to_owned(),
+    }
+}
+
+fn parse_attachment_reference(reference: &str) -> (Option<&str>, &str) {
+    for kind in ["attachment", "hosted-content"] {
+        if let Some(source_id) = reference
+            .strip_prefix(kind)
+            .and_then(|rest| rest.strip_prefix(':'))
+        {
+            return (Some(kind), source_id);
+        }
+    }
+    (None, reference)
 }
 
 fn read_messages(config: TeamsBridgeConfig, options: ReadOptions) -> Result<()> {
@@ -1988,6 +2359,7 @@ struct IncomingMessage {
 
 #[derive(Debug, Clone)]
 struct AttachmentSource {
+    source_kind: &'static str,
     source_id: String,
     source_url: Option<String>,
     name: Option<String>,
@@ -2021,6 +2393,12 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+        let files_branch_id = repo
+            .ensure_branch(FILES_BRANCH_NAME, None)
+            .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
+        let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
+        let files_catalog =
+            map_err_debug(files_ws.checkout(..), "checkout files workspace")?.into_facts();
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
@@ -2084,6 +2462,7 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                     continue;
                 }
             }
+            let file_id = find_optional_id(&catalog, attachment_id, &archive::attachment_file);
             rows.push(AttachmentRow {
                 attachment_id,
                 message_id,
@@ -2095,13 +2474,21 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                     attachment_id,
                     &archive::attachment_source_id,
                 ),
+                source_kind: find_optional_value(&catalog, attachment_id, &teams::attachment_kind),
                 source_pointer: find_optional_handle(
                     &catalog,
                     attachment_id,
                     &archive::attachment_source_pointer,
                 ),
-                name: find_optional_handle(&catalog, attachment_id, &archive::attachment_name),
-                mime: find_optional_value(&catalog, attachment_id, &archive::attachment_mime),
+                name: find_optional_handle(&catalog, attachment_id, &archive::attachment_name)
+                    .or_else(|| {
+                        file_id.and_then(|file_id| {
+                            find_optional_handle(&files_catalog, file_id, &file::name)
+                        })
+                    }),
+                media_type: file_id.and_then(|file_id| {
+                    file_capability::media_type_name_handle(&files_catalog, file_id)
+                }),
                 size: find_optional_value(&catalog, attachment_id, &archive::attachment_size_bytes),
             });
         }
@@ -2135,6 +2522,10 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                 .map(|handle| load_longstring(&mut ws, handle))
                 .transpose()?
                 .unwrap_or_default();
+            let source_kind = row
+                .source_kind
+                .map(|value| String::try_from_inline(&value).unwrap());
+            let source_reference = attachment_reference(source_kind.as_deref(), source_id.as_str());
             let source_pointer = row
                 .source_pointer
                 .map(|handle| load_longstring(&mut ws, handle))
@@ -2143,9 +2534,10 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                 .name
                 .map(|handle| load_longstring(&mut ws, handle))
                 .transpose()?;
-            let mime = row
-                .mime
-                .map(|value| String::try_from_inline(&value).unwrap());
+            let media_type = row
+                .media_type
+                .map(|handle| load_longstring(&mut files_ws, handle))
+                .transpose()?;
             let size = row
                 .size
                 .and_then(u256_to_u128)
@@ -2154,14 +2546,14 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
 
             let size_display = size.unwrap_or_else(|| "-".to_string());
             let name_display = name.unwrap_or_else(|| "-".to_string());
-            let mime_display = mime.unwrap_or_else(|| "-".to_string());
+            let mime_display = media_type.unwrap_or_else(|| "-".to_string());
             let pointer_display = source_pointer.unwrap_or_else(|| "-".to_string());
             println!(
                 "[{}] ({}) msg={} attachment={} name={} mime={} size={} source={}",
                 timestamp,
                 chat,
                 message,
-                source_id,
+                source_reference,
                 name_display,
                 mime_display,
                 size_display,
@@ -2186,7 +2578,15 @@ fn backfill_attachments(
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+        validate_message_identity_lineage(&catalog)?;
         let index = CatalogIndex::build(&catalog);
+        let files_branch_id = repo
+            .ensure_branch(FILES_BRANCH_NAME, None)
+            .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
+        let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
+        let files_catalog =
+            map_err_debug(files_ws.checkout(..), "checkout files workspace")?.into_facts();
+        let existing_files = file_entity_ids(&files_catalog);
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
@@ -2348,31 +2748,40 @@ fn backfill_attachments(
                 &message_external_id,
                 &raw_json,
             );
-            let before = change.len();
+            let before = change.len() + files_change.len();
             ensure_attachments(
                 &mut ws,
+                &mut files_ws,
                 &mut change,
                 &mut files_change,
                 &index,
+                &existing_files,
                 message_id,
                 &attachments,
                 &token,
-                &config,
                 &mut added_attachments,
             )?;
-            if change.len() > before {
+            if change.len() + files_change.len() > before {
                 created += 1;
             }
             scanned += 1;
         }
 
-        if change.is_empty() {
+        let change = change.difference(&catalog);
+        let files_change = files_change.difference(&files_catalog);
+        if change.is_empty() && files_change.is_empty() {
             println!("No attachments to backfill.");
             return Ok(());
         }
 
-        ws.commit(change, "teams attachments backfill");
-        map_err_debug(repo.push(&mut ws), "push workspace")?;
+        if !files_change.is_empty() {
+            files_ws.commit(files_change, "teams attachment files backfill");
+            map_err_debug(repo.push(&mut files_ws), "push files workspace")?;
+        }
+        if !change.is_empty() {
+            ws.commit(change, "teams attachments backfill");
+            map_err_debug(repo.push(&mut ws), "push workspace")?;
+        }
         println!("Backfilled attachments for {created} messages (scanned {scanned}).");
         Ok(())
     })
@@ -2387,6 +2796,12 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
+        let files_branch_id = repo
+            .ensure_branch(FILES_BRANCH_NAME, None)
+            .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
+        let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
+        let files_catalog =
+            map_err_debug(files_ws.checkout(..), "checkout files workspace")?.into_facts();
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
@@ -2425,23 +2840,23 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
             _ => None,
         };
 
-        let wanted_source = options.source_id.trim();
+        let wanted_reference = options.source_id.trim();
+        let (wanted_kind, wanted_source) = parse_attachment_reference(wanted_reference);
         if wanted_source.is_empty() {
             bail!("attachment source id is empty");
         }
 
         let mut candidates = Vec::new();
-        for (message_id, attachment_id, chat_id, source_id_handle, data_handle) in find!(
+        for (message_id, attachment_id, chat_id, source_id_handle) in find!(
             (
                 message: Id,
                 attachment: Id,
                 chat: Id,
-                source_id: Inline<Handle<LongString>>,
-                data: Inline<Handle<RawBytes>>
+                source_id: Inline<Handle<LongString>>
             ),
             pattern!(&catalog, [
                 { ?message @ archive::attachment: ?attachment, teams::chat: ?chat },
-                { ?attachment @ archive::attachment_source_id: ?source_id, archive::attachment_data: ?data }
+                { ?attachment @ archive::attachment_source_id: ?source_id }
             ])
         ) {
             if let Some(filter) = &chat_filter_ids {
@@ -2458,25 +2873,41 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
             if source_id != wanted_source {
                 continue;
             }
+            let source_kind = find_optional_value(&catalog, attachment_id, &teams::attachment_kind)
+                .map(|value| String::try_from_inline(&value).unwrap());
+            if wanted_kind.is_some_and(|wanted| source_kind.as_deref() != Some(wanted)) {
+                continue;
+            }
+            let Some(file_id) =
+                find_optional_id(&catalog, attachment_id, &archive::attachment_file)
+            else {
+                continue;
+            };
+            let Some(data_handle) = find_optional_value(&files_catalog, file_id, &file::content)
+            else {
+                continue;
+            };
 
             candidates.push(AttachmentExportCandidate {
                 message_id,
                 chat_id,
                 source_id,
+                source_kind,
                 data_handle,
-                name: find_optional_handle(&catalog, attachment_id, &archive::attachment_name),
-                mime: find_optional_value(&catalog, attachment_id, &archive::attachment_mime),
+                name: find_optional_handle(&catalog, attachment_id, &archive::attachment_name)
+                    .or_else(|| find_optional_handle(&files_catalog, file_id, &file::name)),
+                media_type: file_capability::media_type_name_handle(&files_catalog, file_id),
             });
         }
 
         if candidates.is_empty() {
-            println!("No attachment found for source id {wanted_source}.");
+            println!("No attachment found for {wanted_reference}.");
             return Ok(());
         }
 
         if candidates.len() > 1 {
             println!(
-                "Multiple attachments matched. Use --chat-id or --message-id to disambiguate:"
+                "Multiple attachments matched. Use the qualified attachment reference shown below, or --chat-id/--message-id, to disambiguate:"
             );
             for candidate in &candidates {
                 let chat = chat_map
@@ -2489,20 +2920,24 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
                     .unwrap_or_else(|| format!("{}", candidate.message_id));
                 println!(
                     "- chat={chat} message={message} attachment={}",
-                    candidate.source_id
+                    attachment_reference(candidate.source_kind.as_deref(), &candidate.source_id)
                 );
             }
             return Ok(());
         }
 
         let candidate = candidates.remove(0);
+        let media_type = candidate
+            .media_type
+            .map(|handle| load_longstring(&mut files_ws, handle))
+            .transpose()?;
         let mut filename = options
             .filename
             .clone()
             .or_else(|| {
                 candidate
                     .name
-                    .map(|handle| load_longstring(&mut ws, handle))
+                    .map(|handle| load_longstring(&mut files_ws, handle))
                     .transpose()
                     .ok()
                     .flatten()
@@ -2511,7 +2946,7 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
 
         filename = sanitize_filename(&filename);
         if !filename.contains('.') {
-            if let Some(ext) = infer_extension(candidate.mime.as_ref()) {
+            if let Some(ext) = infer_extension(media_type.as_deref()) {
                 filename.push('.');
                 filename.push_str(ext);
             }
@@ -2526,7 +2961,7 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
         }
 
         let bytes: Bytes = map_err_debug(
-            ws.get::<Bytes, RawBytes>(candidate.data_handle),
+            files_ws.get::<Bytes, RawBytes>(candidate.data_handle),
             "load attachment bytes",
         )?;
         fs::write(&path, bytes.as_ref())
@@ -2631,7 +3066,12 @@ fn build_cursor_change(
 }
 
 fn parse_messages(messages: Vec<JsonValue>) -> Result<Vec<IncomingMessage>> {
-    let mut parsed = Vec::new();
+    // Graph delta responses may repeat one logical entity, including multiple
+    // versions in one response sequence. Coalesce before constructing facts so
+    // page boundaries and replay order cannot create conflicting first-write
+    // values on a new logical message.
+    let mut parsed: HashMap<(String, String), (i128, String, String, IncomingMessage)> =
+        HashMap::new();
     for message in messages {
         if message.get("@removed").is_some() {
             continue;
@@ -2658,6 +3098,18 @@ fn parse_messages(messages: Vec<JsonValue>) -> Result<Vec<IncomingMessage>> {
         let epoch = parse_graph_datetime(created_at_str).unwrap_or_else(now_epoch);
         let created_at = epoch_interval(epoch);
         let created_at_key = interval_key(created_at);
+        let modified_at_key = message
+            .get("lastModifiedDateTime")
+            .and_then(JsonValue::as_str)
+            .and_then(parse_graph_datetime)
+            .map(epoch_interval)
+            .map(interval_key)
+            .unwrap_or(created_at_key);
+        let etag = message
+            .get("etag")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_owned();
 
         let from = message.get("from");
         let author_external_id = from
@@ -2688,7 +3140,8 @@ fn parse_messages(messages: Vec<JsonValue>) -> Result<Vec<IncomingMessage>> {
             &mut seen_sources,
         ));
 
-        parsed.push(IncomingMessage {
+        let raw_order_key = raw_json.clone();
+        let incoming = IncomingMessage {
             chat_external_id: chat_external_id.to_owned(),
             message_external_id: message_external_id.to_owned(),
             raw_json,
@@ -2698,10 +3151,29 @@ fn parse_messages(messages: Vec<JsonValue>) -> Result<Vec<IncomingMessage>> {
             created_at,
             created_at_key,
             attachments,
-        });
+        };
+        let logical_key = (
+            incoming.chat_external_id.clone(),
+            incoming.message_external_id.clone(),
+        );
+        let version_key = (modified_at_key, etag.clone(), raw_order_key.clone());
+        let replace = parsed
+            .get(&logical_key)
+            .is_none_or(|(modified, old_etag, old_raw, _)| {
+                version_key > (*modified, old_etag.clone(), old_raw.clone())
+            });
+        if replace {
+            parsed.insert(
+                logical_key,
+                (modified_at_key, etag, raw_order_key, incoming),
+            );
+        }
     }
 
-    Ok(parsed)
+    Ok(parsed
+        .into_values()
+        .map(|(_, _, _, message)| message)
+        .collect())
 }
 
 fn parse_json_attachments(
@@ -2718,7 +3190,7 @@ fn parse_json_attachments(
         let Some(source_id) = attachment.get("id").and_then(JsonValue::as_str) else {
             continue;
         };
-        if !seen.insert(source_id.to_string()) {
+        if !seen.insert(format!("attachment:{source_id}")) {
             continue;
         }
 
@@ -2745,6 +3217,7 @@ fn parse_json_attachments(
             .and_then(|value| decode_base64(value).ok());
 
         attachments.push(AttachmentSource {
+            source_kind: "attachment",
             source_id: source_id.to_owned(),
             source_url,
             name,
@@ -2764,13 +3237,14 @@ fn parse_hosted_content_attachments(
 ) -> Vec<AttachmentSource> {
     let mut attachments = Vec::new();
     for hosted_id in extract_hosted_content_ids(content) {
-        if !seen.insert(hosted_id.clone()) {
+        if !seen.insert(format!("hosted-content:{hosted_id}")) {
             continue;
         }
         let url = format!(
             "https://graph.microsoft.com/v1.0/chats/{chat_external_id}/messages/{message_external_id}/hostedContents/{hosted_id}/$value"
         );
         attachments.push(AttachmentSource {
+            source_kind: "hosted-content",
             source_id: hosted_id,
             source_url: Some(url),
             name: None,
@@ -2811,15 +3285,13 @@ fn decode_base64(value: &str) -> Result<Vec<u8>> {
 
 struct CatalogIndex {
     messages: HashSet<Id>,
-    reply_to_set: HashSet<Id>,
     authors: HashSet<Id>,
     chats: HashSet<Id>,
     attachments: HashSet<Id>,
     message_attachment_set: HashSet<(Id, Id)>,
-    last_message_by_chat: HashMap<Id, (i128, Id)>,
+    attachment_files: HashMap<Id, HashSet<Id>>,
     author_name_set: HashSet<Id>,
     message_raw_set: HashSet<Id>,
-    message_chat_set: HashSet<Id>,
     message_content_set: HashSet<Id>,
     message_created_at_set: HashSet<Id>,
 }
@@ -2835,14 +3307,6 @@ impl CatalogIndex {
         )
         .into_iter()
         .map(|(message,)| message)
-        .collect::<HashSet<_>>();
-
-        let reply_to_set = find!(
-            (message: Id, reply_to: Id),
-            pattern!(catalog, [{ ?message @ archive::reply_to: ?reply_to }])
-        )
-        .into_iter()
-        .map(|(message, _)| message)
         .collect::<HashSet<_>>();
 
         let authors = find!(
@@ -2882,6 +3346,17 @@ impl CatalogIndex {
         .into_iter()
         .collect::<HashSet<_>>();
 
+        let mut attachment_files: HashMap<Id, HashSet<Id>> = HashMap::new();
+        for (attachment, file_id) in find!(
+            (attachment: Id, file_id: Id),
+            pattern!(catalog, [{ ?attachment @ archive::attachment_file: ?file_id }])
+        ) {
+            attachment_files
+                .entry(attachment)
+                .or_default()
+                .insert(file_id);
+        }
+
         let author_name_set = find!(
             (author: Id, name: Inline<Handle<LongString>>),
             pattern!(catalog, [{ ?author @ archive::author_name: ?name }])
@@ -2893,14 +3368,6 @@ impl CatalogIndex {
         let message_raw_set = find!(
             (message: Id, raw: Inline<Handle<LongString>>),
             pattern!(catalog, [{ ?message @ teams::message_raw: ?raw }])
-        )
-        .into_iter()
-        .map(|(message, _)| message)
-        .collect::<HashSet<_>>();
-
-        let message_chat_set = find!(
-            (message: Id, chat: Id),
-            pattern!(catalog, [{ ?message @ teams::chat: ?chat }])
         )
         .into_iter()
         .map(|(message, _)| message)
@@ -2922,54 +3389,91 @@ impl CatalogIndex {
         .map(|(message, _)| message)
         .collect::<HashSet<_>>();
 
-        let mut last_message_by_chat: HashMap<Id, (i128, Id)> = HashMap::new();
-        for (message_id, chat_id, created_at) in find!(
-            (message: Id, chat: Id, created_at: Inline<NsTAIInterval>),
-            pattern!(catalog, [{
-                ?message @
-                metadata::tag: archive::kind_message,
-                teams::chat: ?chat,
-                metadata::created_at: ?created_at,
-            }])
-        ) {
-            let key = interval_key(created_at);
-            match last_message_by_chat.get(&chat_id) {
-                None => {
-                    last_message_by_chat.insert(chat_id, (key, message_id));
-                }
-                Some((current_key, current_id))
-                    if key > *current_key || (key == *current_key && message_id > *current_id) =>
-                {
-                    last_message_by_chat.insert(chat_id, (key, message_id));
-                }
-                _ => {}
-            }
-        }
-
         Self {
             messages,
-            reply_to_set,
             authors,
             chats,
             attachments,
             message_attachment_set,
-            last_message_by_chat,
+            attachment_files,
             author_name_set,
             message_raw_set,
-            message_chat_set,
             message_content_set,
             message_created_at_set,
         }
     }
 }
 
+fn file_entity_ids(catalog: &TribleSet) -> HashSet<Id> {
+    find!(
+        (file_id: Id),
+        pattern!(catalog, [
+            {
+                ?file_id @
+                metadata::tag: &KIND_FILE,
+                file::content: _?content,
+                file::name: _?name,
+                file::media_type: _?media_type,
+            },
+            {
+                _?media_type @
+                metadata::tag: &KIND_MEDIA_TYPE,
+                metadata::name: _?media_type_name,
+            }
+        ])
+    )
+    .into_iter()
+    .map(|(file_id,)| file_id)
+    .collect()
+}
+
+fn validate_message_identity_lineage(catalog: &TribleSet) -> Result<()> {
+    for (message_id,) in find!(
+        (message: Id),
+        pattern!(catalog, [{ ?message @ metadata::tag: archive::kind_message }])
+    ) {
+        let chats = find!(
+            (chat: Id),
+            pattern!(catalog, [{ message_id @ teams::chat: ?chat }])
+        )
+        .map(|(chat,)| chat)
+        .collect::<HashSet<_>>();
+        let external_ids = find!(
+            (external: Inline<Handle<LongString>>),
+            pattern!(catalog, [{ message_id @ teams::message_id: ?external }])
+        )
+        .map(|(external,)| external)
+        .collect::<HashSet<_>>();
+        if chats.len() != 1 || external_ids.len() != 1 {
+            bail!(
+                "Teams branch contains a legacy or malformed message identity ({message_id:x}); refusing to sync because replay could merge or duplicate logical messages. Rebuild the Teams branch with the composite identity schema first."
+            );
+        }
+        let chat_id = *chats.iter().next().expect("checked singleton");
+        let external_id = *external_ids.iter().next().expect("checked singleton");
+        let expected = entity! { _ @
+            teams::message_id: external_id,
+            teams::chat: chat_id,
+        }
+        .root()
+        .expect("identity fragment is non-empty");
+        if expected != message_id {
+            bail!(
+                "Teams branch uses the legacy message identity lineage ({message_id:x}); refusing to sync because a full replay would create duplicate subjects. Rebuild the Teams branch with the composite identity schema first."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn build_ingest_change(
     ws: &mut Workspace<Pile>,
+    files_ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     index: &CatalogIndex,
+    existing_files: &HashSet<Id>,
     incoming: Vec<IncomingMessage>,
     token: &str,
-    config: &TeamsBridgeConfig,
 ) -> Result<(TribleSet, TribleSet)> {
     let mut by_chat: HashMap<String, Vec<IncomingMessage>> = HashMap::new();
     for message in incoming {
@@ -3000,18 +3504,15 @@ fn build_ingest_change(
             };
         }
 
-        // Sort by created_at (stable across runs; no derived-id tiebreak yet
-        // because message_ids are per-message below).
+        // Stable ordering keeps ingestion traces deterministic. Chronology is
+        // represented by `created_at`, never by synthetic reply edges: delta
+        // delivery is replayed and out of order, so adjacency would require
+        // non-monotonic replacement when an older message arrives late.
         messages.sort_by(|left, right| {
             left.created_at_key
                 .cmp(&right.created_at_key)
                 .then_with(|| left.message_external_id.cmp(&right.message_external_id))
         });
-
-        let mut predecessor = index
-            .last_message_by_chat
-            .get(&chat_id)
-            .map(|(_, message_id)| *message_id);
 
         for message in messages {
             // Derive author_id intrinsically from the author's external id,
@@ -3028,10 +3529,13 @@ fn build_ingest_change(
                 _ => TEAMS_UNKNOWN_AUTHOR_ID,
             };
 
-            // Derive message_id intrinsically from the message's external id.
+            // Graph message ids are unique only within a chat/channel/thread.
+            // The logical message identity is therefore the composite
+            // (chat, external message id), matching Graph's resource scope.
             let message_external_handle = ws.put(message.message_external_id.clone());
             let message_id_frag = entity! { _ @
                 teams::message_id: message_external_handle,
+                teams::chat: chat_id,
             };
             let message_id = message_id_frag
                 .root()
@@ -3040,13 +3544,14 @@ fn build_ingest_change(
 
             ensure_attachments(
                 ws,
+                files_ws,
                 &mut change,
                 &mut files_change,
                 index,
+                existing_files,
                 message_id,
                 &message.attachments,
                 token,
-                config,
                 &mut added_attachments,
             )?;
 
@@ -3059,41 +3564,31 @@ fn build_ingest_change(
                     archive::author: author_id,
                     metadata::created_at: message.created_at,
                     archive::content: content_handle,
-                    teams::chat: chat_id,
                     teams::message_raw: raw_handle,
-                    archive::reply_to?: predecessor,
                 };
             } else {
-                // Fill in missing metadata for existing messages when possible.
-                let message_chat =
-                    (!index.message_chat_set.contains(&message_id)).then_some(chat_id);
+                // Logical messages are stable subjects. This path repairs
+                // absent first-snapshot fields only; edited/deleted versions
+                // require explicit immutable revision entities rather than
+                // ambiguous additive replacement facts.
                 let message_raw = (!index.message_raw_set.contains(&message_id))
                     .then(|| ws.put(message.raw_json.clone()));
                 let message_created_at = (!index.message_created_at_set.contains(&message_id))
                     .then_some(message.created_at);
                 let message_content = (!index.message_content_set.contains(&message_id))
                     .then(|| ws.put(message.content.clone()));
-                let message_reply_to = (predecessor.is_some()
-                    && !index.reply_to_set.contains(&message_id))
-                .then_some(predecessor.unwrap());
 
-                if message_chat.is_some()
-                    || message_raw.is_some()
+                if message_raw.is_some()
                     || message_created_at.is_some()
                     || message_content.is_some()
-                    || message_reply_to.is_some()
                 {
                     change += entity! { ExclusiveId::force_ref(&message_id) @
-                        teams::chat?: message_chat,
                         teams::message_raw?: message_raw,
                         metadata::created_at?: message_created_at,
                         archive::content?: message_content,
-                        archive::reply_to?: message_reply_to,
                     };
                 }
             }
-
-            predecessor = Some(message_id);
         }
     }
 
@@ -3139,13 +3634,14 @@ fn ensure_author(
 
 fn ensure_attachments(
     ws: &mut Workspace<Pile>,
+    files_ws: &mut Workspace<Pile>,
     change: &mut TribleSet,
     files_change: &mut TribleSet,
     index: &CatalogIndex,
+    existing_files: &HashSet<Id>,
     message_id: Id,
     attachments: &[AttachmentSource],
     token: &str,
-    config: &TeamsBridgeConfig,
     added: &mut HashSet<Id>,
 ) -> Result<()> {
     for source in attachments {
@@ -3153,11 +3649,15 @@ fn ensure_attachments(
         if source_id.is_empty() {
             continue;
         }
-        // Derive attachment_id intrinsically from the source id via the
-        // shared archive::attachment_source_id attribute.
+        // Graph attachment ids are scoped to their containing message, and
+        // ordinary attachments and hosted content are distinct collections.
+        // Preserve the raw source id while deriving identity from the complete
+        // resource scope.
         let source_handle = ws.put(source_id.to_owned());
         let att_id_frag = entity! { _ @
             archive::attachment_source_id: source_handle,
+            teams::attachment_message: message_id,
+            teams::attachment_kind: source.source_kind,
         };
         let attachment_id = att_id_frag
             .root()
@@ -3172,9 +3672,45 @@ fn ensure_attachments(
             };
         }
         *change += att_id_frag;
-
-        if index.attachments.contains(&attachment_id) || !added.insert(attachment_id) {
+        if let Some(linked_files) = index.attachment_files.get(&attachment_id) {
+            if linked_files.len() != 1 {
+                bail!(
+                    "Teams attachment occurrence {attachment_id:x} links to {} file records; refusing to add another append-only value",
+                    linked_files.len()
+                );
+            }
+            let file_id = *linked_files.iter().next().expect("checked singleton");
+            if !existing_files.contains(&file_id) {
+                bail!(
+                    "Teams attachment occurrence {attachment_id:x} links to incomplete file record {file_id:x}; repair the files branch before retrying"
+                );
+            }
             continue;
+        }
+
+        if !added.insert(attachment_id) {
+            continue;
+        }
+
+        // Occurrence metadata is the immutable first snapshot. Source-side
+        // edits belong in explicit revision entities; appending a changed name
+        // here would make readers choose arbitrarily between simultaneous
+        // values.
+        if !index.attachments.contains(&attachment_id) {
+            *change += entity! { ExclusiveId::force_ref(&attachment_id) @
+                metadata::tag: archive::kind_attachment,
+            };
+            if let Some(name) = source
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                let name = ws.put(name.to_owned());
+                *change += entity! { ExclusiveId::force_ref(&attachment_id) @
+                    archive::attachment_name: name,
+                };
+            }
         }
 
         let mut content_type = source.content_type.clone();
@@ -3192,10 +3728,9 @@ fn ensure_attachments(
                         bytes
                     }
                     Err(err) => {
-                        let _ = log_event(
-                            config,
-                            "error",
-                            &format!("attachment fetch failed ({url}): {err:?}"),
+                        eprintln!(
+                            "Teams attachment fetch failed ({}): {err:#}; metadata was retained for backfill.",
+                            url_without_query(url),
                         );
                         continue;
                     }
@@ -3203,26 +3738,24 @@ fn ensure_attachments(
             }
         };
 
-        // Store as a file entity on the files branch.
-        let content_handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>> =
-            ws.put::<blobencodings::RawBytes, _>(bytes);
         let name_str = source
             .name
             .as_deref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .unwrap_or("attachment");
-        let name_handle: Inline<inlineencodings::Handle<blobencodings::LongString>> =
-            ws.put(name_str.to_owned());
         let mime = content_type
             .as_deref()
             .unwrap_or("application/octet-stream");
-
-        *files_change += entity! { ExclusiveId::force_ref(&attachment_id) @
-            metadata::tag: &KIND_FILE,
-            file::content: content_handle,
-            file::name: name_handle,
-            file::mime: mime
+        let media_type = file_capability::normalize_media_type_or_default(mime);
+        let file_fragment =
+            file_capability::stage(files_ws, bytes, name_str.to_owned(), &media_type)?;
+        let file_id = file_fragment
+            .root()
+            .expect("canonical file fragment has one root");
+        *files_change += file_fragment;
+        *change += entity! { ExclusiveId::force_ref(&attachment_id) @
+            archive::attachment_file: file_id,
         };
     }
     Ok(())
@@ -3230,22 +3763,24 @@ fn ensure_attachments(
 
 fn fetch_attachment_bytes(token: &str, url: &str) -> Result<(Vec<u8>, Option<String>)> {
     let client = Client::new();
+    let safe_url = url_without_query(url);
     let resp = client
         .get(url)
         .bearer_auth(token)
         .send()
-        .with_context(|| format!("GET {url}"))?;
+        .map_err(|err| anyhow::anyhow!("GET {safe_url}: {}", err.without_url()))?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        bail!("GET {url} failed: status={status} body={body}");
+        bail!("GET {} failed: status={status}", url_without_query(url));
     }
     let content_type = resp
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
-    let bytes = resp.bytes().context("read attachment bytes")?;
+    let bytes = resp
+        .bytes()
+        .map_err(|err| anyhow::anyhow!("read attachment bytes: {}", err.without_url()))?;
     Ok((bytes.to_vec(), content_type))
 }
 
@@ -3272,11 +3807,8 @@ fn sanitize_filename(value: &str) -> String {
     out
 }
 
-fn infer_extension(mime: Option<&Inline<ShortString>>) -> Option<&'static str> {
-    let mut mime = String::try_from_inline(mime?).ok()?;
-    mime.make_ascii_lowercase();
-    let mime = mime.split(';').next().unwrap_or("").trim();
-    match mime {
+fn infer_extension(media_type: Option<&str>) -> Option<&'static str> {
+    match media_type? {
         "image/jpeg" | "image/jpg" | "image/pjpeg" => Some("jpg"),
         "image/png" => Some("png"),
         "image/gif" => Some("gif"),
@@ -3493,4 +4025,636 @@ fn u256_to_u128(value: Inline<U256BE>) -> Option<u128> {
     let mut buf = [0u8; 16];
     buf.copy_from_slice(&raw[16..]);
     Some(u128::from_be_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestPile {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestPile {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let sequence = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "faculties-teams-context-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("test.pile");
+            fs::File::create(&path).unwrap();
+            Self { dir, path }
+        }
+
+        fn config(&self) -> TeamsBridgeConfig {
+            let branch_id = ensure_test_branch(&self.path, DEFAULT_BRANCH);
+            TeamsBridgeConfig {
+                pile_path: self.path.clone(),
+                branch: DEFAULT_BRANCH.to_string(),
+                branch_id,
+                presentation_context: TeamsPresentationContext::default(),
+                delta_url: DEFAULT_DELTA_URL.to_string(),
+                token: None,
+                token_command: "unused".to_string(),
+            }
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn ensure_test_branch(path: &Path, name: &str) -> Id {
+        with_repo(&path.to_path_buf(), |repo| {
+            repo.ensure_branch(name, None)
+                .map_err(|err| anyhow::anyhow!("ensure test branch: {err:?}"))
+        })
+        .unwrap()
+    }
+
+    fn graph_message(
+        chat_id: &str,
+        message_id: &str,
+        created_at: &str,
+        content: &str,
+        attachments: Vec<JsonValue>,
+    ) -> JsonValue {
+        json!({
+            "chatId": chat_id,
+            "id": message_id,
+            "createdDateTime": created_at,
+            "lastModifiedDateTime": created_at,
+            "etag": format!("{message_id}:{content}"),
+            "from": { "user": { "id": "user-1", "displayName": "Tester" } },
+            "body": { "content": content },
+            "attachments": attachments,
+        })
+    }
+
+    fn inline_attachment(id: &str, name: &str, bytes: &[u8]) -> JsonValue {
+        json!({
+            "id": id,
+            "name": name,
+            "contentType": "application/octet-stream",
+            "contentBytes": base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+    }
+
+    fn ingest_test_batch(
+        config: &TeamsBridgeConfig,
+        messages: Vec<JsonValue>,
+        commit_files: bool,
+        commit_teams: bool,
+    ) -> (usize, usize) {
+        with_repo(&config.pile_path, |repo| {
+            let mut ws = map_err_debug(repo.pull(config.branch_id), "pull test workspace")?;
+            let catalog = map_err_debug(ws.checkout(..), "checkout test workspace")?.into_facts();
+            validate_message_identity_lineage(&catalog)?;
+            let files_branch_id = repo
+                .ensure_branch(FILES_BRANCH_NAME, None)
+                .map_err(|err| anyhow::anyhow!("ensure test files branch: {err:?}"))?;
+            let mut files_ws =
+                map_err_debug(repo.pull(files_branch_id), "pull test files workspace")?;
+            let files_catalog =
+                map_err_debug(files_ws.checkout(..), "checkout test files workspace")?.into_facts();
+            let existing_files = file_entity_ids(&files_catalog);
+            let index = CatalogIndex::build(&catalog);
+            let incoming = parse_messages(messages)?;
+            let (change, files_change) = build_ingest_change(
+                &mut ws,
+                &mut files_ws,
+                &catalog,
+                &index,
+                &existing_files,
+                incoming,
+                "test-token",
+            )?;
+            let files_change = files_change.difference(&files_catalog);
+            let counts = (change.len(), files_change.len());
+
+            if commit_files && !files_change.is_empty() {
+                files_ws.commit(files_change, "test teams files ingest");
+                map_err_debug(repo.push(&mut files_ws), "push test files workspace")?;
+            }
+            if commit_teams && !change.is_empty() {
+                ws.commit(change, "test teams ingest");
+                map_err_debug(repo.push(&mut ws), "push test teams workspace")?;
+            }
+            Ok(counts)
+        })
+        .unwrap()
+    }
+
+    fn test_branch_catalog(path: &Path, branch: &str) -> TribleSet {
+        with_repo(&path.to_path_buf(), |repo| {
+            let branch_id = repo
+                .ensure_branch(branch, None)
+                .map_err(|err| anyhow::anyhow!("ensure test branch: {err:?}"))?;
+            let mut ws = map_err_debug(repo.pull(branch_id), "pull test branch")?;
+            Ok(map_err_debug(ws.checkout(..), "checkout test branch")?.into_facts())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn context_update_preserves_authentication_snapshot() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        let initial = TeamsConfigData {
+            tenant: Some("tenant.example".to_string()),
+            client_id: Some("client-id".to_string()),
+            client_secret: Some("secret-value".to_string()),
+            user_id: Some("user-id".to_string()),
+        };
+        store_config_in_pile(&config, &initial).unwrap();
+
+        store_context_in_pile(&config, "Bulti", "Work-only boundary").unwrap();
+
+        let loaded = load_config_from_pile(&config).unwrap().unwrap();
+        assert_eq!(loaded.tenant, initial.tenant);
+        assert_eq!(loaded.client_id, initial.client_id);
+        assert_eq!(loaded.client_secret, initial.client_secret);
+        assert_eq!(loaded.user_id, initial.user_id);
+        let context = with_repo(&config.pile_path, |repo| {
+            load_context_from_repo(repo, config.branch_id)
+        })
+        .unwrap();
+        assert_eq!(context.name.as_deref(), Some("Bulti"));
+        assert_eq!(context.boundary.as_deref(), Some("Work-only boundary"));
+    }
+
+    #[test]
+    fn context_supersession_ignores_future_wall_clock_values() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        with_repo(&config.pile_path, |repo| {
+            let mut ws = map_err_debug(repo.pull(config.branch_id), "pull test workspace")?;
+            let catalog = map_err_debug(ws.checkout(..), "checkout test workspace")?.into_facts();
+            let context_id = ufoid();
+            let name = ws.put("Future identity".to_string());
+            let boundary = ws.put("Future boundary".to_string());
+            let future = epoch_interval(Epoch::from_gregorian_utc(2099, 1, 1, 0, 0, 0, 0));
+            let change = entity! { &context_id @
+                metadata::tag: teams::kind_context,
+                metadata::created_at: future,
+                metadata::name: name,
+                metadata::description: boundary,
+            };
+            ws.commit(change.difference(&catalog), "future-dated test context");
+            map_err_debug(repo.push(&mut ws), "push test workspace")?;
+            Ok(())
+        })
+        .unwrap();
+
+        store_context_in_pile(&config, "Bulti", "Current boundary").unwrap();
+        let context = with_repo(&config.pile_path, |repo| {
+            load_context_from_repo(repo, config.branch_id)
+        })
+        .unwrap();
+        assert_eq!(context.name.as_deref(), Some("Bulti"));
+        assert_eq!(context.boundary.as_deref(), Some("Current boundary"));
+    }
+
+    #[test]
+    fn outward_mutations_require_the_configured_identity() {
+        let pile = TestPile::new();
+        let mut config = pile.config();
+        store_context_in_pile(&config, "Bulti", "Work-only boundary").unwrap();
+        config.presentation_context = TeamsPresentationContext {
+            name: Some("Bulti".to_string()),
+            boundary: Some("Work-only boundary".to_string()),
+        };
+
+        let missing = prepare_teams_context(&config, None, true).unwrap_err();
+        assert!(missing.to_string().contains("--as Bulti"));
+
+        let mismatch = prepare_teams_context(&config, Some("Liora"), true).unwrap_err();
+        assert!(mismatch.to_string().contains("presentation mismatch"));
+
+        prepare_teams_context(&config, Some("Bulti"), true).unwrap();
+    }
+
+    #[test]
+    fn context_command_accepts_global_identity_argument_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "teams",
+            "--pile",
+            "test.pile",
+            "send",
+            "--as",
+            "Bulti",
+            "chat-id",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(cli.present_as.as_deref(), Some("Bulti"));
+        assert!(matches!(cli.command, Some(CommandMode::Send { .. })));
+    }
+
+    #[test]
+    fn expired_delta_cursor_restarts_from_base_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let fresh_cursor = format!("http://{address}/delta?$deltatoken=fresh-secret");
+        let fresh_cursor_for_server = fresh_cursor.clone();
+        let server = thread::spawn(move || {
+            for (status, body) in [
+                ("410 Gone", String::new()),
+                (
+                    "200 OK",
+                    json!({
+                        "value": [],
+                        "@odata.deltaLink": fresh_cursor_for_server,
+                    })
+                    .to_string(),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let stale = format!("http://{address}/stale?$deltatoken=expired-secret");
+        let base = format!("http://{address}/base");
+        let (messages, cursor) =
+            fetch_delta_with_cursor_recovery("token", &stale, &base, true).unwrap();
+        server.join().unwrap();
+        assert!(messages.is_empty());
+        assert_eq!(cursor.as_deref(), Some(fresh_cursor.as_str()));
+    }
+
+    #[test]
+    fn delta_errors_never_print_query_tokens() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"error":{"code":"testError","message":"must-not-leak-body"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let url = format!("http://{address}/delta?$deltatoken=must-not-leak");
+        let err = fetch_delta_messages("token", &url).unwrap_err();
+        server.join().unwrap();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(&format!("http://{address}/delta")));
+        assert!(!rendered.contains("must-not-leak"));
+        assert!(!rendered.contains("$deltatoken"));
+        assert!(!rendered.contains("must-not-leak-body"));
+    }
+
+    #[test]
+    fn delta_transport_errors_strip_query_tokens_from_the_full_chain() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let url = format!("http://{address}/delta?$deltatoken=transport-secret");
+        let err = fetch_delta_messages("token", &url).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(&format!("http://{address}/delta")));
+        assert!(!rendered.contains("transport-secret"));
+        assert!(!rendered.contains("$deltatoken"));
+    }
+
+    #[test]
+    fn identical_and_prefix_delta_replays_are_noops() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        let a = graph_message("chat-a", "1", "2026-07-29T10:00:00Z", "A", vec![]);
+        let b = graph_message("chat-a", "2", "2026-07-29T10:01:00Z", "B", vec![]);
+
+        let first = ingest_test_batch(&config, vec![a.clone(), b.clone()], true, true);
+        assert!(first.0 > 0);
+        assert_eq!(first.1, 0);
+        assert_eq!(
+            ingest_test_batch(&config, vec![a.clone(), b], true, true),
+            (0, 0)
+        );
+        assert_eq!(ingest_test_batch(&config, vec![a], true, true), (0, 0));
+
+        let catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
+        let reply_edges = find!(
+            (message: Id, parent: Id),
+            pattern!(&catalog, [{ ?message @ archive::reply_to: ?parent }])
+        )
+        .count();
+        assert_eq!(reply_edges, 0);
+    }
+
+    #[test]
+    fn message_identity_is_scoped_to_chat() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        let x = graph_message("chat-x", "42", "2026-07-29T10:00:00Z", "X", vec![]);
+        let y = graph_message("chat-y", "42", "2026-07-29T10:00:00Z", "Y", vec![]);
+
+        ingest_test_batch(&config, vec![x.clone(), y.clone()], true, true);
+        let catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
+        let rows = find!(
+            (message: Id, chat: Id),
+            pattern!(&catalog, [{
+                ?message @
+                metadata::tag: archive::kind_message,
+                teams::chat: ?chat,
+            }])
+        )
+        .collect::<HashSet<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|(message, _)| *message)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|(_, chat)| *chat)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        assert_eq!(ingest_test_batch(&config, vec![y, x], true, true), (0, 0));
+    }
+
+    #[test]
+    fn out_of_order_message_delivery_converges() {
+        let one_shot = TestPile::new();
+        let staged = TestPile::new();
+        let one_shot_config = one_shot.config();
+        let staged_config = staged.config();
+        let a = graph_message("chat-a", "1", "2026-07-29T10:00:00Z", "A", vec![]);
+        let b = graph_message("chat-a", "2", "2026-07-29T10:01:00Z", "B", vec![]);
+        let c = graph_message("chat-a", "3", "2026-07-29T10:02:00Z", "C", vec![]);
+
+        ingest_test_batch(
+            &one_shot_config,
+            vec![a.clone(), b.clone(), c.clone()],
+            true,
+            true,
+        );
+        ingest_test_batch(&staged_config, vec![b.clone(), c.clone()], true, true);
+        ingest_test_batch(&staged_config, vec![a.clone()], true, true);
+
+        assert_eq!(
+            test_branch_catalog(&one_shot.path, DEFAULT_BRANCH),
+            test_branch_catalog(&staged.path, DEFAULT_BRANCH)
+        );
+        assert_eq!(
+            ingest_test_batch(&staged_config, vec![c, a, b], true, true),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn attachment_identity_and_files_are_replay_safe() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        let a = graph_message(
+            "chat-a",
+            "1",
+            "2026-07-29T10:00:00Z",
+            "A",
+            vec![inline_attachment("same-local-id", "a.bin", b"a")],
+        );
+        let b = graph_message(
+            "chat-a",
+            "2",
+            "2026-07-29T10:01:00Z",
+            "B",
+            vec![inline_attachment("same-local-id", "b.bin", b"b")],
+        );
+
+        let first = ingest_test_batch(&config, vec![a.clone(), b.clone()], true, true);
+        assert!(first.0 > 0);
+        assert!(first.1 > 0);
+        let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
+        let attachment_edges = find!(
+            (message: Id, attachment: Id),
+            pattern!(&teams_catalog, [{ ?message @ archive::attachment: ?attachment }])
+        )
+        .collect::<HashSet<_>>();
+        assert_eq!(attachment_edges.len(), 2);
+        assert_eq!(
+            attachment_edges
+                .iter()
+                .map(|(_, attachment)| *attachment)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        let files_catalog = test_branch_catalog(&pile.path, FILES_BRANCH_NAME);
+        assert_eq!(file_entity_ids(&files_catalog).len(), 2);
+        let occurrence_files = find!(
+            (attachment: Id, file_id: Id),
+            pattern!(&teams_catalog, [{ ?attachment @ archive::attachment_file: ?file_id }])
+        )
+        .collect::<HashSet<_>>();
+        assert_eq!(occurrence_files.len(), 2);
+        assert_eq!(
+            occurrence_files
+                .iter()
+                .map(|(_, file_id)| *file_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        assert_eq!(ingest_test_batch(&config, vec![b, a], true, true), (0, 0));
+    }
+
+    #[test]
+    fn identical_file_records_converge_across_attachment_occurrences() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        let a = graph_message(
+            "chat-a",
+            "1",
+            "2026-07-29T10:00:00Z",
+            "A",
+            vec![inline_attachment("source-a", "shared.bin", b"same")],
+        );
+        let b = graph_message(
+            "chat-a",
+            "2",
+            "2026-07-29T10:01:00Z",
+            "B",
+            vec![inline_attachment("source-b", "shared.bin", b"same")],
+        );
+
+        ingest_test_batch(&config, vec![a, b], true, true);
+        let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
+        let occurrence_files = find!(
+            (attachment: Id, file_id: Id),
+            pattern!(&teams_catalog, [{ ?attachment @ archive::attachment_file: ?file_id }])
+        )
+        .collect::<HashSet<_>>();
+        assert_eq!(occurrence_files.len(), 2);
+        assert_eq!(
+            occurrence_files
+                .iter()
+                .map(|(_, file_id)| *file_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            1
+        );
+        let files_catalog = test_branch_catalog(&pile.path, FILES_BRANCH_NAME);
+        assert_eq!(file_entity_ids(&files_catalog).len(), 1);
+    }
+
+    #[test]
+    fn attachment_occurrence_name_is_an_immutable_first_snapshot() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        let first = graph_message(
+            "chat-a",
+            "1",
+            "2026-07-29T10:00:00Z",
+            "A",
+            vec![inline_attachment("attachment-1", "first.bin", b"same")],
+        );
+        let renamed = graph_message(
+            "chat-a",
+            "1",
+            "2026-07-29T10:00:00Z",
+            "A",
+            vec![inline_attachment("attachment-1", "renamed.bin", b"same")],
+        );
+
+        ingest_test_batch(&config, vec![first], true, true);
+        assert_eq!(
+            ingest_test_batch(&config, vec![renamed], true, true),
+            (0, 0)
+        );
+        let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
+        let names = find!(
+            (attachment: Id, name: Inline<Handle<LongString>>),
+            pattern!(&teams_catalog, [{ ?attachment @ archive::attachment_name: ?name }])
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn files_first_partial_commit_recovers_without_duplicate_file_facts() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        let message = graph_message(
+            "chat-a",
+            "1",
+            "2026-07-29T10:00:00Z",
+            "A",
+            vec![inline_attachment("attachment-1", "a.bin", b"a")],
+        );
+
+        let first = ingest_test_batch(&config, vec![message.clone()], true, false);
+        assert!(first.0 > 0);
+        assert!(first.1 > 0);
+        let retry = ingest_test_batch(&config, vec![message.clone()], true, true);
+        assert!(retry.0 > 0);
+        assert_eq!(retry.1, 0);
+        assert_eq!(
+            ingest_test_batch(&config, vec![message], true, true),
+            (0, 0)
+        );
+        let files_catalog = test_branch_catalog(&pile.path, FILES_BRANCH_NAME);
+        assert_eq!(file_entity_ids(&files_catalog).len(), 1);
+        let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
+        assert_eq!(
+            find!(
+                (attachment: Id, file_id: Id),
+                pattern!(&teams_catalog, [{ ?attachment @ archive::attachment_file: ?file_id }])
+            )
+            .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_message_identity_lineage_is_rejected_before_replay() {
+        let pile = TestPile::new();
+        let config = pile.config();
+        with_repo(&config.pile_path, |repo| {
+            let mut ws = map_err_debug(repo.pull(config.branch_id), "pull test workspace")?;
+            let chat_external = ws.put("legacy-chat".to_string());
+            let chat_fragment = entity! { _ @ teams::chat_id: chat_external };
+            let chat_id = chat_fragment.root().expect("chat root");
+            let message_external = ws.put("legacy-message".to_string());
+            let legacy_message = ufoid();
+            let mut change = chat_fragment;
+            change += entity! { &legacy_message @
+                metadata::tag: archive::kind_message,
+                teams::chat: chat_id,
+                teams::message_id: message_external,
+            };
+            ws.commit(change, "legacy Teams identity fixture");
+            map_err_debug(repo.push(&mut ws), "push test workspace")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
+        let error = validate_message_identity_lineage(&catalog).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("legacy message identity lineage"));
+    }
+
+    #[test]
+    fn attachment_references_preserve_collection_scope() {
+        assert_eq!(
+            attachment_reference(Some("hosted-content"), "42"),
+            "hosted-content:42"
+        );
+        assert_eq!(
+            parse_attachment_reference("attachment:42"),
+            (Some("attachment"), "42")
+        );
+        assert_eq!(parse_attachment_reference("42"), (None, "42"));
+    }
+
+    #[test]
+    fn duplicate_delta_versions_are_coalesced_deterministically() {
+        let older = graph_message("chat-a", "1", "2026-07-29T10:00:00Z", "older", vec![]);
+        let mut newer = graph_message("chat-a", "1", "2026-07-29T10:00:00Z", "newer", vec![]);
+        newer["lastModifiedDateTime"] = json!("2026-07-29T10:01:00Z");
+
+        for input in [
+            vec![older.clone(), newer.clone()],
+            vec![newer.clone(), older],
+        ] {
+            let parsed = parse_messages(input).unwrap();
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].content, "newer");
+        }
+    }
 }

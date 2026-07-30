@@ -51,6 +51,11 @@ pub mod archive {
         "8334E282F24A4C7779C8899191B29E00" as pub attachment: GenId;
 
         "C9132D7400892F65B637BCBE92E230FB" as pub attachment_source_id: Handle<LongString>;
+        /// Content artifact represented by this source-specific attachment
+        /// occurrence. The target is a `files::KIND_FILE` entity; keeping the
+        /// occurrence and artifact separate lets identical bytes deduplicate
+        /// without conflating their message-local provenance.
+        "983BE64C7663D4DFBF7F227BA6D32634" as pub attachment_file: GenId;
         "A8F6CF04A9B2391A26F04BC84B77217D" as pub attachment_source_pointer: Handle<LongString>;
         "9ADD88D3FFD9E4F91E0DC08126D9180A" as pub attachment_name: Handle<LongString>;
         "EEFDB32D37B7B2834D99ACCF159B6507" as pub attachment_mime: ShortString;

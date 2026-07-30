@@ -1,7 +1,7 @@
 //! Read-only GORBIE-embeddable viewer for the `files` faculty.
 //!
-//! The files branch can hold tens of thousands of content-addressed
-//! file entities — far too many to render as cards. This widget
+//! The files branch can hold tens of thousands of intrinsic file records
+//! backed by content-addressed blobs — far too many to render as cards. This widget
 //! instead focuses on **imports** (`KIND_IMPORT` entities), which
 //! are the meaningful "I brought a file/directory in at this time"
 //! moments. Each import knows its source filesystem path, when it

@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::files as file_capability;
 use faculties::schemas::embeddings;
 use faculties::schemas::files::{
     file, page, FILES_BRANCH_NAME, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
@@ -216,35 +217,6 @@ fn handle_hex(h: FileHandle) -> String {
     inlineencodings::Hash::<inlineencodings::Blake3>::to_hex(&hash)
 }
 
-fn infer_mime(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
-        "pdf" => "application/pdf",
-        "json" => "application/json",
-        "toml" => "application/toml",
-        "yaml" | "yml" => "application/yaml",
-        "xml" => "application/xml",
-        "csv" => "text/csv",
-        "txt" => "text/plain",
-        "md" | "markdown" => "text/markdown",
-        "rs" => "text/x-rust",
-        "py" => "text/x-python",
-        "js" => "application/javascript",
-        "ts" => "application/typescript",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "webp" => "image/webp",
-        "tar" => "application/x-tar",
-        "gz" | "gzip" => "application/gzip",
-        "zip" => "application/zip",
-        "wasm" => "application/wasm",
-        _ => "application/octet-stream",
-    }
-}
-
 fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -272,12 +244,10 @@ fn read_name(space: &TribleSet, ws: &mut Workspace<Pile>, eid: Id) -> Option<Str
     Some(view.as_ref().to_string())
 }
 
-fn read_mime(space: &TribleSet, eid: Id) -> Option<String> {
-    find!(
-        m: String,
-        pattern!(space, [{ eid @ file::mime: ?m }])
-    )
-    .next()
+fn read_mime(space: &TribleSet, ws: &mut Workspace<Pile>, eid: Id) -> Option<String> {
+    let handle = file_capability::media_type_name_handle(space, eid)?;
+    let view: View<str> = ws.get(handle).ok()?;
+    Some(view.as_ref().to_string())
 }
 
 /// If `eid` is a rasterized-PDF page entity, return its `(parent file id, page
@@ -469,7 +439,7 @@ fn print_fs_tree(
         let size = meta.len();
         stats.bytes += size;
         stats.files += 1;
-        let mime = infer_mime(path);
+        let mime = file_capability::infer_media_type(path);
         println!("{prefix}{name}  ({mime}, {})", human_size(size));
     } else if meta.is_dir() {
         stats.dirs += 1;
@@ -545,7 +515,7 @@ fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
 }
 
 /// Embed an image on `add` and stage it as `file::embedding` exhaust (stored
-/// under the file's content-derived id, so identity is unaffected). Lazy-loads
+/// under the file's intrinsic record id, so identity is unaffected). Lazy-loads
 /// the embedder on the first image. No-op without `local-embed` or for
 /// non-raster mimes (SVG isn't a bitmap CLIP can decode).
 #[allow(unused_variables)]
@@ -683,26 +653,19 @@ fn build_tree(
     if meta.is_file() {
         let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
         stats.bytes += bytes.len() as u64;
-        let mime = mime_override.unwrap_or_else(|| infer_mime(path));
+        let mime = mime_override.unwrap_or_else(|| file_capability::infer_media_type(path));
         // Embed BEFORE the bytes are moved into the blob store.
         let emb_handle = embed_image_on_add(ws, embedder, mime, &bytes)?;
-        let content_h: FileHandle = ws.put::<blobencodings::RawBytes, _>(bytes);
         let name_str = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unnamed");
-        let name_h: TextHandle = ws.put(name_str.to_string());
 
         stats.files += 1;
-        let mut frag = entity! {
-            metadata::tag: &KIND_FILE,
-            file::content: content_h,
-            file::name: name_h,
-            file::mime: mime
-        };
+        let mut frag = file_capability::stage(ws, bytes, name_str, mime)?;
         if let Some(eh) = emb_handle {
-            // Exhaust: stored under the content-derived id, so identity holds.
-            let fid = frag.root().expect("file entity has a content-derived id");
+            // Exhaust: stored under the intrinsic record id, so identity holds.
+            let fid = frag.root().expect("file entity has an intrinsic id");
             frag += entity! { ExclusiveId::force_ref(&fid) @ file::embedding: eh };
         }
         Ok(frag)
@@ -794,7 +757,7 @@ fn cmd_add(
         file::source_path: source_h
     };
     let import_id = import_frag.root().expect("import has an id");
-    let mut change: TribleSet = tree.into();
+    let mut change = tree;
     change += import_frag;
 
     // Tags go on the import entity.
@@ -822,7 +785,7 @@ fn cmd_add(
             .ok_or_else(|| anyhow::anyhow!("missing content handle"))?;
         let hash = handle_hex(h);
         let name = abs_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        let mime = read_mime(&space, root_id).unwrap_or_default();
+        let mime = read_mime(&space, ws, root_id).unwrap_or_default();
         println!("{}  {}  ({})", hash, name, human_size(stats.bytes));
         if mime.starts_with("image/") {
             println!("![{name}](files:{hash})");
@@ -884,7 +847,7 @@ fn cmd_fetch(
         .unwrap_or_else(|| {
             guessed_name
                 .as_deref()
-                .map(|n| infer_mime(Path::new(n)))
+                .map(|n| file_capability::infer_media_type(Path::new(n)))
                 .unwrap_or("application/octet-stream")
                 .to_string()
         });
@@ -919,7 +882,7 @@ fn cmd_list(
         pattern!(&space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
     ) {
         let fname = read_name(&space, ws, eid).unwrap_or_else(|| "?".into());
-        let mime = read_mime(&space, eid).unwrap_or_else(|| "?".into());
+        let mime = read_mime(&space, ws, eid).unwrap_or_else(|| "?".into());
         let tags = tags_of(&space, eid);
 
         if let Some(mp) = filter_mime {
@@ -1078,7 +1041,10 @@ fn cmd_show(ws: &mut Workspace<Pile>, id: &str) -> Result<()> {
             "Name:     {}",
             read_name(&space, ws, eid).unwrap_or("?".into())
         );
-        println!("MIME:     {}", read_mime(&space, eid).unwrap_or("?".into()));
+        println!(
+            "MIME:     {}",
+            read_mime(&space, ws, eid).unwrap_or("?".into())
+        );
         println!("Size:     {}", human_size(size));
     } else if is_directory(&space, eid) {
         let children = children_of(&space, eid);
@@ -1254,7 +1220,7 @@ fn cmd_search(ws: &mut Workspace<Pile>, query: &str) -> Result<()> {
         pattern!(&space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
     ) {
         let fname = read_name(&space, ws, eid).unwrap_or_else(|| "?".into());
-        let mime = read_mime(&space, eid).unwrap_or_else(|| "?".into());
+        let mime = read_mime(&space, ws, eid).unwrap_or_else(|| "?".into());
         let tags = tags_of(&space, eid);
 
         let fname_match = fname.to_lowercase().contains(&needle);
@@ -1356,7 +1322,7 @@ fn print_tree(
     let name = read_name(space, ws, id).unwrap_or_else(|| fmt_id(id));
 
     if is_file(space, id) {
-        let mime = read_mime(space, id).unwrap_or_else(|| "?".into());
+        let mime = read_mime(space, ws, id).unwrap_or_else(|| "?".into());
         let size_str = content_handle_of(space, id)
             .and_then(|h| ws.get::<anybytes::Bytes, _>(h).ok())
             .map(|b| human_size(b.len() as u64))
@@ -1606,7 +1572,7 @@ fn read_embedding(ws: &mut Workspace<Pile>, h: EmbHandle) -> Result<Vec<f32>> {
 }
 
 /// Embed every image file with nomic-embed-multimodal-7b and store the 3584-d
-/// vector on `attr_mm7b::embedding` (under the file's content-derived id, so
+/// vector on `attr_mm7b::embedding` (under the file's intrinsic record id, so
 /// identity is unaffected — pure exhaust). Additive to the CLIP `file::embedding`
 /// path: both coexist. Idempotent — already-embedded files are skipped unless
 /// `--force`. Identical bytes (duplicate imports) are embedded once and the
@@ -1623,7 +1589,7 @@ fn cmd_embed7b(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>, force: boo
         (eid: Id, h: FileHandle),
         pattern!(&space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
     ) {
-        let mime = read_mime(&space, eid).unwrap_or_default();
+        let mime = read_mime(&space, ws, eid).unwrap_or_default();
         if !mime.starts_with("image/") || mime == "image/svg+xml" {
             continue;
         }
@@ -1821,7 +1787,7 @@ fn cmd_embed7b_pdf(
         (eid: Id, h: FileHandle),
         pattern!(&space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
     ) {
-        if read_mime(&space, eid).as_deref() != Some("application/pdf") {
+        if read_mime(&space, ws, eid).as_deref() != Some("application/pdf") {
             continue;
         }
         groups
@@ -2042,7 +2008,7 @@ fn cmd_similar(
     println!("Similar to {label} (cos ≥ {floor}):");
     for (cos, eid) in &rows {
         let name = read_name(&space, ws, *eid).unwrap_or_else(|| "?".into());
-        let mime = read_mime(&space, *eid).unwrap_or_else(|| "?".into());
+        let mime = read_mime(&space, ws, *eid).unwrap_or_else(|| "?".into());
         let hash = content_handle_of(&space, *eid)
             .map(handle_hex)
             .unwrap_or_default();
@@ -2140,7 +2106,7 @@ fn cmd_similar_mm7b(
             None => (*eid, String::new()),
         };
         let name = read_name(&space, ws, display_eid).unwrap_or_else(|| "?".into());
-        let mime = read_mime(&space, display_eid).unwrap_or_else(|| "?".into());
+        let mime = read_mime(&space, ws, display_eid).unwrap_or_else(|| "?".into());
         let hash = content_handle_of(&space, display_eid)
             .map(handle_hex)
             .unwrap_or_default();

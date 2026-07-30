@@ -27,10 +27,8 @@
 //!   `discord::cursor_last_message_id` so successive calls are
 //!   incremental).
 //!
-//! Not yet implemented: attachments, gateway websocket for
-//! real-time events, guild/channel listing. All straightforward
-//! follow-ups; kept out of the MVP so the first working cut is
-//! small.
+//! Guild/channel listing and attachment ingestion are supported. A gateway
+//! websocket for real-time events remains a follow-up.
 
 use std::collections::HashMap;
 use std::fs;
@@ -49,15 +47,14 @@ use serde_json::{json, Value as JsonValue};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::prelude::blobencodings::{self, LongString};
+use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
+use faculties::files as file_capability;
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{discord, DEFAULT_BRANCH, DEFAULT_LOG_BRANCH};
-use faculties::schemas::teams::{file_schema, FILES_BRANCH_NAME};
-use file_schema::file;
-use file_schema::KIND_FILE;
+use faculties::schemas::files::FILES_BRANCH_NAME;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
@@ -526,16 +523,6 @@ fn pull_channel(
         let (change, files_change) =
             build_ingest_change(&mut ws, &mut files_ws, &catalog, incoming, config)?;
 
-        let delta = change.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(
-                delta,
-                &format!("discord: ingest {ingested} messages from {channel_id}"),
-            );
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push discord: {e:?}"))?;
-        }
-
         let files_delta = files_change.difference(&files_catalog);
         if !files_delta.is_empty() {
             files_ws.commit(
@@ -544,6 +531,16 @@ fn pull_channel(
             );
             repo.push(&mut files_ws)
                 .map_err(|e| anyhow!("push files: {e:?}"))?;
+        }
+
+        let delta = change.difference(&catalog);
+        if !delta.is_empty() {
+            ws.commit(
+                delta,
+                &format!("discord: ingest {ingested} messages from {channel_id}"),
+            );
+            repo.push(&mut ws)
+                .map_err(|e| anyhow!("push discord: {e:?}"))?;
         }
         Ok(())
     })?;
@@ -981,12 +978,9 @@ fn build_ingest_change(
         };
 
         // ── attachments ──
-        // For each attachment on this message, derive an intrinsic
-        // id from `archive::attachment_source_id`, link the
-        // message → attachment, and put the file on the shared
-        // files branch tagged KIND_FILE. Deduped across this
-        // batch so the same attachment seen twice only fetches
-        // once.
+        // The source occurrence and canonical file record are distinct:
+        // Discord's snowflake identifies the occurrence, while the shared
+        // file constructor derives the immutable file from bytes/name/MIME.
         for source in &message.attachments {
             let source_handle = ws.put(source.source_id.clone());
             let att_id_frag = entity! { _ @
@@ -1002,7 +996,11 @@ fn build_ingest_change(
                 archive::attachment: attachment_id,
             };
             change += att_id_frag;
-
+            let attachment_name = ws.put(source.filename.clone());
+            change += entity! { ExclusiveId::force_ref(&attachment_id) @
+                metadata::tag: archive::kind_attachment,
+                archive::attachment_name: attachment_name,
+            };
             if !added_attachment_files.insert(attachment_id) {
                 continue;
             }
@@ -1029,14 +1027,15 @@ fn build_ingest_change(
                 .clone()
                 .or(fetched_type)
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            let content_handle = files_ws.put::<blobencodings::RawBytes, _>(bytes);
-            let name_handle = files_ws.put(source.filename.clone());
-
-            files_change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                metadata::tag: &KIND_FILE,
-                file::content: content_handle,
-                file::name: name_handle,
-                file::mime: mime.as_str(),
+            let media_type = file_capability::normalize_media_type_or_default(&mime);
+            let file_fragment =
+                file_capability::stage(files_ws, bytes, source.filename.clone(), &media_type)?;
+            let file_id = file_fragment
+                .root()
+                .expect("canonical file fragment has one root");
+            files_change += file_fragment;
+            change += entity! { ExclusiveId::force_ref(&attachment_id) @
+                archive::attachment_file: file_id,
             };
         }
     }

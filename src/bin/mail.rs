@@ -25,10 +25,11 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::files as file_capability;
 use faculties::schemas::decide::{decide as decide_attrs, KIND_DECISION};
-use faculties::schemas::files::{file, KIND_FILE};
 use faculties::mail_account::{self, MailAccount};
 use faculties::pile_cli::{instant_interval, load_value, now_epoch, put_bytes, with_repo};
+use faculties::schemas::files::file;
 use faculties::schemas::mail::{
     mail, mail_account as mail_attrs, KIND_DRAFT, KIND_MAIL_ACCOUNT, KIND_MESSAGE, KIND_RECEIVED,
     KIND_SENT, KIND_SPAM,
@@ -451,32 +452,6 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
     ws.get::<View<str>, blobencodings::LongString>(h)
         .ok()
         .map(|view| view.to_string())
-}
-
-/// Best-effort MIME type from a filename extension. Used both when
-/// storing an outbound attachment and when re-attaching it on send —
-/// derived from the name rather than the stored `file::mime`, which is
-/// capped at 32 bytes (and so truncates long types like the pptx one).
-fn mime_for_filename(name: &str) -> &'static str {
-    let lower = name.to_ascii_lowercase();
-    let ext = lower.rsplit('.').next().unwrap_or("");
-    match ext {
-        "pdf" => "application/pdf",
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "ppt" => "application/vnd.ms-powerpoint",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "doc" => "application/msword",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "txt" | "md" => "text/plain",
-        "csv" => "text/csv",
-        "json" => "application/json",
-        "zip" => "application/zip",
-        _ => "application/octet-stream",
-    }
 }
 
 // ── read tracking ─────────────────────────────────────────────────────────
@@ -1144,29 +1119,18 @@ fn persist_message(
             .map_err(|e| anyhow::anyhow!("pull files: {e:?}"))?;
 
         let mut change = TribleSet::new();
-        let now = instant_interval(now_epoch());
-        let provenance = format!("mail:{}", parsed.message_id);
         for att in &parsed.attachments {
-            let file_id = ufoid();
-            let file_ref = file_id.id;
-            let blob: Blob<blobencodings::RawBytes> = att.bytes.clone().to_blob();
-            let content_handle: FileHandle = ws.put(blob);
-            let name_handle: TextHandle = ws.put(att.filename.clone());
-            let source_handle: TextHandle = ws.put(provenance.clone());
-            let mime_short = if att.mime.as_bytes().len() <= 32 {
-                att.mime.clone()
-            } else {
-                att.mime.chars().take(32).collect()
-            };
-            change += entity! { &file_id @
-                metadata::tag: &KIND_FILE,
-                metadata::created_at: now,
-                file::content: content_handle,
-                file::name: name_handle,
-                file::mime: mime_short.as_str(),
-                file::source_path: source_handle,
-                file::tag: "mail-attachment",
-            };
+            let media_type = file_capability::normalize_media_type_or_default(&att.mime);
+            let file_fragment = file_capability::stage(
+                &mut ws,
+                att.bytes.clone(),
+                att.filename.clone(),
+                &media_type,
+            )?;
+            let file_ref = file_fragment
+                .root()
+                .expect("canonical file fragment has one root");
+            change += file_fragment;
             attachment_ids.push(file_ref);
         }
         ws.commit(change, "mail: store attachments");
@@ -1348,7 +1312,7 @@ fn cmd_draft(
             .and_then(|s| s.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
-        let mime = mime_for_filename(&filename).to_string();
+        let mime = file_capability::infer_media_type(path).to_string();
         attachments.push(Attachment {
             filename,
             mime,
@@ -1821,28 +1785,45 @@ fn cmd_send(
 
     // Re-read each referenced attachment's bytes + filename from the
     // files branch, so they can be re-attached to the outbound MIME.
-    let attachments: Vec<(String, Vec<u8>)> = with_repo(pile, |repo| {
+    let attachments: Vec<(String, String, Vec<u8>)> = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(files_branch_id)
             .map_err(|e| anyhow::anyhow!("pull files: {e:?}"))?;
         let space = ws
             .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout files: {e:?}"))?;
-        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut out: Vec<(String, String, Vec<u8>)> = Vec::new();
         for &fid in &attrs.attachment_ids {
-            let content_h: Option<FileHandle> =
-                find!(h: FileHandle, pattern!(&space, [{ fid @ file::content: ?h }])).next();
-            let name_h: Option<TextHandle> =
-                find!(h: TextHandle, pattern!(&space, [{ fid @ file::name: ?h }])).next();
-            if let Some(ch) = content_h {
-                let bytes: anybytes::Bytes = ws
-                    .get::<anybytes::Bytes, _>(ch)
-                    .map_err(|e| anyhow::anyhow!("read attachment blob: {e:?}"))?;
-                let name = name_h
-                    .and_then(|h| read_text(&mut ws, h))
-                    .unwrap_or_else(|| "attachment.bin".into());
-                out.push((name, bytes.as_ref().to_vec()));
-            }
+            let content_h: FileHandle =
+                find!(h: FileHandle, pattern!(&space, [{ fid @ file::content: ?h }]))
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "attachment file {fid:x} has no canonical content; rebuild the files branch"
+                        )
+                    })?;
+            let name_h: TextHandle =
+                find!(h: TextHandle, pattern!(&space, [{ fid @ file::name: ?h }]))
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "attachment file {fid:x} has no canonical name; rebuild the files branch"
+                        )
+                    })?;
+            let bytes: anybytes::Bytes = ws
+                .get::<anybytes::Bytes, _>(content_h)
+                .map_err(|e| anyhow::anyhow!("read attachment blob {fid:x}: {e:?}"))?;
+            let name = read_text(&mut ws, name_h)
+                .ok_or_else(|| anyhow::anyhow!("read name for attachment file {fid:x}"))?;
+            let media_type_handle =
+                file_capability::media_type_name_handle(&space, fid).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "attachment file {fid:x} has no canonical media-type entity; rebuild the files branch"
+                    )
+                })?;
+            let media_type = read_text(&mut ws, media_type_handle)
+                .ok_or_else(|| anyhow::anyhow!("read media type for attachment file {fid:x}"))?;
+            out.push((name, media_type, bytes.as_ref().to_vec()));
         }
         Ok(out)
     })?;
@@ -1899,8 +1880,8 @@ fn cmd_send(
                 .header(header::ContentType::TEXT_PLAIN)
                 .body(attrs.body.clone()),
         );
-        for (name, bytes) in &attachments {
-            let ct = header::ContentType::parse(mime_for_filename(name)).unwrap_or_else(|_| {
+        for (name, media_type, bytes) in &attachments {
+            let ct = header::ContentType::parse(media_type).unwrap_or_else(|_| {
                 header::ContentType::parse("application/octet-stream").unwrap()
             });
             multipart = multipart

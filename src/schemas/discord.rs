@@ -4,8 +4,8 @@
 //! Used by `discord.rs` (the faculty CLI). Messages use the generic
 //! `archive::*` schema for the common shape (author / content /
 //! reply_to / kind_message); this module only owns the Discord-
-//! specific attributes and kinds. Attachments go through the shared
-//! `files` branch + `file_schema` — not duplicated here.
+//! specific attributes and kinds. Attachment occurrences link to canonical
+//! file records built by the shared `faculties::files` capability.
 //!
 //! ## Identity
 //!
