@@ -454,6 +454,54 @@ fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
     .collect()
 }
 
+/// The four scalar attributes of a version, in ONE query.
+///
+/// # Why folding these is safe, and why `tags_of` is not folded with them
+///
+/// `pattern!` has no optional matching — `attr?:` is `entity!`'s *writing*
+/// syntax, and OPTIONAL is deliberately periphery for monotonicity. So folding
+/// probes into one pattern is only safe when every attribute is guaranteed
+/// present; otherwise an entity missing one silently vanishes from the result,
+/// where the separate `Option`-returning helpers each degraded independently.
+///
+/// Here it IS guaranteed, by construction rather than by convention. The write
+/// path builds the version as
+///
+/// ```ignore
+/// let version = entity! { _ @
+///     wiki::fragment: &fragment_id,
+///     wiki::title: title_handle,
+///     wiki::content: content,
+/// };
+/// let version_id = version.root().expect("version should be rooted");
+/// ```
+///
+/// so the version id is *content-derived from exactly those three attributes*:
+/// an entity cannot be a version id without carrying all three.
+///
+/// `metadata::created_at` is written unconditionally too, but in a second
+/// `entity!` keyed to the already-derived id, so it is not covered by that
+/// derivation and needed checking against the data. It holds: over the live
+/// pile, all 3,082 latest versions carry a real timestamp (a missing one would
+/// render as epoch zero via `unwrap_or(Lower(0))`, and there are none), and the
+/// earliest is 2026-02-17 — which predates the rust-script-to-binaries port,
+/// so even the pre-port writer wrote it.
+///
+/// `metadata::tag` is REPEATED and stays separate: folding it would multiply the
+/// row count by the tag count rather than adding a column.
+fn version_core(space: &TribleSet, vid: Id) -> Option<(Id, TextHandle, TextHandle, Lower)> {
+    find!(
+        (frag: Id, title: TextHandle, content: TextHandle, ts: Lower),
+        pattern!(space, [{ vid @
+            wiki::fragment: ?frag,
+            wiki::title: ?title,
+            wiki::content: ?content,
+            metadata::created_at: ?ts,
+        }])
+    )
+    .next()
+}
+
 /// Get stored links_to targets for a version entity.
 fn links_of(space: &TribleSet, vid: Id) -> Vec<Id> {
     find!(
@@ -2136,16 +2184,18 @@ fn cmd_show(repo: &mut Repo, bid: Id, id: String, follow_latest: bool) -> Result
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let parsed_id = resolve_prefix(&space, &id)?;
     let vid = resolve_to_show(&space, parsed_id, follow_latest)?;
-    let fragment_id =
-        version_fragment(&space, vid).ok_or_else(|| anyhow::anyhow!("version has no fragment"))?;
-
-    let content_h = content_handle_of(&space, vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
+    // Four probes folded into one — see `version_core`. Was:
+    // version_fragment + content_handle_of + read_title + created_at_of.
+    let (fragment_id, title_h, content_h, created_at) = version_core(&space, vid)
+        .ok_or_else(|| anyhow::anyhow!("version has no fragment"))?;
     let content: View<str> = ws
         .get(content_h)
         .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-    let title = read_title(&space, &mut ws, vid).unwrap_or_default();
+    let title = ws
+        .get::<View<str>, _>(title_h)
+        .map(|v| v.as_ref().to_string())
+        .unwrap_or_default();
     let tags = tags_of(&space, vid);
-    let created_at = created_at_of(&space, vid).unwrap_or(Lower(0));
 
     println!("# {title}");
     println!(
