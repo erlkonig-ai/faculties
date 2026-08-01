@@ -43,6 +43,9 @@ use clap::{Parser, Subcommand};
 use faculties::pile_cli::{now_epoch, with_repo};
 use faculties::schemas::mail::{KIND_DRAFT, KIND_MESSAGE, KIND_RECEIVED, KIND_SENT};
 use faculties::schemas::migrations::{migration, KIND_MIGRATION_APPLIED};
+use faculties::schemas::relations::{relations as rel, KIND_PERSON_ID};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::Handle;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Repository;
@@ -147,7 +150,115 @@ fn registry() -> Vec<Migration> {
                       asserted tag (KIND_RECEIVED / KIND_SENT); mail written before that \
                       carries neither and is invisible to the unread queries.",
         plan: plan_mail_direction,
+    },
+    Migration {
+        id: Id::from_hex("D082982F0AD1E30DF520372B3999775A").expect("minted id"),
+        name: "relations-label-norm",
+        description: "Derive relations::label_norm for people that lack it. \
+                      `message` has been telling operators to run \
+                      playground/migrations/relations_backfill_norm.rs, a path that \
+                      does not exist — this is that migration, with a home.",
+        plan: plan_relations_label_norm,
     }]
+}
+
+/// Backfill `relations::label_norm`.
+///
+/// Label lookup is by normalised key: `relations` writes
+/// `label_norm = label.trim().to_ascii_lowercase()` beside the label itself
+/// (`metadata::name`, a text handle). People minted before that attribute
+/// existed carry the name and not the key, so every label lookup misses them
+/// — which is what `message`'s "unknown person label" error is about, and
+/// why it points at a migration script that was never committed.
+///
+/// Derives the key the same way the writer does, rather than reimplementing
+/// the normalisation: a backfill that normalises differently from the writer
+/// produces entries that are findable by one path and not the other, which
+/// is worse than the gap it closes.
+fn plan_relations_label_norm(repo: &mut Repository<Pile>) -> Result<Plan> {
+    let Some(branch_id) = repo.lookup_branch("relations").ok().flatten() else {
+        return Ok(Plan {
+            changes: vec![BranchChange {
+                branch: "relations",
+                role: "target",
+                mode: Mode::Append,
+                pinned: None,
+                change: TribleSet::new(),
+                detail: "no relations branch — nothing to migrate".into(),
+            }],
+        });
+    };
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+
+    let mut change = TribleSet::new();
+    let (mut fixed, mut ok, mut nameless, mut unkeyable) = (0usize, 0usize, 0usize, 0usize);
+    let people: Vec<Id> = find!(
+        p: Id,
+        pattern!(&space, [{ ?p @ metadata::tag: &KIND_PERSON_ID }])
+    )
+    .collect();
+    for person in people {
+        let has_key = exists!(pattern!(&space, [{ person @ rel::label_norm: _?k }]));
+        if has_key {
+            ok += 1;
+            continue;
+        }
+        let Some(handle) = find!(
+            h: Inline<Handle<LongString>>,
+            pattern!(&space, [{ person @ metadata::name: ?h }])
+        )
+        .next() else {
+            // No label at all — nothing to derive a key from. Counted, not
+            // silently skipped: a person that cannot be looked up by name is
+            // a real gap, just not one this migration can close.
+            nameless += 1;
+            continue;
+        };
+        let Ok(name) = ws.get::<anybytes::View<str>, LongString>(handle) else {
+            nameless += 1;
+            continue;
+        };
+        let key = name.as_ref().trim().to_ascii_lowercase();
+        if key.is_empty() {
+            nameless += 1;
+            continue;
+        }
+        // `label_norm` is a ShortString and `Encodes<&str>` UNWRAPS, so a
+        // long label panics rather than failing. Nothing validates label
+        // length on the way in (`normalize_label` checks only emptiness),
+        // so names arriving from mail auto-registration can exceed it —
+        // those people are permanently unfindable by label, which is a
+        // real pre-existing gap this migration cannot close. Counted and
+        // reported rather than crashed on: a migration that dies partway
+        // through a plan tells the operator nothing about the rest.
+        let Ok(keyed) = key.as_str().try_to_inline() else {
+            unkeyable += 1;
+            continue;
+        };
+        let keyed: Inline<inlineencodings::ShortString> = keyed;
+        change += entity! { ExclusiveId::force_ref(&person) @
+            rel::label_norm: keyed,
+        };
+        fixed += 1;
+    }
+    Ok(Plan {
+        changes: vec![BranchChange {
+            branch: "relations",
+            role: "target",
+            mode: Mode::Append,
+            pinned: Some(branch_id),
+            change,
+            detail: format!(
+                "{ok} already keyed | {fixed} -> label_norm | {nameless} unnamed | \
+                 {unkeyable} too long for ShortString (unfindable by label)"
+            ),
+        }],
+    })
 }
 
 /// The one-shot direction backfill.
