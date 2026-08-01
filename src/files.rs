@@ -13,6 +13,7 @@
 //! to imports or source-specific occurrence entities instead.
 
 use anyhow::{anyhow, Result};
+use std::collections::BTreeSet;
 use std::path::Path;
 use triblespace::core::metadata;
 use triblespace::core::repo::{BlobStore, Workspace};
@@ -20,11 +21,191 @@ use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
-use crate::schemas::files::{file, KIND_FILE, KIND_MEDIA_TYPE};
+use crate::schemas::files::{file, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_MEDIA_TYPE};
 
 pub type ContentHandle = Inline<Handle<RawBytes>>;
 pub type NameHandle = Inline<Handle<LongString>>;
 pub const DEFAULT_MEDIA_TYPE: &str = "application/octet-stream";
+
+/// The two canonical targets carried by a `files:` reference token.
+///
+/// Unlike an entity selector, a content reference identifies bytes directly:
+/// several named file entities may intentionally share one content handle.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FileReference {
+    Entity(Id),
+    Content(ContentHandle),
+}
+
+impl FileReference {
+    pub fn hex(self) -> String {
+        match self {
+            Self::Entity(entity) => format!("{entity:x}"),
+            Self::Content(content) => content_hash_hex(content),
+        }
+    }
+}
+
+/// Return the lowercase Blake3 digest addressed by a canonical file handle.
+pub fn content_hash_hex(handle: ContentHandle) -> String {
+    let hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
+        inlineencodings::Handle::to_hash(handle);
+    inlineencodings::Hash::<inlineencodings::Blake3>::to_hex(&hash).to_ascii_lowercase()
+}
+
+fn normalize_selector(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    let raw = trimmed.strip_prefix("files:").unwrap_or(trimmed);
+    let selector = raw.to_ascii_lowercase();
+    if selector.is_empty()
+        || selector.len() > 64
+        || !selector.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!(
+            "invalid file selector '{selector}': expected 1 to 64 hexadecimal characters, optionally prefixed by 'files:'"
+        );
+    }
+    Ok(selector)
+}
+
+fn exactly_one<T>(
+    selector: &str,
+    matches: BTreeSet<T>,
+    kind: &str,
+    render: impl Fn(T) -> String,
+) -> Result<T>
+where
+    T: Copy + Ord,
+{
+    match matches.len() {
+        0 => anyhow::bail!("no {kind} matches selector '{selector}'"),
+        1 => Ok(*matches.first().expect("one selector match")),
+        _ => {
+            let candidates = matches
+                .into_iter()
+                .map(render)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("{kind} selector '{selector}' is ambiguous; candidates: {candidates}")
+        }
+    }
+}
+
+#[derive(Default)]
+struct SelectorMatches {
+    entities: BTreeSet<Id>,
+    references: BTreeSet<FileReference>,
+}
+
+fn selector_matches(space: &TribleSet, selector: &str) -> SelectorMatches {
+    let mut matches = SelectorMatches::default();
+    for (entity, content) in find!(
+        (entity: Id, content: ContentHandle),
+        pattern!(space, [{
+            ?entity @ metadata::tag: &KIND_FILE,
+            file::content: ?content,
+        }])
+    ) {
+        if format!("{entity:x}").starts_with(selector) {
+            matches.entities.insert(entity);
+            matches.references.insert(FileReference::Entity(entity));
+        }
+        if content_hash_hex(content).starts_with(selector) {
+            matches.entities.insert(entity);
+            matches.references.insert(FileReference::Content(content));
+        }
+    }
+    for entity in find!(
+        entity: Id,
+        pattern!(space, [{ ?entity @ metadata::tag: &KIND_DIRECTORY }])
+    )
+    .chain(find!(
+        entity: Id,
+        pattern!(space, [{ ?entity @ metadata::tag: &KIND_IMPORT }])
+    )) {
+        if format!("{entity:x}").starts_with(selector) {
+            matches.entities.insert(entity);
+            matches.references.insert(FileReference::Entity(entity));
+        }
+    }
+    matches
+}
+
+/// Resolve a file-faculty selector to exactly one entity.
+///
+/// Selectors are case-insensitive hexadecimal with an optional `files:`
+/// prefix. A complete 32-character entity id is direct and intentionally does
+/// not scan the catalog. A complete 64-character digest resolves through
+/// [`file::content`] and must identify exactly one canonical file entity. Any
+/// other shorter selector is matched against eligible file, directory, and
+/// import entity ids as well as file content digests. Matches are deduplicated
+/// by entity, so one file matching through both its id and digest remains one
+/// candidate.
+pub fn resolve_selector(space: &TribleSet, input: &str) -> Result<Id> {
+    let selector = normalize_selector(input)?;
+
+    if selector.len() == 32 {
+        return Id::from_hex(&selector).ok_or_else(|| anyhow!("invalid entity id '{selector}'"));
+    }
+
+    if selector.len() == 64 {
+        let hash = inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(&selector)
+            .map_err(|_| anyhow!("invalid content hash '{selector}'"))?;
+        let handle: ContentHandle = inlineencodings::Handle::from_hash(hash);
+        let matches: BTreeSet<Id> = find!(
+            entity: Id,
+            pattern!(space, [{
+                ?entity @ metadata::tag: &KIND_FILE,
+                file::content: &handle,
+            }])
+        )
+        .collect();
+        return exactly_one(&selector, matches, "file entity", |entity| {
+            format!("{entity:x}")
+        });
+    }
+
+    exactly_one(
+        &selector,
+        selector_matches(space, &selector).entities,
+        "file entity",
+        |entity| format!("{entity:x}"),
+    )
+}
+
+/// Expand a selector to one canonical `files:` reference token.
+///
+/// This is deliberately distinct from [`resolve_selector`]. Entity selectors
+/// collapse matches by entity and therefore reject one content hash shared by
+/// multiple named files. Reference selectors collapse by reference token: the
+/// shared content handle is one valid content reference, while entity ids are
+/// separate reference tokens. Complete 32- and 64-character tokens are direct
+/// and need no catalog evidence; shorter prefixes are expanded from canonical
+/// file, directory, and import records.
+pub fn resolve_reference(space: &TribleSet, input: &str) -> Result<FileReference> {
+    let selector = normalize_selector(input)?;
+
+    if selector.len() == 32 {
+        return Id::from_hex(&selector)
+            .map(FileReference::Entity)
+            .ok_or_else(|| anyhow!("invalid entity id '{selector}'"));
+    }
+
+    if selector.len() == 64 {
+        let hash = inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(&selector)
+            .map_err(|_| anyhow!("invalid content hash '{selector}'"))?;
+        return Ok(FileReference::Content(inlineencodings::Handle::from_hash(
+            hash,
+        )));
+    }
+
+    exactly_one(
+        &selector,
+        selector_matches(space, &selector).references,
+        "file reference",
+        |reference| format!("files:{}", reference.hex()),
+    )
+}
 
 /// Best-effort media type inferred from a filename extension.
 ///
@@ -198,6 +379,150 @@ mod tests {
         .next()
         .expect("file media type")
         .0
+    }
+
+    fn facts_of(fragments: impl IntoIterator<Item = Fragment>) -> TribleSet {
+        let mut facts = TribleSet::new();
+        for fragment in fragments {
+            facts += fragment;
+        }
+        facts
+    }
+
+    #[test]
+    fn complete_entity_ids_are_direct_and_case_insensitive() {
+        let expected = Id::from_hex("abcdef0123456789abcdef0123456789").unwrap();
+        assert_eq!(
+            resolve_selector(&TribleSet::new(), "files:ABCDEF0123456789ABCDEF0123456789").unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolve_reference(&TribleSet::new(), "files:ABCDEF0123456789ABCDEF0123456789").unwrap(),
+            FileReference::Entity(expected)
+        );
+    }
+
+    #[test]
+    fn entity_and_content_prefixes_resolve_without_a_minimum_length() {
+        let mut workspace = workspace();
+        let file = stage(
+            &mut workspace,
+            b"selector bytes".to_vec(),
+            "selector.txt",
+            "text/plain",
+        )
+        .unwrap();
+        let file_id = file.root().unwrap();
+        let content = content_of(&file);
+        let hash = content_hash_hex(content);
+        let facts = facts_of([file]);
+        let id_hex = format!("{file_id:x}");
+        assert_eq!(hash, hash.to_ascii_lowercase());
+
+        assert_eq!(
+            resolve_selector(&facts, &id_hex[..1].to_ascii_uppercase()).unwrap(),
+            file_id
+        );
+        assert_eq!(
+            resolve_selector(&facts, &id_hex[..12].to_ascii_uppercase()).unwrap(),
+            file_id
+        );
+        assert_eq!(
+            resolve_selector(
+                &facts,
+                &format!("files:{}", hash[..20].to_ascii_uppercase())
+            )
+            .unwrap(),
+            file_id
+        );
+        assert_eq!(
+            resolve_selector(&facts, &hash.to_ascii_uppercase()).unwrap(),
+            file_id
+        );
+
+        let id_reference_prefix = (1..32)
+            .map(|len| &id_hex[..len])
+            .find(|prefix| {
+                resolve_reference(&facts, prefix).ok() == Some(FileReference::Entity(file_id))
+            })
+            .expect("entity reference has an unambiguous prefix");
+        assert_eq!(
+            resolve_reference(&facts, &id_reference_prefix.to_ascii_uppercase()).unwrap(),
+            FileReference::Entity(file_id)
+        );
+        assert_eq!(
+            resolve_reference(&facts, &hash[..40].to_ascii_uppercase()).unwrap(),
+            FileReference::Content(content)
+        );
+    }
+
+    #[test]
+    fn duplicate_content_is_ambiguous_by_entity_even_for_a_complete_hash() {
+        let mut workspace = workspace();
+        let first = stage(
+            &mut workspace,
+            b"shared bytes".to_vec(),
+            "first.txt",
+            "text/plain",
+        )
+        .unwrap();
+        let second = stage(
+            &mut workspace,
+            b"shared bytes".to_vec(),
+            "second.txt",
+            "text/plain",
+        )
+        .unwrap();
+        let content = content_of(&first);
+        let hash = content_hash_hex(content);
+        let mut expected = vec![first.root().unwrap(), second.root().unwrap()];
+        expected.sort();
+        let facts = facts_of([first, second]);
+
+        let message = resolve_selector(&facts, &hash).unwrap_err().to_string();
+        assert!(message.contains("ambiguous"));
+        for candidate in expected {
+            assert!(message.contains(&format!("{candidate:x}")));
+        }
+
+        assert_eq!(
+            resolve_reference(&facts, &hash).unwrap(),
+            FileReference::Content(content)
+        );
+        assert_eq!(
+            resolve_reference(&facts, &hash[..40]).unwrap(),
+            FileReference::Content(content)
+        );
+        assert_eq!(
+            resolve_reference(&TribleSet::new(), &hash).unwrap(),
+            FileReference::Content(content)
+        );
+    }
+
+    #[test]
+    fn directory_and_import_ids_are_prefix_eligible() {
+        let directory_id = *fucid();
+        let import_id = *fucid();
+        let directory = entity! { ExclusiveId::force_ref(&directory_id) @
+            metadata::tag: &KIND_DIRECTORY,
+        };
+        let import = entity! { ExclusiveId::force_ref(&import_id) @
+            metadata::tag: &KIND_IMPORT,
+        };
+
+        let directory_facts = facts_of([directory]);
+        let directory_hex = format!("{directory_id:x}");
+        assert_eq!(
+            resolve_selector(&directory_facts, &directory_hex[..1]).unwrap(),
+            directory_id
+        );
+
+        let import_facts = facts_of([import]);
+        let import_hex = format!("{import_id:x}");
+        assert_eq!(
+            resolve_selector(&import_facts, &import_hex[..1]).unwrap(),
+            import_id
+        );
     }
 
     #[test]

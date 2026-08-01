@@ -18,8 +18,8 @@
 //! - Floating wiki-page cards that open when the user clicks a node, a
 //!   `wiki:<hex>` link in typst content, or a file entry
 //! - Version navigation (prev/next/latest) on fragments with history
-//! - `files:` link handling — resolves a 32-char entity id or 64-char
-//!   content hash to a file blob (against the optional files workspace),
+//! - `files:` link handling — resolves the shared file selector language to a
+//!   file blob (against the optional files workspace),
 //!   writes it to `$TMPDIR/faculties-files/`, and opens it via the platform
 //!   `open` command.
 
@@ -29,8 +29,8 @@ use cubecl::prelude::*;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::{Blake3, Handle};
-use triblespace::core::inline::{Inline, TryToInline};
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CommitHandle, Workspace};
@@ -266,53 +266,56 @@ impl WikiLive {
 
     // ── file resolution ──────────────────────────────────────────────
 
-    /// Resolve a `files:<hex>` URL fragment. `hex` must be either a
-    /// 32-char file-entity id or a 64-char blake3 content hash. Returns
-    /// the blob handle and a file name (or "file" if none is known).
+    /// Resolve a `files:<selector>` URL fragment through the canonical file
+    /// selector semantics. Returns the blob handle and a file name (or "file"
+    /// if none is known).
     fn resolve_file(
         &self,
         files_ws: Option<&mut Workspace<Pile>>,
         hex: &str,
     ) -> Option<(FileHandle, String)> {
-        let (entity_id, handle) = if hex.len() == 32 {
-            let eid = Id::from_hex(hex)?;
-            let h = find!(
-                h: FileHandle,
-                pattern!(&self.files_space, [{
-                    eid @ metadata::tag: &KIND_FILE, file::content: ?h,
-                }])
-            )
-            .next()?;
-            (eid, h)
-        } else if hex.len() == 64 {
-            let hash_str = format!("blake3:{hex}");
-            let hash_value: Inline<triblespace::core::inline::encodings::hash::Hash<Blake3>> =
-                hash_str.as_str().try_to_inline().ok()?;
-            let content_handle: FileHandle = hash_value.into();
-            let eid = find!(
-                eid: Id,
-                pattern!(&self.files_space, [{
-                    ?eid @ metadata::tag: &KIND_FILE, file::content: &content_handle,
-                }])
-            )
-            .next()?;
-            (eid, content_handle)
-        } else {
-            return None;
-        };
+        let (entity_id, handle) =
+            match crate::files::resolve_reference(&self.files_space, hex).ok()? {
+                crate::files::FileReference::Entity(entity_id) => {
+                    let handle = find!(
+                        handle: FileHandle,
+                        pattern!(&self.files_space, [{
+                            entity_id @ metadata::tag: &KIND_FILE, file::content: ?handle,
+                        }])
+                    )
+                    .next()?;
+                    (Some(entity_id), handle)
+                }
+                crate::files::FileReference::Content(handle) => {
+                    // The hash names bytes, not metadata. Duplicate named records
+                    // therefore remain one valid reference; the lowest entity id
+                    // is used only as an optional, deterministic display-name hint.
+                    let entity_id = find!(
+                        entity_id: Id,
+                        pattern!(&self.files_space, [{
+                            ?entity_id @ metadata::tag: &KIND_FILE, file::content: &handle,
+                        }])
+                    )
+                    .min();
+                    (entity_id, handle)
+                }
+            };
 
-        let name = find!(
-            h: TextHandle,
-            pattern!(&self.files_space, [{ entity_id @ file::name: ?h }])
-        )
-        .next()
-        .map(|h| self.file_text(files_ws, h))
-        .unwrap_or_else(|| "file".to_string());
+        let name = entity_id
+            .and_then(|entity_id| {
+                find!(
+                    h: TextHandle,
+                    pattern!(&self.files_space, [{ entity_id @ file::name: ?h }])
+                )
+                .next()
+            })
+            .map(|h| self.file_text(files_ws, h))
+            .unwrap_or_else(|| "file".to_string());
 
         Some((handle, name))
     }
 
-    /// Resolve `files:<hex>`, write the blob to `$TMPDIR/faculties-files/<name>`,
+    /// Resolve `files:<selector>`, write the blob to `$TMPDIR/faculties-files/<name>`,
     /// and fire `open` on it. Logs errors to stderr rather than surfacing
     /// them through the UI (this is a best-effort side channel).
     fn open_file(&self, files_ws: Option<&mut Workspace<Pile>>, hex: &str) {
@@ -1200,7 +1203,7 @@ impl WikiGraph {
 pub(crate) enum LinkClick {
     /// `wiki:<hex>` link — `Id` is either a fragment or a version id.
     Wiki(Id),
-    /// `files:<hex>` link — `String` is the 32/64-char hex payload.
+    /// `files:<selector>` link — `String` is the hex selector payload.
     File(String),
 }
 
@@ -1290,7 +1293,7 @@ impl WikiViewer {
 
     /// Render the viewer into a GORBIE card context. `wiki_ws` must point
     /// at the wiki branch; `files_ws` is optional — when provided, the
-    /// viewer will resolve `files:<hex>` links and open the resulting
+    /// viewer will resolve `files:<selector>` links and open the resulting
     /// blobs via the platform `open` command.
     pub fn render(
         &mut self,

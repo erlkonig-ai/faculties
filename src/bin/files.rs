@@ -68,20 +68,20 @@ enum Command {
     },
     /// Show metadata for a file, directory, or import
     Show {
-        /// Entity id (32 hex chars) or content hash (64 hex chars)
+        /// Entity id/content hash or an unambiguous prefix (optional files: prefix)
         id: String,
     },
     /// Extract a file, directory, or import.
     /// Use @- to write to stdout, or omit for the stored filename.
     Get {
-        /// Entity id (32 hex chars) or content hash (64 hex chars) (file, directory, or import)
+        /// Entity id/content hash or an unambiguous prefix (file, directory, or import)
         id: String,
         /// Output path. Omit to use the stored filename. Use @- for stdout.
         output: Option<String>,
     },
     /// Add a tag to a file
     Tag {
-        /// Entity id (32 hex chars) or content hash (64 hex chars)
+        /// Entity id/content hash or an unambiguous prefix
         id: String,
         /// Tag to add
         name: String,
@@ -113,7 +113,7 @@ enum Command {
     /// makes it a hybrid query: similar AND carrying the tag — the join that
     /// tells "a form of me" from the project mascots.
     Similar {
-        /// Entity id or content hash of a query file (omit when using --text)
+        /// Entity id/content hash or an unambiguous prefix (omit with --text)
         id: Option<String>,
         /// Text query for cross-modal search (omit when querying by file)
         #[arg(long)]
@@ -165,23 +165,23 @@ enum Command {
     Imports,
     /// Show the tree structure of an import or directory
     Tree {
-        /// Import or directory id prefix
+        /// Import/directory entity id or an unambiguous prefix
         id: String,
         /// Maximum depth to display (0 = root only, 1 = immediate children, etc.)
         #[arg(long, short)]
         depth: Option<usize>,
     },
-    /// Resolve hash/id prefixes. Single prefix or @path/@- for batch (one per line).
-    /// Batch mode outputs `old\tnew` mapping; ambiguous prefixes go to stderr.
+    /// Expand hash/id selectors to canonical reference tokens. Use @path/@- for batch input.
+    /// Batch mode outputs `old\tfiles:<full-token>`; failures go to stderr.
     Resolve {
-        /// Hash prefix, or @path/@- for batch input (one prefix per line)
+        /// Selector, or @path/@- for batch input (one selector per line)
         input: String,
     },
     /// Compare two imports, directories, or files
     Diff {
-        /// Left (older) id prefix
+        /// Left (older) entity/hash selector
         left: String,
-        /// Right (newer) id prefix
+        /// Right (newer) entity/hash selector
         right: String,
     },
 }
@@ -212,9 +212,7 @@ fn fmt_id(id: Id) -> String {
 }
 
 fn handle_hex(h: FileHandle) -> String {
-    let hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
-        inlineencodings::Handle::to_hash(h);
-    inlineencodings::Hash::<inlineencodings::Blake3>::to_hex(&hash)
+    file_capability::content_hash_hex(h)
 }
 
 fn human_size(bytes: u64) -> String {
@@ -334,36 +332,6 @@ fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
         pattern!(space, [{ eid @ file::tag: ?t }])
     )
     .collect()
-}
-
-/// Resolve a hex prefix to any entity (file, directory, or import).
-/// For files, also matches the content Blake3 hash.
-/// Parse a full entity ID (32 hex chars) or content hash (64 hex chars).
-/// - 32 hex chars: treated as an entity ID (direct lookup)
-/// - 64 hex chars: treated as a Blake3 content hash (find the file entity with that hash)
-fn resolve_entity(space: &TribleSet, input: &str) -> Result<Id> {
-    let trimmed = input.trim();
-    match trimmed.len() {
-        32 => {
-            // Entity ID — direct parse
-            Id::from_hex(trimmed)
-                .ok_or_else(|| anyhow::anyhow!("invalid 32-char hex id '{trimmed}'"))
-        }
-        64 => {
-            // Content hash — find the file entity with this hash
-            let hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
-                inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(trimmed)
-                    .map_err(|_| anyhow::anyhow!("invalid 64-char hex hash '{trimmed}'"))?;
-            let handle: FileHandle = inlineencodings::Handle::from_hash(hash);
-            find!(
-                eid: Id,
-                pattern!(space, [{ ?eid @ file::content: &handle }])
-            )
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no file with content hash '{trimmed}'"))
-        }
-        n => bail!("expected 32-char hex id or 64-char hex hash, got {n} chars: '{trimmed}'"),
-    }
 }
 
 // ── repo helpers ─────────────────────────────────────────────────────────
@@ -917,48 +885,6 @@ fn cmd_list(
     Ok(())
 }
 
-fn resolve_one_prefix(space: &TribleSet, needle: &str) -> Result<String, String> {
-    let mut matches = Vec::new();
-    for (eid, h) in find!(
-        (eid: Id, h: FileHandle),
-        pattern!(space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
-    ) {
-        let hash_hex = handle_hex(h).to_lowercase();
-        if hash_hex.starts_with(needle) {
-            matches.push(hash_hex);
-        }
-        let eid_hex = format!("{eid:x}");
-        if eid_hex.starts_with(needle) && !matches.iter().any(|m| m == &eid_hex) {
-            matches.push(eid_hex);
-        }
-    }
-    for eid in find!(
-        eid: Id,
-        pattern!(space, [{ ?eid @ metadata::tag: &KIND_DIRECTORY }])
-    ) {
-        let hex = format!("{eid:x}");
-        if hex.starts_with(needle) && !matches.contains(&hex) {
-            matches.push(hex);
-        }
-    }
-    for eid in find!(
-        eid: Id,
-        pattern!(space, [{ ?eid @ metadata::tag: &KIND_IMPORT }])
-    ) {
-        let hex = format!("{eid:x}");
-        if hex.starts_with(needle) && !matches.contains(&hex) {
-            matches.push(hex);
-        }
-    }
-    matches.sort();
-    matches.dedup();
-    match matches.len() {
-        0 => Err(format!("no match")),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        n => Err(format!("ambiguous ({n} matches)")),
-    }
-}
-
 fn cmd_resolve(ws: &mut Workspace<Pile>, input: &str) -> Result<()> {
     let space = ws
         .checkout(..)
@@ -974,59 +900,37 @@ fn cmd_resolve(ws: &mut Workspace<Pile>, input: &str) -> Result<()> {
             fs::read_to_string(path).with_context(|| format!("read {path}"))?
         };
         let mut resolved = 0u32;
-        let mut ambiguous = 0u32;
-        let mut already_full = 0u32;
+        let mut failed = 0u32;
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            let prefix = line.strip_prefix("files:").unwrap_or(line);
-            if prefix.len() >= 64 {
-                already_full += 1;
-                continue;
-            }
-            let needle = prefix.to_lowercase();
-            if needle.len() < 4 {
-                continue;
-            }
-            match resolve_one_prefix(&space, &needle) {
-                Ok(full) => {
-                    println!("{}\tfiles:{}", line, full);
+            match file_capability::resolve_reference(&space, line) {
+                Ok(reference) => {
+                    println!("{line}\tfiles:{}", reference.hex());
                     resolved += 1;
                 }
-                Err(e) => {
-                    eprintln!("AMBIGUOUS: {} — {}", line, e);
-                    ambiguous += 1;
+                Err(error) => {
+                    eprintln!("UNRESOLVED: {line} — {error}");
+                    failed += 1;
                 }
             }
         }
-        eprintln!(
-            "{} resolved, {} ambiguous, {} already full",
-            resolved, ambiguous, already_full
-        );
+        eprintln!("{resolved} resolved, {failed} unresolved");
         return Ok(());
     }
 
-    // Single prefix mode
-    let needle = input.trim().to_lowercase();
-    if needle.len() < 4 {
-        bail!("prefix too short (need at least 4 hex chars)");
-    }
-    match resolve_one_prefix(&space, &needle) {
-        Ok(full) => {
-            println!("{}", full);
-            Ok(())
-        }
-        Err(e) => bail!("files resolve '{}': {}", input.trim(), e),
-    }
+    let reference = file_capability::resolve_reference(&space, input)?;
+    println!("{}", reference.hex());
+    Ok(())
 }
 
 fn cmd_show(ws: &mut Workspace<Pile>, id: &str) -> Result<()> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let eid = resolve_entity(&space, id)?;
+    let eid = file_capability::resolve_selector(&space, id)?;
 
     if is_file(&space, eid) {
         let h = content_handle_of(&space, eid).unwrap();
@@ -1086,7 +990,7 @@ fn cmd_get(ws: &mut Workspace<Pile>, id: &str, output: Option<&str>) -> Result<(
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let eid = resolve_entity(&space, id)?;
+    let eid = file_capability::resolve_selector(&space, id)?;
 
     // For imports, follow to root.
     let target = if is_import(&space, eid) {
@@ -1190,7 +1094,7 @@ fn cmd_tag(
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let eid = resolve_entity(&space, id)?;
+    let eid = file_capability::resolve_selector(&space, id)?;
 
     let existing = tags_of(&space, eid);
     if existing.iter().any(|t| t == tag_name) {
@@ -1297,7 +1201,7 @@ fn cmd_tree(ws: &mut Workspace<Pile>, id: &str, max_depth: Option<usize>) -> Res
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let eid = resolve_entity(&space, id)?;
+    let eid = file_capability::resolve_selector(&space, id)?;
 
     // If it's an import, follow to root.
     let root = if is_import(&space, eid) {
@@ -1374,7 +1278,7 @@ fn cmd_diff(ws: &mut Workspace<Pile>, left_id: &str, right_id: &str) -> Result<(
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
     let resolve_root = |raw: &str| -> Result<Id> {
-        let eid = resolve_entity(&space, raw)?;
+        let eid = file_capability::resolve_selector(&space, raw)?;
         if is_import(&space, eid) {
             root_of(&space, eid).ok_or_else(|| anyhow::anyhow!("import has no root"))
         } else {
@@ -1948,7 +1852,7 @@ fn cmd_similar(
     let (query_vec, query_eid, label): (Vec<f32>, Option<Id>, String) = match (text, id) {
         (Some(t), _) => (embed_text_query(t)?, None, format!("{t:?}")),
         (None, Some(idstr)) => {
-            let eid = resolve_entity(&space, idstr)?;
+            let eid = file_capability::resolve_selector(&space, idstr)?;
             let h: EmbHandle = find!(
                 (h: EmbHandle),
                 pattern!(&space, [{ eid @ file::embedding: ?h }])
@@ -2045,7 +1949,7 @@ fn cmd_similar_mm7b(
             (mm7b_embed_query(&embedder, t)?, None, format!("{t:?}"))
         }
         (None, Some(idstr)) => {
-            let eid = resolve_entity(&space, idstr)?;
+            let eid = file_capability::resolve_selector(&space, idstr)?;
             let h: Mm7bHandle = find!(
                 (h: Mm7bHandle),
                 pattern!(&space, [{ eid @ embeddings::attr_mm7b::embedding: ?h }])
@@ -2200,5 +2104,133 @@ fn main() -> Result<()> {
         Command::Diff { left, right } => {
             with_files(pile, branch, |_repo, ws| cmd_diff(ws, &left, &right))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestPile {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestPile {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "faculties-files-selector-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("test.pile");
+            fs::File::create(&path).unwrap();
+            Self { dir, path }
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn unique_id_prefix(space: &TribleSet, entity: Id) -> String {
+        let hex = format!("{entity:x}");
+        (1..32)
+            .find_map(|len| {
+                let prefix = &hex[..len];
+                (file_capability::resolve_selector(space, prefix).ok() == Some(entity))
+                    .then(|| prefix.to_owned())
+            })
+            .expect("entity has a unique short selector")
+    }
+
+    fn unique_hash_prefix(space: &TribleSet, hash: &str, entity: Id) -> String {
+        (33..64)
+            .find_map(|len| {
+                let prefix = &hash[..len];
+                (file_capability::resolve_selector(space, prefix).ok() == Some(entity)
+                    && file_capability::resolve_reference(space, prefix).ok()
+                        == Some(file_capability::FileReference::Content(
+                            content_handle_of(space, entity).unwrap(),
+                        )))
+                .then(|| prefix.to_owned())
+            })
+            .expect("content has a unique short selector")
+    }
+
+    #[test]
+    fn every_entity_taking_command_accepts_the_shared_selector_language() {
+        let test_pile = TestPile::new();
+        let mut repo = open_repo(&test_pile.path).unwrap();
+        let branch = repo.ensure_branch(FILES_BRANCH_NAME, None).unwrap();
+        let mut ws = repo.pull(branch).unwrap();
+
+        let first =
+            file_capability::stage(&mut ws, b"first file".to_vec(), "first.png", "image/png")
+                .unwrap();
+        let second =
+            file_capability::stage(&mut ws, b"second file".to_vec(), "second.png", "image/png")
+                .unwrap();
+        let first_id = first.root().unwrap();
+        let second_id = second.root().unwrap();
+        let first_content = find!(
+            content: FileHandle,
+            pattern!(&first, [{ first_id @ file::content: ?content }])
+        )
+        .next()
+        .unwrap();
+        let first_hash = handle_hex(first_content);
+
+        let first_embedding: EmbHandle = ws.put::<Embedding, _>(vec![1.0, 0.0]);
+        let second_embedding: EmbHandle = ws.put::<Embedding, _>(vec![0.8, 0.2]);
+        let mut first_mm7b = vec![0.0; embeddings::DIM_3584];
+        first_mm7b[0] = 1.0;
+        let mut second_mm7b = vec![0.0; embeddings::DIM_3584];
+        second_mm7b[0] = 0.8;
+        second_mm7b[1] = 0.2;
+        let first_mm7b: Mm7bHandle = ws.put::<embeddings::Embedding3584, _>(first_mm7b);
+        let second_mm7b: Mm7bHandle = ws.put::<embeddings::Embedding3584, _>(second_mm7b);
+
+        let mut change = first;
+        change += second;
+        change += entity! { ExclusiveId::force_ref(&first_id) @
+            file::embedding: first_embedding,
+            embeddings::attr_mm7b::embedding: first_mm7b,
+        };
+        change += entity! { ExclusiveId::force_ref(&second_id) @
+            file::embedding: second_embedding,
+            embeddings::attr_mm7b::embedding: second_mm7b,
+        };
+        ws.commit(change, "seed file selector command test");
+        repo.push(&mut ws).unwrap();
+
+        let space = ws.checkout(..).unwrap();
+        let first_prefix = unique_id_prefix(&space, first_id);
+        let second_prefix = unique_id_prefix(&space, second_id);
+        let hash_prefix = unique_hash_prefix(&space, &first_hash, first_id);
+        drop(space);
+
+        let upper_prefixed = format!("files:{}", first_prefix.to_ascii_uppercase());
+        cmd_show(&mut ws, &upper_prefixed).unwrap();
+
+        let extracted = test_pile.dir.join("extracted.png");
+        cmd_get(&mut ws, &hash_prefix, Some(extracted.to_str().unwrap())).unwrap();
+        assert_eq!(fs::read(&extracted).unwrap(), b"first file");
+
+        cmd_tag(&mut repo, &mut ws, &first_prefix, "selected").unwrap();
+        cmd_tree(&mut ws, &first_prefix, None).unwrap();
+        cmd_diff(&mut ws, &first_prefix, &second_prefix).unwrap();
+        cmd_similar(&mut ws, Some(&first_prefix), None, 0.0, 10, &[], false).unwrap();
+        cmd_similar(&mut ws, Some(&first_prefix), None, 0.0, 10, &[], true).unwrap();
+        cmd_resolve(&mut ws, &hash_prefix).unwrap();
+
+        repo.close().unwrap();
     }
 }

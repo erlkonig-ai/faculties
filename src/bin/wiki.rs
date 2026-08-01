@@ -1384,11 +1384,9 @@ fn find_links(
         (h: Inline<inlineencodings::Handle<blobencodings::RawBytes>>),
         pattern!(space, [{ vid @ wiki::references_file_content: ?h }])
     ) {
-        let hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
-            inlineencodings::Handle::to_hash(handle);
         external.push((
             "files".to_string(),
-            inlineencodings::Hash::<inlineencodings::Blake3>::to_hex(&hash),
+            faculties::files::content_hash_hex(handle),
         ));
     }
     external.sort();
