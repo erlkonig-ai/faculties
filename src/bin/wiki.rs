@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::embeddings::{self, Embedding768};
+use faculties::schemas::files::FILES_BRANCH_NAME;
 use hifitime::efmt::consts::ISO8601_DATE;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -225,7 +226,7 @@ enum Command {
         #[arg(long)]
         compile: bool,
     },
-    /// Resolve a list of scheme:prefix lines to full-length IDs.
+    /// Resolve scheme:prefix lines to canonical wiki IDs or file references.
     /// Input: one `wiki:<hex>` or `files:<hex>` per line (from @path or @-).
     /// Output: `old\tnew` mapping for each resolved prefix, one per line.
     /// Ambiguous or unresolvable prefixes are reported on stderr.
@@ -719,6 +720,30 @@ fn is_fragment(space: &TribleSet, id: Id) -> bool {
 
 type Repo = Repository<Pile>;
 
+/// Load the shared file catalog when it already exists.
+///
+/// Wiki lint only needs this branch to expand short `files:` selectors. Full
+/// entity ids and content hashes are self-describing, so an absent catalog is
+/// not an error. In particular this must use `lookup_branch`, not
+/// `ensure_branch`: linting prose must never create a bookkeeping branch as a
+/// side effect.
+fn load_files_catalog(repo: &mut Repo) -> Result<Option<TribleSet>> {
+    let Some(branch_id) = repo
+        .lookup_branch(FILES_BRANCH_NAME)
+        .map_err(|e| anyhow::anyhow!("look up files branch: {e:?}"))?
+    else {
+        return Ok(None);
+    };
+    let mut workspace = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull files branch: {e:?}"))?;
+    let catalog = workspace
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout files branch: {e:?}"))?
+        .into_facts();
+    Ok(Some(catalog))
+}
+
 /// Ensure all built-in tag/kind IDs have metadata::name entries.
 fn ensure_tag_vocabulary(repo: &mut Repo, ws: &mut Workspace<Pile>) -> Result<()> {
     let space = ws
@@ -887,9 +912,70 @@ mod typst_validate {
 
 // ── lint / auto-fix ────────────────────────────────────────────────
 
+/// Resolution context for the two reference languages understood by wiki
+/// prose. Wiki ids live in the wiki branch; short file selectors live in the
+/// optional files branch.
+#[derive(Clone, Copy)]
+struct ReferenceResolver<'a> {
+    wiki: &'a TribleSet,
+    files: Option<&'a TribleSet>,
+}
+
+impl<'a> ReferenceResolver<'a> {
+    fn new(wiki: &'a TribleSet, files: Option<&'a TribleSet>) -> Self {
+        Self { wiki, files }
+    }
+
+    /// Expand the part after `wiki:` / `files:` and return its canonical
+    /// spelling. Full file entity ids and hashes resolve without a catalog;
+    /// only prefixes need the files branch.
+    fn expand(&self, scheme: &str, rest: &str) -> Result<String> {
+        match scheme {
+            "wiki" => {
+                let (type_prefix, hex) = split_typed(rest);
+                let id = try_expand_id(hex, self.wiki)?;
+                Ok(format!("{type_prefix}{id:x}"))
+            }
+            "files" => {
+                if rest.contains(':') {
+                    bail!("files references do not have typed targets");
+                }
+                let clean = rest.trim().to_ascii_lowercase();
+                let reference = match self.files {
+                    Some(files) => faculties::files::resolve_reference(files, &clean),
+                    None if clean.len() == 32 || clean.len() == 64 => {
+                        faculties::files::resolve_reference(&TribleSet::new(), &clean)
+                    }
+                    None => bail!(
+                        "cannot resolve short files selector '{clean}': the files branch is absent"
+                    ),
+                }?;
+                Ok(reference.hex())
+            }
+            _ => bail!("unknown reference scheme '{scheme}'"),
+        }
+    }
+}
+
+/// Whether linting this text can actually benefit from the files catalog.
+/// Exact entity ids (32 hex chars) and content hashes (64) are direct, so only
+/// the two prefix ranges require a branch checkout.
+fn has_short_files_selector(content: &str) -> bool {
+    content.match_indices("files:").any(|(start, _)| {
+        let hex_len = content[start + "files:".len()..]
+            .bytes()
+            .take_while(u8::is_ascii_hexdigit)
+            .count();
+        (1..32).contains(&hex_len) || (33..64).contains(&hex_len)
+    })
+}
+
 /// Apply lint transforms to content: markdown→typst syntax, expand short IDs.
-/// Returns the transformed content. The TribleSet is used for ID expansion.
-fn lint_fix(content: &str, space: &TribleSet) -> String {
+/// Returns the transformed content. Short file selectors are expanded from
+/// `files_space` when that branch exists; full 32/64-character file tokens are
+/// canonicalized without it.
+fn lint_fix(content: &str, wiki_space: &TribleSet, files_space: Option<&TribleSet>) -> String {
+    let resolver = ReferenceResolver::new(wiki_space, files_space);
     let mut out = String::with_capacity(content.len());
     let mut in_code_block = false;
     for line in content.lines() {
@@ -899,7 +985,7 @@ fn lint_fix(content: &str, space: &TribleSet) -> String {
         let fixed = if in_code_block {
             line.to_string() // Skip all transforms inside code blocks
         } else {
-            lint_line(line, space)
+            lint_line(line, &resolver)
         };
         out.push_str(&fixed);
         out.push('\n');
@@ -967,7 +1053,7 @@ fn warn_bare_refs(content: &str) {
 /// Bare `[wiki:HEX]`, `[wiki:<type>:HEX]` or `[files:HEX]` (no parenthesized URL, not
 /// inside #link) → `#link("scheme:hex")[scheme:hex]`.
 /// Must run BEFORE lint_links (which handles the markdown `[text](scheme:hex)` form).
-fn lint_bare_brackets(line: &str, space: &TribleSet) -> String {
+fn lint_bare_brackets(line: &str, resolver: &ReferenceResolver<'_>) -> String {
     use regex::Regex;
     // Match [wiki:HEX], [wiki:type:HEX], or [files:HEX] NOT followed by ( and NOT preceded by ") (inside a #link)
     let re_bare =
@@ -987,15 +1073,16 @@ fn lint_bare_brackets(line: &str, space: &TribleSet) -> String {
         let scheme = &caps[1];
         let rest = &caps[2];
         let after = &caps[3];
-        // Split optional type prefix: "reviews:HEX" vs "HEX"
-        let (type_prefix, hex) = split_typed(rest);
-        let full_hex = match try_expand_id(hex, space) {
-            Ok(id) => format!("{:x}", id),
-            Err(_) => hex.to_lowercase(),
-        };
+        // Ambiguous or missing prefixes deliberately stay truncated so
+        // `wiki check` continues to report them instead of minting a false
+        // edge. Successful resolutions always use their canonical lowercase
+        // spelling.
+        let full_rest = resolver
+            .expand(scheme, rest)
+            .unwrap_or_else(|_| rest.to_ascii_lowercase());
         result.push_str(&line[last_end..m.start()]);
         result.push_str(&format!(
-            "#link(\"{scheme}:{type_prefix}{full_hex}\")[{scheme}:{type_prefix}{hex}]{after}"
+            "#link(\"{scheme}:{full_rest}\")[{scheme}:{rest}]{after}"
         ));
         last_end = m.end();
     }
@@ -1033,11 +1120,11 @@ fn lint_web_links(line: &str) -> String {
     .to_string()
 }
 
-fn lint_line(line: &str, space: &TribleSet) -> String {
+fn lint_line(line: &str, resolver: &ReferenceResolver<'_>) -> String {
     let mut s = lint_headings(line);
     s = lint_bold(&s);
-    s = lint_bare_brackets(&s, space);
-    s = lint_links(&s, space);
+    s = lint_bare_brackets(&s, resolver);
+    s = lint_links(&s, resolver);
     s = lint_web_links(&s);
     // NB: bare `scheme:HEX` in prose is deliberately NOT auto-linked — a graph
     // edge must come from an explicit `[label](scheme:hex)`. `bare_ref_warnings`
@@ -1120,8 +1207,9 @@ fn lint_bold(line: &str) -> String {
 }
 
 /// `[text](wiki:ID)` → `#link("wiki:ID")[text]`; also handles `wiki:<type>:ID`
-/// and `files:ID`. Expands short ID prefixes to full 32-char hex.
-fn lint_links(line: &str, space: &TribleSet) -> String {
+/// and `files:ID`. Expands short selectors to a full 32-char entity id or
+/// 64-char content hash as appropriate.
+fn lint_links(line: &str, resolver: &ReferenceResolver<'_>) -> String {
     use regex::Regex;
     let re = Regex::new(r"\[([^\]]+)\]\((wiki|files):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]+)\)")
         .unwrap();
@@ -1129,12 +1217,10 @@ fn lint_links(line: &str, space: &TribleSet) -> String {
         let text = &caps[1];
         let scheme = &caps[2];
         let rest = &caps[3];
-        let (type_prefix, hex) = split_typed(rest);
-        let full_hex = match try_expand_id(hex, space) {
-            Ok(id) => format!("{:x}", id),
-            Err(_) => hex.to_lowercase(),
-        };
-        format!("#link(\"{scheme}:{type_prefix}{full_hex}\")[{text}]")
+        let full_rest = resolver
+            .expand(scheme, rest)
+            .unwrap_or_else(|_| rest.to_ascii_lowercase());
+        format!("#link(\"{scheme}:{full_rest}\")[{text}]")
     })
     .to_string()
 }
@@ -1151,7 +1237,7 @@ fn lint_horizontal_rule(line: &str) -> String {
 
 /// Try to expand a hex prefix to a full ID using the space.
 /// Prefers fragment IDs over version IDs for wiki: links.
-/// Returns Ok(Id) if unique, Err if ambiguous/missing/already full.
+/// Full ids are parsed directly; prefixes error when ambiguous or missing.
 fn try_expand_id(hex: &str, space: &TribleSet) -> Result<Id> {
     let clean = hex.trim().to_lowercase();
     if clean.len() == 32 {
@@ -1416,16 +1502,73 @@ fn resolve_to_show(space: &TribleSet, id: Id, follow_latest: bool) -> Result<Id>
 
 // ── commands ───────────────────────────────────────────────────────────────
 
+#[derive(Debug, Eq, PartialEq)]
+enum ReferenceLineResolution {
+    AlreadyFull,
+    Expanded(String),
+}
+
+/// Resolve one `scheme:selector` line for `wiki fix-truncated`.
+///
+/// The returned token preserves a wiki link's optional relation type while
+/// canonicalizing all hexadecimal payloads to lowercase. `files:` has two
+/// full forms (32-character entity id and 64-character content hash); both
+/// are direct even without a files catalog.
+fn resolve_reference_line(
+    line: &str,
+    resolver: &ReferenceResolver<'_>,
+) -> Result<ReferenceLineResolution> {
+    let (scheme, rest) = line
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("no scheme:selector format"))?;
+
+    let (hex, is_full) = match scheme {
+        "wiki" => {
+            let (_, hex) = split_typed(rest);
+            (hex, hex.len() == 32)
+        }
+        "files" => {
+            if rest.contains(':') {
+                bail!("files references do not have typed targets");
+            }
+            (rest, rest.len() == 32 || rest.len() == 64)
+        }
+        _ => bail!("unknown scheme '{scheme}'"),
+    };
+
+    if (scheme == "wiki" && hex.len() > 32) || (scheme == "files" && rest.len() > 64) {
+        bail!("invalid {scheme} selector length {}", hex.len());
+    }
+
+    // Preserve the command's existing wiki-prefix semantics (fragments and
+    // versions in one namespace, with no lint-only minimum length). File
+    // references use the shared files resolver instead.
+    let expanded = if scheme == "wiki" {
+        let (type_prefix, hex) = split_typed(rest);
+        format!("{type_prefix}{:x}", resolve_prefix(resolver.wiki, hex)?)
+    } else {
+        resolver.expand(scheme, rest)?
+    };
+    let canonical = format!("{scheme}:{expanded}");
+    if is_full && canonical == line {
+        Ok(ReferenceLineResolution::AlreadyFull)
+    } else {
+        Ok(ReferenceLineResolution::Expanded(canonical))
+    }
+}
+
 fn cmd_fix_truncated(repo: &mut Repo, bid: Id, raw_input: String) -> Result<()> {
     let input = faculties::text_arg(&raw_input, "input")?;
+    let files_space = load_files_catalog(repo)?;
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolver = ReferenceResolver::new(&space, files_space.as_ref());
 
     let mut resolved = 0u32;
-    let mut ambiguous = 0u32;
+    let mut failed = 0u32;
     let mut already_full = 0u32;
 
     for line in input.lines() {
@@ -1433,36 +1576,30 @@ fn cmd_fix_truncated(repo: &mut Repo, bid: Id, raw_input: String) -> Result<()> 
         if line.is_empty() {
             continue;
         }
-        let Some((scheme, hex)) = line.split_once(':') else {
+        let Some((scheme, _)) = line.split_once(':') else {
             eprintln!("SKIP: {line} (no scheme:prefix format)");
             continue;
         };
-        let full_len = if scheme == "wiki" {
-            32
-        } else if scheme == "files" {
-            64
-        } else {
+        if scheme != "wiki" && scheme != "files" {
             eprintln!("SKIP: {line} (unknown scheme '{scheme}')");
             continue;
-        };
-        if hex.len() >= full_len {
-            already_full += 1;
-            continue; // already full length, nothing to do
         }
-        match resolve_prefix(&space, hex) {
-            Ok(id) => {
-                println!("{}\t{}:{}", line, scheme, id);
+
+        match resolve_reference_line(line, &resolver) {
+            Ok(ReferenceLineResolution::AlreadyFull) => already_full += 1,
+            Ok(ReferenceLineResolution::Expanded(canonical)) => {
+                println!("{line}\t{canonical}");
                 resolved += 1;
             }
             Err(e) => {
-                eprintln!("AMBIGUOUS: {} — {}", line, e);
-                ambiguous += 1;
+                eprintln!("FAILED: {line} — {e}");
+                failed += 1;
             }
         }
     }
     eprintln!(
-        "{} resolved, {} ambiguous, {} already full",
-        resolved, ambiguous, already_full
+        "{} resolved, {} failed, {} already full",
+        resolved, failed, already_full
     );
     Ok(())
 }
@@ -1650,6 +1787,8 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
 }
 
 fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<()> {
+    let files_space = load_files_catalog(repo)?;
+
     // Dry-run and check modes: single pull, no commits.
     if !do_fix {
         let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
@@ -1672,7 +1811,7 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
             let original = content.as_ref().to_string();
             checked += 1;
 
-            let fixed = lint_fix(&original, &space);
+            let fixed = lint_fix(&original, &space, files_space.as_ref());
             if fixed != original {
                 changed += 1;
                 let title = read_title(&space, &mut ws, vid).unwrap_or_default();
@@ -1741,7 +1880,7 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
             let original = content.as_ref().to_string();
             checked += 1;
 
-            let fixed = lint_fix(&original, &space);
+            let fixed = lint_fix(&original, &space, files_space.as_ref());
             if fixed == original {
                 // Text already clean: rebuild the desired link tribles and subtract
                 // what's already in the space — add only the missing ones.
@@ -1860,6 +1999,7 @@ fn cmd_export_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
 }
 
 fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
+    let files_space = load_files_catalog(repo)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws
         .checkout(..)
@@ -1942,7 +2082,7 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
             }
 
             // Lint-fix then validate typst
-            let new_content = lint_fix(&new_content, &space);
+            let new_content = lint_fix(&new_content, &space, files_space.as_ref());
             if let Err(e) = validate_typst(&new_content) {
                 eprintln!("TYPST_ERROR {}: {}", path.display(), e);
                 continue;
@@ -2009,6 +2149,11 @@ fn cmd_create(
 ) -> Result<()> {
     let title = faculties::text_arg(&title, "title")?;
     let content = faculties::text_arg(&content, "content")?;
+    let files_space = if has_short_files_selector(&content) {
+        load_files_catalog(repo)?
+    } else {
+        None
+    };
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     ensure_tag_vocabulary(repo, &mut ws)?;
@@ -2019,7 +2164,7 @@ fn cmd_create(
     let tag_ids = resolve_tags(&space, &mut ws, &tags, &mut change);
 
     // Lint-fix then validate typst compilation and link targets.
-    let content = lint_fix(&content, &space);
+    let content = lint_fix(&content, &space, files_space.as_ref());
     validate_typst(&content)?;
     validate_wiki_links(&content, &space, force)?;
     warn_bare_refs(&content);
@@ -2076,6 +2221,11 @@ fn cmd_edit(
     if content.is_none() && new_title.is_none() && tags.is_empty() {
         bail!("nothing to change — provide content, --title, or --tag");
     }
+    let files_space = if content.as_deref().is_some_and(has_short_files_selector) {
+        load_files_catalog(repo)?
+    } else {
+        None
+    };
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws
@@ -2100,7 +2250,7 @@ fn cmd_edit(
     let content_handle = match &content {
         Some(text) => {
             // Lint-fix then validate typst compilation and link targets.
-            let fixed = lint_fix(text, &space);
+            let fixed = lint_fix(text, &space, files_space.as_ref());
             validate_typst(&fixed)?;
             validate_wiki_links(&fixed, &space, force)?;
             warn_bare_refs(&fixed);
@@ -3149,6 +3299,165 @@ fn cmd_search(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faculties::files::{content_hash_hex, ContentHandle};
+    use faculties::schemas::files::{file, KIND_FILE};
+
+    fn id(hex: &str) -> Id {
+        Id::from_hex(hex).expect("test id")
+    }
+
+    fn content(hex: &str) -> ContentHandle {
+        let hash = inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(hex)
+            .expect("test content hash");
+        inlineencodings::Handle::from_hash(hash)
+    }
+
+    fn file_catalog(entries: &[(&str, ContentHandle)]) -> TribleSet {
+        let mut catalog = TribleSet::new();
+        for (entity_hex, content) in entries {
+            let entity = id(entity_hex);
+            let content = *content;
+            catalog += entity! { ExclusiveId::force_ref(&entity) @
+                metadata::tag: &KIND_FILE,
+                file::content: content,
+            };
+        }
+        catalog
+    }
+
+    #[test]
+    fn markdown_file_content_prefix_uses_the_files_catalog() {
+        let wiki = TribleSet::new();
+        let handle = content(&"ab".repeat(32));
+        let hash = content_hash_hex(handle);
+        let files = file_catalog(&[("11111111111111111111111111111111", handle)]);
+        let prefix = hash[..40].to_ascii_uppercase();
+        assert!(has_short_files_selector(&format!("files:{prefix}")));
+
+        assert_eq!(
+            lint_fix(&format!("[paper](files:{prefix})"), &wiki, Some(&files)),
+            format!("#link(\"files:{hash}\")[paper]")
+        );
+    }
+
+    #[test]
+    fn bare_file_content_prefix_collapses_duplicate_named_files() {
+        let wiki = TribleSet::new();
+        let handle = content(&"cd".repeat(32));
+        let hash = content_hash_hex(handle);
+        let files = file_catalog(&[
+            ("11111111111111111111111111111111", handle),
+            ("22222222222222222222222222222222", handle),
+        ]);
+        let prefix = hash[..40].to_ascii_uppercase();
+
+        assert_eq!(
+            lint_fix(&format!("[files:{prefix}]"), &wiki, Some(&files)),
+            format!("#link(\"files:{hash}\")[files:{prefix}]")
+        );
+        assert_eq!(
+            resolve_reference_line(
+                &format!("files:{prefix}"),
+                &ReferenceResolver::new(&wiki, Some(&files))
+            )
+            .unwrap(),
+            ReferenceLineResolution::Expanded(format!("files:{hash}"))
+        );
+    }
+
+    #[test]
+    fn full_file_tokens_are_direct_without_a_files_catalog() {
+        let wiki = TribleSet::new();
+        let resolver = ReferenceResolver::new(&wiki, None);
+        let entity = "ABCDEF0123456789ABCDEF0123456789";
+        let hash = "AB".repeat(32);
+        assert!(!has_short_files_selector(&format!(
+            "files:{entity} files:{hash}"
+        )));
+
+        assert_eq!(
+            lint_fix(
+                &format!("[entity](files:{entity}) [bytes](files:{hash})"),
+                &wiki,
+                None
+            ),
+            format!(
+                "#link(\"files:{}\")[entity] #link(\"files:{}\")[bytes]",
+                entity.to_ascii_lowercase(),
+                hash.to_ascii_lowercase()
+            )
+        );
+        assert_eq!(
+            resolve_reference_line(&format!("files:{entity}"), &resolver).unwrap(),
+            ReferenceLineResolution::Expanded(format!("files:{}", entity.to_ascii_lowercase()))
+        );
+        assert_eq!(
+            resolve_reference_line(&format!("files:{}", hash.to_ascii_lowercase()), &resolver)
+                .unwrap(),
+            ReferenceLineResolution::AlreadyFull
+        );
+    }
+
+    #[test]
+    fn fix_truncated_preserves_wiki_types_and_reports_file_ambiguity() {
+        let fragment = id("abcd0000000000000000000000000000");
+        let version = id("12340000000000000000000000000000");
+        let wiki_fragment = entity! { ExclusiveId::force_ref(&version) @
+            metadata::tag: &KIND_VERSION_ID,
+            wiki::fragment: &fragment,
+        };
+        let mut wiki = TribleSet::new();
+        wiki += wiki_fragment;
+
+        let first = content(&"11".repeat(32));
+        let second = content(&"22".repeat(32));
+        let files = file_catalog(&[
+            ("aa000000000000000000000000000000", first),
+            ("aa111111111111111111111111111111", second),
+        ]);
+        let resolver = ReferenceResolver::new(&wiki, Some(&files));
+
+        assert_eq!(
+            resolve_reference_line("wiki:reviews:ABCD", &resolver).unwrap(),
+            ReferenceLineResolution::Expanded(
+                "wiki:reviews:abcd0000000000000000000000000000".to_owned()
+            )
+        );
+
+        let error = resolve_reference_line("files:AA", &resolver)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"));
+        assert!(error.contains("files:aa000000000000000000000000000000"));
+        assert!(error.contains("files:aa111111111111111111111111111111"));
+        assert_eq!(
+            lint_fix("[ambiguous](files:AA)", &wiki, Some(&files)),
+            "#link(\"files:aa\")[ambiguous]"
+        );
+    }
+
+    #[test]
+    fn loading_an_absent_files_catalog_does_not_create_it() {
+        let path = std::env::temp_dir().join(format!("wiki-files-catalog-{}.pile", fucid()));
+        std::fs::File::create(&path).expect("create test pile");
+        let pile = Pile::open(&path).expect("open test pile");
+        let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+            .expect("repository");
+        repo.ensure_branch(WIKI_BRANCH_NAME, None)
+            .expect("wiki branch");
+
+        assert!(repo.lookup_branch(FILES_BRANCH_NAME).unwrap().is_none());
+        assert!(load_files_catalog(&mut repo).unwrap().is_none());
+        assert!(repo.lookup_branch(FILES_BRANCH_NAME).unwrap().is_none());
+
+        repo.close().expect("close test pile");
+        std::fs::remove_file(path).expect("remove test pile");
+    }
 }
 
 // ── diff engine ────────────────────────────────────────────────────────────
