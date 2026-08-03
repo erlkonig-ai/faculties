@@ -10,24 +10,6 @@ pub use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
-/// Tag for BM25 search-index entities on the archive branch. Each
-/// `archive index` run mints a fresh entity (kind + blob handle +
-/// indexed_at); readers take the latest by `indexed_at` — indexes are
-/// rebuild-and-replace, the history is just exhaust.
-pub const KIND_SEARCH_INDEX: Id = id_hex!("0378075561687300E7028D923708A7BC");
-
-pub mod search_index {
-    use super::*;
-    use triblespace_search::succinct::SuccinctBM25Blob;
-    attributes! {
-        /// Exact-TF BM25 artifact. Rotated with `SuccinctBM25Blob` on
-        /// 2026-08-03; retired score blobs remain inert and `archive index`
-        /// rebuilds under this attribute.
-        "BE3EF8A63DFD0C29993E93B8037BC2C7" as index: Handle<SuccinctBM25Blob>;
-        "DCEC5F15A91F89F95A2A5E1D3C1C34DB" as indexed_at: NsTAIInterval;
-    }
-}
-
 /// A unified archive projection for externally sourced conversations.
 ///
 /// This schema is used by archive importers (ChatGPT, Codex, Copilot, Gemini, ...)

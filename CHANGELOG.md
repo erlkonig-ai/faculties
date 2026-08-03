@@ -4,10 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-- **Archive and memory search attributes follow the exact-TF BM25 format.**
-  Both typed index attributes have fresh IDs for the breaking
-  `SuccinctBM25Blob` layout. Retired score-index facts remain inert; the normal
-  `archive index` / `memory index` refresh paths rebuild under the new schema.
+- **Memory search follows the exact-TF BM25 format.** Its typed index attribute
+  has a fresh ID for the breaking `SuccinctBM25Blob` layout, so retired
+  score-index facts remain inert and `memory index` rebuilds cleanly. The dead
+  pre-rollup archive search-index schema has been removed instead of migrated.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile
