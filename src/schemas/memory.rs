@@ -37,7 +37,10 @@ pub mod search_index {
     use super::*;
     use triblespace_search::succinct::SuccinctBM25Blob;
     attributes! {
-        "3BAF1837E1A1128042A0582CF6D71CE0" as index: Handle<SuccinctBM25Blob>;
+        /// Exact-TF BM25 artifact. Rotated with `SuccinctBM25Blob` on
+        /// 2026-08-03; retired score blobs remain inert and `memory index`
+        /// rebuilds under this attribute.
+        "E8AE08F96BB552892BD106E45AAB5007" as index: Handle<SuccinctBM25Blob>;
         "FD8C086B68F20AD04B2C70B9CE3C2BCC" as indexed_at: NsTAIInterval;
     }
 }
