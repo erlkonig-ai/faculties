@@ -51,7 +51,6 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
 use faculties::collection_access::{self, CollectionView};
 use faculties::schemas::voice::{
     route, utterance, CHANNEL_SAY, CHANNEL_SHOUT, DEFAULT_SCOPE_ID, KIND_ROUTE, KIND_UTTERANCE,
@@ -60,14 +59,11 @@ use hifitime::efmt::consts::ISO8601;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
 use rand_core::OsRng;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use triblespace::core::blob::Blob;
-use triblespace::core::collection::simplearchive_union;
-use triblespace::core::collection::{CollectionCommit, CollectionData};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{self, reachable};
 use triblespace::prelude::*;
 
 type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -544,153 +540,6 @@ impl VoiceStorage<'_> {
 
 // ── one-way legacy branch migration ──────────────────────────────────────
 
-#[derive(Debug)]
-struct LegacyCommitMigration {
-    source: CommitHandle,
-    target: CollectionCommit,
-    content: Fragment,
-    metadata: Fragment,
-}
-
-#[derive(Debug)]
-struct LegacyMigrationPlan {
-    branch_id: Id,
-    pin_metadata: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
-    head: Option<CommitHandle>,
-    commits: Vec<LegacyCommitMigration>,
-    skipped_merges: usize,
-    facts: TribleSet,
-}
-
-#[derive(Debug)]
-struct LegacyMigrationReport {
-    branch_id: Id,
-    head: Option<CommitHandle>,
-    commits: Vec<(CommitHandle, Id)>,
-    skipped_merges: usize,
-    facts: usize,
-    retention_direct: usize,
-    retention_recursive: usize,
-}
-
-fn one_commit_value<V: InlineEncoding>(
-    facts: &TribleSet,
-    subject: Id,
-    attribute: &Attribute<V>,
-    field: &str,
-) -> Result<Option<Inline<V>>> {
-    let mut values = facts
-        .iter()
-        .filter(|fact| fact.e() == &subject && fact.a() == &attribute.id())
-        .map(|fact| *fact.v::<V>());
-    let first = values.next();
-    if values.next().is_some() {
-        bail!("legacy commit has repeated {field}");
-    }
-    Ok(first)
-}
-
-fn legacy_commit_subject(facts: &TribleSet, handle: CommitHandle) -> Result<Id> {
-    let entities: BTreeSet<Id> = facts.iter().map(|fact| *fact.e()).collect();
-    if entities.len() != 1 {
-        bail!(
-            "legacy commit {} must contain exactly one metadata entity, found {}",
-            hex::encode_upper(handle.raw),
-            entities.len()
-        );
-    }
-    Ok(*entities.iter().next().expect("one entity"))
-}
-
-fn legacy_parents(
-    facts: &TribleSet,
-    subject: Id,
-) -> Vec<Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>> {
-    let mut parents: Vec<_> = find!(
-        (parent: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>),
-        pattern!(facts, [{ subject @ repo::parent: ?parent }])
-    )
-    .map(|(parent,)| parent)
-    .collect();
-    parents.sort_unstable_by_key(|parent| parent.raw);
-    parents.dedup();
-    parents
-}
-
-fn load_legacy_commit_metadata(reader: &PileReader, handle: CommitHandle) -> Result<TribleSet> {
-    reader
-        .get(handle)
-        .with_context(|| format!("read legacy commit {}", hex::encode_upper(handle.raw)))
-}
-
-fn legacy_commits_topological(
-    reader: &PileReader,
-    head: CommitHandle,
-) -> Result<Vec<CommitHandle>> {
-    let mut ordered = Vec::new();
-    let mut emitted = HashSet::new();
-    let mut active = HashSet::new();
-    let mut stack = vec![(head, false)];
-
-    while let Some((commit, expanded)) = stack.pop() {
-        if emitted.contains(&commit) {
-            continue;
-        }
-        if expanded {
-            active.remove(&commit);
-            emitted.insert(commit);
-            ordered.push(commit);
-            continue;
-        }
-        if !active.insert(commit) {
-            bail!(
-                "cycle in legacy commit ancestry at {}",
-                hex::encode_upper(commit.raw)
-            );
-        }
-
-        let facts = load_legacy_commit_metadata(reader, commit)?;
-        let subject = legacy_commit_subject(&facts, commit)?;
-        let parents = legacy_parents(&facts, subject);
-        stack.push((commit, true));
-        for parent in parents.into_iter().rev() {
-            if active.contains(&parent) {
-                bail!(
-                    "cycle in legacy commit ancestry at {}",
-                    hex::encode_upper(parent.raw)
-                );
-            }
-            if !emitted.contains(&parent) {
-                stack.push((parent, false));
-            }
-        }
-    }
-    Ok(ordered)
-}
-
-/// Hydrate the transitive part of a closure which is already resident.
-///
-/// `reachable` can follow references present in resident typed blobs, but an
-/// untyped fact set cannot prove that a directly named child is absent. Voice's
-/// known direct payload attributes are therefore read strictly in
-/// `preflight_legacy_voice_payloads` before this helper is used.
-fn hydrate_resident_closure(
-    reader: &PileReader,
-    roots: impl IntoIterator<Item = Inline<inlineencodings::Handle<blobencodings::UnknownBlob>>>,
-) -> Result<MemoryBlobStore> {
-    let mut blobs = MemoryBlobStore::new();
-    for handle in reachable(reader, roots) {
-        let blob: Blob<blobencodings::UnknownBlob> = reader.get(handle).with_context(|| {
-            format!(
-                "load reachable legacy attachment {}",
-                hex::encode_upper(handle.raw)
-            )
-        })?;
-        blobs.insert(blob);
-    }
-    Ok(blobs)
-}
-
 fn preflight_legacy_voice_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
     for fact in facts.iter() {
         if fact.a() == &utterance::audio.id() {
@@ -717,345 +566,18 @@ fn preflight_legacy_voice_payloads(reader: &PileReader, facts: &TribleSet) -> Re
     Ok(())
 }
 
-fn legacy_content_fragment(
-    reader: &PileReader,
-    content: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
-) -> Result<(Blob<blobencodings::SimpleArchive>, Fragment)> {
-    let archive: Blob<blobencodings::SimpleArchive> = reader
-        .get(content)
-        .with_context(|| format!("read legacy content {}", hex::encode_upper(content.raw)))?;
-    let facts: TribleSet = reader
-        .get(content)
-        .with_context(|| format!("decode legacy content {}", hex::encode_upper(content.raw)))?;
-    preflight_legacy_voice_payloads(reader, &facts)?;
-    let blobs = hydrate_resident_closure(reader, [content.transmute()])?;
-    Ok((archive, Fragment::from_facts_and_blobs(facts, blobs)))
-}
-
-fn legacy_metadata_fragment(
-    reader: &PileReader,
-    facts: &TribleSet,
-    subject: Id,
-) -> Result<Fragment> {
-    let attached = one_commit_value(facts, subject, &repo::metadata, "metadata")?;
-    let message = one_commit_value(facts, subject, &repo::message, "message")?;
-    let created = one_commit_value(facts, subject, &metadata::created_at, "created_at")?;
-
-    let (mut projected_facts, mut projected_blobs) = if let Some(handle) = attached {
-        let facts: TribleSet = reader.get(handle).with_context(|| {
-            format!(
-                "read attached legacy metadata {}",
-                hex::encode_upper(handle.raw)
-            )
-        })?;
-        let blobs = hydrate_resident_closure(reader, [handle.transmute()])?;
-        (facts, blobs)
-    } else {
-        (TribleSet::new(), MemoryBlobStore::new())
-    };
-
-    if let Some(handle) = message {
-        let _: View<str> = reader.get(handle).with_context(|| {
-            format!(
-                "strictly read legacy commit message {}",
-                hex::encode_upper(handle.raw)
-            )
-        })?;
-        projected_blobs.union(hydrate_resident_closure(reader, [handle.transmute()])?);
-    }
-
-    let projection = match (created, message) {
-        (Some(created), Some(message)) => entity! {
-            metadata::created_at: created,
-            metadata::description: message,
-        },
-        (Some(created), None) => entity! { metadata::created_at: created },
-        (None, Some(message)) => entity! { metadata::description: message },
-        (None, None) => Fragment::empty(),
-    };
-    let (projection_facts, projection_blobs) = projection.into_facts_and_blobs();
-    projected_facts += projection_facts;
-    projected_blobs.union(projection_blobs);
-    Ok(Fragment::from_facts_and_blobs(
-        projected_facts,
-        projected_blobs,
-    ))
-}
-
-fn validate_contentless_legacy_merge(
-    facts: &TribleSet,
-    subject: Id,
-    source: CommitHandle,
-) -> Result<()> {
-    let parents = legacy_parents(facts, subject);
-    let contains_only_parent_edges = facts
-        .iter()
-        .all(|fact| fact.e() == &subject && fact.a() == &repo::parent.id());
-    let canonical_subject = entity! { repo::parent*: parents.clone() }.root();
-    if parents.len() < 2 || !contains_only_parent_edges || canonical_subject != Some(subject) {
-        bail!(
-            "legacy contentless commit {} is not a canonical merge",
-            hex::encode_upper(source.raw)
-        );
-    }
-    Ok(())
-}
-
-fn named_legacy_branch_snapshot(
-    pile: &mut Pile,
-    explicit: Option<Id>,
-) -> Result<(
-    Id,
-    Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
-    PileReader,
-)> {
-    let ids: Vec<Id> = if let Some(branch) = explicit {
-        vec![branch]
-    } else {
-        pile.pins()
-            .context("list legacy pins")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("read legacy pin id")?
-    };
-    let mut heads = Vec::new();
-    for id in ids {
-        if let Some(head) = pile.head(id).context("read legacy pin head")? {
-            heads.push((id, head));
-        } else if explicit == Some(id) {
-            bail!("legacy branch {id:X} does not exist");
-        }
-    }
-    let reader = pile.reader().context("snapshot legacy voice branch")?;
-    let wanted: Inline<inlineencodings::Handle<blobencodings::LongString>> =
-        LEGACY_VOICE_BRANCH_NAME.to_owned().to_blob().get_handle();
-    let mut matches = Vec::new();
-    for (branch_id, pin_metadata) in heads {
-        let branch_facts: TribleSet = reader
-            .get(pin_metadata)
-            .with_context(|| format!("read legacy branch metadata for {branch_id:X}"))?;
-        let Ok(entity) = repo::branch::branch_entity(&branch_facts, branch_id) else {
-            continue;
-        };
-        let name = one_commit_value(&branch_facts, entity, &metadata::name, "branch name")?;
-        if name == Some(wanted) {
-            matches.push((branch_id, pin_metadata));
-        }
-    }
-    match matches.len() {
-        0 if explicit.is_some() => bail!("the selected legacy pin is not the named voice branch"),
-        0 => bail!("no legacy voice branch exists"),
-        1 => Ok((matches[0].0, matches[0].1, reader)),
-        _ => bail!("multiple legacy branches are named voice; rerun with --legacy-branch-id"),
-    }
-}
-
-fn build_legacy_migration_plan(
-    pile_path: &Path,
-    signer: &SigningKey,
-    scope: Id,
-    explicit_branch: Option<Id>,
-) -> Result<LegacyMigrationPlan> {
-    let mut pile = collection_access::open_pile_strict(pile_path)?;
-    let snapshot = named_legacy_branch_snapshot(&mut pile, explicit_branch);
-    let (branch_id, pin_metadata, reader) = finish_migration_pile(pile, snapshot)?;
-
-    let branch_facts: TribleSet = reader
-        .get(pin_metadata)
-        .context("read snapshotted legacy branch metadata")?;
-    let branch_entity = repo::branch::branch_entity(&branch_facts, branch_id)
-        .map_err(|error| anyhow::anyhow!("resolve legacy branch entity: {error:?}"))?;
-    let head = one_commit_value(&branch_facts, branch_entity, &repo::head, "branch head")?;
-    if let Some(head) = head {
-        let head_blob: Blob<blobencodings::SimpleArchive> =
-            reader.get(head).context("read legacy branch head commit")?;
-        repo::branch::verify(branch_id, head_blob, branch_facts.clone())
-            .map_err(|_| anyhow::anyhow!("legacy voice branch-head signature is invalid"))?;
-    }
-
-    let definition = simplearchive_union::definition(scope);
-    let mut commits = Vec::new();
-    let mut targets = BTreeMap::new();
-    let mut skipped_merges = 0;
-    let mut union = TribleSet::new();
-
-    let sources = match head {
-        Some(head) => legacy_commits_topological(&reader, head)?,
-        None => Vec::new(),
-    };
-    for source in sources {
-        let commit_facts = load_legacy_commit_metadata(&reader, source)?;
-        let subject = legacy_commit_subject(&commit_facts, source)?;
-        let Some(content_handle) =
-            one_commit_value(&commit_facts, subject, &repo::content, "content")?
-        else {
-            validate_contentless_legacy_merge(&commit_facts, subject, source)?;
-            skipped_merges += 1;
-            continue;
-        };
-        let (content_blob, content) = legacy_content_fragment(&reader, content_handle)?;
-        repo::commit::verify(content_blob, commit_facts.clone()).map_err(|_| {
-            anyhow::anyhow!(
-                "legacy authored commit {} has an invalid content signature",
-                hex::encode_upper(source.raw)
-            )
-        })?;
-        let metadata = legacy_metadata_fragment(&reader, &commit_facts, subject)?;
-        let data_blob: Blob<blobencodings::SimpleArchive> = content.facts().clone().to_blob();
-        let metadata_blob: Blob<blobencodings::SimpleArchive> = metadata.facts().clone().to_blob();
-        let data: CollectionData = data_blob.get_handle().into();
-        let metadata_handle = metadata_blob.get_handle();
-        let target = CollectionCommit::sign(signer, definition.id(), data, metadata_handle);
-        if let Some(previous) = targets.insert(target.id(), source) {
-            bail!(
-                "legacy commits {} and {} collapse to collection commit {}; refusing to invent identity",
-                hex::encode_upper(previous.raw),
-                hex::encode_upper(source.raw),
-                target.id()
-            );
-        }
-        union += content.facts().clone();
-        commits.push(LegacyCommitMigration {
-            source,
-            target,
-            content,
-            metadata,
-        });
-    }
-
-    Ok(LegacyMigrationPlan {
-        branch_id,
-        pin_metadata,
-        head,
-        commits,
-        skipped_merges,
-        facts: union,
-    })
-}
-
-fn finish_migration_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close();
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(anyhow::anyhow!("close migration pile: {error}")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing migration pile failed too: {close_error}")))
-        }
-    }
-}
-
-fn confirm_legacy_pin(
-    pile_path: &Path,
-    branch_id: Id,
-    expected: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
-) -> Result<bool> {
-    let mut pile = collection_access::open_pile_strict(pile_path)?;
-    let current = pile.head(branch_id).context("recheck legacy voice pin")?;
-    finish_migration_pile(pile, Ok(current == Some(expected)))
-}
-
-/// Re-read the resident transitive closure of the newly published roots.
-/// Direct voice payload presence and decoding were established independently
-/// during the strict legacy preflight.
-fn verify_resident_collection_closure(
-    view: &CollectionView,
-    commits: impl IntoIterator<Item = CollectionCommit>,
-) -> Result<()> {
-    let roots = commits.into_iter().flat_map(|commit| {
-        [
-            inlineencodings::Handle::<blobencodings::UnknownBlob>::from_hash(commit.data()),
-            commit.metadata().transmute(),
-        ]
-    });
-    for handle in reachable(&view.reader, roots) {
-        let _: Blob<blobencodings::UnknownBlob> = view.reader.get(handle).with_context(|| {
-            format!(
-                "verify migrated collection attachment {}",
-                hex::encode_upper(handle.raw)
-            )
-        })?;
-    }
-    Ok(())
-}
-
 fn migrate_legacy(
     storage: VoiceStorage<'_>,
     explicit_branch: Option<Id>,
-) -> Result<LegacyMigrationReport> {
-    // The durable signer is required before the legacy pile is even opened.
-    let signer = collection_access::load_signer(storage.pile, storage.key)?;
-    let allowed = HashSet::from([signer.verifying_key()]);
-    let plan = build_legacy_migration_plan(storage.pile, &signer, storage.scope, explicit_branch)?;
-    let CollectionView {
-        facts: mut expected,
-        reader: _,
-    } = collection_access::materialize_scope(storage.pile, storage.scope, &allowed)?;
-    expected += plan.facts.clone();
-
-    // Validate every already-authorized collection before this command adds a
-    // byte. In particular, an unsupported collection kind owned by the same
-    // signer must fail here rather than after migrated COMMITs were appended.
-    collection_access::plan_authorized_union_retention(storage.pile, &allowed)
-        .context("preflight existing authorized collection retention")?;
-
-    let mut pile = collection_access::open_pile_strict(storage.pile)?;
-    let result = (|| {
-        let current = pile
-            .head(plan.branch_id)
-            .context("recheck legacy voice pin")?;
-        if current != Some(plan.pin_metadata) {
-            bail!("legacy voice pin changed after snapshot; no collection commit was published");
-        }
-
-        let definition = simplearchive_union::definition(storage.scope);
-        let mut published = Vec::with_capacity(plan.commits.len());
-        for migration in &plan.commits {
-            let commit = simplearchive_union::publish_fragment_commit(
-                &mut pile,
-                &definition,
-                migration.content.clone(),
-                migration.metadata.clone(),
-                &signer,
-            )
-            .context("publish migrated voice collection commit")?;
-            if commit != migration.target {
-                bail!("published migration commit differs from its preflight identity");
-            }
-            commit
-                .verify_strict()
-                .context("verify migrated voice collection signature")?;
-            published.push((migration.source, commit));
-        }
-        Ok(published)
-    })();
-    let published = finish_migration_pile(pile, result)?;
-
-    let view = collection_access::materialize_scope(storage.pile, storage.scope, &allowed)?;
-    if view.facts != expected {
-        bail!("migrated voice collection does not equal the prior collection union legacy facts");
-    }
-    verify_resident_collection_closure(&view, published.iter().map(|(_, commit)| commit.clone()))?;
-    let retention = collection_access::plan_authorized_union_retention(storage.pile, &allowed)?;
-    let retention_direct = retention.direct().len();
-    let retention_recursive = retention.recursive().len();
-    if !confirm_legacy_pin(storage.pile, plan.branch_id, plan.pin_metadata)? {
-        bail!(
-            "legacy voice pin advanced during migration; collection commits may already have been appended. Stop every legacy writer, then rerun to migrate the new prefix; deterministic replay will reuse matching records"
-        );
-    }
-
-    Ok(LegacyMigrationReport {
-        branch_id: plan.branch_id,
-        head: plan.head,
-        commits: published
-            .into_iter()
-            .map(|(source, target)| (source, target.id()))
-            .collect(),
-        skipped_merges: plan.skipped_merges,
-        facts: plan.facts.len() as usize,
-        retention_direct,
-        retention_recursive,
-    })
+) -> Result<collection_access::LegacyMigrationReport> {
+    collection_access::migrate_legacy_simplearchive_branch(
+        storage.pile,
+        storage.key,
+        storage.scope,
+        LEGACY_VOICE_BRANCH_NAME,
+        explicit_branch,
+        preflight_legacy_voice_payloads,
+    )
 }
 
 fn cmd_migrate_legacy(storage: VoiceStorage<'_>, explicit_branch: Option<Id>) -> Result<()> {
@@ -1773,8 +1295,10 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    use ed25519_dalek::SigningKey;
+    use std::collections::BTreeSet;
     use std::fs::File;
-    use triblespace::core::collection::discover_collection_records;
+    use triblespace::core::collection::{discover_collection_records, simplearchive_union};
     use triblespace::core::repo::Repository;
 
     fn at_unix(seconds: f64) -> Inline<inlineencodings::NsTAIInterval> {
@@ -2043,18 +1567,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_migration_is_exact_idempotent_and_preserves_pin() {
+    fn legacy_migration_preserves_domain_facts_attachments_and_pin() {
         let directory = tempfile::tempdir().unwrap();
         let fixture = legacy_fixture(&directory);
         let old_pin = pin_head(&fixture.pile, fixture.branch);
 
-        let first = migrate_legacy(fixture_storage(&fixture), None).unwrap();
-        let length = std::fs::metadata(&fixture.pile).unwrap().len();
-        let second = migrate_legacy(fixture_storage(&fixture), None).unwrap();
+        let report = migrate_legacy(fixture_storage(&fixture), None).unwrap();
 
-        assert_eq!(first.commits, second.commits);
-        assert_eq!(first.commits.len(), 2);
-        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert_eq!(report.commits.len(), 2);
         assert_eq!(pin_head(&fixture.pile, fixture.branch), old_pin);
         let view = fixture_storage(&fixture).view().unwrap();
         assert_eq!(view.facts, fixture.legacy_facts);
@@ -2171,108 +1691,6 @@ mod tests {
         assert!(collection_commits(&pile_path, &key_path, storage.scope)
             .1
             .is_empty());
-    }
-
-    #[test]
-    fn missing_legacy_commit_message_fails_before_publication() {
-        let directory = tempfile::tempdir().unwrap();
-        let fixture = legacy_fixture(&directory);
-        let signer = SigningKey::from_bytes(&[0x32; 32]);
-        let mut pile = collection_access::open_pile_strict(&fixture.pile).unwrap();
-        let old_pin = pile.head(fixture.branch).unwrap().unwrap();
-        let reader = pile.reader().unwrap();
-        let branch_facts: TribleSet = reader.get(old_pin).unwrap();
-        let branch_entity = repo::branch::branch_entity(&branch_facts, fixture.branch).unwrap();
-        let name = one_commit_value(&branch_facts, branch_entity, &metadata::name, "branch name")
-            .unwrap()
-            .unwrap();
-        let old_head = one_commit_value(&branch_facts, branch_entity, &repo::head, "branch head")
-            .unwrap()
-            .unwrap();
-        let content = entity! { metadata::tag: &KIND_UTTERANCE }
-            .into_facts()
-            .to_blob();
-        pile.put::<blobencodings::SimpleArchive, _>(content.clone())
-            .unwrap();
-        let missing_message: TextHandle = Inline::new([0x93; 32]);
-        let commit = repo::commit::commit_metadata(
-            &signer,
-            [old_head],
-            Some(missing_message),
-            Some(content),
-            None,
-        )
-        .to_blob();
-        pile.put::<blobencodings::SimpleArchive, _>(commit.clone())
-            .unwrap();
-        let branch_metadata =
-            repo::branch::branch_metadata(&signer, fixture.branch, name, Some(commit)).to_blob();
-        let bad_pin = pile
-            .put::<blobencodings::SimpleArchive, _>(branch_metadata)
-            .unwrap();
-        pile.update(fixture.branch, Some(old_pin), Some(bad_pin))
-            .unwrap();
-        pile.flush().unwrap();
-        pile.close().unwrap();
-        let length = std::fs::metadata(&fixture.pile).unwrap().len();
-
-        let error = migrate_legacy(fixture_storage(&fixture), None).unwrap_err();
-
-        assert!(format!("{error:#}").contains("strictly read legacy commit message"));
-        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
-        assert_eq!(pin_head(&fixture.pile, fixture.branch), bad_pin);
-        assert!(
-            collection_commits(&fixture.pile, &fixture.key, fixture.scope)
-                .1
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn contentless_legacy_node_requires_its_intrinsic_parent_set_subject() {
-        let first: CommitHandle = Inline::new([0x51; 32]);
-        let second: CommitHandle = Inline::new([0x52; 32]);
-        let source: CommitHandle = Inline::new([0x53; 32]);
-        let canonical = entity! { repo::parent*: [first, second] };
-        let subject = canonical.root().unwrap();
-        validate_contentless_legacy_merge(&canonical.into_facts(), subject, source).unwrap();
-
-        let forged = ExclusiveId::force(test_id(0x66));
-        let mut forged_facts = entity! { &forged @ repo::parent: first }.into_facts();
-        forged_facts += entity! { &forged @ repo::parent: second }.into_facts();
-        let error =
-            validate_contentless_legacy_merge(&forged_facts, forged.id, source).unwrap_err();
-        assert!(format!("{error:#}").contains("not a canonical merge"));
-    }
-
-    #[test]
-    fn empty_legacy_voice_branch_is_a_clean_noop() {
-        let directory = tempfile::tempdir().unwrap();
-        let pile_path = directory.path().join("empty-voice.pile");
-        let key_path = directory.path().join("collection.key");
-        File::create(&pile_path).unwrap();
-        let pile = collection_access::open_pile_strict(&pile_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x51; 32]), Fragment::empty()).unwrap();
-        let branch = *repository
-            .create_branch(LEGACY_VOICE_BRANCH_NAME, None)
-            .unwrap();
-        repository.close().unwrap();
-        collection_access::initialize_signer(&pile_path, Some(&key_path)).unwrap();
-        let old_pin = pin_head(&pile_path, branch);
-        let length = std::fs::metadata(&pile_path).unwrap().len();
-        let storage = VoiceStorage {
-            pile: &pile_path,
-            key: Some(&key_path),
-            scope: test_id(0x64),
-        };
-
-        let report = migrate_legacy(storage, None).unwrap();
-
-        assert!(report.head.is_none());
-        assert!(report.commits.is_empty());
-        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
-        assert_eq!(pin_head(&pile_path, branch), old_pin);
     }
 
     #[test]

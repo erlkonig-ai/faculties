@@ -5,14 +5,18 @@
 //! the collection definition, signed commits, reproducible merge equations,
 //! and physical cover remain the canonical TribleSpace objects.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anybytes::View;
+use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use triblespace::core::attribute::Attribute;
+use triblespace::core::blob::encodings::longstring::LongString;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::Blob;
+use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::blob::{Blob, IntoBlob, MemoryBlobStore};
 use triblespace::core::collection::simplearchive_union::{
     self, publish_fragment_commit, validate_commit, validate_merge,
 };
@@ -23,10 +27,15 @@ use triblespace::core::collection::{
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::{Inline, InlineEncoding};
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader, ReadError};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, RetentionRoots};
+use triblespace::core::repo::{
+    self, reachable, BlobStore, BlobStoreGet, BlobStoreMeta, CommitHandle, PinStore, RetentionRoots,
+};
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
+use triblespace::macros::{entity, find, pattern};
 
 /// The minimum useful read view: queryable facts plus their attachment reader.
 ///
@@ -246,6 +255,637 @@ pub fn plan_authorized_union_retention(
     finish_pile(pile, result)
 }
 
+/// Materialize one exact-name legacy repository branch without constructing a
+/// signer or mutating the pile.
+///
+/// A missing branch returns `None`; a present empty branch returns an empty
+/// [`CollectionView`]. Duplicate names are rejected. Present branch heads,
+/// authored commits, and contentless merge nodes are verified before their
+/// content facts are returned. Schema-typed attachment reads remain the
+/// caller's responsibility through the snapshot-owned `reader`.
+pub fn materialize_named_legacy_branch(
+    pile_path: &Path,
+    legacy_branch_name: &str,
+) -> Result<Option<CollectionView>> {
+    let mut pile = open_pile_strict(pile_path)?;
+    let snapshot = named_legacy_branch_snapshot(&mut pile, legacy_branch_name, None);
+    let Some((branch_id, pin_metadata, reader)) = finish_pile(pile, snapshot)? else {
+        return Ok(None);
+    };
+
+    let branch_facts: TribleSet = reader
+        .get(pin_metadata)
+        .with_context(|| format!("read snapshotted legacy {legacy_branch_name} branch metadata"))?;
+    let branch_entity = repo::branch::branch_entity(&branch_facts, branch_id)
+        .map_err(|error| anyhow!("resolve legacy branch entity: {error:?}"))?;
+    let head = one_legacy_commit_value(&branch_facts, branch_entity, &repo::head, "branch head")?;
+    if let Some(head) = head {
+        let head_blob: Blob<SimpleArchive> = reader
+            .get(head)
+            .with_context(|| format!("read legacy {legacy_branch_name} branch head commit"))?;
+        repo::branch::verify(branch_id, head_blob, branch_facts)
+            .map_err(|_| anyhow!("legacy {legacy_branch_name} branch-head signature is invalid"))?;
+    }
+
+    let mut facts = TribleSet::new();
+    let sources = match head {
+        Some(head) => legacy_commits_topological(&reader, head)?,
+        None => Vec::new(),
+    };
+    for source in sources {
+        let commit_facts = load_legacy_commit_metadata(&reader, source)?;
+        let subject = legacy_commit_subject(&commit_facts, source)?;
+        let Some(content_handle) =
+            one_legacy_commit_value(&commit_facts, subject, &repo::content, "content")?
+        else {
+            validate_contentless_legacy_merge(&commit_facts, subject, source)?;
+            continue;
+        };
+        let content_blob: Blob<SimpleArchive> = reader.get(content_handle).with_context(|| {
+            format!(
+                "read legacy {legacy_branch_name} content {}",
+                hex::encode_upper(content_handle.raw)
+            )
+        })?;
+        repo::commit::verify(content_blob, commit_facts).map_err(|_| {
+            anyhow!(
+                "legacy authored commit {} has an invalid content signature",
+                hex::encode_upper(source.raw)
+            )
+        })?;
+        let content_facts: TribleSet = reader.get(content_handle).with_context(|| {
+            format!(
+                "decode legacy {legacy_branch_name} content {}",
+                hex::encode_upper(content_handle.raw)
+            )
+        })?;
+        facts += content_facts;
+    }
+
+    Ok(Some(CollectionView { facts, reader }))
+}
+
+/// Outcome of publishing one named legacy repository branch into a union scope.
+///
+/// `commits` is in deterministic topological order and maps each authored
+/// legacy commit to the id of its independently signed collection COMMIT.
+/// Contentless canonical merge nodes are counted but deliberately omitted.
+#[derive(Debug)]
+pub struct LegacyMigrationReport {
+    pub branch_id: Id,
+    pub head: Option<CommitHandle>,
+    pub commits: Vec<(CommitHandle, Id)>,
+    pub skipped_merges: usize,
+    pub facts: usize,
+    pub retention_direct: usize,
+    pub retention_recursive: usize,
+}
+
+/// Publish one named legacy `Repository` branch into a `SimpleArchive`-union
+/// collection and verify the exact resulting materialization.
+///
+/// The durable target signer is loaded before the pile is touched. The entire
+/// legacy DAG, every authored signature, every commit message, and all
+/// caller-known direct payloads are preflighted before the first collection
+/// append. `validate_payloads` is called for both authored content facts and
+/// attached semantic-metadata facts because conservative resident-closure
+/// traversal cannot prove that a directly named nonresident child is absent.
+///
+/// `explicit_legacy_branch` only disambiguates the input pin. It never selects
+/// an output branch; publication always targets `target_scope`.
+///
+/// Empty named branches are valid zero-COMMIT migrations. Callers must keep
+/// both the legacy branch and collection-native writers for `target_scope`
+/// quiescent during the operation. The legacy pin is checked before and after
+/// publication and is never updated or removed. Strong retention is verified
+/// and reported but is not persisted as recurring policy.
+pub fn migrate_legacy_simplearchive_branch(
+    pile_path: &Path,
+    key_path: Option<&Path>,
+    target_scope: Id,
+    legacy_branch_name: &str,
+    explicit_legacy_branch: Option<Id>,
+    validate_payloads: impl Fn(&PileReader, &TribleSet) -> Result<()>,
+) -> Result<LegacyMigrationReport> {
+    // A missing durable signer must fail before even opening the pile.
+    let signer = load_signer(pile_path, key_path)?;
+    let allowed = HashSet::from([signer.verifying_key()]);
+    let plan = build_legacy_migration_plan(
+        pile_path,
+        &signer,
+        target_scope,
+        legacy_branch_name,
+        explicit_legacy_branch,
+        &validate_payloads,
+    )?;
+
+    let CollectionView {
+        facts: mut expected,
+        reader: _,
+    } = materialize_scope(pile_path, target_scope, &allowed)?;
+    expected += plan.facts.clone();
+
+    // Validate every collection already owned by this signer before adding a
+    // byte, not only the target scope observed above.
+    plan_authorized_union_retention(pile_path, &allowed)
+        .context("preflight existing authorized collection retention")?;
+
+    let mut pile = open_pile_strict(pile_path)?;
+    let result = (|| {
+        let current = pile.head(plan.branch_id).with_context(|| {
+            format!("recheck legacy {legacy_branch_name} pin before publication")
+        })?;
+        if current != Some(plan.pin_metadata) {
+            bail!(
+                "legacy {legacy_branch_name} pin changed after snapshot; no collection commit was published"
+            );
+        }
+
+        let definition = simplearchive_union::definition(target_scope);
+        let mut published = Vec::with_capacity(plan.commits.len());
+        for migration in &plan.commits {
+            let commit = publish_fragment_commit(
+                &mut pile,
+                &definition,
+                migration.content.clone(),
+                migration.metadata.clone(),
+                &signer,
+            )
+            .with_context(|| format!("publish migrated {legacy_branch_name} collection commit"))?;
+            if commit != migration.target {
+                bail!("published migration commit differs from its preflight identity");
+            }
+            commit.verify_strict().with_context(|| {
+                format!("verify migrated {legacy_branch_name} collection signature")
+            })?;
+            published.push((migration.source, commit));
+        }
+        Ok(published)
+    })();
+    let published = finish_pile(pile, result)?;
+
+    let view = materialize_scope(pile_path, target_scope, &allowed)?;
+    if view.facts != expected {
+        bail!(
+            "migrated {legacy_branch_name} collection does not equal the prior collection union legacy facts"
+        );
+    }
+    verify_resident_collection_closure(&view, published.iter().map(|(_, commit)| commit.clone()))?;
+
+    let retention = plan_authorized_union_retention(pile_path, &allowed)?;
+    let retention_direct = retention.direct().len();
+    let retention_recursive = retention.recursive().len();
+    if !confirm_legacy_pin(
+        pile_path,
+        plan.branch_id,
+        plan.pin_metadata,
+        legacy_branch_name,
+    )? {
+        bail!(
+            "legacy {legacy_branch_name} pin advanced during migration; collection commits may already have been appended. Stop every legacy writer, then rerun to migrate the new prefix; deterministic replay will reuse matching records"
+        );
+    }
+
+    Ok(LegacyMigrationReport {
+        branch_id: plan.branch_id,
+        head: plan.head,
+        commits: published
+            .into_iter()
+            .map(|(source, target)| (source, target.id()))
+            .collect(),
+        skipped_merges: plan.skipped_merges,
+        facts: plan.facts.len() as usize,
+        retention_direct,
+        retention_recursive,
+    })
+}
+
+#[derive(Debug)]
+struct PlannedLegacyCommit {
+    source: CommitHandle,
+    target: CollectionCommit,
+    content: Fragment,
+    metadata: Fragment,
+}
+
+#[derive(Debug)]
+struct LegacyMigrationPlan {
+    branch_id: Id,
+    pin_metadata: Inline<Handle<SimpleArchive>>,
+    head: Option<CommitHandle>,
+    commits: Vec<PlannedLegacyCommit>,
+    skipped_merges: usize,
+    facts: TribleSet,
+}
+
+fn one_legacy_commit_value<V: InlineEncoding>(
+    facts: &TribleSet,
+    subject: Id,
+    attribute: &Attribute<V>,
+    field: &str,
+) -> Result<Option<Inline<V>>> {
+    let mut values = facts
+        .iter()
+        .filter(|fact| fact.e() == &subject && fact.a() == &attribute.id())
+        .map(|fact| *fact.v::<V>());
+    let first = values.next();
+    if values.next().is_some() {
+        bail!("legacy commit has repeated {field}");
+    }
+    Ok(first)
+}
+
+fn legacy_commit_subject(facts: &TribleSet, handle: CommitHandle) -> Result<Id> {
+    let entities: BTreeSet<Id> = facts.iter().map(|fact| *fact.e()).collect();
+    if entities.len() != 1 {
+        bail!(
+            "legacy commit {} must contain exactly one metadata entity, found {}",
+            hex::encode_upper(handle.raw),
+            entities.len()
+        );
+    }
+    Ok(*entities.iter().next().expect("one entity"))
+}
+
+fn legacy_parents(facts: &TribleSet, subject: Id) -> Vec<CommitHandle> {
+    let mut parents: Vec<_> = find!(
+        (parent: CommitHandle),
+        pattern!(facts, [{ subject @ repo::parent: ?parent }])
+    )
+    .map(|(parent,)| parent)
+    .collect();
+    parents.sort_unstable_by_key(|parent| parent.raw);
+    parents.dedup();
+    parents
+}
+
+fn load_legacy_commit_metadata(reader: &PileReader, handle: CommitHandle) -> Result<TribleSet> {
+    reader
+        .get(handle)
+        .with_context(|| format!("read legacy commit {}", hex::encode_upper(handle.raw)))
+}
+
+fn legacy_commits_topological(
+    reader: &PileReader,
+    head: CommitHandle,
+) -> Result<Vec<CommitHandle>> {
+    let mut ordered = Vec::new();
+    let mut emitted = HashSet::new();
+    let mut active = HashSet::new();
+    let mut stack = vec![(head, false)];
+
+    while let Some((commit, expanded)) = stack.pop() {
+        if emitted.contains(&commit) {
+            continue;
+        }
+        if expanded {
+            active.remove(&commit);
+            emitted.insert(commit);
+            ordered.push(commit);
+            continue;
+        }
+        if !active.insert(commit) {
+            bail!(
+                "cycle in legacy commit ancestry at {}",
+                hex::encode_upper(commit.raw)
+            );
+        }
+
+        let facts = load_legacy_commit_metadata(reader, commit)?;
+        let subject = legacy_commit_subject(&facts, commit)?;
+        let parents = legacy_parents(&facts, subject);
+        stack.push((commit, true));
+        for parent in parents.into_iter().rev() {
+            if active.contains(&parent) {
+                bail!(
+                    "cycle in legacy commit ancestry at {}",
+                    hex::encode_upper(parent.raw)
+                );
+            }
+            if !emitted.contains(&parent) {
+                stack.push((parent, false));
+            }
+        }
+    }
+    Ok(ordered)
+}
+
+/// Hydrate only the transitive closure which is already resident.
+///
+/// Direct schema-known handles are checked by the mandatory caller validator;
+/// without their types this conservative traversal cannot prove absence.
+fn hydrate_resident_closure(
+    reader: &PileReader,
+    roots: impl IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
+) -> Result<MemoryBlobStore> {
+    let mut blobs = MemoryBlobStore::new();
+    for handle in reachable(reader, roots) {
+        let blob: Blob<UnknownBlob> = reader.get(handle).with_context(|| {
+            format!(
+                "load reachable legacy attachment {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+        blobs.insert(blob);
+    }
+    Ok(blobs)
+}
+
+fn legacy_content_fragment<V>(
+    reader: &PileReader,
+    content: Inline<Handle<SimpleArchive>>,
+    source: CommitHandle,
+    legacy_branch_name: &str,
+    validate_payloads: &V,
+) -> Result<(Blob<SimpleArchive>, Fragment)>
+where
+    V: Fn(&PileReader, &TribleSet) -> Result<()> + ?Sized,
+{
+    let archive: Blob<SimpleArchive> = reader
+        .get(content)
+        .with_context(|| format!("read legacy content {}", hex::encode_upper(content.raw)))?;
+    let facts: TribleSet = reader
+        .get(content)
+        .with_context(|| format!("decode legacy content {}", hex::encode_upper(content.raw)))?;
+    validate_payloads(reader, &facts).with_context(|| {
+        format!(
+            "validate legacy {legacy_branch_name} content payloads in commit {}",
+            hex::encode_upper(source.raw)
+        )
+    })?;
+    let blobs = hydrate_resident_closure(reader, [content.transmute()])?;
+    Ok((archive, Fragment::from_facts_and_blobs(facts, blobs)))
+}
+
+fn legacy_metadata_fragment<V>(
+    reader: &PileReader,
+    facts: &TribleSet,
+    subject: Id,
+    source: CommitHandle,
+    legacy_branch_name: &str,
+    validate_payloads: &V,
+) -> Result<Fragment>
+where
+    V: Fn(&PileReader, &TribleSet) -> Result<()> + ?Sized,
+{
+    let attached = one_legacy_commit_value(facts, subject, &repo::metadata, "metadata")?;
+    let message = one_legacy_commit_value(facts, subject, &repo::message, "message")?;
+    let created = one_legacy_commit_value(facts, subject, &metadata::created_at, "created_at")?;
+
+    let (mut projected_facts, mut projected_blobs) = if let Some(handle) = attached {
+        let attached_facts: TribleSet = reader.get(handle).with_context(|| {
+            format!(
+                "read attached legacy metadata {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+        validate_payloads(reader, &attached_facts).with_context(|| {
+            format!(
+                "validate attached legacy {legacy_branch_name} semantic-metadata payloads in commit {}",
+                hex::encode_upper(source.raw)
+            )
+        })?;
+        let blobs = hydrate_resident_closure(reader, [handle.transmute()])?;
+        (attached_facts, blobs)
+    } else {
+        (TribleSet::new(), MemoryBlobStore::new())
+    };
+
+    if let Some(handle) = message {
+        let _: View<str> = reader.get(handle).with_context(|| {
+            format!(
+                "strictly read legacy commit message {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+        projected_blobs.union(hydrate_resident_closure(reader, [handle.transmute()])?);
+    }
+
+    let projection = match (created, message) {
+        (Some(created), Some(message)) => entity! {
+            metadata::created_at: created,
+            metadata::description: message,
+        },
+        (Some(created), None) => entity! { metadata::created_at: created },
+        (None, Some(message)) => entity! { metadata::description: message },
+        (None, None) => Fragment::empty(),
+    };
+    let (projection_facts, projection_blobs) = projection.into_facts_and_blobs();
+    projected_facts += projection_facts;
+    projected_blobs.union(projection_blobs);
+    Ok(Fragment::from_facts_and_blobs(
+        projected_facts,
+        projected_blobs,
+    ))
+}
+
+fn validate_contentless_legacy_merge(
+    facts: &TribleSet,
+    subject: Id,
+    source: CommitHandle,
+) -> Result<()> {
+    let parents = legacy_parents(facts, subject);
+    let contains_only_parent_edges = facts
+        .iter()
+        .all(|fact| fact.e() == &subject && fact.a() == &repo::parent.id());
+    let canonical_subject = entity! { repo::parent*: parents.clone() }.root();
+    if parents.len() < 2 || !contains_only_parent_edges || canonical_subject != Some(subject) {
+        bail!(
+            "legacy contentless commit {} is not a canonical merge",
+            hex::encode_upper(source.raw)
+        );
+    }
+    Ok(())
+}
+
+fn named_legacy_branch_snapshot(
+    pile: &mut Pile,
+    legacy_branch_name: &str,
+    explicit: Option<Id>,
+) -> Result<Option<(Id, Inline<Handle<SimpleArchive>>, PileReader)>> {
+    let ids: Vec<Id> = if let Some(branch) = explicit {
+        vec![branch]
+    } else {
+        pile.pins()
+            .context("list legacy pins")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("read legacy pin id")?
+    };
+    let mut heads = Vec::new();
+    for id in ids {
+        if let Some(head) = pile.head(id).context("read legacy pin head")? {
+            heads.push((id, head));
+        } else if explicit == Some(id) {
+            bail!("legacy branch {id:X} does not exist");
+        }
+    }
+
+    let reader = pile
+        .reader()
+        .with_context(|| format!("snapshot legacy {legacy_branch_name} branch"))?;
+    let wanted: Inline<Handle<LongString>> = legacy_branch_name.to_owned().to_blob().get_handle();
+    let mut matches = Vec::new();
+    for (branch_id, pin_metadata) in heads {
+        let branch_facts: TribleSet = reader
+            .get(pin_metadata)
+            .with_context(|| format!("read legacy branch metadata for {branch_id:X}"))?;
+        let Ok(entity) = repo::branch::branch_entity(&branch_facts, branch_id) else {
+            continue;
+        };
+        let name = one_legacy_commit_value(&branch_facts, entity, &metadata::name, "branch name")?;
+        if name == Some(wanted) {
+            matches.push((branch_id, pin_metadata));
+        }
+    }
+    match matches.len() {
+        0 if explicit.is_some() => {
+            bail!("the selected legacy pin is not the named {legacy_branch_name} branch")
+        }
+        0 => Ok(None),
+        1 => Ok(Some((matches[0].0, matches[0].1, reader))),
+        _ => bail!(
+            "multiple legacy branches are named {legacy_branch_name}; rerun with --legacy-branch-id"
+        ),
+    }
+}
+
+fn build_legacy_migration_plan<V>(
+    pile_path: &Path,
+    signer: &SigningKey,
+    target_scope: Id,
+    legacy_branch_name: &str,
+    explicit_branch: Option<Id>,
+    validate_payloads: &V,
+) -> Result<LegacyMigrationPlan>
+where
+    V: Fn(&PileReader, &TribleSet) -> Result<()> + ?Sized,
+{
+    let mut pile = open_pile_strict(pile_path)?;
+    let snapshot = named_legacy_branch_snapshot(&mut pile, legacy_branch_name, explicit_branch);
+    let Some((branch_id, pin_metadata, reader)) = finish_pile(pile, snapshot)? else {
+        bail!("no legacy {legacy_branch_name} branch exists");
+    };
+
+    let branch_facts: TribleSet = reader
+        .get(pin_metadata)
+        .context("read snapshotted legacy branch metadata")?;
+    let branch_entity = repo::branch::branch_entity(&branch_facts, branch_id)
+        .map_err(|error| anyhow!("resolve legacy branch entity: {error:?}"))?;
+    let head = one_legacy_commit_value(&branch_facts, branch_entity, &repo::head, "branch head")?;
+    if let Some(head) = head {
+        let head_blob: Blob<SimpleArchive> =
+            reader.get(head).context("read legacy branch head commit")?;
+        repo::branch::verify(branch_id, head_blob, branch_facts.clone())
+            .map_err(|_| anyhow!("legacy {legacy_branch_name} branch-head signature is invalid"))?;
+    }
+
+    let definition = simplearchive_union::definition(target_scope);
+    let mut commits = Vec::new();
+    let mut targets = BTreeMap::new();
+    let mut skipped_merges = 0;
+    let mut union = TribleSet::new();
+
+    let sources = match head {
+        Some(head) => legacy_commits_topological(&reader, head)?,
+        None => Vec::new(),
+    };
+    for source in sources {
+        let commit_facts = load_legacy_commit_metadata(&reader, source)?;
+        let subject = legacy_commit_subject(&commit_facts, source)?;
+        let Some(content_handle) =
+            one_legacy_commit_value(&commit_facts, subject, &repo::content, "content")?
+        else {
+            validate_contentless_legacy_merge(&commit_facts, subject, source)?;
+            skipped_merges += 1;
+            continue;
+        };
+        let (content_blob, content) = legacy_content_fragment(
+            &reader,
+            content_handle,
+            source,
+            legacy_branch_name,
+            validate_payloads,
+        )?;
+        repo::commit::verify(content_blob, commit_facts.clone()).map_err(|_| {
+            anyhow!(
+                "legacy authored commit {} has an invalid content signature",
+                hex::encode_upper(source.raw)
+            )
+        })?;
+        let metadata = legacy_metadata_fragment(
+            &reader,
+            &commit_facts,
+            subject,
+            source,
+            legacy_branch_name,
+            validate_payloads,
+        )?;
+        let data_blob: Blob<SimpleArchive> = content.facts().clone().to_blob();
+        let metadata_blob: Blob<SimpleArchive> = metadata.facts().clone().to_blob();
+        let data: CollectionData = data_blob.get_handle().into();
+        let metadata_handle = metadata_blob.get_handle();
+        let target = CollectionCommit::sign(signer, definition.id(), data, metadata_handle);
+        if let Some(previous) = targets.insert(target.id(), source) {
+            bail!(
+                "legacy commits {} and {} collapse to collection commit {}; refusing to invent identity",
+                hex::encode_upper(previous.raw),
+                hex::encode_upper(source.raw),
+                target.id()
+            );
+        }
+        union += content.facts().clone();
+        commits.push(PlannedLegacyCommit {
+            source,
+            target,
+            content,
+            metadata,
+        });
+    }
+
+    Ok(LegacyMigrationPlan {
+        branch_id,
+        pin_metadata,
+        head,
+        commits,
+        skipped_merges,
+        facts: union,
+    })
+}
+
+fn confirm_legacy_pin(
+    pile_path: &Path,
+    branch_id: Id,
+    expected: Inline<Handle<SimpleArchive>>,
+    legacy_branch_name: &str,
+) -> Result<bool> {
+    let mut pile = open_pile_strict(pile_path)?;
+    let current = pile
+        .head(branch_id)
+        .with_context(|| format!("recheck legacy {legacy_branch_name} pin"))?;
+    finish_pile(pile, Ok(current == Some(expected)))
+}
+
+fn verify_resident_collection_closure(
+    view: &CollectionView,
+    commits: impl IntoIterator<Item = CollectionCommit>,
+) -> Result<()> {
+    let roots = commits.into_iter().flat_map(|commit| {
+        [
+            Handle::<UnknownBlob>::from_hash(commit.data()),
+            commit.metadata().transmute(),
+        ]
+    });
+    for handle in reachable(&view.reader, roots) {
+        let _: Blob<UnknownBlob> = view.reader.get(handle).with_context(|| {
+            format!(
+                "verify migrated collection attachment {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+    }
+    Ok(())
+}
+
 struct ResolvedScope {
     definition: CollectionDefinition,
     resolution: CollectionResolution<String>,
@@ -445,6 +1085,688 @@ mod tests {
 
     fn allowed(key: &SigningKey) -> HashSet<VerifyingKey> {
         HashSet::from([key.verifying_key()])
+    }
+
+    fn description_fragment(kind: Id, text: &str) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let description: Inline<Handle<LongString>> = fragment.put(text.to_owned());
+        fragment += entity! {
+            metadata::tag: &kind,
+            metadata::description: description,
+        };
+        fragment
+    }
+
+    fn validate_description_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+        for fact in facts
+            .iter()
+            .filter(|fact| fact.a() == &metadata::description.id())
+        {
+            let handle = *fact.v::<Handle<LongString>>();
+            let _: View<str> = reader.get(handle).with_context(|| {
+                format!(
+                    "strictly read test description payload {}",
+                    hex::encode_upper(handle.raw)
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    struct LegacyFixture {
+        pile: PathBuf,
+        key: PathBuf,
+        scope: Id,
+        branch: Id,
+        facts: TribleSet,
+    }
+
+    fn legacy_fixture(directory: &tempfile::TempDir) -> LegacyFixture {
+        let pile = directory.path().join("legacy.pile");
+        let key = directory.path().join("collection.key");
+        File::create(&pile).unwrap();
+
+        let first_signer = SigningKey::from_bytes(&[0x31; 32]);
+        let storage = open_pile_strict(&pile).unwrap();
+        let mut repository = Repository::new(storage, first_signer, Fragment::empty()).unwrap();
+        let branch = *repository.create_branch("legacy-test", None).unwrap();
+
+        let first = description_fragment(id(20), "first content payload");
+        let semantic = description_fragment(id(21), "attached semantic payload");
+        let mut first_workspace = repository.pull(branch).unwrap();
+        first_workspace.commit_with_metadata(first.clone(), semantic, "first legacy message");
+        repository.push(&mut first_workspace).unwrap();
+
+        // A real fork gives the migration one canonical contentless merge to
+        // validate and omit while retaining both authored leaves.
+        let mut left = repository.pull(branch).unwrap();
+        let mut right = repository.pull(branch).unwrap();
+        let left_content = description_fragment(id(22), "left content payload");
+        let right_content = description_fragment(id(23), "right content payload");
+        left.commit(left_content.clone(), "left legacy message");
+        right.commit(right_content.clone(), "right legacy message");
+        repository.push(&mut left).unwrap();
+        repository.push(&mut right).unwrap();
+        repository.close().unwrap();
+
+        // Legacy faculties used ephemeral per-process identities. The final
+        // authored node therefore deliberately has a different valid signer.
+        let storage = open_pile_strict(&pile).unwrap();
+        let mut repository = Repository::new(
+            storage,
+            SigningKey::from_bytes(&[0x32; 32]),
+            Fragment::empty(),
+        )
+        .unwrap();
+        let last = description_fragment(id(24), "heterogeneous signer payload");
+        let mut last_workspace = repository.pull(branch).unwrap();
+        last_workspace.commit(last.clone(), "last legacy message");
+        repository.push(&mut last_workspace).unwrap();
+        repository.close().unwrap();
+
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let mut facts = first.into_facts();
+        facts += left_content.into_facts();
+        facts += right_content.into_facts();
+        facts += last.into_facts();
+        LegacyFixture {
+            pile,
+            key,
+            scope: id(30),
+            branch,
+            facts,
+        }
+    }
+
+    fn pin_head(pile_path: &Path, branch: Id) -> Inline<Handle<SimpleArchive>> {
+        let mut pile = open_pile_strict(pile_path).unwrap();
+        let head = pile.head(branch).unwrap().unwrap();
+        pile.close().unwrap();
+        head
+    }
+
+    fn migrated_commits(fixture: &LegacyFixture) -> (PileReader, Vec<CollectionCommit>) {
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let definition = simplearchive_union::definition(fixture.scope);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let reader = pile.reader().unwrap();
+        pile.close().unwrap();
+        let records = discover_collection_records(&reader).unwrap();
+        let commits = records
+            .commits()
+            .iter()
+            .filter(|commit| commit.collection() == definition.id())
+            .filter(|commit| commit.public_key().raw == signer.verifying_key().to_bytes())
+            .cloned()
+            .collect();
+        (reader, commits)
+    }
+
+    #[test]
+    fn legacy_migration_is_exact_metadata_preserving_and_byte_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = legacy_fixture(&directory);
+        let old_pin = pin_head(&fixture.pile, fixture.branch);
+
+        let first = migrate_legacy_simplearchive_branch(
+            &fixture.pile,
+            Some(&fixture.key),
+            fixture.scope,
+            "legacy-test",
+            None,
+            validate_description_payloads,
+        )
+        .unwrap();
+        let length = std::fs::metadata(&fixture.pile).unwrap().len();
+        let second = migrate_legacy_simplearchive_branch(
+            &fixture.pile,
+            Some(&fixture.key),
+            fixture.scope,
+            "legacy-test",
+            Some(fixture.branch),
+            validate_description_payloads,
+        )
+        .unwrap();
+
+        assert_eq!(first.branch_id, fixture.branch);
+        assert!(first.head.is_some());
+        assert_eq!(first.commits.len(), 4);
+        assert_eq!(first.skipped_merges, 1);
+        assert_eq!(first.commits, second.commits);
+        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert_eq!(pin_head(&fixture.pile, fixture.branch), old_pin);
+
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let view = materialize_scope(&fixture.pile, fixture.scope, &allowed(&signer)).unwrap();
+        assert_eq!(view.facts, fixture.facts);
+        for handle in find!(
+            (description: Inline<Handle<LongString>>),
+            pattern!(&view.facts, [{ metadata::description: ?description }])
+        )
+        .map(|(handle,)| handle)
+        {
+            let _: View<str> = view.reader.get(handle).unwrap();
+        }
+
+        let (reader, commits) = migrated_commits(&fixture);
+        assert_eq!(commits.len(), 4);
+        let mut projected = TribleSet::new();
+        for commit in commits {
+            commit.verify_strict().unwrap();
+            assert_eq!(commit.public_key().raw, signer.verifying_key().to_bytes());
+            let facts: TribleSet = reader.get(commit.metadata()).unwrap();
+            projected += facts;
+        }
+        let descriptions: BTreeSet<String> = find!(
+            (description: Inline<Handle<LongString>>),
+            pattern!(&projected, [{ metadata::description: ?description }])
+        )
+        .map(|(handle,)| reader.get::<View<str>, _>(handle).unwrap().to_string())
+        .collect();
+        for expected in [
+            "first legacy message",
+            "left legacy message",
+            "right legacy message",
+            "last legacy message",
+            "attached semantic payload",
+        ] {
+            assert!(descriptions.contains(expected));
+        }
+        assert_eq!(
+            find!(
+                (created: Inline<_>),
+                pattern!(&projected, [{ metadata::created_at: ?created }])
+            )
+            .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn empty_legacy_branch_is_a_zero_commit_noop() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("collection.key");
+        let storage = open_pile_strict(&pile).unwrap();
+        let mut repository = Repository::new(
+            storage,
+            SigningKey::from_bytes(&[0x41; 32]),
+            Fragment::empty(),
+        )
+        .unwrap();
+        let branch = *repository.create_branch("empty-test", None).unwrap();
+        repository.close().unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let old_pin = pin_head(&pile, branch);
+        let length = std::fs::metadata(&pile).unwrap().len();
+
+        let report = migrate_legacy_simplearchive_branch(
+            &pile,
+            Some(&key),
+            id(31),
+            "empty-test",
+            Some(branch),
+            validate_description_payloads,
+        )
+        .unwrap();
+
+        assert_eq!(report.branch_id, branch);
+        assert!(report.head.is_none());
+        assert!(report.commits.is_empty());
+        assert_eq!(report.facts, 0);
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
+        assert_eq!(pin_head(&pile, branch), old_pin);
+    }
+
+    #[test]
+    fn named_legacy_branch_view_is_read_only_and_keeps_attachments() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let storage = open_pile_strict(&pile).unwrap();
+        let mut repository = Repository::new(
+            storage,
+            SigningKey::from_bytes(&[0x43; 32]),
+            Fragment::empty(),
+        )
+        .unwrap();
+        let branch = *repository.create_branch("snapshot-test", None).unwrap();
+        let content = description_fragment(id(42), "snapshot attachment");
+        let expected = content.facts().clone();
+        let mut workspace = repository.pull(branch).unwrap();
+        workspace.commit(content, "snapshot commit");
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+        let length = std::fs::metadata(&pile).unwrap().len();
+
+        let view = materialize_named_legacy_branch(&pile, "snapshot-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.facts, expected);
+        let description = find!(
+            (description: Inline<Handle<LongString>>),
+            pattern!(&view.facts, [{ metadata::description: ?description }])
+        )
+        .next()
+        .unwrap()
+        .0;
+        assert_eq!(
+            &*view.reader.get::<View<str>, _>(description).unwrap(),
+            "snapshot attachment"
+        );
+        assert!(materialize_named_legacy_branch(&pile, "missing-test")
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
+    }
+
+    #[test]
+    fn explicit_legacy_branch_disambiguates_duplicate_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("collection.key");
+        let storage = open_pile_strict(&pile).unwrap();
+        let mut repository = Repository::new(
+            storage,
+            SigningKey::from_bytes(&[0x44; 32]),
+            Fragment::empty(),
+        )
+        .unwrap();
+        let first_branch = *repository.create_branch("duplicate-test", None).unwrap();
+        let second_branch = *repository.create_branch("duplicate-test", None).unwrap();
+        assert_ne!(first_branch, second_branch);
+
+        let first = description_fragment(id(43), "unselected branch");
+        let mut first_workspace = repository.pull(first_branch).unwrap();
+        first_workspace.commit(first, "first duplicate branch");
+        repository.push(&mut first_workspace).unwrap();
+
+        let second = description_fragment(id(44), "selected branch");
+        let expected = second.facts().clone();
+        let mut second_workspace = repository.pull(second_branch).unwrap();
+        second_workspace.commit(second, "second duplicate branch");
+        repository.push(&mut second_workspace).unwrap();
+        repository.close().unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let length = std::fs::metadata(&pile).unwrap().len();
+
+        let read_error = materialize_named_legacy_branch(&pile, "duplicate-test").unwrap_err();
+        assert!(format!("{read_error:#}").contains("multiple legacy branches"));
+        let migration_error = migrate_legacy_simplearchive_branch(
+            &pile,
+            Some(&key),
+            id(33),
+            "duplicate-test",
+            None,
+            validate_description_payloads,
+        )
+        .unwrap_err();
+        assert!(format!("{migration_error:#}").contains("multiple legacy branches"));
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
+
+        let report = migrate_legacy_simplearchive_branch(
+            &pile,
+            Some(&key),
+            id(33),
+            "duplicate-test",
+            Some(second_branch),
+            validate_description_payloads,
+        )
+        .unwrap();
+        assert_eq!(report.branch_id, second_branch);
+        assert_eq!(report.commits.len(), 1);
+        let signer = load_signer(&pile, Some(&key)).unwrap();
+        let view = materialize_scope(&pile, id(33), &allowed(&signer)).unwrap();
+        assert_eq!(view.facts, expected);
+    }
+
+    #[test]
+    fn attached_semantic_payload_failure_precedes_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("collection.key");
+        let storage = open_pile_strict(&pile).unwrap();
+        let mut repository = Repository::new(
+            storage,
+            SigningKey::from_bytes(&[0x42; 32]),
+            Fragment::empty(),
+        )
+        .unwrap();
+        let branch = *repository.create_branch("metadata-test", None).unwrap();
+        let content = entity! { metadata::tag: &id(40) };
+        let missing: Inline<Handle<LongString>> = Inline::new([0x91; 32]);
+        let semantic = entity! { metadata::description: missing };
+        let mut workspace = repository.pull(branch).unwrap();
+        workspace.commit_with_metadata(content, semantic, "valid message");
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let length = std::fs::metadata(&pile).unwrap().len();
+
+        let error = migrate_legacy_simplearchive_branch(
+            &pile,
+            Some(&key),
+            id(32),
+            "metadata-test",
+            None,
+            validate_description_payloads,
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("semantic-metadata payloads"));
+        assert!(message.contains("strictly read test description payload"));
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
+    }
+
+    #[test]
+    fn missing_legacy_commit_message_precedes_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = legacy_fixture(&directory);
+        let signer = SigningKey::from_bytes(&[0x32; 32]);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let old_pin = pile.head(fixture.branch).unwrap().unwrap();
+        let reader = pile.reader().unwrap();
+        let branch_facts: TribleSet = reader.get(old_pin).unwrap();
+        let branch_entity = repo::branch::branch_entity(&branch_facts, fixture.branch).unwrap();
+        let name =
+            one_legacy_commit_value(&branch_facts, branch_entity, &metadata::name, "branch name")
+                .unwrap()
+                .unwrap();
+        let old_head =
+            one_legacy_commit_value(&branch_facts, branch_entity, &repo::head, "branch head")
+                .unwrap()
+                .unwrap();
+        let content = entity! { metadata::tag: &id(41) }.into_facts().to_blob();
+        pile.put::<SimpleArchive, _>(content.clone()).unwrap();
+        let missing_message: Inline<Handle<LongString>> = Inline::new([0x92; 32]);
+        let commit = repo::commit::commit_metadata(
+            &signer,
+            [old_head],
+            Some(missing_message),
+            Some(content),
+            None,
+        )
+        .to_blob();
+        pile.put::<SimpleArchive, _>(commit.clone()).unwrap();
+        let branch_metadata =
+            repo::branch::branch_metadata(&signer, fixture.branch, name, Some(commit)).to_blob();
+        let bad_pin = pile.put::<SimpleArchive, _>(branch_metadata).unwrap();
+        pile.update(fixture.branch, Some(old_pin), Some(bad_pin))
+            .unwrap();
+        pile.flush().unwrap();
+        pile.close().unwrap();
+        let length = std::fs::metadata(&fixture.pile).unwrap().len();
+
+        let error = migrate_legacy_simplearchive_branch(
+            &fixture.pile,
+            Some(&fixture.key),
+            fixture.scope,
+            "legacy-test",
+            None,
+            validate_description_payloads,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("strictly read legacy commit message"));
+        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert!(migrated_commits(&fixture).1.is_empty());
+    }
+
+    #[test]
+    fn migration_requires_the_durable_signer_before_touching_the_pile() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = legacy_fixture(&directory);
+        let missing_key = directory.path().join("missing.key");
+        let pin = pin_head(&fixture.pile, fixture.branch);
+        let length = std::fs::metadata(&fixture.pile).unwrap().len();
+
+        let error = migrate_legacy_simplearchive_branch(
+            &fixture.pile,
+            Some(&missing_key),
+            fixture.scope,
+            "legacy-test",
+            None,
+            validate_description_payloads,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("load durable signing key"));
+        assert!(!missing_key.exists());
+        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert_eq!(pin_head(&fixture.pile, fixture.branch), pin);
+        assert!(migrated_commits(&fixture).1.is_empty());
+    }
+
+    #[test]
+    fn colliding_legacy_commit_identities_fail_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("collection.key");
+        let legacy_signer = SigningKey::from_bytes(&[0x45; 32]);
+        let storage = open_pile_strict(&pile).unwrap();
+        let mut repository =
+            Repository::new(storage, legacy_signer.clone(), Fragment::empty()).unwrap();
+        let branch = *repository.create_branch("collision-test", None).unwrap();
+        repository.close().unwrap();
+
+        let mut pile_store = open_pile_strict(&pile).unwrap();
+        let old_pin = pile_store.head(branch).unwrap().unwrap();
+        let reader = pile_store.reader().unwrap();
+        let branch_facts: TribleSet = reader.get(old_pin).unwrap();
+        let branch_entity = repo::branch::branch_entity(&branch_facts, branch).unwrap();
+        let name =
+            one_legacy_commit_value(&branch_facts, branch_entity, &metadata::name, "branch name")
+                .unwrap()
+                .unwrap();
+
+        let content: Blob<SimpleArchive> =
+            entity! { metadata::tag: &id(45) }.into_facts().to_blob();
+        pile_store.put::<SimpleArchive, _>(content.clone()).unwrap();
+        let message_blob: Blob<LongString> = "same projected metadata".to_owned().to_blob();
+        let message = pile_store.put::<LongString, _>(message_blob).unwrap();
+        let first_facts = repo::commit::commit_metadata(
+            &legacy_signer,
+            [],
+            Some(message),
+            Some(content.clone()),
+            None,
+        );
+        let first_blob: Blob<SimpleArchive> = first_facts.clone().to_blob();
+        let first_subject = legacy_commit_subject(&first_facts, first_blob.get_handle()).unwrap();
+        let created = one_legacy_commit_value(
+            &first_facts,
+            first_subject,
+            &metadata::created_at,
+            "created_at",
+        )
+        .unwrap()
+        .unwrap();
+        let content_handle =
+            one_legacy_commit_value(&first_facts, first_subject, &repo::content, "content")
+                .unwrap()
+                .unwrap();
+        let signed_by =
+            one_legacy_commit_value(&first_facts, first_subject, &repo::signed_by, "signed_by")
+                .unwrap()
+                .unwrap();
+        let signature_r = one_legacy_commit_value(
+            &first_facts,
+            first_subject,
+            &repo::signature_r,
+            "signature_r",
+        )
+        .unwrap()
+        .unwrap();
+        let signature_s = one_legacy_commit_value(
+            &first_facts,
+            first_subject,
+            &repo::signature_s,
+            "signature_s",
+        )
+        .unwrap()
+        .unwrap();
+        let first = pile_store.put::<SimpleArchive, _>(first_blob).unwrap();
+
+        // The parent edge gives this authored commit a distinct canonical
+        // legacy identity while every field projected into the collection
+        // COMMIT remains byte-identical to the first commit.
+        let second_facts = entity! {
+            metadata::created_at: created,
+            repo::content: content_handle,
+            repo::signed_by: signed_by,
+            repo::signature_r: signature_r,
+            repo::signature_s: signature_s,
+            repo::message: message,
+            repo::parent: first,
+        }
+        .into_facts();
+        assert!(repo::commit::verify(content.clone(), second_facts.clone()).is_ok());
+        let second_blob: Blob<SimpleArchive> = second_facts.to_blob();
+        let second = pile_store
+            .put::<SimpleArchive, _>(second_blob.clone())
+            .unwrap();
+        assert_eq!(second, second_blob.get_handle());
+        let branch_metadata =
+            repo::branch::branch_metadata(&legacy_signer, branch, name, Some(second_blob))
+                .to_blob();
+        let new_pin = pile_store.put::<SimpleArchive, _>(branch_metadata).unwrap();
+        pile_store
+            .update(branch, Some(old_pin), Some(new_pin))
+            .unwrap();
+        pile_store.flush().unwrap();
+        pile_store.close().unwrap();
+
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let length = std::fs::metadata(&pile).unwrap().len();
+        let error = migrate_legacy_simplearchive_branch(
+            &pile,
+            Some(&key),
+            id(34),
+            "collision-test",
+            None,
+            validate_description_payloads,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("collapse to collection commit"));
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
+        assert_eq!(pin_head(&pile, branch), new_pin);
+        let signer = load_signer(&pile, Some(&key)).unwrap();
+        assert!(materialize_scope(&pile, id(34), &allowed(&signer))
+            .unwrap()
+            .facts
+            .is_empty());
+    }
+
+    #[test]
+    fn existing_retention_failure_precedes_migration_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = legacy_fixture(&directory);
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let unrelated = simplearchive_union::definition(id(35));
+        let missing: CollectionData = Inline::new([0xA5; 32]);
+        let incomplete =
+            CollectionCommit::sign(&signer, unrelated.id(), missing, empty_metadata_handle());
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        pile.put::<SimpleArchive, _>(CollectionDefinition::to_blob(&unrelated))
+            .unwrap();
+        pile.put::<SimpleArchive, _>(CollectionCommit::to_blob(&incomplete))
+            .unwrap();
+        pile.flush().unwrap();
+        pile.close().unwrap();
+        let legacy_pin = pin_head(&fixture.pile, fixture.branch);
+        let length = std::fs::metadata(&fixture.pile).unwrap().len();
+
+        let error = migrate_legacy_simplearchive_branch(
+            &fixture.pile,
+            Some(&fixture.key),
+            fixture.scope,
+            "legacy-test",
+            None,
+            validate_description_payloads,
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("preflight existing authorized collection retention"));
+        assert!(message.contains("authorized collection commit"));
+        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert_eq!(pin_head(&fixture.pile, fixture.branch), legacy_pin);
+        assert!(migrated_commits(&fixture).1.is_empty());
+    }
+
+    #[test]
+    fn full_dag_preflight_rejects_a_late_noncanonical_merge_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = legacy_fixture(&directory);
+        let signer = SigningKey::from_bytes(&[0x32; 32]);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let old_pin = pile.head(fixture.branch).unwrap().unwrap();
+        let reader = pile.reader().unwrap();
+        let branch_facts: TribleSet = reader.get(old_pin).unwrap();
+        let branch_entity = repo::branch::branch_entity(&branch_facts, fixture.branch).unwrap();
+        let name =
+            one_legacy_commit_value(&branch_facts, branch_entity, &metadata::name, "branch name")
+                .unwrap()
+                .unwrap();
+        let old_head =
+            one_legacy_commit_value(&branch_facts, branch_entity, &repo::head, "branch head")
+                .unwrap()
+                .unwrap();
+        let bad_commit = entity! { repo::parent: old_head }.into_facts().to_blob();
+        pile.put::<SimpleArchive, _>(bad_commit.clone()).unwrap();
+        let bad_branch =
+            repo::branch::branch_metadata(&signer, fixture.branch, name, Some(bad_commit))
+                .to_blob();
+        let bad_pin = pile.put::<SimpleArchive, _>(bad_branch).unwrap();
+        pile.update(fixture.branch, Some(old_pin), Some(bad_pin))
+            .unwrap();
+        pile.flush().unwrap();
+        pile.close().unwrap();
+        let length = std::fs::metadata(&fixture.pile).unwrap().len();
+
+        let error = migrate_legacy_simplearchive_branch(
+            &fixture.pile,
+            Some(&fixture.key),
+            fixture.scope,
+            "legacy-test",
+            None,
+            validate_description_payloads,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("not a canonical merge"));
+        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert_eq!(pin_head(&fixture.pile, fixture.branch), bad_pin);
+        assert!(migrated_commits(&fixture).1.is_empty());
+    }
+
+    #[test]
+    fn contentless_legacy_node_requires_canonical_parent_set_subject() {
+        let first: CommitHandle = Inline::new([0x51; 32]);
+        let second: CommitHandle = Inline::new([0x52; 32]);
+        let source: CommitHandle = Inline::new([0x53; 32]);
+        let canonical = entity! { repo::parent*: [first, second] };
+        let subject = canonical.root().unwrap();
+        let facts = canonical.into_facts();
+        validate_contentless_legacy_merge(&facts, subject, source).unwrap();
+
+        let forged = ExclusiveId::force(id(42));
+        let mut forged_facts = entity! { &forged @ repo::parent: first }.into_facts();
+        forged_facts += entity! { &forged @ repo::parent: second }.into_facts();
+        assert!(validate_contentless_legacy_merge(&forged_facts, forged.id, source).is_err());
+
+        let explicit = ExclusiveId::force(subject);
+        let mut annotated = facts;
+        annotated += entity! { &explicit @ metadata::tag: &id(43) }.into_facts();
+        assert!(validate_contentless_legacy_merge(&annotated, subject, source).is_err());
+
+        let one_parent = entity! { repo::parent: first };
+        let one_subject = one_parent.root().unwrap();
+        assert!(
+            validate_contentless_legacy_merge(&one_parent.into_facts(), one_subject, source,)
+                .is_err()
+        );
     }
 
     #[test]

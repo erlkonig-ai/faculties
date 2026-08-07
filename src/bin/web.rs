@@ -4,21 +4,25 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::web::{config_schema, web_schema, CONFIG_BRANCH_ID, CONFIG_KIND_ID};
+use faculties::collection_access;
+use faculties::schemas::headspace::{
+    playground_config as config_schema, CONFIG_BRANCH, KIND_CONFIG_ID as CONFIG_KIND_ID,
+};
+use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use hifitime::Epoch;
-use rand_core::OsRng;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::json;
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::PileReader;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
+
+const LEGACY_WEB_BRANCH_NAME: &str = "web";
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Provider {
@@ -33,9 +37,14 @@ struct Cli {
     /// Path to the pile file to use.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch id to store web events into (hex). Overrides ensure_branch/env branch id.
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Stored results never create it;
+    /// initialize explicitly with `trible pile signing-key init <pile>`.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Extrinsic collection scope for stored searches and fetches. Defaults to
+    /// the stable web scope declared by this faculty.
+    #[arg(long, value_parser = parse_id_arg)]
+    scope: Option<Id>,
     /// Override Tavily API key (otherwise loaded from config.tavily_api_key). Use @path for file input or @- for stdin.
     #[arg(long)]
     tavily_api_key: Option<String>,
@@ -69,6 +78,16 @@ enum Command {
         #[arg(long, default_value_t = 12_000)]
         max_characters: usize,
     },
+    /// Publish the signed legacy `web` branch as collection commits, then
+    /// verify the exact materialized view. Stop every legacy web writer and
+    /// every collection-native writer using the same target scope before
+    /// running this command. It never removes the legacy pin.
+    MigrateLegacy {
+        /// Exact legacy web branch id. Needed only when duplicate `web`
+        /// branch names make name lookup ambiguous.
+        #[arg(long, value_parser = parse_id_arg)]
+        legacy_branch_id: Option<Id>,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -83,14 +102,31 @@ struct ConfigSnapshot {
     exa_api_key: Option<String>,
 }
 
+fn parse_id_arg(raw: &str) -> std::result::Result<Id, String> {
+    Id::from_hex(raw.trim()).ok_or_else(|| format!("invalid id '{raw}'"))
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    run(Cli::parse())
+}
+
+fn run(cli: Cli) -> Result<()> {
     let Some(cmd) = cli.command.as_ref() else {
         let mut command = Cli::command();
         command.print_help()?;
         println!();
         return Ok(());
     };
+
+    let storage = WebStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+        scope: cli.scope.unwrap_or(DEFAULT_SCOPE_ID),
+    };
+
+    if let Command::MigrateLegacy { legacy_branch_id } = cmd {
+        return cmd_migrate_legacy(storage, *legacy_branch_id);
+    }
 
     let config = load_config_snapshot(&cli.pile)?;
     let keys = resolve_api_keys(&cli, &config)?;
@@ -102,13 +138,14 @@ fn main() -> Result<()> {
             provider,
         } => {
             let query = load_value_or_file(query, "search query")?;
-            cmd_search(&cli, keys, *provider, &query, *max_results)
+            cmd_search(&cli, storage, keys, *provider, &query, *max_results)
         }
         Command::Fetch {
             url,
             provider,
             max_characters,
-        } => cmd_fetch(&cli, keys, *provider, url, *max_characters),
+        } => cmd_fetch(&cli, storage, keys, *provider, url, *max_characters),
+        Command::MigrateLegacy { .. } => unreachable!("handled before provider configuration"),
     }
 }
 
@@ -130,6 +167,7 @@ fn resolve_api_keys(cli: &Cli, config: &ConfigSnapshot) -> Result<ApiKeys> {
 
 fn cmd_search(
     cli: &Cli,
+    storage: WebStorage<'_>,
     keys: ApiKeys,
     provider: Provider,
     query: &str,
@@ -151,15 +189,12 @@ fn cmd_search(
 
     print_search_results(provider, query, &results);
 
-    if cli.no_store {
-        return Ok(());
-    }
-    let branch_id = resolve_branch_id(cli)?;
-    store_search(cli, branch_id, provider, query, &results)
+    store_search_if_enabled(cli.no_store, storage, provider, query, &results)
 }
 
 fn cmd_fetch(
     cli: &Cli,
+    storage: WebStorage<'_>,
     keys: ApiKeys,
     provider: Provider,
     url: &str,
@@ -179,11 +214,7 @@ fn cmd_fetch(
 
     println!("{content}");
 
-    if cli.no_store {
-        return Ok(());
-    }
-    let branch_id = resolve_branch_id(cli)?;
-    store_fetch(cli, branch_id, provider, url, &content)
+    store_fetch_if_enabled(cli.no_store, storage, provider, url, &content)
 }
 
 fn choose_provider(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
@@ -229,64 +260,35 @@ fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider>
 
 fn load_config_snapshot(pile_path: &Path) -> Result<ConfigSnapshot> {
     let debug = std::env::var_os("PLAYGROUND_WEB_DEBUG").is_some();
-    with_repo(pile_path, |repo| {
-        let snapshot = if repo
-            .storage_mut()
-            .head(CONFIG_BRANCH_ID)
-            .map_err(|e| anyhow!("config branch head: {e:?}"))?
-            .is_none()
-        {
-            ConfigSnapshot::default()
-        } else {
-            let mut ws = repo
-                .pull(CONFIG_BRANCH_ID)
-                .map_err(|e| anyhow!("pull config: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow!("checkout config: {e:?}"))?;
-            match latest_config_id(&space)? {
-                Some(config_id) => {
-                    if debug {
-                        eprintln!("[web] latest config id: {config_id:x}");
-                    }
-                    ConfigSnapshot {
-                        tavily_api_key: load_string_attr(
-                            &mut ws,
-                            &space,
-                            config_id,
-                            &config_schema::tavily_api_key,
-                        )?,
-                        exa_api_key: load_string_attr(
-                            &mut ws,
-                            &space,
-                            config_id,
-                            &config_schema::exa_api_key,
-                        )?,
-                    }
-                }
-                None => ConfigSnapshot::default(),
-            }
-        };
-        Ok(snapshot)
-    })
-}
-
-fn resolve_branch_id(cli: &Cli) -> Result<Id> {
-    with_repo(&cli.pile, |repo| {
-        if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
-        }
-        if let Ok(hex) = std::env::var("TRIBLESPACE_BRANCH_ID") {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID"));
-        }
-        repo.ensure_branch("web", None)
-            .map_err(|e| anyhow!("ensure web branch: {e:?}"))
+    let Some(view) = collection_access::materialize_named_legacy_branch(pile_path, CONFIG_BRANCH)
+        .context("look up config branch")?
+    else {
+        return Ok(ConfigSnapshot::default());
+    };
+    let Some(config_id) = latest_config_id(&view.facts)? else {
+        return Ok(ConfigSnapshot::default());
+    };
+    if debug {
+        eprintln!("[web] latest config id: {config_id:x}");
+    }
+    Ok(ConfigSnapshot {
+        tavily_api_key: load_string_attr(
+            &view.reader,
+            &view.facts,
+            config_id,
+            &config_schema::tavily_api_key,
+        )?,
+        exa_api_key: load_string_attr(
+            &view.reader,
+            &view.facts,
+            config_id,
+            &config_schema::exa_api_key,
+        )?,
     })
 }
 
 fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
-    let mut latest: Option<(Id, Inline<NsTAIInterval>)> = None;
+    let mut latest: Option<(i128, Id)> = None;
     for (config_id, updated_at) in find!(
         (config_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(space, [{
@@ -295,13 +297,12 @@ fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
             metadata::updated_at: ?updated_at,
         }])
     ) {
-        let key = interval_key(updated_at);
-        match latest {
-            Some((_, cur)) if interval_key(cur) >= key => {}
-            _ => latest = Some((config_id, updated_at)),
+        let candidate = (interval_key(updated_at), config_id);
+        if latest.is_none_or(|current| candidate > current) {
+            latest = Some(candidate);
         }
     }
-    Ok(latest.map(|(id, _)| id))
+    Ok(latest.map(|(_, id)| id))
 }
 
 fn interval_key(value: Inline<NsTAIInterval>) -> i128 {
@@ -310,7 +311,7 @@ fn interval_key(value: Inline<NsTAIInterval>) -> i128 {
 }
 
 fn load_string_attr(
-    ws: &mut Workspace<Pile>,
+    reader: &PileReader,
     space: &TribleSet,
     entity: Id,
     attr: &Attribute<Handle<LongString>>,
@@ -325,7 +326,7 @@ fn load_string_attr(
         Some((handle,)) => handle,
         None => return Ok(None),
     };
-    let view: View<str> = ws.get(handle).context("read config string")?;
+    let view: View<str> = reader.get(handle).context("read config string")?;
     Ok(Some(view.to_string()))
 }
 
@@ -336,12 +337,16 @@ struct SearchResult {
     snippet: Option<String>,
 }
 
-fn print_search_results(provider: Provider, query: &str, results: &[SearchResult]) {
-    let provider_name = match provider {
+fn provider_name(provider: Provider) -> &'static str {
+    match provider {
         Provider::Tavily => "tavily",
         Provider::Exa => "exa",
         Provider::Auto => "auto",
-    };
+    }
+}
+
+fn print_search_results(provider: Provider, query: &str, results: &[SearchResult]) {
+    let provider_name = provider_name(provider);
     println!("provider: {provider_name}");
     println!("query: {query}");
     println!("results: {}", results.len());
@@ -360,124 +365,216 @@ fn print_search_results(provider: Provider, query: &str, results: &[SearchResult
     }
 }
 
-fn store_search(
-    cli: &Cli,
-    branch_id: Id,
+#[derive(Clone, Copy)]
+struct WebStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+    scope: Id,
+}
+
+impl WebStorage<'_> {
+    fn publish(&self, fragment: Fragment, message: &str) -> Result<CollectionCommit> {
+        let metadata = entity! { metadata::description: message.to_owned() };
+        collection_access::publish_fragment(self.pile, self.key, self.scope, fragment, metadata)
+    }
+}
+
+fn preflight_legacy_web_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+    for fact in facts {
+        let field = if fact.a() == &web_schema::query.id() {
+            Some("web::query")
+        } else if fact.a() == &web_schema::url.id() {
+            Some("web::url")
+        } else if fact.a() == &web_schema::title.id() {
+            Some("web::title")
+        } else if fact.a() == &web_schema::snippet.id() {
+            Some("web::snippet")
+        } else if fact.a() == &web_schema::content.id() {
+            Some("web::content")
+        } else {
+            None
+        };
+        let Some(field) = field else {
+            continue;
+        };
+        let handle = *fact.v::<Handle<LongString>>();
+        let _: View<str> = reader.get(handle).with_context(|| {
+            format!(
+                "strictly read legacy {field} payload {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy(
+    storage: WebStorage<'_>,
+    explicit_branch: Option<Id>,
+) -> Result<collection_access::LegacyMigrationReport> {
+    collection_access::migrate_legacy_simplearchive_branch(
+        storage.pile,
+        storage.key,
+        storage.scope,
+        LEGACY_WEB_BRANCH_NAME,
+        explicit_branch,
+        preflight_legacy_web_payloads,
+    )
+}
+
+fn cmd_migrate_legacy(storage: WebStorage<'_>, explicit_branch: Option<Id>) -> Result<()> {
+    let report = migrate_legacy(storage, explicit_branch)?;
+    println!(
+        "migrated {} authored commit{} ({} facts); skipped {} contentless merge{}",
+        report.commits.len(),
+        if report.commits.len() == 1 { "" } else { "s" },
+        report.facts,
+        report.skipped_merges,
+        if report.skipped_merges == 1 { "" } else { "s" },
+    );
+    println!("  legacy branch {}", report.branch_id);
+    println!(
+        "  legacy head   {}",
+        report
+            .head
+            .map(|head| hex::encode_upper(head.raw))
+            .unwrap_or_else(|| "<empty>".to_owned())
+    );
+    println!(
+        "  retention     {} direct + {} recursive roots (verified, not persisted)",
+        report.retention_direct, report.retention_recursive
+    );
+    println!("  legacy pin remains in place until recurring retention policy exists");
+    Ok(())
+}
+
+fn search_fragment(
+    provider: Provider,
+    query: &str,
+    results: &[SearchResult],
+    created_at: Inline<NsTAIInterval>,
+) -> Result<Fragment> {
+    let mut search = Fragment::empty();
+    let mut result_ids = Vec::with_capacity(results.len());
+
+    for result in results {
+        let title = result
+            .title
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned();
+        let snippet = result.snippet.as_ref().filter(|value| !value.is_empty());
+        let snippet = snippet.cloned();
+        let result_fragment = entity! { _ @
+            metadata::tag: &web_schema::kind_result,
+            web_schema::url: result.url.clone(),
+            web_schema::title?: title,
+            web_schema::snippet?: snippet,
+        };
+        let result_id = result_fragment
+            .root()
+            .ok_or_else(|| anyhow!("result fragment missing root export"))?;
+        result_ids.push(result_id);
+        search += result_fragment;
+    }
+
+    search += entity! { _ @
+        metadata::tag: &web_schema::kind_search,
+        web_schema::query: query.to_owned(),
+        web_schema::provider: provider_name(provider),
+        metadata::created_at: created_at,
+        web_schema::result*: result_ids,
+    };
+    Ok(search)
+}
+
+fn fetch_fragment(
+    provider: Provider,
+    url: &str,
+    content: &str,
+    created_at: Inline<NsTAIInterval>,
+) -> Fragment {
+    entity! { _ @
+        metadata::tag: &web_schema::kind_fetch,
+        web_schema::provider: provider_name(provider),
+        metadata::created_at: created_at,
+        web_schema::url: url.to_owned(),
+        web_schema::content: content.to_owned(),
+    }
+}
+
+fn store_search_if_enabled(
+    no_store: bool,
+    storage: WebStorage<'_>,
     provider: Provider,
     query: &str,
     results: &[SearchResult],
 ) -> Result<()> {
-    with_repo(&cli.pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull web ws: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
-
-        let provider_str = match provider {
-            Provider::Tavily => "tavily",
-            Provider::Exa => "exa",
-            Provider::Auto => "auto",
-        };
-        let created_at = epoch_interval(now_epoch());
-        let query_handle = ws.put(query.to_string());
-
-        let mut change = TribleSet::new();
-        let mut result_ids = Vec::with_capacity(results.len());
-
-        for r in results {
-            let url_handle = ws.put(r.url.clone());
-            let title_handle = r
-                .title
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|title| ws.put(title.to_string()));
-            let snippet_handle = r
-                .snippet
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|snippet| ws.put(snippet.to_string()));
-            let result_fragment = entity! { _ @
-                metadata::tag: &web_schema::kind_result,
-                web_schema::url: url_handle,
-                web_schema::title?: title_handle,
-                web_schema::snippet?: snippet_handle,
-            };
-            let result_id = result_fragment
-                .root()
-                .ok_or_else(|| anyhow!("result fragment missing root export"))?;
-            result_ids.push(result_id);
-            change += result_fragment;
-        }
-        change += entity! { _ @
-            metadata::tag: &web_schema::kind_search,
-            web_schema::query: query_handle,
-            web_schema::provider: provider_str,
-            metadata::created_at: created_at,
-            web_schema::result*: result_ids,
-        };
-
-        let delta = change.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(delta, "web search");
-            push_workspace(repo, &mut ws).context("push web search")?;
-        }
-
-        Ok(())
-    })
+    if no_store {
+        return Ok(());
+    }
+    store_search(storage, provider, query, results)
 }
 
-fn store_fetch(
-    cli: &Cli,
-    branch_id: Id,
+fn store_search(
+    storage: WebStorage<'_>,
+    provider: Provider,
+    query: &str,
+    results: &[SearchResult],
+) -> Result<()> {
+    store_search_at(
+        storage,
+        provider,
+        query,
+        results,
+        epoch_interval(now_epoch()),
+    )?;
+    Ok(())
+}
+
+fn store_search_at(
+    storage: WebStorage<'_>,
+    provider: Provider,
+    query: &str,
+    results: &[SearchResult],
+    created_at: Inline<NsTAIInterval>,
+) -> Result<CollectionCommit> {
+    let fragment = search_fragment(provider, query, results, created_at)?;
+    storage.publish(fragment, "web search")
+}
+
+fn store_fetch_if_enabled(
+    no_store: bool,
+    storage: WebStorage<'_>,
     provider: Provider,
     url: &str,
     content: &str,
 ) -> Result<()> {
-    with_repo(&cli.pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull web ws: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
-
-        let provider_str = match provider {
-            Provider::Tavily => "tavily",
-            Provider::Exa => "exa",
-            Provider::Auto => "auto",
-        };
-        let created_at = epoch_interval(now_epoch());
-        let url_handle = ws.put(url.to_string());
-        let content_handle = ws.put(content.to_string());
-
-        let fetch_fragment = entity! { _ @
-            metadata::tag: &web_schema::kind_fetch,
-            web_schema::provider: provider_str,
-            metadata::created_at: created_at,
-            web_schema::url: url_handle,
-            web_schema::content: content_handle,
-        };
-
-        let delta = fetch_fragment.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(delta, "web fetch");
-            push_workspace(repo, &mut ws).context("push web fetch")?;
-        }
-
-        Ok(())
-    })
+    if no_store {
+        return Ok(());
+    }
+    store_fetch(storage, provider, url, content)
 }
 
-fn push_workspace(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>) -> Result<()> {
-    while let Some(mut conflict) = repo.try_push(ws).map_err(|e| anyhow!("push: {e:?}"))? {
-        conflict
-            .merge(ws)
-            .map_err(|e| anyhow!("merge conflict: {e:?}"))?;
-        *ws = conflict;
-    }
+fn store_fetch(
+    storage: WebStorage<'_>,
+    provider: Provider,
+    url: &str,
+    content: &str,
+) -> Result<()> {
+    store_fetch_at(storage, provider, url, content, epoch_interval(now_epoch()))?;
     Ok(())
+}
+
+fn store_fetch_at(
+    storage: WebStorage<'_>,
+    provider: Provider,
+    url: &str,
+    content: &str,
+    created_at: Inline<NsTAIInterval>,
+) -> Result<CollectionCommit> {
+    let fragment = fetch_fragment(provider, url, content, created_at);
+    storage.publish(fragment, "web fetch")
 }
 
 fn now_epoch() -> Epoch {
@@ -674,41 +771,6 @@ fn exa_contents(
     Ok(first.text)
 }
 
-// --- Pile helpers ---
-
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        // Avoid Drop warnings on early errors.
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))
-}
-
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     if let Some(path) = raw.strip_prefix('@') {
         if path == "-" {
@@ -725,4 +787,522 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 
 fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
     Ok(load_value_or_file(raw, label)?.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashSet;
+    use std::fs::File;
+
+    use ed25519_dalek::SigningKey;
+    use triblespace::core::collection::{discover_collection_records, simplearchive_union};
+    use triblespace::core::repo::{PinStore, Repository};
+
+    fn test_id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn at_unix(seconds: f64) -> Inline<NsTAIInterval> {
+        epoch_interval(Epoch::from_unix_seconds(seconds))
+    }
+
+    fn fresh_storage(directory: &tempfile::TempDir) -> (PathBuf, PathBuf, Id) {
+        let pile = directory.path().join("web.pile");
+        let key = directory.path().join("web.key");
+        File::create(&pile).unwrap();
+        collection_access::initialize_signer(&pile, Some(&key)).unwrap();
+        (pile, key, test_id(0x51))
+    }
+
+    fn collection_commits(
+        pile_path: &Path,
+        key_path: &Path,
+        scope: Id,
+    ) -> (PileReader, Vec<CollectionCommit>) {
+        let signer = collection_access::load_signer(pile_path, Some(key_path)).unwrap();
+        let definition = simplearchive_union::definition(scope);
+        let mut pile = collection_access::open_pile_strict(pile_path).unwrap();
+        let reader = pile.reader().unwrap();
+        pile.close().unwrap();
+        let records = discover_collection_records(&reader).unwrap();
+        let commits = records
+            .commits()
+            .iter()
+            .filter(|commit| commit.collection() == definition.id())
+            .filter(|commit| commit.public_key().raw == signer.verifying_key().to_bytes())
+            .cloned()
+            .collect();
+        (reader, commits)
+    }
+
+    fn sample_results() -> Vec<SearchResult> {
+        vec![
+            SearchResult {
+                url: "https://example.com/one".to_owned(),
+                title: Some("One".to_owned()),
+                snippet: Some("First result".to_owned()),
+            },
+            SearchResult {
+                url: "https://example.com/two".to_owned(),
+                title: Some(String::new()),
+                snippet: None,
+            },
+        ]
+    }
+
+    fn legacy_pin(pile_path: &Path, branch: Id) -> Inline<Handle<blobencodings::SimpleArchive>> {
+        let mut pile = collection_access::open_pile_strict(pile_path).unwrap();
+        let pin = pile.head(branch).unwrap().unwrap();
+        pile.close().unwrap();
+        pin
+    }
+
+    #[test]
+    fn search_and_fetch_each_publish_one_self_contained_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key, scope) = fresh_storage(&directory);
+        let storage = WebStorage {
+            pile: &pile,
+            key: Some(&key),
+            scope,
+        };
+        let results = sample_results();
+        let search_time = at_unix(10.0);
+        let expected_search =
+            search_fragment(Provider::Tavily, "rust triplestore", &results, search_time).unwrap();
+
+        let search = store_search_at(
+            storage,
+            Provider::Tavily,
+            "rust triplestore",
+            &results,
+            search_time,
+        )
+        .unwrap();
+
+        let signer = collection_access::load_signer(&pile, Some(&key)).unwrap();
+        let allowed = HashSet::from([signer.verifying_key()]);
+        let view = collection_access::materialize_scope(&pile, scope, &allowed).unwrap();
+        assert_eq!(view.facts, expected_search.facts().clone());
+        let (reader, commits) = collection_commits(&pile, &key, scope);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0], search);
+        search.verify_strict().unwrap();
+
+        let query = find!(
+            (query: Inline<Handle<LongString>>),
+            pattern!(&view.facts, [{
+                metadata::tag: web_schema::kind_search,
+                web_schema::query: ?query,
+            }])
+        )
+        .next()
+        .unwrap()
+        .0;
+        assert_eq!(
+            &*view.reader.get::<View<str>, _>(query).unwrap(),
+            "rust triplestore"
+        );
+        let urls: Vec<_> = find!(
+            (url: Inline<Handle<LongString>>),
+            pattern!(&view.facts, [{
+                metadata::tag: web_schema::kind_result,
+                web_schema::url: ?url,
+            }])
+        )
+        .map(|(handle,)| view.reader.get::<View<str>, _>(handle).unwrap().to_string())
+        .collect();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains(&"https://example.com/one".to_owned()));
+        assert!(urls.contains(&"https://example.com/two".to_owned()));
+
+        let metadata_facts: TribleSet = reader.get(search.metadata()).unwrap();
+        let description = find!(
+            (description: Inline<Handle<LongString>>),
+            pattern!(&metadata_facts, [{ metadata::description: ?description }])
+        )
+        .next()
+        .unwrap()
+        .0;
+        assert_eq!(
+            &*reader.get::<View<str>, _>(description).unwrap(),
+            "web search"
+        );
+
+        let fetch_time = at_unix(20.0);
+        let expected_fetch = fetch_fragment(
+            Provider::Exa,
+            "https://example.com/page",
+            "Fetched body",
+            fetch_time,
+        );
+        let fetch = store_fetch_at(
+            storage,
+            Provider::Exa,
+            "https://example.com/page",
+            "Fetched body",
+            fetch_time,
+        )
+        .unwrap();
+
+        let view = collection_access::materialize_scope(&pile, scope, &allowed).unwrap();
+        let mut expected = expected_search.into_facts();
+        expected += expected_fetch.into_facts();
+        assert_eq!(view.facts, expected);
+        let (_, commits) = collection_commits(&pile, &key, scope);
+        assert_eq!(commits.len(), 2);
+        assert!(commits.contains(&search));
+        assert!(commits.contains(&fetch));
+        let content = find!(
+            (content: Inline<Handle<LongString>>),
+            pattern!(&view.facts, [{
+                metadata::tag: web_schema::kind_fetch,
+                web_schema::content: ?content,
+            }])
+        )
+        .next()
+        .unwrap()
+        .0;
+        assert_eq!(
+            &*view.reader.get::<View<str>, _>(content).unwrap(),
+            "Fetched body"
+        );
+    }
+
+    #[test]
+    fn no_store_paths_do_not_require_or_create_a_signer_or_pile() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("must-not-exist.pile");
+        let key = directory.path().join("must-not-exist.key");
+        let storage = WebStorage {
+            pile: &pile,
+            key: Some(&key),
+            scope: test_id(0x52),
+        };
+
+        store_search_if_enabled(
+            true,
+            storage,
+            Provider::Tavily,
+            "not sent",
+            &sample_results(),
+        )
+        .unwrap();
+        store_fetch_if_enabled(
+            true,
+            storage,
+            Provider::Exa,
+            "https://example.com/not-fetched",
+            "not stored",
+        )
+        .unwrap();
+
+        assert!(!pile.exists());
+        assert!(!key.exists());
+    }
+
+    #[test]
+    fn legacy_web_migration_preserves_raw_deltas_and_excludes_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("legacy-web.pile");
+        let key_path = directory.path().join("collection.key");
+        File::create(&pile_path).unwrap();
+
+        let pile = collection_access::open_pile_strict(&pile_path).unwrap();
+        let mut repo =
+            Repository::new(pile, SigningKey::from_bytes(&[0x71; 32]), Fragment::empty()).unwrap();
+        let web_branch = *repo.create_branch(LEGACY_WEB_BRANCH_NAME, None).unwrap();
+        let config_branch = *repo.create_branch(CONFIG_BRANCH, None).unwrap();
+
+        // Deliberately split one logical search across raw historical deltas.
+        // Migration must preserve exactly these facts, not rebuild a modern
+        // self-contained search fragment per legacy commit.
+        let (result_id, result_facts) = {
+            let mut workspace = repo.pull(web_branch).unwrap();
+            let url = workspace.put("https://example.com/legacy".to_owned());
+            let title = workspace.put("Legacy title".to_owned());
+            let snippet = workspace.put("Legacy snippet".to_owned());
+            let result = entity! { _ @
+                metadata::tag: &web_schema::kind_result,
+                web_schema::url: url,
+                web_schema::title: title,
+                web_schema::snippet: snippet,
+            };
+            let result_id = result.root().unwrap();
+            let facts = result.into_facts();
+            workspace.commit(facts.clone(), "legacy result delta");
+            repo.push(&mut workspace).unwrap();
+            (result_id, facts)
+        };
+        let search_facts = {
+            let mut workspace = repo.pull(web_branch).unwrap();
+            let query = workspace.put("legacy query".to_owned());
+            let search = entity! { _ @
+                metadata::tag: &web_schema::kind_search,
+                web_schema::query: query,
+                web_schema::provider: "tavily",
+                metadata::created_at: at_unix(50.0),
+                web_schema::result: &result_id,
+            }
+            .into_facts();
+            workspace.commit(search.clone(), "legacy search delta");
+            repo.push(&mut workspace).unwrap();
+            search
+        };
+        let fetch_facts = {
+            let mut workspace = repo.pull(web_branch).unwrap();
+            let url = workspace.put("https://example.com/fetched".to_owned());
+            let content = workspace.put("Legacy fetched body".to_owned());
+            let fetch = entity! { _ @
+                metadata::tag: &web_schema::kind_fetch,
+                web_schema::provider: "exa",
+                metadata::created_at: at_unix(60.0),
+                web_schema::url: url,
+                web_schema::content: content,
+            }
+            .into_facts();
+            workspace.commit(fetch.clone(), "legacy fetch delta");
+            repo.push(&mut workspace).unwrap();
+            fetch
+        };
+
+        // Provider credentials remain a separate legacy config concern and
+        // must never enter the web collection migration.
+        {
+            let mut workspace = repo.pull(config_branch).unwrap();
+            let config = entity! { _ @
+                metadata::tag: &CONFIG_KIND_ID,
+                metadata::updated_at: at_unix(70.0),
+                config_schema::tavily_api_key: "not-web-data",
+            };
+            workspace.commit(config, "legacy web config");
+            repo.push(&mut workspace).unwrap();
+        }
+        repo.close().unwrap();
+
+        collection_access::initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let scope = test_id(0x53);
+        let storage = WebStorage {
+            pile: &pile_path,
+            key: Some(&key_path),
+            scope,
+        };
+        let old_pin = legacy_pin(&pile_path, web_branch);
+        let mut expected = result_facts;
+        expected += search_facts;
+        expected += fetch_facts;
+
+        let first = migrate_legacy(storage, None).unwrap();
+        let length = std::fs::metadata(&pile_path).unwrap().len();
+        let second = migrate_legacy(storage, Some(web_branch)).unwrap();
+
+        assert_eq!(first.commits.len(), 3);
+        assert_eq!(first.commits, second.commits);
+        assert_eq!(first.facts, expected.len() as usize);
+        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
+        assert_eq!(legacy_pin(&pile_path, web_branch), old_pin);
+
+        let signer = collection_access::load_signer(&pile_path, Some(&key_path)).unwrap();
+        let allowed = HashSet::from([signer.verifying_key()]);
+        let view = collection_access::materialize_scope(&pile_path, scope, &allowed).unwrap();
+        assert_eq!(view.facts, expected);
+        preflight_legacy_web_payloads(&view.reader, &view.facts).unwrap();
+        assert!(!exists!(pattern!(&view.facts, [{
+            _?config @ metadata::tag: &CONFIG_KIND_ID,
+        }])));
+    }
+
+    #[test]
+    fn empty_legacy_web_branch_is_a_zero_commit_noop() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("empty-legacy-web.pile");
+        let key_path = directory.path().join("collection.key");
+        File::create(&pile_path).unwrap();
+
+        let pile = collection_access::open_pile_strict(&pile_path).unwrap();
+        let mut repo =
+            Repository::new(pile, SigningKey::from_bytes(&[0x72; 32]), Fragment::empty()).unwrap();
+        let branch = *repo.create_branch(LEGACY_WEB_BRANCH_NAME, None).unwrap();
+        repo.close().unwrap();
+        collection_access::initialize_signer(&pile_path, Some(&key_path)).unwrap();
+
+        let pin = legacy_pin(&pile_path, branch);
+        let length = std::fs::metadata(&pile_path).unwrap().len();
+        // Exercise the real dispatch path without any provider credentials or
+        // config branch: migration is storage maintenance, not a web request.
+        let cli = Cli::try_parse_from([
+            "web".to_owned(),
+            "--pile".to_owned(),
+            pile_path.display().to_string(),
+            "--key".to_owned(),
+            key_path.display().to_string(),
+            "--scope".to_owned(),
+            format!("{:x}", test_id(0x54)),
+            "migrate-legacy".to_owned(),
+        ])
+        .unwrap();
+        run(cli).unwrap();
+        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
+
+        let report = migrate_legacy(
+            WebStorage {
+                pile: &pile_path,
+                key: Some(&key_path),
+                scope: test_id(0x54),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.branch_id, branch);
+        assert!(report.head.is_none());
+        assert!(report.commits.is_empty());
+        assert_eq!(report.facts, 0);
+        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
+        assert_eq!(legacy_pin(&pile_path, branch), pin);
+    }
+
+    #[test]
+    fn legacy_web_preflight_strictly_reads_direct_longstring_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("missing-web-payload.pile");
+        File::create(&pile_path).unwrap();
+        let mut pile = collection_access::open_pile_strict(&pile_path).unwrap();
+        let reader = pile.reader().unwrap();
+        pile.close().unwrap();
+
+        let missing: Inline<Handle<LongString>> = Inline::new([0x91; 32]);
+        let entity = ufoid();
+        let facts = entity! { &entity @ web_schema::snippet: missing }.into_facts();
+        let error = preflight_legacy_web_payloads(&reader, &facts).unwrap_err();
+        assert!(format!("{error:#}").contains("legacy web::snippet payload"));
+    }
+
+    #[test]
+    fn search_identity_remains_orderless_deduplicated_and_ignores_empty_optionals() {
+        let created = at_unix(30.0);
+        let first = SearchResult {
+            url: "https://example.com/a".to_owned(),
+            title: Some(String::new()),
+            snippet: None,
+        };
+        let second = SearchResult {
+            url: "https://example.com/b".to_owned(),
+            title: Some("B".to_owned()),
+            snippet: Some("second".to_owned()),
+        };
+        let forward = search_fragment(
+            Provider::Tavily,
+            "same identity",
+            &[first.clone(), second.clone()],
+            created,
+        )
+        .unwrap();
+        let reverse = search_fragment(
+            Provider::Tavily,
+            "same identity",
+            &[second, first.clone()],
+            created,
+        )
+        .unwrap();
+        let duplicate = search_fragment(
+            Provider::Tavily,
+            "same identity",
+            &[first.clone(), first],
+            created,
+        )
+        .unwrap();
+        let single = search_fragment(
+            Provider::Tavily,
+            "same identity",
+            &[SearchResult {
+                url: "https://example.com/a".to_owned(),
+                title: None,
+                snippet: None,
+            }],
+            created,
+        )
+        .unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(duplicate, single);
+    }
+
+    #[test]
+    fn config_is_found_by_name_and_equal_times_choose_greater_entity_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("config.pile");
+        File::create(&pile_path).unwrap();
+        let pile = collection_access::open_pile_strict(&pile_path).unwrap();
+        let mut repo =
+            Repository::new(pile, SigningKey::from_bytes(&[0x61; 32]), Fragment::empty()).unwrap();
+        let branch = *repo.create_branch(CONFIG_BRANCH, None).unwrap();
+        let updated = at_unix(40.0);
+        let first = entity! { _ @
+            metadata::tag: &CONFIG_KIND_ID,
+            metadata::updated_at: updated,
+            config_schema::tavily_api_key: "first-tavily",
+            config_schema::exa_api_key: "first-exa",
+        };
+        let first_id = first.root().unwrap();
+        let second = entity! { _ @
+            metadata::tag: &CONFIG_KIND_ID,
+            metadata::updated_at: updated,
+            config_schema::tavily_api_key: "second-tavily",
+            config_schema::exa_api_key: "second-exa",
+        };
+        let second_id = second.root().unwrap();
+        let mut facts = first.facts().clone();
+        facts += second.facts().clone();
+        assert_eq!(
+            latest_config_id(&facts).unwrap(),
+            Some(first_id.max(second_id))
+        );
+        let expected = if first_id > second_id {
+            ("first-tavily", "first-exa")
+        } else {
+            ("second-tavily", "second-exa")
+        };
+        let mut workspace = repo.pull(branch).unwrap();
+        workspace.commit(first + second, "two equal-time configs");
+        repo.push(&mut workspace).unwrap();
+        repo.close().unwrap();
+
+        let length = std::fs::metadata(&pile_path).unwrap().len();
+        let snapshot = load_config_snapshot(&pile_path).unwrap();
+        assert_eq!(snapshot.tavily_api_key.as_deref(), Some(expected.0));
+        assert_eq!(snapshot.exa_api_key.as_deref(), Some(expected.1));
+        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
+    }
+
+    #[test]
+    fn missing_config_branch_returns_defaults_and_ambiguity_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty = directory.path().join("empty.pile");
+        File::create(&empty).unwrap();
+        let empty_length = std::fs::metadata(&empty).unwrap().len();
+        let snapshot = load_config_snapshot(&empty).unwrap();
+        assert!(snapshot.tavily_api_key.is_none());
+        assert!(snapshot.exa_api_key.is_none());
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), empty_length);
+
+        let ambiguous = directory.path().join("ambiguous.pile");
+        File::create(&ambiguous).unwrap();
+        let pile = collection_access::open_pile_strict(&ambiguous).unwrap();
+        let mut repo =
+            Repository::new(pile, SigningKey::from_bytes(&[0x62; 32]), Fragment::empty()).unwrap();
+        repo.create_branch(CONFIG_BRANCH, None).unwrap();
+        repo.create_branch(CONFIG_BRANCH, None).unwrap();
+        repo.close().unwrap();
+
+        let ambiguous_length = std::fs::metadata(&ambiguous).unwrap().len();
+        let error = load_config_snapshot(&ambiguous).unwrap_err();
+        assert!(format!("{error:#}").contains("look up config branch"));
+        assert_eq!(
+            std::fs::metadata(&ambiguous).unwrap().len(),
+            ambiguous_length
+        );
+    }
 }

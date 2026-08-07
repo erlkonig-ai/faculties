@@ -40,6 +40,16 @@ All notable changes to this project will be documented in this file.
   retention, tolerates the legacy empty-branch artifact, and leaves the legacy
   pin untouched. Legacy and same-target-scope collection writers must be
   quiescent during migration.
+- **Stored web results are collection-native.** Search and fetch operations now
+  publish one complete, attachment-owning signed COMMIT in a stable web scope
+  under an existing durable signer; `--no-store` still loads no signer and
+  publishes no output. `web migrate-legacy` preflights and publishes the raw
+  signed `web` history through the shared exact migration seam (including an
+  empty-branch no-op) without moving its legacy pin. Provider credentials remain
+  excluded on the legacy config branch, which web now materializes without a
+  signer or any write by its canonical name, using headspace's shared schema and
+  deterministic equal-time config tie-break instead of a stale pile-local
+  branch id.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile

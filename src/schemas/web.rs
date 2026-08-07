@@ -1,5 +1,4 @@
-//! Web schema: search and fetch events, plus the config subset that holds
-//! provider API keys (Tavily, Exa).
+//! Web schema: persisted search and fetch events.
 //!
 //! Used by `web.rs` (the faculty CLI).
 
@@ -8,17 +7,11 @@ use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
 use triblespace::prelude::*;
 
-pub const CONFIG_BRANCH_ID: Id = id_hex!("6069A136254E1B87E4C0D2E0295DB382");
-pub const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
-
-pub mod config_schema {
-    use super::*;
-
-    attributes! {
-        "328B29CE81665EE719C5A6E91695D4D4" as tavily_api_key: Handle<LongString>;
-        "AB0DF9F03F28A27A6DB95B693CC0EC53" as exa_api_key: Handle<LongString>;
-    }
-}
+/// Stable extrinsic scope for stored web searches and fetches.
+///
+/// Minted with `trible genid` on 2026-08-07:
+/// `74897A5A9C573A8A17AD515F782951A2`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("74897A5A9C573A8A17AD515F782951A2");
 
 pub mod web_schema {
     use super::*;
