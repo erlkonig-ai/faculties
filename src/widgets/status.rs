@@ -39,7 +39,7 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
-use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
+use crate::relations::{self as relations_model, ProfileView};
 use crate::schemas::status::{status as status_attrs, KIND_STATUS_UPDATE};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
@@ -149,95 +149,20 @@ impl StatusLive {
     }
 }
 
-/// Display-name map for relations persons: alias > first+last >
-/// display_name > (caller falls back to hex id). Only persons are
-/// enumerated; windows absent here render by hex id.
+/// Display-name map for stable Relations person anchors. A canonical profile
+/// label is the handle; a fork or malformed profile remains visible instead
+/// of an arbitrary snapshot being selected.
 fn build_names(rspace: &TribleSet, reader: &PileReader) -> HashMap<Id, String> {
-    #[derive(Default)]
-    struct N {
-        alias: Option<String>,
-        first: Option<String>,
-        last: Option<String>,
-        display: Option<String>,
-    }
-    let mut acc: HashMap<Id, N> = HashMap::new();
-    for (pid,) in find!(
-        (p: Id,),
-        pattern!(rspace, [{ ?p @ metadata::tag: KIND_PERSON_ID }])
-    ) {
-        acc.entry(pid).or_default();
-    }
-    for (pid, a) in find!(
-        (p: Id, a: String),
-        pattern!(rspace, [{ ?p @ rel::alias: ?a }])
-    ) {
-        if let Some(n) = acc.get_mut(&pid) {
-            // Prefer the shortest alias as the canonical short handle
-            // (e.g. "Zeta" over "Zeta Lyrae") — matches the star-as-label feel.
-            match n.alias.as_ref() {
-                Some(existing) if existing.len() <= a.len() => {}
-                _ => n.alias = Some(a),
-            }
-        }
-    }
-    let first_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::first_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in first_rows {
-        if acc.contains_key(&pid) {
-            if let Some(v) = read_text(reader, h) {
-                if let Some(n) = acc.get_mut(&pid) {
-                    n.first.get_or_insert(v);
+    relations_model::person_profile_views(reader, rspace)
+        .into_iter()
+        .map(|(id, state)| {
+            let name = match state {
+                ProfileView::Current { value, .. } => value.label,
+                ProfileView::Forked(heads) => {
+                    format!("⚠ profile fork ({} heads)", heads.len())
                 }
-            }
-        }
-    }
-    let last_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::last_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in last_rows {
-        if acc.contains_key(&pid) {
-            if let Some(v) = read_text(reader, h) {
-                if let Some(n) = acc.get_mut(&pid) {
-                    n.last.get_or_insert(v);
-                }
-            }
-        }
-    }
-    let display_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::display_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in display_rows {
-        if acc.contains_key(&pid) {
-            if let Some(v) = read_text(reader, h) {
-                if let Some(n) = acc.get_mut(&pid) {
-                    n.display.get_or_insert(v);
-                }
-            }
-        }
-    }
-
-    acc.into_iter()
-        .map(|(id, n)| {
-            let name = n
-                .alias
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| match (n.first.as_ref(), n.last.as_ref()) {
-                    (Some(f), Some(l)) if !f.trim().is_empty() && !l.trim().is_empty() => {
-                        Some(format!("{f} {l}"))
-                    }
-                    (Some(f), _) if !f.trim().is_empty() => Some(f.clone()),
-                    (_, Some(l)) if !l.trim().is_empty() => Some(l.clone()),
-                    _ => None,
-                })
-                .or_else(|| n.display.filter(|s| !s.trim().is_empty()))
-                .unwrap_or_else(|| id_hex(id));
+                ProfileView::Invalid(error) => format!("⚠ invalid profile: {error}"),
+            };
             (id, name)
         })
         .collect()

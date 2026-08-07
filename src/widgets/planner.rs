@@ -48,8 +48,8 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
+use crate::relations::{self as relations_model, ProfileView};
 use crate::schemas::planner::{event, note, KIND_EVENT_ID, KIND_NOTE_ID};
-use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
@@ -384,66 +384,29 @@ fn collect_events(reader: &PileReader, space: &TribleSet) -> Vec<EventRow> {
 }
 
 fn build_people(rspace: &TribleSet, reader: &PileReader) -> HashMap<Id, Person> {
-    let person_ids: Vec<Id> = find!(
-        (pid: Id,),
-        pattern!(rspace, [{ ?pid @ metadata::tag: KIND_PERSON_ID }])
-    )
-    .map(|(pid,)| pid)
-    .collect();
-
-    let mut people: HashMap<Id, Person> = person_ids
+    relations_model::person_profile_views(reader, rspace)
         .into_iter()
-        .map(|p| (p, Person::default()))
-        .collect();
-
-    for (pid, alias) in find!(
-        (p: Id, a: String),
-        pattern!(rspace, [{ ?p @ rel::alias: ?a }])
-    ) {
-        if let Some(p) = people.get_mut(&pid) {
-            p.alias = Some(alias);
-        }
-    }
-    let first_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::first_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in first_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.first_name = read_text(reader, h);
-        }
-    }
-    let last_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::last_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in last_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.last_name = read_text(reader, h);
-        }
-    }
-    let display_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::display_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in display_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.display_name = read_text(reader, h);
-        }
-    }
-    for (pid, e) in find!(
-        (p: Id, e: String),
-        pattern!(rspace, [{ ?p @ rel::email: ?e }])
-    ) {
-        if let Some(p) = people.get_mut(&pid) {
-            p.email = Some(e);
-        }
-    }
-
-    people
+        .map(|(id, state)| {
+            let person = match state {
+                ProfileView::Current { value, .. } => Person {
+                    alias: Some(value.label),
+                    first_name: value.first_name,
+                    last_name: value.last_name,
+                    display_name: value.display_name,
+                    email: value.emails.into_iter().next(),
+                },
+                ProfileView::Forked(heads) => Person {
+                    alias: Some(format!("⚠ profile fork ({} heads)", heads.len())),
+                    ..Person::default()
+                },
+                ProfileView::Invalid(error) => Person {
+                    alias: Some(format!("⚠ invalid profile: {error}")),
+                    ..Person::default()
+                },
+            };
+            (id, person)
+        })
+        .collect()
 }
 
 fn read_text(reader: &PileReader, h: TextHandle) -> Option<String> {

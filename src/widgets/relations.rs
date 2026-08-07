@@ -14,24 +14,13 @@
 //! panel.render(ctx, relations_ws);
 //! ```
 
-use std::collections::HashMap;
-
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::BlobStoreGet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 
-use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
+use crate::relations::{self as relations_model, ProfileView};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
-
-type TextHandle = Inline<Handle<LongString>>;
 
 // ── Color palette ────────────────────────────────────────────────────
 
@@ -141,83 +130,31 @@ struct RelationsLive {
 
 impl RelationsLive {
     fn refresh(dataset: DatasetView<'_>) -> Self {
-        let space = dataset.facts;
-
-        let mut by_id: HashMap<Id, PersonRow> = HashMap::new();
-        for (id,) in find!(
-            (p: Id,),
-            pattern!(space, [{ ?p @ metadata::tag: KIND_PERSON_ID }])
-        ) {
-            by_id.insert(id, PersonRow::empty(id));
-        }
-
-        let alias_rows: Vec<(Id, String)> = find!(
-            (p: Id, a: String),
-            pattern!(space, [{ ?p @ rel::alias: ?a }])
-        )
-        .collect();
-        for (pid, alias) in alias_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.alias = Some(alias);
-            }
-        }
-        let first_rows: Vec<(Id, TextHandle)> = find!(
-            (p: Id, h: TextHandle),
-            pattern!(space, [{ ?p @ rel::first_name: ?h }])
-        )
-        .collect();
-        for (pid, h) in first_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.first_name = read_text(dataset, h);
-            }
-        }
-        let last_rows: Vec<(Id, TextHandle)> = find!(
-            (p: Id, h: TextHandle),
-            pattern!(space, [{ ?p @ rel::last_name: ?h }])
-        )
-        .collect();
-        for (pid, h) in last_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.last_name = read_text(dataset, h);
-            }
-        }
-        let display_rows: Vec<(Id, TextHandle)> = find!(
-            (p: Id, h: TextHandle),
-            pattern!(space, [{ ?p @ rel::display_name: ?h }])
-        )
-        .collect();
-        for (pid, h) in display_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.display_name = read_text(dataset, h);
-            }
-        }
-        let email_rows: Vec<(Id, String)> = find!(
-            (p: Id, e: String),
-            pattern!(space, [{ ?p @ rel::email: ?e }])
-        )
-        .collect();
-        for (pid, e) in email_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.email = Some(e);
-            }
-        }
-        // Affinities — multi-valued tag-like attribute.
-        let affinity_rows: Vec<(Id, String)> = find!(
-            (p: Id, a: String),
-            pattern!(space, [{ ?p @ rel::affinity: ?a }])
-        )
-        .collect();
-        for (pid, aff) in affinity_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.affinities.push(aff);
-            }
-        }
-        for row in by_id.values_mut() {
-            row.affinities.sort();
-            row.affinities.dedup();
-        }
-
-        let mut people: Vec<PersonRow> = by_id.into_values().collect();
+        let mut people: Vec<PersonRow> =
+            relations_model::person_profile_views(dataset.reader, dataset.facts)
+                .into_iter()
+                .map(|(id, state)| match state {
+                    ProfileView::Current { value, .. } => PersonRow {
+                        id,
+                        alias: Some(value.label),
+                        first_name: value.first_name,
+                        last_name: value.last_name,
+                        display_name: value.display_name,
+                        email: value.emails.into_iter().next(),
+                        affinities: value.affinities,
+                    },
+                    ProfileView::Forked(heads) => {
+                        let mut row = PersonRow::empty(id);
+                        row.alias = Some(format!("⚠ profile fork ({} heads)", heads.len()));
+                        row
+                    }
+                    ProfileView::Invalid(error) => {
+                        let mut row = PersonRow::empty(id);
+                        row.alias = Some(format!("⚠ invalid profile: {error}"));
+                        row
+                    }
+                })
+                .collect();
         people.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
         RelationsLive {
@@ -225,17 +162,6 @@ impl RelationsLive {
             people,
         }
     }
-}
-
-fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
-    dataset
-        .reader
-        .get::<View<str>, LongString>(h)
-        .ok()
-        .map(|v| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        })
 }
 
 // ── Widget ───────────────────────────────────────────────────────────

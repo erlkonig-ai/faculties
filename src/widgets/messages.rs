@@ -38,8 +38,8 @@ use triblespace::prelude::View;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
+use crate::relations::{self as relations_model, ProfileView};
 use crate::schemas::message::{local, KIND_MESSAGE_ID, KIND_READ_ID};
-use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 /// Handle to a long-string blob (message bodies).
@@ -312,97 +312,32 @@ impl MessagesLive {
 
 /// Build the people map by scanning the relations fact space.
 fn build_people(relations_space: &TribleSet, relations_reader: &PileReader) -> HashMap<Id, Person> {
-    let mut people: HashMap<Id, Person> = HashMap::new();
-
-    let person_ids: Vec<Id> = find!(
-        pid: Id,
-        pattern!(relations_space, [{ ?pid @ metadata::tag: &KIND_PERSON_ID }])
-    )
-    .collect();
-    for pid in &person_ids {
-        people.insert(*pid, Person::default());
-    }
-
-    let alias_rows: Vec<(Id, String)> = find!(
-        (pid: Id, alias: String),
-        pattern!(relations_space, [{ ?pid @ rel::alias: ?alias }])
-    )
-    .collect();
-    for (pid, alias) in alias_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            match p.alias.as_ref() {
-                Some(existing) if existing.as_str() <= alias.as_str() => {}
-                _ => p.alias = Some(alias),
-            }
-        }
-    }
-
-    let relations_text = |reader: &PileReader, h: TextHandle| -> Option<String> {
-        reader.get::<View<str>, LongString>(h).ok().map(|v| {
-            let s: &str = v.as_ref();
-            s.to_string()
+    relations_model::person_profile_views(relations_reader, relations_space)
+        .into_iter()
+        .map(|(id, state)| {
+            let person = match state {
+                ProfileView::Current { value, .. } => Person {
+                    alias: Some(value.label),
+                    first_name: value.first_name,
+                    last_name: value.last_name,
+                    display_name: value.display_name,
+                    is_operator: value
+                        .affinities
+                        .iter()
+                        .any(|affinity| affinity.eq_ignore_ascii_case("operator")),
+                },
+                ProfileView::Forked(heads) => Person {
+                    alias: Some(format!("⚠ profile fork ({} heads)", heads.len())),
+                    ..Person::default()
+                },
+                ProfileView::Invalid(error) => Person {
+                    alias: Some(format!("⚠ invalid profile: {error}")),
+                    ..Person::default()
+                },
+            };
+            (id, person)
         })
-    };
-
-    let first_rows: Vec<(Id, TextHandle)> = find!(
-        (pid: Id, h: TextHandle),
-        pattern!(relations_space, [{ ?pid @ rel::first_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in first_rows {
-        if people.contains_key(&pid) {
-            if let Some(v) = relations_text(relations_reader, h) {
-                if let Some(p) = people.get_mut(&pid) {
-                    p.first_name.get_or_insert(v);
-                }
-            }
-        }
-    }
-
-    let last_rows: Vec<(Id, TextHandle)> = find!(
-        (pid: Id, h: TextHandle),
-        pattern!(relations_space, [{ ?pid @ rel::last_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in last_rows {
-        if people.contains_key(&pid) {
-            if let Some(v) = relations_text(relations_reader, h) {
-                if let Some(p) = people.get_mut(&pid) {
-                    p.last_name.get_or_insert(v);
-                }
-            }
-        }
-    }
-
-    let display_rows: Vec<(Id, TextHandle)> = find!(
-        (pid: Id, h: TextHandle),
-        pattern!(relations_space, [{ ?pid @ rel::display_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in display_rows {
-        if people.contains_key(&pid) {
-            if let Some(v) = relations_text(relations_reader, h) {
-                if let Some(p) = people.get_mut(&pid) {
-                    p.display_name.get_or_insert(v);
-                }
-            }
-        }
-    }
-
-    // Operator detection — the `operator` affinity marks humans the
-    // agents work for. Their inbound messages form the inbox subset.
-    for (pid, affinity) in find!(
-        (pid: Id, a: String),
-        pattern!(relations_space, [{ ?pid @ rel::affinity: ?a }])
-    ) {
-        if affinity.eq_ignore_ascii_case("operator") {
-            if let Some(p) = people.get_mut(&pid) {
-                p.is_operator = true;
-            }
-        }
-    }
-
-    people
+        .collect()
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
