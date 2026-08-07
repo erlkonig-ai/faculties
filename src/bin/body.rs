@@ -139,8 +139,9 @@ enum Command {
         output: Option<String>,
     },
     /// Publish the signed legacy `body` branch as collection commits, then
-    /// verify the exact materialized view. This never removes the legacy pin;
-    /// collection retention is not yet a durable recurring policy.
+    /// verify the exact materialized view. Stop every legacy body writer before
+    /// running this command. It never removes the legacy pin; collection
+    /// retention is not yet a durable recurring policy.
     MigrateLegacy {
         /// Exact legacy body branch id. Needed only when duplicate `body`
         /// branch names make name lookup ambiguous.
@@ -590,7 +591,13 @@ fn legacy_commits_topological(
     Ok(ordered)
 }
 
-fn hydrate_closure(
+/// Hydrate the transitive part of a closure which is already resident.
+///
+/// `reachable` can follow references present in resident typed blobs, but an
+/// untyped fact set cannot prove that a directly named child is absent. Body's
+/// known direct payload attributes are therefore read strictly in
+/// `preflight_legacy_body_payloads` before this helper is used.
+fn hydrate_resident_closure(
     reader: &PileReader,
     roots: impl IntoIterator<Item = Inline<inlineencodings::Handle<blobencodings::UnknownBlob>>>,
 ) -> Result<MemoryBlobStore> {
@@ -607,6 +614,41 @@ fn hydrate_closure(
     Ok(blobs)
 }
 
+fn preflight_legacy_body_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+    for fact in facts.iter() {
+        if fact.a() == &capture::frame.id() {
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::RawBytes>>();
+            let _: anybytes::Bytes = reader.get(handle).with_context(|| {
+                format!(
+                    "strictly read legacy capture::frame payload {}",
+                    hex::encode_upper(handle.raw)
+                )
+            })?;
+            continue;
+        }
+
+        let field = if fact.a() == &intent::text.id() {
+            Some("intent::text")
+        } else if fact.a() == &capture::note.id() {
+            Some("capture::note")
+        } else if fact.a() == &capture::pose.id() {
+            Some("capture::pose")
+        } else {
+            None
+        };
+        if let Some(field) = field {
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let _: View<str> = reader.get(handle).with_context(|| {
+                format!(
+                    "strictly read legacy {field} payload {}",
+                    hex::encode_upper(handle.raw)
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn legacy_content_fragment(
     reader: &PileReader,
     content: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
@@ -617,7 +659,8 @@ fn legacy_content_fragment(
     let facts: TribleSet = reader
         .get(content)
         .with_context(|| format!("decode legacy content {}", hex::encode_upper(content.raw)))?;
-    let blobs = hydrate_closure(reader, [content.transmute()])?;
+    preflight_legacy_body_payloads(reader, &facts)?;
+    let blobs = hydrate_resident_closure(reader, [content.transmute()])?;
     Ok((archive, Fragment::from_facts_and_blobs(facts, blobs)))
 }
 
@@ -637,14 +680,14 @@ fn legacy_metadata_fragment(
                 hex::encode_upper(handle.raw)
             )
         })?;
-        let blobs = hydrate_closure(reader, [handle.transmute()])?;
+        let blobs = hydrate_resident_closure(reader, [handle.transmute()])?;
         (facts, blobs)
     } else {
         (TribleSet::new(), MemoryBlobStore::new())
     };
 
     if let Some(handle) = message {
-        projected_blobs.union(hydrate_closure(reader, [handle.transmute()])?);
+        projected_blobs.union(hydrate_resident_closure(reader, [handle.transmute()])?);
     }
 
     let projection = match (created, message) {
@@ -831,7 +874,10 @@ fn confirm_legacy_pin(
     finish_migration_pile(pile, Ok(current == Some(expected)))
 }
 
-fn verify_collection_closure(
+/// Re-read the resident transitive closure of the newly published roots.
+/// Direct body payload presence and decoding were established independently
+/// during the strict legacy preflight.
+fn verify_resident_collection_closure(
     view: &CollectionView,
     commits: impl IntoIterator<Item = CollectionCommit>,
 ) -> Result<()> {
@@ -865,6 +911,12 @@ fn migrate_legacy(
         reader: _,
     } = collection_access::materialize_scope(storage.pile, storage.scope, &allowed)?;
     expected += plan.facts.clone();
+
+    // Validate every already-authorized collection before this command adds a
+    // byte. In particular, an unsupported collection kind owned by the same
+    // signer must fail here rather than after migrated COMMITs were appended.
+    collection_access::plan_authorized_union_retention(storage.pile, &allowed)
+        .context("preflight existing authorized collection retention")?;
 
     let mut pile = collection_access::open_pile_strict(storage.pile)?;
     let result = (|| {
@@ -902,13 +954,13 @@ fn migrate_legacy(
     if view.facts != expected {
         bail!("migrated body collection does not equal the prior collection union legacy facts");
     }
-    verify_collection_closure(&view, published.iter().map(|(_, commit)| commit.clone()))?;
+    verify_resident_collection_closure(&view, published.iter().map(|(_, commit)| commit.clone()))?;
     let retention = collection_access::plan_authorized_union_retention(storage.pile, &allowed)?;
     let retention_direct = retention.direct().len();
     let retention_recursive = retention.recursive().len();
     if !confirm_legacy_pin(storage.pile, plan.branch_id, plan.pin_metadata)? {
         bail!(
-            "legacy body pin advanced during migration; published collection commits are harmless and idempotent, but rerun to migrate the new prefix"
+            "legacy body pin advanced during migration; collection commits may already have been appended. Stop every legacy writer, then rerun to migrate the new prefix; deterministic replay will reuse matching records"
         );
     }
 
@@ -1912,6 +1964,34 @@ mod tests {
 
         assert!(format!("{error:#}").contains("not a canonical merge"));
         assert_eq!(pin_head(&fixture.pile, fixture.branch), bad_pin);
+        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert!(migrated_commits(&fixture).1.is_empty());
+    }
+
+    #[test]
+    fn missing_known_legacy_payload_fails_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = legacy_fixture(&directory);
+        let missing: TextHandle = Inline::new([0x91; 32]);
+        let bad_content = entity! {
+            metadata::tag: &KIND_INTENT,
+            metadata::created_at: at_unix(40.0),
+            intent::text: missing,
+        };
+        let pile = collection_access::open_pile_strict(&fixture.pile).unwrap();
+        let mut repository =
+            Repository::new(pile, SigningKey::from_bytes(&[0x35; 32]), Fragment::empty()).unwrap();
+        let mut workspace = repository.pull(fixture.branch).unwrap();
+        workspace.commit(bad_content, "legacy commit with missing intent payload");
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+        let legacy_pin = pin_head(&fixture.pile, fixture.branch);
+        let length = std::fs::metadata(&fixture.pile).unwrap().len();
+
+        let error = migrate_legacy(fixture_storage(&fixture), None).unwrap_err();
+
+        assert!(format!("{error:#}").contains("strictly read legacy intent::text payload"));
+        assert_eq!(pin_head(&fixture.pile, fixture.branch), legacy_pin);
         assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
         assert!(migrated_commits(&fixture).1.is_empty());
     }

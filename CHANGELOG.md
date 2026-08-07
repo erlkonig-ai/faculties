@@ -23,7 +23,9 @@ All notable changes to this project will be documented in this file.
   advertised Ctrl-C stop path. `body migrate-legacy` verifies and deterministically
   republishes each authored legacy commit, omits contentless merge nodes,
   projects semantic commit metadata, and verifies the exact new materialization
-  without removing the legacy pin; replay is idempotent.
+  without removing the legacy pin; replay is idempotent. Migration requires
+  legacy writers to be quiescent and strictly preflights every body-schema
+  payload handle before its first collection append.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile
