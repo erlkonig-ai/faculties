@@ -1,33 +1,23 @@
-use anyhow::{bail, Result};
-use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::message::{
-    is_inbox_message, local, relations_schema, DEFAULT_BRANCH, DEFAULT_RELATIONS_BRANCH,
-    KIND_MESSAGE_ID, KIND_PERSON_ID, KIND_READ_ID, KIND_SPECS,
-};
-use faculties::schemas::relations::{groups_for_member, KIND_GROUP};
-use hifitime::Epoch;
-use rand_core::OsRng;
-use std::collections::{HashMap, HashSet};
+//! Collection-native local messaging CLI.
+//!
+//! The reusable Message ontology, validation, recipient resolution, and
+//! frozen-snapshot delivery semantics live in [`faculties::message`]. This
+//! binary only orchestrates collection access and presents commands.
+
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use clap::{CommandFactory, Parser, Subcommand};
+use faculties::collection_access::{self, CollectionSnapshot, CollectionView};
+use faculties::message::{self, IntervalValue, MessageRow};
+use faculties::relations::{self, IdentityComponents};
+use faculties::schemas::message::DEFAULT_SCOPE_ID;
+use faculties::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
+use hifitime::Epoch;
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
-use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
-
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-
-fn normalize_label(label: &str) -> Result<String> {
-    let trimmed = label.trim();
-    if trimmed.is_empty() {
-        bail!("label is empty");
-    }
-    Ok(trimmed.to_string())
-}
-
-fn normalize_lookup_key(label: &str) -> Result<String> {
-    Ok(normalize_label(label)?.to_ascii_lowercase())
-}
 
 #[derive(Parser)]
 #[command(
@@ -36,696 +26,382 @@ fn normalize_lookup_key(label: &str) -> Result<String> {
     about = "Local messaging faculty for the agent"
 )]
 struct Cli {
-    /// Path to the pile file to use
+    /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name for local messages
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
-    /// Explicit branch id for local messages (hex). Overrides name-based lookup.
-    #[arg(long)]
-    branch_id: Option<String>,
-    /// Branch name for relations
-    #[arg(long, default_value = DEFAULT_RELATIONS_BRANCH)]
-    relations_branch: String,
-    /// Explicit branch id for relations (hex). Overrides name-based lookup.
-    #[arg(long)]
-    relations_branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Extrinsic Message collection scope.
+    #[arg(long, value_parser = parse_id_arg)]
+    scope: Option<Id>,
+    /// Extrinsic Relations collection scope used for names, identity, and
+    /// frozen group snapshots.
+    #[arg(long, value_parser = parse_id_arg)]
+    relations_scope: Option<Id>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send a message as $PERSONA (override the sender with --from)
+    /// Send a message as $PERSONA (override the sender with --from).
     Send {
-        /// Receiver label (person or group).
+        /// Recipient label, id, or id prefix (person or group).
         to: String,
-        /// Message text.
-        #[arg(
-            value_name = "TEXT",
-            help = "Message text. Use @path for file input or @- for stdin."
-        )]
+        /// Message text. Use @path for file input or @- for stdin.
         text: String,
-        /// Sender label. Defaults to $PERSONA; pass explicitly for
-        /// deliberate cross-persona sends or shells without PERSONA.
-        /// There is intentionally no FROM positional — deriving the
-        /// sender makes the swapped-arguments bug (recipient in the
-        /// FROM slot, message lands in the wrong outbox and the real
-        /// recipient's watcher never fires) structurally impossible.
-        #[arg(long, env = "PERSONA", value_name = "LABEL")]
+        /// Sender label, id, or id prefix. Defaults to $PERSONA.
+        #[arg(long, env = "PERSONA", value_name = "PERSON")]
         from: Option<String>,
     },
-    /// List recent messages (latest first)
+    /// List recent inbox and outbox messages (latest first).
     List {
-        /// Reader id or label.
+        /// Reader label, id, or id prefix.
         reader: String,
-        /// Only show inbox messages unread by the reader.
+        /// Only show unread inbox messages.
         #[arg(long)]
         unread: bool,
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Mark a message as read
+    /// Mark one inbox message as read.
     Ack {
+        /// Message id or unambiguous id prefix.
         id: String,
-        /// Reader id or label.
+        /// Reader label, id, or id prefix.
         by: String,
     },
-    /// Mark ALL unread inbox messages for a reader as read, in ONE commit.
-    /// The one-at-a-time `ack` is fine for a message or two, but a loud colony
-    /// accretes a deep unread backlog that per-message acks can't clear
-    /// efficiently (each is its own pile commit); this bulk path writes every
-    /// read record in a single commit.
+    /// Mark every currently unread inbox message as read in one commit.
     AckAll {
-        /// Reader id or label.
+        /// Reader label, id, or id prefix.
         by: String,
-        /// Only ack messages from this sender (id/label); default: all senders.
+        /// Restrict to one sender label, id, or id prefix.
         #[arg(long)]
         from: Option<String>,
     },
 }
 
-#[derive(Debug, Clone)]
-struct MessageRow {
-    id: Id,
-    from: Id,
-    to: Id,
-    body: String,
-    created_at: i128,
+#[derive(Clone, Copy)]
+struct MessageStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+    scope: Id,
+    relations_scope: Id,
+}
+
+struct MessageViews {
+    messages: CollectionView,
+    relations: CollectionView,
+}
+
+impl MessageStorage<'_> {
+    fn views(&self) -> Result<MessageViews> {
+        let signer = collection_access::load_signer(self.pile, self.key)?;
+        let allowed = HashSet::from([signer.verifying_key()]);
+        let snapshot = CollectionSnapshot::open(self.pile)?;
+        let relations = snapshot
+            .materialize_scope(self.relations_scope, &allowed)
+            .context("materialize Relations collection")?;
+        relations::validate_catalog(&relations.reader, &relations.facts)
+            .context("validate Relations collection")?;
+        let messages = snapshot
+            .materialize_scope(self.scope, &allowed)
+            .context("materialize Message collection")?;
+        message::validate_catalog(&messages.reader, &messages.facts, &relations.facts)
+            .context("validate Message collection")?;
+        Ok(MessageViews {
+            messages,
+            relations,
+        })
+    }
+
+    fn publish(
+        &self,
+        views: &MessageViews,
+        fragment: Fragment,
+        description: &str,
+    ) -> Result<CollectionCommit> {
+        message::validate_catalog_union(
+            &views.messages.reader,
+            &views.messages.facts,
+            &fragment,
+            &views.relations.facts,
+        )?;
+        let metadata = entity! { metadata::description: description.to_owned() };
+        collection_access::publish_fragment(self.pile, self.key, self.scope, fragment, metadata)
+    }
+}
+
+fn parse_id_arg(raw: &str) -> std::result::Result<Id, String> {
+    Id::from_hex(raw.trim()).ok_or_else(|| format!("invalid id '{raw}'"))
 }
 
 fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
-    (epoch, epoch).try_to_inline().unwrap()
+fn epoch_interval(epoch: Epoch) -> IntervalValue {
+    (epoch, epoch)
+        .try_to_inline()
+        .expect("a point in time is a valid interval")
 }
 
-fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
-    lower.to_tai_duration().total_nanoseconds()
-}
-
-fn format_age(now_key: i128, past_key: i128) -> String {
-    let delta_ns = now_key.saturating_sub(past_key);
-    let delta_s = (delta_ns / 1_000_000_000).max(0) as i64;
-    if delta_s < 60 {
-        format!("{delta_s}s")
-    } else if delta_s < 60 * 60 {
-        format!("{}m", delta_s / 60)
-    } else if delta_s < 24 * 60 * 60 {
-        format!("{}h", delta_s / 3600)
-    } else {
-        format!("{}d", delta_s / 86_400)
-    }
-}
-
-fn truncate_single_line(text: &str, max: usize) -> String {
-    let mut out = String::with_capacity(max);
-    for ch in text.chars() {
-        if out.len() >= max {
-            out.push_str("...");
-            break;
-        }
-        if ch == '\n' || ch == '\r' {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-fn render_list_body(text: &str) -> String {
-    text.replace('\r', "").replace('\n', "\\n")
+fn interval_key(interval: IntervalValue) -> i128 {
+    let (lower, _): (i128, i128) = interval
+        .try_from_inline()
+        .expect("stored Message timestamp is a valid interval");
+    lower
 }
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn load_relations(
-    repo: &mut Repository<Pile>,
-    relations_branch_id: Id,
-) -> Result<(TribleSet, Workspace<Pile>)> {
-    if repo
-        .storage_mut()
-        .head(relations_branch_id)
-        .map_err(|e| anyhow::anyhow!("relations branch head: {e:?}"))?
-        .is_none()
-    {
+fn format_age(now_key: i128, past_key: i128) -> String {
+    let seconds = (now_key.saturating_sub(past_key) / 1_000_000_000).max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+fn truncate_single_line(text: &str, max: usize) -> String {
+    let mut output = String::with_capacity(max);
+    for character in text.chars() {
+        if output.len() >= max {
+            output.push_str("...");
+            break;
+        }
+        if matches!(character, '\n' | '\r') {
+            output.push(' ');
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn render_list_body(text: &str) -> String {
+    text.replace('\r', "").replace('\n', "\\n")
+}
+
+fn person_label(view: &CollectionView, person: Id) -> Result<String> {
+    let profile = relations::current_profile(&view.facts, person)?;
+    Ok(relations::profile_input(&view.reader, &profile)?.label)
+}
+
+fn recipient_label(view: &CollectionView, row: &MessageRow) -> Result<String> {
+    match row.group_snapshot {
+        None => person_label(view, row.to),
+        Some(snapshot) => {
+            let snapshot = relations::group_snapshot(&view.facts, snapshot)?;
+            relations::read_text(&view.reader, snapshot.name)
+        }
+    }
+}
+
+fn cmd_send(storage: MessageStorage<'_>, text: String, from: String, to: String) -> Result<()> {
+    if text.trim().is_empty() {
+        bail!("message text is empty");
+    }
+    let views = storage.views()?;
+    let from_id = message::resolve_person(&views.relations.reader, &views.relations.facts, &from)?
+        .require_unique("active person", &from)?;
+    let recipient =
+        message::resolve_recipient(&views.relations.reader, &views.relations.facts, &to)?
+            .require_unique(&to)?;
+    let message_id = genid().id;
+    let fragment = message::message_fragment(
+        message_id,
+        from_id,
+        &recipient,
+        &text,
+        epoch_interval(now_epoch()),
+    );
+    storage.publish(&views, fragment, "local message")?;
+    println!(
+        "[{}] {} -> {}: {}",
+        fmt_id(message_id),
+        fmt_id(from_id),
+        fmt_id(recipient.anchor()),
+        truncate_single_line(&text, 120)
+    );
+    Ok(())
+}
+
+fn cmd_ack(storage: MessageStorage<'_>, id: String, by: String) -> Result<()> {
+    let views = storage.views()?;
+    let reader = message::resolve_person(&views.relations.reader, &views.relations.facts, &by)?
+        .require_unique("active person", &by)?;
+    let message_id = message::resolve_message_id(&views.messages.facts, &id)?;
+    let row = message::row_by_id(&views.messages.facts, message_id)?;
+    let identities = IdentityComponents::from_facts(&views.relations.facts)?;
+    if !message::is_inbox_message(&row, reader, &views.relations.facts, &identities)? {
         bail!(
-            "missing relations branch {:x} (create with relations faculty)",
-            relations_branch_id
+            "message {} is not in {}'s inbox",
+            fmt_id(message_id),
+            fmt_id(reader)
         );
     }
-    let mut ws = repo
-        .pull(relations_branch_id)
-        .map_err(|e| anyhow::anyhow!("pull relations workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?
-        .into_facts();
-    Ok((space, ws))
-}
-
-fn resolve_normalized_person_matches(relations_space: &TribleSet, key: &str) -> Vec<Id> {
-    // A recipient can be a person OR a group — both are addressable parties.
-    let persons = find!(
-        id: Id,
-        pattern!(relations_space, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])
-    );
-    let groups = find!(
-        id: Id,
-        pattern!(relations_space, [{ ?id @ metadata::tag: &KIND_GROUP }])
-    );
-    let mut matches: Vec<Id> = persons
-        .chain(groups)
-        .filter(|&id| {
-            exists!(pattern!(relations_space, [{ id @ relations_schema::label_norm: key }]))
-                || exists!(pattern!(relations_space, [{ id @ relations_schema::alias_norm: key }]))
-        })
-        .collect();
-    // An entity tagged both person and group appears twice.
-    matches.sort();
-    matches.dedup();
-    matches
-}
-
-fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
-    let trimmed = input.trim();
-    if let Some(id) = Id::from_hex(trimmed) {
-        return Ok(id);
-    }
-    let label = normalize_label(trimmed)?;
-    let key = normalize_lookup_key(trimmed)?;
-    let matches = resolve_normalized_person_matches(relations_space, &key);
-
-    match matches.len() {
-        0 => bail!(
-            "unknown person label '{label}' (run playground/migrations/relations_backfill_norm.rs for older piles)"
-        ),
-        1 => Ok(matches[0]),
-        _ => bail!(
-            "multiple people match label '{label}': {}",
-            matches.iter().map(|id| format!("{id:x}")).collect::<Vec<_>>().join(", ")
-        ),
-    }
-}
-
-/// Resolve a message RECIPIENT: a person or a group. On an exact-label tie
-/// between a group and person aliases, the group wins — addressing a
-/// broadcast set by its name is virtually always the intent (e.g. the
-/// the broadcast group vs. stray aliases). Ties among multiple groups
-/// or with no group stay hard errors, listing the claimants.
-fn resolve_recipient_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
-    let trimmed = input.trim();
-    if let Some(id) = Id::from_hex(trimmed) {
-        return Ok(id);
-    }
-    let label = normalize_label(trimmed)?;
-    let key = normalize_lookup_key(trimmed)?;
-    let matches = resolve_normalized_person_matches(relations_space, &key);
-
-    match matches.len() {
-        0 => bail!(
-            "unknown recipient label '{label}' (run playground/migrations/relations_backfill_norm.rs for older piles)"
-        ),
-        1 => Ok(matches[0]),
-        _ => {
-            let groups: Vec<Id> = matches
-                .iter()
-                .copied()
-                .filter(|&id| {
-                    exists!(pattern!(relations_space, [{ id @ metadata::tag: &KIND_GROUP }]))
-                })
-                .collect();
-            if groups.len() == 1 {
-                return Ok(groups[0]);
-            }
-            bail!(
-                "multiple recipients match label '{label}': {}",
-                matches.iter().map(|id| format!("{id:x}")).collect::<Vec<_>>().join(", ")
-            )
-        }
-    }
-}
-
-fn person_label(ws: &mut Workspace<Pile>, space: &TribleSet, person_id: Id) -> String {
-    find!(h: TextHandle, pattern!(space, [{ person_id @ metadata::name: ?h }]))
-        .next()
-        .and_then(|h| load_text(ws, h).ok())
-        .unwrap_or_else(|| fmt_id(person_id))
-}
-
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        // Avoid Drop warnings on early errors.
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
-}
-
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
-fn ensure_metadata(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-        .into_facts();
-    let mut change = TribleSet::new();
-
-    let mut existing_kinds: HashSet<Id> = find!(
-        (kind: Id),
-        pattern!(&space, [{ ?kind @ metadata::name: _?name }])
-    )
-    .into_iter()
-    .map(|(kind,)| kind)
-    .collect();
-
-    for (id, label) in KIND_SPECS {
-        if !existing_kinds.contains(&id) {
-            let name_handle = label.to_owned().to_blob().get_handle();
-            change += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_handle };
-            existing_kinds.insert(id);
-        }
-    }
-
-    Ok(change)
-}
-
-fn resolve_message_id(space: &TribleSet, prefix: &str) -> Result<Id> {
-    let candidates = find!(
-        message_id: Id,
-        pattern!(space, [{ ?message_id @ metadata::tag: &KIND_MESSAGE_ID }])
-    );
-    faculties::resolve_id_prefix(prefix, candidates)
-}
-
-fn load_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
-    let view: View<str> = ws.get(handle).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    Ok(view.as_ref().to_string())
-}
-
-fn cmd_send(
-    pile: &Path,
-    branch_id: Id,
-    relations_branch_id: Id,
-    text: String,
-    from: String,
-    to: String,
-) -> Result<()> {
-    with_repo(pile, |repo| {
-        let (relations_space, _relations_ws) = load_relations(repo, relations_branch_id)?;
-        let from_id = resolve_person_id(&relations_space, &from)?;
-        let to_id = resolve_recipient_id(&relations_space, &to)?;
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let mut change = ensure_metadata(&mut ws)?;
-
-        let now = epoch_interval(now_epoch());
-        let message_id = ufoid();
-        let body_handle = ws.put(text.clone());
-        change += entity! { &message_id @
-            metadata::tag: &KIND_MESSAGE_ID,
-            local::from: from_id,
-            local::to: to_id,
-            local::body: body_handle,
-            metadata::created_at: now,
-        };
-
-        ws.commit(change, "local message");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push message: {e:?}"))?;
-        drop(ws);
+    let reads = message::load_read_rows(&views.messages.facts)?;
+    if message::is_read_by(&reads, message_id, reader, &identities)? {
         println!(
-            "[{}] {} -> {}: {}",
-            fmt_id(*message_id),
-            from_id,
-            to_id,
-            truncate_single_line(&text, 120)
+            "Message {} was already read by {}.",
+            fmt_id(message_id),
+            fmt_id(reader)
         );
-        Ok(())
-    })
+        return Ok(());
+    }
+    let (fragment, _) =
+        message::read_fragment(message_id, reader, Some(epoch_interval(now_epoch())));
+    storage.publish(&views, fragment, "local message read")?;
+    println!(
+        "Marked {} as read by {}.",
+        fmt_id(message_id),
+        fmt_id(reader)
+    );
+    Ok(())
 }
 
-fn cmd_ack(
-    pile: &Path,
-    branch_id: Id,
-    relations_branch_id: Id,
-    id: String,
-    by: String,
-) -> Result<()> {
-    with_repo(pile, |repo| {
-        let (relations_space, _relations_ws) = load_relations(repo, relations_branch_id)?;
-        let reader_id = resolve_person_id(&relations_space, &by)?;
+fn cmd_ack_all(storage: MessageStorage<'_>, by: String, from: Option<String>) -> Result<()> {
+    let views = storage.views()?;
+    let reader = message::resolve_person(&views.relations.reader, &views.relations.facts, &by)?
+        .require_unique("active person", &by)?;
+    let from = from
+        .as_deref()
+        .map(|selector| {
+            message::resolve_person(&views.relations.reader, &views.relations.facts, selector)?
+                .require_unique("active person", selector)
+        })
+        .transpose()?;
+    let identities = IdentityComponents::from_facts(&views.relations.facts)?;
+    let reads = message::load_read_rows(&views.messages.facts)?;
+    let observed_at = epoch_interval(now_epoch());
+    let mut fragment = Fragment::empty();
+    let mut count = 0usize;
+    for row in message::load_message_rows(&views.messages.facts)? {
+        if !message::is_inbox_message(&row, reader, &views.relations.facts, &identities)?
+            || message::is_read_by(&reads, row.id, reader, &identities)?
+        {
+            continue;
+        }
+        if let Some(from) = from {
+            if !identities.equivalent(row.from, from)? {
+                continue;
+            }
+        }
+        fragment += message::read_fragment(row.id, reader, Some(observed_at)).0;
+        count += 1;
+    }
+    if count == 0 {
+        println!("No unread messages for {}.", fmt_id(reader));
+        return Ok(());
+    }
+    storage.publish(&views, fragment, "local messages bulk read")?;
+    println!("Marked {count} message(s) as read by {}.", fmt_id(reader));
+    Ok(())
+}
 
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let mut change = ensure_metadata(&mut ws)?;
+fn cmd_list(storage: MessageStorage<'_>, reader: String, unread: bool, limit: usize) -> Result<()> {
+    let views = storage.views()?;
+    let reader_id =
+        message::resolve_person(&views.relations.reader, &views.relations.facts, &reader)?
+            .require_unique("active person", &reader)?;
+    let identities = IdentityComponents::from_facts(&views.relations.facts)?;
+    let reads = message::load_read_rows(&views.messages.facts)?;
+    let mut messages = message::load_message_rows(&views.messages.facts)?;
+    messages.sort_by(|left, right| {
+        interval_key(right.created_at)
+            .cmp(&interval_key(left.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
 
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .into_facts();
-        let message_id = resolve_message_id(&space, &id)?;
+    let now = interval_key(epoch_interval(now_epoch()));
+    let mut shown = 0usize;
+    for row in messages {
+        let incoming =
+            message::is_inbox_message(&row, reader_id, &views.relations.facts, &identities)?;
+        let outgoing = message::is_outgoing_message(&row, reader_id, &identities)?;
+        if !incoming && !outgoing {
+            continue;
+        }
+        let read = message::is_read_by(&reads, row.id, reader_id, &identities)?;
+        if unread && !(incoming && !read) {
+            continue;
+        }
 
-        let now = epoch_interval(now_epoch());
-        let read_id = ufoid();
-        change += entity! { &read_id @
-            metadata::tag: &KIND_READ_ID,
-            local::about_message: message_id,
-            local::reader: reader_id,
-            local::read_at: now,
+        let from_label = person_label(&views.relations, row.from)?;
+        let to_label = recipient_label(&views.relations, &row)?;
+        let status = if incoming {
+            if read { "read" } else { "unread" }.to_owned()
+        } else if row.group_snapshot.is_none()
+            && message::is_read_by(&reads, row.id, row.to, &identities)?
+        {
+            format!("read-by:{to_label}")
+        } else {
+            "sent".to_owned()
         };
-
-        ws.commit(change, "local message read");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push read: {e:?}"))?;
-        drop(ws);
-        println!("Marked {} as read by {}.", fmt_id(message_id), reader_id);
-        Ok(())
-    })
-}
-
-/// Bulk analogue of [`cmd_ack`]: mark every unread inbox message for `by` (a
-/// message directed to the reader or a group they belong to, with no existing
-/// read record for them) as read in a SINGLE commit. Optionally restricted to
-/// one sender via `from`. Reuses the exact inbox/unread predicate `cmd_list`
-/// renders, so what it clears is exactly what `list --unread` shows.
-fn cmd_ack_all(
-    pile: &Path,
-    branch_id: Id,
-    relations_branch_id: Id,
-    by: String,
-    from: Option<String>,
-) -> Result<()> {
-    with_repo(pile, |repo| {
-        let (relations_space, _relations_ws) = load_relations(repo, relations_branch_id)?;
-        let reader_id = resolve_person_id(&relations_space, &by)?;
-        let reader_groups = groups_for_member(&relations_space, reader_id);
-        let from_filter = from
-            .as_deref()
-            .map(|f| resolve_person_id(&relations_space, f))
-            .transpose()?;
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let mut change = ensure_metadata(&mut ws)?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .into_facts();
-
-        // Messages this reader has already read (any read record with them as
-        // reader) — the set we skip.
-        let mut read_set: std::collections::HashSet<Id> = std::collections::HashSet::new();
-        for (_read_id, message_id, reader) in find!(
-            (read_id: Id, message_id: Id, reader: Id),
-            pattern!(&space, [{
-                ?read_id @
-                metadata::tag: &KIND_READ_ID,
-                local::about_message: ?message_id,
-                local::reader: ?reader,
-            }])
-        ) {
-            if reader == reader_id {
-                read_set.insert(message_id);
-            }
+        let body = message::read_body(&views.messages.reader, row.body)?;
+        println!(
+            "[{}] {} {} -> {} ({}) {}",
+            fmt_id(row.id),
+            format_age(now, interval_key(row.created_at)),
+            from_label,
+            to_label,
+            status,
+            render_list_body(&body)
+        );
+        shown += 1;
+        if shown >= limit {
+            break;
         }
-
-        let now = epoch_interval(now_epoch());
-        let mut acked = 0usize;
-        for (message_id, msg_from, msg_to) in find!(
-            (message_id: Id, msg_from: Id, msg_to: Id),
-            pattern!(&space, [{
-                ?message_id @
-                metadata::tag: &KIND_MESSAGE_ID,
-                local::from: ?msg_from,
-                local::to: ?msg_to,
-            }])
-        ) {
-            if !is_inbox_message(msg_from, msg_to, reader_id, &reader_groups) {
-                continue; // not in this reader's inbox
-            }
-            if read_set.contains(&message_id) {
-                continue; // already read
-            }
-            if let Some(f) = from_filter {
-                if msg_from != f {
-                    continue; // sender filter
-                }
-            }
-            let read_id = ufoid();
-            change += entity! { &read_id @
-                metadata::tag: &KIND_READ_ID,
-                local::about_message: message_id,
-                local::reader: reader_id,
-                local::read_at: now,
-            };
-            acked += 1;
-        }
-
-        if acked == 0 {
-            println!("No unread messages for {reader_id}.");
-            return Ok(());
-        }
-        ws.commit(change, "local messages bulk read");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push bulk read: {e:?}"))?;
-        drop(ws);
-        println!("Marked {acked} message(s) as read by {reader_id}.");
-        Ok(())
-    })
-}
-
-fn cmd_list(
-    pile: &Path,
-    branch_id: Id,
-    relations_branch_id: Id,
-    reader: String,
-    unread: bool,
-    limit: usize,
-) -> Result<()> {
-    with_repo(pile, |repo| {
-        let (relations_space, mut relations_ws) = load_relations(repo, relations_branch_id)?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
-            .into_facts();
-
-        let mut messages = Vec::new();
-        for (message_id, from, to, body, created_at) in find!(
-            (
-                message_id: Id,
-                from: Id,
-                to: Id,
-                body: TextHandle,
-                created_at: Inline<inlineencodings::NsTAIInterval>
-            ),
-            pattern!(&space, [{
-                ?message_id @
-                metadata::tag: &KIND_MESSAGE_ID,
-                local::from: ?from,
-                local::to: ?to,
-                local::body: ?body,
-                metadata::created_at: ?created_at,
-            }])
-        ) {
-            let body_text = load_text(&mut ws, body)?;
-            messages.push(MessageRow {
-                id: message_id,
-                from,
-                to,
-                body: body_text,
-                created_at: interval_key(created_at),
-            });
-        }
-
-        let mut reads: HashMap<(Id, Id), i128> = HashMap::new();
-        for (_read_id, message_id, reader_id, read_at) in find!(
-            (
-                read_id: Id,
-                message_id: Id,
-                reader_id: Id,
-                read_at: Inline<inlineencodings::NsTAIInterval>
-            ),
-            pattern!(&space, [{
-                ?read_id @
-                metadata::tag: &KIND_READ_ID,
-                local::about_message: ?message_id,
-                local::reader: ?reader_id,
-                local::read_at: ?read_at,
-            }])
-        ) {
-            let key = (message_id, reader_id);
-            let ts = interval_key(read_at);
-            reads
-                .entry(key)
-                .and_modify(|existing| {
-                    if ts > *existing {
-                        *existing = ts;
-                    }
-                })
-                .or_insert(ts);
-        }
-
-        messages.sort_by_key(|msg| msg.created_at);
-        messages.reverse();
-
-        let now_key = interval_key(epoch_interval(now_epoch()));
-        let reader_id = resolve_person_id(&relations_space, &reader)?;
-        let reader_groups = groups_for_member(&relations_space, reader_id);
-        let mut shown = 0usize;
-
-        for msg in messages {
-            let incoming = is_inbox_message(msg.from, msg.to, reader_id, &reader_groups);
-            let outgoing = msg.from == reader_id;
-            if !incoming && !outgoing {
-                continue;
-            }
-
-            let read = reads.get(&(msg.id, reader_id)).copied();
-            if unread && !(incoming && read.is_none()) {
-                continue;
-            }
-
-            let from_label = person_label(&mut relations_ws, &relations_space, msg.from);
-            let to_label = person_label(&mut relations_ws, &relations_space, msg.to);
-            let status = if incoming {
-                if read.is_some() {
-                    "read".to_string()
-                } else {
-                    "unread".to_string()
-                }
-            } else if reads.contains_key(&(msg.id, msg.to)) {
-                format!("read-by:{to_label}")
-            } else {
-                "sent".to_string()
-            };
-            let age = format_age(now_key, msg.created_at);
-            println!(
-                "[{}] {} {} -> {} ({}) {}",
-                fmt_id(msg.id),
-                age,
-                from_label,
-                to_label,
-                status,
-                render_list_body(&msg.body)
-            );
-            shown += 1;
-            if shown >= limit {
-                break;
-            }
-        }
-
-        if shown == 0 {
-            println!("No messages.");
-        }
-
-        drop(ws);
-        Ok(())
-    })
+    }
+    if shown == 0 {
+        println!("No messages.");
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let Some(cmd) = cli.command else {
+    let Some(command) = cli.command else {
         let mut command = Cli::command();
         command.print_help()?;
         println!();
         return Ok(());
     };
-
-    let message_branch_id = with_repo(&cli.pile, |repo| {
-        if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"));
-        }
-        repo.ensure_branch(&cli.branch, None)
-            .map_err(|e| anyhow::anyhow!("ensure message branch: {e:?}"))
-    })?;
-    let relations_branch_id = with_repo(&cli.pile, |repo| {
-        if let Some(hex) = cli.relations_branch_id.as_deref() {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow::anyhow!("invalid relations branch id '{hex}'"));
-        }
-        repo.ensure_branch(&cli.relations_branch, None)
-            .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))
-    })?;
-
-    match cmd {
+    let storage = MessageStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+        scope: cli.scope.unwrap_or(DEFAULT_SCOPE_ID),
+        relations_scope: cli.relations_scope.unwrap_or(DEFAULT_RELATIONS_SCOPE_ID),
+    };
+    match command {
         Command::Send { to, text, from } => {
-            // Sender derivation: --from wins, else $PERSONA (clap env
-            // fallback). A set-but-empty PERSONA counts as unset.
-            let Some(from) = from.map(|f| f.trim().to_string()).filter(|f| !f.is_empty()) else {
+            let Some(from) = from
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+            else {
                 bail!(
-                    "no sender: set $PERSONA or pass --from <label>\n\
-                     usage: message send <TO> <TEXT> [--from <LABEL>]"
+                    "no sender: set $PERSONA or pass --from <person>\n\
+                     usage: message send <TO> <TEXT> [--from <PERSON>]"
                 );
             };
             let text = faculties::text_arg(&text, "message text")?;
-            cmd_send(
-                &cli.pile,
-                message_branch_id,
-                relations_branch_id,
-                text,
-                from,
-                to,
-            )
+            cmd_send(storage, text, from, to)
         }
         Command::List {
             reader,
             unread,
             limit,
-        } => cmd_list(
-            &cli.pile,
-            message_branch_id,
-            relations_branch_id,
-            reader,
-            unread,
-            limit,
-        ),
-        Command::Ack { id, by } => {
-            cmd_ack(&cli.pile, message_branch_id, relations_branch_id, id, by)
-        }
-        Command::AckAll { by, from } => {
-            cmd_ack_all(&cli.pile, message_branch_id, relations_branch_id, by, from)
-        }
+        } => cmd_list(storage, reader, unread, limit),
+        Command::Ack { id, by } => cmd_ack(storage, id, by),
+        Command::AckAll { by, from } => cmd_ack_all(storage, by, from),
     }
 }

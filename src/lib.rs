@@ -36,6 +36,7 @@ pub mod collection_access;
 pub mod discord;
 pub mod files;
 pub mod memory_cover;
+pub mod message;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
 pub mod relations;
