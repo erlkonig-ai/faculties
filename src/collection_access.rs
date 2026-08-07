@@ -18,7 +18,8 @@ use triblespace::core::collection::simplearchive_union::{
 };
 use triblespace::core::collection::{
     discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionResolution, CollectionValidationRequest,
+    CollectionCommit, CollectionData, CollectionDefinition, CollectionResolution,
+    CollectionValidationRequest,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -35,6 +36,73 @@ use triblespace::core::trible::{Fragment, TribleSet};
 pub struct CollectionView {
     pub facts: TribleSet,
     pub reader: PileReader,
+}
+
+/// An explicitly closed writer for repeated publications into one collection.
+///
+/// This is only an ownership seam around an open [`Pile`], one intrinsic
+/// collection definition, and one durable signer. It does not introduce a
+/// head, staging area, checkout, or mutable workspace. Each call to
+/// [`Self::publish_fragment`] remains an independently signed, crash-ordered
+/// collection commit.
+///
+/// Call [`Self::finish`] even when the surrounding operation failed so close
+/// errors remain observable. Dropping the writer without finishing delegates
+/// to [`Pile`]'s loud unclosed-pile warning; `Drop` is not a durability path.
+#[derive(Debug)]
+pub struct CollectionWriter {
+    pile: Option<Pile>,
+    definition: CollectionDefinition,
+    signer: SigningKey,
+}
+
+impl CollectionWriter {
+    /// Open one collection for repeated publication with an existing signer.
+    ///
+    /// The signer is loaded before the pile is touched. Neither a missing key
+    /// nor a corrupt pile is repaired implicitly.
+    pub fn open(pile_path: &Path, key_path: Option<&Path>, scope: Id) -> Result<Self> {
+        let signer = load_signer(pile_path, key_path)?;
+        let definition = simplearchive_union::definition(scope);
+        let pile = open_pile_strict(pile_path)?;
+        Ok(Self {
+            pile: Some(pile),
+            definition,
+            signer,
+        })
+    }
+
+    /// Publish one independent signed fragment without reopening the pile.
+    pub fn publish_fragment(
+        &mut self,
+        content: impl Into<Fragment>,
+        metadata: impl Into<Fragment>,
+    ) -> Result<CollectionCommit> {
+        let pile = self
+            .pile
+            .as_mut()
+            .expect("collection writer is open until consumed by finish");
+        publish_fragment_commit(pile, &self.definition, content, metadata, &self.signer)
+            .context("publish collection fragment")
+    }
+
+    /// Close the pile and combine its result with the surrounding operation.
+    ///
+    /// This makes the common `let result = ...; writer.finish(result)` pattern
+    /// preserve the primary operation error while still observing and
+    /// reporting a simultaneous close failure.
+    pub fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        let pile = self
+            .pile
+            .take()
+            .expect("collection writer can only be finished once");
+        finish_pile(pile, result)
+    }
+
+    /// Explicitly close a successfully used writer.
+    pub fn close(self) -> Result<()> {
+        self.finish(Ok(()))
+    }
 }
 
 /// Resolve the durable signer path for a pile without touching the filesystem.
@@ -95,13 +163,9 @@ pub fn publish_fragment(
     content: impl Into<Fragment>,
     metadata: impl Into<Fragment>,
 ) -> Result<CollectionCommit> {
-    // Loading first ensures a missing key fails before the pile is touched.
-    let signer = load_signer(pile_path, key_path)?;
-    let definition = simplearchive_union::definition(scope);
-    let mut pile = open_pile_strict(pile_path)?;
-    let result = publish_fragment_commit(&mut pile, &definition, content, metadata, &signer)
-        .context("publish collection fragment");
-    finish_pile(pile, result)
+    let mut writer = CollectionWriter::open(pile_path, key_path, scope)?;
+    let result = writer.publish_fragment(content, metadata);
+    writer.finish(result)
 }
 
 /// Materialize one scope under an explicit set of authorized signing keys.
@@ -304,6 +368,27 @@ mod tests {
         let handle = *fact.v::<Handle<LongString>>();
         let text: View<str> = view.reader.get(handle).unwrap();
         assert_eq!(&*text, "reader survives close");
+    }
+
+    #[test]
+    fn writer_publishes_multiple_commits_before_explicit_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key_path = directory.path().join("writer.key");
+        let signer = initialize_signer(&pile, Some(&key_path)).unwrap();
+        let first_kind = id(20);
+        let second_kind = id(21);
+        let first = entity! { metadata::tag: &first_kind };
+        let second = entity! { metadata::tag: &second_kind };
+        let expected = first.clone() + second.clone();
+
+        let mut writer = CollectionWriter::open(&pile, Some(&key_path), id(1)).unwrap();
+        writer.publish_fragment(first, Fragment::empty()).unwrap();
+        writer.publish_fragment(second, Fragment::empty()).unwrap();
+        writer.close().unwrap();
+
+        let view = materialize_scope(&pile, id(1), &allowed(&signer)).unwrap();
+        assert_eq!(view.facts, expected.into_facts());
     }
 
     #[test]

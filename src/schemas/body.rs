@@ -22,7 +22,11 @@ use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, ShortString, U256BE};
 use triblespace::prelude::*;
 
-pub const BODY_BRANCH_NAME: &str = "body";
+/// Stable extrinsic scope for the body's deliberate captures and intents.
+///
+/// Minted with `trible genid` on 2026-08-07:
+/// `7CF255AAA8D79CA997F991183611C6A5`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("7CF255AAA8D79CA997F991183611C6A5");
 
 /// Tag for a deliberate capture (a frame, an audio clip, or a felt touch).
 pub const KIND_CAPTURE: Id = id_hex!("9C26C6EFD09EB2A401EF009FE9229E16");

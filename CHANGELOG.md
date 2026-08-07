@@ -7,8 +7,16 @@ All notable changes to this project will be documented in this file.
 - **Faculties can use the collection calculus without a compatibility model.**
   A narrow shared module opens piles without auto-repair, keeps durable signer
   initialization explicit, publishes self-contained fragments as signed
-  SimpleArchive-union roots, and materializes explicitly authorized scopes as
-  query facts plus an attachment-capable pile reader.
+  SimpleArchive-union roots, keeps repeated publications on an explicitly
+  closed writer, and materializes explicitly authorized scopes as query facts
+  plus an attachment-capable pile reader.
+- **Body persistence is collection-native.** Deliberate captures and intents
+  now use one stable extrinsic scope and durable signer instead of a branch,
+  repository workspace, and ephemeral identity. Publications carry every
+  LongString and RawBytes attachment they reference, equal-time latest-intent
+  selection has a deterministic entity-id tie-break, and hardware-only body
+  commands no longer require a pile. `feel --keep` holds one collection writer
+  for the session and explicitly observes its close result.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile
