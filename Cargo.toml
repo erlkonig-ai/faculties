@@ -149,6 +149,7 @@ base64 = "0.22"             # teams
 blake3 = "1"                # mail (deterministic entity id from Message-Id)
 chrono = { version = "0.4.39", features = ["clock"] }  # orient
 comemo = "0.5.1"            # wiki
+ctrlc = "3.5"               # body (graceful close for kept touch loops)
 dirs = "5"                  # wiki
 dryoc = "0.8"               # secrets (libsodium-compatible pure-Rust crypto)
 hex = "0.4"                 # gauge

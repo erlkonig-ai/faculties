@@ -29,6 +29,8 @@ use hifitime::Epoch;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as PCommand;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use triblespace::core::metadata;
 use triblespace::prelude::*;
@@ -713,10 +715,14 @@ fn cmd_feel(
 ) -> Result<()> {
     if loop_ {
         let session = secs.unwrap_or(300.0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let requested = Arc::clone(&stop);
+        ctrlc::set_handler(move || requested.store(true, Ordering::SeqCst))
+            .context("install Ctrl-C handler")?;
         println!("feeling continuously for {session:.0}s — pet the top of my head whenever; Ctrl-C to stop.");
         let start = Instant::now();
         let mut felt_count = 0usize;
-        while start.elapsed().as_secs_f64() < session {
+        while start.elapsed().as_secs_f64() < session && !stop.load(Ordering::SeqCst) {
             let felt = feel_window(daemon, 3.0);
             if felt.samples > 0 && felt.touched() {
                 felt_count += 1;
@@ -732,7 +738,12 @@ fn cmd_feel(
             }
         }
         println!(
-            "(stopped — felt {felt_count} touch{} this session)",
+            "(stopped{} — felt {felt_count} touch{} this session)",
+            if stop.load(Ordering::SeqCst) {
+                " by request"
+            } else {
+                ""
+            },
             if felt_count == 1 { "" } else { "es" }
         );
         return Ok(());

@@ -16,7 +16,8 @@ All notable changes to this project will be documented in this file.
   LongString and RawBytes attachment they reference, equal-time latest-intent
   selection has a deterministic entity-id tie-break, and hardware-only body
   commands no longer require a pile. `feel --keep` holds one collection writer
-  for the session and explicitly observes its close result.
+  for the session and explicitly observes its close result, including the
+  advertised Ctrl-C stop path.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile
