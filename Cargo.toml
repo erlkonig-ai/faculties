@@ -191,6 +191,9 @@ mary = { path = "../mary", default-features = false, optional = true }
 # RgbImage the pipeline returns can be `.save()`d to a PNG here.
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 # ── patches ────────────────────────────────────────────────────────────────
 # `[patch]` only takes effect from the *root* crate of a build, so mary's own
 # patch section is ignored when mary is consumed as a path dep here. We mirror

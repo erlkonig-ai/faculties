@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Faculties can use the collection calculus without a compatibility model.**
+  A narrow shared module opens piles without auto-repair, keeps durable signer
+  initialization explicit, publishes self-contained fragments as signed
+  SimpleArchive-union roots, and materializes explicitly authorized scopes as
+  query facts plus an attachment-capable pile reader.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile
