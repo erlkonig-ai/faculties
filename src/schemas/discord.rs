@@ -1,38 +1,38 @@
-//! Discord schema: bot-token cache, channel/guild/message identity,
-//! per-channel sync cursors, and log entries.
+//! Discord schema: stable upstream anchors, immutable semantic observations,
+//! attachment occurrences, and explicit ingestion coverage.
 //!
-//! Used by `discord.rs` (the faculty CLI). Messages use the generic
-//! `archive::*` schema for the common shape (author / content /
-//! reply_to / kind_message); this module only owns the Discord-
-//! specific attributes and kinds. Attachment occurrences link to canonical
-//! file records built by the shared `faculties::files` capability.
+//! Used by `discord.rs` (the faculty CLI). Message observations use the generic
+//! `archive::*` schema for their common projection (author / content / reply_to
+//! / kind_message); this module owns only Discord-specific identity and
+//! context. Attachment occurrences link to canonical file records built with
+//! the shared `faculties::files` model.
 //!
 //! ## Identity
 //!
-//! Entity ids are derived intrinsically from the external Discord
-//! snowflake via the identity-only-fragment idiom:
+//! Discord snowflakes are globally unique upstream, but mutable Discord
+//! resources must not become mutable entities in a union-only collection. A
+//! message snowflake therefore derives a stable identity anchor carrying only
+//! [`discord::message_id`]. Each semantic version is a separate intrinsic
+//! observation linked to that anchor through [`discord::message`]. Volatile
+//! REST response state is deliberately absent. Discord users follow the same
+//! pattern: messages point to stable user anchors, while names are independent
+//! profile observations.
 //!
-//! ```rust,ignore
-//! let id_frag = entity! { _ @ discord::message_id: external_handle };
-//! let message_id = id_frag.root().expect("rooted");
-//! let full = entity! { ExclusiveId::force_ref(&message_id) @
-//!     metadata::tag: archive::kind_message,
-//!     archive::author: author_id,
-//!     archive::content: content_handle,
-//!     // ...
-//! } + id_frag;
-//! ```
-//!
-//! Re-ingesting the same external id collapses to the same entity,
-//! so edits update the existing entity rather than spawning a new one.
+//! Coverage is an integer interval `(after_exclusive, through_inclusive]`, not
+//! a scalar high-water mark. Baseline intervals make the intentionally bounded
+//! first import explicit; ordinary intervals may advance a reader only when
+//! they connect to that baseline cover.
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{GenId, Handle};
+use triblespace::prelude::inlineencodings::{GenId, Handle, U256BE};
 use triblespace::prelude::*;
 
-pub const DEFAULT_BRANCH: &str = "discord";
-pub const DEFAULT_LOG_BRANCH: &str = "logs";
+/// Stable extrinsic scope of the Discord observation collection.
+///
+/// Minted with `trible genid` on 2026-08-07:
+/// `908A81B67AF50D568C3863E7D6708EEB`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("908A81B67AF50D568C3863E7D6708EEB");
 
 pub mod discord {
     use super::*;
@@ -42,6 +42,18 @@ pub mod discord {
         "E3022EC14FD000BB8556CD32C2C68E59" as pub guild: GenId;
         /// Link from a message entity to its channel.
         "B8EA57CD650A678ACA5D1479BF195C4C" as pub channel: GenId;
+        /// Link from an immutable message observation to the stable identity
+        /// anchor derived from the upstream Discord message snowflake.
+        ///
+        /// Minted with `trible genid` on 2026-08-07:
+        /// `4B9C024EDD627A4E8786E01B196FDF16`.
+        "4B9C024EDD627A4E8786E01B196FDF16" as pub message: GenId;
+        /// Link from an immutable Discord profile observation to its stable
+        /// Discord user anchor.
+        ///
+        /// Minted with `trible genid` on 2026-08-08:
+        /// `CE2A12E5A260253138C86DD2D15654C7`.
+        "CE2A12E5A260253138C86DD2D15654C7" as pub user: GenId;
         /// External Discord snowflake for a guild (server). Stored
         /// as a string — Discord ids are u64 but the REST API
         /// ships them as strings to survive JavaScript clients.
@@ -52,20 +64,18 @@ pub mod discord {
         "758C42164B566C2AFECBCD7129163A34" as pub message_id: Handle<LongString>;
         /// External Discord snowflake for a user.
         "2A74F35C6720A0C60BF43D30DF272F85" as pub user_id: Handle<LongString>;
-        /// Full Discord JSON body of a message. Stored raw so
-        /// future code can derive additional fields without
-        /// re-fetching.
-        "5B9DCF6170CD775FC5DA22C8DB96599D" as pub message_raw: Handle<LongString>;
-        /// Bot token (passed to the REST API as `Authorization:
-        /// Bot <token>`). One token per bot identity; a caller
-        /// who operates multiple bots would tag the token entity
-        /// with a different `kind` or a user-scoped id.
-        "E20FEC3E1714D5EDC556936AE1C0F463" as pub bot_token: Handle<LongString>;
-        /// Per-channel pagination cursor — the snowflake of the
-        /// newest message we ingested. Next sync fetches
-        /// `?after=<cursor>`. Stored as a LongString handle for
-        /// consistency with the other snowflake attributes.
-        "3C510E125ACE09DC9B297D533C0F13B7" as pub cursor_last_message_id: Handle<LongString>;
+        /// Exclusive lower endpoint of one fully persisted numeric coverage
+        /// interval.
+        ///
+        /// Minted with `trible genid` on 2026-08-08:
+        /// `A37BBC85528AF14B6C20280886B7A537`.
+        "A37BBC85528AF14B6C20280886B7A537" as pub receipt_after_exclusive: U256BE;
+        /// Inclusive upper endpoint of one fully persisted numeric coverage
+        /// interval.
+        ///
+        /// Minted with `trible genid` on 2026-08-07:
+        /// `8B9F2C90AB42911696E17F49974CD28B`.
+        "8B9F2C90AB42911696E17F49974CD28B" as pub receipt_through_inclusive: U256BE;
     }
 
     /// Root id for describing the Discord protocol in metadata.
@@ -79,13 +89,29 @@ pub mod discord {
     /// Tag for Discord channel entities.
     #[allow(non_upper_case_globals)]
     pub const kind_channel: Id = id_hex!("7812454E8EFBB87245AE770B48EFC611");
-    /// Tag for per-channel sync cursors.
+    /// Tag for stable Discord user anchors.
+    ///
+    /// Minted with `trible genid` on 2026-08-08:
+    /// `3548F7AC7E229BCFAD1347FEC256C25C`.
     #[allow(non_upper_case_globals)]
-    pub const kind_cursor: Id = id_hex!("4BB2A6C06AF842F1C24C5A6A1386E810");
-    /// Tag for the bot-token cache entity.
+    pub const kind_user: Id = id_hex!("3548F7AC7E229BCFAD1347FEC256C25C");
+    /// Tag for immutable observed Discord user profiles.
+    ///
+    /// Minted with `trible genid` on 2026-08-08:
+    /// `B1751751B2DDFDF166D4EF0DA8D53D13`.
     #[allow(non_upper_case_globals)]
-    pub const kind_token: Id = id_hex!("E630CD6620C35F3CAE02945A9962B2C5");
-    /// Tag for Discord sync log entries.
+    pub const kind_user_profile: Id = id_hex!("B1751751B2DDFDF166D4EF0DA8D53D13");
+    /// Tag for a fully successful forward-ingestion interval.
+    ///
+    /// Minted with `trible genid` on 2026-08-07:
+    /// `EB592647E59EBBF07E7221DDC746A2B6`.
     #[allow(non_upper_case_globals)]
-    pub const kind_log: Id = id_hex!("AED1F7A81D9D23F929C4AAF747888235");
+    pub const kind_ingestion_receipt: Id = id_hex!("EB592647E59EBBF07E7221DDC746A2B6");
+    /// Tag for the explicit bounded-history baseline established by a first
+    /// import. Older snowflakes are intentionally outside its claim.
+    ///
+    /// Minted with `trible genid` on 2026-08-08:
+    /// `D5CE5556F159FE3F34A67A87DB105281`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_ingestion_baseline: Id = id_hex!("D5CE5556F159FE3F34A67A87DB105281");
 }

@@ -1,60 +1,46 @@
+//! Discord observation faculty.
 //!
-//! # Discord faculty
+//! The faculty stores complete, immutable message observations in one
+//! SimpleArchive-union collection. Discord snowflakes identify stable anchors;
+//! mutable payloads never accumulate conflicting values on those anchors.
+//! Replaying an identical REST payload converges on the same intrinsic
+//! observation, while an edit creates a new observation linked to the same
+//! message anchor.
 //!
-//! Ingests Discord channel messages into a TribleSpace pile and
-//! posts new messages on request. Bot-token only — no OAuth2 dance.
-//! Paste the token once (`discord login @token.txt`); it's cached
-//! in the pile under a `kind_token` entity and reused on every
-//! subsequent call.
+//! Forward progress is represented by immutable numeric intervals. The first
+//! bounded import establishes an explicit baseline immediately before its
+//! oldest returned message. Later reads backpaginate to the connected frontier
+//! before publishing one interval in the same signed COMMIT as every message
+//! and attachment it covers. A bounded recent-window fetch also reconciles
+//! edits. The REST API cannot prove deletions or edits outside that window;
+//! future Gateway tombstones can be modeled as another immutable observation
+//! kind.
 //!
-//! Messages land on the `discord` branch using the generic
-//! `archive::*` schema (author / content / reply_to / kind_message)
-//! so downstream consumers don't care which protocol they came
-//! from. Discord-specific context (guild, channel, external
-//! snowflakes, raw JSON) lives under the `discord::*` attributes.
-//!
-//! Entity ids are derived intrinsically from the external
-//! snowflake via the identity-only-fragment idiom — re-ingesting
-//! the same message collapses to the same entity, so edits and
-//! re-runs are idempotent.
-//!
-//! ## MVP scope
-//!
-//! - `discord login <token>` — cache bot token in the pile.
-//! - `discord send <channel_id> <text>` — POST a message.
-//! - `discord read <channel_id>` — GET recent messages, ingest
-//!   into the pile (per-channel cursor stored as
-//!   `discord::cursor_last_message_id` so successive calls are
-//!   incremental).
-//!
-//! Guild/channel listing and attachment ingestion are supported. A gateway
-//! websocket for real-time events remains a follow-up.
+//! Bot credentials are deliberately external input. This faculty neither
+//! claims the historical shared logs branch nor stores mutable secrets in the
+//! logical Discord dataset.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
 use hifitime::{Epoch, TimeScale};
-use rand_core::OsRng;
 use reqwest::blocking::Client;
 use serde_json::{json, Value as JsonValue};
 
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
-use triblespace::prelude::*;
-
+use faculties::collection_access::{self, CollectionSnapshot, CollectionView};
+use faculties::discord as discord_model;
 use faculties::files as file_capability;
 use faculties::schemas::archive::archive;
-use faculties::schemas::discord::{discord, DEFAULT_BRANCH, DEFAULT_LOG_BRANCH};
-use faculties::schemas::files::FILES_BRANCH_NAME;
+use faculties::schemas::discord::{discord, DEFAULT_SCOPE_ID};
+use triblespace::core::collection::CollectionCommit;
+use triblespace::core::metadata;
+use triblespace::prelude::inlineencodings::NsTAIInterval;
+use triblespace::prelude::*;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
@@ -65,66 +51,55 @@ const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
     about = "Post to and ingest Discord channels into TribleSpace"
 )]
 struct Cli {
-    /// Path to the pile file to write into.
+    /// Path to the pile file to use.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name to write into (created if missing).
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
-    /// Branch id (hex). Overrides `--branch`.
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it;
+    /// initialize explicitly with trible pile signing-key init.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Extrinsic collection scope for Discord observations. Defaults to the
+    /// stable Discord scope declared by this faculty.
+    #[arg(long, value_parser = parse_id_arg)]
+    scope: Option<Id>,
+    /// Discord bot token. Use @path or @- to avoid exposing it in argv.
+    #[arg(long, env = "DISCORD_TOKEN")]
+    token: Option<String>,
     #[command(subcommand)]
     command: Option<CommandMode>,
 }
 
 #[derive(Subcommand)]
 enum CommandMode {
-    /// Cache a Discord bot token in the pile. Subsequent calls
-    /// read it from the pile — no need to re-pass it.
-    Login {
-        /// Bot token (from the Discord developer portal). Use
-        /// `@path` to read from a file or `@-` for stdin.
-        token: String,
-    },
-    /// Post a message to a Discord channel.
+    /// Post a message and persist the returned Discord observation.
     Send {
-        /// Channel id (external Discord snowflake).
+        /// Channel id (global Discord snowflake).
         channel_id: String,
         /// Message body. Use @path for file input or @- for stdin.
         text: String,
     },
-    /// Pull recent messages into the pile, then print the newest
-    /// ones. If no channel is specified, polls every channel the
-    /// bot can see (iterating via `/users/@me/guilds` +
-    /// `/guilds/{id}/channels`) — Discord has no cross-channel
-    /// delta stream the way Graph does, so the faculty does the
-    /// fan-out itself. Successive runs are incremental: each
-    /// channel has its own cursor.
+    /// Pull one complete forward interval plus a bounded recent window.
     Read {
-        /// Channel id (external Discord snowflake). If omitted,
-        /// polls every text-capable channel the bot can see.
+        /// Channel id (global Discord snowflake). If omitted, poll every
+        /// visible text-capable channel.
         channel_id: Option<String>,
-        /// Only show messages at or after this timestamp
-        /// (RFC3339: e.g. `2026-04-24T12:00:00Z`).
+        /// Only display messages at or after this RFC3339 timestamp.
         #[arg(long)]
         since: Option<String>,
-        /// Max messages to print from the pile after ingest
-        /// (0 = no limit).
+        /// Maximum messages to display after ingestion (0 = no limit).
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Print newest first (default: oldest first).
+        /// Display newest first.
         #[arg(long)]
         descending: bool,
-        /// Max messages to fetch *per channel call* (1–100,
-        /// Discord's API cap).
-        #[arg(long, default_value_t = 50)]
+        /// Maximum messages per forward page (Discord caps this at 100).
+        #[arg(long, default_value_t = 100)]
         fetch_limit: u32,
+        /// Recent messages re-fetched to observe bounded-window edits.
+        #[arg(long, default_value_t = 50)]
+        reconcile_limit: u32,
     },
-    /// List guilds (servers) + their text channels visible to the
-    /// bot. Answers the "what can the bot see?" diagnostic — if a
-    /// channel you expect isn't listed, the bot needs to be
-    /// invited / granted access on Discord's side first.
+    /// List guilds and channels visible to the bot.
     Channels {
         #[command(subcommand)]
         command: ChannelsCommand,
@@ -133,285 +108,131 @@ enum CommandMode {
 
 #[derive(Subcommand)]
 enum ChannelsCommand {
-    /// Print guilds + channels.
+    /// Print guilds and channels.
     List {
-        /// Only show channels in this guild (snowflake id).
+        /// Only show channels in this guild (global Discord snowflake).
         #[arg(long)]
         guild: Option<String>,
     },
 }
 
-#[derive(Clone, Debug)]
-struct DiscordConfig {
-    pile_path: PathBuf,
-    #[allow(dead_code)]
-    branch: String,
-    branch_id: Id,
-    log_branch_id: Id,
-    files_branch_id: Id,
+#[derive(Clone, Copy)]
+struct DiscordStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+    scope: Id,
+}
+
+impl DiscordStorage<'_> {
+    fn view(&self) -> Result<CollectionView> {
+        let signer = collection_access::load_signer(self.pile, self.key)?;
+        let allowed = HashSet::from([signer.verifying_key()]);
+        CollectionSnapshot::open(self.pile)?.materialize_scope(self.scope, &allowed)
+    }
+
+    fn publish(&self, content: Fragment, description: String) -> Result<CollectionCommit> {
+        collection_access::publish_fragment(
+            self.pile,
+            self.key,
+            self.scope,
+            content,
+            entity! { metadata::description: description },
+        )
+    }
+}
+
+fn parse_id_arg(raw: &str) -> std::result::Result<Id, String> {
+    Id::from_hex(raw.trim()).ok_or_else(|| format!("invalid id '{raw}'"))
 }
 
 fn main() -> Result<()> {
-    let mut cli = Cli::parse();
-    let Some(mode) = cli.command.take() else {
+    let cli = Cli::parse();
+    let Some(command) = cli.command.as_ref() else {
         let mut command = Cli::command();
         command.print_help()?;
         println!();
         return Ok(());
     };
-    let config = build_config(&cli)?;
+    let token = cli
+        .token
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing Discord token; pass --token, DISCORD_TOKEN, @path, or @-"))
+        .and_then(|raw| load_value_or_file_trimmed(raw, "Discord token"))?;
+    if token.is_empty() {
+        bail!("empty Discord token");
+    }
+    let storage = DiscordStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+        scope: cli.scope.unwrap_or(DEFAULT_SCOPE_ID),
+    };
 
-    match mode {
-        CommandMode::Login { token } => login(config, token),
-        CommandMode::Send { channel_id, text } => send(config, channel_id, text),
+    match command {
+        CommandMode::Send { channel_id, text } => send(storage, &token, channel_id, text),
         CommandMode::Read {
             channel_id,
             since,
             limit,
             descending,
             fetch_limit,
+            reconcile_limit,
         } => read(
-            config,
+            storage,
+            &token,
             ReadOptions {
-                channel_id,
-                since,
-                limit,
-                descending,
-                fetch_limit,
+                channel_id: channel_id.clone(),
+                since: since.clone(),
+                limit: *limit,
+                descending: *descending,
+                fetch_limit: (*fetch_limit).clamp(1, 100),
+                reconcile_limit: (*reconcile_limit).clamp(1, 100),
             },
         ),
         CommandMode::Channels { command } => match command {
-            ChannelsCommand::List { guild } => list_channels(config, guild),
+            ChannelsCommand::List { guild } => list_channels(&token, guild.as_deref()),
         },
     }
 }
 
-// ── config / pile plumbing ───────────────────────────────────────
-
-fn build_config(cli: &Cli) -> Result<DiscordConfig> {
-    let pile_path = cli.pile.clone();
-    let branch = cli.branch.clone();
-    let log_branch = DEFAULT_LOG_BRANCH.to_string();
-    let branch_id = with_repo(&pile_path, |repo| {
-        if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
-        }
-        repo.ensure_branch(&branch, None)
-            .map_err(|e| anyhow!("ensure discord branch: {e:?}"))
-    })?;
-    let log_branch_id = with_repo(&pile_path, |repo| {
-        repo.ensure_branch(&log_branch, None)
-            .map_err(|e| anyhow!("ensure logs branch: {e:?}"))
-    })?;
-    let files_branch_id = with_repo(&pile_path, |repo| {
-        repo.ensure_branch(FILES_BRANCH_NAME, None)
-            .map_err(|e| anyhow!("ensure files branch: {e:?}"))
-    })?;
-    Ok(DiscordConfig {
-        pile_path,
-        branch,
-        branch_id,
-        log_branch_id,
-        files_branch_id,
-    })
-}
-
-fn open_pile(path: &PathBuf) -> Result<Pile> {
-    Pile::open(path).with_context(|| format!("open pile {}", path.display()))
-}
-
-fn with_repo<T>(
-    pile_path: &PathBuf,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
-    let pile = open_pile(pile_path)?;
-    let repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .map_err(|e| anyhow!("create repository: {e:?}"))?;
-    with_repo_close(repo, f)
-}
-
-fn with_repo_close<T, F>(repo: Repository<Pile>, f: F) -> Result<T>
-where
-    F: FnOnce(&mut Repository<Pile>) -> Result<T>,
-{
-    let mut repo = repo;
-    let result = f(&mut repo);
-    let pile = repo.into_storage();
-    let close_res = pile.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
-fn log_event(config: &DiscordConfig, level: &str, message: &str) -> Result<()> {
-    with_repo(&config.pile_path, |repo| {
-        let mut ws = repo
-            .pull(config.log_branch_id)
-            .map_err(|e| anyhow!("pull logs: {e:?}"))?;
-        let level_handle = ws.put(level.to_string());
-        let message_handle = ws.put(message.to_string());
-        let change = entity! { _ @
-            metadata::tag: discord::kind_log,
-            metadata::created_at: epoch_interval(now_epoch()),
-            archive::author_role: level_handle,
-            archive::content: message_handle,
-        };
-        ws.commit(change, &format!("discord {level}"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push logs: {e:?}"))?;
-        Ok(())
-    })
-}
-
-// ── token cache ──────────────────────────────────────────────────
-
-fn login(config: DiscordConfig, raw_token: String) -> Result<()> {
-    let token = load_value_or_file_trimmed(&raw_token, "token")?;
-    if token.is_empty() {
-        bail!("empty token");
-    }
-
-    with_repo(&config.pile_path, |repo| {
-        let mut ws = repo
-            .pull(config.branch_id)
-            .map_err(|e| anyhow!("pull discord: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout discord: {e:?}"))?
-            .into_facts();
-
-        // Identity fragment for the bot-token entity — keyed on
-        // `kind_token` alone, so there's exactly one token entity
-        // per pile. Re-running `login` updates the token on the
-        // same entity rather than minting a new one.
-        let id_frag = entity! { _ @ metadata::tag: discord::kind_token };
-        let token_id = id_frag.root().ok_or_else(|| anyhow!("token id rooted"))?;
-
-        let token_handle = ws.put(token);
-        let mut change = id_frag;
-        change += entity! { ExclusiveId::force_ref(&token_id) @
-            discord::bot_token: token_handle,
-        };
-
-        let delta = change.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(delta, "discord: store bot token");
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push discord: {e:?}"))?;
-        }
-        Ok(())
-    })?;
-
-    log_event(&config, "info", "bot token cached")?;
-    println!("Token cached in pile.");
-    Ok(())
-}
-
-fn load_bot_token(config: &DiscordConfig) -> Result<String> {
-    let token: Result<Option<String>> = with_repo(&config.pile_path, |repo| {
-        let mut ws = repo
-            .pull(config.branch_id)
-            .map_err(|e| anyhow!("pull discord: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout discord: {e:?}"))?
-            .into_facts();
-        // Find any (entity, bot_token-handle) pair. There's at
-        // most one by construction (kind_token is intrinsic-id'd
-        // from just the tag).
-        for (_tok, handle) in find!(
-            (tok: Id, handle: Inline<Handle<LongString>>),
-            pattern!(&catalog, [{
-                ?tok @
-                metadata::tag: discord::kind_token,
-                discord::bot_token: ?handle,
-            }])
-        ) {
-            let view: View<str> = ws
-                .get(handle)
-                .map_err(|e| anyhow!("get token bytes: {e:?}"))?;
-            return Ok(Some(view.to_string()));
-        }
-        Ok(None)
-    });
-    token?.ok_or_else(|| anyhow!("no bot token cached; run `discord login <token>` first"))
-}
-
-// ── send ─────────────────────────────────────────────────────────
-
-fn send(config: DiscordConfig, channel_id: String, raw_text: String) -> Result<()> {
-    let token = load_bot_token(&config)?;
-    let text = faculties::text_arg(&raw_text, "message text")?;
+fn send(storage: DiscordStorage<'_>, token: &str, channel_id: &str, raw_text: &str) -> Result<()> {
+    discord_model::validate_snowflake(channel_id).context("invalid channel id")?;
+    let text = faculties::text_arg(raw_text, "message text")?;
     if text.trim().is_empty() {
         bail!("empty message body");
     }
 
+    // Fail before the external side effect if this process has no durable
+    // collection authority.
+    collection_access::load_signer(storage.pile, storage.key)?;
+
     let client = build_client()?;
     let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
-    let resp = client
+    let response = client
         .post(&url)
         .header("Authorization", format!("Bot {token}"))
         .header("Content-Type", "application/json")
         .body(json!({ "content": text }).to_string())
         .send()
         .with_context(|| format!("POST {url}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
         bail!("discord send failed ({status}): {body}");
     }
 
-    let json: JsonValue = resp.json().context("parse send response")?;
-    let message_id = json
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<unknown>");
-    log_event(
-        &config,
-        "info",
-        &format!("sent message {message_id} to channel {channel_id}"),
+    let payload: JsonValue = response.json().context("parse send response")?;
+    let messages = parse_messages(vec![payload], channel_id)?;
+    let message_id = messages
+        .first()
+        .map(|message| message.external_id.as_str())
+        .ok_or_else(|| anyhow!("Discord send response contained no message"))?;
+    let fragment = build_ingest_fragment(&messages, None, fetch_attachment_bytes)?;
+    storage.publish(
+        fragment,
+        format!("discord: sent and observed message {message_id} in channel {channel_id}"),
     )?;
-    println!("Sent message {message_id} to channel {channel_id}");
+    println!("Sent and stored message {message_id} in channel {channel_id}");
     Ok(())
-}
-
-// ── read ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-struct IncomingMessage {
-    external_id: String,
-    raw_json: String,
-    channel_external_id: String,
-    author_external_id: String,
-    author_display_name: String,
-    content: String,
-    created_at: Inline<NsTAIInterval>,
-    /// Present only on edited messages. Re-ingesting an edited
-    /// message updates this attribute on the existing entity.
-    edited_at: Option<Inline<NsTAIInterval>>,
-    reply_to_external_id: Option<String>,
-    attachments: Vec<AttachmentSource>,
-}
-
-#[derive(Debug, Clone)]
-struct AttachmentSource {
-    /// Discord attachment snowflake — the external identity used
-    /// to derive the attachment entity's intrinsic id via
-    /// `archive::attachment_source_id`.
-    source_id: String,
-    /// CDN URL Discord serves the file from. Open (no auth) for
-    /// discord.com attachments; we still user-agent the request.
-    url: String,
-    /// Original filename as uploaded.
-    filename: String,
-    /// MIME type Discord reports. May be missing for legacy
-    /// attachments; caller falls back to "application/octet-stream".
-    content_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -421,20 +242,24 @@ struct ReadOptions {
     limit: usize,
     descending: bool,
     fetch_limit: u32,
+    reconcile_limit: u32,
 }
 
-fn read(config: DiscordConfig, options: ReadOptions) -> Result<()> {
-    let token = load_bot_token(&config)?;
-    let fetch_limit = options.fetch_limit.clamp(1, 100);
-
+fn read(storage: DiscordStorage<'_>, token: &str, options: ReadOptions) -> Result<()> {
     match options.channel_id.as_deref() {
-        Some(id) => {
-            pull_channel(&config, &token, id, fetch_limit)?;
+        Some(channel_id) => {
+            pull_channel(
+                storage,
+                token,
+                channel_id,
+                options.fetch_limit,
+                options.reconcile_limit,
+            )?;
         }
         None => {
-            let channels = list_visible_text_channels(&token)?;
+            let channels = list_visible_text_channels(token)?;
             if channels.is_empty() {
-                println!("Bot is not in any guilds (or has no text-capable channels).");
+                println!("Bot is not in any guilds or has no text-capable channels.");
                 return Ok(());
             }
             println!(
@@ -442,133 +267,652 @@ fn read(config: DiscordConfig, options: ReadOptions) -> Result<()> {
                 channels.len(),
                 channels
                     .iter()
-                    .map(|c| c.guild_id.as_str())
-                    .collect::<std::collections::HashSet<_>>()
+                    .map(|channel| channel.guild_id.as_str())
+                    .collect::<HashSet<_>>()
                     .len()
             );
-            for ch in &channels {
-                if let Err(err) = pull_channel(&config, &token, &ch.id, fetch_limit) {
-                    let _ = log_event(
-                        &config,
-                        "warn",
-                        &format!("poll failed for channel {} ({}): {err:?}", ch.id, ch.name),
-                    );
-                    eprintln!("  ! {}: {err}", ch.id);
+            for channel in &channels {
+                if let Err(error) = pull_channel(
+                    storage,
+                    token,
+                    &channel.id,
+                    options.fetch_limit,
+                    options.reconcile_limit,
+                ) {
+                    eprintln!("  ! {} ({}): {error:#}", channel.id, channel.name);
                 }
             }
         }
     }
 
-    print_history(&config, &options)?;
-    Ok(())
+    print_history(storage, &options)
 }
 
-/// Sync one channel from Discord into the pile: fetch via REST
-/// using the stored cursor (if any), ingest messages +
-/// attachments, advance the cursor to the newest snowflake seen.
+/// Fetch a complete forward interval and one bounded recent reconciliation
+/// window. The interval is appended only after every semantic payload and file
+/// has been staged successfully.
 fn pull_channel(
-    config: &DiscordConfig,
+    storage: DiscordStorage<'_>,
     token: &str,
     channel_id: &str,
     fetch_limit: u32,
+    reconcile_limit: u32,
 ) -> Result<()> {
-    let cursor = load_channel_cursor(config, channel_id)?;
+    discord_model::validate_snowflake(channel_id).context("invalid channel id")?;
+    let view = storage.view()?;
+    let channel = discord_model::channel_fragment(channel_id)?
+        .root()
+        .expect("intrinsic channel has one root");
+    let prior = discord_model::channel_coverage(&view.facts, channel)?;
+    let forward = fetch_complete_forward(
+        prior.map(|coverage| coverage.through_inclusive),
+        fetch_limit,
+        |request| fetch_message_page(token, channel_id, request),
+    )?;
+    let recent_payloads = if prior.is_some() {
+        fetch_message_page(
+            token,
+            channel_id,
+            PageRequest {
+                after: None,
+                before: None,
+                limit: reconcile_limit,
+            },
+        )?
+    } else {
+        Vec::new()
+    };
 
-    // `after=<id>` returns messages newer than `id`. Without a
-    // cursor we get the most-recent `fetch_limit` messages (in
-    // reverse order), which we normalise below.
-    let client = build_client()?;
-    let mut url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages?limit={fetch_limit}");
-    if let Some(c) = cursor.as_deref() {
-        url.push_str(&format!("&after={c}"));
+    let mut payloads = forward.payloads;
+    payloads.extend(recent_payloads);
+    let messages = parse_messages(payloads, channel_id)?;
+    if messages.is_empty() {
+        println!("  {channel_id}: no observations");
+        return Ok(());
     }
-    let resp = client
+
+    let fragment = build_ingest_fragment(&messages, forward.coverage, fetch_attachment_bytes)?;
+    let description = match forward.coverage {
+        Some(interval) => format!(
+            "discord: observed {} payloads in channel {channel_id}, covered ({}, {}]{}",
+            messages.len(),
+            interval.after_exclusive,
+            interval.through_inclusive,
+            if interval.baseline {
+                " from bounded baseline"
+            } else {
+                ""
+            },
+        ),
+        None => format!(
+            "discord: reconciled {} recent payloads in channel {channel_id}",
+            messages.len()
+        ),
+    };
+    storage.publish(fragment, description)?;
+    match forward.coverage {
+        Some(interval) => println!(
+            "  {channel_id}: {} observations; covered ({}, {}]{}",
+            messages.len(),
+            interval.after_exclusive,
+            interval.through_inclusive,
+            if interval.baseline {
+                " (bounded baseline)"
+            } else {
+                ""
+            },
+        ),
+        None => println!("  {channel_id}: {} reconciled observations", messages.len()),
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PageRequest {
+    after: Option<u64>,
+    before: Option<u64>,
+    limit: u32,
+}
+
+#[derive(Debug)]
+struct ForwardBatch {
+    payloads: Vec<JsonValue>,
+    coverage: Option<discord_model::CoverageInterval>,
+}
+
+fn fetch_message_page(
+    token: &str,
+    channel_id: &str,
+    request: PageRequest,
+) -> Result<Vec<JsonValue>> {
+    let mut url = format!(
+        "{DISCORD_API_BASE}/channels/{channel_id}/messages?limit={}",
+        request.limit.clamp(1, 100)
+    );
+    if let Some(after) = request.after {
+        url.push_str("&after=");
+        url.push_str(&after.to_string());
+    }
+    if let Some(before) = request.before {
+        url.push_str("&before=");
+        url.push_str(&before.to_string());
+    }
+    let response = build_client()?
         .get(&url)
         .header("Authorization", format!("Bot {token}"))
         .send()
         .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
         bail!("discord read failed ({status}): {body}");
     }
-    let messages: Vec<JsonValue> = resp.json().context("parse read response")?;
+    response.json().context("parse Discord message page")
+}
+
+/// Discord returns message pages newest first. When a forward page is full we
+/// must walk backwards from its smallest id until crossing the prior frontier;
+/// otherwise a burst larger than `limit` would publish a cursor past messages
+/// it never ingested.
+fn fetch_complete_forward<F>(
+    prior_frontier: Option<u64>,
+    limit: u32,
+    mut fetch: F,
+) -> Result<ForwardBatch>
+where
+    F: FnMut(PageRequest) -> Result<Vec<JsonValue>>,
+{
+    let limit = limit.clamp(1, 100);
+    let first_request = PageRequest {
+        after: prior_frontier,
+        before: None,
+        limit,
+    };
+    let mut payloads = fetch(first_request)?;
+    let mut ids = checked_page_ids(&payloads, limit)?;
+    if ids.is_empty() {
+        return Ok(ForwardBatch {
+            payloads,
+            coverage: None,
+        });
+    }
+
+    if let Some(frontier) = prior_frontier {
+        if ids.iter().any(|id| *id <= frontier) {
+            bail!("Discord after={frontier} page returned a non-forward message");
+        }
+    }
+    let through = *ids.iter().max().expect("non-empty id page");
+
+    if let Some(frontier) = prior_frontier {
+        let mut before = *ids.iter().min().expect("non-empty id page");
+        while ids.len() == limit as usize {
+            let page = fetch(PageRequest {
+                after: None,
+                before: Some(before),
+                limit,
+            })?;
+            let page_ids = checked_page_ids(&page, limit)?;
+            if page_ids.is_empty() {
+                break;
+            }
+            if page_ids.iter().any(|id| *id >= before) {
+                bail!("Discord before={before} page did not move backwards");
+            }
+            let reached_frontier = page_ids.iter().any(|id| *id <= frontier);
+            let short_page = page_ids.len() < limit as usize;
+            payloads.extend(
+                page.into_iter()
+                    .zip(page_ids.iter().copied())
+                    .filter_map(|(payload, id)| {
+                        (id > frontier && id <= through).then_some(payload)
+                    }),
+            );
+            before = *page_ids.iter().min().expect("non-empty id page");
+            if reached_frontier || short_page {
+                break;
+            }
+            ids = page_ids;
+        }
+        Ok(ForwardBatch {
+            payloads,
+            coverage: Some(discord_model::CoverageInterval::new(
+                frontier, through, false,
+            )?),
+        })
+    } else {
+        let minimum = *ids.iter().min().expect("non-empty baseline page");
+        Ok(ForwardBatch {
+            payloads,
+            coverage: Some(discord_model::CoverageInterval::new(
+                minimum.saturating_sub(1),
+                through,
+                true,
+            )?),
+        })
+    }
+}
+
+fn checked_page_ids(payloads: &[JsonValue], limit: u32) -> Result<Vec<u64>> {
+    if payloads.len() > limit as usize {
+        bail!(
+            "Discord returned {} messages for a page limited to {limit}",
+            payloads.len()
+        );
+    }
+    let ids = payload_ids(payloads)?;
+    if ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len() {
+        bail!("Discord returned duplicate message ids within one page");
+    }
+    Ok(ids)
+}
+
+fn payload_ids(payloads: &[JsonValue]) -> Result<Vec<u64>> {
+    payloads
+        .iter()
+        .map(|payload| {
+            let raw = payload
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("Discord message payload missing id"))?;
+            discord_model::validate_snowflake(raw)
+                .with_context(|| format!("invalid Discord message id '{raw}'"))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct IncomingMessage {
+    external_id: String,
+    channel_external_id: String,
+    author_external_id: String,
+    author_display_name: Option<String>,
+    content: String,
+    created_at: Inline<NsTAIInterval>,
+    edited_at: Option<Inline<NsTAIInterval>>,
+    reply_to_external_id: Option<String>,
+    attachments: Vec<AttachmentSource>,
+}
+
+#[derive(Debug, Clone)]
+struct AttachmentSource {
+    source_id: String,
+    /// Ephemeral transport locator. Discord signs and refreshes this value; it
+    /// must never participate in semantic identity or equality.
+    url: String,
+    filename: String,
+    content_type: Option<String>,
+}
+
+fn parse_messages(
+    payloads: Vec<JsonValue>,
+    expected_channel_id: &str,
+) -> Result<Vec<IncomingMessage>> {
+    discord_model::validate_snowflake(expected_channel_id)
+        .context("invalid expected channel id")?;
+    let mut messages = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let external_id = required_snowflake(&payload, "id", "message")?;
+        if let Some(actual_channel) = payload.get("channel_id").and_then(JsonValue::as_str) {
+            discord_model::validate_snowflake(actual_channel)
+                .context("invalid message channel_id")?;
+            if actual_channel != expected_channel_id {
+                bail!(
+                    "Discord returned message {external_id} for channel {actual_channel}, expected {expected_channel_id}"
+                );
+            }
+        }
+        let content = payload
+            .get("content")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let author = payload
+            .get("author")
+            .ok_or_else(|| anyhow!("message {external_id} missing author"))?;
+        let author_external_id = required_snowflake(author, "id", "message author")?;
+        let author_display_name = author
+            .get("global_name")
+            .and_then(JsonValue::as_str)
+            .or_else(|| author.get("username").and_then(JsonValue::as_str))
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        let timestamp = payload
+            .get("timestamp")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("message {external_id} missing timestamp"))?;
+        let created_at =
+            parse_iso8601(timestamp).with_context(|| format!("parse timestamp '{timestamp}'"))?;
+        let edited_at = payload
+            .get("edited_timestamp")
+            .and_then(JsonValue::as_str)
+            .map(parse_iso8601)
+            .transpose()
+            .with_context(|| format!("parse edited timestamp for message {external_id}"))?;
+        let reply_to_external_id = payload
+            .get("referenced_message")
+            .and_then(|value| value.get("id"))
+            .and_then(JsonValue::as_str)
+            .map(|raw| {
+                discord_model::validate_snowflake(raw)
+                    .with_context(|| format!("invalid reply target id '{raw}'"))
+                    .map(|_| raw.to_owned())
+            })
+            .transpose()?;
+
+        let attachments = match payload.get("attachments") {
+            None | Some(JsonValue::Null) => Vec::new(),
+            Some(JsonValue::Array(values)) => values
+                .iter()
+                .map(|attachment| {
+                    let source_id = required_snowflake(attachment, "id", "attachment")?;
+                    let url = attachment
+                        .get("url")
+                        .and_then(JsonValue::as_str)
+                        .filter(|url| !url.is_empty())
+                        .ok_or_else(|| anyhow!("attachment {source_id} missing URL"))?
+                        .to_owned();
+                    let filename = attachment
+                        .get("filename")
+                        .and_then(JsonValue::as_str)
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| anyhow!("attachment {source_id} missing filename"))?
+                        .to_owned();
+                    let content_type = attachment
+                        .get("content_type")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned);
+                    Ok(AttachmentSource {
+                        source_id,
+                        url,
+                        filename,
+                        content_type,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => bail!("message {external_id} attachments field is not an array"),
+        };
+
+        messages.push(IncomingMessage {
+            external_id,
+            channel_external_id: expected_channel_id.to_owned(),
+            author_external_id,
+            author_display_name,
+            content,
+            created_at,
+            edited_at,
+            reply_to_external_id,
+            attachments,
+        });
+    }
+    messages
+        .sort_by_key(|message| discord_model::validate_snowflake(&message.external_id).unwrap());
+    Ok(messages)
+}
+
+fn required_snowflake(value: &JsonValue, field: &str, subject: &str) -> Result<String> {
+    let raw = value
+        .get(field)
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("{subject} missing {field}"))?;
+    discord_model::validate_snowflake(raw)
+        .with_context(|| format!("invalid {subject} {field} '{raw}'"))?;
+    Ok(raw.to_owned())
+}
+
+/// Construct one complete self-contained collection fragment.
+///
+/// The fetch callback makes the validation-before-publication boundary
+/// directly testable. Any attachment error aborts construction; callers have
+/// not opened a writer yet and therefore cannot publish a receipt.
+fn build_ingest_fragment<F>(
+    messages: &[IncomingMessage],
+    coverage: Option<discord_model::CoverageInterval>,
+    mut fetch: F,
+) -> Result<Fragment>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
     if messages.is_empty() {
+        if coverage.is_some() {
+            bail!("an ingestion receipt requires at least one observed message");
+        }
+        return Ok(Fragment::empty());
+    }
+
+    let expected_channel = messages[0].channel_external_id.as_str();
+    for message in messages {
+        if message.channel_external_id != expected_channel {
+            bail!("one Discord ingestion COMMIT cannot span channels");
+        }
+    }
+    if let Some(interval) = coverage {
+        let covers_observation = messages.iter().any(|message| {
+            let id = discord_model::validate_snowflake(&message.external_id)
+                .expect("parsed messages have valid ids");
+            id > interval.after_exclusive && id <= interval.through_inclusive
+        });
+        if !covers_observation {
+            bail!("an ingestion interval must cover at least one staged message");
+        }
+    }
+
+    let mut fragment = Fragment::empty();
+    let channel = discord_model::channel_fragment(expected_channel)?;
+    let channel_id = channel.root().expect("intrinsic channel has one root");
+    fragment += channel;
+
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct AttachmentKey {
+        source_id: String,
+        filename: String,
+        content_type: Option<String>,
+    }
+
+    #[derive(Debug)]
+    struct AttachmentTransport {
+        urls: BTreeSet<String>,
+    }
+
+    // Aggregate by stable Discord attachment id. Signed CDN URLs are merely
+    // retryable transports and are intentionally absent from equality and
+    // intrinsic identity.
+    let mut transports: BTreeMap<AttachmentKey, AttachmentTransport> = BTreeMap::new();
+    for source in messages.iter().flat_map(|message| &message.attachments) {
+        let key = AttachmentKey {
+            source_id: source.source_id.clone(),
+            filename: file_capability::leaf_name(&source.filename),
+            content_type: source.content_type.clone(),
+        };
+        transports
+            .entry(key)
+            .or_insert_with(|| AttachmentTransport {
+                urls: BTreeSet::new(),
+            })
+            .urls
+            .insert(source.url.clone());
+    }
+
+    let mut prepared_attachments: BTreeMap<AttachmentKey, (Id, Fragment)> = BTreeMap::new();
+    for (key, transport) in transports {
+        let mut failures = Vec::new();
+        let mut bytes = None;
+        for url in &transport.urls {
+            match fetch(url) {
+                Ok(value) => {
+                    bytes = Some(value);
+                    break;
+                }
+                Err(error) => failures.push(format!("{url}: {error:#}")),
+            }
+        }
+        let bytes = bytes.ok_or_else(|| {
+            anyhow!(
+                "fetch Discord attachment {} failed via every observed URL: {}",
+                key.source_id,
+                failures.join("; ")
+            )
+        })?;
+        let media_type = key
+            .content_type
+            .as_deref()
+            .unwrap_or_else(|| file_capability::infer_media_type(Path::new(&key.filename)));
+        let file_fragment = file_capability::fragment(bytes, &key.filename, media_type)
+            .with_context(|| {
+                format!("construct canonical file for attachment {}", key.source_id)
+            })?;
+        let file_id = file_fragment
+            .root()
+            .expect("canonical file fragment has one root");
+        let mut attachment = entity! { _ @
+            metadata::tag: archive::kind_attachment,
+            archive::attachment_source_id: key.source_id.clone(),
+            archive::attachment_name: key.filename.clone(),
+            archive::attachment_file: file_id,
+        };
+        let attachment_id = attachment
+            .root()
+            .expect("attachment occurrence has one exported root");
+        attachment += file_fragment;
+        prepared_attachments.insert(key, (attachment_id, attachment));
+    }
+
+    for message in messages {
+        let message_anchor = discord_model::message_anchor_fragment(&message.external_id)?;
+        let message_anchor_id = message_anchor
+            .root()
+            .expect("intrinsic message anchor has one root");
+        fragment += message_anchor;
+
+        let author = discord_model::user_fragment(&message.author_external_id)?;
+        let author_id = author.root().expect("intrinsic user anchor has one root");
+        fragment += author;
+        if let Some(display_name) = &message.author_display_name {
+            fragment += entity! { _ @
+                metadata::tag: discord::kind_user_profile,
+                discord::user: author_id,
+                archive::author_name: display_name.clone(),
+            };
+        }
+
+        let reply_to = match message.reply_to_external_id.as_deref() {
+            Some(external) => {
+                let anchor = discord_model::message_anchor_fragment(external)?;
+                let id = anchor.root().expect("intrinsic reply anchor has one root");
+                fragment += anchor;
+                Some(id)
+            }
+            None => None,
+        };
+
+        let mut attachment_ids = Vec::with_capacity(message.attachments.len());
+        for source in &message.attachments {
+            let key = AttachmentKey {
+                source_id: source.source_id.clone(),
+                filename: file_capability::leaf_name(&source.filename),
+                content_type: source.content_type.clone(),
+            };
+            let (id, attachment) = prepared_attachments
+                .get(&key)
+                .expect("every parsed attachment was prepared");
+            attachment_ids.push(*id);
+            fragment += attachment.clone();
+        }
+
+        fragment += entity! { _ @
+            metadata::tag: archive::kind_message,
+            discord::message: message_anchor_id,
+            discord::channel: channel_id,
+            archive::author: author_id,
+            archive::content: message.content.clone(),
+            metadata::created_at: message.created_at,
+            archive::edited_at?: message.edited_at,
+            archive::reply_to?: reply_to,
+            archive::attachment*: attachment_ids,
+        };
+    }
+
+    // Keep this last: no receipt fragment exists until every semantic payload
+    // and attachment above has validated and staged successfully.
+    if let Some(interval) = coverage {
+        fragment += discord_model::coverage_fragment(channel_id, interval);
+    }
+    Ok(fragment)
+}
+
+fn print_history(storage: DiscordStorage<'_>, options: &ReadOptions) -> Result<()> {
+    let since = options
+        .since
+        .as_deref()
+        .map(|value| parse_iso8601(value.trim()))
+        .transpose()?;
+    let view = storage.view()?;
+    let channel_filter = options
+        .channel_id
+        .as_deref()
+        .map(discord_model::channel_fragment)
+        .transpose()?
+        .map(|fragment| fragment.root().expect("intrinsic channel has one root"));
+    let mut messages = discord_model::select_messages(&view.facts, channel_filter, since)?;
+
+    if options.limit > 0 && messages.len() > options.limit {
+        messages = messages.split_off(messages.len() - options.limit);
+    }
+    if options.descending {
+        messages.reverse();
+    }
+    if messages.is_empty() {
+        match options.channel_id.as_deref() {
+            Some(channel) => println!("(no messages in collection for channel {channel})"),
+            None => println!("(no messages in collection)"),
+        }
         return Ok(());
     }
 
-    let incoming = parse_messages(messages, channel_id)?;
-    let ingested = incoming.len();
-    let newest_snowflake = incoming
-        .iter()
-        .map(|m| m.external_id.clone())
-        .max_by(|a, b| compare_snowflakes(a, b));
-
-    with_repo(&config.pile_path, |repo| {
-        let mut ws = repo
-            .pull(config.branch_id)
-            .map_err(|e| anyhow!("pull discord: {e:?}"))?;
-        let mut files_ws = repo
-            .pull(config.files_branch_id)
-            .map_err(|e| anyhow!("pull files: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout discord: {e:?}"))?
-            .into_facts();
-        let files_catalog = files_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout files: {e:?}"))?
-            .into_facts();
-
-        let (change, files_change) =
-            build_ingest_change(&mut ws, &mut files_ws, &catalog, incoming, config)?;
-
-        let files_delta = files_change.difference(&files_catalog);
-        if !files_delta.is_empty() {
-            files_ws.commit(
-                files_delta,
-                &format!("discord: attachments from channel {channel_id}"),
-            );
-            repo.push(&mut files_ws)
-                .map_err(|e| anyhow!("push files: {e:?}"))?;
-        }
-
-        let delta = change.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(
-                delta,
-                &format!("discord: ingest {ingested} messages from {channel_id}"),
-            );
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push discord: {e:?}"))?;
-        }
-        Ok(())
-    })?;
-
-    if let Some(snowflake) = newest_snowflake {
-        store_channel_cursor(config, channel_id, &snowflake)?;
+    let channel_names = discord_model::channel_labels(&view.facts, &view.reader)?;
+    let author_names = discord_model::user_labels(&view.facts, &view.reader)?;
+    for message in messages {
+        let content =
+            discord_model::read_text(&view.reader, message.content, "Discord message content")?;
+        let author = author_names
+            .get(&message.author)
+            .cloned()
+            .unwrap_or_else(|| format!("{}", message.author));
+        let edited = message
+            .edited_at
+            .map(|edited| format!(" (edited {})", format_interval(edited)))
+            .unwrap_or_default();
+        let channel = if options.channel_id.is_some() {
+            String::new()
+        } else {
+            channel_names
+                .get(&message.channel)
+                .map(|external| format!(" #{external}"))
+                .unwrap_or_default()
+        };
+        let conflict = if message.variant_count > 1 {
+            format!(
+                " [DIVERGENT {}/{}]",
+                message.variant_index + 1,
+                message.variant_count
+            )
+        } else {
+            String::new()
+        };
+        println!(
+            "[{}]{channel}{edited}{conflict} {author}: {content}",
+            format_interval(message.created_at)
+        );
     }
-
-    log_event(
-        config,
-        "info",
-        &format!("ingested {ingested} messages from channel {channel_id}"),
-    )?;
-    println!("  {channel_id}: +{ingested}");
     Ok(())
 }
 
-/// Describe one visible channel for the all-channels poll loop.
 struct VisibleChannel {
     id: String,
     name: String,
     guild_id: String,
 }
 
-/// Enumerate every text-capable channel the bot can see. Text
-/// channels are types 0 (GUILD_TEXT), 5 (GUILD_ANNOUNCEMENT), and
-/// 15 (GUILD_FORUM); voice / stage / category / thread types are
-/// skipped. Mirrors the shape `channels list` uses for display.
 fn list_visible_text_channels(token: &str) -> Result<Vec<VisibleChannel>> {
     let client = build_client()?;
     let guilds: Vec<JsonValue> = client
@@ -583,12 +927,8 @@ fn list_visible_text_channels(token: &str) -> Result<Vec<VisibleChannel>> {
 
     let mut out = Vec::new();
     for guild in guilds {
-        let guild_id = guild
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if guild_id.is_empty() {
+        let guild_id = guild.get("id").and_then(JsonValue::as_str).unwrap_or("");
+        if discord_model::validate_snowflake(guild_id).is_err() {
             continue;
         }
         let channels: Vec<JsonValue> = client
@@ -600,538 +940,37 @@ fn list_visible_text_channels(token: &str) -> Result<Vec<VisibleChannel>> {
             .with_context(|| format!("channels request for guild {guild_id} failed"))?
             .json()
             .with_context(|| format!("parse channels for guild {guild_id}"))?;
-        for ch in channels {
-            let kind = ch.get("type").and_then(|v| v.as_i64()).unwrap_or(-1);
+        for channel in channels {
+            let kind = channel
+                .get("type")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(-1);
             if !matches!(kind, 0 | 5 | 15) {
                 continue;
             }
-            let id = ch.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let name = ch.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if id.is_empty() {
+            let id = channel.get("id").and_then(JsonValue::as_str).unwrap_or("");
+            if discord_model::validate_snowflake(id).is_err() {
                 continue;
             }
             out.push(VisibleChannel {
-                id: id.to_string(),
-                name: name.to_string(),
-                guild_id: guild_id.clone(),
+                id: id.to_owned(),
+                name: channel
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                guild_id: guild_id.to_owned(),
             });
         }
     }
     Ok(out)
 }
 
-/// Query the pile for messages — filtered by channel if
-/// `options.channel_id` is set, otherwise pooled across every
-/// channel — and print them. Channel identity comes from the
-/// same identity-only-fragment idiom `build_ingest_change` uses,
-/// so the filter is by intrinsic id.
-fn print_history(config: &DiscordConfig, options: &ReadOptions) -> Result<()> {
-    let since_key = match options.since.as_deref() {
-        Some(s) => Some(interval_key(parse_iso8601(s.trim())?)),
-        None => None,
-    };
-
-    with_repo(&config.pile_path, |repo| {
-        let mut ws = repo
-            .pull(config.branch_id)
-            .map_err(|e| anyhow!("pull discord: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout discord: {e:?}"))?
-            .into_facts();
-
-        // Re-derive the channel id from the external snowflake,
-        // if filtering.
-        let channel_filter: Option<Id> = match options.channel_id.as_deref() {
-            Some(id_str) => {
-                let external_handle = ws.put(id_str.to_string());
-                let id_frag = entity! { _ @ discord::channel_id: external_handle };
-                Some(id_frag.root().ok_or_else(|| anyhow!("channel id rooted"))?)
-            }
-            None => None,
-        };
-
-        // Channel id → external snowflake, for display when the
-        // filter is off.
-        let mut channel_externals: HashMap<Id, String> = HashMap::new();
-        for (ch_id, ext_handle) in find!(
-            (channel: Id, ext: Inline<Handle<LongString>>),
-            pattern!(&catalog, [{
-                ?channel @
-                metadata::tag: discord::kind_channel,
-                discord::channel_id: ?ext,
-            }])
-        ) {
-            let view: View<str> = ws
-                .get(ext_handle)
-                .map_err(|e| anyhow!("load channel external: {e:?}"))?;
-            channel_externals.insert(ch_id, view.to_string());
-        }
-
-        // First pass: required attributes.
-        let mut messages: Vec<HistoryRow> = Vec::new();
-        for (msg, content, author_id, created_at, ch) in find!(
-            (
-                message: Id,
-                content: Inline<Handle<LongString>>,
-                author: Id,
-                created_at: Inline<NsTAIInterval>,
-                channel: Id,
-            ),
-            pattern!(&catalog, [{
-                ?message @
-                metadata::tag: archive::kind_message,
-                archive::content: ?content,
-                archive::author: ?author,
-                metadata::created_at: ?created_at,
-                discord::channel: ?channel,
-            }])
-        ) {
-            if let Some(filter) = channel_filter {
-                if ch != filter {
-                    continue;
-                }
-            }
-            let key = interval_key(created_at);
-            if let Some(s) = since_key {
-                if key < s {
-                    continue;
-                }
-            }
-            messages.push(HistoryRow {
-                message_id: msg,
-                channel_id: ch,
-                content,
-                author_id,
-                created_at,
-                created_at_key: key,
-                edited_at: None,
-            });
-        }
-
-        let edited: std::collections::HashMap<Id, Inline<NsTAIInterval>> = find!(
-            (message: Id, edited: Inline<NsTAIInterval>),
-            pattern!(&catalog, [{
-                ?message @
-                metadata::tag: archive::kind_message,
-                archive::edited_at: ?edited,
-            }])
-        )
-        .into_iter()
-        .collect();
-        for row in messages.iter_mut() {
-            row.edited_at = edited.get(&row.message_id).copied();
-        }
-
-        // Resolve author display names in one pass.
-        let mut author_names: HashMap<Id, String> = HashMap::new();
-        for (author, name_handle) in find!(
-            (author: Id, name: Inline<Handle<LongString>>),
-            pattern!(&catalog, [{
-                ?author @
-                metadata::tag: archive::kind_author,
-                archive::author_name: ?name,
-            }])
-        ) {
-            let view: View<str> = ws
-                .get(name_handle)
-                .map_err(|e| anyhow!("load author name: {e:?}"))?;
-            author_names.insert(author, view.to_string());
-        }
-
-        messages.sort_by_key(|m| m.created_at_key);
-        if options.limit > 0 && messages.len() > options.limit {
-            let start = messages.len() - options.limit;
-            messages = messages.split_off(start);
-        }
-        if options.descending {
-            messages.reverse();
-        }
-
-        if messages.is_empty() {
-            match options.channel_id.as_deref() {
-                Some(id) => println!("(no messages in pile for channel {id})"),
-                None => println!("(no messages in pile)"),
-            }
-            return Ok(());
-        }
-        for message in messages {
-            let view: View<str> = ws
-                .get(message.content)
-                .map_err(|e| anyhow!("load content: {e:?}"))?;
-            let content = view.to_string();
-            let author = author_names
-                .get(&message.author_id)
-                .cloned()
-                .unwrap_or_else(|| format!("{}", message.author_id));
-            let timestamp = format_interval(message.created_at);
-            let edited_marker = match message.edited_at {
-                Some(edit_interval) => format!(" (edited {})", format_interval(edit_interval)),
-                None => String::new(),
-            };
-            // Prefix with the channel snowflake when showing
-            // pooled history across channels.
-            let channel_prefix = if channel_filter.is_some() {
-                String::new()
-            } else {
-                match channel_externals.get(&message.channel_id) {
-                    Some(ext) => format!(" #{ext}"),
-                    None => String::new(),
-                }
-            };
-            println!("[{timestamp}]{channel_prefix}{edited_marker} {author}: {content}");
-        }
-        Ok(())
-    })
-}
-
-struct HistoryRow {
-    message_id: Id,
-    channel_id: Id,
-    content: Inline<Handle<LongString>>,
-    author_id: Id,
-    created_at: Inline<NsTAIInterval>,
-    created_at_key: i128,
-    edited_at: Option<Inline<NsTAIInterval>>,
-}
-
-fn parse_messages(
-    messages: Vec<JsonValue>,
-    channel_external_id: &str,
-) -> Result<Vec<IncomingMessage>> {
-    let mut out = Vec::with_capacity(messages.len());
-    for message in messages {
-        let raw_json = serde_json::to_string(&message).context("serialize message json")?;
-        let external_id = message
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("message missing id"))?
-            .to_string();
-        let content = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let author = message.get("author").cloned().unwrap_or(JsonValue::Null);
-        let author_external_id = author
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let author_display_name = author
-            .get("global_name")
-            .and_then(|v| v.as_str())
-            .or_else(|| author.get("username").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .to_string();
-        let timestamp_str = message
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("message {external_id} missing timestamp"))?;
-        let created_at = parse_iso8601(timestamp_str)
-            .with_context(|| format!("parse timestamp {timestamp_str}"))?;
-        // `edited_timestamp` is null on unedited messages and an
-        // ISO-8601 string otherwise. Skip silently on parse
-        // failure — a malformed edit stamp shouldn't block ingest.
-        let edited_at = message
-            .get("edited_timestamp")
-            .and_then(|v| v.as_str())
-            .and_then(|s| parse_iso8601(s).ok());
-        let reply_to_external_id = message
-            .get("referenced_message")
-            .and_then(|v| v.get("id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        // Discord attachments live in `attachments[]` on the
-        // message body; shape documented at
-        // https://discord.com/developers/docs/resources/channel#attachment-object
-        let attachments = message
-            .get("attachments")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|a| {
-                        let source_id = a.get("id").and_then(|v| v.as_str())?.to_string();
-                        let url = a.get("url").and_then(|v| v.as_str())?.to_string();
-                        let filename = a
-                            .get("filename")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("attachment")
-                            .to_string();
-                        let content_type = a
-                            .get("content_type")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        Some(AttachmentSource {
-                            source_id,
-                            url,
-                            filename,
-                            content_type,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        out.push(IncomingMessage {
-            external_id,
-            raw_json,
-            channel_external_id: channel_external_id.to_string(),
-            author_external_id,
-            author_display_name,
-            content,
-            created_at,
-            edited_at,
-            reply_to_external_id,
-            attachments,
-        });
+fn list_channels(token: &str, guild_filter: Option<&str>) -> Result<()> {
+    if let Some(filter) = guild_filter {
+        discord_model::validate_snowflake(filter).context("invalid guild filter")?;
     }
-    // Normalise to oldest-first for stable `reply_to` resolution.
-    out.sort_by(|a, b| compare_snowflakes(&a.external_id, &b.external_id));
-    Ok(out)
-}
-
-fn build_ingest_change(
-    ws: &mut Workspace<Pile>,
-    files_ws: &mut Workspace<Pile>,
-    _catalog: &TribleSet,
-    messages: Vec<IncomingMessage>,
-    config: &DiscordConfig,
-) -> Result<(TribleSet, TribleSet)> {
-    let mut change = TribleSet::new();
-    let mut files_change = TribleSet::new();
-    let mut added_attachment_files: std::collections::HashSet<Id> =
-        std::collections::HashSet::new();
-
-    // Resolve each external id (channel, author, message) to an
-    // intrinsic Id via the identity-only-fragment idiom. Cached
-    // across this batch so repeated references hit the same id.
-    let mut channel_ids: HashMap<String, Id> = HashMap::new();
-    let mut author_ids: HashMap<String, Id> = HashMap::new();
-    let mut message_ids: HashMap<String, Id> = HashMap::new();
-
-    for message in &messages {
-        // ── channel ──
-        if !channel_ids.contains_key(&message.channel_external_id) {
-            let external_handle = ws.put(message.channel_external_id.clone());
-            let id_frag = entity! { _ @
-                discord::channel_id: external_handle,
-            };
-            let channel_id = id_frag.root().ok_or_else(|| anyhow!("channel id rooted"))?;
-            change += id_frag;
-            change += entity! { ExclusiveId::force_ref(&channel_id) @
-                metadata::tag: discord::kind_channel,
-            };
-            channel_ids.insert(message.channel_external_id.clone(), channel_id);
-        }
-        // ── author ──
-        if !author_ids.contains_key(&message.author_external_id) {
-            let external_handle = ws.put(message.author_external_id.clone());
-            let id_frag = entity! { _ @
-                discord::user_id: external_handle,
-            };
-            let author_id = id_frag.root().ok_or_else(|| anyhow!("author id rooted"))?;
-            change += id_frag;
-            let mut author_facts = entity! { ExclusiveId::force_ref(&author_id) @
-                metadata::tag: archive::kind_author,
-            };
-            if !message.author_display_name.is_empty() {
-                let name_handle = ws.put(message.author_display_name.clone());
-                author_facts += entity! { ExclusiveId::force_ref(&author_id) @
-                    archive::author_name: name_handle,
-                };
-            }
-            change += author_facts;
-            author_ids.insert(message.author_external_id.clone(), author_id);
-        }
-    }
-
-    // ── messages (second pass, so reply_to can resolve predecessors from this batch) ──
-    for message in &messages {
-        let external_handle = ws.put(message.external_id.clone());
-        let id_frag = entity! { _ @
-            discord::message_id: external_handle,
-        };
-        let message_id = id_frag.root().ok_or_else(|| anyhow!("message id rooted"))?;
-        message_ids.insert(message.external_id.clone(), message_id);
-
-        let content_handle = ws.put(message.content.clone());
-        let raw_handle = ws.put(message.raw_json.clone());
-        let channel_id = channel_ids[&message.channel_external_id];
-        let author_id = author_ids[&message.author_external_id];
-        let reply_to = message
-            .reply_to_external_id
-            .as_ref()
-            .and_then(|ext| message_ids.get(ext).copied());
-
-        change += id_frag;
-        change += entity! { ExclusiveId::force_ref(&message_id) @
-            metadata::tag: archive::kind_message,
-            archive::author: author_id,
-            archive::content: content_handle,
-            metadata::created_at: message.created_at,
-            discord::channel: channel_id,
-            discord::message_raw: raw_handle,
-            archive::reply_to?: reply_to,
-            archive::edited_at?: message.edited_at,
-        };
-
-        // ── attachments ──
-        // The source occurrence and canonical file record are distinct:
-        // Discord's snowflake identifies the occurrence, while the shared
-        // file constructor derives the immutable file from bytes/name/MIME.
-        for source in &message.attachments {
-            let source_handle = ws.put(source.source_id.clone());
-            let att_id_frag = entity! { _ @
-                archive::attachment_source_id: source_handle,
-            };
-            let attachment_id = att_id_frag
-                .root()
-                .ok_or_else(|| anyhow!("attachment id rooted"))?;
-
-            // Link message → attachment. Safe to re-emit; trible
-            // de-duplicates against the catalog at commit time.
-            change += entity! { ExclusiveId::force_ref(&message_id) @
-                archive::attachment: attachment_id,
-            };
-            change += att_id_frag;
-            let attachment_name = ws.put(source.filename.clone());
-            change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                metadata::tag: archive::kind_attachment,
-                archive::attachment_name: attachment_name,
-            };
-            if !added_attachment_files.insert(attachment_id) {
-                continue;
-            }
-
-            // Download the bytes from Discord's CDN. No bot auth
-            // required — CDN URLs are open. If the fetch fails,
-            // log and skip the file entity; the message and the
-            // `archive::attachment_source_id` entity still land,
-            // so a later backfill can pick it up.
-            let (bytes, fetched_type) = match fetch_attachment_bytes(&source.url) {
-                Ok(pair) => pair,
-                Err(err) => {
-                    let _ = log_event(
-                        config,
-                        "error",
-                        &format!("attachment fetch failed ({}): {err:?}", source.url),
-                    );
-                    continue;
-                }
-            };
-
-            let mime = source
-                .content_type
-                .clone()
-                .or(fetched_type)
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let media_type = file_capability::normalize_media_type_or_default(&mime);
-            let file_fragment =
-                file_capability::stage(files_ws, bytes, source.filename.clone(), &media_type)?;
-            let file_id = file_fragment
-                .root()
-                .expect("canonical file fragment has one root");
-            files_change += file_fragment;
-            change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                archive::attachment_file: file_id,
-            };
-        }
-    }
-
-    Ok((change, files_change))
-}
-
-// ── per-channel cursor ───────────────────────────────────────────
-
-fn load_channel_cursor(
-    config: &DiscordConfig,
-    channel_external_id: &str,
-) -> Result<Option<String>> {
-    with_repo(&config.pile_path, |repo| {
-        let mut ws = repo
-            .pull(config.branch_id)
-            .map_err(|e| anyhow!("pull discord: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout discord: {e:?}"))?
-            .into_facts();
-
-        // Cursor id is the root of `{kind_cursor, channel_id=X}`.
-        let external_handle = ws.put(channel_external_id.to_string());
-        let id_frag = entity! { _ @
-            metadata::tag: discord::kind_cursor,
-            discord::channel_id: external_handle,
-        };
-        let cursor_id = id_frag.root().ok_or_else(|| anyhow!("cursor id rooted"))?;
-
-        for (_cur, handle) in find!(
-            (cur: Id, handle: Inline<Handle<LongString>>),
-            pattern!(&catalog, [{
-                ?cur @
-                metadata::tag: discord::kind_cursor,
-                discord::cursor_last_message_id: ?handle,
-            }])
-        ) {
-            // find! doesn't let us filter by cursor_id in-macro
-            // without rebinding, so check match manually:
-            if _cur == cursor_id {
-                let view: View<str> = ws.get(handle).map_err(|e| anyhow!("get cursor: {e:?}"))?;
-                return Ok(Some(view.to_string()));
-            }
-        }
-        Ok(None)
-    })
-}
-
-fn store_channel_cursor(
-    config: &DiscordConfig,
-    channel_external_id: &str,
-    snowflake: &str,
-) -> Result<()> {
-    with_repo(&config.pile_path, |repo| {
-        let mut ws = repo
-            .pull(config.branch_id)
-            .map_err(|e| anyhow!("pull discord: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout discord: {e:?}"))?
-            .into_facts();
-
-        let external_handle = ws.put(channel_external_id.to_string());
-        let id_frag = entity! { _ @
-            metadata::tag: discord::kind_cursor,
-            discord::channel_id: external_handle,
-        };
-        let cursor_id = id_frag.root().ok_or_else(|| anyhow!("cursor id rooted"))?;
-
-        let snowflake_handle = ws.put(snowflake.to_string());
-        let mut change = id_frag;
-        change += entity! { ExclusiveId::force_ref(&cursor_id) @
-            discord::cursor_last_message_id: snowflake_handle,
-        };
-
-        let delta = change.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(
-                delta,
-                &format!("discord: update cursor for {channel_external_id}"),
-            );
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push discord: {e:?}"))?;
-        }
-        Ok(())
-    })
-}
-
-// ── channels list ────────────────────────────────────────────────
-
-fn list_channels(config: DiscordConfig, guild_filter: Option<String>) -> Result<()> {
-    let token = load_bot_token(&config)?;
     let client = build_client()?;
-
-    // 1. guilds the bot is in.
     let guilds: Vec<JsonValue> = client
         .get(format!("{DISCORD_API_BASE}/users/@me/guilds"))
         .header("Authorization", format!("Bot {token}"))
@@ -1141,30 +980,26 @@ fn list_channels(config: DiscordConfig, guild_filter: Option<String>) -> Result<
         .context("guilds request failed")?
         .json()
         .context("parse guilds response")?;
-
     if guilds.is_empty() {
         println!("Bot is not a member of any guilds. Invite it to a server first.");
         return Ok(());
     }
 
-    let filter = guild_filter.as_deref().map(str::trim);
-
     for guild in guilds {
         let guild_id = guild
             .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<missing>");
-        let guild_name = guild
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<unnamed>");
-        if filter.map_or(false, |f| !f.is_empty() && f != guild_id) {
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("Discord guild missing id"))?;
+        discord_model::validate_snowflake(guild_id).context("invalid Discord guild id")?;
+        if guild_filter.is_some_and(|filter| filter != guild_id) {
             continue;
         }
-
+        let guild_name = guild
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<unnamed>");
         println!("{guild_name}  ({guild_id})");
 
-        // 2. channels in this guild.
         let channels: Vec<JsonValue> = client
             .get(format!("{DISCORD_API_BASE}/guilds/{guild_id}/channels"))
             .header("Authorization", format!("Bot {token}"))
@@ -1174,34 +1009,31 @@ fn list_channels(config: DiscordConfig, guild_filter: Option<String>) -> Result<
             .with_context(|| format!("channels request for guild {guild_id} failed"))?
             .json()
             .with_context(|| format!("parse channels for guild {guild_id}"))?;
-
-        // Discord channel types: 0 = GUILD_TEXT, 2 = GUILD_VOICE,
-        // 4 = GUILD_CATEGORY, 5 = GUILD_ANNOUNCEMENT, 15 = GUILD_FORUM.
-        // Group by category; show text-ish ones first.
-        let mut rows: Vec<(i64, &str, &str, &str)> = Vec::new();
+        let mut rows = Vec::new();
         for channel in &channels {
             let id = channel
                 .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("<missing>");
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| anyhow!("Discord channel missing id"))?;
+            discord_model::validate_snowflake(id).context("invalid Discord channel id")?;
             let name = channel
                 .get("name")
-                .and_then(|v| v.as_str())
+                .and_then(JsonValue::as_str)
                 .unwrap_or("<unnamed>");
-            let kind = channel.get("type").and_then(|v| v.as_i64()).unwrap_or(-1);
-            let kind_label = channel_type_label(kind);
-            rows.push((kind, id, name, kind_label));
+            let kind = channel
+                .get("type")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(-1);
+            rows.push((kind, id, name, channel_type_label(kind)));
         }
-        // Stable order: categories first, then text/announce/forum, then voice.
         rows.sort_by_key(|(kind, _, _, _)| match kind {
-            4 => 0,     // category
-            0 | 5 => 1, // text / announcement
-            15 => 2,    // forum
-            _ => 3,     // voice, stage, thread, ...
+            4 => 0,
+            0 | 5 => 1,
+            15 => 2,
+            _ => 3,
         });
-
-        for (_, id, name, kind_label) in rows {
-            println!("  {kind_label:<12} #{name:<30} {id}");
+        for (_, id, name, kind) in rows {
+            println!("  {kind:<12} #{name:<30} {id}");
         }
         println!();
     }
@@ -1227,74 +1059,42 @@ fn channel_type_label(kind: i64) -> &'static str {
     }
 }
 
-// ── attachment bytes ─────────────────────────────────────────────
-
-/// Fetch attachment bytes from Discord's CDN. Unlike teams'
-/// `fetch_attachment_bytes`, no bearer token is needed — Discord
-/// CDN URLs are open. Returns `(bytes, response_content_type)`
-/// so a missing `content_type` on the JSON attachment object can
-/// fall back to whatever the CDN reports.
-fn fetch_attachment_bytes(url: &str) -> Result<(Vec<u8>, Option<String>)> {
-    let client = build_client()?;
-    let resp = client
+fn fetch_attachment_bytes(url: &str) -> Result<Vec<u8>> {
+    let response = build_client()?
         .get(url)
         .send()
         .with_context(|| format!("GET {url}"))?;
-    let status = resp.status();
+    let status = response.status();
     if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
+        let body = response.text().unwrap_or_default();
         bail!("GET {url} failed: status={status} body={body}");
     }
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let bytes = resp.bytes().context("read attachment body")?;
-    Ok((bytes.to_vec(), content_type))
+    let bytes = response.bytes().context("read attachment body")?;
+    Ok(bytes.to_vec())
 }
-
-// ── helpers ──────────────────────────────────────────────────────
 
 fn build_client() -> Result<Client> {
     Client::builder()
-        .user_agent("triblespace-discord/0.1")
+        .user_agent("triblespace-discord/0.2")
         .timeout(Duration::from_secs(30))
         .build()
         .context("build reqwest client")
 }
 
-/// Compare two Discord snowflakes numerically without parsing —
-/// they're fixed-width u64 strings, so lexicographic works as long
-/// as the strings are equal-length. Discord snowflakes are all
-/// 17–19 digits; compare by (length, string) to get numeric order.
-fn compare_snowflakes(a: &str, b: &str) -> std::cmp::Ordering {
-    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
-}
-
 fn parse_iso8601(value: &str) -> Result<Inline<NsTAIInterval>> {
-    // Discord timestamps look like `2026-04-22T09:12:34.567000+00:00`.
-    // hifitime's Epoch::from_gregorian_str handles RFC3339.
-    let epoch =
-        Epoch::from_gregorian_str(value).map_err(|e| anyhow!("parse iso8601 '{value}': {e}"))?;
+    let epoch = Epoch::from_gregorian_str(value)
+        .map_err(|error| anyhow!("parse ISO8601 '{value}': {error}"))?;
     Ok(epoch_interval(epoch))
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or(Epoch::from_gregorian_tai_at_midnight(2026, 1, 1))
-}
-
 fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
-    (epoch, epoch).try_to_inline().unwrap()
-}
-
-fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
-    lower.to_tai_duration().total_nanoseconds()
+    (epoch, epoch)
+        .try_to_inline()
+        .expect("point interval encodes")
 }
 
 fn format_interval(interval: Inline<NsTAIInterval>) -> String {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().expect("valid TAI interval");
     lower.to_gregorian_str(TimeScale::UTC)
 }
 
@@ -1309,9 +1109,395 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
         }
         return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
     }
-    Ok(raw.to_string())
+    Ok(raw.to_owned())
 }
 
 fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
-    Ok(load_value_or_file(raw, label)?.trim().to_string())
+    Ok(load_value_or_file(raw, label)?.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faculties::schemas::files::KIND_FILE;
+    use std::fs::File;
+
+    fn message_json(
+        id: &str,
+        channel: &str,
+        content: &str,
+        edited: Option<&str>,
+        attachments: JsonValue,
+    ) -> JsonValue {
+        json!({
+            "id": id,
+            "channel_id": channel,
+            "content": content,
+            "author": {
+                "id": "100000000000000010",
+                "username": "Ada",
+                "global_name": "Ada Lovelace"
+            },
+            "timestamp": "2026-08-07T08:00:00Z",
+            "edited_timestamp": edited,
+            "attachments": attachments,
+            "referenced_message": null
+        })
+    }
+
+    fn fresh_storage(directory: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let pile = directory.path().join("discord.pile");
+        let key = directory.path().join("discord.key");
+        File::create(&pile).unwrap();
+        collection_access::initialize_signer(&pile, Some(&key)).unwrap();
+        (pile, key)
+    }
+
+    fn test_storage<'a>(pile: &'a Path, key: &'a Path) -> DiscordStorage<'a> {
+        DiscordStorage {
+            pile,
+            key: Some(key),
+            scope: DEFAULT_SCOPE_ID,
+        }
+    }
+
+    #[test]
+    fn replayed_payload_has_identical_intrinsic_observation() {
+        let payload = message_json(
+            "100000000000000001",
+            "100000000000000002",
+            "hello",
+            None,
+            json!([]),
+        );
+        let first = parse_messages(vec![payload.clone()], "100000000000000002").unwrap();
+        let second = parse_messages(vec![payload], "100000000000000002").unwrap();
+        let interval =
+            discord_model::CoverageInterval::new(100000000000000000, 100000000000000001, true)
+                .unwrap();
+        let first =
+            build_ingest_fragment(&first, Some(interval), |_| unreachable!("no attachments"))
+                .unwrap();
+        let second =
+            build_ingest_fragment(&second, Some(interval), |_| unreachable!("no attachments"))
+                .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn volatile_payload_and_profile_changes_do_not_fork_message_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = test_storage(&pile, &key);
+        let channel = "100000000000000004";
+        let first = message_json(
+            "100000000000000003",
+            channel,
+            "stable meaning",
+            None,
+            json!([]),
+        );
+        let mut second = first.clone();
+        second["pinned"] = json!(true);
+        second["reactions"] = json!([{"count": 42, "emoji": {"name": "✨"}}]);
+        second["author"]["global_name"] = json!("Countess Lovelace");
+        let messages = parse_messages(vec![first, second], channel).unwrap();
+        storage
+            .publish(
+                build_ingest_fragment(&messages, None, |_| unreachable!("no attachments")).unwrap(),
+                "volatile replay".to_owned(),
+            )
+            .unwrap();
+        let view = storage.view().unwrap();
+        let selected = discord_model::select_messages(
+            &view.facts,
+            Some(
+                discord_model::channel_fragment(channel)
+                    .unwrap()
+                    .root()
+                    .unwrap(),
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].variant_count, 1);
+        let observations = find!(
+            observation: Id,
+            pattern!(&view.facts, [{
+                ?observation @
+                metadata::tag: archive::kind_message,
+                discord::message: _?anchor,
+            }])
+        )
+        .collect::<BTreeSet<_>>();
+        assert_eq!(observations.len(), 1);
+
+        let users = find!(
+            user: Id,
+            pattern!(&view.facts, [{
+                ?user @ metadata::tag: discord::kind_user
+            }])
+        )
+        .collect::<BTreeSet<_>>();
+        let profiles = find!(
+            profile: Id,
+            pattern!(&view.facts, [{
+                ?profile @ metadata::tag: discord::kind_user_profile
+            }])
+        )
+        .collect::<BTreeSet<_>>();
+        assert_eq!(users.len(), 1);
+        assert_eq!(profiles.len(), 2);
+        let label = discord_model::user_labels(&view.facts, &view.reader)
+            .unwrap()
+            .remove(users.first().unwrap())
+            .unwrap();
+        assert!(label.contains("Ada Lovelace"));
+        assert!(label.contains("Countess Lovelace"));
+    }
+
+    #[test]
+    fn refreshed_signed_attachment_urls_are_retryable_transport_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = test_storage(&pile, &key);
+        let channel = "100000000000000006";
+        let mut old = message_json(
+            "100000000000000005",
+            channel,
+            "with file",
+            None,
+            json!([{
+                "id": "100000000000000007",
+                "url": "https://cdn.example/a-expired.bin?ex=old&hm=old",
+                "filename": "folder/file.bin",
+                "content_type": "application/octet-stream"
+            }]),
+        );
+        let mut refreshed = old.clone();
+        refreshed["attachments"][0]["url"] = json!("https://cdn.example/b-fresh.bin?ex=new&hm=new");
+        // A volatile field changes too; neither change belongs to message
+        // semantics.
+        old["pinned"] = json!(false);
+        refreshed["pinned"] = json!(true);
+
+        let old_fragment = build_ingest_fragment(
+            &parse_messages(vec![old.clone()], channel).unwrap(),
+            None,
+            |_| Ok(b"bytes".to_vec()),
+        )
+        .unwrap();
+        let refreshed_fragment = build_ingest_fragment(
+            &parse_messages(vec![refreshed.clone()], channel).unwrap(),
+            None,
+            |_| Ok(b"bytes".to_vec()),
+        )
+        .unwrap();
+        assert_eq!(old_fragment, refreshed_fragment);
+
+        let messages = parse_messages(vec![old, refreshed], channel).unwrap();
+        let mut attempts = Vec::new();
+        let fragment = build_ingest_fragment(&messages, None, |url| {
+            attempts.push(url.to_owned());
+            if url.contains("expired") {
+                bail!("expired signature");
+            }
+            Ok(b"bytes".to_vec())
+        })
+        .unwrap();
+        assert_eq!(attempts.len(), 2);
+        storage
+            .publish(fragment, "refreshed attachment URL".to_owned())
+            .unwrap();
+        let view = storage.view().unwrap();
+        assert_eq!(
+            discord_model::select_messages(&view.facts, None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        let attachments = find!(
+            attachment: Id,
+            pattern!(&view.facts, [{
+                ?attachment @ metadata::tag: archive::kind_attachment
+            }])
+        )
+        .collect::<BTreeSet<_>>();
+        assert_eq!(attachments.len(), 1);
+        assert!(exists!(pattern!(&view.facts, [{
+            _?file @ metadata::tag: &KIND_FILE
+        }])));
+    }
+
+    #[test]
+    fn attachment_failure_cannot_publish_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = test_storage(&pile, &key);
+        let channel = "100000000000000009";
+        let payload = message_json(
+            "100000000000000008",
+            channel,
+            "with file",
+            None,
+            json!([{
+                "id": "100000000000000010",
+                "url": "https://cdn.example/file.bin",
+                "filename": "file.bin",
+                "content_type": "application/octet-stream"
+            }]),
+        );
+        let messages = parse_messages(vec![payload], channel).unwrap();
+        let interval =
+            discord_model::CoverageInterval::new(100000000000000007, 100000000000000008, true)
+                .unwrap();
+        assert!(build_ingest_fragment(&messages, Some(interval), |_| bail!("offline")).is_err());
+        assert!(storage.view().unwrap().facts.is_empty());
+
+        let fragment =
+            build_ingest_fragment(&messages, Some(interval), |_| Ok(b"bytes".to_vec())).unwrap();
+        storage
+            .publish(fragment, "complete test page".to_owned())
+            .unwrap();
+        let view = storage.view().unwrap();
+        let channel_id = discord_model::channel_fragment(channel)
+            .unwrap()
+            .root()
+            .unwrap();
+        assert_eq!(
+            discord_model::channel_coverage(&view.facts, channel_id)
+                .unwrap()
+                .unwrap()
+                .through_inclusive,
+            100000000000000008
+        );
+        assert_eq!(view.commits.len(), 1);
+    }
+
+    #[test]
+    fn newest_first_pagination_closes_a_150_message_gap_before_advancing() {
+        let frontier = 100_000_u64;
+        let available = ((frontier - 100)..=(frontier + 150)).collect::<Vec<_>>();
+        let mut requests = Vec::new();
+        let batch = fetch_complete_forward(Some(frontier), 100, |request| {
+            requests.push(request);
+            let mut ids = available
+                .iter()
+                .copied()
+                .filter(|id| request.after.is_none_or(|after| *id > after))
+                .filter(|id| request.before.is_none_or(|before| *id < before))
+                .collect::<Vec<_>>();
+            ids.sort_unstable_by(|left, right| right.cmp(left));
+            ids.truncate(request.limit as usize);
+            Ok(ids
+                .into_iter()
+                .map(|id| json!({"id": id.to_string()}))
+                .collect())
+        })
+        .unwrap();
+        let ingested = payload_ids(&batch.payloads)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ingested, ((frontier + 1)..=(frontier + 150)).collect());
+        assert_eq!(
+            batch.coverage,
+            Some(discord_model::CoverageInterval::new(frontier, frontier + 150, false).unwrap())
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].after, Some(frontier));
+        assert_eq!(requests[1].before, Some(frontier + 51));
+    }
+
+    #[test]
+    fn first_page_is_an_explicit_bounded_baseline() {
+        let available = (1_u64..=150).collect::<Vec<_>>();
+        let batch = fetch_complete_forward(None, 100, |request| {
+            let mut ids = available.clone();
+            ids.sort_unstable_by(|left, right| right.cmp(left));
+            ids.truncate(request.limit as usize);
+            Ok(ids
+                .into_iter()
+                .map(|id| json!({"id": id.to_string()}))
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(batch.payloads.len(), 100);
+        assert_eq!(
+            batch.coverage,
+            Some(discord_model::CoverageInterval::new(50, 150, true).unwrap())
+        );
+    }
+
+    #[test]
+    fn latest_official_edit_wins_and_divergent_maxima_are_exposed() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = test_storage(&pile, &key);
+        let channel = "100000000000000007";
+        let original = message_json("100000000000000008", channel, "original", None, json!([]));
+        let edited = message_json(
+            "100000000000000008",
+            channel,
+            "edited",
+            Some("2026-08-07T09:00:00Z"),
+            json!([]),
+        );
+        let messages = parse_messages(vec![original, edited], channel).unwrap();
+        storage
+            .publish(
+                build_ingest_fragment(&messages, None, |_| unreachable!("no attachments")).unwrap(),
+                "original and edit".to_owned(),
+            )
+            .unwrap();
+        let view = storage.view().unwrap();
+        let channel_id = discord_model::channel_fragment(channel)
+            .unwrap()
+            .root()
+            .unwrap();
+        let rows = discord_model::select_messages(&view.facts, Some(channel_id), None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            discord_model::read_text(&view.reader, rows[0].content, "content").unwrap(),
+            "edited"
+        );
+
+        let divergent = message_json(
+            "100000000000000008",
+            channel,
+            "different at same edit time",
+            Some("2026-08-07T09:00:00Z"),
+            json!([]),
+        );
+        let messages = parse_messages(vec![divergent], channel).unwrap();
+        storage
+            .publish(
+                build_ingest_fragment(&messages, None, |_| unreachable!("no attachments")).unwrap(),
+                "divergent edit".to_owned(),
+            )
+            .unwrap();
+        let view = storage.view().unwrap();
+        let rows = discord_model::select_messages(&view.facts, Some(channel_id), None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.variant_count == 2));
+        let contents = rows
+            .iter()
+            .map(|row| discord_model::read_text(&view.reader, row.content, "content").unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            contents,
+            BTreeSet::from([
+                "different at same edit time".to_owned(),
+                "edited".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn malformed_locally_supplied_ids_are_rejected() {
+        assert!(discord_model::validate_snowflake("01").is_err());
+        assert!(discord_model::validate_snowflake("not-an-id").is_err());
+        assert!(discord_model::validate_snowflake("18446744073709551616").is_err());
+    }
 }

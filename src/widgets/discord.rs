@@ -1,10 +1,8 @@
 //! Read-only GORBIE-embeddable viewer for the `discord` faculty.
 //!
-//! Discord messages on disk use the protocol-agnostic
-//! `archive::kind_message` tag plus the discord-specific
-//! `discord::channel` / `discord::guild` joins. This widget renders
-//! the most recent N messages as a chronological feed, with each
-//! card identifying its channel/guild and author.
+//! The widget consumes the same shared semantic selector as the CLI: volatile
+//! REST state cannot create cards, exact semantic replays collapse, and every
+//! divergent state at a maximal official edit timestamp remains visible.
 //!
 //! ```ignore
 //! let mut panel = DiscordViewer::default();
@@ -19,22 +17,15 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 
-use crate::schemas::archive::archive as archive_attrs;
+use crate::discord as discord_model;
 use crate::schemas::discord::discord as discord_attrs;
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
-type TextHandle = Inline<Handle<LongString>>;
-
-/// Cap on visible messages. Older messages are still on the
-/// branch; the `discord read` CLI is the right tool for full
+/// Cap on visible messages. Older messages are still in the
+/// collection; the `discord read` CLI is the right tool for full
 /// history.
 const MAX_MESSAGES: usize = 30;
 
@@ -80,10 +71,12 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 struct MessageRow {
     id: Id,
     at: DateTime<Utc>,
-    author_id: Option<Id>,
+    author_id: Id,
     author_name: Option<String>,
-    channel_id: Option<Id>,
+    channel_id: Id,
     content: String,
+    variant_index: usize,
+    variant_count: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -105,12 +98,29 @@ struct DiscordLive {
     total_messages: usize,
     channel_count: usize,
     guild_count: usize,
+    error: Option<String>,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl DiscordLive {
     fn refresh(dataset: DatasetView<'_>) -> Self {
+        match Self::try_refresh(dataset) {
+            Ok(live) => live,
+            Err(error) => Self {
+                cached_revision: dataset.revision,
+                messages: Vec::new(),
+                channels: HashMap::new(),
+                guilds: HashMap::new(),
+                total_messages: 0,
+                channel_count: 0,
+                guild_count: 0,
+                error: Some(format!("{error:#}")),
+            },
+        }
+    }
+
+    fn try_refresh(dataset: DatasetView<'_>) -> anyhow::Result<Self> {
         let space = dataset.facts;
 
         // Channels — read first so messages can look up channel
@@ -124,19 +134,10 @@ impl DiscordLive {
         }
         let channel_count = channels.len();
 
-        // Channel names (metadata::name long-string).
-        let chan_name_rows: Vec<(Id, TextHandle)> = find!(
-            (cid: Id, h: TextHandle),
-            pattern!(space, [{
-                ?cid @
-                metadata::tag: &discord_attrs::kind_channel,
-                metadata::name: ?h,
-            }])
-        )
-        .collect();
-        for (cid, h) in chan_name_rows {
+        // Use the same stable external-id labels as the CLI.
+        for (cid, name) in discord_model::channel_labels(space, dataset.reader)? {
             if let Some(c) = channels.get_mut(&cid) {
-                c.name = read_text(dataset, h);
+                c.name = Some(name);
             }
         }
         // Channel → guild pointer (so chips can show the guild).
@@ -160,8 +161,8 @@ impl DiscordLive {
             guilds.insert(gid, Guild::default());
         }
         let guild_count = guilds.len();
-        let guild_name_rows: Vec<(Id, TextHandle)> = find!(
-            (gid: Id, h: TextHandle),
+        let guild_name_rows: Vec<(Id, discord_model::TextHandle)> = find!(
+            (gid: Id, h: discord_model::TextHandle),
             pattern!(space, [{
                 ?gid @
                 metadata::tag: &discord_attrs::kind_guild,
@@ -171,60 +172,30 @@ impl DiscordLive {
         .collect();
         for (gid, h) in guild_name_rows {
             if let Some(g) = guilds.get_mut(&gid) {
-                g.name = read_text(dataset, h);
+                g.name = discord_model::read_text(dataset.reader, h, "Discord guild name").ok();
             }
         }
 
-        // Messages: archive::kind_message + discord::channel
-        // (filters out any message-style entries that
-        // accidentally share the tag — discord branch shouldn't
-        // have those, but the join is harmless and explicit).
-        let msg_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
-            (mid: Id, cid: Id, content: TextHandle, ts: (i128, i128)),
-            pattern!(space, [{
-                ?mid @
-                metadata::tag: &archive_attrs::kind_message,
-                discord_attrs::channel: ?cid,
-                archive_attrs::content: ?content,
-                metadata::created_at: ?ts,
-            }])
-        )
-        .collect();
-
-        // Per-message author lookup. We do it separately so the
-        // main query stays manageable; authors are shared across
-        // many messages.
-        let author_rows: HashMap<Id, Id> = find!(
-            (mid: Id, aid: Id),
-            pattern!(space, [{ ?mid @ archive_attrs::author: ?aid }])
-        )
-        .collect();
-        let author_name_rows: Vec<(Id, TextHandle)> = find!(
-            (aid: Id, h: TextHandle),
-            pattern!(space, [{ ?aid @ archive_attrs::author_name: ?h }])
-        )
-        .collect();
-        let mut author_names: HashMap<Id, String> = HashMap::new();
-        for (aid, h) in author_name_rows {
-            if let Some(name) = read_text(dataset, h) {
-                author_names.insert(aid, name);
-            }
-        }
-
-        let total_messages = msg_rows.len();
-        let mut messages: Vec<MessageRow> = Vec::with_capacity(msg_rows.len());
-        for (mid, cid, content_h, ts) in msg_rows {
-            let raw = read_text(dataset, content_h).unwrap_or_default();
-            let content = strip_html(&raw);
-            let author_id = author_rows.get(&mid).copied();
-            let author_name = author_id.and_then(|aid| author_names.get(&aid).cloned());
+        let selected = discord_model::select_messages(space, None, None)?;
+        let author_names = discord_model::user_labels(space, dataset.reader)?;
+        let total_messages = selected.len();
+        let mut messages: Vec<MessageRow> = Vec::with_capacity(selected.len());
+        for version in selected {
+            let raw = discord_model::read_text(
+                dataset.reader,
+                version.content,
+                "Discord message content",
+            )?;
+            let author_name = author_names.get(&version.author).cloned();
             messages.push(MessageRow {
-                id: mid,
-                at: ns_to_chrono(ts.0),
-                author_id,
+                id: version.observation,
+                at: ns_to_chrono(discord_model::interval_key(version.created_at)),
+                author_id: version.author,
                 author_name,
-                channel_id: Some(cid),
-                content,
+                channel_id: version.channel,
+                content: raw,
+                variant_index: version.variant_index,
+                variant_count: version.variant_count,
             });
         }
 
@@ -232,7 +203,7 @@ impl DiscordLive {
         messages.sort_by(|a, b| b.at.cmp(&a.at));
         messages.truncate(MAX_MESSAGES);
 
-        DiscordLive {
+        Ok(DiscordLive {
             cached_revision: dataset.revision,
             messages,
             channels,
@@ -240,7 +211,8 @@ impl DiscordLive {
             total_messages,
             channel_count,
             guild_count,
-        }
+            error: None,
+        })
     }
 
     fn channel_label(&self, cid: Id) -> String {
@@ -255,17 +227,6 @@ impl DiscordLive {
         let name = self.guilds.get(&gid).and_then(|g| g.name.clone());
         Some(name.unwrap_or_else(|| short_hex(gid)))
     }
-}
-
-fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
-    dataset
-        .reader
-        .get::<View<str>, LongString>(h)
-        .ok()
-        .map(|v| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        })
 }
 
 fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
@@ -319,42 +280,6 @@ fn truncate_to(text: &str, max: usize) -> String {
     }
 }
 
-/// Strip basic HTML/markup so message previews stay readable when
-/// content arrives with embedded tags. Discord messages are usually
-/// plain text, but bot integrations and webhooks sometimes ship
-/// HTML-fragmented payloads. Cheap tag elision is enough for the
-/// preview layer; the message id is always available for the CLI
-/// drill-down if the raw form matters.
-fn strip_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_tag = false;
-    let mut last_ws = false;
-    for ch in text.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => {
-                in_tag = false;
-                if !last_ws {
-                    out.push(' ');
-                    last_ws = true;
-                }
-            }
-            _ if in_tag => {}
-            c if c.is_whitespace() => {
-                if !last_ws {
-                    out.push(' ');
-                    last_ws = true;
-                }
-            }
-            c => {
-                out.push(c);
-                last_ws = false;
-            }
-        }
-    }
-    out.trim().to_string()
-}
-
 // ── Widget ───────────────────────────────────────────────────────────
 
 pub struct DiscordViewer {
@@ -385,6 +310,20 @@ impl DiscordViewer {
             let Some(live) = self.live.as_ref() else {
                 return;
             };
+            if let Some(error) = &live.error {
+                ctx.grid(|g| {
+                    g.full(|ctx| {
+                        let ui = ctx.ui_mut();
+                        ui.label(
+                            egui::RichText::new(format!("Discord data error: {error}"))
+                                .monospace()
+                                .small()
+                                .color(ui.visuals().error_fg_color),
+                        );
+                    });
+                });
+                return;
+            }
             let now = Utc::now();
 
             ctx.grid(|g| {
@@ -431,7 +370,7 @@ impl DiscordViewer {
                             );
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new("No Discord messages on this branch.")
+                                egui::RichText::new("No Discord messages in this collection.")
                                     .monospace()
                                     .small()
                                     .strong()
@@ -473,10 +412,7 @@ fn render_message_card(
     let bubble_fill = ui.visuals().window_fill;
     // Header accent = channel's hashed colour so all messages from
     // the same channel visually group.
-    let accent = msg
-        .channel_id
-        .map(channel_color)
-        .unwrap_or_else(|| egui::Color32::from_gray(120));
+    let accent = channel_color(msg.channel_id);
     let text_on_accent = colorhash::text_color_on(accent);
     let body_muted = {
         let body_text = colorhash::text_color_on(bubble_fill);
@@ -513,29 +449,28 @@ fn render_message_card(
                     ui.spacing_mut().item_spacing.y = 2.0;
 
                     ui.horizontal(|ui| {
-                        if let Some(cid) = msg.channel_id {
-                            if let Some(guild) = live.guild_label_for(cid) {
-                                ui.label(
-                                    egui::RichText::new(guild)
-                                        .monospace()
-                                        .strong()
-                                        .small()
-                                        .color(text_on_accent),
-                                );
-                                ui.label(
-                                    egui::RichText::new("·")
-                                        .monospace()
-                                        .small()
-                                        .color(text_on_accent),
-                                );
-                            }
+                        let cid = msg.channel_id;
+                        if let Some(guild) = live.guild_label_for(cid) {
                             ui.label(
-                                egui::RichText::new(live.channel_label(cid))
+                                egui::RichText::new(guild)
                                     .monospace()
                                     .strong()
+                                    .small()
+                                    .color(text_on_accent),
+                            );
+                            ui.label(
+                                egui::RichText::new("·")
+                                    .monospace()
+                                    .small()
                                     .color(text_on_accent),
                             );
                         }
+                        ui.label(
+                            egui::RichText::new(live.channel_label(cid))
+                                .monospace()
+                                .strong()
+                                .color(text_on_accent),
+                        );
                         ui.label(
                             egui::RichText::new(format!(
                                 "· {} · {}",
@@ -549,18 +484,27 @@ fn render_message_card(
                     });
 
                     // Author chip + content first line.
-                    let author_label = msg.author_name.clone().unwrap_or_else(|| {
-                        msg.author_id
-                            .map(short_hex)
-                            .unwrap_or_else(|| "?".to_string())
-                    });
-                    let author_fill = msg
-                        .author_id
-                        .map(author_color)
-                        .unwrap_or_else(|| egui::Color32::from_gray(150));
+                    let author_label = msg
+                        .author_name
+                        .clone()
+                        .unwrap_or_else(|| short_hex(msg.author_id));
+                    let author_fill = author_color(msg.author_id);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
                         render_author_chip(ui, &author_label, author_fill);
+                        if msg.variant_count > 1 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "DIVERGENT {}/{}",
+                                    msg.variant_index + 1,
+                                    msg.variant_count
+                                ))
+                                .monospace()
+                                .strong()
+                                .small()
+                                .color(text_on_accent),
+                            );
+                        }
                         ui.label(
                             egui::RichText::new(truncate_to(
                                 msg.content.lines().next().unwrap_or("").trim(),
