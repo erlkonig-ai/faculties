@@ -3,13 +3,16 @@
 //! A status update is an append-only timestamped event keyed to a window
 //! (a relations persona / zooid). Latest-per-window = current status; the
 //! history is exhaust (a free per-window activity timeline). Mirrors the
-//! compass goal-status shape. Lives on its own `status` branch so the
-//! high-churn present-tense updates don't load the relations branch.
+//! compass goal-status shape. Status events live in their own union collection
+//! so high-churn present-tense updates remain independent from relations.
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
-pub const DEFAULT_BRANCH: &str = "status";
+/// Stable extrinsic scope of the status event collection.
+///
+/// Minted with `trible genid` on 2026-08-07.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("5C563832935FD4CFC726D63D2631DC5D");
 
 pub const KIND_STATUS_UPDATE: Id = id_hex!("1622DB88E9D9B455EEE1E82470E6730C");
 
