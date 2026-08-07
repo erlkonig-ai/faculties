@@ -30,8 +30,7 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
@@ -39,6 +38,7 @@ use triblespace::prelude::inlineencodings::{NsTAIInterval, U256BE};
 use triblespace::prelude::View;
 
 use crate::schemas::headspace::{playground_config, KIND_CONFIG_ID, KIND_MODEL_PROFILE_ID};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -116,7 +116,7 @@ struct ActiveConfig {
 }
 
 struct HeadspaceLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     active: ActiveConfig,
     /// All known model profiles, keyed by their profile id (the
     /// `playground_config::model_profile_id` value on the catalog
@@ -128,19 +128,12 @@ struct HeadspaceLive {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl HeadspaceLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[headspace] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-        let active = load_active_config(ws, &space);
-        let profiles = load_profiles(ws, &space);
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let space = dataset.facts;
+        let active = load_active_config(space);
+        let profiles = load_profiles(dataset, space);
         HeadspaceLive {
-            cached_head,
+            cached_revision: dataset.revision,
             active,
             profiles,
         }
@@ -151,7 +144,7 @@ impl HeadspaceLive {
 /// its persona pointer + active-profile pointer. There can be many
 /// historical config rows; `metadata::updated_at` orders them and
 /// the latest wins.
-fn load_active_config(_ws: &mut Workspace<Pile>, space: &TribleSet) -> ActiveConfig {
+fn load_active_config(space: &TribleSet) -> ActiveConfig {
     let mut best: Option<(Id, i128)> = None;
     for (config_id, updated_at) in find!(
         (config_id: Id, updated_at: Inline<NsTAIInterval>),
@@ -192,7 +185,7 @@ fn load_active_config(_ws: &mut Workspace<Pile>, space: &TribleSet) -> ActiveCon
 /// latest per `model_profile_id`, and load its attributes. The
 /// catalog stores append-only revisions per profile id; the latest
 /// `metadata::updated_at` is the live row.
-fn load_profiles(ws: &mut Workspace<Pile>, space: &TribleSet) -> HashMap<Id, ModelProfile> {
+fn load_profiles(dataset: DatasetView<'_>, space: &TribleSet) -> HashMap<Id, ModelProfile> {
     // Map profile_id → (entry_id, updated_at key) — pick the latest.
     let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
     for (entry_id, profile_id, updated_at) in find!(
@@ -226,7 +219,7 @@ fn load_profiles(ws: &mut Workspace<Pile>, space: &TribleSet) -> HashMap<Id, Mod
         )
         .next();
         p.name = name_handle
-            .and_then(|h| read_text(ws, h))
+            .and_then(|h| read_text(dataset, h))
             .unwrap_or_else(|| format!("profile-{}", short_hex(profile_id)));
 
         // Model name (Handle<LongString>).
@@ -235,7 +228,7 @@ fn load_profiles(ws: &mut Workspace<Pile>, space: &TribleSet) -> HashMap<Id, Mod
             pattern!(space, [{ entry_id @ playground_config::model_name: ?h }])
         )
         .next();
-        p.model_name = model_handle.and_then(|h| read_text(ws, h));
+        p.model_name = model_handle.and_then(|h| read_text(dataset, h));
 
         // Base URL (Handle<LongString>).
         let url_handle = find!(
@@ -243,7 +236,7 @@ fn load_profiles(ws: &mut Workspace<Pile>, space: &TribleSet) -> HashMap<Id, Mod
             pattern!(space, [{ entry_id @ playground_config::model_base_url: ?h }])
         )
         .next();
-        p.base_url = url_handle.and_then(|h| read_text(ws, h));
+        p.base_url = url_handle.and_then(|h| read_text(dataset, h));
 
         // Reasoning effort (Handle<LongString>).
         let effort_handle = find!(
@@ -251,7 +244,7 @@ fn load_profiles(ws: &mut Workspace<Pile>, space: &TribleSet) -> HashMap<Id, Mod
             pattern!(space, [{ entry_id @ playground_config::model_reasoning_effort: ?h }])
         )
         .next();
-        p.reasoning_effort = effort_handle.and_then(|h| read_text(ws, h));
+        p.reasoning_effort = effort_handle.and_then(|h| read_text(dataset, h));
 
         // API key presence (Handle<LongString>) — we don't surface
         // the secret, just whether one is configured.
@@ -315,11 +308,15 @@ fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
     i128::from_be_bytes(bytes)
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
 }
 
 /// Decode a 32-byte big-endian U256 to u64 when the value fits.
@@ -373,14 +370,13 @@ impl HeadspaceViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(HeadspaceLive::refresh(ws));
+            self.live = Some(HeadspaceLive::refresh(dataset));
         }
 
         ctx.section("Headspace", |ctx| {

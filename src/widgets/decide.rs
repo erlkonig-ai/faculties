@@ -21,14 +21,14 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
 use crate::schemas::decide::{decide as decide_attrs, factor, KIND_CON, KIND_DECISION, KIND_PRO};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -135,20 +135,13 @@ impl DecisionRow {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 struct DecideLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     decisions: Vec<DecisionRow>,
 }
 
 impl DecideLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[decide] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let space = dataset.facts;
 
         // Per-decision rollups — title / description / outcome handles,
         // about pointer, created/finished timestamps.
@@ -156,7 +149,7 @@ impl DecideLive {
 
         for (id,) in find!(
             (d: Id,),
-            pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
+            pattern!(space, [{ ?d @ metadata::tag: KIND_DECISION }])
         ) {
             decisions.insert(
                 id,
@@ -177,7 +170,7 @@ impl DecideLive {
         // Title.
         let title_rows: Vec<(Id, TextHandle)> = find!(
             (d: Id, h: TextHandle),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?d @
                 metadata::tag: KIND_DECISION,
                 metadata::name: ?h,
@@ -186,7 +179,7 @@ impl DecideLive {
         .collect();
         for (id, h) in title_rows {
             if let Some(row) = decisions.get_mut(&id) {
-                if let Some(text) = read_text(ws, h) {
+                if let Some(text) = read_text(dataset, h) {
                     row.title = text;
                 }
             }
@@ -195,7 +188,7 @@ impl DecideLive {
         // Context (description).
         let ctx_rows: Vec<(Id, TextHandle)> = find!(
             (d: Id, h: TextHandle),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?d @
                 metadata::tag: KIND_DECISION,
                 metadata::description: ?h,
@@ -204,14 +197,14 @@ impl DecideLive {
         .collect();
         for (id, h) in ctx_rows {
             if let Some(row) = decisions.get_mut(&id) {
-                row.context = read_text(ws, h);
+                row.context = read_text(dataset, h);
             }
         }
 
         // Outcome (only set on resolved).
         let outcome_rows: Vec<(Id, TextHandle)> = find!(
             (d: Id, h: TextHandle),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?d @
                 metadata::tag: KIND_DECISION,
                 decide_attrs::outcome: ?h,
@@ -220,14 +213,14 @@ impl DecideLive {
         .collect();
         for (id, h) in outcome_rows {
             if let Some(row) = decisions.get_mut(&id) {
-                row.outcome = read_text(ws, h);
+                row.outcome = read_text(dataset, h);
             }
         }
 
         // About pointer.
         for (id, target) in find!(
             (d: Id, a: Id),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?d @
                 metadata::tag: KIND_DECISION,
                 decide_attrs::about: ?a,
@@ -241,7 +234,7 @@ impl DecideLive {
         // Timestamps (intervals — take the start ns).
         for (id, ts) in find!(
             (d: Id, ts: (i128, i128)),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?d @
                 metadata::tag: KIND_DECISION,
                 metadata::created_at: ?ts,
@@ -253,7 +246,7 @@ impl DecideLive {
         }
         for (id, ts) in find!(
             (d: Id, ts: (i128, i128)),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?d @
                 metadata::tag: KIND_DECISION,
                 metadata::finished_at: ?ts,
@@ -267,10 +260,10 @@ impl DecideLive {
         // Pros / cons. Each factor has metadata::name (one-liner),
         // optional metadata::description (long form), and a
         // factor::about_decision pointer back to its parent.
-        collect_factors(ws, &space, KIND_PRO, &mut decisions, |row, f| {
+        collect_factors(dataset, space, KIND_PRO, &mut decisions, |row, f| {
             row.pros.push(f);
         });
-        collect_factors(ws, &space, KIND_CON, &mut decisions, |row, f| {
+        collect_factors(dataset, space, KIND_CON, &mut decisions, |row, f| {
             row.cons.push(f);
         });
 
@@ -285,14 +278,14 @@ impl DecideLive {
         decisions.sort_by_key(|d| std::cmp::Reverse(d.sort_key()));
 
         DecideLive {
-            cached_head,
+            cached_revision: dataset.revision,
             decisions,
         }
     }
 }
 
 fn collect_factors(
-    ws: &mut Workspace<Pile>,
+    dataset: DatasetView<'_>,
     space: &TribleSet,
     kind: Id,
     decisions: &mut HashMap<Id, DecisionRow>,
@@ -312,13 +305,13 @@ fn collect_factors(
     )
     .collect();
     for (factor_id, decision_id, name) in rows {
-        let text = read_text(ws, name).unwrap_or_else(|| "(unnamed)".into());
+        let text = read_text(dataset, name).unwrap_or_else(|| "(unnamed)".into());
         let detail = find!(
             (h: TextHandle,),
             pattern!(space, [{ factor_id @ metadata::description: ?h }])
         )
         .next()
-        .and_then(|(h,)| read_text(ws, h));
+        .and_then(|(h,)| read_text(dataset, h));
         let created_at = find!(
             (ts: (i128, i128),),
             pattern!(space, [{ factor_id @ metadata::created_at: ?ts }])
@@ -338,11 +331,15 @@ fn collect_factors(
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -362,14 +359,13 @@ impl DecidePanel {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(DecideLive::refresh(ws));
+            self.live = Some(DecideLive::refresh(dataset));
         }
 
         ctx.section("Decisions", |ctx| {

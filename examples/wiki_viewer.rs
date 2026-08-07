@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{StorageState, WikiViewer};
+use faculties::widgets::{SourceKey, StorageState, WikiViewer};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -36,11 +36,10 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("wiki", WikiViewer::default(), move |ctx, viewer| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("wiki") else {
+        let sources = st.context();
+        let Some(wiki) = sources.dataset(SourceKey::Wiki) else {
             return;
         };
-        let mut files = st.workspace("files");
-        viewer.render(ctx, &mut ws, files.as_mut());
-        st.push(&mut ws);
+        viewer.render(ctx, wiki, sources.dataset(SourceKey::Files));
     });
 }

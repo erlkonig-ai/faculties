@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{HeadspaceViewer, StorageState};
+use faculties::widgets::{HeadspaceViewer, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -39,11 +39,10 @@ fn main(nb: &mut NotebookCtx) {
         HeadspaceViewer::default(),
         move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
-            let Some(mut ws) = st.workspace("config") else {
+            let Some(view) = st.context().dataset(SourceKey::Headspace) else {
                 return;
             };
-            panel.render(ctx, &mut ws);
-            st.push(&mut ws);
+            panel.render(ctx, view);
         },
     );
 }

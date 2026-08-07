@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{StatusViewer, StorageState};
+use faculties::widgets::{SourceKey, StatusViewer, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -35,11 +35,10 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("status", StatusViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("status") else {
+        let sources = st.context();
+        let Some(status) = sources.dataset(SourceKey::Status) else {
             return;
         };
-        let mut relations = st.workspace("relations");
-        panel.render(ctx, &mut ws, relations.as_mut());
-        st.push(&mut ws);
+        panel.render(ctx, status, sources.dataset(SourceKey::Relations));
     });
 }

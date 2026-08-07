@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{PlannerViewer, StorageState};
+use faculties::widgets::{PlannerViewer, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -46,11 +46,10 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("planner", PlannerViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("planner") else {
+        let sources = st.context();
+        let Some(planner) = sources.dataset(SourceKey::Planner) else {
             return;
         };
-        let mut relations = st.workspace("relations");
-        panel.render(ctx, &mut ws, relations.as_mut());
-        st.push(&mut ws);
+        panel.render(ctx, planner, sources.dataset(SourceKey::Relations));
     });
 }

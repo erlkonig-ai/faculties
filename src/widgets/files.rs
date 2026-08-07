@@ -39,14 +39,14 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::View;
 
 use crate::schemas::files::{file as file_attrs, KIND_IMPORT};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 type FileHandle = Inline<Handle<RawBytes>>;
@@ -105,7 +105,7 @@ struct ImportRow {
 }
 
 struct FilesLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     imports: Vec<ImportRow>,
     total: usize,
     /// Retained fact space so click-time actions (opening a card's
@@ -118,15 +118,8 @@ struct FilesLive {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl FilesLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[files] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let space = dataset.facts.clone();
 
         let mut by_id: HashMap<Id, ImportRow> = HashMap::new();
 
@@ -162,7 +155,7 @@ impl FilesLive {
             }
         }
 
-        // Source path — a Handle<LongString>, dereffed via ws.get on
+        // Source path — a Handle<LongString>, dereferenced via the dataset reader on
         // demand. Reading text per import is cheap because there's
         // usually a handful of imports per pile (vs. tens of
         // thousands of files).
@@ -173,7 +166,7 @@ impl FilesLive {
         .collect();
         for (id, h) in path_rows {
             if let Some(row) = by_id.get_mut(&id) {
-                row.source_path = read_text(ws, h);
+                row.source_path = read_text(dataset, h);
             }
         }
 
@@ -228,7 +221,7 @@ impl FilesLive {
         imports.truncate(MAX_IMPORTS);
 
         FilesLive {
-            cached_head,
+            cached_revision: dataset.revision,
             imports,
             total,
             space,
@@ -243,11 +236,15 @@ fn epoch_to_chrono(e: Epoch) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
 }
 
 fn id_hex(id: Id) -> String {
@@ -321,21 +318,20 @@ impl FilesViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(FilesLive::refresh(ws));
+            self.live = Some(FilesLive::refresh(dataset));
         }
 
         // Click-time action: open the import's root file/directory.
         // The card's OPEN button only sets this request; the actual
         // blob extraction happens after the section closure ends, when
         // the immutable `live` borrow has been released and we can use
-        // `ws` for blob reads again.
+        // the dataset reader for blob reads again.
         let mut open_root: Option<Id> = None;
 
         ctx.section("Files", |ctx| {
@@ -407,7 +403,7 @@ impl FilesViewer {
 
         if let Some(root) = open_root {
             if let Some(live) = self.live.as_ref() {
-                open_entity(ws, &live.space, root);
+                open_entity(dataset, &live.space, root);
             }
         }
     }
@@ -418,13 +414,13 @@ impl FilesViewer {
 /// result — same flow the wiki widget uses for `files:` links, but
 /// extended to handle directory roots by recursing through
 /// `file::children`. Best-effort: errors log to stderr.
-fn open_entity(ws: &mut Workspace<Pile>, space: &TribleSet, entity_id: Id) {
+fn open_entity(dataset: DatasetView<'_>, space: &TribleSet, entity_id: Id) {
     let tmp_dir = std::env::temp_dir().join("faculties-files");
     if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
         eprintln!("[files] mkdir {}: {e}", tmp_dir.display());
         return;
     }
-    match extract_tree(ws, space, entity_id, &tmp_dir, 0) {
+    match extract_tree(dataset, space, entity_id, &tmp_dir, 0) {
         Ok(path) => {
             eprintln!("[files] opening: {}", path.display());
             let _ = std::process::Command::new("open").arg(&path).spawn();
@@ -440,7 +436,7 @@ fn open_entity(ws: &mut Workspace<Pile>, space: &TribleSet, entity_id: Id) {
 /// as a cycle guard — the files faculty never writes cyclic trees,
 /// but a corrupted pile shouldn't be able to hang the viewer.
 fn extract_tree(
-    ws: &mut Workspace<Pile>,
+    dataset: DatasetView<'_>,
     space: &TribleSet,
     entity_id: Id,
     dest: &std::path::Path,
@@ -455,7 +451,7 @@ fn extract_tree(
         pattern!(space, [{ entity_id @ file_attrs::name: ?h }])
     )
     .next()
-    .and_then(|h| read_text(ws, h))
+    .and_then(|h| read_text(dataset, h))
     .unwrap_or_else(|| short_hex_name(entity_id));
 
     // File leaf: has a content blob.
@@ -465,7 +461,8 @@ fn extract_tree(
     )
     .next()
     {
-        let blob: Blob<RawBytes> = ws
+        let blob: Blob<RawBytes> = dataset
+            .reader
             .get(content)
             .map_err(|e| format!("get blob for {name}: {e:?}"))?;
         let path = dest.join(&name);
@@ -486,7 +483,7 @@ fn extract_tree(
     for child in children {
         // Best-effort per child: one unreadable blob shouldn't kill
         // the rest of the tree.
-        if let Err(e) = extract_tree(ws, space, child, &dir, depth + 1) {
+        if let Err(e) = extract_tree(dataset, space, child, &dir, depth + 1) {
             eprintln!("[files] skipping child: {e}");
         }
     }

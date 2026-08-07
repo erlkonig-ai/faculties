@@ -6,12 +6,11 @@
 //! cargo run --example compass_board --features widgets -- ./self.pile
 //! ```
 //!
-//! Or set `PILE=./self.pile` in the environment. A non-default branch name
-//! can be passed as the second positional argument or via `BRANCH=<name>`.
+//! Or set `PILE=./self.pile` in the environment.
 
 use std::path::PathBuf;
 
-use faculties::widgets::{CompassBoard, StorageState};
+use faculties::widgets::{CompassBoard, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -23,11 +22,6 @@ fn main(nb: &mut NotebookCtx) {
         .or_else(|| std::env::var("PILE").ok())
         .unwrap_or_else(|| "./self.pile".to_owned())
         .into();
-    let branch = args
-        .next()
-        .or_else(|| std::env::var("BRANCH").ok())
-        .unwrap_or_else(|| "compass".to_owned());
-
     let storage = nb.state("storage", StorageState::new(pile_path), |ctx, st| {
         st.top_bar(ctx);
     });
@@ -42,10 +36,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("compass", CompassBoard::default(), move |ctx, board| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace(&branch) else {
+        let Some(view) = st.context().dataset(SourceKey::Compass) else {
             return;
         };
-        board.render(ctx, &mut ws);
-        st.push(&mut ws);
+        board.render(ctx, view);
     });
 }

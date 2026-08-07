@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{MemoryViewer, StorageState};
+use faculties::widgets::{MemoryViewer, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -38,12 +38,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("memory", MemoryViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        // Try `memory` first, fall back to `cognition` for older
-        // agent runs (which wrote chunks to the cognition branch
-        // before the memory branch became canonical).
-        let ws = st.workspace("memory").or_else(|| st.workspace("cognition"));
-        let Some(mut ws) = ws else { return };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        let Some(view) = st.context().dataset(SourceKey::Memory) else {
+            return;
+        };
+        panel.render(ctx, view);
     });
 }

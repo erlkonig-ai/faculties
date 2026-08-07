@@ -19,11 +19,9 @@ use std::path::PathBuf;
 use faculties::widgets::{
     AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
     GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
-    RelationsViewer, StatusViewer, StorageState, TeamsViewer, TimelineSource, TriageViewer,
-    WikiViewer,
+    RelationsViewer, SourceKey, StatusViewer, StorageState, TeamsViewer, TimelineSource,
+    TriageViewer, WikiViewer,
 };
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Workspace;
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -99,147 +97,127 @@ fn main(nb: &mut NotebookCtx) {
         HeadspaceViewer::default(),
         move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
-            let Some(mut ws) = st.workspace("config") else {
+            let Some(view) = st.context().dataset(SourceKey::Headspace) else {
                 return;
             };
-            panel.render(ctx, &mut ws);
-            st.push(&mut ws);
+            panel.render(ctx, view);
         },
     );
 
     nb.state("status", StatusViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("status") else {
+        let sources = st.context();
+        let Some(view) = sources.dataset(SourceKey::Status) else {
             return;
         };
-        let mut relations = st.workspace("relations");
-        panel.render(ctx, &mut ws, relations.as_mut());
-        st.push(&mut ws);
+        panel.render(ctx, view, sources.dataset(SourceKey::Relations));
     });
 
     nb.state(
         "timeline",
         BranchTimeline::multi(vec![
             TimelineSource::Compass {
+                key: SourceKey::Compass,
                 label: "goals".to_owned(),
             },
             TimelineSource::LocalMessages {
+                key: SourceKey::Messages,
                 label: "local".to_owned(),
             },
             TimelineSource::Wiki {
+                key: SourceKey::Wiki,
                 label: "wiki".to_owned(),
             },
             TimelineSource::Reason {
+                key: SourceKey::Reason,
                 label: "reason".to_owned(),
             },
             TimelineSource::Archive {
+                key: SourceKey::Archive,
                 label: "archive".to_owned(),
             },
         ]),
         move |ctx, tl| {
             let mut st = storage.read_mut(ctx);
-            // Branches are positional w.r.t. the TimelineSource vec
-            // above. Missing branches at the tail are handled cleanly
-            // by MultiLive (workspaces.get_mut(idx) returning None
-            // → the corresponding source is skipped for the frame),
-            // so e.g. an empty archive branch produces no archive
-            // events without breaking the others.
-            let branch_names: &[&str] = &["compass", "message", "wiki", "cognition", "archive"];
-            let mut pulled: Vec<(&str, Workspace<Pile>)> = Vec::with_capacity(branch_names.len());
-            for name in branch_names {
-                if let Some(ws) = st.workspace(name) {
-                    pulled.push((*name, ws));
-                }
-            }
-            let mut slots: Vec<(&str, &mut Workspace<Pile>)> =
-                pulled.iter_mut().map(|(n, ws)| (*n, ws)).collect();
-            tl.render(ctx, slots.as_mut_slice());
+            let sources = st.context();
+            tl.render(ctx, &sources);
         },
     );
 
     nb.state("gauge", GaugeViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("wiki") else {
+        let Some(view) = st.context().dataset(SourceKey::Wiki) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 
     nb.state("wiki", WikiViewer::default(), move |ctx, wiki| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("wiki") else {
+        let sources = st.context();
+        let Some(view) = sources.dataset(SourceKey::Wiki) else {
             return;
         };
-        let mut files = st.workspace("files");
-        wiki.render(ctx, &mut ws, files.as_mut());
-        st.push(&mut ws);
+        wiki.render(ctx, view, sources.dataset(SourceKey::Files));
     });
 
     nb.state("compass", CompassBoard::default(), move |ctx, compass| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("compass") else {
+        let Some(view) = st.context().dataset(SourceKey::Compass) else {
             return;
         };
-        compass.render(ctx, &mut ws);
-        st.push(&mut ws);
+        compass.render(ctx, view);
     });
 
     nb.state("decide", DecidePanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("decide") else {
+        let Some(view) = st.context().dataset(SourceKey::Decide) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 
     nb.state("mail", MailViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("mail") else {
+        let sources = st.context();
+        let Some(view) = sources.dataset(SourceKey::Mail) else {
             return;
         };
-        let mut relations = st.workspace("relations");
-        panel.render(ctx, &mut ws, relations.as_mut());
-        st.push(&mut ws);
+        panel.render(ctx, view, sources.dataset(SourceKey::Relations));
     });
 
     nb.state("planner", PlannerViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("planner") else {
+        let sources = st.context();
+        let Some(view) = sources.dataset(SourceKey::Planner) else {
             return;
         };
-        let mut relations = st.workspace("relations");
-        panel.render(ctx, &mut ws, relations.as_mut());
-        st.push(&mut ws);
+        panel.render(ctx, view, sources.dataset(SourceKey::Relations));
     });
 
     nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("message") else {
+        let sources = st.context();
+        let Some(view) = sources.dataset(SourceKey::Messages) else {
             return;
         };
-        let mut relations = st.workspace("relations");
-        panel.render(ctx, &mut ws, relations.as_mut());
-        st.push(&mut ws);
+        panel.render(ctx, view, sources.dataset(SourceKey::Relations));
     });
 
     nb.state("discord", DiscordViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("discord") else {
+        let Some(view) = st.context().dataset(SourceKey::Discord) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 
     nb.state("teams", TeamsViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("teams") else {
+        let Some(view) = st.context().dataset(SourceKey::Teams) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 
     nb.state(
@@ -247,48 +225,42 @@ fn main(nb: &mut NotebookCtx) {
         RelationsViewer::default(),
         move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
-            let Some(mut ws) = st.workspace("relations") else {
+            let Some(view) = st.context().dataset(SourceKey::Relations) else {
                 return;
             };
-            panel.render(ctx, &mut ws);
-            st.push(&mut ws);
+            panel.render(ctx, view);
         },
     );
 
     nb.state("memory", MemoryViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        // Try the canonical `memory` branch first; fall back to
-        // `cognition` for piles seeded before memory split out.
-        let ws = st.workspace("memory").or_else(|| st.workspace("cognition"));
-        let Some(mut ws) = ws else { return };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        let Some(view) = st.context().dataset(SourceKey::Memory) else {
+            return;
+        };
+        panel.render(ctx, view);
     });
 
     nb.state("files", FilesViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("files") else {
+        let Some(view) = st.context().dataset(SourceKey::Files) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 
     nb.state("triage", TriageViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("cognition") else {
+        let Some(view) = st.context().dataset(SourceKey::Triage) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 
     nb.state("atlas", AtlasViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("atlas") else {
+        let Some(view) = st.context().dataset(SourceKey::Atlas) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 }

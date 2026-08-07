@@ -21,15 +21,14 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
 use crate::schemas::archive::archive as archive_attrs;
 use crate::schemas::teams::teams as teams_attrs;
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -89,7 +88,7 @@ struct Chat {
 }
 
 struct TeamsLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     messages: Vec<MessageRow>,
     chats: HashMap<Id, Chat>,
     total_messages: usize,
@@ -99,20 +98,13 @@ struct TeamsLive {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl TeamsLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[teams] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let space = dataset.facts;
 
         let mut chats: HashMap<Id, Chat> = HashMap::new();
         for (cid,) in find!(
             (cid: Id,),
-            pattern!(&space, [{ ?cid @ metadata::tag: &teams_attrs::kind_chat }])
+            pattern!(space, [{ ?cid @ metadata::tag: &teams_attrs::kind_chat }])
         ) {
             chats.insert(cid, Chat::default());
         }
@@ -123,7 +115,7 @@ impl TeamsLive {
         // still resolve when present.
         let chat_name_rows: Vec<(Id, TextHandle)> = find!(
             (cid: Id, h: TextHandle),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?cid @
                 metadata::tag: &teams_attrs::kind_chat,
                 metadata::name: ?h,
@@ -132,7 +124,7 @@ impl TeamsLive {
         .collect();
         for (cid, h) in chat_name_rows {
             if let Some(c) = chats.get_mut(&cid) {
-                c.name = read_text(ws, h);
+                c.name = read_text(dataset, h);
             }
         }
 
@@ -142,7 +134,7 @@ impl TeamsLive {
         // archive::kind_message.
         let msg_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
             (mid: Id, cid: Id, content: TextHandle, ts: (i128, i128)),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?mid @
                 metadata::tag: &archive_attrs::kind_message,
                 teams_attrs::chat: ?cid,
@@ -154,17 +146,17 @@ impl TeamsLive {
 
         let author_rows: HashMap<Id, Id> = find!(
             (mid: Id, aid: Id),
-            pattern!(&space, [{ ?mid @ archive_attrs::author: ?aid }])
+            pattern!(space, [{ ?mid @ archive_attrs::author: ?aid }])
         )
         .collect();
         let author_name_rows: Vec<(Id, TextHandle)> = find!(
             (aid: Id, h: TextHandle),
-            pattern!(&space, [{ ?aid @ archive_attrs::author_name: ?h }])
+            pattern!(space, [{ ?aid @ archive_attrs::author_name: ?h }])
         )
         .collect();
         let mut author_names: HashMap<Id, String> = HashMap::new();
         for (aid, h) in author_name_rows {
-            if let Some(name) = read_text(ws, h) {
+            if let Some(name) = read_text(dataset, h) {
                 author_names.insert(aid, name);
             }
         }
@@ -172,7 +164,7 @@ impl TeamsLive {
         let total_messages = msg_rows.len();
         let mut messages: Vec<MessageRow> = Vec::with_capacity(msg_rows.len());
         for (mid, cid, content_h, ts) in msg_rows {
-            let raw = read_text(ws, content_h).unwrap_or_default();
+            let raw = read_text(dataset, content_h).unwrap_or_default();
             let content = strip_html(&raw);
             let author_id = author_rows.get(&mid).copied();
             let author_name = author_id.and_then(|aid| author_names.get(&aid).cloned());
@@ -190,7 +182,7 @@ impl TeamsLive {
         messages.truncate(MAX_MESSAGES);
 
         TeamsLive {
-            cached_head,
+            cached_revision: dataset.revision,
             messages,
             chats,
             total_messages,
@@ -206,11 +198,15 @@ impl TeamsLive {
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
 }
 
 fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
@@ -319,14 +315,13 @@ impl TeamsViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(TeamsLive::refresh(ws));
+            self.live = Some(TeamsLive::refresh(dataset));
         }
 
         ctx.section("Teams", |ctx| {

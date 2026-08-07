@@ -22,15 +22,14 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
 use crate::schemas::archive::archive as archive_attrs;
 use crate::schemas::discord::discord as discord_attrs;
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -99,7 +98,7 @@ struct Guild {
 }
 
 struct DiscordLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     messages: Vec<MessageRow>,
     channels: HashMap<Id, Channel>,
     guilds: HashMap<Id, Guild>,
@@ -111,22 +110,15 @@ struct DiscordLive {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl DiscordLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[discord] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let space = dataset.facts;
 
         // Channels — read first so messages can look up channel
         // names without an extra per-message find!().
         let mut channels: HashMap<Id, Channel> = HashMap::new();
         for (cid,) in find!(
             (cid: Id,),
-            pattern!(&space, [{ ?cid @ metadata::tag: &discord_attrs::kind_channel }])
+            pattern!(space, [{ ?cid @ metadata::tag: &discord_attrs::kind_channel }])
         ) {
             channels.insert(cid, Channel::default());
         }
@@ -135,7 +127,7 @@ impl DiscordLive {
         // Channel names (metadata::name long-string).
         let chan_name_rows: Vec<(Id, TextHandle)> = find!(
             (cid: Id, h: TextHandle),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?cid @
                 metadata::tag: &discord_attrs::kind_channel,
                 metadata::name: ?h,
@@ -144,13 +136,13 @@ impl DiscordLive {
         .collect();
         for (cid, h) in chan_name_rows {
             if let Some(c) = channels.get_mut(&cid) {
-                c.name = read_text(ws, h);
+                c.name = read_text(dataset, h);
             }
         }
         // Channel → guild pointer (so chips can show the guild).
         for (cid, gid) in find!(
             (cid: Id, gid: Id),
-            pattern!(&space, [{ ?cid @ discord_attrs::guild: ?gid }])
+            pattern!(space, [{ ?cid @ discord_attrs::guild: ?gid }])
         ) {
             if let Some(c) = channels.get_mut(&cid) {
                 c.guild_id = Some(gid);
@@ -163,14 +155,14 @@ impl DiscordLive {
         let mut guilds: HashMap<Id, Guild> = HashMap::new();
         for (gid,) in find!(
             (gid: Id,),
-            pattern!(&space, [{ ?gid @ metadata::tag: &discord_attrs::kind_guild }])
+            pattern!(space, [{ ?gid @ metadata::tag: &discord_attrs::kind_guild }])
         ) {
             guilds.insert(gid, Guild::default());
         }
         let guild_count = guilds.len();
         let guild_name_rows: Vec<(Id, TextHandle)> = find!(
             (gid: Id, h: TextHandle),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?gid @
                 metadata::tag: &discord_attrs::kind_guild,
                 metadata::name: ?h,
@@ -179,7 +171,7 @@ impl DiscordLive {
         .collect();
         for (gid, h) in guild_name_rows {
             if let Some(g) = guilds.get_mut(&gid) {
-                g.name = read_text(ws, h);
+                g.name = read_text(dataset, h);
             }
         }
 
@@ -189,7 +181,7 @@ impl DiscordLive {
         // have those, but the join is harmless and explicit).
         let msg_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
             (mid: Id, cid: Id, content: TextHandle, ts: (i128, i128)),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?mid @
                 metadata::tag: &archive_attrs::kind_message,
                 discord_attrs::channel: ?cid,
@@ -204,17 +196,17 @@ impl DiscordLive {
         // many messages.
         let author_rows: HashMap<Id, Id> = find!(
             (mid: Id, aid: Id),
-            pattern!(&space, [{ ?mid @ archive_attrs::author: ?aid }])
+            pattern!(space, [{ ?mid @ archive_attrs::author: ?aid }])
         )
         .collect();
         let author_name_rows: Vec<(Id, TextHandle)> = find!(
             (aid: Id, h: TextHandle),
-            pattern!(&space, [{ ?aid @ archive_attrs::author_name: ?h }])
+            pattern!(space, [{ ?aid @ archive_attrs::author_name: ?h }])
         )
         .collect();
         let mut author_names: HashMap<Id, String> = HashMap::new();
         for (aid, h) in author_name_rows {
-            if let Some(name) = read_text(ws, h) {
+            if let Some(name) = read_text(dataset, h) {
                 author_names.insert(aid, name);
             }
         }
@@ -222,7 +214,7 @@ impl DiscordLive {
         let total_messages = msg_rows.len();
         let mut messages: Vec<MessageRow> = Vec::with_capacity(msg_rows.len());
         for (mid, cid, content_h, ts) in msg_rows {
-            let raw = read_text(ws, content_h).unwrap_or_default();
+            let raw = read_text(dataset, content_h).unwrap_or_default();
             let content = strip_html(&raw);
             let author_id = author_rows.get(&mid).copied();
             let author_name = author_id.and_then(|aid| author_names.get(&aid).cloned());
@@ -241,7 +233,7 @@ impl DiscordLive {
         messages.truncate(MAX_MESSAGES);
 
         DiscordLive {
-            cached_head,
+            cached_revision: dataset.revision,
             messages,
             channels,
             guilds,
@@ -265,11 +257,15 @@ impl DiscordLive {
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
 }
 
 fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
@@ -376,14 +372,13 @@ impl DiscordViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(DiscordLive::refresh(ws));
+            self.live = Some(DiscordLive::refresh(dataset));
         }
 
         ctx.section("Discord", |ctx| {

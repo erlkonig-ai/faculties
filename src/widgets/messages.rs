@@ -8,8 +8,8 @@
 //! optional read receipts, and a short id footer.
 //!
 //! The widget holds UI + cached-query state only; the host supplies
-//! the message workspace (required) and an optional `relations`
-//! workspace at render time.
+//! the message dataset (required) and an optional `relations`
+//! dataset at render time.
 //!
 //! Identity display is resolved against the relations branch (if
 //! supplied): `alias → first_name last_name → display_name → 8-char
@@ -20,7 +20,7 @@
 //!
 //! ```ignore
 //! let mut panel = MessagesPanel::default();
-//! panel.render(ctx, messages_ws, Some(relations_ws));
+//! panel.render(ctx, messages_view, Some(relations_view));
 //! ```
 
 use std::collections::HashMap;
@@ -29,8 +29,8 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
@@ -40,6 +40,7 @@ use GORBIE::themes::colorhash;
 
 use crate::schemas::message::{local, KIND_MESSAGE_ID, KIND_READ_ID};
 use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 /// Handle to a long-string blob (message bodies).
 type TextHandle = Inline<Handle<LongString>>;
@@ -186,55 +187,40 @@ impl Person {
 
 // ── Cached message query state ───────────────────────────────────────
 
-/// Cached fact spaces + head markers + resolved people map. Rebuilt
-/// whenever the message head advances or the relations head
-/// changes.
+/// Cached fact space + revision markers + resolved people map. Rebuilt
+/// whenever the message or relations dataset revision changes.
 struct MessagesLive {
     space: TribleSet,
-    cached_head: Option<CommitHandle>,
-    relations_cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
+    relations_cached_revision: Option<DatasetRevision>,
     people: HashMap<Id, Person>,
 }
 
 impl MessagesLive {
     /// Refresh cached fact spaces + people map from the provided
-    /// workspaces.
-    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[messages] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    /// dataset views.
+    fn refresh(view: DatasetView<'_>, relations: Option<DatasetView<'_>>) -> Self {
+        let space = view.facts.clone();
 
-        let (relations_cached_head, people) = match relations_ws {
-            Some(rws) => {
-                let head = rws.head();
-                let rspace = rws
-                    .checkout(..)
-                    .map(|co| co.into_facts())
-                    .unwrap_or_else(|e| {
-                        eprintln!("[messages] relations checkout: {e:?}");
-                        TribleSet::new()
-                    });
-                let people = build_people(&rspace, rws);
-                (head, people)
-            }
+        let (relations_cached_revision, people) = match relations {
+            Some(relations) => (
+                Some(relations.revision),
+                build_people(relations.facts, relations.reader),
+            ),
             None => (None, HashMap::new()),
         };
 
         MessagesLive {
             space,
-            cached_head,
-            relations_cached_head,
+            cached_revision: view.revision,
+            relations_cached_revision,
             people,
         }
     }
 
-    fn text(&self, ws: &mut Workspace<Pile>, h: TextHandle) -> String {
-        ws.get::<View<str>, LongString>(h)
+    fn text(&self, reader: &PileReader, h: TextHandle) -> String {
+        reader
+            .get::<View<str>, LongString>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
                 s.to_string()
@@ -252,7 +238,7 @@ impl MessagesLive {
 
     /// Collect every message with its from/to/body/created_at and fold
     /// in the read-receipt events that target it.
-    fn messages(&self, ws: &mut Workspace<Pile>) -> Vec<MessageRow> {
+    fn messages(&self, reader: &PileReader) -> Vec<MessageRow> {
         let mut by_id: HashMap<Id, MessageRow> = HashMap::new();
 
         let rows: Vec<(Id, Id, Id, TextHandle, (i128, i128))> = find!(
@@ -278,7 +264,7 @@ impl MessagesLive {
             if by_id.contains_key(&mid) {
                 continue;
             }
-            let body = self.text(ws, body_handle);
+            let body = self.text(reader, body_handle);
             by_id.insert(
                 mid,
                 MessageRow {
@@ -325,10 +311,7 @@ impl MessagesLive {
 }
 
 /// Build the people map by scanning the relations fact space.
-fn build_people(
-    relations_space: &TribleSet,
-    relations_ws: &mut Workspace<Pile>,
-) -> HashMap<Id, Person> {
+fn build_people(relations_space: &TribleSet, relations_reader: &PileReader) -> HashMap<Id, Person> {
     let mut people: HashMap<Id, Person> = HashMap::new();
 
     let person_ids: Vec<Id> = find!(
@@ -354,8 +337,8 @@ fn build_people(
         }
     }
 
-    let relations_text = |ws: &mut Workspace<Pile>, h: TextHandle| -> Option<String> {
-        ws.get::<View<str>, LongString>(h).ok().map(|v| {
+    let relations_text = |reader: &PileReader, h: TextHandle| -> Option<String> {
+        reader.get::<View<str>, LongString>(h).ok().map(|v| {
             let s: &str = v.as_ref();
             s.to_string()
         })
@@ -368,7 +351,7 @@ fn build_people(
     .collect();
     for (pid, h) in first_rows {
         if people.contains_key(&pid) {
-            if let Some(v) = relations_text(relations_ws, h) {
+            if let Some(v) = relations_text(relations_reader, h) {
                 if let Some(p) = people.get_mut(&pid) {
                     p.first_name.get_or_insert(v);
                 }
@@ -383,7 +366,7 @@ fn build_people(
     .collect();
     for (pid, h) in last_rows {
         if people.contains_key(&pid) {
-            if let Some(v) = relations_text(relations_ws, h) {
+            if let Some(v) = relations_text(relations_reader, h) {
                 if let Some(p) = people.get_mut(&pid) {
                     p.last_name.get_or_insert(v);
                 }
@@ -398,7 +381,7 @@ fn build_people(
     .collect();
     for (pid, h) in display_rows {
         if people.contains_key(&pid) {
-            if let Some(v) = relations_text(relations_ws, h) {
+            if let Some(v) = relations_text(relations_reader, h) {
                 if let Some(p) = people.get_mut(&pid) {
                     p.display_name.get_or_insert(v);
                 }
@@ -440,7 +423,7 @@ enum StreamFilter {
 }
 
 pub struct MessagesPanel {
-    /// Rebuilt when the messages / relations head changes.
+    /// Rebuilt when the messages / relations revision changes.
     live: Option<MessagesLive>,
     /// Current stream filter — toggled via the ALL / INBOX chips.
     filter: StreamFilter,
@@ -468,27 +451,26 @@ impl MessagesPanel {
         self
     }
 
-    /// Render the panel. `ws` must point at the message branch;
-    /// `relations_ws` is optional and, when provided, is used for
+    /// Render the panel. `view` is the messages dataset;
+    /// `relations` is optional and, when provided, is used for
     /// friendly-name resolution.
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-        mut relations_ws: Option<&mut Workspace<Pile>>,
+        view: DatasetView<'_>,
+        relations: Option<DatasetView<'_>>,
     ) {
-        // Refresh cached state if any head advanced.
-        let head = ws.head();
-        let rhead = relations_ws.as_ref().and_then(|w| w.head());
+        // Refresh cached state if either logical dataset changed.
+        let revision = view.revision;
+        let relations_revision = relations.map(|view| view.revision);
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head || l.relations_cached_head != rhead,
+            Some(l) => {
+                l.cached_revision != revision || l.relations_cached_revision != relations_revision
+            }
         };
         if need_refresh {
-            self.live = Some(MessagesLive::refresh(
-                ws,
-                relations_ws.as_mut().map(|w| &mut **w),
-            ));
+            self.live = Some(MessagesLive::refresh(view, relations));
         }
 
         let filter = &mut self.filter;
@@ -498,7 +480,7 @@ impl MessagesPanel {
             };
 
             // Pre-materialize everything the UI closure needs.
-            let mut messages = live.messages(ws);
+            let mut messages = live.messages(view.reader);
             messages.sort_by(|a, b| {
                 a.sort_key()
                     .cmp(&b.sort_key())
@@ -652,9 +634,6 @@ impl MessagesPanel {
                     });
                 }
             });
-
-            // Read-only viewer — no writes to apply post-render.
-            let _ = ws;
         });
     }
 }

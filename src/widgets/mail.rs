@@ -12,7 +12,7 @@
 //!
 //! ```ignore
 //! let mut panel = MailViewer::default();
-//! panel.render(ctx, mail_ws, Some(relations_ws));
+//! panel.render(ctx, mail_view, Some(relations_view));
 //! ```
 
 use std::collections::HashMap;
@@ -24,8 +24,8 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
@@ -33,6 +33,7 @@ use triblespace::prelude::View;
 
 use crate::schemas::mail::{mail as mail_attrs, KIND_DRAFT, KIND_MESSAGE, KIND_SPAM};
 use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -157,43 +158,27 @@ fn id_hex(id: Id) -> String {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 struct MailLive {
-    cached_head: Option<CommitHandle>,
-    relations_cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
+    relations_cached_revision: Option<DatasetRevision>,
     people: HashMap<Id, Person>,
     mails: Vec<MailRow>,
 }
 
 impl MailLive {
-    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[mail] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-
-        let (relations_cached_head, people) = match relations_ws {
-            Some(rws) => {
-                let head = rws.head();
-                let rspace = rws
-                    .checkout(..)
-                    .map(|co| co.into_facts())
-                    .unwrap_or_else(|e| {
-                        eprintln!("[mail] relations checkout: {e:?}");
-                        TribleSet::new()
-                    });
-                (head, build_people(&rspace, rws))
-            }
+    fn refresh(view: DatasetView<'_>, relations: Option<DatasetView<'_>>) -> Self {
+        let (relations_cached_revision, people) = match relations {
+            Some(relations) => (
+                Some(relations.revision),
+                build_people(relations.facts, relations.reader),
+            ),
             None => (None, HashMap::new()),
         };
 
-        let mails = collect_mails(ws, &space);
+        let mails = collect_mails(view.reader, view.facts);
 
         MailLive {
-            cached_head,
-            relations_cached_head,
+            cached_revision: view.revision,
+            relations_cached_revision,
             people,
             mails,
         }
@@ -207,7 +192,7 @@ impl MailLive {
     }
 }
 
-fn collect_mails(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<MailRow> {
+fn collect_mails(reader: &PileReader, space: &TribleSet) -> Vec<MailRow> {
     // All KIND_MESSAGE ids.
     let mut by_id: HashMap<Id, MailRow> = HashMap::new();
     for (id,) in find!(
@@ -300,7 +285,7 @@ fn collect_mails(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<MailRow> {
         }
     }
 
-    // Subject / body — Handle<LongString>, resolved via `ws.get`.
+    // Subject / body — Handle<LongString>, resolved through the dataset reader.
     let subject_rows: Vec<(Id, TextHandle)> = find!(
         (m: Id, h: TextHandle),
         pattern!(space, [{ ?m @ mail_attrs::subject: ?h }])
@@ -308,7 +293,7 @@ fn collect_mails(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<MailRow> {
     .collect();
     for (id, h) in subject_rows {
         if let Some(row) = by_id.get_mut(&id) {
-            if let Some(text) = read_text(ws, h) {
+            if let Some(text) = read_text(reader, h) {
                 row.subject = text;
             }
         }
@@ -320,7 +305,7 @@ fn collect_mails(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<MailRow> {
     .collect();
     for (id, h) in body_rows {
         if let Some(row) = by_id.get_mut(&id) {
-            if let Some(text) = read_text(ws, h) {
+            if let Some(text) = read_text(reader, h) {
                 row.body = text;
             }
         }
@@ -443,7 +428,7 @@ fn flatten_threaded(mails: &[MailRow]) -> Vec<(usize, &MailRow)> {
     out
 }
 
-fn build_people(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, Person> {
+fn build_people(rspace: &TribleSet, reader: &PileReader) -> HashMap<Id, Person> {
     let person_ids: Vec<Id> = find!(
         (pid: Id,),
         pattern!(rspace, [{ ?pid @ metadata::tag: KIND_PERSON_ID }])
@@ -473,7 +458,7 @@ fn build_people(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, Pe
     .collect();
     for (pid, h) in first_rows {
         if let Some(p) = people.get_mut(&pid) {
-            p.first_name = read_text(rws, h);
+            p.first_name = read_text(reader, h);
         }
     }
     let last_rows: Vec<(Id, TextHandle)> = find!(
@@ -483,7 +468,7 @@ fn build_people(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, Pe
     .collect();
     for (pid, h) in last_rows {
         if let Some(p) = people.get_mut(&pid) {
-            p.last_name = read_text(rws, h);
+            p.last_name = read_text(reader, h);
         }
     }
     let display_rows: Vec<(Id, TextHandle)> = find!(
@@ -493,7 +478,7 @@ fn build_people(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, Pe
     .collect();
     for (pid, h) in display_rows {
         if let Some(p) = people.get_mut(&pid) {
-            p.display_name = read_text(rws, h);
+            p.display_name = read_text(reader, h);
         }
     }
     let email_rows: Vec<(Id, String)> = find!(
@@ -510,8 +495,8 @@ fn build_people(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, Pe
     people
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
+fn read_text(reader: &PileReader, h: TextHandle) -> Option<String> {
+    reader.get::<View<str>, LongString>(h).ok().map(|v| {
         let s: &str = v.as_ref();
         s.to_string()
     })
@@ -548,20 +533,19 @@ impl MailViewer {
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-        mut relations_ws: Option<&mut Workspace<Pile>>,
+        view: DatasetView<'_>,
+        relations: Option<DatasetView<'_>>,
     ) {
-        let head = ws.head();
-        let rhead = relations_ws.as_ref().and_then(|w| w.head());
+        let revision = view.revision;
+        let relations_revision = relations.map(|view| view.revision);
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head || l.relations_cached_head != rhead,
+            Some(l) => {
+                l.cached_revision != revision || l.relations_cached_revision != relations_revision
+            }
         };
         if need_refresh {
-            self.live = Some(MailLive::refresh(
-                ws,
-                relations_ws.as_mut().map(|w| &mut **w),
-            ));
+            self.live = Some(MailLive::refresh(view, relations));
         }
 
         ctx.section("Mail", |ctx| {

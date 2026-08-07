@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{GaugeViewer, StorageState};
+use faculties::widgets::{GaugeViewer, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -35,10 +35,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("gauge", GaugeViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("wiki") else {
+        let Some(view) = st.context().dataset(SourceKey::Wiki) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 }

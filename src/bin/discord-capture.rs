@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{DiscordViewer, StorageState};
+use faculties::widgets::{DiscordViewer, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -35,10 +35,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("discord", DiscordViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("discord") else {
+        let Some(view) = st.context().dataset(SourceKey::Discord) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 }

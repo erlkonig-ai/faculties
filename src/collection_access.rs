@@ -85,10 +85,21 @@ pub struct CollectionView {
 /// admitted collection commits and therefore cannot honestly carry a
 /// [`CollectionRevision`]. New collection-native readers should use
 /// [`CollectionSnapshot`] and [`CollectionView`] instead.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LegacyBranchRevision([u8; 32]);
+
+impl LegacyBranchRevision {
+    /// Raw handle of the exact signed legacy branch-pin metadata snapshot.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 #[derive(Debug)]
 pub struct LegacyBranchView {
     pub facts: TribleSet,
     pub reader: PileReader,
+    pub revision: LegacyBranchRevision,
 }
 
 /// One immutable pile snapshot with collection records discovered exactly once.
@@ -418,7 +429,11 @@ pub fn materialize_named_legacy_branch(
         facts += content_facts;
     }
 
-    Ok(Some(LegacyBranchView { facts, reader }))
+    Ok(Some(LegacyBranchView {
+        facts,
+        reader,
+        revision: LegacyBranchRevision(pin_metadata.raw),
+    }))
 }
 
 /// Outcome of publishing one named legacy repository branch into a union scope.
@@ -1463,12 +1478,14 @@ mod tests {
         workspace.commit(content, "snapshot commit");
         repository.push(&mut workspace).unwrap();
         repository.close().unwrap();
+        let pin = pin_head(&pile, branch);
         let length = std::fs::metadata(&pile).unwrap().len();
 
         let view = materialize_named_legacy_branch(&pile, "snapshot-test")
             .unwrap()
             .unwrap();
         assert_eq!(view.facts, expected);
+        assert_eq!(view.revision.as_bytes(), &pin.raw);
         let description = find!(
             (description: Inline<Handle<LongString>>),
             pattern!(&view.facts, [{ metadata::description: ?description }])

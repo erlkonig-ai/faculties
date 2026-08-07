@@ -1,30 +1,35 @@
-//! GORBIE-embeddable branch timeline.
+//! GORBIE-embeddable activity timeline.
 //!
 //! A pan/zoom time axis that overlays events from one or more pile
-//! branches on a single vertical timeline (newest at top, oldest at
-//! bottom). The widget holds UI + cached-event state only; the host
-//! configures it with a list of [`SourceKind`]s (what kind of decoration
-//! to use per branch) and passes in the matching workspaces at render
-//! time.
+//! datasets on a single vertical timeline (newest at top, oldest at
+//! bottom). The widget holds UI + cached-event state only; each configured
+//! [`TimelineSource`] names its dataset with a stable
+//! [`SourceKey`](crate::widgets::storage::SourceKey), and rendering resolves
+//! those keys through a shared
+//! [`WidgetContext`](crate::widgets::storage::WidgetContext).
 //!
 //! Per-kind decoration:
 //! * Compass — goal status changes (pill + goal title)
 //! * Local messages — body preview with sender/recipient pills
-//! * Wiki — fragment-version commits with title
-//! * Commits — generic commit-bar rendering for arbitrary branches
+//! * Wiki — fragment versions with title
 //!
 //! ```ignore
 //! let mut timeline = BranchTimeline::multi(vec![
-//!     TimelineSource::Compass { label: "goals".into() },
-//!     TimelineSource::LocalMessages { label: "local".into() },
-//!     TimelineSource::Wiki { label: "wiki".into() },
+//!     TimelineSource::Compass {
+//!         key: SourceKey::Compass,
+//!         label: "goals".into(),
+//!     },
+//!     TimelineSource::LocalMessages {
+//!         key: SourceKey::Messages,
+//!         label: "local".into(),
+//!     },
+//!     TimelineSource::Wiki {
+//!         key: SourceKey::Wiki,
+//!         label: "wiki".into(),
+//!     },
 //! ]);
 //! // Inside a GORBIE card:
-//! timeline.render(ctx, &mut [
-//!     ("compass", &mut compass_ws),
-//!     ("message", &mut messages_ws),
-//!     ("wiki", &mut wiki_ws),
-//! ]);
+//! timeline.render(ctx, &storage.context());
 //! ```
 //!
 //! Input handling:
@@ -38,18 +43,16 @@
 //! at nice times. Labels are placed independently at the coarsest interval
 //! that gives ~6-10 labels per viewport.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use hifitime::{Duration as HifiDuration, Epoch};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{ancestors, CommitHandle, CommitSelector, CommitSet, Workspace};
-use triblespace::core::trible::TribleSet;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
+use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 use GORBIE::card_ctx::GRID_ROW_MODULE;
 use GORBIE::prelude::CardCtx;
@@ -59,11 +62,10 @@ use crate::schemas::compass::{board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID
 use crate::schemas::message::{local as local_attrs, KIND_MESSAGE_ID};
 use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
 use crate::schemas::wiki::{attrs as wiki_attrs, KIND_VERSION_ID};
+use crate::widgets::storage::{DatasetRevision, DatasetView, SourceKey, WidgetContext};
 
-/// Handle to a long-string blob (branch names, titles, bodies, notes).
+/// Handle to a long-string blob (titles, bodies, notes).
 type TextHandle = Inline<Handle<LongString>>;
-/// A commit blob handle (SimpleArchive of its metadata tribles).
-type CommitHandleValue = Inline<Handle<SimpleArchive>>;
 
 // ── Rendering constants ──────────────────────────────────────────────
 
@@ -170,33 +172,30 @@ fn text_on(fill: egui::Color32) -> egui::Color32 {
 
 // ── Source descriptions & styling ────────────────────────────────────
 
-/// Decoration description for a timeline source. Branch names are
-/// supplied separately at render time.
+/// Decoration description for a timeline source. Each variant carries the
+/// stable key used to find its immutable dataset at render time.
 #[derive(Clone, Debug)]
 pub enum TimelineSource {
-    /// Plain commit bars (useful for arbitrary branches).
-    Commits { label: String, color: egui::Color32 },
     /// Compass — render goal status changes with the goal title and
     /// status-color pill.
-    Compass { label: String },
+    Compass { key: SourceKey, label: String },
     /// Local-messages — render each message with sender/body preview.
-    LocalMessages { label: String },
-    /// Wiki — render fragment-version commits with title.
-    Wiki { label: String },
+    LocalMessages { key: SourceKey, label: String },
+    /// Wiki — render fragment versions with title.
+    Wiki { key: SourceKey, label: String },
     /// Reason events — explicit reasoning notes the agent records
-    /// alongside the command it ran (cognition branch). Useful as
+    /// alongside the command it ran. Useful as
     /// "thought before action" markers along the activity axis.
-    Reason { label: String },
+    Reason { key: SourceKey, label: String },
     /// Archive — externally imported conversation messages (archive
-    /// branch), so e.g. ChatGPT / Codex / Copilot history appears
-    /// inline with the rest of the timeline.
-    Archive { label: String },
+    /// dataset), so e.g. ChatGPT / Codex / Copilot history appears inline
+    /// with the rest of the timeline.
+    Archive { key: SourceKey, label: String },
 }
 
 /// Coarse kind used on the widget's `selected_event` and as a color key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
-    Commits,
     Compass,
     LocalMessages,
     Wiki,
@@ -205,21 +204,29 @@ pub enum SourceKind {
 }
 
 impl TimelineSource {
+    fn key(&self) -> SourceKey {
+        match self {
+            TimelineSource::Compass { key, .. }
+            | TimelineSource::LocalMessages { key, .. }
+            | TimelineSource::Wiki { key, .. }
+            | TimelineSource::Reason { key, .. }
+            | TimelineSource::Archive { key, .. } => *key,
+        }
+    }
+
     /// A short (≤6 char) source label used in the pill.
     fn label(&self) -> String {
         match self {
-            TimelineSource::Commits { label, .. }
-            | TimelineSource::Compass { label }
-            | TimelineSource::LocalMessages { label }
-            | TimelineSource::Wiki { label }
-            | TimelineSource::Reason { label }
-            | TimelineSource::Archive { label } => label.clone(),
+            TimelineSource::Compass { label, .. }
+            | TimelineSource::LocalMessages { label, .. }
+            | TimelineSource::Wiki { label, .. }
+            | TimelineSource::Reason { label, .. }
+            | TimelineSource::Archive { label, .. } => label.clone(),
         }
     }
 
     fn color(&self) -> egui::Color32 {
         match self {
-            TimelineSource::Commits { color, .. } => *color,
             // RAL 1012 lemon yellow — matches playground color_goals.
             TimelineSource::Compass { .. } => egui::Color32::from_rgb(0xd9, 0xc2, 0x2e),
             // RAL 6032 signal green — matches playground color_local_msg.
@@ -262,8 +269,7 @@ struct Event {
     kind: SourceKind,
     entity_id: Id,
     ts_ns: i128,
-    /// Primary one-line preview (goal title, message body, wiki title,
-    /// or short commit id for generic sources).
+    /// Primary one-line preview (goal title, message body, or wiki title).
     summary: String,
     /// Optional kanban-status pill label (Compass).
     status: Option<String>,
@@ -273,85 +279,68 @@ struct Event {
 
 // ── Live connection ──────────────────────────────────────────────────
 
-/// Cached events + per-source head markers. Rebuilt when any source's
-/// workspace head advances.
+/// Resolve configured sources by their stable keys while retaining their
+/// display position. In particular, an absent source in the middle is simply
+/// omitted; it can never cause the next available dataset to inherit the
+/// missing source's semantic kind.
+fn resolve_sources<'a, T>(
+    sources: &'a [TimelineSource],
+    mut resolve: impl FnMut(SourceKey) -> Option<T>,
+) -> Vec<(usize, &'a TimelineSource, T)> {
+    sources
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, source)| resolve(source.key()).map(|dataset| (idx, source, dataset)))
+        .collect()
+}
+
+fn source_revisions(
+    sources: &[TimelineSource],
+    datasets: &WidgetContext<'_>,
+) -> BTreeMap<SourceKey, DatasetRevision> {
+    resolve_sources(sources, |key| datasets.dataset(key))
+        .into_iter()
+        .map(|(_, source, dataset)| (source.key(), dataset.revision))
+        .collect()
+}
+
+/// Cached events + per-source revision markers. Rebuilt when any keyed
+/// dataset appears, disappears, or changes revision.
 struct MultiLive {
-    cached_heads: Vec<Option<CommitHandle>>,
+    cached_revisions: BTreeMap<SourceKey, DatasetRevision>,
     events: Vec<Event>,
 }
 
 impl MultiLive {
-    /// Rebuild events from the provided workspaces.
-    fn refresh(
-        sources: &[TimelineSource],
-        workspaces: &mut [(&str, &mut Workspace<Pile>)],
-    ) -> Self {
+    /// Rebuild events from the datasets available in this context.
+    fn refresh(sources: &[TimelineSource], datasets: &WidgetContext<'_>) -> Self {
         let mut out: Vec<Event> = Vec::new();
-        let mut heads: Vec<Option<CommitHandle>> = Vec::with_capacity(sources.len());
+        let mut cached_revisions = BTreeMap::new();
 
-        for (idx, src) in sources.iter().enumerate() {
-            let entry = workspaces.get_mut(idx);
-            let ws = match entry {
-                Some((_, ws)) => ws,
-                None => {
-                    heads.push(None);
-                    continue;
-                }
-            };
-            heads.push(ws.head());
+        for (idx, src, dataset) in resolve_sources(sources, |key| datasets.dataset(key)) {
+            cached_revisions.insert(src.key(), dataset.revision);
             match src {
-                TimelineSource::Commits { .. } => collect_commit_events(idx, ws, &mut out),
-                TimelineSource::Compass { .. } => collect_compass_events(idx, ws, &mut out),
-                TimelineSource::LocalMessages { .. } => collect_local_events(idx, ws, &mut out),
-                TimelineSource::Wiki { .. } => collect_wiki_events(idx, ws, &mut out),
-                TimelineSource::Reason { .. } => collect_reason_events(idx, ws, &mut out),
-                TimelineSource::Archive { .. } => collect_archive_events(idx, ws, &mut out),
+                TimelineSource::Compass { .. } => collect_compass_events(idx, dataset, &mut out),
+                TimelineSource::LocalMessages { .. } => {
+                    collect_local_events(idx, dataset, &mut out)
+                }
+                TimelineSource::Wiki { .. } => collect_wiki_events(idx, dataset, &mut out),
+                TimelineSource::Reason { .. } => collect_reason_events(idx, dataset, &mut out),
+                TimelineSource::Archive { .. } => collect_archive_events(idx, dataset, &mut out),
             }
         }
         out.sort_by_key(|e| e.ts_ns);
         MultiLive {
-            cached_heads: heads,
+            cached_revisions,
             events: out,
         }
     }
 }
 
-/// Walk every commit reachable from HEAD and emit one Event per commit.
-/// Commits without `created_at` are skipped — they're merge commits by
-/// design and carry no author-time bits.
-fn collect_commit_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
-    let Some(head) = ws.head() else {
-        return;
-    };
-    let Ok(set): Result<CommitSet, _> = ancestors(head).select(ws) else {
-        return;
-    };
-    for raw in set.iter() {
-        let handle: CommitHandleValue = Inline::new(*raw);
-        let Ok(meta) = ws.get::<TribleSet, SimpleArchive>(handle) else {
-            continue;
-        };
-        if let Some((cid, ts)) = find!(
-            (cid: Id, ts: (i128, i128)),
-            pattern!(&meta, [{ ?cid @ metadata::created_at: ?ts }])
-        )
-        .next()
-        {
-            out.push(Event {
-                source_idx: idx,
-                kind: SourceKind::Commits,
-                entity_id: cid,
-                ts_ns: ts.0,
-                summary: "commit".to_string(),
-                status: None,
-                from_to: None,
-            });
-        }
-    }
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> String {
-    ws.get::<View<str>, LongString>(h)
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> String {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
         .map(|v| {
             let s: &str = v.as_ref();
             s.to_string()
@@ -361,20 +350,12 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> String {
 
 /// Emit a Compass event per status-change entity. Also records "goal
 /// created" and "note" events so quiet boards still show up.
-fn collect_compass_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
-    let space = match ws.checkout(..) {
-        Ok(co) => co.into_facts(),
-        Err(e) => {
-            eprintln!("[timeline] compass checkout: {e:?}");
-            return;
-        }
-    };
-
+fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
     let mut title_by_goal: HashMap<Id, String> = HashMap::new();
 
     let goal_rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
         (gid: Id, title: TextHandle, ts: (i128, i128)),
-        pattern!(&space, [{
+        pattern!(dataset.facts, [{
             ?gid @
             metadata::tag: &KIND_GOAL_ID,
             compass_attrs::title: ?title,
@@ -384,7 +365,7 @@ fn collect_compass_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Ev
     .collect();
 
     for (gid, title_h, ts) in goal_rows {
-        let title = read_text(ws, title_h);
+        let title = read_text(dataset, title_h);
         title_by_goal.insert(gid, title.clone());
         out.push(Event {
             source_idx: idx,
@@ -399,7 +380,7 @@ fn collect_compass_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Ev
 
     let status_rows: Vec<(Id, Id, String, (i128, i128))> = find!(
         (event_id: Id, gid: Id, status: String, ts: (i128, i128)),
-        pattern!(&space, [{
+        pattern!(dataset.facts, [{
             ?event_id @
             metadata::tag: &KIND_STATUS_ID,
             compass_attrs::task: ?gid,
@@ -427,7 +408,7 @@ fn collect_compass_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Ev
 
     let note_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
         (event_id: Id, gid: Id, note: TextHandle, ts: (i128, i128)),
-        pattern!(&space, [{
+        pattern!(dataset.facts, [{
             ?event_id @
             metadata::tag: &KIND_NOTE_ID,
             compass_attrs::task: ?gid,
@@ -438,7 +419,7 @@ fn collect_compass_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Ev
     .collect();
 
     for (event_id, gid, note_h, ts) in note_rows {
-        let body = read_text(ws, note_h);
+        let body = read_text(dataset, note_h);
         let title = title_by_goal
             .get(&gid)
             .cloned()
@@ -461,18 +442,10 @@ fn collect_compass_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Ev
 }
 
 /// Emit a LocalMessages event per message.
-fn collect_local_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
-    let space = match ws.checkout(..) {
-        Ok(co) => co.into_facts(),
-        Err(e) => {
-            eprintln!("[timeline] message checkout: {e:?}");
-            return;
-        }
-    };
-
+fn collect_local_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
     let rows: Vec<(Id, Id, Id, TextHandle, (i128, i128))> = find!(
         (mid: Id, from: Id, to: Id, body: TextHandle, ts: (i128, i128)),
-        pattern!(&space, [{
+        pattern!(dataset.facts, [{
             ?mid @
             metadata::tag: &KIND_MESSAGE_ID,
             local_attrs::from: ?from,
@@ -484,7 +457,7 @@ fn collect_local_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Even
     .collect();
 
     for (mid, from, to, body_h, ts) in rows {
-        let body = read_text(ws, body_h);
+        let body = read_text(dataset, body_h);
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::LocalMessages,
@@ -498,18 +471,10 @@ fn collect_local_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Even
 }
 
 /// Emit a Wiki event per fragment-version.
-fn collect_wiki_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
-    let space = match ws.checkout(..) {
-        Ok(co) => co.into_facts(),
-        Err(e) => {
-            eprintln!("[timeline] wiki checkout: {e:?}");
-            return;
-        }
-    };
-
+fn collect_wiki_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
     let rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
         (vid: Id, title: TextHandle, ts: (i128, i128)),
-        pattern!(&space, [{
+        pattern!(dataset.facts, [{
             ?vid @
             metadata::tag: &KIND_VERSION_ID,
             wiki_attrs::title: ?title,
@@ -519,7 +484,7 @@ fn collect_wiki_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event
     .collect();
 
     for (vid, title_h, ts) in rows {
-        let title = read_text(ws, title_h);
+        let title = read_text(dataset, title_h);
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::Wiki,
@@ -532,22 +497,14 @@ fn collect_wiki_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event
     }
 }
 
-/// Emit a Reason event per cognition-branch reason entity. Each
+/// Emit a Reason event per reasoning entity. Each
 /// entity has a long-string `text` payload (the agent's thought)
 /// and a created-at timestamp; the timeline chip shows the first
 /// line of the thought as its summary.
-fn collect_reason_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
-    let space = match ws.checkout(..) {
-        Ok(co) => co.into_facts(),
-        Err(e) => {
-            eprintln!("[timeline] reason checkout: {e:?}");
-            return;
-        }
-    };
-
+fn collect_reason_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
     let rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
         (rid: Id, text: TextHandle, ts: (i128, i128)),
-        pattern!(&space, [{
+        pattern!(dataset.facts, [{
             ?rid @
             metadata::tag: &KIND_REASON_ID,
             reason_attrs::text: ?text,
@@ -557,7 +514,7 @@ fn collect_reason_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Eve
     .collect();
 
     for (rid, text_h, ts) in rows {
-        let text = read_text(ws, text_h);
+        let text = read_text(dataset, text_h);
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::Reason,
@@ -570,28 +527,19 @@ fn collect_reason_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Eve
     }
 }
 
-/// Emit an Archive event per externally imported conversation
-/// message (archive branch). Each archived message carries the
+/// Emit an Archive event per externally imported conversation message. Each
+/// archived message carries the
 /// same `kind_message` tag we use for local messages — we
-/// disambiguate by branch (the archive workspace is what's
-/// passed in here). The chip's summary line is the message
+/// disambiguate by keyed dataset. The chip's summary line is the message
 /// `content`'s first line.
-fn collect_archive_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
-    let space = match ws.checkout(..) {
-        Ok(co) => co.into_facts(),
-        Err(e) => {
-            eprintln!("[timeline] archive checkout: {e:?}");
-            return;
-        }
-    };
-
+fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
     // archive::archive::kind_message is the canonical tag id for an
     // archived message payload — same value the message
     // schema uses for KIND_MESSAGE_ID, since both faculties share
     // the protocol-agnostic "this is a message" marker.
     let rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
         (mid: Id, content: TextHandle, ts: (i128, i128)),
-        pattern!(&space, [{
+        pattern!(dataset.facts, [{
             ?mid @
             metadata::tag: &archive_attrs::kind_message,
             archive_attrs::content: ?content,
@@ -601,7 +549,7 @@ fn collect_archive_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Ev
     .collect();
 
     for (mid, content_h, ts) in rows {
-        let content = read_text(ws, content_h);
+        let content = read_text(dataset, content_h);
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::Archive,
@@ -616,7 +564,7 @@ fn collect_archive_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Ev
 
 // ── Widget ───────────────────────────────────────────────────────────
 
-/// GORBIE-embeddable pan/zoom timeline for one or more pile branches.
+/// GORBIE-embeddable pan/zoom timeline for one or more semantic datasets.
 ///
 /// Paints a full-width vertical time axis (newest at top, oldest at
 /// bottom) with:
@@ -626,16 +574,15 @@ fn collect_archive_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Ev
 /// * time labels at the coarsest interval that fits
 /// * per-source event chips with source-specific decoration
 ///
-/// The pile + all requested source branches are opened lazily on the
-/// first render, in the same pattern as [`WikiViewer`](crate::widgets::WikiViewer).
+/// Sources are resolved by [`SourceKey`] from the immutable context supplied by
+/// the host. Missing datasets are omitted independently.
 pub struct BranchTimeline {
-    /// One entry per source — matches the workspaces passed in at
-    /// render time (by index). Single-branch constructor builds a single
-    /// `TimelineSource::Commits` entry.
+    /// Semantic sources in display order. Dataset lookup is always keyed and
+    /// never inferred from this vector's positional relationship to input.
     sources: Vec<TimelineSource>,
     viewport_height: f32,
-    /// Cached events + head markers; rebuilt when any source's head
-    /// advances.
+    /// Cached events + revision markers; rebuilt when any source dataset
+    /// changes.
     live: Option<MultiLive>,
     /// Top edge of viewport, in TAI ns. Newest visible time.
     timeline_start: i128,
@@ -650,16 +597,6 @@ pub struct BranchTimeline {
 }
 
 impl BranchTimeline {
-    /// Single-source commit-bars timeline (matches v1 behavior).
-    pub fn new(label: impl Into<String>) -> Self {
-        // Default commit-bar color: muted amber (matches v1 "commit_color").
-        let color = egui::Color32::from_rgb(0xff, 0xc8, 0x3a);
-        Self::multi(vec![TimelineSource::Commits {
-            label: label.into(),
-            color,
-        }])
-    }
-
     /// Multi-source overlay — each source paints its own events on the
     /// shared axis.
     pub fn multi(sources: Vec<TimelineSource>) -> Self {
@@ -680,37 +617,22 @@ impl BranchTimeline {
         self
     }
 
-    /// Render the timeline. `workspaces` must have the same length and
-    /// ordering as the `sources` list configured at construction. Each
-    /// entry is `(branch_name, &mut Workspace)` — the branch name is
-    /// only used in error messages; indices are what's authoritative.
-    pub fn render(
-        &mut self,
-        ctx: &mut CardCtx<'_>,
-        workspaces: &mut [(&str, &mut Workspace<Pile>)],
-    ) {
+    /// Render the timeline from immutable datasets resolved by stable key.
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, datasets: &WidgetContext<'_>) {
         let now = now_key();
         if self.first_render {
             self.timeline_start = now;
             self.first_render = false;
         }
 
-        // Refresh if any head advanced (or first pass).
+        // Refresh if any keyed dataset appeared, disappeared, or changed.
+        let revisions = source_revisions(&self.sources, datasets);
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => {
-                if l.cached_heads.len() != self.sources.len() {
-                    true
-                } else {
-                    (0..self.sources.len()).any(|i| {
-                        let head = workspaces.get(i).map(|(_, ws)| ws.head()).unwrap_or(None);
-                        l.cached_heads.get(i).copied().flatten() != head
-                    })
-                }
-            }
+            Some(live) => live.cached_revisions != revisions,
         };
         if need_refresh {
-            self.live = Some(MultiLive::refresh(&self.sources, workspaces));
+            self.live = Some(MultiLive::refresh(&self.sources, datasets));
         }
 
         let events = self
@@ -990,271 +912,177 @@ impl BranchTimeline {
             painter.galley(span_pos, span_galley, span_color);
         }
 
-        // Per-source event rendering.
-        //
-        // Two layouts depending on source count:
-        //   1 source, all Commits → v1 ribbon-on-right style (short
-        //      horizontal tick + dot on a thin vertical axis line).
-        //   Otherwise → chip-style rows: wide chip with source pill +
-        //      per-kind decoration + summary text.
-        let only_commits =
-            sources.len() == 1 && matches!(sources[0], TimelineSource::Commits { .. });
-
+        // Per-source chip rows with source-specific decoration.
         let pointer_pos = ui.input(|i| i.pointer.hover_pos());
-        let mut hover_label: Option<(egui::Pos2, String)> = None;
         let mut clicked_event: Option<(SourceKind, Id)> = None;
         let mut hover_rect: Option<(egui::Rect, egui::Color32)> = None;
 
-        if only_commits {
-            // v1 compact ribbon.
-            let commit_color = sources[0].color();
-            let axis_color = egui::Color32::from_rgb(0xbd, 0xbd, 0xbd);
-            let axis_x = viewport_rect.right() - 40.0;
-            painter.line_segment(
-                [
-                    egui::pos2(axis_x, viewport_rect.top()),
-                    egui::pos2(axis_x, viewport_rect.bottom()),
-                ],
-                egui::Stroke::new(0.5, axis_color),
+        let event_left = viewport_rect.left() + max_len + 110.0;
+        let event_right_margin = 8.0;
+        let event_width = (viewport_rect.right() - event_left - event_right_margin).max(80.0);
+        let chip_h = 16.0;
+        let text_color = egui::Color32::from_rgb(0xe6, 0xe6, 0xe6);
+
+        for ev in events {
+            if ev.ts_ns < view_end || ev.ts_ns > view_start {
+                continue;
+            }
+            let y = viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
+            let src = &sources[ev.source_idx];
+            let src_color = src.color();
+            let src_label = src.label();
+
+            let chip_rect = egui::Rect::from_min_size(
+                egui::pos2(event_left, y - chip_h * 0.5),
+                egui::vec2(event_width, chip_h),
             );
 
-            // Empty state: when there are no events at all, paint a
-            // centered hourglass + muted hint over the ruler so the
-            // viewport isn't a blank scrubbing surface.
-            if events.is_empty() {
-                let center = viewport_rect.center();
+            // Chip background.
+            painter.rect_filled(chip_rect, 3.0, frame_color);
+
+            // Source pill (left).
+            let src_pill_w = 42.0;
+            let src_pill = egui::Rect::from_min_size(
+                egui::pos2(event_left + 2.0, y - chip_h * 0.5 + 1.0),
+                egui::vec2(src_pill_w, chip_h - 2.0),
+            );
+            painter.rect_filled(src_pill, 3.0, src_color);
+            painter.text(
+                src_pill.center(),
+                egui::Align2::CENTER_CENTER,
+                &src_label.to_uppercase(),
+                egui::FontId::monospace(9.0),
+                text_on(src_color),
+            );
+
+            // Optional secondary pill (status / from→to).
+            let mut text_x = event_left + src_pill_w + 6.0;
+            if let Some(status) = &ev.status {
+                let pill_color = match ev.kind {
+                    SourceKind::Compass => status_color(status),
+                    _ => src_color,
+                };
+                let pill_w = 40.0 + (status.len() as f32 * 4.0).min(40.0);
+                let pill = egui::Rect::from_min_size(
+                    egui::pos2(text_x, y - chip_h * 0.5 + 1.0),
+                    egui::vec2(pill_w, chip_h - 2.0),
+                );
+                painter.rect_filled(pill, 3.0, pill_color);
                 painter.text(
-                    egui::pos2(center.x, center.y - 14.0),
+                    pill.center(),
                     egui::Align2::CENTER_CENTER,
-                    "\u{231b}",
-                    egui::FontId::proportional(28.0),
-                    muted,
-                );
-                painter.text(
-                    egui::pos2(center.x, center.y + 12.0),
-                    egui::Align2::CENTER_CENTER,
-                    "NO EVENTS IN RANGE",
-                    egui::FontId::monospace(11.0),
-                    muted,
-                );
-                painter.text(
-                    egui::pos2(center.x, center.y + 28.0),
-                    egui::Align2::CENTER_CENTER,
-                    "Drag to pan · pinch or ⌘+scroll to zoom",
-                    egui::FontId::proportional(11.0),
-                    muted,
-                );
-            }
-
-            for ev in events {
-                if ev.ts_ns < view_end || ev.ts_ns > view_start {
-                    continue;
-                }
-                let y = viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
-                let x1 = axis_x - 8.0;
-                let x2 = axis_x + 8.0;
-                painter.line_segment(
-                    [egui::pos2(x1, y), egui::pos2(x2, y)],
-                    egui::Stroke::new(1.5, commit_color),
-                );
-                painter.circle_filled(egui::pos2(axis_x, y), 2.5, commit_color);
-
-                if let Some(p) = pointer_pos {
-                    if viewport_rect.contains(p)
-                        && (p.y - y).abs() <= 4.0
-                        && (p.x - axis_x).abs() <= 40.0
-                    {
-                        let label = format!("{}  {}", ev.summary, format_time_marker(ev.ts_ns));
-                        hover_label = Some((egui::pos2(axis_x - 12.0, y), label));
-                        if viewport_response.clicked() {
-                            clicked_event = Some((ev.kind, ev.entity_id));
-                        }
-                    }
-                }
-            }
-
-            if let Some((pos, label)) = hover_label {
-                painter.text(
-                    pos,
-                    egui::Align2::RIGHT_CENTER,
-                    label,
-                    egui::FontId::monospace(10.0),
-                    axis_color,
-                );
-            }
-        } else {
-            // Multi-source chip layout.
-            let event_left = viewport_rect.left() + max_len + 110.0;
-            let event_right_margin = 8.0;
-            let event_width = (viewport_rect.right() - event_left - event_right_margin).max(80.0);
-            let chip_h = 16.0;
-            let text_color = egui::Color32::from_rgb(0xe6, 0xe6, 0xe6);
-
-            for ev in events {
-                if ev.ts_ns < view_end || ev.ts_ns > view_start {
-                    continue;
-                }
-                let y = viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
-                let src = &sources[ev.source_idx];
-                let src_color = src.color();
-                let src_label = src.label();
-
-                let chip_rect = egui::Rect::from_min_size(
-                    egui::pos2(event_left, y - chip_h * 0.5),
-                    egui::vec2(event_width, chip_h),
-                );
-
-                // Chip background.
-                painter.rect_filled(chip_rect, 3.0, frame_color);
-
-                // Source pill (left).
-                let src_pill_w = 42.0;
-                let src_pill = egui::Rect::from_min_size(
-                    egui::pos2(event_left + 2.0, y - chip_h * 0.5 + 1.0),
-                    egui::vec2(src_pill_w, chip_h - 2.0),
-                );
-                painter.rect_filled(src_pill, 3.0, src_color);
-                painter.text(
-                    src_pill.center(),
-                    egui::Align2::CENTER_CENTER,
-                    &src_label.to_uppercase(),
+                    &status.to_uppercase(),
                     egui::FontId::monospace(9.0),
-                    text_on(src_color),
+                    text_on(pill_color),
                 );
+                text_x = pill.right() + 6.0;
+            }
+            // `from_to` is intentionally not painted on the chip
+            // strip — those are bare IDs and would dominate the
+            // visible row. The full sender/recipient line is
+            // surfaced in the hover tooltip instead.
 
-                // Optional secondary pill (status / from→to).
-                let mut text_x = event_left + src_pill_w + 6.0;
-                if let Some(status) = &ev.status {
-                    let pill_color = match ev.kind {
-                        SourceKind::Compass => status_color(status),
-                        _ => src_color,
-                    };
-                    let pill_w = 40.0 + (status.len() as f32 * 4.0).min(40.0);
-                    let pill = egui::Rect::from_min_size(
-                        egui::pos2(text_x, y - chip_h * 0.5 + 1.0),
-                        egui::vec2(pill_w, chip_h - 2.0),
-                    );
-                    painter.rect_filled(pill, 3.0, pill_color);
-                    painter.text(
-                        pill.center(),
-                        egui::Align2::CENTER_CENTER,
-                        &status.to_uppercase(),
-                        egui::FontId::monospace(9.0),
-                        text_on(pill_color),
-                    );
-                    text_x = pill.right() + 6.0;
-                }
-                // `from_to` is intentionally not painted on the chip
-                // strip — those are bare IDs and would dominate the
-                // visible row. The full sender/recipient line is
-                // surfaced in the hover tooltip instead.
+            // Summary text — char-truncated to fit the available
+            // chip width with a trailing "…". Cleaner than a hard
+            // clip-rect cutoff because it always ends at a char
+            // boundary with a visible overflow indicator.
+            let available_px = (chip_rect.right() - text_x - 4.0).max(0.0);
+            let truncated = truncate_to_chip_width(&ev.summary, available_px, 6.0);
+            painter.text(
+                egui::pos2(text_x, y),
+                egui::Align2::LEFT_CENTER,
+                &truncated,
+                egui::FontId::monospace(10.0),
+                text_color,
+            );
 
-                // Summary text — char-truncated to fit the available
-                // chip width with a trailing "…". Cleaner than a hard
-                // clip-rect cutoff because it always ends at a char
-                // boundary with a visible overflow indicator.
-                let available_px = (chip_rect.right() - text_x - 4.0).max(0.0);
-                let truncated = truncate_to_chip_width(&ev.summary, available_px, 6.0);
-                painter.text(
-                    egui::pos2(text_x, y),
-                    egui::Align2::LEFT_CENTER,
-                    &truncated,
-                    egui::FontId::monospace(10.0),
-                    text_color,
-                );
-
-                // Interaction: hover highlight + click + tooltip with
-                // full summary + absolute timestamp (truncated chip text
-                // often hides context, so surface it on hover).
-                if let Some(p) = pointer_pos {
-                    if chip_rect.contains(p) {
-                        hover_rect = Some((chip_rect, src_color));
-                        if viewport_response.clicked() {
-                            clicked_event = Some((ev.kind, ev.entity_id));
-                        }
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        let time_str = format_time_marker(ev.ts_ns);
-                        let summary = ev.summary.clone();
-                        let src_label = src_label.clone();
-                        let status_label = ev.status.clone();
-                        let fromto_label = ev.from_to.clone();
-                        let src_color_tip = src_color;
-                        egui::Tooltip::always_open(
-                            ui.ctx().clone(),
-                            ui.layer_id(),
-                            egui::Id::new(("timeline_event_tip", ev.entity_id)),
-                            egui::PopupAnchor::Pointer,
-                        )
-                        .gap(12.0)
-                        .show(|tip| {
-                            tip.set_max_width(360.0);
-                            // Header: colored source dot + source
-                            // label + timestamp on a single line.
-                            tip.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                let (dot_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(8.0, 8.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter()
-                                    .circle_filled(dot_rect.center(), 4.0, src_color_tip);
-                                ui.label(
-                                    egui::RichText::new(src_label.to_uppercase())
-                                        .small()
-                                        .monospace()
-                                        .strong()
-                                        .color(src_color_tip),
-                                );
-                                ui.label(egui::RichText::new("·").small().weak());
-                                ui.label(egui::RichText::new(time_str).small().monospace().weak());
-                            });
-                            // Optional status + from→to meta line.
-                            if status_label.is_some() || fromto_label.is_some() {
-                                tip.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    if let Some(st) = status_label {
-                                        ui.label(
-                                            egui::RichText::new(st.to_uppercase())
-                                                .small()
-                                                .monospace()
-                                                .strong(),
-                                        );
-                                    }
-                                    if let Some(ft) = fromto_label {
-                                        ui.label(
-                                            egui::RichText::new(ft).small().monospace().weak(),
-                                        );
-                                    }
-                                });
-                            }
-                            tip.separator();
-                            tip.add(egui::Label::new(summary).wrap());
-                            // Full canonical id at the bottom — the
-                            // chip strip itself omits ids to keep the
-                            // top-level view readable, so the hover
-                            // surface is where they live.
-                            tip.add(
-                                egui::Label::new(
-                                    egui::RichText::new(id_hex(ev.entity_id))
-                                        .monospace()
-                                        .small()
-                                        .weak(),
-                                )
-                                .wrap(),
-                            );
-                        });
+            // Interaction: hover highlight + click + tooltip with
+            // full summary + absolute timestamp (truncated chip text
+            // often hides context, so surface it on hover).
+            if let Some(p) = pointer_pos {
+                if chip_rect.contains(p) {
+                    hover_rect = Some((chip_rect, src_color));
+                    if viewport_response.clicked() {
+                        clicked_event = Some((ev.kind, ev.entity_id));
                     }
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    let time_str = format_time_marker(ev.ts_ns);
+                    let summary = ev.summary.clone();
+                    let src_label = src_label.clone();
+                    let status_label = ev.status.clone();
+                    let fromto_label = ev.from_to.clone();
+                    let src_color_tip = src_color;
+                    egui::Tooltip::always_open(
+                        ui.ctx().clone(),
+                        ui.layer_id(),
+                        egui::Id::new(("timeline_event_tip", ev.entity_id)),
+                        egui::PopupAnchor::Pointer,
+                    )
+                    .gap(12.0)
+                    .show(|tip| {
+                        tip.set_max_width(360.0);
+                        // Header: colored source dot + source
+                        // label + timestamp on a single line.
+                        tip.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter()
+                                .circle_filled(dot_rect.center(), 4.0, src_color_tip);
+                            ui.label(
+                                egui::RichText::new(src_label.to_uppercase())
+                                    .small()
+                                    .monospace()
+                                    .strong()
+                                    .color(src_color_tip),
+                            );
+                            ui.label(egui::RichText::new("·").small().weak());
+                            ui.label(egui::RichText::new(time_str).small().monospace().weak());
+                        });
+                        // Optional status + from→to meta line.
+                        if status_label.is_some() || fromto_label.is_some() {
+                            tip.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                if let Some(st) = status_label {
+                                    ui.label(
+                                        egui::RichText::new(st.to_uppercase())
+                                            .small()
+                                            .monospace()
+                                            .strong(),
+                                    );
+                                }
+                                if let Some(ft) = fromto_label {
+                                    ui.label(egui::RichText::new(ft).small().monospace().weak());
+                                }
+                            });
+                        }
+                        tip.separator();
+                        tip.add(egui::Label::new(summary).wrap());
+                        // Full canonical id at the bottom — the
+                        // chip strip itself omits ids to keep the
+                        // top-level view readable, so the hover
+                        // surface is where they live.
+                        tip.add(
+                            egui::Label::new(
+                                egui::RichText::new(id_hex(ev.entity_id))
+                                    .monospace()
+                                    .small()
+                                    .weak(),
+                            )
+                            .wrap(),
+                        );
+                    });
                 }
             }
+        }
 
-            if let Some((rect, color)) = hover_rect {
-                painter.rect_stroke(
-                    rect,
-                    3.0,
-                    egui::Stroke::new(1.0, color),
-                    egui::StrokeKind::Outside,
-                );
-            }
+        if let Some((rect, color)) = hover_rect {
+            painter.rect_stroke(
+                rect,
+                3.0,
+                egui::Stroke::new(1.0, color),
+                egui::StrokeKind::Outside,
+            );
         }
 
         if let Some(sel) = clicked_event {
@@ -1286,5 +1114,96 @@ fn format_span(secs: f64) -> String {
         format!("{:.0}M", s / 60.0)
     } else {
         format!("{s:.0}S")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kind(source: &TimelineSource) -> SourceKind {
+        match source {
+            TimelineSource::Compass { .. } => SourceKind::Compass,
+            TimelineSource::LocalMessages { .. } => SourceKind::LocalMessages,
+            TimelineSource::Wiki { .. } => SourceKind::Wiki,
+            TimelineSource::Reason { .. } => SourceKind::Reason,
+            TimelineSource::Archive { .. } => SourceKind::Archive,
+        }
+    }
+
+    fn configured_sources() -> Vec<TimelineSource> {
+        vec![
+            TimelineSource::Compass {
+                key: SourceKey::Compass,
+                label: "goals".into(),
+            },
+            TimelineSource::Wiki {
+                key: SourceKey::Wiki,
+                label: "wiki".into(),
+            },
+            TimelineSource::Archive {
+                key: SourceKey::Archive,
+                label: "chat".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn missing_middle_source_does_not_shift_kinds() {
+        let sources = configured_sources();
+        let resolved = resolve_sources(&sources, |key| match key {
+            SourceKey::Compass => Some("compass dataset"),
+            SourceKey::Archive => Some("archive dataset"),
+            _ => None,
+        });
+        let routes: Vec<_> = resolved
+            .into_iter()
+            .map(|(idx, source, dataset)| (idx, source.key(), kind(source), dataset))
+            .collect();
+
+        assert_eq!(
+            routes,
+            vec![
+                (
+                    0,
+                    SourceKey::Compass,
+                    SourceKind::Compass,
+                    "compass dataset"
+                ),
+                (
+                    2,
+                    SourceKey::Archive,
+                    SourceKind::Archive,
+                    "archive dataset"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_map_order_does_not_change_source_resolution() {
+        let sources = configured_sources();
+        let forward = [
+            (SourceKey::Compass, "compass dataset"),
+            (SourceKey::Wiki, "wiki dataset"),
+            (SourceKey::Archive, "archive dataset"),
+        ];
+        let reverse = [
+            (SourceKey::Archive, "archive dataset"),
+            (SourceKey::Wiki, "wiki dataset"),
+            (SourceKey::Compass, "compass dataset"),
+        ];
+        let route = |available: &[(SourceKey, &'static str)]| {
+            resolve_sources(&sources, |key| {
+                available
+                    .iter()
+                    .find_map(|(candidate, dataset)| (*candidate == key).then_some(*dataset))
+            })
+            .into_iter()
+            .map(|(idx, source, dataset)| (idx, source.key(), kind(source), dataset))
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(route(&forward), route(&reverse));
     }
 }

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{StorageState, TeamsViewer};
+use faculties::widgets::{SourceKey, StorageState, TeamsViewer};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -35,10 +35,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("teams", TeamsViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("teams") else {
+        let Some(view) = st.context().dataset(SourceKey::Teams) else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, view);
     });
 }

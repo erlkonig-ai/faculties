@@ -23,14 +23,13 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
 use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -136,32 +135,25 @@ fn id_hex(id: Id) -> String {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 struct RelationsLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     people: Vec<PersonRow>,
 }
 
 impl RelationsLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[relations] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let space = dataset.facts;
 
         let mut by_id: HashMap<Id, PersonRow> = HashMap::new();
         for (id,) in find!(
             (p: Id,),
-            pattern!(&space, [{ ?p @ metadata::tag: KIND_PERSON_ID }])
+            pattern!(space, [{ ?p @ metadata::tag: KIND_PERSON_ID }])
         ) {
             by_id.insert(id, PersonRow::empty(id));
         }
 
         let alias_rows: Vec<(Id, String)> = find!(
             (p: Id, a: String),
-            pattern!(&space, [{ ?p @ rel::alias: ?a }])
+            pattern!(space, [{ ?p @ rel::alias: ?a }])
         )
         .collect();
         for (pid, alias) in alias_rows {
@@ -171,37 +163,37 @@ impl RelationsLive {
         }
         let first_rows: Vec<(Id, TextHandle)> = find!(
             (p: Id, h: TextHandle),
-            pattern!(&space, [{ ?p @ rel::first_name: ?h }])
+            pattern!(space, [{ ?p @ rel::first_name: ?h }])
         )
         .collect();
         for (pid, h) in first_rows {
             if let Some(row) = by_id.get_mut(&pid) {
-                row.first_name = read_text(ws, h);
+                row.first_name = read_text(dataset, h);
             }
         }
         let last_rows: Vec<(Id, TextHandle)> = find!(
             (p: Id, h: TextHandle),
-            pattern!(&space, [{ ?p @ rel::last_name: ?h }])
+            pattern!(space, [{ ?p @ rel::last_name: ?h }])
         )
         .collect();
         for (pid, h) in last_rows {
             if let Some(row) = by_id.get_mut(&pid) {
-                row.last_name = read_text(ws, h);
+                row.last_name = read_text(dataset, h);
             }
         }
         let display_rows: Vec<(Id, TextHandle)> = find!(
             (p: Id, h: TextHandle),
-            pattern!(&space, [{ ?p @ rel::display_name: ?h }])
+            pattern!(space, [{ ?p @ rel::display_name: ?h }])
         )
         .collect();
         for (pid, h) in display_rows {
             if let Some(row) = by_id.get_mut(&pid) {
-                row.display_name = read_text(ws, h);
+                row.display_name = read_text(dataset, h);
             }
         }
         let email_rows: Vec<(Id, String)> = find!(
             (p: Id, e: String),
-            pattern!(&space, [{ ?p @ rel::email: ?e }])
+            pattern!(space, [{ ?p @ rel::email: ?e }])
         )
         .collect();
         for (pid, e) in email_rows {
@@ -212,7 +204,7 @@ impl RelationsLive {
         // Affinities — multi-valued tag-like attribute.
         let affinity_rows: Vec<(Id, String)> = find!(
             (p: Id, a: String),
-            pattern!(&space, [{ ?p @ rel::affinity: ?a }])
+            pattern!(space, [{ ?p @ rel::affinity: ?a }])
         )
         .collect();
         for (pid, aff) in affinity_rows {
@@ -229,17 +221,21 @@ impl RelationsLive {
         people.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
         RelationsLive {
-            cached_head,
+            cached_revision: dataset.revision,
             people,
         }
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -259,14 +255,13 @@ impl RelationsViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(RelationsLive::refresh(ws));
+            self.live = Some(RelationsLive::refresh(dataset));
         }
 
         ctx.section("Relations", |ctx| {

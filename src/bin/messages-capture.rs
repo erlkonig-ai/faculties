@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{MessagesPanel, StorageState};
+use faculties::widgets::{MessagesPanel, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -35,11 +35,10 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("message") else {
+        let sources = st.context();
+        let Some(messages) = sources.dataset(SourceKey::Messages) else {
             return;
         };
-        let mut relations = st.workspace("relations");
-        panel.render(ctx, &mut ws, relations.as_mut());
-        st.push(&mut ws);
+        panel.render(ctx, messages, sources.dataset(SourceKey::Relations));
     });
 }

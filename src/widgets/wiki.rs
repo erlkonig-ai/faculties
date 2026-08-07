@@ -1,14 +1,13 @@
 //! Full-featured GORBIE-embeddable wiki viewer.
 //!
 //! Renders wiki fragments from a triblespace pile. The widget holds only
-//! UI state plus cached query results; the host is responsible for
-//! pulling the wiki branch (and optionally a files branch) and passing
-//! the workspaces in at render time:
+//! UI state plus cached query results; the host passes a wiki dataset
+//! (and optionally a files dataset) at render time:
 //!
 //! ```ignore
 //! let mut viewer = WikiViewer::default();
-//! // Inside a GORBIE card, with `wiki_ws` and optional `files_ws`:
-//! viewer.render(ctx, wiki_ws, files_ws);
+//! // Inside a GORBIE card, with `wiki_view` and optional `files_view`:
+//! viewer.render(ctx, wiki_view, files_view);
 //! ```
 //!
 //! Features:
@@ -19,7 +18,7 @@
 //!   `wiki:<hex>` link in typst content, or a file entry
 //! - Version navigation (prev/next/latest) on fragments with history
 //! - `files:` link handling — resolves the shared file selector language to a
-//!   file blob (against the optional files workspace),
+//!   file blob (against the optional files dataset),
 //!   writes it to `$TMPDIR/faculties-files/`, and opens it via the platform
 //!   `open` command.
 
@@ -32,8 +31,8 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
@@ -43,6 +42,7 @@ use GORBIE::themes::colorhash;
 
 use crate::schemas::files::{file, KIND_FILE};
 use crate::schemas::wiki::{attrs as wiki, KIND_VERSION_ID, TAG_ARCHIVED_ID};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 /// Handle to a long-string blob living in a pile.
 type TextHandle = Inline<Handle<LongString>>;
@@ -64,54 +64,34 @@ fn frag_color(id: Id) -> egui::Color32 {
 
 // ── cached wiki query state ──────────────────────────────────────────
 
-/// Cached fact spaces + head marker. Rebuilt when the wiki workspace's
-/// head advances past `cached_head` (i.e. we pushed something, or the
-/// host re-pulled after an external write).
+/// Cached fact spaces + revision markers. Rebuilt when either input dataset
+/// changes.
 struct WikiLive {
     wiki_space: TribleSet,
     files_space: TribleSet,
-    cached_head: Option<CommitHandle>,
-    files_cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
+    files_cached_revision: Option<DatasetRevision>,
 }
 
 impl WikiLive {
-    /// Refresh cached fact spaces from the provided workspaces. Pulls
-    /// fresh `TribleSet`s via `checkout(..)`.
-    fn refresh(wiki_ws: &mut Workspace<Pile>, files_ws: Option<&mut Workspace<Pile>>) -> Self {
-        let wiki_space = wiki_ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[wiki] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = wiki_ws.head();
-
-        let (files_space, files_cached_head) = match files_ws {
-            Some(ws) => {
-                let head = ws.head();
-                let space = ws
-                    .checkout(..)
-                    .map(|co| co.into_facts())
-                    .unwrap_or_else(|e| {
-                        eprintln!("[files] checkout: {e:?}");
-                        TribleSet::new()
-                    });
-                (space, head)
-            }
+    /// Refresh cached fact spaces from the provided immutable dataset views.
+    fn refresh(wiki: DatasetView<'_>, files: Option<DatasetView<'_>>) -> Self {
+        let (files_space, files_cached_revision) = match files {
+            Some(files) => (files.facts.clone(), Some(files.revision)),
             None => (TribleSet::new(), None),
         };
 
         WikiLive {
-            wiki_space,
+            wiki_space: wiki.facts.clone(),
             files_space,
-            cached_head,
-            files_cached_head,
+            cached_revision: wiki.revision,
+            files_cached_revision,
         }
     }
 
-    fn text(&self, ws: &mut Workspace<Pile>, h: TextHandle) -> String {
-        ws.get::<View<str>, LongString>(h)
+    fn text(&self, reader: &PileReader, h: TextHandle) -> String {
+        reader
+            .get::<View<str>, LongString>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
                 s.to_string()
@@ -119,9 +99,9 @@ impl WikiLive {
             .unwrap_or_default()
     }
 
-    fn file_text(&self, files_ws: Option<&mut Workspace<Pile>>, h: TextHandle) -> String {
-        files_ws
-            .and_then(|ws| ws.get::<View<str>, LongString>(h).ok())
+    fn file_text(&self, files_reader: Option<&PileReader>, h: TextHandle) -> String {
+        files_reader
+            .and_then(|reader| reader.get::<View<str>, LongString>(h).ok())
             .map(|v| {
                 let s: &str = v.as_ref();
                 s.to_string()
@@ -199,17 +179,17 @@ impl WikiLive {
         .map(|(vid, _)| vid)
     }
 
-    fn title(&self, wiki_ws: &mut Workspace<Pile>, vid: Id) -> String {
+    fn title(&self, wiki_reader: &PileReader, vid: Id) -> String {
         find!(h: TextHandle, pattern!(&self.wiki_space, [{ vid @ wiki::title: ?h }]))
             .next()
-            .map(|h| self.text(wiki_ws, h))
+            .map(|h| self.text(wiki_reader, h))
             .unwrap_or_default()
     }
 
-    fn content(&self, wiki_ws: &mut Workspace<Pile>, vid: Id) -> String {
+    fn content(&self, wiki_reader: &PileReader, vid: Id) -> String {
         find!(h: TextHandle, pattern!(&self.wiki_space, [{ vid @ wiki::content: ?h }]))
             .next()
-            .map(|h| self.text(wiki_ws, h))
+            .map(|h| self.text(wiki_reader, h))
             .unwrap_or_default()
     }
 
@@ -232,7 +212,7 @@ impl WikiLive {
     }
 
     /// Latest non-archived (fragment_id, version_id) pairs sorted by title.
-    fn fragments_sorted(&self, wiki_ws: &mut Workspace<Pile>) -> Vec<(Id, Id)> {
+    fn fragments_sorted(&self, wiki_reader: &PileReader) -> Vec<(Id, Id)> {
         let mut latest: BTreeMap<Id, (Id, i128)> = BTreeMap::new();
         for (vid, frag, ts) in find!(
             (vid: Id, frag: Id, ts: (i128, i128)),
@@ -257,9 +237,9 @@ impl WikiLive {
             .filter(|(_, vid)| !self.is_archived(*vid))
             .collect();
         entries.sort_by(|a, b| {
-            self.title(wiki_ws, a.1)
+            self.title(wiki_reader, a.1)
                 .to_lowercase()
-                .cmp(&self.title(wiki_ws, b.1).to_lowercase())
+                .cmp(&self.title(wiki_reader, b.1).to_lowercase())
         });
         entries
     }
@@ -271,7 +251,7 @@ impl WikiLive {
     /// if none is known).
     fn resolve_file(
         &self,
-        files_ws: Option<&mut Workspace<Pile>>,
+        files_reader: Option<&PileReader>,
         hex: &str,
     ) -> Option<(FileHandle, String)> {
         let (entity_id, handle) =
@@ -309,7 +289,7 @@ impl WikiLive {
                 )
                 .next()
             })
-            .map(|h| self.file_text(files_ws, h))
+            .map(|h| self.file_text(files_reader, h))
             .unwrap_or_else(|| "file".to_string());
 
         Some((handle, name))
@@ -318,20 +298,19 @@ impl WikiLive {
     /// Resolve `files:<selector>`, write the blob to `$TMPDIR/faculties-files/<name>`,
     /// and fire `open` on it. Logs errors to stderr rather than surfacing
     /// them through the UI (this is a best-effort side channel).
-    fn open_file(&self, files_ws: Option<&mut Workspace<Pile>>, hex: &str) {
-        let Some(ws) = files_ws else {
-            eprintln!("[files] no files workspace available");
+    fn open_file(&self, files_reader: Option<&PileReader>, hex: &str) {
+        let Some(reader) = files_reader else {
+            eprintln!("[files] no files dataset available");
             return;
         };
-        // Resolve using a re-borrow so we can still use the workspace for
-        // the blob read below.
-        let Some((handle, name)) = self.resolve_file(Some(&mut *ws), hex) else {
+        let Some((handle, name)) = self.resolve_file(Some(reader), hex) else {
             eprintln!("[files] could not resolve files:{hex}");
             return;
         };
 
         let result = (|| -> Result<std::path::PathBuf, String> {
-            let blob: Blob<RawBytes> = ws.get(handle).map_err(|e| format!("get blob: {e:?}"))?;
+            let blob: Blob<RawBytes> =
+                reader.get(handle).map_err(|e| format!("get blob: {e:?}"))?;
             let tmp_dir = std::env::temp_dir().join("faculties-files");
             std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir: {e}"))?;
             let path = tmp_dir.join(&name);
@@ -610,8 +589,8 @@ struct GraphNode {
 }
 
 impl WikiGraph {
-    fn from_wiki(live: &WikiLive, wiki_ws: &mut Workspace<Pile>) -> Self {
-        let fragments = live.fragments_sorted(wiki_ws);
+    fn from_wiki(live: &WikiLive, wiki_reader: &PileReader) -> Self {
+        let fragments = live.fragments_sorted(wiki_reader);
         let mut frag_to_idx = BTreeMap::new();
         let mut nodes = Vec::new();
 
@@ -619,7 +598,7 @@ impl WikiGraph {
         for (i, &(frag_id, vid)) in fragments.iter().enumerate() {
             let angle = (i as f32 / n) * std::f32::consts::TAU;
             let radius = 200.0 + n * 5.0;
-            let title = live.title(wiki_ws, vid);
+            let title = live.title(wiki_reader, vid);
             frag_to_idx.insert(frag_id, i);
             nodes.push(GraphNode {
                 frag_id,
@@ -1260,15 +1239,15 @@ struct OpenPage {
 
 /// GORBIE-embeddable wiki viewer.
 ///
-/// Holds pure UI state plus a cached query snapshot. The wiki workspace
-/// (and optionally a files workspace, for `files:` link resolution) are
+/// Holds pure UI state plus a cached query snapshot. The wiki dataset
+/// (and optionally a files dataset, for `files:` link resolution) are
 /// passed in at render time; the viewer refreshes its cached fact space
-/// whenever the wiki workspace's head advances.
+/// whenever either dataset revision advances.
 ///
 /// ```ignore
 /// let mut viewer = WikiViewer::default();
-/// // Inside a GORBIE card, with `wiki_ws` and optional `files_ws`:
-/// viewer.render(ctx, wiki_ws, files_ws);
+/// // Inside a GORBIE card, with `wiki_view` and optional `files_view`:
+/// viewer.render(ctx, wiki_view, files_view);
 /// ```
 #[derive(Default)]
 pub struct WikiViewer {
@@ -1276,7 +1255,7 @@ pub struct WikiViewer {
     /// Last search miss (for the "no match" chip). Cleared whenever
     /// the query text is edited.
     search_miss: Option<String>,
-    /// Rebuilt when the wiki workspace's head advances.
+    /// Rebuilt when the wiki or files dataset revision changes.
     live: Option<WikiLive>,
     /// Lazily-initialized once `live` is populated (needs queries to
     /// build). Dropped whenever `live` is rebuilt.
@@ -1291,30 +1270,31 @@ impl WikiViewer {
         Self::default()
     }
 
-    /// Render the viewer into a GORBIE card context. `wiki_ws` must point
-    /// at the wiki branch; `files_ws` is optional — when provided, the
+    /// Render the viewer into a GORBIE card context. `wiki_view` is the
+    /// wiki dataset; `files_view` is optional — when provided, the
     /// viewer will resolve `files:<selector>` links and open the resulting
     /// blobs via the platform `open` command.
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        wiki_ws: &mut Workspace<Pile>,
-        mut files_ws: Option<&mut Workspace<Pile>>,
+        wiki_view: DatasetView<'_>,
+        files_view: Option<DatasetView<'_>>,
     ) {
+        let wiki_reader = wiki_view.reader;
+        let files_reader = files_view.map(|view| view.reader);
         ctx.section("Wiki", |ctx| {
-        // Refresh cached spaces if the wiki head has advanced since the
-        // last frame (push happened, external write, or first render).
-        let wiki_head = wiki_ws.head();
-        let files_head = files_ws.as_ref().and_then(|ws| ws.head());
+        // Refresh cached spaces if either revision changed since the last frame.
+        let wiki_revision = wiki_view.revision;
+        let files_revision = files_view.map(|view| view.revision);
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != wiki_head || l.files_cached_head != files_head,
+            Some(l) => {
+                l.cached_revision != wiki_revision
+                    || l.files_cached_revision != files_revision
+            }
         };
         if need_refresh {
-            self.live = Some(WikiLive::refresh(
-                wiki_ws,
-                files_ws.as_mut().map(|w| &mut **w),
-            ));
+            self.live = Some(WikiLive::refresh(wiki_view, files_view));
             self.graph = None;
         }
 
@@ -1329,7 +1309,7 @@ impl WikiViewer {
 
         // ── force-directed graph ─────────────────────────────────────
         if self.graph.is_none() {
-            self.graph = Some(WikiGraph::from_wiki(live, wiki_ws));
+            self.graph = Some(WikiGraph::from_wiki(live, wiki_reader));
         }
         // Empty state when the wiki branch has no fragments at all —
         // otherwise the graph is a blank canvas.
@@ -1492,10 +1472,14 @@ impl WikiViewer {
                 live.resolve_prefix(&q)
             } else {
                 let q_lower = q.to_lowercase();
-                let frags = live.fragments_sorted(wiki_ws);
+                let frags = live.fragments_sorted(wiki_reader);
                 frags
                     .iter()
-                    .find(|(_, vid)| live.title(wiki_ws, *vid).to_lowercase().contains(&q_lower))
+                    .find(|(_, vid)| {
+                        live.title(wiki_reader, *vid)
+                            .to_lowercase()
+                            .contains(&q_lower)
+                    })
                     .map(|(frag_id, _)| *frag_id)
             };
             if let Some(frag_id) = found {
@@ -1557,8 +1541,12 @@ impl WikiViewer {
 
             let history = live.version_history(frag_id);
             let vid = pinned.or_else(|| live.latest_version(frag_id));
-            let title = vid.map(|v| live.title(wiki_ws, v)).unwrap_or_default();
-            let content = vid.map(|v| live.content(wiki_ws, v)).unwrap_or_default();
+            let title = vid
+                .map(|v| live.title(wiki_reader, v))
+                .unwrap_or_default();
+            let content = vid
+                .map(|v| live.content(wiki_reader, v))
+                .unwrap_or_default();
             let current_idx = vid.and_then(|v| history.iter().position(|&h| h == v));
             let n_versions = history.len();
 
@@ -1744,7 +1732,7 @@ impl WikiViewer {
             });
         }
         for hex in to_open_file {
-            live.open_file(files_ws.as_mut().map(|w| &mut **w), &hex);
+            live.open_file(files_reader, &hex);
         }
         });
     }

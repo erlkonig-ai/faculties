@@ -38,14 +38,13 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 
 use crate::schemas::memory::{ctx as memctx, KIND_CHUNK_ID};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -107,7 +106,7 @@ impl ChunkRow {
 }
 
 struct MemoryLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     chunks: Vec<ChunkRow>,
     /// Total chunk count regardless of MAX_CHUNKS clamp — surfaced in
     /// the section header so the user can tell when they're seeing a
@@ -118,15 +117,8 @@ struct MemoryLive {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl MemoryLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[memory] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let space = dataset.facts;
 
         let mut by_id: HashMap<Id, ChunkRow> = HashMap::new();
 
@@ -134,7 +126,7 @@ impl MemoryLive {
         // included — same exclusion the CLI read paths apply (tag-agnostic:
         // anything something else supersedes is invisible).
         let superseded: std::collections::HashSet<Id> =
-            find!(old: Id, pattern!(&space, [{ _ @ memctx::supersedes: ?old }])).collect();
+            find!(old: Id, pattern!(space, [{ _ @ memctx::supersedes: ?old }])).collect();
 
         // Enumerate every chunk + its time-range bounds in one query.
         // start_at and end_at are NsTAIInterval values, projected as
@@ -142,7 +134,7 @@ impl MemoryLive {
         // need the lower bound of each interval.
         for (id, start_iv, end_iv) in find!(
             (id: Id, s: (Epoch, Epoch), e: (Epoch, Epoch)),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?id @
                 metadata::tag: KIND_CHUNK_ID,
                 memctx::start_at: ?s,
@@ -172,12 +164,12 @@ impl MemoryLive {
         // didn't match the time-bounded find!() above.
         let summary_rows: Vec<(Id, TextHandle)> = find!(
             (id: Id, h: TextHandle),
-            pattern!(&space, [{ ?id @ memctx::summary: ?h }])
+            pattern!(space, [{ ?id @ memctx::summary: ?h }])
         )
         .collect();
         for (id, h) in summary_rows {
             if let Some(row) = by_id.get_mut(&id) {
-                if let Some(text) = read_text(ws, h) {
+                if let Some(text) = read_text(dataset, h) {
                     row.summary = text;
                 }
             }
@@ -187,7 +179,7 @@ impl MemoryLive {
         // surfaced in the card footer.
         for (id, pid) in find!(
             (id: Id, pid: Id),
-            pattern!(&space, [{ ?id @ memctx::about_exec_result: ?pid }])
+            pattern!(space, [{ ?id @ memctx::about_exec_result: ?pid }])
         ) {
             if let Some(row) = by_id.get_mut(&id) {
                 row.about_exec_result = Some(pid);
@@ -195,7 +187,7 @@ impl MemoryLive {
         }
         for (id, pid) in find!(
             (id: Id, pid: Id),
-            pattern!(&space, [{ ?id @ memctx::about_archive_message: ?pid }])
+            pattern!(space, [{ ?id @ memctx::about_archive_message: ?pid }])
         ) {
             if let Some(row) = by_id.get_mut(&id) {
                 row.about_archive_message = Some(pid);
@@ -206,7 +198,7 @@ impl MemoryLive {
         // edge. We just need the count for the badge.
         for (id, _child) in find!(
             (id: Id, c: Id),
-            pattern!(&space, [{ ?id @ memctx::reference: ?c }])
+            pattern!(space, [{ ?id @ memctx::reference: ?c }])
         ) {
             if let Some(row) = by_id.get_mut(&id) {
                 row.child_count += 1;
@@ -220,7 +212,7 @@ impl MemoryLive {
         chunks.truncate(MAX_CHUNKS);
 
         MemoryLive {
-            cached_head,
+            cached_revision: dataset.revision,
             chunks,
             total,
         }
@@ -234,11 +226,15 @@ fn epoch_to_chrono(e: Epoch) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
 }
 
 // ── Time / span formatting ──────────────────────────────────────────
@@ -326,14 +322,13 @@ impl MemoryViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(MemoryLive::refresh(ws));
+            self.live = Some(MemoryLive::refresh(dataset));
         }
 
         ctx.section("Memory", |ctx| {

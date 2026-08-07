@@ -29,12 +29,12 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
+
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -93,7 +93,7 @@ impl AtlasRow {
 }
 
 struct AtlasLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     entries: Vec<AtlasRow>,
     /// Name lookup keyed by entity id — used to resolve tag chips.
     /// Same data as `entries` but indexed for O(1) chip rendering.
@@ -103,15 +103,8 @@ struct AtlasLive {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl AtlasLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[atlas] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let space = dataset.facts;
 
         // All entities with a metadata::name. The query gives us
         // (entity_id, name_handle) pairs; we deref the handle to a
@@ -119,14 +112,14 @@ impl AtlasLive {
         // discriminator — anything named is a catalog entry.
         let name_rows: Vec<(Id, TextHandle)> = find!(
             (id: Id, h: TextHandle),
-            pattern!(&space, [{ ?id @ metadata::name: ?h }])
+            pattern!(space, [{ ?id @ metadata::name: ?h }])
         )
         .collect();
 
         let mut entries: HashMap<Id, AtlasRow> = HashMap::new();
         let mut name_by_id: HashMap<Id, String> = HashMap::new();
         for (id, h) in name_rows {
-            let name = read_text(ws, h).unwrap_or_else(|| short_id(id));
+            let name = read_text(dataset, h).unwrap_or_else(|| short_id(id));
             name_by_id.insert(id, name.clone());
             entries.insert(
                 id,
@@ -143,12 +136,12 @@ impl AtlasLive {
         // Descriptions for the same entries.
         let desc_rows: Vec<(Id, TextHandle)> = find!(
             (id: Id, h: TextHandle),
-            pattern!(&space, [{ ?id @ metadata::description: ?h }])
+            pattern!(space, [{ ?id @ metadata::description: ?h }])
         )
         .collect();
         for (id, h) in desc_rows {
             if let Some(row) = entries.get_mut(&id) {
-                row.description = read_text(ws, h);
+                row.description = read_text(dataset, h);
             }
         }
 
@@ -159,7 +152,7 @@ impl AtlasLive {
         let mut member_counts: HashMap<Id, usize> = HashMap::new();
         for (entity_id, tag_id) in find!(
             (id: Id, t: Id),
-            pattern!(&space, [{ ?id @ metadata::tag: ?t }])
+            pattern!(space, [{ ?id @ metadata::tag: ?t }])
         ) {
             if let Some(row) = entries.get_mut(&entity_id) {
                 row.tags.push(tag_id);
@@ -179,18 +172,22 @@ impl AtlasLive {
         entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
         AtlasLive {
-            cached_head,
+            cached_revision: dataset.revision,
             entries,
             name_by_id,
         }
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
 }
 
 fn id_hex(id: Id) -> String {
@@ -236,14 +233,13 @@ impl AtlasViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(AtlasLive::refresh(ws));
+            self.live = Some(AtlasLive::refresh(dataset));
         }
 
         ctx.section("Atlas", |ctx| {

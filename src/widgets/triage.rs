@@ -37,8 +37,7 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
@@ -50,6 +49,7 @@ use crate::schemas::triage::{
     KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID, KIND_MODEL_IN_PROGRESS_ID,
     KIND_MODEL_REQUEST_ID, KIND_MODEL_RESULT_ID, KIND_REASON_EVENT_ID,
 };
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 type TextHandle = Inline<Handle<LongString>>;
 
@@ -163,7 +163,7 @@ struct QueueCounts {
 }
 
 struct TriageLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     exec: QueueCounts,
     model: QueueCounts,
     events: Vec<EventRow>,
@@ -173,28 +173,21 @@ struct TriageLive {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl TriageLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[triage] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let space = dataset.facts;
 
         let now_ns = now_tai_ns();
         let stale_cutoff_ns = now_ns - (STALE_SECONDS as i128) * 1_000_000_000;
 
         let exec = collect_queue(
-            &space,
+            space,
             KIND_EXEC_REQUEST_ID,
             KIND_EXEC_IN_PROGRESS_ID,
             KIND_EXEC_RESULT_ID,
             stale_cutoff_ns,
         );
         let model = collect_queue(
-            &space,
+            space,
             KIND_MODEL_REQUEST_ID,
             KIND_MODEL_IN_PROGRESS_ID,
             KIND_MODEL_RESULT_ID,
@@ -202,16 +195,16 @@ impl TriageLive {
         );
 
         let mut events: Vec<EventRow> = Vec::new();
-        collect_exec_results(ws, &space, &mut events);
-        collect_model_results(ws, &space, &mut events);
-        collect_reason_events(ws, &space, &mut events);
+        collect_exec_results(dataset, space, &mut events);
+        collect_model_results(dataset, space, &mut events);
+        collect_reason_events(dataset, space, &mut events);
 
         events.sort_by(|a, b| b.at.cmp(&a.at));
         let total_events = events.len();
         events.truncate(MAX_EVENTS);
 
         TriageLive {
-            cached_head,
+            cached_revision: dataset.revision,
             exec,
             model,
             events,
@@ -256,7 +249,7 @@ fn collect_queue(
     counts
 }
 
-fn collect_exec_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut Vec<EventRow>) {
+fn collect_exec_results(dataset: DatasetView<'_>, space: &TribleSet, out: &mut Vec<EventRow>) {
     // Each exec result has: about_request → command_text,
     // exit_code, stdout/stderr/error handles, created_at.
     // For the timeline we just need the result entity + its
@@ -291,13 +284,13 @@ fn collect_exec_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut V
             )
             .next()
         });
-        let command = command_handle.and_then(|h| read_text(ws, h));
+        let command = command_handle.and_then(|h| read_text(dataset, h));
         let error_handle = find!(
             h: TextHandle,
             pattern!(space, [{ id @ exec_attrs::error: ?h }])
         )
         .next();
-        let error_text = error_handle.and_then(|h| read_text(ws, h));
+        let error_text = error_handle.and_then(|h| read_text(dataset, h));
 
         let summary = command
             .clone()
@@ -324,7 +317,7 @@ fn collect_exec_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut V
     }
 }
 
-fn collect_model_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut Vec<EventRow>) {
+fn collect_model_results(dataset: DatasetView<'_>, space: &TribleSet, out: &mut Vec<EventRow>) {
     for (id, ts) in find!(
         (id: Id, ts: (i128, i128)),
         pattern!(space, [{
@@ -339,7 +332,7 @@ fn collect_model_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut 
             pattern!(space, [{ id @ model_attrs::error: ?h }])
         )
         .next();
-        let error_text = error_handle.and_then(|h| read_text(ws, h));
+        let error_text = error_handle.and_then(|h| read_text(dataset, h));
         let is_error = error_text.is_some();
 
         let output_handle = find!(
@@ -347,7 +340,7 @@ fn collect_model_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut 
             pattern!(space, [{ id @ model_attrs::output_text: ?h }])
         )
         .next();
-        let output_text = output_handle.and_then(|h| read_text(ws, h));
+        let output_text = output_handle.and_then(|h| read_text(dataset, h));
 
         let input_tokens = find_u64(space, id, |id| {
             find!(
@@ -390,7 +383,7 @@ fn collect_model_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut 
     }
 }
 
-fn collect_reason_events(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut Vec<EventRow>) {
+fn collect_reason_events(dataset: DatasetView<'_>, space: &TribleSet, out: &mut Vec<EventRow>) {
     for (id, ts) in find!(
         (id: Id, ts: (i128, i128)),
         pattern!(space, [{
@@ -405,13 +398,13 @@ fn collect_reason_events(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut 
             pattern!(space, [{ id @ reason_attrs::text: ?h }])
         )
         .next();
-        let text = text_handle.and_then(|h| read_text(ws, h));
+        let text = text_handle.and_then(|h| read_text(dataset, h));
         let cmd_handle = find!(
             h: TextHandle,
             pattern!(space, [{ id @ reason_attrs::command_text: ?h }])
         )
         .next();
-        let cmd = cmd_handle.and_then(|h| read_text(ws, h));
+        let cmd = cmd_handle.and_then(|h| read_text(dataset, h));
 
         let summary = text
             .as_ref()
@@ -430,11 +423,15 @@ fn collect_reason_events(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut 
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
+    dataset
+        .reader
+        .get::<View<str>, LongString>(h)
+        .ok()
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
 }
 
 fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
@@ -521,14 +518,13 @@ impl TriageViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(TriageLive::refresh(ws));
+            self.live = Some(TriageLive::refresh(dataset));
         }
 
         ctx.section("Triage", |ctx| {
