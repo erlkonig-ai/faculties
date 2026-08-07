@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod body;
+pub mod cognition;
 pub mod compass;
 pub mod decide;
 pub mod discord;

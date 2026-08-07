@@ -1,14 +1,14 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::patience::{exec_schema, DEFAULT_BRANCH, KIND_TIMEOUT_EXTENSION_ID};
+use faculties::collection_access;
+use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
+use faculties::schemas::patience::{exec_schema, KIND_TIMEOUT_EXTENSION_ID};
 use hifitime::Epoch;
 use humantime::parse_duration;
-use rand_core::OsRng;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
-use triblespace::core::repo::Repository;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -21,12 +21,14 @@ struct Cli {
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Target branch name for timeout extension events.
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
-    /// Target branch id for timeout extension events (hex). Overrides ensure_branch.
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it;
+    /// initialize explicitly with `trible pile signing-key init <pile>`.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Extrinsic collection scope for cognition events. Defaults to the stable
+    /// shared cognition scope used by patience, reason, and related faculties.
+    #[arg(long, value_parser = parse_id_arg)]
+    scope: Option<Id>,
     /// Turn id to annotate (hex). Defaults to $TURN_ID.
     #[arg(long)]
     turn_id: Option<String>,
@@ -52,6 +54,10 @@ fn now_epoch() -> Epoch {
 
 fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
     (epoch, epoch).try_to_inline().unwrap()
+}
+
+fn parse_id_arg(raw: &str) -> std::result::Result<Id, String> {
+    Id::from_hex(raw.trim()).ok_or_else(|| format!("invalid id '{raw}'"))
 }
 
 fn fmt_id(id: Id) -> String {
@@ -92,79 +98,65 @@ fn parse_timeout_ms(raw: &str) -> Result<u64> {
     Ok(millis as u64)
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))
+#[derive(Clone, Copy)]
+struct PatienceStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+    scope: Id,
 }
 
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
+fn timeout_extension_fragment(
+    request_id: Id,
+    worker_id: Id,
+    timeout_ms: u64,
+    requested_at: Inline<inlineencodings::NsTAIInterval>,
+) -> Fragment {
+    entity! { _ @
+        metadata::tag: KIND_TIMEOUT_EXTENSION_ID,
+        exec_schema::about_request: request_id,
+        exec_schema::worker: worker_id,
+        exec_schema::timeout_ms: timeout_ms,
+        exec_schema::requested_at: requested_at,
     }
-    result
 }
 
-fn resolve_branch_id(
-    repo: &mut Repository<Pile>,
-    explicit_hex: Option<&str>,
-    branch_name: &str,
-) -> Result<Id> {
-    if let Some(hex) = explicit_hex {
-        return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
-    }
-    if let Ok(hex) = std::env::var("TRIBLESPACE_BRANCH_ID") {
-        return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID"));
-    }
-    repo.ensure_branch(branch_name, None)
-        .map_err(|e| anyhow!("ensure {branch_name} branch: {e:?}"))
+fn publish_timeout_extension(
+    storage: PatienceStorage<'_>,
+    request_id: Id,
+    worker_id: Id,
+    timeout_ms: u64,
+    requested_at: Inline<inlineencodings::NsTAIInterval>,
+) -> Result<(Id, CollectionCommit)> {
+    let event = timeout_extension_fragment(request_id, worker_id, timeout_ms, requested_at);
+    let event_id = event
+        .root()
+        .expect("timeout extension has one intrinsic root");
+    let commit_metadata =
+        entity! { metadata::description: "playground_exec timeout_extension".to_owned() };
+    let commit = collection_access::publish_fragment(
+        storage.pile,
+        storage.key,
+        storage.scope,
+        event,
+        commit_metadata,
+    )?;
+    Ok((event_id, commit))
 }
 
 fn append_timeout_extension(
-    pile: &Path,
-    branch_id: Id,
+    storage: PatienceStorage<'_>,
     request_id: Id,
     worker_id: Id,
     timeout_ms: u64,
 ) -> Result<Id> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-
-        let event_id = ufoid();
-        let now = epoch_interval(now_epoch());
-        let change = entity! { &event_id @
-            metadata::tag: KIND_TIMEOUT_EXTENSION_ID,
-            exec_schema::about_request: request_id,
-            exec_schema::worker: worker_id,
-            exec_schema::timeout_ms: timeout_ms,
-            exec_schema::requested_at: now,
-        };
-        ws.commit(change, "playground_exec timeout_extension");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push timeout extension: {e:?}"))?;
-        Ok(*event_id)
-    })
+    publish_timeout_extension(
+        storage,
+        request_id,
+        worker_id,
+        timeout_ms,
+        epoch_interval(now_epoch()),
+    )
+    .map(|(event, _)| event)
 }
 
 fn shell_quote(word: &str) -> String {
@@ -197,7 +189,6 @@ fn run_command(command: &[String]) -> Result<i32> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let pile_path = cli.pile.clone();
     let Some(duration_raw) = cli.duration.as_ref() else {
         let mut cmd = Cli::command();
         cmd.print_help()?;
@@ -209,10 +200,6 @@ fn main() -> Result<()> {
     let env_turn_id = std::env::var("TURN_ID").ok();
     let env_worker_id = std::env::var("WORKER_ID").ok();
 
-    let branch_id = with_repo(&pile_path, |repo| {
-        resolve_branch_id(repo, cli.branch_id.as_deref(), &cli.branch)
-    })?;
-
     let request_id =
         parse_optional_hex_id(cli.turn_id.as_deref().or(env_turn_id.as_deref()), "turn id")?
             .ok_or_else(|| anyhow!("missing turn id (pass --turn-id or set TURN_ID)"))?;
@@ -222,8 +209,12 @@ fn main() -> Result<()> {
     )?
     .ok_or_else(|| anyhow!("missing worker id (pass --worker-id or set WORKER_ID)"))?;
 
-    let event_id =
-        append_timeout_extension(&pile_path, branch_id, request_id, worker_id, timeout_ms)?;
+    let storage = PatienceStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+        scope: cli.scope.unwrap_or(DEFAULT_SCOPE_ID),
+    };
+    let event_id = append_timeout_extension(storage, request_id, worker_id, timeout_ms)?;
 
     eprintln!(
         "[{}] timeout extended by {} ms",
@@ -237,4 +228,149 @@ fn main() -> Result<()> {
 
     let exit_code = run_command(&cli.command)?;
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ed25519_dalek::SigningKey;
+    use std::collections::HashSet;
+    use std::fs::File;
+    use triblespace::core::repo::{PinStore, Repository};
+
+    fn test_id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn at_unix(seconds: f64) -> Inline<inlineencodings::NsTAIInterval> {
+        epoch_interval(Epoch::from_unix_seconds(seconds))
+    }
+
+    fn pin_head(
+        pile_path: &Path,
+        branch: Id,
+    ) -> Inline<inlineencodings::Handle<blobencodings::SimpleArchive>> {
+        let mut pile = collection_access::open_pile_strict(pile_path).unwrap();
+        let head = pile.head(branch).unwrap().unwrap();
+        pile.close().unwrap();
+        head
+    }
+
+    fn u256be_to_u64(value: Inline<inlineencodings::U256BE>) -> Option<u64> {
+        if value.raw[..24].iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        Some(u64::from_be_bytes(value.raw[24..].try_into().ok()?))
+    }
+
+    #[test]
+    fn exact_timeout_event_is_one_intrinsic_idempotent_commit_and_keeps_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("patience.pile");
+        let key_path = directory.path().join("patience.key");
+        File::create(&pile_path).unwrap();
+
+        let pile = collection_access::open_pile_strict(&pile_path).unwrap();
+        let mut repository =
+            Repository::new(pile, SigningKey::from_bytes(&[0x51; 32]), Fragment::empty()).unwrap();
+        let legacy_branch = *repository.create_branch("cognition", None).unwrap();
+        repository.close().unwrap();
+        let legacy_pin = pin_head(&pile_path, legacy_branch);
+
+        collection_access::initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let scope = test_id(0x61);
+        let storage = PatienceStorage {
+            pile: &pile_path,
+            key: Some(&key_path),
+            scope,
+        };
+        let request = test_id(0x62);
+        let worker = test_id(0x63);
+        let requested_at = at_unix(42.0);
+        let expected = timeout_extension_fragment(request, worker, 90_000, requested_at);
+        let expected_id = expected.root().unwrap();
+
+        let (event_id, first_commit) =
+            publish_timeout_extension(storage, request, worker, 90_000, requested_at).unwrap();
+        let length_after_first = std::fs::metadata(&pile_path).unwrap().len();
+        let (replayed_id, replayed_commit) =
+            publish_timeout_extension(storage, request, worker, 90_000, requested_at).unwrap();
+
+        assert_eq!(event_id, expected_id);
+        assert_eq!(replayed_id, event_id);
+        assert_eq!(replayed_commit, first_commit);
+        assert_eq!(
+            std::fs::metadata(&pile_path).unwrap().len(),
+            length_after_first
+        );
+        assert_eq!(pin_head(&pile_path, legacy_branch), legacy_pin);
+
+        let signer = collection_access::load_signer(&pile_path, Some(&key_path)).unwrap();
+        let view = collection_access::materialize_scope(
+            &pile_path,
+            scope,
+            &HashSet::from([signer.verifying_key()]),
+        )
+        .unwrap();
+        assert_eq!(view.commits, vec![first_commit]);
+        assert_eq!(view.facts, expected.into_facts());
+
+        let (found_request, found_worker, timeout, found_at) = find!(
+            (request: Id, worker: Id, timeout: Inline<inlineencodings::U256BE>, at: Inline<inlineencodings::NsTAIInterval>),
+            pattern!(&view.facts, [{ event_id @
+                metadata::tag: KIND_TIMEOUT_EXTENSION_ID,
+                exec_schema::about_request: ?request,
+                exec_schema::worker: ?worker,
+                exec_schema::timeout_ms: ?timeout,
+                exec_schema::requested_at: ?at,
+            }])
+        )
+        .next()
+        .unwrap();
+        assert_eq!(found_request, request);
+        assert_eq!(found_worker, worker);
+        assert_eq!(u256be_to_u64(timeout), Some(90_000));
+        assert_eq!(found_at, requested_at);
+    }
+
+    #[test]
+    fn missing_signer_fails_before_touching_pile() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("patience.pile");
+        let key_path = directory.path().join("missing.key");
+        File::create(&pile_path).unwrap();
+        let before = std::fs::metadata(&pile_path).unwrap().len();
+
+        let error = publish_timeout_extension(
+            PatienceStorage {
+                pile: &pile_path,
+                key: Some(&key_path),
+                scope: test_id(0x64),
+            },
+            test_id(0x65),
+            test_id(0x66),
+            1_000,
+            at_unix(43.0),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("load durable signing key"));
+        assert!(!key_path.exists());
+        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
+    }
+
+    #[test]
+    fn permanent_cli_has_scope_but_no_branch_selector() {
+        let command = Cli::command();
+        assert!(command
+            .get_arguments()
+            .any(|argument| argument.get_id() == "scope"));
+        assert!(!command
+            .get_arguments()
+            .any(|argument| argument.get_id() == "branch"));
+        assert!(!command
+            .get_arguments()
+            .any(|argument| argument.get_id() == "branch_id"));
+    }
 }
