@@ -456,11 +456,14 @@ pub struct LegacyMigrationReport {
 /// collection and verify the exact resulting materialization.
 ///
 /// The durable target signer is loaded before the pile is touched. The entire
-/// legacy DAG, every authored signature, every commit message, and all
-/// caller-known direct payloads are preflighted before the first collection
-/// append. `validate_payloads` is called for both authored content facts and
-/// attached semantic-metadata facts because conservative resident-closure
-/// traversal cannot prove that a directly named nonresident child is absent.
+/// legacy DAG, every authored signature, every commit message, all
+/// caller-known direct payloads, and the complete resulting materialized union
+/// are preflighted before the first collection append. `validate_payloads` is
+/// called for both authored content facts and attached semantic-metadata facts
+/// because conservative resident-closure traversal cannot prove that a
+/// directly named nonresident child is absent. `validate_materialized` is a
+/// distinct callback because individual legacy commits are deltas and need not
+/// satisfy invariants which only make sense over the complete union.
 ///
 /// `explicit_legacy_branch` only disambiguates the input pin. It never selects
 /// an output branch; publication always targets `target_scope`.
@@ -477,6 +480,7 @@ pub fn migrate_legacy_simplearchive_branch(
     legacy_branch_name: &str,
     explicit_legacy_branch: Option<Id>,
     validate_payloads: impl Fn(&PileReader, &TribleSet) -> Result<()>,
+    validate_materialized: impl Fn(&PileReader, &TribleSet) -> Result<()>,
 ) -> Result<LegacyMigrationReport> {
     // A missing durable signer must fail before even opening the pile.
     let signer = load_signer(pile_path, key_path)?;
@@ -490,8 +494,11 @@ pub fn migrate_legacy_simplearchive_branch(
         &validate_payloads,
     )?;
 
-    let mut expected = materialize_scope(pile_path, target_scope, &allowed)?.facts;
+    let existing = materialize_scope(pile_path, target_scope, &allowed)?;
+    let mut expected = existing.facts;
     expected += plan.facts.clone();
+    validate_materialized(&existing.reader, &expected)
+        .context("preflight materialized target union")?;
 
     // Validate every collection already owned by this signer before adding a
     // byte, not only the target scope observed above.
@@ -1255,6 +1262,10 @@ mod tests {
         Ok(())
     }
 
+    fn accept_materialized_union(_: &PileReader, _: &TribleSet) -> Result<()> {
+        Ok(())
+    }
+
     struct LegacyFixture {
         pile: PathBuf,
         key: PathBuf,
@@ -1357,6 +1368,7 @@ mod tests {
             "legacy-test",
             None,
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap();
         let length = std::fs::metadata(&fixture.pile).unwrap().len();
@@ -1367,6 +1379,7 @@ mod tests {
             "legacy-test",
             Some(fixture.branch),
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap();
 
@@ -1449,6 +1462,7 @@ mod tests {
             "empty-test",
             Some(branch),
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap();
 
@@ -1542,6 +1556,7 @@ mod tests {
             "duplicate-test",
             None,
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap_err();
         assert!(format!("{migration_error:#}").contains("multiple legacy branches"));
@@ -1554,6 +1569,7 @@ mod tests {
             "duplicate-test",
             Some(second_branch),
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap();
         assert_eq!(report.branch_id, second_branch);
@@ -1593,6 +1609,7 @@ mod tests {
             "metadata-test",
             None,
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap_err();
 
@@ -1600,6 +1617,70 @@ mod tests {
         assert!(message.contains("semantic-metadata payloads"));
         assert!(message.contains("strictly read test description payload"));
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
+    }
+
+    #[test]
+    fn invalid_materialized_union_leaves_the_pile_byte_identical() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("collection.key");
+        let scope = id(36);
+        let subject = id(37);
+        let existing_kind = id(38);
+        let legacy_kind = id(39);
+
+        let storage = open_pile_strict(&pile).unwrap();
+        let mut repository = Repository::new(
+            storage,
+            SigningKey::from_bytes(&[0x46; 32]),
+            Fragment::empty(),
+        )
+        .unwrap();
+        let branch = *repository.create_branch("union-test", None).unwrap();
+        let mut workspace = repository.pull(branch).unwrap();
+        workspace.commit(
+            entity! { ExclusiveId::force(subject) @ metadata::tag: &legacy_kind },
+            "legacy conflicting kind",
+        );
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+
+        initialize_signer(&pile, Some(&key)).unwrap();
+        publish_fragment(
+            &pile,
+            Some(&key),
+            scope,
+            entity! { ExclusiveId::force(subject) @ metadata::tag: &existing_kind },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let before = std::fs::read(&pile).unwrap();
+
+        let error = migrate_legacy_simplearchive_branch(
+            &pile,
+            Some(&key),
+            scope,
+            "union-test",
+            Some(branch),
+            |_, _| Ok(()),
+            |_, facts| {
+                let kinds: BTreeSet<Id> = find!(
+                    kind: Id,
+                    pattern!(facts, [{ subject @ metadata::tag: ?kind }])
+                )
+                .collect();
+                if kinds.len() != 1 {
+                    bail!("subject has conflicting kinds in materialized union");
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("preflight materialized target union"));
+        assert!(message.contains("conflicting kinds"));
+        assert_eq!(std::fs::read(&pile).unwrap(), before);
     }
 
     #[test]
@@ -1648,6 +1729,7 @@ mod tests {
             "legacy-test",
             None,
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap_err();
 
@@ -1671,6 +1753,7 @@ mod tests {
             "legacy-test",
             None,
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap_err();
 
@@ -1789,6 +1872,7 @@ mod tests {
             "collision-test",
             None,
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap_err();
 
@@ -1828,6 +1912,7 @@ mod tests {
             "legacy-test",
             None,
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap_err();
 
@@ -1876,6 +1961,7 @@ mod tests {
             "legacy-test",
             None,
             validate_description_payloads,
+            accept_materialized_union,
         )
         .unwrap_err();
 

@@ -577,6 +577,7 @@ fn migrate_legacy(
         LEGACY_VOICE_BRANCH_NAME,
         explicit_branch,
         preflight_legacy_voice_payloads,
+        |_, _| Ok(()),
     )
 }
 

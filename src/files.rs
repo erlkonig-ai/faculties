@@ -34,6 +34,14 @@ pub type EmbeddingHandle = Inline<Handle<Embedding>>;
 pub type Mm7bHandle = Inline<Handle<embeddings::Embedding3584>>;
 pub const DEFAULT_MEDIA_TYPE: &str = "application/octet-stream";
 
+// Historical schema ids are intentionally private to the canonical-catalog
+// gate. Exact-copying either attribute into the collection would preserve an
+// obsolete identity projection and permanently poison the union. The existing
+// `canonical-file-media-types` migration (commit 93643ef) must rewrite those
+// lineages before collection publication.
+const LEGACY_FILE_MIME_ATTRIBUTE: Id = id_hex!("BFE2C88ECD13D56F80967C343FC072EE");
+const LEGACY_IMPORTED_AT_ATTRIBUTE: Id = id_hex!("EA8B5429A86AF26D2B87F169AFEE3919");
+
 /// The two canonical targets carried by a `files:` reference token.
 ///
 /// Unlike an entity selector, a content reference identifies bytes directly:
@@ -716,6 +724,14 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
 pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
     validate_known_payloads(reader, facts)?;
 
+    if facts.iter().any(|fact| {
+        fact.a() == &LEGACY_FILE_MIME_ATTRIBUTE || fact.a() == &LEGACY_IMPORTED_AT_ATTRIBUTE
+    }) {
+        bail!(
+            "Files catalog contains the historical inline-MIME/import-time schema; refusing an exact-copy collection migration. Run the canonical-file-media-types lineage rewrite before publishing this catalog"
+        );
+    }
+
     let files: BTreeSet<Id> = find!(
         id: Id,
         pattern!(facts, [{ ?id @ metadata::tag: &KIND_FILE }])
@@ -753,7 +769,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
 
     for id in &media_types {
         entity_kind(facts, *id)?;
-        one_required(
+        let name = one_required(
             find!(
                 name: NameHandle,
                 pattern!(facts, [{ *id @ metadata::name: ?name }])
@@ -761,10 +777,19 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
             .collect(),
             "media type name",
         )?;
+        let expected = entity! {
+            metadata::tag: &KIND_MEDIA_TYPE,
+            metadata::name: name,
+        }
+        .root()
+        .expect("media type intrinsic core has one root");
+        if expected != *id {
+            bail!("media type {id:x} does not match its intrinsic core {expected:x}");
+        }
     }
 
     for id in &files {
-        one_required(
+        let content = one_required(
             find!(
                 content: ContentHandle,
                 pattern!(facts, [{ *id @ file::content: ?content }])
@@ -772,7 +797,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
             .collect(),
             "file content",
         )?;
-        one_required(
+        let name = one_required(
             find!(
                 name: NameHandle,
                 pattern!(facts, [{ *id @ file::name: ?name }])
@@ -790,6 +815,17 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
         )?;
         if !media_types.contains(&media_type) {
             bail!("file {id:x} points to non-media-type entity {media_type:x}");
+        }
+        let expected = entity! {
+            metadata::tag: &KIND_FILE,
+            file::content: content,
+            file::name: name,
+            file::media_type: &media_type,
+        }
+        .root()
+        .expect("file intrinsic core has one root");
+        if expected != *id {
+            bail!("file {id:x} does not match its intrinsic core {expected:x}");
         }
         one(
             find!(
@@ -810,7 +846,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
     }
 
     for id in &directories {
-        one_required(
+        let name = one_required(
             find!(
                 name: NameHandle,
                 pattern!(facts, [{ *id @ file::name: ?name }])
@@ -818,10 +854,21 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
             .collect(),
             "directory name",
         )?;
-        for child in children(facts, *id) {
-            if !files.contains(&child) && !directories.contains(&child) {
+        let children = children(facts, *id);
+        for child in &children {
+            if !files.contains(child) && !directories.contains(child) {
                 bail!("directory {id:x} has non-tree child {child:x}");
             }
+        }
+        let expected = entity! {
+            metadata::tag: &KIND_DIRECTORY,
+            file::name: name,
+            file::children*: children.iter(),
+        }
+        .root()
+        .expect("directory intrinsic core has one root");
+        if expected != *id {
+            bail!("directory {id:x} does not match its intrinsic core {expected:x}");
         }
     }
 
@@ -833,7 +880,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
         if !files.contains(&root) && !directories.contains(&root) {
             bail!("import {id:x} has non-tree root {root:x}");
         }
-        one_required(
+        let imported_at = one_required(
             find!(
                 imported_at: Inline<inlineencodings::NsTAIInterval>,
                 pattern!(facts, [{ *id @ file::imported_at: ?imported_at }])
@@ -841,7 +888,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
             .collect(),
             "imported-at time",
         )?;
-        one_required(
+        let source = one_required(
             find!(
                 source: NameHandle,
                 pattern!(facts, [{ *id @ file::source_path: ?source }])
@@ -849,6 +896,17 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
             .collect(),
             "import source path",
         )?;
+        let expected = entity! {
+            metadata::tag: &KIND_IMPORT,
+            file::root: &root,
+            file::imported_at: imported_at,
+            file::source_path: source,
+        }
+        .root()
+        .expect("import intrinsic core has one root");
+        if expected != *id {
+            bail!("import {id:x} does not match its intrinsic core {expected:x}");
+        }
     }
 
     for id in &pages {
@@ -859,7 +917,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
         if !files.contains(&parent) {
             bail!("page {id:x} has non-file parent {parent:x}");
         }
-        one_required(
+        let index = one_required(
             find!(
                 index: String,
                 pattern!(facts, [{ *id @ page::index: ?index }])
@@ -867,6 +925,10 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
             .collect(),
             "page index",
         )?;
+        let expected = page_id(parent, &index);
+        if expected != *id {
+            bail!("page {id:x} does not match its intrinsic core {expected:x}");
+        }
         one_required(
             find!(
                 embedding: Mm7bHandle,

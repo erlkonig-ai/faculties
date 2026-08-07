@@ -377,6 +377,7 @@ fn migrate_legacy(
         LEGACY_STATUS_BRANCH_NAME,
         explicit_branch,
         preflight_legacy_status_payloads,
+        |_, _| Ok(()),
     )
 }
 

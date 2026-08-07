@@ -510,6 +510,7 @@ fn migrate_legacy(
         LEGACY_BODY_BRANCH_NAME,
         explicit_branch,
         preflight_legacy_body_payloads,
+        |_, _| Ok(()),
     )
 }
 

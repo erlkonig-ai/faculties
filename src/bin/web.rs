@@ -419,6 +419,7 @@ fn migrate_legacy(
         LEGACY_WEB_BRANCH_NAME,
         explicit_branch,
         preflight_legacy_web_payloads,
+        |_, _| Ok(()),
     )
 }
 

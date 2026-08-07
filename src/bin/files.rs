@@ -162,10 +162,12 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         max_pages: usize,
     },
-    /// Publish the signed legacy `files` branch as collection commits, then
-    /// verify the exact materialized view. Stop every legacy Files writer and
-    /// every collection-native writer using the same target scope first. The
-    /// legacy pin is never moved or removed.
+    /// Publish an already-canonical signed legacy `files` branch as collection
+    /// commits, then verify the exact materialized view. Branches carrying the
+    /// historical inline-MIME/import-time schema are rejected before any
+    /// append; they require the canonical-file-media-types lineage rewrite.
+    /// Stop every legacy Files writer and every collection-native writer using
+    /// the same target scope first. The legacy pin is never moved or removed.
     MigrateLegacy {
         /// Exact legacy files branch id. Needed only when duplicate `files`
         /// branch names make name lookup ambiguous.
@@ -1940,9 +1942,10 @@ fn migrate_legacy(
         FILES_BRANCH_NAME,
         explicit_branch,
         file_capability::validate_known_payloads,
+        file_capability::validate_catalog,
     )?;
-    // The per-commit callback proves direct payload closure before append;
-    // validate the final union as a complete immutable Files catalog too.
+    // Revalidate the published view as defense in depth. The same complete
+    // catalog was already checked before the first append by migration.
     storage.view()?;
     Ok(report)
 }
@@ -2084,6 +2087,17 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::fs::File;
     use triblespace::core::repo::{PinStore, Repository};
+    use triblespace::core::trible::{E_END, E_START};
+
+    use faculties::schemas::files::KIND_MEDIA_TYPE;
+
+    mod legacy_schema {
+        use triblespace::prelude::*;
+
+        attributes! {
+            "BFE2C88ECD13D56F80967C343FC072EE" as mime: inlineencodings::ShortString;
+        }
+    }
 
     struct Fixture {
         directory: tempfile::TempDir,
@@ -2132,6 +2146,37 @@ mod tests {
             embeddings::attr_mm7b::embedding: mm7b,
         };
         file
+    }
+
+    fn force_entity_id(fragment: Fragment, from: Id, to: Id) -> Fragment {
+        let (facts, blobs) = fragment.into_facts_and_blobs();
+        let mut rewritten = TribleSet::new();
+        for fact in &facts {
+            if fact.e() == &from {
+                let mut raw = fact.data;
+                raw[E_START..=E_END].copy_from_slice(&to[..]);
+                rewritten.insert(&Trible::force_raw(raw).unwrap());
+            } else {
+                rewritten.insert(&fact);
+            }
+        }
+        Fragment::from_facts_and_blobs(rewritten, blobs)
+    }
+
+    fn assert_catalog_rejects(fragment: Fragment, scope_byte: u8, message: &str) {
+        let fixture = Fixture::new(scope_byte);
+        let storage = fixture.storage();
+        storage.publish(fragment, "malformed identity").unwrap();
+        let error = storage.view().unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(message),
+            "unexpected validation error: {error:#}"
+        );
+        assert!(
+            rendered.contains("does not match its intrinsic core"),
+            "unexpected validation error: {error:#}"
+        );
     }
 
     fn seed_two(storage: FilesStorage<'_>) -> (Id, Id, String) {
@@ -2268,6 +2313,64 @@ mod tests {
     }
 
     #[test]
+    fn every_canonical_files_kind_requires_its_intrinsic_id() {
+        let media_type = entity! {
+            metadata::tag: &KIND_MEDIA_TYPE,
+            metadata::name: "text/plain".to_owned(),
+        };
+        let media_type_id = media_type.root().unwrap();
+        assert_catalog_rejects(
+            force_entity_id(media_type, media_type_id, Id::new([0xA1; 16]).unwrap()),
+            0xA0,
+            "media type",
+        );
+
+        let file = file_capability::fragment(b"file".to_vec(), "file.txt", "text/plain").unwrap();
+        let file_id = file.root().unwrap();
+        assert_catalog_rejects(
+            force_entity_id(file, file_id, Id::new([0xA3; 16]).unwrap()),
+            0xA2,
+            "file",
+        );
+
+        let tree = file_capability::directory_fragment(
+            "directory",
+            file_capability::fragment(b"child".to_vec(), "child.txt", "text/plain").unwrap(),
+        );
+        let directory_id = tree.root().unwrap();
+        assert_catalog_rejects(
+            force_entity_id(tree, directory_id, Id::new([0xA5; 16]).unwrap()),
+            0xA4,
+            "directory",
+        );
+
+        let import = file_capability::import_fragment(
+            file_capability::fragment(b"import".to_vec(), "import.txt", "text/plain").unwrap(),
+            "/tmp/import.txt",
+            now_tai(),
+            std::iter::empty::<String>(),
+        )
+        .unwrap();
+        let import_id = import.import_id;
+        assert_catalog_rejects(
+            force_entity_id(import.fragment, import_id, Id::new([0xA7; 16]).unwrap()),
+            0xA6,
+            "import",
+        );
+
+        let parent =
+            file_capability::fragment(b"pdf".to_vec(), "document.pdf", "application/pdf").unwrap();
+        let parent_id = parent.root().unwrap();
+        let page = file_capability::page_fragment(parent_id, "1", vec![0.0; embeddings::DIM_3584]);
+        let page_id = file_capability::page_id(parent_id, "1");
+        assert_catalog_rejects(
+            parent + force_entity_id(page, page_id, Id::new([0xA9; 16]).unwrap()),
+            0xA8,
+            "page",
+        );
+    }
+
+    #[test]
     fn one_existing_pdf_page_does_not_complete_other_requested_pages() {
         let parent = Id::new([0x86; 16]).unwrap();
         let page = file_capability::page_fragment(parent, "1", vec![0.0; embeddings::DIM_3584]);
@@ -2332,5 +2435,47 @@ mod tests {
         assert_eq!(storage.view().unwrap().facts, expected);
         assert_eq!(legacy_pin(&pile, branch), pin);
         assert_eq!(fs::metadata(&pile).unwrap().len(), length);
+    }
+
+    #[test]
+    fn legacy_schema_migration_is_rejected_before_any_collection_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("legacy-schema.pile");
+        let key = directory.path().join("collection.key");
+        File::create(&pile).unwrap();
+        let repository_pile = collection_access::open_pile_strict(&pile).unwrap();
+        let mut repository = Repository::new(
+            repository_pile,
+            SigningKey::from_bytes(&[0x92; 32]),
+            Fragment::empty(),
+        )
+        .unwrap();
+        let branch = *repository.create_branch(FILES_BRANCH_NAME, None).unwrap();
+        let mut workspace = repository.pull(branch).unwrap();
+        let content: FileHandle = workspace.put::<blobencodings::RawBytes, _>(b"legacy".to_vec());
+        let name = workspace.put::<blobencodings::LongString, _>("legacy.txt".to_owned());
+        let legacy_file = entity! {
+            metadata::tag: &KIND_FILE,
+            file::content: content,
+            file::name: name,
+            legacy_schema::mime: "text/plain",
+        };
+        workspace.commit(legacy_file, "legacy inline MIME");
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+        collection_access::initialize_signer(&pile, Some(&key)).unwrap();
+
+        let storage = FilesStorage {
+            pile: &pile,
+            key: Some(&key),
+            scope: Id::new([0x8A; 16]).unwrap(),
+        };
+        let before = fs::read(&pile).unwrap();
+        let error = migrate_legacy(storage, Some(branch)).unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("preflight materialized target union"));
+        assert!(message.contains("historical inline-MIME/import-time schema"));
+        assert_eq!(fs::read(&pile).unwrap(), before);
     }
 }

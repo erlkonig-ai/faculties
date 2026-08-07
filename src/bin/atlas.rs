@@ -329,6 +329,7 @@ fn migrate_legacy(
         LEGACY_ATLAS_BRANCH_NAME,
         explicit_branch,
         preflight_legacy_atlas_payloads,
+        |_, _| Ok(()),
     )
 }
 
