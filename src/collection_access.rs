@@ -1,4 +1,4 @@
-//! Narrow shared access to one `SimpleArchive`-union collection in a pile.
+//! Shared access to `SimpleArchive`-union collections in a pile.
 //!
 //! This is intentionally a composition boundary, not another repository
 //! model. Callers supply an extrinsic scope and explicit signer authority;
@@ -17,14 +17,14 @@ use triblespace::core::collection::simplearchive_union::{
     self, publish_fragment_commit, validate_commit, validate_merge,
 };
 use triblespace::core::collection::{
-    discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionDefinition, CollectionResolution,
-    CollectionValidationRequest,
+    discover_collection_records, plan_collection_retention, resolve_collection_semantics,
+    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDefinition,
+    CollectionResolution, CollectionValidationRequest,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::repo::pile::{Pile, PileReader, ReadError};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, RetentionRoots};
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 
@@ -196,14 +196,74 @@ fn materialize_reader_scope(
     scope: Id,
     allowed_signers: &HashSet<VerifyingKey>,
 ) -> Result<TribleSet> {
+    let resolved = resolve_reader_scope(reader, scope, allowed_signers)?;
+    simplearchive_union::materialize(
+        resolved.resolution.semantics(),
+        &resolved.definition,
+        reader,
+    )
+    .context("materialize collection physical cover")
+}
+
+/// Plan conservative roots for every union collection owned by authorized keys.
+///
+/// Signed collection commits are the durable declaration of desire: every
+/// strictly valid commit signed by `allowed_signers` is admitted. Each admitted
+/// COMMIT roots its collection definition, canonical record, data, metadata,
+/// and resident attachment closure. Unsigned MERGE and DERIVE equations are
+/// reproducible caches and root nothing. This avoids a separate mutable
+/// retained-scope registry while covering all of one owner's collections in a
+/// shared pile, not merely the scope a caller happens to be reading now.
+///
+/// The returned roots are still a pure result for this observed pile snapshot.
+/// A future rewrite must rediscover and replan; this helper persists no policy.
+pub fn plan_authorized_union_retention(
+    pile_path: &Path,
+    allowed_signers: &HashSet<VerifyingKey>,
+) -> Result<RetentionRoots> {
+    let mut pile = open_pile_strict(pile_path)?;
+    let result = (|| {
+        let reader = pile.reader().context("snapshot pile for retention plan")?;
+        let records =
+            discover_collection_records(&reader).context("discover collection records")?;
+        let allowed_key_bytes: HashSet<[u8; 32]> =
+            allowed_signers.iter().map(VerifyingKey::to_bytes).collect();
+        let authorized_commits: BTreeSet<Id> = records
+            .commits()
+            .iter()
+            .filter(|commit| allowed_key_bytes.contains(&commit.public_key().raw))
+            .map(CollectionCommit::id)
+            .collect();
+        let resolution: CollectionResolution<String> =
+            resolve_collection_semantics(&records, &authorized_commits, |request| {
+                validate_retention_request(&reader, &authorized_commits, request)
+            })
+            .map_err(|error| anyhow!("resolve collection semantics: {error}"))?;
+        require_authorized_commits(&resolution, &authorized_commits)?;
+        plan_collection_retention(&records, &resolution, &reader)
+            .context("plan strong collection retention")
+    })();
+    finish_pile(pile, result)
+}
+
+struct ResolvedScope {
+    definition: CollectionDefinition,
+    resolution: CollectionResolution<String>,
+}
+
+fn resolve_reader_scope(
+    reader: &PileReader,
+    scope: Id,
+    allowed_signers: &HashSet<VerifyingKey>,
+) -> Result<ResolvedScope> {
     let definition = simplearchive_union::definition(scope);
-    let discovered = discover_collection_records(reader).context("discover collection records")?;
+    let records = discover_collection_records(reader).context("discover collection records")?;
 
     // Discovery already established strict self-signatures. Authorization is
     // a separate exact byte comparison against caller-supplied keys.
     let allowed_key_bytes: HashSet<[u8; 32]> =
         allowed_signers.iter().map(VerifyingKey::to_bytes).collect();
-    let authorized_target_commits: BTreeSet<Id> = discovered
+    let authorized_target_commits: BTreeSet<Id> = records
         .commits()
         .iter()
         .filter(|commit| commit.collection() == definition.id())
@@ -212,48 +272,89 @@ fn materialize_reader_scope(
         .collect();
 
     let resolution: CollectionResolution<String> =
-        resolve_collection_semantics(&discovered, &authorized_target_commits, |request| {
-            validate_request(reader, definition.id(), request)
+        resolve_collection_semantics(&records, &authorized_target_commits, |request| {
+            validate_scope_request(reader, definition.id(), &authorized_target_commits, request)
         })
         .map_err(|error| anyhow!("resolve collection semantics: {error}"))?;
 
     // Only policy-eligible signed roots are mandatory. Unsigned equations may
     // be inert, incomplete, or malicious append noise; unless positively
     // validated and activated they are diagnostics, not a global stop switch.
-    for commit in &authorized_target_commits {
+    require_authorized_commits(&resolution, &authorized_target_commits)?;
+
+    Ok(ResolvedScope {
+        definition,
+        resolution,
+    })
+}
+
+fn require_authorized_commits(
+    resolution: &CollectionResolution<String>,
+    authorized: &BTreeSet<Id>,
+) -> Result<()> {
+    for commit in authorized {
         if resolution.validation_pending().contains(commit) {
-            return Err(anyhow!("authorized target commit {commit:X} is incomplete"));
+            return Err(anyhow!(
+                "authorized collection commit {commit:X} is incomplete"
+            ));
         }
         if let Some(reason) = resolution.rejected().get(commit) {
             return Err(anyhow!(
-                "authorized target commit {commit:X} was rejected: {reason}"
+                "authorized collection commit {commit:X} was rejected: {reason}"
             ));
         }
     }
-
-    simplearchive_union::materialize(resolution.semantics(), &definition, reader)
-        .context("materialize collection physical cover")
+    Ok(())
 }
 
-fn validate_request(
+fn validate_commit_request(
     reader: &PileReader,
-    target: Id,
+    definition: &CollectionDefinition,
+    claim: &CollectionCommit,
+) -> Result<CollectionClaimValidation<String>> {
+    let Some(data) = load_element(reader, claim.data())? else {
+        return Ok(CollectionClaimValidation::Pending);
+    };
+    Ok(match validate_commit(definition, claim, &data) {
+        Ok(()) => CollectionClaimValidation::Accepted,
+        Err(error) => CollectionClaimValidation::Rejected(error.to_string()),
+    })
+}
+
+fn validate_retention_request(
+    reader: &PileReader,
+    authorized_commits: &BTreeSet<Id>,
+    request: CollectionValidationRequest<'_>,
+) -> Result<CollectionClaimValidation<String>> {
+    match request {
+        CollectionValidationRequest::Commit { definition, claim }
+            if authorized_commits.contains(&claim.id()) =>
+        {
+            validate_commit_request(reader, definition, claim)
+        }
+        CollectionValidationRequest::Commit { .. }
+        | CollectionValidationRequest::Merge { .. }
+        | CollectionValidationRequest::Derive { .. } => Ok(CollectionClaimValidation::Pending),
+    }
+}
+
+fn validate_scope_request(
+    reader: &PileReader,
+    target_collection: Id,
+    authorized_commits: &BTreeSet<Id>,
     request: CollectionValidationRequest<'_>,
 ) -> Result<CollectionClaimValidation<String>> {
     match request {
         CollectionValidationRequest::Commit { definition, claim } => {
-            debug_assert_eq!(claim.collection(), target);
-            let Some(data) = load_element(reader, claim.data())? else {
+            if !authorized_commits.contains(&claim.id()) {
                 return Ok(CollectionClaimValidation::Pending);
-            };
-            Ok(match validate_commit(definition, claim, &data) {
-                Ok(()) => CollectionClaimValidation::Accepted,
-                Err(error) => CollectionClaimValidation::Rejected(error.to_string()),
-            })
+            }
+            validate_commit_request(reader, definition, claim)
         }
-        CollectionValidationRequest::Merge { definition, claim }
-            if claim.collection() == target =>
-        {
+        CollectionValidationRequest::Merge { definition, claim } => {
+            if claim.collection() != target_collection {
+                return Ok(CollectionClaimValidation::Pending);
+            }
             let (low, high) = claim.inputs();
             let Some(low) = load_element(reader, low)? else {
                 return Ok(CollectionClaimValidation::Pending);
@@ -274,9 +375,7 @@ fn validate_request(
         // This first boundary has no cross-representation recipe oracle. The
         // generic resolver must not infer DERIVE validity, and claims for
         // unrelated collections must not trigger arbitrary blob reads.
-        CollectionValidationRequest::Merge { .. } | CollectionValidationRequest::Derive { .. } => {
-            Ok(CollectionClaimValidation::Pending)
-        }
+        CollectionValidationRequest::Derive { .. } => Ok(CollectionClaimValidation::Pending),
     }
 }
 
@@ -434,8 +533,83 @@ mod tests {
         pile.close().unwrap();
 
         let error = materialize_scope(&pile_path, id(1), &allowed(&signer)).unwrap_err();
-        assert!(format!("{error:#}").contains("authorized target commit"));
+        assert!(format!("{error:#}").contains("authorized collection commit"));
         assert!(format!("{error:#}").contains("incomplete"));
+    }
+
+    #[test]
+    fn signer_wide_retention_covers_every_authorized_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let first_path = directory.path().join("first.key");
+        let second_path = directory.path().join("second.key");
+        let first = initialize_signer(&pile, Some(&first_path)).unwrap();
+        initialize_signer(&pile, Some(&second_path)).unwrap();
+
+        let one = publish_fragment(
+            &pile,
+            Some(&first_path),
+            id(1),
+            entity! { metadata::tag: &id(20) },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let two = publish_fragment(
+            &pile,
+            Some(&first_path),
+            id(2),
+            entity! { metadata::tag: &id(21) },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let other = publish_fragment(
+            &pile,
+            Some(&second_path),
+            id(3),
+            entity! { metadata::tag: &id(22) },
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let roots = plan_authorized_union_retention(&pile, &allowed(&first)).unwrap();
+        let direct: BTreeSet<_> = roots.direct().map(|handle| handle.raw).collect();
+        let recursive: BTreeSet<_> = roots.recursive().map(|handle| handle.raw).collect();
+        for commit in [&one, &two] {
+            assert!(direct.contains(&CollectionCommit::to_blob(commit).get_handle().raw));
+            assert!(recursive.contains(&Handle::<SimpleArchive>::from_hash(commit.data()).raw));
+            assert!(recursive.contains(&commit.metadata().raw));
+        }
+        assert!(!direct.contains(&CollectionCommit::to_blob(&other).get_handle().raw));
+        assert!(!recursive.contains(&Handle::<SimpleArchive>::from_hash(other.data()).raw));
+    }
+
+    #[test]
+    fn retention_validation_never_reads_merge_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = fresh_pile(&directory);
+        let unrelated = simplearchive_union::definition(id(2));
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let invalid = pile
+            .put::<triblespace::core::blob::encodings::UnknownBlob, _>(
+                anybytes::Bytes::from_source(b"not an archive".to_vec()),
+            )
+            .unwrap();
+        let reader = pile.reader().unwrap();
+        pile.close().unwrap();
+        let endpoint: CollectionData = invalid.into();
+        let claim = CollectionMerge::new(unrelated.id(), endpoint, endpoint, endpoint);
+
+        let result = validate_retention_request(
+            &reader,
+            &BTreeSet::new(),
+            CollectionValidationRequest::Merge {
+                definition: &unrelated,
+                claim: &claim,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(result, CollectionClaimValidation::Pending));
     }
 
     #[test]

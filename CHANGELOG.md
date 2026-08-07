@@ -9,7 +9,10 @@ All notable changes to this project will be documented in this file.
   initialization explicit, publishes self-contained fragments as signed
   SimpleArchive-union roots, keeps repeated publications on an explicitly
   closed writer, and materializes explicitly authorized scopes as query facts
-  plus an attachment-capable pile reader.
+  plus an attachment-capable pile reader. Strong retention follows every
+  authorized strict COMMIT directly, while reproducible MERGE/DERIVE cache
+  records root nothing; publication is the durable desire ledger and no
+  separate scope registry is needed.
 - **Body persistence is collection-native.** Deliberate captures and intents
   now use one stable extrinsic scope and durable signer instead of a branch,
   repository workspace, and ephemeral identity. Publications carry every
@@ -17,7 +20,10 @@ All notable changes to this project will be documented in this file.
   selection has a deterministic entity-id tie-break, and hardware-only body
   commands no longer require a pile. `feel --keep` holds one collection writer
   for the session and explicitly observes its close result, including the
-  advertised Ctrl-C stop path.
+  advertised Ctrl-C stop path. `body migrate-legacy` verifies and deterministically
+  republishes each authored legacy commit, omits contentless merge nodes,
+  projects semantic commit metadata, and verifies the exact new materialization
+  without removing the legacy pin; replay is idempotent.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile
