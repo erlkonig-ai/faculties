@@ -5,7 +5,8 @@
 //! Extracted from `body` (2026-06-30): speaking is its own organ, not a limb of
 //! the Reachy body. The body stays the physical Reachy loop (pose/look/feel/act);
 //! the voice owns synthesis (F5/mary) and output
-//! routing. Utterances and routing config live on the `voice` branch.
+//! routing. Utterances and routing config live in one stable extrinsic
+//! collection scope.
 //!
 //! Two channels, each a hard contract — NOT a soft preference:
 //!   - `say`   — the PRIVATE channel: in-ear/headphone only. If no private
@@ -27,7 +28,11 @@ use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, ShortString, U256BE};
 use triblespace::prelude::*;
 
-pub const VOICE_BRANCH_NAME: &str = "voice";
+/// Stable extrinsic scope for utterances and routing policy.
+///
+/// Minted with `trible genid` on 2026-08-07:
+/// `D51A6FB28036D12290404277F273E909`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("D51A6FB28036D12290404277F273E909");
 
 /// Canonical channel names — also the `route::channel` discriminator.
 pub const CHANNEL_SAY: &str = "say";
@@ -53,9 +58,9 @@ pub mod utterance {
 
 /// Tag for a ROUTE preference — one (channel, device, priority) entry. A
 /// channel's policy is the set of its entries read in ascending priority. The
-/// latest entry per (channel, device) wins on `metadata::updated_at`
-/// (coordinate-and-cursor), so re-configuring is a monotonic append, never a
-/// mutation.
+/// route-set operation publishes a complete timestamped generation, and readers
+/// choose the latest generation by `metadata::updated_at`; exact-time ties are
+/// unioned. Reconfiguring is a monotonic append, never a mutation.
 pub const KIND_ROUTE: Id = id_hex!("1198DF29E642F2598BB4BDF9D4CD1F07");
 
 pub mod route {

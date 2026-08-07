@@ -26,6 +26,17 @@ All notable changes to this project will be documented in this file.
   without removing the legacy pin; replay is idempotent. Migration requires
   legacy writers to be quiescent and strictly preflights every body-schema
   payload handle before its first collection append.
+- **Voice persistence is collection-native.** Utterances and routing policy now
+  use a stable extrinsic scope and the existing durable signer rather than a
+  branch and per-process ephemeral identity. A complete route generation is one
+  atomic fragment/COMMIT; utterance text, optional audio, and the operational
+  outcome message remain together in content plus COMMIT metadata. Initialize
+  the identity explicitly with `trible pile signing-key init <pile>`; ordinary
+  reads and writes never mint a key. `voice migrate-legacy` validates the named
+  branch and every heterogeneous authored signature, strictly preflights known
+  text/audio payloads before publishing, deterministically re-signs authored
+  commits, verifies exact materialization and signer-wide retention, tolerates
+  the legacy empty-branch artifact, and leaves the legacy pin untouched.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile

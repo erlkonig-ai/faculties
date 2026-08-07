@@ -32,8 +32,8 @@ pub const DEFAULT_SCOPE_ID: Id = id_hex!("7CF255AAA8D79CA997F991183611C6A5");
 pub const KIND_CAPTURE: Id = id_hex!("9C26C6EFD09EB2A401EF009FE9229E16");
 
 // Speech moved OUT of `body` into the dedicated `voice` faculty (2026-06-30):
-// speaking is its own organ. Utterances now live on the pile's `voice` branch
-// (see `schemas::voice`). The body is the physical Reachy loop only.
+// speaking is its own organ. Utterances now live in the stable voice collection
+// scope (see `schemas::voice`). The body is the physical Reachy loop only.
 
 /// Tag for an INTENT — a reasoned instruction (the perceive-then-reason model output): gemma's
 /// perceive+reason output, the language the VLA is conditioned on. Unlike the
