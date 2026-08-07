@@ -168,8 +168,9 @@ enum Command {
         devices: Vec<String>,
     },
     /// Publish the signed legacy `voice` branch as collection commits, then
-    /// verify the exact materialized view. Stop every legacy voice writer
-    /// before running this command. It never removes the legacy pin.
+    /// verify the exact materialized view. Stop every legacy voice writer and
+    /// every collection-native writer using the same target scope before
+    /// running this command. It never removes the legacy pin.
     MigrateLegacy {
         /// Exact legacy voice branch id. Needed only when duplicate `voice`
         /// branch names make name lookup ambiguous.
@@ -754,6 +755,12 @@ fn legacy_metadata_fragment(
     };
 
     if let Some(handle) = message {
+        let _: View<str> = reader.get(handle).with_context(|| {
+            format!(
+                "strictly read legacy commit message {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
         projected_blobs.union(hydrate_resident_closure(reader, [handle.transmute()])?);
     }
 
@@ -784,7 +791,8 @@ fn validate_contentless_legacy_merge(
     let contains_only_parent_edges = facts
         .iter()
         .all(|fact| fact.e() == &subject && fact.a() == &repo::parent.id());
-    if parents.len() < 2 || !contains_only_parent_edges {
+    let canonical_subject = entity! { repo::parent*: parents.clone() }.root();
+    if parents.len() < 2 || !contains_only_parent_edges || canonical_subject != Some(subject) {
         bail!(
             "legacy contentless commit {} is not a canonical merge",
             hex::encode_upper(source.raw)
@@ -2163,6 +2171,78 @@ mod tests {
         assert!(collection_commits(&pile_path, &key_path, storage.scope)
             .1
             .is_empty());
+    }
+
+    #[test]
+    fn missing_legacy_commit_message_fails_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = legacy_fixture(&directory);
+        let signer = SigningKey::from_bytes(&[0x32; 32]);
+        let mut pile = collection_access::open_pile_strict(&fixture.pile).unwrap();
+        let old_pin = pile.head(fixture.branch).unwrap().unwrap();
+        let reader = pile.reader().unwrap();
+        let branch_facts: TribleSet = reader.get(old_pin).unwrap();
+        let branch_entity = repo::branch::branch_entity(&branch_facts, fixture.branch).unwrap();
+        let name = one_commit_value(&branch_facts, branch_entity, &metadata::name, "branch name")
+            .unwrap()
+            .unwrap();
+        let old_head = one_commit_value(&branch_facts, branch_entity, &repo::head, "branch head")
+            .unwrap()
+            .unwrap();
+        let content = entity! { metadata::tag: &KIND_UTTERANCE }
+            .into_facts()
+            .to_blob();
+        pile.put::<blobencodings::SimpleArchive, _>(content.clone())
+            .unwrap();
+        let missing_message: TextHandle = Inline::new([0x93; 32]);
+        let commit = repo::commit::commit_metadata(
+            &signer,
+            [old_head],
+            Some(missing_message),
+            Some(content),
+            None,
+        )
+        .to_blob();
+        pile.put::<blobencodings::SimpleArchive, _>(commit.clone())
+            .unwrap();
+        let branch_metadata =
+            repo::branch::branch_metadata(&signer, fixture.branch, name, Some(commit)).to_blob();
+        let bad_pin = pile
+            .put::<blobencodings::SimpleArchive, _>(branch_metadata)
+            .unwrap();
+        pile.update(fixture.branch, Some(old_pin), Some(bad_pin))
+            .unwrap();
+        pile.flush().unwrap();
+        pile.close().unwrap();
+        let length = std::fs::metadata(&fixture.pile).unwrap().len();
+
+        let error = migrate_legacy(fixture_storage(&fixture), None).unwrap_err();
+
+        assert!(format!("{error:#}").contains("strictly read legacy commit message"));
+        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert_eq!(pin_head(&fixture.pile, fixture.branch), bad_pin);
+        assert!(
+            collection_commits(&fixture.pile, &fixture.key, fixture.scope)
+                .1
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn contentless_legacy_node_requires_its_intrinsic_parent_set_subject() {
+        let first: CommitHandle = Inline::new([0x51; 32]);
+        let second: CommitHandle = Inline::new([0x52; 32]);
+        let source: CommitHandle = Inline::new([0x53; 32]);
+        let canonical = entity! { repo::parent*: [first, second] };
+        let subject = canonical.root().unwrap();
+        validate_contentless_legacy_merge(&canonical.into_facts(), subject, source).unwrap();
+
+        let forged = ExclusiveId::force(test_id(0x66));
+        let mut forged_facts = entity! { &forged @ repo::parent: first }.into_facts();
+        forged_facts += entity! { &forged @ repo::parent: second }.into_facts();
+        let error =
+            validate_contentless_legacy_merge(&forged_facts, forged.id, source).unwrap_err();
+        assert!(format!("{error:#}").contains("not a canonical merge"));
     }
 
     #[test]

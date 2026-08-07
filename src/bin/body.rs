@@ -139,7 +139,8 @@ enum Command {
         output: Option<String>,
     },
     /// Publish the signed legacy `body` branch as collection commits, then
-    /// verify the exact materialized view. Stop every legacy body writer before
+    /// verify the exact materialized view. Stop every legacy body writer and
+    /// every collection-native writer using the same target scope before
     /// running this command. It never removes the legacy pin; collection
     /// retention is not yet a durable recurring policy.
     MigrateLegacy {
@@ -687,6 +688,12 @@ fn legacy_metadata_fragment(
     };
 
     if let Some(handle) = message {
+        let _: View<str> = reader.get(handle).with_context(|| {
+            format!(
+                "strictly read legacy commit message {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
         projected_blobs.union(hydrate_resident_closure(reader, [handle.transmute()])?);
     }
 
@@ -717,7 +724,8 @@ fn validate_contentless_legacy_merge(
     let contains_only_parent_edges = facts
         .iter()
         .all(|fact| fact.e() == &subject && fact.a() == &repo::parent.id());
-    if parents.len() < 2 || !contains_only_parent_edges {
+    let canonical_subject = entity! { repo::parent*: parents.clone() }.root();
+    if parents.len() < 2 || !contains_only_parent_edges || canonical_subject != Some(subject) {
         bail!(
             "legacy contentless commit {} is not a canonical merge",
             hex::encode_upper(source.raw)
@@ -1997,17 +2005,77 @@ mod tests {
     }
 
     #[test]
+    fn missing_legacy_commit_message_fails_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = legacy_fixture(&directory);
+        let signer = SigningKey::from_bytes(&[0x35; 32]);
+        let mut pile = collection_access::open_pile_strict(&fixture.pile).unwrap();
+        let old_pin = pile.head(fixture.branch).unwrap().unwrap();
+        let reader = pile.reader().unwrap();
+        let branch_facts: TribleSet = reader.get(old_pin).unwrap();
+        let branch_entity = repo::branch::branch_entity(&branch_facts, fixture.branch).unwrap();
+        let name = one_commit_value(&branch_facts, branch_entity, &metadata::name, "branch name")
+            .unwrap()
+            .unwrap();
+        let old_head = one_commit_value(&branch_facts, branch_entity, &repo::head, "branch head")
+            .unwrap()
+            .unwrap();
+        let content = entity! { metadata::tag: &KIND_INTENT }
+            .into_facts()
+            .to_blob();
+        pile.put::<blobencodings::SimpleArchive, _>(content.clone())
+            .unwrap();
+        let missing_message: TextHandle = Inline::new([0x92; 32]);
+        let commit = repo::commit::commit_metadata(
+            &signer,
+            [old_head],
+            Some(missing_message),
+            Some(content),
+            None,
+        )
+        .to_blob();
+        pile.put::<blobencodings::SimpleArchive, _>(commit.clone())
+            .unwrap();
+        let branch_metadata =
+            repo::branch::branch_metadata(&signer, fixture.branch, name, Some(commit)).to_blob();
+        let bad_pin = pile
+            .put::<blobencodings::SimpleArchive, _>(branch_metadata)
+            .unwrap();
+        pile.update(fixture.branch, Some(old_pin), Some(bad_pin))
+            .unwrap();
+        pile.flush().unwrap();
+        pile.close().unwrap();
+        let length = std::fs::metadata(&fixture.pile).unwrap().len();
+
+        let error = migrate_legacy(fixture_storage(&fixture), None).unwrap_err();
+
+        assert!(format!("{error:#}").contains("strictly read legacy commit message"));
+        assert_eq!(pin_head(&fixture.pile, fixture.branch), bad_pin);
+        assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert!(migrated_commits(&fixture).1.is_empty());
+    }
+
+    #[test]
     fn contentless_legacy_node_must_be_a_parent_only_merge() {
-        let subject = ExclusiveId::force(test_id(0x72));
         let first: CommitHandle = Inline::new([0x41; 32]);
         let second: CommitHandle = Inline::new([0x42; 32]);
         let source: CommitHandle = Inline::new([0x43; 32]);
-        let mut facts = entity! { &subject @ repo::parent: first }.into_facts();
-        facts += entity! { &subject @ repo::parent: second }.into_facts();
-        validate_contentless_legacy_merge(&facts, subject.id, source).unwrap();
+        let canonical = entity! { repo::parent*: [first, second] };
+        let subject = canonical.root().unwrap();
+        let facts = canonical.into_facts();
+        validate_contentless_legacy_merge(&facts, subject, source).unwrap();
 
-        facts += entity! { &subject @ metadata::tag: &test_id(0x73) }.into_facts();
-        let error = validate_contentless_legacy_merge(&facts, subject.id, source).unwrap_err();
+        let forged = ExclusiveId::force(test_id(0x72));
+        let mut forged_facts = entity! { &forged @ repo::parent: first }.into_facts();
+        forged_facts += entity! { &forged @ repo::parent: second }.into_facts();
+        let error =
+            validate_contentless_legacy_merge(&forged_facts, forged.id, source).unwrap_err();
+        assert!(format!("{error:#}").contains("not a canonical merge"));
+
+        let mut annotated = facts;
+        let explicit_subject = ExclusiveId::force(subject);
+        annotated += entity! { &explicit_subject @ metadata::tag: &test_id(0x73) }.into_facts();
+        let error = validate_contentless_legacy_merge(&annotated, subject, source).unwrap_err();
         assert!(format!("{error:#}").contains("not a canonical merge"));
     }
 
