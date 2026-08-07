@@ -23,7 +23,7 @@ use triblespace::core::collection::simplearchive_union::{
 use triblespace::core::collection::{
     discover_collection_records, plan_collection_retention, resolve_collection_semantics,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDefinition,
-    CollectionResolution, CollectionValidationRequest,
+    CollectionResolution, CollectionValidationRequest, DiscoveredCollectionRecords,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -37,14 +37,70 @@ use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{entity, find, pattern};
 
-/// The minimum useful read view: queryable facts plus their attachment reader.
+/// Canonical identity of one authorized collection view.
 ///
-/// The reader owns an immutable pile snapshot. It remains usable after the
-/// writable [`Pile`] used to create the view has been closed.
+/// The digest commits to the exact intrinsic collection-definition id, sorted
+/// authorization roster, and sorted ids of every authorized, admitted target
+/// [`CollectionCommit`]. It deliberately excludes unsigned equations and
+/// unauthorized records.
+///
+/// Version 1 describes direct target-COMMIT roots: this module currently keeps
+/// every `DERIVE` claim pending. Admitting cross-collection derives in the
+/// future requires a new transcript version covering the relevant active claim
+/// ids and supporting source commits; the v1 formula must not be silently
+/// extended.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CollectionRevision([u8; 32]);
+
+impl CollectionRevision {
+    /// Raw BLAKE3 revision digest.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CollectionRevision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&hex::encode_upper(self.0))
+    }
+}
+
+/// One immutable materialization of a real collection.
+///
+/// `commits` is the exact sorted set of authorized target commit records which
+/// passed concrete validation. The reader owns the same immutable pile
+/// snapshot used for discovery and remains usable for attachment reads after
+/// the writable [`Pile`] used to create the snapshot has been closed.
 #[derive(Debug)]
 pub struct CollectionView {
     pub facts: TribleSet,
     pub reader: PileReader,
+    pub commits: Vec<CollectionCommit>,
+    pub revision: CollectionRevision,
+}
+
+/// Temporary read result for one named legacy repository branch.
+///
+/// Legacy branches have no collection definition, authorization roster, or
+/// admitted collection commits and therefore cannot honestly carry a
+/// [`CollectionRevision`]. New collection-native readers should use
+/// [`CollectionSnapshot`] and [`CollectionView`] instead.
+#[derive(Debug)]
+pub struct LegacyBranchView {
+    pub facts: TribleSet,
+    pub reader: PileReader,
+}
+
+/// One immutable pile snapshot with collection records discovered exactly once.
+///
+/// Reuse a snapshot to materialize any number of scopes. Each call supplies an
+/// independent signer roster while sharing the exact same record discovery and
+/// attachment-reader boundary. Opening and reading a snapshot never resolves a
+/// signer and never writes to the pile.
+#[derive(Debug)]
+pub struct CollectionSnapshot {
+    reader: PileReader,
+    records: DiscoveredCollectionRecords,
 }
 
 /// An explicitly closed writer for repeated publications into one collection.
@@ -160,6 +216,62 @@ pub fn open_pile_strict(path: &Path) -> Result<Pile> {
     Ok(pile)
 }
 
+impl CollectionSnapshot {
+    /// Open one strict immutable pile snapshot and discover collection records.
+    ///
+    /// Discovery happens exactly once here. Later materializations reuse both
+    /// these canonicalized records and this snapshot-owned attachment reader.
+    pub fn open(pile_path: &Path) -> Result<Self> {
+        let mut pile = open_pile_strict(pile_path)?;
+        let result = (|| {
+            let reader = pile.reader().context("snapshot pile for collection read")?;
+            let records =
+                discover_collection_records(&reader).context("discover collection records")?;
+            Ok(Self { reader, records })
+        })();
+        finish_pile(pile, result)
+    }
+
+    /// Materialize one scope under an independent explicit signer roster.
+    ///
+    /// Every structurally valid target commit signed by a roster member must
+    /// validate now. Unauthorized commits and unsigned pending/rejected noise
+    /// do not poison the view or enter its revision.
+    pub fn materialize_scope(
+        &self,
+        scope: Id,
+        allowed_signers: &HashSet<VerifyingKey>,
+    ) -> Result<CollectionView> {
+        let resolved = resolve_reader_scope(&self.reader, &self.records, scope, allowed_signers)?;
+        let facts = simplearchive_union::materialize(
+            resolved.resolution.semantics(),
+            &resolved.definition,
+            &self.reader,
+        )
+        .context("materialize collection physical cover")?;
+        let admitted = resolved.resolution.admitted_claims();
+        let mut commits: Vec<_> = self
+            .records
+            .commits()
+            .iter()
+            .filter(|commit| {
+                resolved.authorized_target_commits.contains(&commit.id())
+                    && admitted.contains(&commit.id())
+            })
+            .cloned()
+            .collect();
+        commits.sort_unstable_by_key(CollectionCommit::id);
+        let revision = collection_revision(resolved.definition.id(), allowed_signers, &commits);
+
+        Ok(CollectionView {
+            facts,
+            reader: self.reader.clone(),
+            commits,
+            revision,
+        })
+    }
+}
+
 /// Publish one self-contained content fragment and metadata fragment.
 ///
 /// The signer must already exist. The publication is a signed root in
@@ -186,32 +298,16 @@ pub fn publish_fragment(
 /// invalid element makes the view incomplete. Malformed discovery diagnostics,
 /// unauthorized commits, and pending/rejected unsigned merge/derive noise do
 /// not globally poison an otherwise complete target view.
+///
+/// This convenience opens a fresh [`CollectionSnapshot`] per call. Readers
+/// requiring a coherent multi-scope view must open one snapshot themselves and
+/// reuse [`CollectionSnapshot::materialize_scope`].
 pub fn materialize_scope(
     pile_path: &Path,
     scope: Id,
     allowed_signers: &HashSet<VerifyingKey>,
 ) -> Result<CollectionView> {
-    let mut pile = open_pile_strict(pile_path)?;
-    let result = (|| {
-        let reader = pile.reader().context("snapshot pile for collection read")?;
-        let facts = materialize_reader_scope(&reader, scope, allowed_signers)?;
-        Ok(CollectionView { facts, reader })
-    })();
-    finish_pile(pile, result)
-}
-
-fn materialize_reader_scope(
-    reader: &PileReader,
-    scope: Id,
-    allowed_signers: &HashSet<VerifyingKey>,
-) -> Result<TribleSet> {
-    let resolved = resolve_reader_scope(reader, scope, allowed_signers)?;
-    simplearchive_union::materialize(
-        resolved.resolution.semantics(),
-        &resolved.definition,
-        reader,
-    )
-    .context("materialize collection physical cover")
+    CollectionSnapshot::open(pile_path)?.materialize_scope(scope, allowed_signers)
 }
 
 /// Plan conservative roots for every union collection owned by authorized keys.
@@ -259,14 +355,14 @@ pub fn plan_authorized_union_retention(
 /// signer or mutating the pile.
 ///
 /// A missing branch returns `None`; a present empty branch returns an empty
-/// [`CollectionView`]. Duplicate names are rejected. Present branch heads,
+/// [`LegacyBranchView`]. Duplicate names are rejected. Present branch heads,
 /// authored commits, and contentless merge nodes are verified before their
 /// content facts are returned. Schema-typed attachment reads remain the
 /// caller's responsibility through the snapshot-owned `reader`.
 pub fn materialize_named_legacy_branch(
     pile_path: &Path,
     legacy_branch_name: &str,
-) -> Result<Option<CollectionView>> {
+) -> Result<Option<LegacyBranchView>> {
     let mut pile = open_pile_strict(pile_path)?;
     let snapshot = named_legacy_branch_snapshot(&mut pile, legacy_branch_name, None);
     let Some((branch_id, pin_metadata, reader)) = finish_pile(pile, snapshot)? else {
@@ -322,7 +418,7 @@ pub fn materialize_named_legacy_branch(
         facts += content_facts;
     }
 
-    Ok(Some(CollectionView { facts, reader }))
+    Ok(Some(LegacyBranchView { facts, reader }))
 }
 
 /// Outcome of publishing one named legacy repository branch into a union scope.
@@ -379,10 +475,7 @@ pub fn migrate_legacy_simplearchive_branch(
         &validate_payloads,
     )?;
 
-    let CollectionView {
-        facts: mut expected,
-        reader: _,
-    } = materialize_scope(pile_path, target_scope, &allowed)?;
+    let mut expected = materialize_scope(pile_path, target_scope, &allowed)?.facts;
     expected += plan.facts.clone();
 
     // Validate every collection already owned by this signer before adding a
@@ -886,18 +979,51 @@ fn verify_resident_collection_closure(
     Ok(())
 }
 
+const COLLECTION_REVISION_CONTEXT: &str = "triblespace.faculties.collection-snapshot.revision.v1";
+
+fn collection_revision(
+    definition_id: Id,
+    allowed_signers: &HashSet<VerifyingKey>,
+    commits: &[CollectionCommit],
+) -> CollectionRevision {
+    let mut roster: Vec<[u8; 32]> = allowed_signers.iter().map(VerifyingKey::to_bytes).collect();
+    roster.sort_unstable();
+    roster.dedup();
+    let mut commit_ids: Vec<Id> = commits.iter().map(CollectionCommit::id).collect();
+    commit_ids.sort_unstable();
+    commit_ids.dedup();
+    let roster_len = u64::try_from(roster.len()).expect("authorization roster fits u64");
+    let commit_count = u64::try_from(commit_ids.len()).expect("commit roster fits u64");
+
+    let mut hasher = blake3::Hasher::new_derive_key(COLLECTION_REVISION_CONTEXT);
+    hasher.update(b"definition-id\0");
+    hasher.update(&definition_id.raw());
+    hasher.update(b"authorization-roster\0");
+    hasher.update(&roster_len.to_be_bytes());
+    for public_key in roster {
+        hasher.update(&public_key);
+    }
+    hasher.update(b"admitted-commit-ids\0");
+    hasher.update(&commit_count.to_be_bytes());
+    for commit_id in commit_ids {
+        hasher.update(&commit_id.raw());
+    }
+    CollectionRevision(*hasher.finalize().as_bytes())
+}
+
 struct ResolvedScope {
     definition: CollectionDefinition,
     resolution: CollectionResolution<String>,
+    authorized_target_commits: BTreeSet<Id>,
 }
 
 fn resolve_reader_scope(
     reader: &PileReader,
+    records: &DiscoveredCollectionRecords,
     scope: Id,
     allowed_signers: &HashSet<VerifyingKey>,
 ) -> Result<ResolvedScope> {
     let definition = simplearchive_union::definition(scope);
-    let records = discover_collection_records(reader).context("discover collection records")?;
 
     // Discovery already established strict self-signatures. Authorization is
     // a separate exact byte comparison against caller-supplied keys.
@@ -912,7 +1038,7 @@ fn resolve_reader_scope(
         .collect();
 
     let resolution: CollectionResolution<String> =
-        resolve_collection_semantics(&records, &authorized_target_commits, |request| {
+        resolve_collection_semantics(records, &authorized_target_commits, |request| {
             validate_scope_request(reader, definition.id(), &authorized_target_commits, request)
         })
         .map_err(|error| anyhow!("resolve collection semantics: {error}"))?;
@@ -925,6 +1051,7 @@ fn resolve_reader_scope(
     Ok(ResolvedScope {
         definition,
         resolution,
+        authorized_target_commits,
     })
 }
 
@@ -1792,6 +1919,224 @@ mod tests {
     }
 
     #[test]
+    fn one_snapshot_materializes_two_scopes_with_independent_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let first_path = directory.path().join("first.key");
+        let second_path = directory.path().join("second.key");
+        let first = initialize_signer(&pile, Some(&first_path)).unwrap();
+        let second = initialize_signer(&pile, Some(&second_path)).unwrap();
+        let first_scope = id(1);
+        let second_scope = id(2);
+
+        let first_author = entity! { metadata::tag: &id(20) };
+        let second_author = entity! { metadata::tag: &id(21) };
+        let other_scope = entity! { metadata::tag: &id(22) };
+        let expected_first_only = first_author.facts().clone();
+        let mut expected_union = expected_first_only.clone();
+        expected_union += second_author.facts().clone();
+        let expected_other = other_scope.facts().clone();
+        let first_commit = publish_fragment(
+            &pile,
+            Some(&first_path),
+            first_scope,
+            first_author,
+            Fragment::empty(),
+        )
+        .unwrap();
+        let second_commit = publish_fragment(
+            &pile,
+            Some(&second_path),
+            first_scope,
+            second_author,
+            Fragment::empty(),
+        )
+        .unwrap();
+        let other_commit = publish_fragment(
+            &pile,
+            Some(&first_path),
+            second_scope,
+            other_scope,
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let snapshot = CollectionSnapshot::open(&pile).unwrap();
+        let both = HashSet::from([first.verifying_key(), second.verifying_key()]);
+        let union = snapshot.materialize_scope(first_scope, &both).unwrap();
+        let first_only = snapshot
+            .materialize_scope(first_scope, &allowed(&first))
+            .unwrap();
+        let other = snapshot
+            .materialize_scope(second_scope, &allowed(&first))
+            .unwrap();
+
+        assert_eq!(union.facts, expected_union);
+        assert_eq!(first_only.facts, expected_first_only);
+        assert_eq!(other.facts, expected_other);
+        let mut expected_ids = vec![first_commit.id(), second_commit.id()];
+        expected_ids.sort_unstable();
+        assert_eq!(
+            union
+                .commits
+                .iter()
+                .map(CollectionCommit::id)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(first_only.commits, vec![first_commit]);
+        assert_eq!(other.commits, vec![other_commit]);
+        assert_ne!(union.revision, first_only.revision);
+        assert_ne!(first_only.revision, other.revision);
+
+        let mut reversed = union.commits.clone();
+        reversed.reverse();
+        assert_eq!(
+            union.revision,
+            collection_revision(
+                simplearchive_union::definition(first_scope).id(),
+                &both,
+                &reversed,
+            )
+        );
+    }
+
+    #[test]
+    fn revision_tracks_roster_and_same_facts_metadata_only_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let first_path = directory.path().join("first.key");
+        let second_path = directory.path().join("second.key");
+        let first = initialize_signer(&pile, Some(&first_path)).unwrap();
+        let second = initialize_signer(&pile, Some(&second_path)).unwrap();
+        let scope = id(3);
+        let kind = id(23);
+        let content = entity! { metadata::tag: &kind };
+        let expected = content.facts().clone();
+        let first_commit = publish_fragment(
+            &pile,
+            Some(&first_path),
+            scope,
+            content,
+            entity! { metadata::description: "first metadata" },
+        )
+        .unwrap();
+
+        let old_snapshot = CollectionSnapshot::open(&pile).unwrap();
+        let first_roster = allowed(&first);
+        let expanded_roster = HashSet::from([first.verifying_key(), second.verifying_key()]);
+        let old = old_snapshot
+            .materialize_scope(scope, &first_roster)
+            .unwrap();
+        let roster_changed = old_snapshot
+            .materialize_scope(scope, &expanded_roster)
+            .unwrap();
+        assert_eq!(old.facts, roster_changed.facts);
+        assert_eq!(old.commits, roster_changed.commits);
+        assert_ne!(old.revision, roster_changed.revision);
+
+        let second_commit = publish_fragment(
+            &pile,
+            Some(&first_path),
+            scope,
+            entity! { metadata::tag: &kind },
+            entity! { metadata::description: "second metadata" },
+        )
+        .unwrap();
+        assert_ne!(first_commit.id(), second_commit.id());
+
+        let old_again = old_snapshot
+            .materialize_scope(scope, &first_roster)
+            .unwrap();
+        assert_eq!(old_again.facts, expected);
+        assert_eq!(old_again.commits, vec![first_commit]);
+        assert_eq!(old_again.revision, old.revision);
+
+        let new_snapshot = CollectionSnapshot::open(&pile).unwrap();
+        let new = new_snapshot
+            .materialize_scope(scope, &first_roster)
+            .unwrap();
+        assert_eq!(new.facts, expected);
+        assert_eq!(new.commits.len(), 2);
+        assert_ne!(new.revision, old.revision);
+    }
+
+    #[test]
+    fn revision_ignores_unauthorized_commits_and_unsigned_noise() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let first_path = directory.path().join("first.key");
+        let second_path = directory.path().join("second.key");
+        let first = initialize_signer(&pile, Some(&first_path)).unwrap();
+        initialize_signer(&pile, Some(&second_path)).unwrap();
+        let scope = id(4);
+        let accepted = entity! { metadata::tag: &id(24) };
+        let expected = accepted.facts().clone();
+        publish_fragment(&pile, Some(&first_path), scope, accepted, Fragment::empty()).unwrap();
+        let roster = allowed(&first);
+        let before = CollectionSnapshot::open(&pile)
+            .unwrap()
+            .materialize_scope(scope, &roster)
+            .unwrap();
+
+        publish_fragment(
+            &pile,
+            Some(&second_path),
+            scope,
+            entity! { metadata::tag: &id(25) },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let definition = simplearchive_union::definition(scope);
+        let pending = CollectionMerge::new(
+            definition.id(),
+            Inline::new([0xA1; 32]),
+            Inline::new([0xA2; 32]),
+            Inline::new([0xA3; 32]),
+        );
+        let mut pile_store = open_pile_strict(&pile).unwrap();
+        pile_store
+            .put::<SimpleArchive, _>(CollectionMerge::to_blob(&pending))
+            .unwrap();
+        pile_store.flush().unwrap();
+        pile_store.close().unwrap();
+
+        let after = CollectionSnapshot::open(&pile)
+            .unwrap()
+            .materialize_scope(scope, &roster)
+            .unwrap();
+        assert_eq!(after.facts, expected);
+        assert_eq!(after.commits, before.commits);
+        assert_eq!(after.revision, before.revision);
+    }
+
+    #[test]
+    fn collection_revision_v1_transcript_is_stable() {
+        let first = SigningKey::from_bytes(&[0x51; 32]);
+        let second = SigningKey::from_bytes(&[0x52; 32]);
+        let definition_id = id(5);
+        let first_commit = CollectionCommit::sign(
+            &first,
+            definition_id,
+            Inline::new([0x61; 32]),
+            Inline::new([0x71; 32]),
+        );
+        let second_commit = CollectionCommit::sign(
+            &second,
+            definition_id,
+            Inline::new([0x62; 32]),
+            Inline::new([0x72; 32]),
+        );
+        let roster = HashSet::from([second.verifying_key(), first.verifying_key()]);
+        let revision = collection_revision(definition_id, &roster, &[second_commit, first_commit]);
+
+        assert_eq!(
+            hex::encode_upper(revision.as_bytes()),
+            "7C701F2FC9FF707C1A8D384F4D4D1730AE03476F56147597FA8CC1C5AABE3947"
+        );
+    }
+
+    #[test]
     fn writer_publishes_multiple_commits_before_explicit_close() {
         let directory = tempfile::tempdir().unwrap();
         let pile = fresh_pile(&directory);
@@ -1854,9 +2199,15 @@ mod tests {
         pile.flush().unwrap();
         pile.close().unwrap();
 
-        let error = materialize_scope(&pile_path, id(1), &allowed(&signer)).unwrap_err();
+        let snapshot = CollectionSnapshot::open(&pile_path).unwrap();
+        let error = snapshot
+            .materialize_scope(id(1), &allowed(&signer))
+            .unwrap_err();
         assert!(format!("{error:#}").contains("authorized collection commit"));
         assert!(format!("{error:#}").contains("incomplete"));
+        let convenience_error =
+            materialize_scope(&pile_path, id(1), &allowed(&signer)).unwrap_err();
+        assert!(format!("{convenience_error:#}").contains("incomplete"));
     }
 
     #[test]
@@ -1970,21 +2321,38 @@ mod tests {
     }
 
     #[test]
-    fn read_does_not_create_a_missing_signing_key() {
+    fn snapshot_reads_leave_the_pile_and_missing_key_untouched() {
         let directory = tempfile::tempdir().unwrap();
         let pile = fresh_pile(&directory);
+        let missing_key = directory.path().join("missing.key");
+        let length = std::fs::metadata(&pile).unwrap().len();
         let before: BTreeSet<_> = std::fs::read_dir(directory.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
 
-        let view = materialize_scope(&pile, id(1), &HashSet::new()).unwrap();
-        assert!(view.facts.is_empty());
+        let snapshot = CollectionSnapshot::open(&pile).unwrap();
+        assert!(snapshot
+            .materialize_scope(id(1), &HashSet::new())
+            .unwrap()
+            .facts
+            .is_empty());
+        assert!(snapshot
+            .materialize_scope(id(2), &HashSet::new())
+            .unwrap()
+            .facts
+            .is_empty());
+        assert!(materialize_scope(&pile, id(1), &HashSet::new())
+            .unwrap()
+            .facts
+            .is_empty());
         let after: BTreeSet<_> = std::fs::read_dir(directory.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(after, before);
+        assert!(!missing_key.exists());
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
     }
 
     #[test]
