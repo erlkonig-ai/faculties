@@ -12,19 +12,26 @@
 //! provenance are deliberately not accepted here. Callers attach those facts
 //! to imports or source-specific occurrence entities instead.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 use triblespace::core::metadata;
-use triblespace::core::repo::{BlobStore, Workspace};
+use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::{BlobStore, BlobStoreGet, Workspace};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
+use triblespace_search::schemas::Embedding;
 
-use crate::schemas::files::{file, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_MEDIA_TYPE};
+use crate::schemas::embeddings;
+use crate::schemas::files::{
+    file, page, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_MEDIA_TYPE, KIND_PAGE,
+};
 
 pub type ContentHandle = Inline<Handle<RawBytes>>;
 pub type NameHandle = Inline<Handle<LongString>>;
+pub type EmbeddingHandle = Inline<Handle<Embedding>>;
+pub type Mm7bHandle = Inline<Handle<embeddings::Embedding3584>>;
 pub const DEFAULT_MEDIA_TYPE: &str = "application/octet-stream";
 
 /// The two canonical targets carried by a `files:` reference token.
@@ -296,22 +303,68 @@ pub fn normalize_media_type_or_default(media_type: &str) -> String {
 /// The join deliberately verifies the target's kind as well as following the
 /// relation. A dangling or wrongly-typed target is not a valid media type.
 pub fn media_type_name_handle(space: &TribleSet, file_id: Id) -> Option<NameHandle> {
-    find!(
-        (name: NameHandle),
-        pattern!(space, [
-            { file_id @ file::media_type: _?media_type },
-            { _?media_type @ metadata::tag: &KIND_MEDIA_TYPE, metadata::name: ?name }
-        ])
-    )
-    .next()
-    .map(|(name,)| name)
+    media_type_name_handle_strict(space, file_id).ok().flatten()
 }
 
-/// Stage a file's blobs in `workspace` and return its canonical fragment.
+/// Strict variant of [`media_type_name_handle`].
 ///
-/// `name` is a leaf name supplied by the caller, not a filesystem path. The
-/// workspace remains responsible for commit composition and push ordering, so
-/// faculties can include this fragment in larger cross-branch operations.
+/// A file may name exactly one media-type entity and that entity may carry
+/// exactly one canonical name. Ambiguity is corruption, not an arbitrary
+/// iterator-order choice.
+pub fn media_type_name_handle_strict(space: &TribleSet, file_id: Id) -> Result<Option<NameHandle>> {
+    let values: BTreeSet<(Id, NameHandle)> = find!(
+        (media_type: Id, name: NameHandle),
+        pattern!(space, [
+            { file_id @ file::media_type: ?media_type },
+            { ?media_type @ metadata::tag: &KIND_MEDIA_TYPE, metadata::name: ?name }
+        ])
+    )
+    .collect();
+    one(values, "file media type").map(|value| value.map(|(_, name)| name))
+}
+
+fn file_record(content: ContentHandle, name: NameHandle, media_type_name: NameHandle) -> Fragment {
+    let media_type = entity! {
+        metadata::tag: &KIND_MEDIA_TYPE,
+        metadata::name: media_type_name,
+    };
+
+    // Spreading the child fragment consumes its exported id into the relation
+    // while folding its facts into the returned fragment. The file remains the
+    // fragment's sole exported root.
+    entity! {
+        metadata::tag: &KIND_FILE,
+        file::content: content,
+        file::name: name,
+        file::media_type*: media_type,
+    }
+}
+
+/// Construct one self-contained canonical file fragment.
+///
+/// This is the collection-native constructor: the returned [`Fragment`] owns
+/// every referenced blob and can be published directly as part of a signed
+/// collection COMMIT. File identity remains exactly kind + content + leaf name
+/// + intrinsic media-type entity; no source path, containing directory, clock,
+/// tag, or embedding participates.
+pub fn fragment<T>(bytes: T, name: impl Into<String>, media_type: &str) -> Result<Fragment>
+where
+    T: triblespace::core::blob::IntoBlob<RawBytes>,
+{
+    let media_type = normalize_media_type(media_type)?;
+    let mut fragment = Fragment::empty();
+    let content = fragment.put::<RawBytes, _>(bytes);
+    let name = fragment.put::<LongString, _>(leaf_name(&name.into()));
+    let media_type_name = fragment.put::<LongString, _>(media_type);
+    fragment += file_record(content, name, media_type_name);
+    Ok(fragment)
+}
+
+/// Stage a file's blobs in a legacy repository workspace and return its facts.
+///
+/// New collection-native producers should use [`fragment`]. This adapter stays
+/// while the coordinated faculty cutover is prepared because Mail, Teams, and
+/// Discord still compose file facts into legacy multi-branch transactions.
 pub fn stage<Blobs, T>(
     workspace: &mut Workspace<Blobs>,
     bytes: T,
@@ -326,20 +379,505 @@ where
     let content = workspace.put::<RawBytes, _>(bytes);
     let name = workspace.put::<LongString, _>(leaf_name(&name.into()));
     let media_type_name = workspace.put::<LongString, _>(media_type);
-    let media_type = entity! {
-        metadata::tag: &KIND_MEDIA_TYPE,
-        metadata::name: media_type_name,
-    };
+    Ok(file_record(content, name, media_type_name))
+}
 
-    // Spreading the child fragment consumes its exported id into the relation
-    // while folding its facts into the returned fragment. The file remains the
-    // fragment's sole exported root.
-    Ok(entity! {
-        metadata::tag: &KIND_FILE,
-        file::content: content,
-        file::name: name,
-        file::media_type*: media_type,
+/// The result of wrapping one immutable file/directory tree in an import
+/// occurrence. `root_id` identifies the path-independent Merkle value;
+/// `import_id` identifies this source-path/time observation.
+#[derive(Debug)]
+pub struct ImportedTree {
+    pub fragment: Fragment,
+    pub root_id: Id,
+    pub import_id: Id,
+}
+
+/// Construct an intrinsic directory value from its leaf name and child roots.
+///
+/// `children` is spread into the directory so all descendant facts and blobs
+/// remain self-contained. Child order and duplicates are ignored by `entity!`;
+/// empty directories remain valid values carrying just kind + name.
+pub fn directory_fragment(name: impl Into<String>, children: Fragment) -> Fragment {
+    entity! {
+        metadata::tag: &KIND_DIRECTORY,
+        file::name: leaf_name(&name.into()),
+        file::children*: children,
+    }
+}
+
+/// Wrap one immutable tree in an immutable import-occurrence record.
+///
+/// The import identity is derived from root, source path, and import time.
+/// Tags are additive annotations on that identity and deliberately do not
+/// affect it. The source path belongs only to the import; it never leaks into
+/// file or directory identities.
+pub fn import_fragment(
+    tree: Fragment,
+    source_path: impl Into<String>,
+    imported_at: Inline<inlineencodings::NsTAIInterval>,
+    tags: impl IntoIterator<Item = String>,
+) -> Result<ImportedTree> {
+    let root_id = tree
+        .root()
+        .ok_or_else(|| anyhow!("file tree must export exactly one root"))?;
+    let import = entity! {
+        metadata::tag: &KIND_IMPORT,
+        file::root: &root_id,
+        file::imported_at: imported_at,
+        file::source_path: source_path.into(),
+    };
+    let import_id = import
+        .root()
+        .ok_or_else(|| anyhow!("import record must export exactly one root"))?;
+    let mut fragment = tree;
+    fragment += import;
+    for tag in tags {
+        fragment += entity! { ExclusiveId::force_ref(&import_id) @ file::tag: tag };
+    }
+    Ok(ImportedTree {
+        fragment,
+        root_id,
+        import_id,
     })
+}
+
+/// Stable identity of one rasterized page within a file.
+///
+/// The embedding is deliberately exhaust: identity is only parent file +
+/// 1-based page label. A different model/recipe must therefore use a distinct
+/// derived collection rather than append a second value to this record.
+pub fn page_id(parent: Id, index: &str) -> Id {
+    entity! { _ @
+        page::parent: parent,
+        page::index: index,
+    }
+    .root()
+    .expect("page identity fields derive one root")
+}
+
+/// Construct one self-contained page record with its canonical 3584-d vector.
+pub fn page_fragment(parent: Id, index: impl Into<String>, vector: Vec<f32>) -> Fragment {
+    let index = index.into();
+    let id = page_id(parent, &index);
+    let mut fragment = Fragment::empty();
+    let embedding: Mm7bHandle = fragment.put::<embeddings::Embedding3584, _>(vector);
+    fragment += entity! { ExclusiveId::force_ref(&id) @
+        metadata::tag: &KIND_PAGE,
+        page::parent: parent,
+        page::index: index,
+        embeddings::attr_mm7b::embedding: embedding,
+    };
+    fragment
+}
+
+/// The mutually exclusive canonical record kinds understood by Files.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileEntityKind {
+    File,
+    Directory,
+    Import,
+    Page,
+    MediaType,
+}
+
+fn one<T: Ord>(mut values: BTreeSet<T>, field: &str) -> Result<Option<T>> {
+    match values.len() {
+        0 => Ok(None),
+        1 => Ok(values.pop_first()),
+        count => bail!("{field} is ambiguous ({count} distinct values)"),
+    }
+}
+
+fn one_required<T: Ord>(values: BTreeSet<T>, field: &str) -> Result<T> {
+    one(values, field)?.ok_or_else(|| anyhow!("missing {field}"))
+}
+
+/// Classify a Files entity without relying on query iteration order.
+pub fn entity_kind(space: &TribleSet, id: Id) -> Result<Option<FileEntityKind>> {
+    let candidates = [
+        (KIND_FILE, FileEntityKind::File),
+        (KIND_DIRECTORY, FileEntityKind::Directory),
+        (KIND_IMPORT, FileEntityKind::Import),
+        (KIND_PAGE, FileEntityKind::Page),
+        (KIND_MEDIA_TYPE, FileEntityKind::MediaType),
+    ];
+    let kinds: Vec<_> = candidates
+        .into_iter()
+        .filter_map(|(tag, kind)| {
+            exists!(pattern!(space, [{ id @ metadata::tag: &tag }])).then_some(kind)
+        })
+        .collect();
+    match kinds.as_slice() {
+        [] => Ok(None),
+        [kind] => Ok(Some(*kind)),
+        _ => bail!("files entity {id:x} has multiple canonical kinds"),
+    }
+}
+
+pub fn content_handle(space: &TribleSet, id: Id) -> Result<Option<ContentHandle>> {
+    one(
+        find!(
+            content: ContentHandle,
+            pattern!(space, [{ id @ file::content: ?content }])
+        )
+        .collect(),
+        "file content",
+    )
+}
+
+pub fn name_handle(space: &TribleSet, id: Id) -> Result<Option<NameHandle>> {
+    one(
+        find!(
+            name: NameHandle,
+            pattern!(space, [{ id @ file::name: ?name }])
+        )
+        .collect(),
+        "file name",
+    )
+}
+
+pub fn import_root(space: &TribleSet, id: Id) -> Result<Option<Id>> {
+    one(
+        find!(root: Id, pattern!(space, [{ id @ file::root: ?root }])).collect(),
+        "import root",
+    )
+}
+
+pub fn imported_at(
+    space: &TribleSet,
+    id: Id,
+) -> Result<Option<Inline<inlineencodings::NsTAIInterval>>> {
+    one(
+        find!(
+            imported_at: Inline<inlineencodings::NsTAIInterval>,
+            pattern!(space, [{ id @ file::imported_at: ?imported_at }])
+        )
+        .collect(),
+        "imported-at time",
+    )
+}
+
+pub fn source_path_handle(space: &TribleSet, id: Id) -> Result<Option<NameHandle>> {
+    one(
+        find!(
+            source: NameHandle,
+            pattern!(space, [{ id @ file::source_path: ?source }])
+        )
+        .collect(),
+        "import source path",
+    )
+}
+
+pub fn embedding_handle(space: &TribleSet, id: Id) -> Result<Option<EmbeddingHandle>> {
+    one(
+        find!(
+            embedding: EmbeddingHandle,
+            pattern!(space, [{ id @ file::embedding: ?embedding }])
+        )
+        .collect(),
+        "file CLIP embedding",
+    )
+}
+
+pub fn mm7b_embedding_handle(space: &TribleSet, id: Id) -> Result<Option<Mm7bHandle>> {
+    one(
+        find!(
+            embedding: Mm7bHandle,
+            pattern!(space, [{ id @ embeddings::attr_mm7b::embedding: ?embedding }])
+        )
+        .collect(),
+        "Files 3584-d embedding",
+    )
+}
+
+pub fn children(space: &TribleSet, id: Id) -> Vec<Id> {
+    find!(child: Id, pattern!(space, [{ id @ file::children: ?child }]))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub fn tags(space: &TribleSet, id: Id) -> Vec<String> {
+    find!(tag: String, pattern!(space, [{ id @ file::tag: ?tag }]))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub fn page_origin(space: &TribleSet, id: Id) -> Result<Option<(Id, String)>> {
+    one(
+        find!(
+            (parent: Id, index: String),
+            pattern!(space, [{ id @ metadata::tag: &KIND_PAGE, page::parent: ?parent, page::index: ?index }])
+        )
+        .collect(),
+        "page origin",
+    )
+}
+
+fn read_long_string<B: BlobStoreGet>(blobs: &B, handle: NameHandle, field: &str) -> Result<String> {
+    let value: anybytes::View<str> = blobs
+        .get(handle)
+        .with_context(|| format!("read {field} blob {}", content_hash_hex_raw(handle.raw)))?;
+    Ok(value.as_ref().to_owned())
+}
+
+fn content_hash_hex_raw(raw: [u8; 32]) -> String {
+    hex::encode(raw)
+}
+
+pub fn read_name<B: BlobStoreGet>(space: &TribleSet, blobs: &B, id: Id) -> Result<Option<String>> {
+    name_handle(space, id)?
+        .map(|handle| read_long_string(blobs, handle, "file name"))
+        .transpose()
+}
+
+pub fn read_media_type<B: BlobStoreGet>(
+    space: &TribleSet,
+    blobs: &B,
+    id: Id,
+) -> Result<Option<String>> {
+    media_type_name_handle_strict(space, id)?
+        .map(|handle| read_long_string(blobs, handle, "media type name"))
+        .transpose()
+}
+
+pub fn read_source_path<B: BlobStoreGet>(
+    space: &TribleSet,
+    blobs: &B,
+    id: Id,
+) -> Result<Option<String>> {
+    source_path_handle(space, id)?
+        .map(|handle| read_long_string(blobs, handle, "import source path"))
+        .transpose()
+}
+
+/// Strictly read every directly named Files payload in `facts`.
+///
+/// The generic collection walker retains resident closure conservatively, but
+/// migration must additionally prove that every schema-known direct handle is
+/// present and decodes under its declared encoding before publication begins.
+pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+    for fact in facts {
+        if fact.a() == &file::content.id() {
+            let handle = *fact.v::<Handle<RawBytes>>();
+            let _: anybytes::Bytes = reader.get(handle).with_context(|| {
+                format!(
+                    "strictly read file content payload {}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        } else if fact.a() == &file::name.id()
+            || fact.a() == &file::source_path.id()
+            || fact.a() == &metadata::name.id()
+            || fact.a() == &metadata::description.id()
+        {
+            let handle = *fact.v::<Handle<LongString>>();
+            let _: anybytes::View<str> = reader.get(handle).with_context(|| {
+                format!(
+                    "strictly read Files text payload {}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        } else if fact.a() == &file::embedding.id() {
+            let handle = *fact.v::<Handle<Embedding>>();
+            let _: anybytes::View<[f32]> = reader.get(handle).with_context(|| {
+                format!(
+                    "strictly read Files CLIP embedding {}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        } else if fact.a() == &embeddings::attr::embedding.id() {
+            let handle = *fact.v::<Handle<embeddings::Embedding768>>();
+            let _: anybytes::View<[f32]> = reader.get(handle).with_context(|| {
+                format!(
+                    "strictly read Files 768-d embedding {}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        } else if fact.a() == &embeddings::attr_mm7b::embedding.id() {
+            let handle = *fact.v::<Handle<embeddings::Embedding3584>>();
+            let _: anybytes::View<[f32]> = reader.get(handle).with_context(|| {
+                format!(
+                    "strictly read Files 3584-d embedding {}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate the complete materialized Files catalog and every attachment.
+///
+/// Files records are immutable value objects plus additive annotations. Every
+/// field that the CLI treats as singular is required to be exactly one here;
+/// no command is allowed to select an arbitrary witness with `.next()`.
+pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+    validate_known_payloads(reader, facts)?;
+
+    let files: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &KIND_FILE }])
+    )
+    .collect();
+    let directories: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &KIND_DIRECTORY }])
+    )
+    .collect();
+    let imports: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &KIND_IMPORT }])
+    )
+    .collect();
+    let pages: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &KIND_PAGE }])
+    )
+    .collect();
+    let media_types: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &KIND_MEDIA_TYPE }])
+    )
+    .collect();
+
+    for id in files
+        .iter()
+        .chain(&directories)
+        .chain(&imports)
+        .chain(&pages)
+    {
+        entity_kind(facts, *id)?;
+    }
+
+    for id in &media_types {
+        entity_kind(facts, *id)?;
+        one_required(
+            find!(
+                name: NameHandle,
+                pattern!(facts, [{ *id @ metadata::name: ?name }])
+            )
+            .collect(),
+            "media type name",
+        )?;
+    }
+
+    for id in &files {
+        one_required(
+            find!(
+                content: ContentHandle,
+                pattern!(facts, [{ *id @ file::content: ?content }])
+            )
+            .collect(),
+            "file content",
+        )?;
+        one_required(
+            find!(
+                name: NameHandle,
+                pattern!(facts, [{ *id @ file::name: ?name }])
+            )
+            .collect(),
+            "file name",
+        )?;
+        let media_type = one_required(
+            find!(
+                media_type: Id,
+                pattern!(facts, [{ *id @ file::media_type: ?media_type }])
+            )
+            .collect(),
+            "file media type",
+        )?;
+        if !media_types.contains(&media_type) {
+            bail!("file {id:x} points to non-media-type entity {media_type:x}");
+        }
+        one(
+            find!(
+                embedding: EmbeddingHandle,
+                pattern!(facts, [{ *id @ file::embedding: ?embedding }])
+            )
+            .collect(),
+            "file CLIP embedding",
+        )?;
+        one(
+            find!(
+                embedding: Mm7bHandle,
+                pattern!(facts, [{ *id @ embeddings::attr_mm7b::embedding: ?embedding }])
+            )
+            .collect(),
+            "file 3584-d embedding",
+        )?;
+    }
+
+    for id in &directories {
+        one_required(
+            find!(
+                name: NameHandle,
+                pattern!(facts, [{ *id @ file::name: ?name }])
+            )
+            .collect(),
+            "directory name",
+        )?;
+        for child in children(facts, *id) {
+            if !files.contains(&child) && !directories.contains(&child) {
+                bail!("directory {id:x} has non-tree child {child:x}");
+            }
+        }
+    }
+
+    for id in &imports {
+        let root = one_required(
+            find!(root: Id, pattern!(facts, [{ *id @ file::root: ?root }])).collect(),
+            "import root",
+        )?;
+        if !files.contains(&root) && !directories.contains(&root) {
+            bail!("import {id:x} has non-tree root {root:x}");
+        }
+        one_required(
+            find!(
+                imported_at: Inline<inlineencodings::NsTAIInterval>,
+                pattern!(facts, [{ *id @ file::imported_at: ?imported_at }])
+            )
+            .collect(),
+            "imported-at time",
+        )?;
+        one_required(
+            find!(
+                source: NameHandle,
+                pattern!(facts, [{ *id @ file::source_path: ?source }])
+            )
+            .collect(),
+            "import source path",
+        )?;
+    }
+
+    for id in &pages {
+        let parent = one_required(
+            find!(parent: Id, pattern!(facts, [{ *id @ page::parent: ?parent }])).collect(),
+            "page parent",
+        )?;
+        if !files.contains(&parent) {
+            bail!("page {id:x} has non-file parent {parent:x}");
+        }
+        one_required(
+            find!(
+                index: String,
+                pattern!(facts, [{ *id @ page::index: ?index }])
+            )
+            .collect(),
+            "page index",
+        )?;
+        one_required(
+            find!(
+                embedding: Mm7bHandle,
+                pattern!(facts, [{ *id @ embeddings::attr_mm7b::embedding: ?embedding }])
+            )
+            .collect(),
+            "page 3584-d embedding",
+        )?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -607,6 +1145,81 @@ mod tests {
 
         assert_eq!(unix.root(), bare.root());
         assert_eq!(windows.root(), bare.root());
+    }
+
+    #[test]
+    fn directories_are_path_independent_merkle_values_including_empty_ones() {
+        let mut workspace = workspace();
+        let first = stage(
+            &mut workspace,
+            b"first".to_vec(),
+            "/tmp/one/first.txt",
+            "text/plain",
+        )
+        .unwrap();
+        let second = stage(
+            &mut workspace,
+            b"second".to_vec(),
+            r"C:\two\second.txt",
+            "text/plain",
+        )
+        .unwrap();
+
+        let forward = directory_fragment("/snapshot/root", first.clone() + second.clone());
+        let reverse = directory_fragment("root", second.clone() + first.clone());
+        assert_eq!(forward.root(), reverse.root());
+        assert_eq!(forward, reverse);
+
+        let changed_child = stage(
+            &mut workspace,
+            b"changed".to_vec(),
+            "second.txt",
+            "text/plain",
+        )
+        .unwrap();
+        let changed = directory_fragment("root", first + changed_child);
+        assert_ne!(forward.root(), changed.root());
+
+        let empty = directory_fragment("empty", Fragment::empty());
+        assert!(matches!(
+            entity_kind(empty.facts(), empty.root().unwrap()).unwrap(),
+            Some(FileEntityKind::Directory)
+        ));
+        assert!(children(empty.facts(), empty.root().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn imports_are_occurrence_snapshots_while_tags_are_annotations() {
+        let mut workspace = workspace();
+        let tree = stage(
+            &mut workspace,
+            b"snapshot".to_vec(),
+            "snapshot.txt",
+            "text/plain",
+        )
+        .unwrap();
+        let instant = hifitime::Epoch::from_unix_seconds(10.0);
+        let at: Inline<inlineencodings::NsTAIInterval> =
+            (instant, instant).try_to_inline().unwrap();
+        let first =
+            import_fragment(tree.clone(), "/one/snapshot.txt", at, ["alpha".to_owned()]).unwrap();
+        let retagged =
+            import_fragment(tree.clone(), "/one/snapshot.txt", at, ["beta".to_owned()]).unwrap();
+        let moved = import_fragment(tree, "/two/snapshot.txt", at, Vec::new()).unwrap();
+
+        assert_eq!(first.root_id, retagged.root_id);
+        assert_eq!(first.import_id, retagged.import_id);
+        assert_ne!(first.fragment, retagged.fragment);
+        assert_ne!(first.import_id, moved.import_id);
+    }
+
+    #[test]
+    fn page_identity_excludes_embedding_exhaust() {
+        let parent = Id::new([0x44; 16]).unwrap();
+        let first = page_fragment(parent, "1", vec![0.0; embeddings::DIM_3584]);
+        let second = page_fragment(parent, "1", vec![1.0; embeddings::DIM_3584]);
+        assert_eq!(first.root(), second.root());
+        assert_ne!(first, second);
     }
 
     #[test]
