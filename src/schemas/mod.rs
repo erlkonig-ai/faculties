@@ -1,6 +1,7 @@
 //! Faculty schemas: attribute IDs and kind markers per faculty.
 
 pub mod archive;
+pub mod atlas;
 pub mod body;
 pub mod cognition;
 pub mod compass;
