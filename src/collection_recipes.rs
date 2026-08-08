@@ -12,11 +12,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::encodings::simplearchive::UnarchiveError;
 use triblespace::core::blob::encodings::succinctarchive::{
-    merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
+    SuccinctArchiveBlob, SuccinctArchiveRawBuildError,
 };
-use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
+use triblespace::core::blob::{Blob, BlobEncoding};
 use triblespace::core::collection::simplearchive_union::{
     validate_commit, validate_merge, TRIBLE_SET_UNION_RECIPE_V1,
 };
@@ -388,9 +387,8 @@ pub(crate) fn succinctarchive_kind() -> CollectionKind {
 /// operations.
 pub fn derive_succinctarchive_union_element(
     source: Blob<SimpleArchive>,
-) -> std::result::Result<Blob<SuccinctArchiveBlob>, UnarchiveError> {
-    let archive = SuccinctArchive::<OrderedUniverse>::try_from_blob(source)?;
-    Ok(archive.to_blob())
+) -> std::result::Result<Blob<SuccinctArchiveBlob>, SuccinctArchiveRawBuildError> {
+    SuccinctArchiveBlob::build_from_simple_archive(&source)
 }
 
 #[cfg(test)]
@@ -514,15 +512,14 @@ fn validate_succinctarchive_merge(
     let Some(result) = load_blob::<SuccinctArchiveBlob>(reader, claim.result())? else {
         return Ok(ValidationVerdict::Pending);
     };
-    let low = match attach_succinctarchive(low, "succinct merge low input") {
-        Ok(archive) => archive,
-        Err(reason) => return Ok(ValidationVerdict::Rejected(reason)),
+    let expected = match SuccinctArchiveBlob::merge(&[low, high]) {
+        Ok(expected) => expected,
+        Err(error) => {
+            return Ok(ValidationVerdict::Rejected(format!(
+                "invalid canonical raw SuccinctArchive merge input: {error}"
+            )))
+        }
     };
-    let high = match attach_succinctarchive(high, "succinct merge high input") {
-        Ok(archive) => archive,
-        Err(reason) => return Ok(ValidationVerdict::Rejected(reason)),
-    };
-    let expected: Blob<SuccinctArchiveBlob> = merge_ordered_archives(&[low, high]).to_blob();
     Ok(if result.bytes == expected.bytes {
         ValidationVerdict::Accepted
     } else {
@@ -565,19 +562,6 @@ fn validate_simplearchive_to_succinct(
             "derive output is not the exact canonical projection of its source".to_owned(),
         )
     })
-}
-
-/// Attach a portable archive through TribleSpace's exact canonical gate.
-///
-/// The public attachment path independently reconstructs every prefix, change
-/// mask, and Ring rotation before it exposes a query runtime. Faculties only
-/// supplies the collection equation; it does not duplicate that byte proof.
-fn attach_succinctarchive(
-    blob: Blob<SuccinctArchiveBlob>,
-    role: &'static str,
-) -> std::result::Result<SuccinctArchive<OrderedUniverse>, String> {
-    SuccinctArchive::<OrderedUniverse>::try_from_blob(blob)
-        .map_err(|error| format!("invalid {role}: {error}"))
 }
 
 #[cfg(test)]

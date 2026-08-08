@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
   Shared constructors keep kind markers, paths, actors, and source labels as
   monotone nonidentity annotations, while binary facts reuse Files' intrinsic
   normalized media-type entities.
+- **Collection Succinct derivation and merge validation stay in the portable
+  carrier.** Faculties now calls TribleSpace's direct SimpleArchive-to-raw
+  builder and exact raw-blob MERGE proof, avoiding native query arenas and
+  detached Rank9 accelerators in maintenance and validation paths.
 - **Faculties can use the collection calculus without a compatibility model.**
   A narrow shared module opens piles without auto-repair, keeps durable signer
   initialization explicit, publishes self-contained fragments as signed
