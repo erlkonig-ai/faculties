@@ -1830,8 +1830,8 @@ fn parse_id_arg(raw: &str) -> std::result::Result<Id, String> {
     Id::from_hex(raw.trim()).ok_or_else(|| format!("invalid id '{raw}'"))
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
+fn now_epoch() -> Result<Epoch> {
+    Epoch::now().map_err(|error| anyhow!("read current time: {error:?}"))
 }
 
 fn point_interval(epoch: Epoch) -> IntervalValue {
@@ -2957,7 +2957,7 @@ fn cmd_scan(storage: PostureStorage<'_>, target: &Path, dry_run: bool) -> Result
         target,
         &files,
         &omissions,
-        point_interval(now_epoch()),
+        point_interval(now_epoch()?),
         occurrence,
     );
     storage.publish_scan(fragment, "posture complete scan")?;
