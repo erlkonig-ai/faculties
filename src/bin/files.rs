@@ -2411,8 +2411,7 @@ mod tests {
             (b"second".as_slice(), "second.txt"),
         ] {
             let mut workspace = repository.pull(branch).unwrap();
-            let file =
-                file_capability::stage(&mut workspace, bytes.to_vec(), name, "text/plain").unwrap();
+            let file = file_capability::fragment(bytes.to_vec(), name, "text/plain").unwrap();
             expected += file.clone();
             workspace.commit(file, &format!("add {name}"));
             repository.push(&mut workspace).unwrap();

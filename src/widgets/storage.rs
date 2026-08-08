@@ -20,6 +20,7 @@ use crate::collection_access::{
     self, CollectionRevision, CollectionView, LegacyBranchRevision, LegacyBranchView,
 };
 use crate::schemas::atlas::DEFAULT_SCOPE_ID as ATLAS_SCOPE_ID;
+use crate::schemas::cognition::DEFAULT_SCOPE_ID as COGNITION_SCOPE_ID;
 use crate::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
 use crate::schemas::decide::DEFAULT_SCOPE_ID as DECIDE_SCOPE_ID;
 use crate::schemas::discord::DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID;
@@ -204,6 +205,11 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         label: "Messages",
     },
     CollectionSource {
+        key: SourceKey::Reason,
+        scope: COGNITION_SCOPE_ID,
+        label: "Cognition",
+    },
+    CollectionSource {
         key: SourceKey::Relations,
         scope: RELATIONS_SCOPE_ID,
         label: "Relations",
@@ -235,10 +241,6 @@ const LEGACY_SOURCE_CATALOG: &[LegacySource] = &[
     LegacySource {
         key: SourceKey::Planner,
         branches: &["planner"],
-    },
-    LegacySource {
-        key: SourceKey::Reason,
-        branches: &["cognition"],
     },
     LegacySource {
         key: SourceKey::Triage,
@@ -484,35 +486,58 @@ fn load_collection_catalog(
     allowed: &HashSet<ed25519_dalek::VerifyingKey>,
 ) -> Result<BTreeMap<SourceKey, LoadedDataset>, String> {
     let mut by_scope: BTreeMap<Id, LoadedDataset> = BTreeMap::new();
-    let mut datasets = BTreeMap::new();
 
+    // Phase one freezes every distinct collection scope before any domain
+    // validation begins. Cross-collection validators therefore always see
+    // peers from this exact CollectionSnapshot, independent of catalog order.
     for source in COLLECTION_SOURCE_CATALOG {
-        let dataset = if let Some(dataset) = by_scope.get(&source.scope) {
-            dataset.clone()
-        } else {
+        if let std::collections::btree_map::Entry::Vacant(entry) = by_scope.entry(source.scope) {
             let view = snapshot
                 .materialize_scope(source.scope, allowed)
                 .map_err(|error| format!("materialize {} collection: {error:#}", source.label))?;
-            let dataset = LoadedDataset::from_collection(view);
-            by_scope.insert(source.scope, dataset.clone());
-            dataset
-        };
-        match source.key {
-            SourceKey::Compass => crate::compass::validate_catalog(&dataset.reader, &dataset.facts)
-                .map_err(|error| format!("validate Compass collection: {error:#}"))?,
-            SourceKey::Decide => {
-                crate::decide::validate_catalog(&dataset.reader, &dataset.facts)
-                    .map_err(|error| format!("validate Decide collection: {error:#}"))?
-            }
-            SourceKey::Headspace => {
-                crate::headspace::validate_catalog(&dataset.reader, &dataset.facts)
-                    .map_err(|error| format!("validate Headspace collection: {error:#}"))?
-            }
-            _ => {}
+            entry.insert(LoadedDataset::from_collection(view));
         }
-        datasets.insert(source.key, dataset);
     }
 
+    // Phase two validates the fully materialized map. Keep these calls at the
+    // shared domain boundaries: they are the same exact validators used by
+    // the faculty writers, not viewer-specific approximations.
+    let dataset = |scope: Id| {
+        by_scope
+            .get(&scope)
+            .expect("every catalog scope was materialized in phase one")
+    };
+    let compass = dataset(COMPASS_SCOPE_ID);
+    crate::compass::validate_catalog(&compass.reader, &compass.facts)
+        .map_err(|error| format!("validate Compass collection: {error:#}"))?;
+    let decide = dataset(DECIDE_SCOPE_ID);
+    crate::decide::validate_catalog(&decide.reader, &decide.facts)
+        .map_err(|error| format!("validate Decide collection: {error:#}"))?;
+    let files = dataset(FILES_SCOPE_ID);
+    crate::files::validate_catalog(&files.reader, &files.facts)
+        .map_err(|error| format!("validate Files collection: {error:#}"))?;
+    let headspace = dataset(HEADSPACE_SCOPE_ID);
+    crate::headspace::validate_catalog(&headspace.reader, &headspace.facts)
+        .map_err(|error| format!("validate Headspace collection: {error:#}"))?;
+    let relations = dataset(RELATIONS_SCOPE_ID);
+    crate::relations::validate_catalog(&relations.reader, &relations.facts)
+        .map_err(|error| format!("validate Relations collection: {error:#}"))?;
+    let messages = dataset(MESSAGES_SCOPE_ID);
+    crate::message::validate_catalog(&messages.reader, &messages.facts, &relations.facts)
+        .map_err(|error| format!("validate Messages collection: {error:#}"))?;
+
+    let datasets = COLLECTION_SOURCE_CATALOG
+        .iter()
+        .map(|source| {
+            (
+                source.key,
+                by_scope
+                    .get(&source.scope)
+                    .expect("validated catalog scope exists")
+                    .clone(),
+            )
+        })
+        .collect();
     Ok(datasets)
 }
 
@@ -931,18 +956,33 @@ mod tests {
     }
 
     #[test]
-    fn memory_fallback_is_private_to_the_legacy_catalog() {
+    fn reason_reads_the_cognition_collection_while_legacy_consumers_keep_the_branch() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fallback.pile");
         create_branch(&path, "cognition", "legacy cognition");
+        let marker = Id::new([0x76; 16]).unwrap();
+        collection_access::publish_fragment(
+            &path,
+            None,
+            COGNITION_SCOPE_ID,
+            entity! { metadata::tag: &marker },
+            Fragment::empty(),
+        )
+        .unwrap();
         let mut storage = StorageState::new(&path);
         let context = storage.context();
 
         let memory = context.dataset(SourceKey::Memory).unwrap();
         let reason = context.dataset(SourceKey::Reason).unwrap();
         let triage = context.dataset(SourceKey::Triage).unwrap();
-        assert_eq!(memory.revision, reason.revision);
         assert_eq!(memory.revision, triage.revision);
+        assert_ne!(memory.revision, reason.revision);
+        assert!(exists!(
+            pattern!(reason.facts, [{ metadata::tag: &marker }])
+        ));
+        assert!(!exists!(
+            pattern!(memory.facts, [{ metadata::tag: &marker }])
+        ));
         for key in [SourceKey::Archive, SourceKey::Planner, SourceKey::Wiki] {
             assert!(context.dataset(key).is_none());
         }
@@ -969,7 +1009,6 @@ mod tests {
                 SourceKey::Archive,
                 SourceKey::Memory,
                 SourceKey::Planner,
-                SourceKey::Reason,
                 SourceKey::Triage,
                 SourceKey::Wiki,
             ])
@@ -984,6 +1023,7 @@ mod tests {
                 SourceKey::Files,
                 SourceKey::Headspace,
                 SourceKey::Messages,
+                SourceKey::Reason,
                 SourceKey::Relations,
                 SourceKey::Status,
                 SourceKey::Teams,
@@ -1054,7 +1094,7 @@ mod tests {
             &path,
             None,
             FILES_SCOPE_ID,
-            entity! { metadata::tag: &Id::new([0x92; 16]).unwrap() },
+            crate::files::fragment(b"snapshot".to_vec(), "snapshot.txt", "text/plain").unwrap(),
             Fragment::empty(),
         )
         .unwrap();
@@ -1067,5 +1107,104 @@ mod tests {
         let current_catalog = load_collection_catalog(&current, &allowed).unwrap();
         assert!(!current_catalog[&SourceKey::Atlas].facts.is_empty());
         assert!(!current_catalog[&SourceKey::Files].facts.is_empty());
+    }
+
+    #[test]
+    fn messages_validate_against_relations_materialized_later_from_the_same_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cross-validated.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+
+        let sender = Id::new([0x93; 16]).unwrap();
+        let recipient = Id::new([0x94; 16]).unwrap();
+        let message = Id::new([0x95; 16]).unwrap();
+        let epoch = Epoch::from_unix_seconds(3.0);
+        let at: crate::message::IntervalValue = (epoch, epoch).try_to_inline().unwrap();
+        collection_access::publish_fragment(
+            &path,
+            None,
+            MESSAGES_SCOPE_ID,
+            crate::message::message_fragment(
+                message,
+                sender,
+                &crate::message::Recipient::Person(recipient),
+                "hello",
+                at,
+            ),
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let mut relations = crate::relations::person_fragment(
+            sender,
+            crate::relations::ProfileInput {
+                label: "Sender".to_owned(),
+                ..crate::relations::ProfileInput::default()
+            },
+        )
+        .unwrap()
+        .0;
+        relations += crate::relations::person_fragment(
+            recipient,
+            crate::relations::ProfileInput {
+                label: "Recipient".to_owned(),
+                ..crate::relations::ProfileInput::default()
+            },
+        )
+        .unwrap()
+        .0;
+        collection_access::publish_fragment(
+            &path,
+            None,
+            RELATIONS_SCOPE_ID,
+            relations,
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        // Messages precedes Relations in COLLECTION_SOURCE_CATALOG. A loader
+        // that validates while materializing would reject this valid catalog.
+        let signer = collection_access::load_signer(&path, None).unwrap();
+        let allowed = HashSet::from([signer.verifying_key()]);
+        let snapshot = collection_access::CollectionSnapshot::open(&path).unwrap();
+        let catalog = load_collection_catalog(&snapshot, &allowed).unwrap();
+        assert!(crate::message::row_by_id(&catalog[&SourceKey::Messages].facts, message).is_ok());
+        assert!(!catalog[&SourceKey::Relations].facts.is_empty());
+    }
+
+    #[test]
+    fn message_validation_rejects_a_recipient_absent_from_the_exact_relations_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cross-validation-rejects.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+
+        let sender = Id::new([0x96; 16]).unwrap();
+        let recipient = Id::new([0x97; 16]).unwrap();
+        let message = Id::new([0x98; 16]).unwrap();
+        let epoch = Epoch::from_unix_seconds(4.0);
+        let at: crate::message::IntervalValue = (epoch, epoch).try_to_inline().unwrap();
+        collection_access::publish_fragment(
+            &path,
+            None,
+            MESSAGES_SCOPE_ID,
+            crate::message::message_fragment(
+                message,
+                sender,
+                &crate::message::Recipient::Person(recipient),
+                "hello",
+                at,
+            ),
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let signer = collection_access::load_signer(&path, None).unwrap();
+        let allowed = HashSet::from([signer.verifying_key()]);
+        let snapshot = collection_access::CollectionSnapshot::open(&path).unwrap();
+        let error = load_collection_catalog(&snapshot, &allowed).unwrap_err();
+        assert!(error.contains("validate Messages collection"));
+        assert!(error.contains("sender"));
     }
 }
