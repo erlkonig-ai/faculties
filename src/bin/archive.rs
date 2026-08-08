@@ -2115,7 +2115,8 @@ fn run_search_standalone(
 
         // 2. Rank across the segment union (per-segment BM25; best score wins).
         let bm25_start = Instant::now();
-        let ranked = query_across(&segments, &hash_tokens(&text));
+        let ranked = query_across(&segments, &hash_tokens(&text))
+            .map_err(|error| anyhow!("query BM25 segment cover: {error}"))?;
         let total_docs: usize = segments.iter().map(|s| s.doc_count()).sum();
         tracing::info!(
             segment_documents = total_docs,

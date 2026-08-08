@@ -21,6 +21,26 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lib]
 path = "src/lib.rs"
 
+[[example]]
+name = "branch_timeline"
+required-features = ["widgets"]
+
+[[example]]
+name = "compass_board"
+required-features = ["widgets"]
+
+[[example]]
+name = "messages_panel"
+required-features = ["widgets"]
+
+[[example]]
+name = "pile_inspector"
+required-features = ["widgets"]
+
+[[example]]
+name = "wiki_viewer"
+required-features = ["widgets"]
+
 # GORBIE-backed viewer binary. Requires the `widgets` feature.
 [[bin]]
 name = "viewer"
