@@ -10,6 +10,7 @@ use faculties::collection_access::{self, CollectionSnapshot, CollectionView};
 use faculties::decide;
 use faculties::files;
 use faculties::mail::{self, AccountConfigInput, DraftInput, Head, SendAttemptInput};
+use faculties::mail_pop;
 use faculties::relations;
 use faculties::schemas::{
     decide as decide_schema, files as files_schema, mail as mail_schema,
@@ -855,8 +856,114 @@ fn cmd_search(storage: &Storage<'_>, query: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_fetch(_storage: &Storage<'_>) -> Result<()> {
-    bail!("the octet-safe UIDL/explicit-QUIT POP adapter is being integrated; fetch is intentionally unavailable rather than falling back to the lossy legacy client")
+fn fragment_is_materialized(facts: &TribleSet, fragment: &Fragment) -> bool {
+    fragment.facts().iter().all(|fact| facts.contains(fact))
+}
+
+fn publish_pop_publication_with<V, P>(
+    publication: &mail::SourcePublication,
+    scopes: Scopes,
+    mut materialize: V,
+    mut publish: P,
+) -> Result<()>
+where
+    V: FnMut() -> Result<Views>,
+    P: FnMut(Id, Fragment, &str) -> Result<()>,
+{
+    // First prove the prospective cross-scope state while both fragments and
+    // all of their attachment blobs are still available in memory.
+    let before = materialize()?;
+    let mut prospective_files = before.files.facts.clone();
+    prospective_files += publication.files.facts().clone();
+    mail::validate_catalog_union(
+        &before.mail.reader,
+        &before.mail.facts,
+        &publication.mail,
+        &prospective_files,
+        &before.decide.facts,
+        &before.relations.facts,
+    )?;
+
+    if !publication.files.facts().is_empty()
+        && !fragment_is_materialized(&before.files.facts, &publication.files)
+    {
+        publish(
+            scopes.files,
+            publication.files.clone(),
+            "mail: POP attachment evidence",
+        )?;
+    }
+
+    // A PileReader is an immutable snapshot. Reopen after Files so exact
+    // validation sees both its facts and newly appended attachment blobs.
+    let after_files = materialize()?;
+    if !fragment_is_materialized(&after_files.files.facts, &publication.files) {
+        bail!("published POP attachment evidence did not materialize");
+    }
+    mail::validate_catalog_union(
+        &after_files.mail.reader,
+        &after_files.mail.facts,
+        &publication.mail,
+        &after_files.files.facts,
+        &after_files.decide.facts,
+        &after_files.relations.facts,
+    )?;
+    if fragment_is_materialized(&after_files.mail.facts, &publication.mail) {
+        return Ok(());
+    }
+    publish(
+        scopes.mail,
+        publication.mail.clone(),
+        "mail: POP source evidence and parser projection",
+    )?;
+
+    // Only a fully rematerialized, exactly validated Mail observation lets
+    // drain_pop proceed to DELE.
+    let after_mail = materialize()?;
+    if !fragment_is_materialized(&after_mail.mail.facts, &publication.mail) {
+        bail!("published POP mail evidence did not materialize");
+    }
+    Ok(())
+}
+
+fn cmd_fetch(storage: &Storage<'_>) -> Result<()> {
+    let master = passphrase()?;
+    let views = storage.views()?;
+    let mut accounts = Vec::new();
+    for anchor in mail::account_anchors(&views.mail.facts) {
+        let account = mail::open_account(&views.mail.reader, &views.mail.facts, anchor, &master)
+            .with_context(|| format!("open POP account {anchor:x}"))?;
+        if account.enabled {
+            accounts.push(account);
+        }
+    }
+    drop(views);
+
+    for account in accounts {
+        let (host, port) = endpoint(&account.pop_endpoint, "POP")?;
+        let session =
+            mail_pop::connect_implicit_tls(host, port, &account.username, &account.password)
+                .with_context(|| format!("connect POP account {}", account.address))?;
+        let mut fetched = 0usize;
+        mail::drain_pop(session, account.anchor, |publication| {
+            publish_pop_publication_with(
+                publication,
+                storage.scopes,
+                || storage.views(),
+                |scope, fragment, description| storage.publish(scope, fragment, description),
+            )?;
+            fetched += 1;
+            Ok(())
+        })
+        .with_context(|| {
+            format!(
+                "drain POP account {}; a QUIT failure after DELE is an uncertain remote deletion transaction",
+                account.address
+            )
+        })?;
+        println!("{}: fetched {fetched} message(s)", account.address);
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -912,3 +1019,392 @@ fn main() -> Result<()> {
 // Short aliases keep declarative query clauses readable without recreating a
 // second ontology in the binary.
 use faculties::schemas::mail::{observation, projection};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::rc::Rc;
+
+    use faculties::schemas::mail::credential;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn scopes() -> Scopes {
+        Scopes {
+            mail: mail_schema::DEFAULT_SCOPE_ID,
+            files: files_schema::DEFAULT_SCOPE_ID,
+            decide: decide_schema::DEFAULT_SCOPE_ID,
+            relations: relations_schema::DEFAULT_SCOPE_ID,
+        }
+    }
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        pile: PathBuf,
+        key: PathBuf,
+        account: Id,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let pile = directory.path().join("mail-cli.pile");
+            let key = directory.path().join("mail-cli.key");
+            File::create(&pile).unwrap();
+            collection_access::initialize_signer(&pile, Some(&key)).unwrap();
+
+            let account = id(70);
+            let credential_id = id(71);
+            let mut fragment = Fragment::empty();
+            let box_handle: mail::BytesHandle = fragment.put(vec![0u8; 64]);
+            fragment += entity! {
+                ExclusiveId::force_ref(&credential_id) @
+                metadata::tag: &mail_schema::KIND_CREDENTIAL
+            };
+            fragment += entity! {
+                metadata::tag: &mail_schema::KIND_CREDENTIAL_ENVELOPE,
+                credential::of: &credential_id,
+                credential::r#box: box_handle,
+            };
+            fragment += mail::account_config_fragment(
+                account,
+                AccountConfigInput {
+                    address: "me@example.test".into(),
+                    display_name: "Me".into(),
+                    pop_endpoint: "pop.example.test:995".into(),
+                    smtp_endpoint: "smtp.example.test:465".into(),
+                    username: "me@example.test".into(),
+                    credential: credential_id,
+                    enabled: true,
+                    predecessors: Vec::new(),
+                },
+            )
+            .unwrap()
+            .0;
+            collection_access::publish_fragment(
+                &pile,
+                Some(&key),
+                mail_schema::DEFAULT_SCOPE_ID,
+                fragment,
+                Fragment::empty(),
+            )
+            .unwrap();
+
+            let fixture = Self {
+                _directory: directory,
+                pile,
+                key,
+                account,
+            };
+            fixture.storage().views().unwrap();
+            fixture
+        }
+
+        fn storage(&self) -> Storage<'_> {
+            Storage {
+                pile: &self.pile,
+                key: Some(&self.key),
+                scopes: scopes(),
+            }
+        }
+    }
+
+    fn raw(message_id: &str) -> Vec<u8> {
+        format!(
+            "From: Sender <sender@example.test>\r\nTo: me@example.test\r\nMessage-ID: <{message_id}>\r\nDate: Sat, 8 Aug 2026 00:00:01 +0000\r\nSubject: Hello\r\nContent-Type: multipart/mixed; boundary=test\r\n\r\n--test\r\nContent-Type: text/plain\r\n\r\nbody\r\n--test\r\nContent-Type: application/octet-stream; name=note.bin\r\nContent-Disposition: attachment; filename=note.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--test--\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[derive(Default)]
+    struct PopState {
+        events: Vec<String>,
+        marked: Vec<u32>,
+        committed: Vec<u32>,
+    }
+
+    struct FakePop {
+        state: Rc<RefCell<PopState>>,
+        items: Vec<mail::PopItem>,
+        messages: HashMap<u32, Vec<u8>>,
+        fail_dele: Option<u32>,
+        fail_quit: bool,
+        quit: bool,
+    }
+
+    impl Drop for FakePop {
+        fn drop(&mut self) {
+            if !self.quit {
+                self.state.borrow_mut().events.push("disconnect".into());
+            }
+        }
+    }
+
+    impl mail::PopTxn for FakePop {
+        fn enumerate_uidls(&mut self) -> Result<Vec<mail::PopItem>> {
+            self.state.borrow_mut().events.push("uidl".into());
+            Ok(self.items.clone())
+        }
+
+        fn retrieve_exact(&mut self, session_seq: u32) -> Result<Vec<u8>> {
+            self.state
+                .borrow_mut()
+                .events
+                .push(format!("retr:{session_seq}"));
+            self.messages
+                .get(&session_seq)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing scripted message {session_seq}"))
+        }
+
+        fn mark_delete(&mut self, session_seq: u32) -> Result<()> {
+            self.state
+                .borrow_mut()
+                .events
+                .push(format!("dele:{session_seq}"));
+            if self.fail_dele == Some(session_seq) {
+                bail!("scripted DELE rejection");
+            }
+            self.state.borrow_mut().marked.push(session_seq);
+            Ok(())
+        }
+
+        fn quit(mut self) -> Result<()> {
+            self.state.borrow_mut().events.push("quit".into());
+            if self.fail_quit {
+                bail!("scripted lost QUIT reply");
+            }
+            let marked = self.state.borrow().marked.clone();
+            self.state.borrow_mut().committed = marked;
+            self.quit = true;
+            Ok(())
+        }
+    }
+
+    fn fake_pop(state: Rc<RefCell<PopState>>, messages: Vec<(u32, &str, Vec<u8>)>) -> FakePop {
+        FakePop {
+            state,
+            items: messages
+                .iter()
+                .map(|(sequence, uidl, _)| mail::PopItem {
+                    session_seq: *sequence,
+                    uidl: (*uidl).to_owned(),
+                })
+                .collect(),
+            messages: messages
+                .into_iter()
+                .map(|(sequence, _, raw)| (sequence, raw))
+                .collect(),
+            fail_dele: None,
+            fail_quit: false,
+            quit: false,
+        }
+    }
+
+    fn publish_recording(
+        storage: &Storage<'_>,
+        state: &Rc<RefCell<PopState>>,
+        publication: &mail::SourcePublication,
+        fail_scope: Option<Id>,
+    ) -> Result<()> {
+        publish_pop_publication_with(
+            publication,
+            storage.scopes,
+            || storage.views(),
+            |scope, fragment, description| {
+                let label = if scope == storage.scopes.files {
+                    "files"
+                } else if scope == storage.scopes.mail {
+                    "mail"
+                } else {
+                    "unexpected-scope"
+                };
+                state.borrow_mut().events.push(label.into());
+                if fail_scope == Some(scope) {
+                    bail!("scripted {label} publication failure");
+                }
+                storage.publish(scope, fragment, description)
+            },
+        )
+    }
+
+    #[test]
+    fn pop_composition_is_files_then_mail_then_dele_then_quit() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let bytes = raw("ordered@example.test");
+        let expected = mail::pop_publication(fixture.account, "uid-1", &bytes).unwrap();
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let transaction = fake_pop(state.clone(), vec![(1, "uid-1", bytes)]);
+
+        mail::drain_pop(transaction, fixture.account, |publication| {
+            publish_recording(&storage, &state, publication, None)
+        })
+        .unwrap();
+
+        assert_eq!(
+            state.borrow().events,
+            ["uidl", "retr:1", "files", "mail", "dele:1", "quit"]
+        );
+        assert_eq!(state.borrow().committed, [1]);
+        let views = storage.views().unwrap();
+        assert!(fragment_is_materialized(
+            &views.files.facts,
+            &expected.files
+        ));
+        assert!(fragment_is_materialized(&views.mail.facts, &expected.mail));
+    }
+
+    #[test]
+    fn pop_publication_failures_prevent_dele_and_retry_reuses_durable_files() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let bytes = raw("files-fail@example.test");
+        let transaction = fake_pop(state.clone(), vec![(1, "uid-files", bytes)]);
+        assert!(
+            mail::drain_pop(transaction, fixture.account, |publication| {
+                publish_recording(&storage, &state, publication, Some(storage.scopes.files))
+            })
+            .is_err()
+        );
+        assert_eq!(
+            state.borrow().events,
+            ["uidl", "retr:1", "files", "disconnect"]
+        );
+
+        let bytes = raw("mail-fail@example.test");
+        let expected = mail::pop_publication(fixture.account, "uid-mail", &bytes).unwrap();
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let transaction = fake_pop(state.clone(), vec![(2, "uid-mail", bytes.clone())]);
+        assert!(
+            mail::drain_pop(transaction, fixture.account, |publication| {
+                publish_recording(&storage, &state, publication, Some(storage.scopes.mail))
+            })
+            .is_err()
+        );
+        assert_eq!(
+            state.borrow().events,
+            ["uidl", "retr:2", "files", "mail", "disconnect"]
+        );
+        let views = storage.views().unwrap();
+        assert!(fragment_is_materialized(
+            &views.files.facts,
+            &expected.files
+        ));
+        assert!(!fragment_is_materialized(&views.mail.facts, &expected.mail));
+
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let transaction = fake_pop(state.clone(), vec![(2, "uid-mail", bytes)]);
+        mail::drain_pop(transaction, fixture.account, |publication| {
+            publish_recording(&storage, &state, publication, None)
+        })
+        .unwrap();
+        assert_eq!(
+            state.borrow().events,
+            ["uidl", "retr:2", "mail", "dele:2", "quit"]
+        );
+        assert_eq!(state.borrow().committed, [2]);
+    }
+
+    #[test]
+    fn dele_and_quit_failures_leave_durable_mail_without_claiming_rollback() {
+        for fail_quit in [false, true] {
+            let fixture = Fixture::new();
+            let storage = fixture.storage();
+            let bytes = raw(if fail_quit {
+                "quit-fail@example.test"
+            } else {
+                "dele-fail@example.test"
+            });
+            let uidl = if fail_quit { "uid-quit" } else { "uid-dele" };
+            let expected = mail::pop_publication(fixture.account, uidl, &bytes).unwrap();
+            let state = Rc::new(RefCell::new(PopState::default()));
+            let mut transaction = fake_pop(state.clone(), vec![(1, uidl, bytes)]);
+            transaction.fail_dele = (!fail_quit).then_some(1);
+            transaction.fail_quit = fail_quit;
+            let error = mail::drain_pop(transaction, fixture.account, |publication| {
+                publish_recording(&storage, &state, publication, None)
+            })
+            .unwrap_err();
+            let views = storage.views().unwrap();
+            assert!(fragment_is_materialized(&views.mail.facts, &expected.mail));
+            assert!(state.borrow().committed.is_empty());
+            if fail_quit {
+                assert!(format!("{error:#}").contains("uncertain"));
+                assert_eq!(
+                    state.borrow().events,
+                    [
+                        "uidl",
+                        "retr:1",
+                        "files",
+                        "mail",
+                        "dele:1",
+                        "quit",
+                        "disconnect"
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    state.borrow().events,
+                    ["uidl", "retr:1", "files", "mail", "dele:1", "disconnect"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_maildrop_quits_and_late_failure_commits_no_earlier_delete() {
+        let state = Rc::new(RefCell::new(PopState::default()));
+        mail::drain_pop(
+            fake_pop(state.clone(), Vec::new()),
+            id(72),
+            |_| unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(state.borrow().events, ["uidl", "quit"]);
+
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let transaction = fake_pop(
+            state.clone(),
+            vec![
+                (1, "uid-first", raw("first@example.test")),
+                (2, "uid-second", raw("second@example.test")),
+            ],
+        );
+        let mut seen = 0usize;
+        let error = mail::drain_pop(transaction, fixture.account, |publication| {
+            seen += 1;
+            if seen == 2 {
+                state.borrow_mut().events.push("publish-2-failed".into());
+                bail!("scripted second-message failure");
+            }
+            publish_recording(&storage, &state, publication, None)
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("second-message"));
+        assert_eq!(state.borrow().marked, [1]);
+        assert!(state.borrow().committed.is_empty());
+        assert_eq!(
+            state.borrow().events,
+            [
+                "uidl",
+                "retr:1",
+                "files",
+                "mail",
+                "dele:1",
+                "retr:2",
+                "publish-2-failed",
+                "disconnect"
+            ]
+        );
+    }
+}

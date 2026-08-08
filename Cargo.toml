@@ -162,8 +162,7 @@ libc = "0.2"                # teams
 lopdf = { version = "0.44", default-features = false }  # posture (PDF objects + content streams)
 mailparse = "0.16"          # mail (RFC 5322 parser)
 mime = "0.3"                # shared canonical file media-type parsing
-rust-pop3-client = "0.3"    # mail (POP3 fetch, rustls-backed)
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }  # mail (crypto provider for rust-pop3-client)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }  # mail POP transport
 rustls-native-certs = "0.8" # mail POP transport (platform trust roots)
 quick-xml = "0.37"          # posture (OOXML part parsing)
 rayon = "1.10"              # archive

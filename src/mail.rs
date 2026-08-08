@@ -2057,18 +2057,7 @@ pub fn render_draft(draft: &MaterializedDraft, account: &OpenAccount) -> Result<
 
 // ── irreversible-effect protocol seams ────────────────────────────────────
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PopItem {
-    /// Session-local POP sequence number. Never persisted.
-    pub session_seq: u32,
-    /// Account-scoped, case-sensitive stable server identity. Persisted.
-    pub uidl: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PopQuitReply {
-    pub message: String,
-}
+pub use crate::mail_pop::PopItem;
 
 /// One POP transaction. Implementations must make ordinary Drop disconnect
 /// without issuing QUIT; only explicit `quit` may commit marked deletions.
@@ -2076,19 +2065,31 @@ pub trait PopTxn {
     fn enumerate_uidls(&mut self) -> Result<Vec<PopItem>>;
     fn retrieve_exact(&mut self, session_seq: u32) -> Result<Vec<u8>>;
     fn mark_delete(&mut self, session_seq: u32) -> Result<()>;
-    fn quit(self) -> Result<PopQuitReply>;
+    fn quit(self) -> Result<()>;
 }
 
 /// Fetch every UIDL exactly, publish its evidence, then mark it for deletion.
-/// A duplicate UIDL is a protocol error and no deletion is attempted.
-pub fn drain_pop<T, F>(mut transaction: T, account_id: Id, mut publish: F) -> Result<PopQuitReply>
+/// Duplicate or zero session identities are protocol errors and no deletion is
+/// attempted. A failed explicit QUIT is an uncertain remote transaction, not
+/// evidence that already-marked deletions were rolled back.
+pub fn drain_pop<T, F>(mut transaction: T, account_id: Id, mut publish: F) -> Result<()>
 where
     T: PopTxn,
     F: FnMut(&SourcePublication) -> Result<()>,
 {
     let items = transaction.enumerate_uidls()?;
     let mut uidls = BTreeSet::new();
+    let mut sequences = BTreeSet::new();
     for item in &items {
+        if item.session_seq == 0 {
+            bail!("POP server returned zero session sequence");
+        }
+        if !sequences.insert(item.session_seq) {
+            bail!(
+                "POP server returned duplicate session sequence {}",
+                item.session_seq
+            );
+        }
         if !uidls.insert(item.uidl.clone()) {
             bail!("POP server returned duplicate UIDL {:?}", item.uidl);
         }
@@ -2099,7 +2100,32 @@ where
         publish(&publication)?;
         transaction.mark_delete(item.session_seq)?;
     }
-    transaction.quit()
+    transaction
+        .quit()
+        .context("POP QUIT failed after delete marks; remote deletion commit is uncertain")
+}
+
+impl<S> PopTxn for crate::mail_pop::PopSession<S>
+where
+    S: std::io::Read + std::io::Write,
+{
+    fn enumerate_uidls(&mut self) -> Result<Vec<PopItem>> {
+        Ok(self.uidl()?)
+    }
+
+    fn retrieve_exact(&mut self, session_seq: u32) -> Result<Vec<u8>> {
+        Ok(self.retr(session_seq)?)
+    }
+
+    fn mark_delete(&mut self, session_seq: u32) -> Result<()> {
+        self.dele(session_seq)?;
+        Ok(())
+    }
+
+    fn quit(self) -> Result<()> {
+        crate::mail_pop::PopSession::quit(self)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2596,12 +2622,10 @@ mod tests {
             Ok(())
         }
 
-        fn quit(mut self) -> Result<PopQuitReply> {
+        fn quit(mut self) -> Result<()> {
             self.events.borrow_mut().push("quit");
             self.quit = true;
-            Ok(PopQuitReply {
-                message: "bye".into(),
-            })
+            Ok(())
         }
     }
 
@@ -2642,5 +2666,47 @@ mod tests {
             events.borrow().as_slice(),
             ["uidl", "retr", "publish-failed", "disconnect"]
         );
+    }
+
+    #[test]
+    fn pop_rejects_zero_and_duplicate_session_identities_before_retrieval() {
+        let invalid = [
+            vec![PopItem {
+                session_seq: 0,
+                uidl: "zero".into(),
+            }],
+            vec![
+                PopItem {
+                    session_seq: 1,
+                    uidl: "first".into(),
+                },
+                PopItem {
+                    session_seq: 1,
+                    uidl: "second".into(),
+                },
+            ],
+            vec![
+                PopItem {
+                    session_seq: 1,
+                    uidl: "same".into(),
+                },
+                PopItem {
+                    session_seq: 2,
+                    uidl: "same".into(),
+                },
+            ],
+        ];
+        for items in invalid {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let transaction = FakePop {
+                events: events.clone(),
+                items,
+                messages: HashMap::new(),
+                deleted: Vec::new(),
+                quit: false,
+            };
+            assert!(drain_pop(transaction, id(9), |_| Ok(())).is_err());
+            assert_eq!(events.borrow().as_slice(), ["uidl", "disconnect"]);
+        }
     }
 }
