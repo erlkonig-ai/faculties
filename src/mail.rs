@@ -2029,7 +2029,12 @@ pub fn render_draft(draft: &MaterializedDraft, account: &OpenAccount) -> Result<
             .body(draft.body.clone())
             .context("format draft")?
     } else {
-        let mut multipart = MultiPart::mixed().singlepart(
+        // Lettre otherwise invents a random boundary here.  The immutable
+        // draft id commits to the body and attachment identities, making it a
+        // canonical boundary seed and therefore making raw rendering—and the
+        // intrinsic SendAttempt that contains it—repeatable.
+        let boundary = format!("=_triblespace_{:x}", draft.id);
+        let mut multipart = MultiPart::mixed().boundary(boundary).singlepart(
             SinglePart::builder()
                 .header(header::ContentType::TEXT_PLAIN)
                 .body(draft.body.clone()),
@@ -2327,6 +2332,48 @@ mod tests {
         assert_eq!(first.canonical_message_id, same.canonical_message_id);
         assert_ne!(first.canonical_message_id, other.canonical_message_id);
         assert!(parse_rfc5322(b"Message-ID: <a@b>\r\nMessage-ID: <c@d>\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn multipart_draft_rendering_is_byte_deterministic() {
+        let draft = MaterializedDraft {
+            id: id(80),
+            account: id(81),
+            envelope_from: "sender@example.test".into(),
+            to: vec!["Receiver <receiver@example.test>".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Deterministic multipart".into(),
+            body: "same body every time".into(),
+            attachments: vec![AttachmentData {
+                filename: "bytes.bin".into(),
+                media_type: "application/octet-stream".into(),
+                bytes: vec![0, 1, 2, 3, 254, 255],
+            }],
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
+            created_at: at(4),
+        };
+        let account = OpenAccount {
+            anchor: draft.account,
+            config: id(82),
+            address: draft.envelope_from.clone(),
+            display_name: "Sender".into(),
+            pop_endpoint: "pop.example.test:995".into(),
+            smtp_endpoint: "smtp.example.test:465".into(),
+            username: "sender@example.test".into(),
+            password: "unused".into(),
+            enabled: true,
+        };
+
+        let first = render_draft(&draft, &account).unwrap();
+        let second = render_draft(&draft, &account).unwrap();
+        assert_eq!(first, second);
+        let boundary = format!("boundary=\"=_triblespace_{:x}\"", draft.id);
+        assert!(first
+            .raw
+            .windows(boundary.len())
+            .any(|window| window == boundary.as_bytes()));
     }
 
     #[test]
