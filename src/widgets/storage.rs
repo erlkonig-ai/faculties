@@ -2,10 +2,10 @@
 //!
 //! Widgets consume borrowed [`DatasetView`] values through a keyed
 //! [`WidgetContext`]. `StorageState` owns the currently loaded snapshot and the
-//! top-bar path selector and has no write path. It loads Compass and Decide
-//! directly from their union collections under the existing durable signer;
-//! the private legacy catalog remains only for faculties which have not made
-//! that cutover yet.
+//! top-bar path selector and has no write path. It loads collection-native
+//! faculties directly from one immutable collection snapshot under the
+//! existing durable signer; the private legacy catalog remains only for
+//! faculties which have not made that cutover yet.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,13 +13,21 @@ use std::time::SystemTime;
 
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::trible::TribleSet;
+use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
 
 use crate::collection_access::{
     self, CollectionRevision, CollectionView, LegacyBranchRevision, LegacyBranchView,
 };
+use crate::schemas::atlas::DEFAULT_SCOPE_ID as ATLAS_SCOPE_ID;
 use crate::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
 use crate::schemas::decide::DEFAULT_SCOPE_ID as DECIDE_SCOPE_ID;
+use crate::schemas::discord::DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID;
+use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
+use crate::schemas::message::DEFAULT_SCOPE_ID as MESSAGES_SCOPE_ID;
+use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
+use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
+use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 
 /// Stable logical input requested by a widget.
 ///
@@ -147,25 +155,72 @@ struct LegacySource {
     branches: &'static [&'static str],
 }
 
-// Temporary and deliberately private. Compass and Decide are absent because
-// they have made the collection cutover; every remaining source is loaded
-// only from legacy state until its own schema migration lands.
+#[derive(Clone, Copy)]
+struct CollectionSource {
+    key: SourceKey,
+    scope: Id,
+    label: &'static str,
+}
+
+// Deliberately private: storage identity stays behind SourceKey/DatasetView.
+// The loader materializes every distinct scope once from one immutable
+// CollectionSnapshot, then shares that exact result with any logical sources
+// which intentionally name the same scope.
+const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
+    CollectionSource {
+        key: SourceKey::Atlas,
+        scope: ATLAS_SCOPE_ID,
+        label: "Atlas",
+    },
+    CollectionSource {
+        key: SourceKey::Compass,
+        scope: COMPASS_SCOPE_ID,
+        label: "Compass",
+    },
+    CollectionSource {
+        key: SourceKey::Decide,
+        scope: DECIDE_SCOPE_ID,
+        label: "Decide",
+    },
+    CollectionSource {
+        key: SourceKey::Discord,
+        scope: DISCORD_SCOPE_ID,
+        label: "Discord",
+    },
+    CollectionSource {
+        key: SourceKey::Files,
+        scope: FILES_SCOPE_ID,
+        label: "Files",
+    },
+    CollectionSource {
+        key: SourceKey::Messages,
+        scope: MESSAGES_SCOPE_ID,
+        label: "Messages",
+    },
+    CollectionSource {
+        key: SourceKey::Relations,
+        scope: RELATIONS_SCOPE_ID,
+        label: "Relations",
+    },
+    CollectionSource {
+        key: SourceKey::Status,
+        scope: STATUS_SCOPE_ID,
+        label: "Status",
+    },
+    CollectionSource {
+        key: SourceKey::Teams,
+        scope: TEAMS_SCOPE_ID,
+        label: "Teams",
+    },
+];
+
+// Temporary and deliberately private. Collection-native sources are absent;
+// every remaining source is loaded only from legacy state until its own
+// schema migration lands.
 const LEGACY_SOURCE_CATALOG: &[LegacySource] = &[
     LegacySource {
         key: SourceKey::Archive,
         branches: &["archive"],
-    },
-    LegacySource {
-        key: SourceKey::Atlas,
-        branches: &["atlas"],
-    },
-    LegacySource {
-        key: SourceKey::Discord,
-        branches: &["discord"],
-    },
-    LegacySource {
-        key: SourceKey::Files,
-        branches: &["files"],
     },
     LegacySource {
         key: SourceKey::Headspace,
@@ -176,28 +231,12 @@ const LEGACY_SOURCE_CATALOG: &[LegacySource] = &[
         branches: &["memory", "cognition"],
     },
     LegacySource {
-        key: SourceKey::Messages,
-        branches: &["message"],
-    },
-    LegacySource {
         key: SourceKey::Planner,
         branches: &["planner"],
     },
     LegacySource {
         key: SourceKey::Reason,
         branches: &["cognition"],
-    },
-    LegacySource {
-        key: SourceKey::Relations,
-        branches: &["relations"],
-    },
-    LegacySource {
-        key: SourceKey::Status,
-        branches: &["status"],
-    },
-    LegacySource {
-        key: SourceKey::Teams,
-        branches: &["teams"],
     },
     LegacySource {
         key: SourceKey::Triage,
@@ -434,18 +473,40 @@ fn load_catalog(path: &Path) -> Result<BTreeMap<SourceKey, LoadedDataset>, Strin
     let allowed = HashSet::from([signer.verifying_key()]);
     let snapshot = collection_access::CollectionSnapshot::open(path)
         .map_err(|error| format!("open collection snapshot: {error:#}"))?;
-    let compass = snapshot
-        .materialize_scope(COMPASS_SCOPE_ID, &allowed)
-        .map_err(|error| format!("materialize Compass collection: {error:#}"))?;
-    crate::compass::validate_catalog(&compass.reader, &compass.facts)
-        .map_err(|error| format!("validate Compass collection: {error:#}"))?;
-    datasets.insert(SourceKey::Compass, LoadedDataset::from_collection(compass));
-    let decide = snapshot
-        .materialize_scope(DECIDE_SCOPE_ID, &allowed)
-        .map_err(|error| format!("materialize Decide collection: {error:#}"))?;
-    crate::decide::validate_catalog(&decide.reader, &decide.facts)
-        .map_err(|error| format!("validate Decide collection: {error:#}"))?;
-    datasets.insert(SourceKey::Decide, LoadedDataset::from_collection(decide));
+    datasets.extend(load_collection_catalog(&snapshot, &allowed)?);
+    Ok(datasets)
+}
+
+fn load_collection_catalog(
+    snapshot: &collection_access::CollectionSnapshot,
+    allowed: &HashSet<ed25519_dalek::VerifyingKey>,
+) -> Result<BTreeMap<SourceKey, LoadedDataset>, String> {
+    let mut by_scope: BTreeMap<Id, LoadedDataset> = BTreeMap::new();
+    let mut datasets = BTreeMap::new();
+
+    for source in COLLECTION_SOURCE_CATALOG {
+        let dataset = if let Some(dataset) = by_scope.get(&source.scope) {
+            dataset.clone()
+        } else {
+            let view = snapshot
+                .materialize_scope(source.scope, allowed)
+                .map_err(|error| format!("materialize {} collection: {error:#}", source.label))?;
+            let dataset = LoadedDataset::from_collection(view);
+            by_scope.insert(source.scope, dataset.clone());
+            dataset
+        };
+        match source.key {
+            SourceKey::Compass => crate::compass::validate_catalog(&dataset.reader, &dataset.facts)
+                .map_err(|error| format!("validate Compass collection: {error:#}"))?,
+            SourceKey::Decide => {
+                crate::decide::validate_catalog(&dataset.reader, &dataset.facts)
+                    .map_err(|error| format!("validate Decide collection: {error:#}"))?
+            }
+            _ => {}
+        }
+        datasets.insert(source.key, dataset);
+    }
+
     Ok(datasets)
 }
 
@@ -491,20 +552,28 @@ mod tests {
     use triblespace::prelude::*;
 
     fn create_branch(path: &Path, name: &str, text: &str) -> Id {
+        create_branches(path, &[(name, text)])[name]
+    }
+
+    fn create_branches(path: &Path, branches: &[(&str, &str)]) -> BTreeMap<String, Id> {
         File::create(path).unwrap();
         let pile = collection_access::open_pile_strict(path).unwrap();
         let mut repository =
             Repository::new(pile, SigningKey::from_bytes(&[0x31; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(name, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        workspace.commit(
-            entity! { metadata::description: text.to_owned() },
-            "fixture",
-        );
-        repository.push(&mut workspace).unwrap();
+        let mut ids = BTreeMap::new();
+        for &(name, text) in branches {
+            let branch = *repository.create_branch(name, None).unwrap();
+            let mut workspace = repository.pull(branch).unwrap();
+            workspace.commit(
+                entity! { metadata::description: text.to_owned() },
+                "fixture",
+            );
+            repository.push(&mut workspace).unwrap();
+            ids.insert(name.to_owned(), branch);
+        }
         repository.close().unwrap();
         collection_access::initialize_signer(path, None).unwrap();
-        branch
+        ids
     }
 
     fn append_branch(path: &Path, branch: Id, text: &str) {
@@ -562,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_sources_have_no_legacy_fallback_and_other_scopes_are_ignored() {
+    fn collection_only_catalog_exposes_every_native_source_and_ignores_other_scopes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("collection-only.pile");
         let key = directory.path().join("writer.key");
@@ -581,15 +650,48 @@ mod tests {
         let mut storage = StorageState::new(&path);
         let context = storage.context();
 
-        let compass = context.dataset(SourceKey::Compass).unwrap();
-        let decide = context.dataset(SourceKey::Decide).unwrap();
-        assert!(compass.facts.is_empty());
-        assert!(decide.facts.is_empty());
-        assert!(SourceKey::ALL
-            .into_iter()
-            .filter(|key| !matches!(key, SourceKey::Compass | SourceKey::Decide))
-            .all(|key| context.dataset(key).is_none()));
+        for source in COLLECTION_SOURCE_CATALOG {
+            assert!(context.dataset(source.key).unwrap().facts.is_empty());
+        }
+        for source in LEGACY_SOURCE_CATALOG {
+            assert!(context.dataset(source.key).is_none());
+        }
         assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
+    }
+
+    #[test]
+    fn collection_sources_never_fall_back_to_same_named_legacy_branches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shadowed-legacy.pile");
+        create_branches(
+            &path,
+            &[
+                ("atlas", "legacy atlas"),
+                ("discord", "legacy discord"),
+                ("files", "legacy files"),
+                ("message", "legacy messages"),
+                ("relations", "legacy relations"),
+                ("status", "legacy status"),
+                ("teams", "legacy teams"),
+            ],
+        );
+
+        let mut storage = StorageState::new(&path);
+        let context = storage.context();
+        for key in [
+            SourceKey::Atlas,
+            SourceKey::Discord,
+            SourceKey::Files,
+            SourceKey::Messages,
+            SourceKey::Relations,
+            SourceKey::Status,
+            SourceKey::Teams,
+        ] {
+            assert!(
+                context.dataset(key).unwrap().facts.is_empty(),
+                "{key:?} unexpectedly read its former legacy branch"
+            );
+        }
     }
 
     #[test]
@@ -744,6 +846,61 @@ mod tests {
     }
 
     #[test]
+    fn failed_live_reload_retains_the_last_coherent_collection_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retain-last-good.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+        collection_access::publish_fragment(
+            &path,
+            None,
+            ATLAS_SCOPE_ID,
+            entity! { metadata::tag: &Id::new([0x73; 16]).unwrap() },
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let mut storage = StorageState::new(&path);
+        let retained_revision = storage
+            .context()
+            .dataset(SourceKey::Atlas)
+            .unwrap()
+            .revision;
+
+        let decision = Id::new([0x74; 16]).unwrap();
+        let epoch = Epoch::from_unix_seconds(1.0);
+        let at: crate::decide::IntervalValue = (epoch, epoch).try_to_inline().unwrap();
+        let mut malformed = crate::decide::decision_fragment(decision, "Broken", None, None, at)
+            .unwrap()
+            .0;
+        let outcome = malformed.put("Outcome".to_owned());
+        let bogus = Id::new([0x75; 16]).unwrap();
+        malformed += entity! { ExclusiveId::force_ref(&bogus) @
+            metadata::tag: &crate::schemas::decide::KIND_RESOLUTION_SNAPSHOT,
+            crate::schemas::decide::resolution::of: &decision,
+            crate::schemas::decide::decide::outcome: outcome,
+            crate::schemas::decide::resolution::forced: true,
+            metadata::finished_at: at,
+        };
+        collection_access::publish_fragment(
+            &path,
+            None,
+            DECIDE_SCOPE_ID,
+            malformed,
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let retained = storage.context().dataset(SourceKey::Atlas).unwrap();
+        assert_eq!(retained.revision, retained_revision);
+        assert!(!retained.facts.is_empty());
+        assert!(storage
+            .error()
+            .unwrap()
+            .contains("validate Decide collection"));
+    }
+
+    #[test]
     fn memory_fallback_is_private_to_the_legacy_catalog() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fallback.pile");
@@ -756,6 +913,14 @@ mod tests {
         let triage = context.dataset(SourceKey::Triage).unwrap();
         assert_eq!(memory.revision, reason.revision);
         assert_eq!(memory.revision, triage.revision);
+        for key in [
+            SourceKey::Archive,
+            SourceKey::Headspace,
+            SourceKey::Planner,
+            SourceKey::Wiki,
+        ] {
+            assert!(context.dataset(key).is_none());
+        }
     }
 
     #[test]
@@ -764,12 +929,113 @@ mod tests {
             .iter()
             .map(|source| source.key)
             .collect();
-        assert!(!legacy.contains(&SourceKey::Compass));
-        assert!(!legacy.contains(&SourceKey::Decide));
-        let mut complete = legacy.clone();
-        complete.insert(SourceKey::Compass);
-        complete.insert(SourceKey::Decide);
+        let collections: BTreeSet<_> = COLLECTION_SOURCE_CATALOG
+            .iter()
+            .map(|source| source.key)
+            .collect();
+        assert_eq!(
+            legacy,
+            BTreeSet::from([
+                SourceKey::Archive,
+                SourceKey::Headspace,
+                SourceKey::Memory,
+                SourceKey::Planner,
+                SourceKey::Reason,
+                SourceKey::Triage,
+                SourceKey::Wiki,
+            ])
+        );
+        assert_eq!(
+            collections,
+            BTreeSet::from([
+                SourceKey::Atlas,
+                SourceKey::Compass,
+                SourceKey::Decide,
+                SourceKey::Discord,
+                SourceKey::Files,
+                SourceKey::Messages,
+                SourceKey::Relations,
+                SourceKey::Status,
+                SourceKey::Teams,
+            ])
+        );
+        assert!(legacy.is_disjoint(&collections));
+        let complete: BTreeSet<_> = legacy.union(&collections).copied().collect();
         assert_eq!(complete, SourceKey::ALL.into_iter().collect());
         assert_eq!(legacy.len(), LEGACY_SOURCE_CATALOG.len());
+        assert_eq!(collections.len(), COLLECTION_SOURCE_CATALOG.len());
+    }
+
+    #[test]
+    fn semantic_commit_changes_only_its_collection_source_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source-revisions.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+        let mut storage = StorageState::new(&path);
+        let before: BTreeMap<_, _> = {
+            let context = storage.context();
+            COLLECTION_SOURCE_CATALOG
+                .iter()
+                .map(|source| (source.key, context.dataset(source.key).unwrap().revision))
+                .collect()
+        };
+
+        collection_access::publish_fragment(
+            &path,
+            None,
+            ATLAS_SCOPE_ID,
+            entity! { metadata::tag: &Id::new([0x81; 16]).unwrap() },
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let context = storage.context();
+        for source in COLLECTION_SOURCE_CATALOG {
+            let after = context.dataset(source.key).unwrap().revision;
+            if source.key == SourceKey::Atlas {
+                assert_ne!(after, before[&source.key]);
+            } else {
+                assert_eq!(after, before[&source.key], "changed {:?}", source.key);
+            }
+        }
+    }
+
+    #[test]
+    fn collection_catalog_materializes_every_source_from_one_frozen_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared-snapshot.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+        collection_access::publish_fragment(
+            &path,
+            None,
+            ATLAS_SCOPE_ID,
+            entity! { metadata::tag: &Id::new([0x91; 16]).unwrap() },
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let signer = collection_access::load_signer(&path, None).unwrap();
+        let allowed = HashSet::from([signer.verifying_key()]);
+        let frozen = collection_access::CollectionSnapshot::open(&path).unwrap();
+
+        collection_access::publish_fragment(
+            &path,
+            None,
+            FILES_SCOPE_ID,
+            entity! { metadata::tag: &Id::new([0x92; 16]).unwrap() },
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let frozen_catalog = load_collection_catalog(&frozen, &allowed).unwrap();
+        assert!(!frozen_catalog[&SourceKey::Atlas].facts.is_empty());
+        assert!(frozen_catalog[&SourceKey::Files].facts.is_empty());
+
+        let current = collection_access::CollectionSnapshot::open(&path).unwrap();
+        let current_catalog = load_collection_catalog(&current, &allowed).unwrap();
+        assert!(!current_catalog[&SourceKey::Atlas].facts.is_empty());
+        assert!(!current_catalog[&SourceKey::Files].facts.is_empty());
     }
 }
