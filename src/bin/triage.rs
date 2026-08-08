@@ -1,8 +1,14 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::collection_access::{self, CollectionSnapshot};
+use faculties::headspace::{self, Catalog};
+use faculties::schemas::headspace::{
+    DEFAULT_CHARS_PER_TOKEN, DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS, DEFAULT_CONTEXT_WINDOW_TOKENS,
+    DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_SCOPE_ID, DEFAULT_SYSTEM_PROMPT,
+};
 use faculties::schemas::triage::{
-    cog, config, context, exec, local, model_chat, reason, relations, KIND_CONTEXT_CHUNK_ID,
+    cog, context, exec, local, model_chat, reason, relations, KIND_CONTEXT_CHUNK_ID,
     KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID, KIND_LOCAL_MESSAGE_ID,
     KIND_LOCAL_READ_ID, KIND_MODEL_IN_PROGRESS_ID, KIND_MODEL_REQUEST_ID, KIND_MODEL_RESULT_ID,
     KIND_PERSON_ID, KIND_REASON_EVENT_ID, REPO_CONTENT_ATTR, REPO_HEAD_ATTR, REPO_PARENT_ATTR,
@@ -120,11 +126,12 @@ enum RepairCommand {
     },
 }
 
-/// Lightweight config snapshot — only non-branch fields that triage still needs.
-#[derive(Debug, Clone, Default)]
-struct ConfigSnapshot {
-    updated_at: Option<i128>,
+/// The small, immutable Headspace projection needed by Triage.
+#[derive(Debug, Clone)]
+struct TriageHeadspace {
+    config_missing: bool,
     persona_id: Option<Id>,
+    budget: BudgetInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -502,48 +509,91 @@ fn resolve_target_branch(repo: &mut Repository<Pile>, cli: &Cli) -> Result<Id> {
     ensure_branch_id(repo, &cli.branch)
 }
 
-/// Load lightweight config snapshot (persona_id + updated_at) from the config branch.
-fn load_latest_config(repo: &mut Repository<Pile>) -> Result<Option<ConfigSnapshot>> {
-    let branch_id = ensure_branch_id(repo, "config")?;
-    let mut ws = pull_workspace(repo, branch_id, "pull config workspace")?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
-
-    let mut latest: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest {
-            Some((_, best)) if best >= key => {}
-            _ => latest = Some((config_id, key)),
-        }
-    }
-
-    let Some((config_id, updated_at)) = latest else {
-        return Ok(None);
-    };
-
-    let mut snapshot = ConfigSnapshot {
-        updated_at: Some(updated_at),
-        ..Default::default()
-    };
-
-    if let Some(value) = find!(
-        value: Id,
-        pattern!(&space, [{ config_id @ config::persona_id: ?value }])
+fn default_budget() -> BudgetInfo {
+    budget_info(
+        DEFAULT_CONTEXT_WINDOW_TOKENS,
+        DEFAULT_MAX_OUTPUT_TOKENS,
+        DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
+        DEFAULT_CHARS_PER_TOKEN,
+        DEFAULT_SYSTEM_PROMPT.len(),
     )
-    .next()
-    {
-        snapshot.persona_id = Some(value);
-    }
+}
 
-    Ok(Some(snapshot))
+fn budget_info(
+    context_window_tokens: u64,
+    max_output_tokens: u64,
+    safety_margin_tokens: u64,
+    chars_per_token: u64,
+    system_prompt_chars: usize,
+) -> BudgetInfo {
+    let chars_per_token = chars_per_token.max(1);
+    let body_budget_chars = ((context_window_tokens as i64)
+        - (max_output_tokens as i64)
+        - (safety_margin_tokens as i64))
+        * (chars_per_token as i64)
+        - (system_prompt_chars as i64);
+    BudgetInfo {
+        context_window_tokens,
+        max_output_tokens,
+        safety_margin_tokens,
+        chars_per_token,
+        system_prompt_chars,
+        body_budget_chars,
+    }
+}
+
+/// Project the small runtime view Triage needs from the shared Headspace
+/// resolver. A missing config track means canonical defaults; ambiguity and
+/// malformed state remain visible errors rather than timestamp-selected state.
+fn project_triage_headspace(catalog: &Catalog) -> Result<TriageHeadspace> {
+    let config = catalog.config.settled_value("Headspace config")?;
+    let Some(config) = config else {
+        return Ok(TriageHeadspace {
+            config_missing: true,
+            persona_id: None,
+            budget: default_budget(),
+        });
+    };
+
+    let profile = catalog
+        .profiles
+        .get(&config.active_profile)
+        .ok_or_else(|| {
+            anyhow!(
+                "Headspace config names missing profile track {:x}",
+                config.active_profile
+            )
+        })?
+        .settled_value(&format!("Headspace profile {:x}", config.active_profile))?
+        .ok_or_else(|| {
+            anyhow!(
+                "Headspace config names empty profile track {:x}",
+                config.active_profile
+            )
+        })?;
+
+    Ok(TriageHeadspace {
+        config_missing: false,
+        persona_id: config.persona,
+        budget: budget_info(
+            profile.context_window_tokens,
+            profile.max_output_tokens,
+            profile.context_safety_margin_tokens,
+            profile.chars_per_token,
+            config.system_prompt.len(),
+        ),
+    })
+}
+
+/// Resolve the stable Headspace collection once, before Triage opens its
+/// legacy diagnostic repository for unrelated cognition data.
+fn load_triage_headspace(pile_path: &Path) -> Result<TriageHeadspace> {
+    let signer = collection_access::load_signer(pile_path, None)?;
+    let allowed = HashSet::from([signer.verifying_key()]);
+    let snapshot = CollectionSnapshot::open(pile_path)?;
+    let view = snapshot.materialize_scope(DEFAULT_SCOPE_ID, &allowed)?;
+    let catalog = headspace::project_result(&view.reader, &view.facts)?;
+    project_triage_headspace(&catalog)
 }
 
 fn collect_exec_state(ws: &mut Workspace<Pile>, space: &TribleSet) -> Result<ExecState> {
@@ -1022,11 +1072,11 @@ fn count_unread_message(repo: &mut Repository<Pile>, reader_id: Id) -> Result<Op
 fn cmd_scan(
     repo: &mut Repository<Pile>,
     cli: &Cli,
+    headspace: &TriageHeadspace,
     recent: usize,
     loop_min: usize,
     stale_min: i64,
 ) -> Result<()> {
-    let config = load_latest_config(repo)?;
     let branch_id = resolve_target_branch(repo, cli)?;
     let mut ws = pull_workspace(repo, branch_id, "pull target workspace")?;
     let space = ws
@@ -1046,7 +1096,7 @@ fn cmd_scan(
     let model_running = active_model_running_count(&model_state);
     let loop_report = build_loop_report(&exec_state, recent, loop_min);
 
-    let unread_local = if let Some(persona_id) = config.as_ref().and_then(|cfg| cfg.persona_id) {
+    let unread_local = if let Some(persona_id) = headspace.persona_id {
         count_unread_message(repo, persona_id)?
     } else {
         None
@@ -1055,15 +1105,11 @@ fn cmd_scan(
     println!("Triage scan");
     println!("- pile: {}", cli.pile.display());
     println!("- target branch: {branch_id:x}");
-    if let Some(cfg) = config.as_ref() {
-        if let Some(updated_at) = cfg.updated_at {
-            println!("- config age: {}", format_age(now_key, updated_at));
-        }
-        if let Some(persona_id) = cfg.persona_id {
-            println!("- persona id: {persona_id:x}");
-        }
-    } else {
-        println!("- config: missing");
+    if headspace.config_missing {
+        println!("- Headspace config: missing (using defaults)");
+    }
+    if let Some(persona_id) = headspace.persona_id {
+        println!("- persona id: {persona_id:x}");
     }
 
     println!();
@@ -1937,113 +1983,6 @@ fn find_root_chunks(chunks: &[ContextChunkRow]) -> Vec<usize> {
         .collect()
 }
 
-fn load_budget_from_config(repo: &mut Repository<Pile>) -> Result<Option<BudgetInfo>> {
-    let branch_id = ensure_branch_id(repo, "config")?;
-    let mut ws = pull_workspace(repo, branch_id, "pull config for budget")?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout config: {e:?}"))?;
-
-    // Find latest config
-    let mut latest_config: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest_config {
-            Some((_, best)) if best >= key => {}
-            _ => latest_config = Some((config_id, key)),
-        }
-    }
-    let Some((config_id, _)) = latest_config else {
-        return Ok(None);
-    };
-
-    // Get active model profile id
-    let mut active_profile_id: Option<Id> = None;
-    if let Some(value) = find!(
-        value: Id,
-        pattern!(&space, [{ config_id @ config::active_model_profile_id: ?value }])
-    )
-    .next()
-    {
-        active_profile_id = Some(value);
-    }
-
-    // Get system prompt length
-    let system_prompt_chars: usize = if let Some(handle) = find!(
-        handle: TextHandle,
-        pattern!(&space, [{ config_id @ config::system_prompt: ?handle }])
-    )
-    .next()
-    {
-        read_text(&mut ws, handle)?.len()
-    } else {
-        0
-    };
-
-    // Find model profile
-    let Some(profile_id) = active_profile_id else {
-        return Ok(None);
-    };
-
-    let mut context_window: u64 = 0;
-    let mut max_output: u64 = 0;
-    let mut safety_margin: u64 = 0;
-    let mut chars_per_token: u64 = 4;
-
-    if let Some(value) = find!(
-        value: Inline<inlineencodings::U256BE>,
-        pattern!(&space, [{ profile_id @ config::model_context_window_tokens: ?value }])
-    )
-    .next()
-    {
-        context_window = u256be_to_u64(value).unwrap_or(0);
-    }
-    if let Some(value) = find!(
-        value: Inline<inlineencodings::U256BE>,
-        pattern!(&space, [{ profile_id @ config::model_max_output_tokens: ?value }])
-    )
-    .next()
-    {
-        max_output = u256be_to_u64(value).unwrap_or(0);
-    }
-    if let Some(value) = find!(
-        value: Inline<inlineencodings::U256BE>,
-        pattern!(&space, [{ profile_id @ config::model_context_safety_margin_tokens: ?value }])
-    )
-    .next()
-    {
-        safety_margin = u256be_to_u64(value).unwrap_or(0);
-    }
-    if let Some(value) = find!(
-        value: Inline<inlineencodings::U256BE>,
-        pattern!(&space, [{ profile_id @ config::model_chars_per_token: ?value }])
-    )
-    .next()
-    {
-        chars_per_token = u256be_to_u64(value).unwrap_or(4).max(1);
-    }
-
-    let body_budget_chars =
-        ((context_window as i64) - (max_output as i64) - (safety_margin as i64))
-            * (chars_per_token as i64)
-            - (system_prompt_chars as i64);
-
-    Ok(Some(BudgetInfo {
-        context_window_tokens: context_window,
-        max_output_tokens: max_output,
-        safety_margin_tokens: safety_margin,
-        chars_per_token,
-        system_prompt_chars,
-        body_budget_chars,
-    }))
-}
-
 fn load_turn_context(
     repo: &mut Repository<Pile>,
     exec_branch_id: Id,
@@ -2147,7 +2086,13 @@ fn load_turn_context(
     Ok(Some((request_id, command, messages)))
 }
 
-fn cmd_cover(repo: &mut Repository<Pile>, cli: &Cli, full: bool, tree: bool) -> Result<()> {
+fn cmd_cover(
+    repo: &mut Repository<Pile>,
+    cli: &Cli,
+    headspace: &TriageHeadspace,
+    full: bool,
+    tree: bool,
+) -> Result<()> {
     // Memory chunks live on the "memory" branch, not cognition.
     let branch_id = ensure_branch_id(repo, "memory")?;
     let mut ws = pull_workspace(repo, branch_id, "pull target for cover")?;
@@ -2193,30 +2138,28 @@ fn cmd_cover(repo: &mut Repository<Pile>, cli: &Cli, full: bool, tree: bool) -> 
     );
 
     // Budget
-    let budget = load_budget_from_config(repo)?;
-    if let Some(ref b) = budget {
-        let cover_chars: usize = chunks
-            .iter()
-            .filter_map(|c| c.summary.as_ref())
-            .map(|s| s.len())
-            .sum();
-        let fill_pct = if b.body_budget_chars > 0 {
-            (cover_chars as f64 / b.body_budget_chars as f64 * 100.0) as u32
-        } else {
-            0
-        };
-        println!();
-        println!("Budget");
-        println!(
-            "  context_window={} max_output={} safety={} chars/tok={}",
-            b.context_window_tokens, b.max_output_tokens, b.safety_margin_tokens, b.chars_per_token
-        );
-        println!(
-            "  system_prompt={} chars  body_budget={} chars",
-            b.system_prompt_chars, b.body_budget_chars
-        );
-        println!("  cover_chars={cover_chars}  fill={fill_pct}%");
-    }
+    let b = &headspace.budget;
+    let cover_chars: usize = chunks
+        .iter()
+        .filter_map(|c| c.summary.as_ref())
+        .map(|s| s.len())
+        .sum();
+    let fill_pct = if b.body_budget_chars > 0 {
+        (cover_chars as f64 / b.body_budget_chars as f64 * 100.0) as u32
+    } else {
+        0
+    };
+    println!();
+    println!("Budget");
+    println!(
+        "  context_window={} max_output={} safety={} chars/tok={}",
+        b.context_window_tokens, b.max_output_tokens, b.safety_margin_tokens, b.chars_per_token
+    );
+    println!(
+        "  system_prompt={} chars  body_budget={} chars",
+        b.system_prompt_chars, b.body_budget_chars
+    );
+    println!("  cover_chars={cover_chars}  fill={fill_pct}%");
 
     println!();
     if tree {
@@ -2783,6 +2726,7 @@ fn cmd_turn(repo: &mut Repository<Pile>, cli: &Cli, turn_offset: usize, full: bo
 fn cmd_context(
     repo: &mut Repository<Pile>,
     cli: &Cli,
+    headspace: &TriageHeadspace,
     turn: usize,
     full: bool,
     raw: bool,
@@ -2807,14 +2751,9 @@ fn cmd_context(
 
     let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
 
-    let budget = load_budget_from_config(repo)?;
-    let fill_str = if let Some(ref b) = budget {
-        if b.body_budget_chars > 0 {
-            let pct = (total_chars as f64 / b.body_budget_chars as f64 * 100.0) as u32;
-            format!("  fill={pct}%")
-        } else {
-            String::new()
-        }
+    let fill_str = if headspace.budget.body_budget_chars > 0 {
+        let pct = (total_chars as f64 / headspace.budget.body_budget_chars as f64 * 100.0) as u32;
+        format!("  fill={pct}%")
     } else {
         String::new()
     };
@@ -2858,20 +2797,48 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
+    // Collection materialization opens one immutable pile snapshot. Do it
+    // before the unrelated legacy Repository owns the pile for diagnostics.
+    let headspace = match command {
+        Command::Scan { .. } | Command::Cover { .. } | Command::Context { .. } => {
+            Some(load_triage_headspace(&cli.pile)?)
+        }
+        _ => None,
+    };
     let mut repo = open_repo(&cli.pile)?;
     let command_result = match command {
         Command::Scan {
             recent,
             loop_min,
             stale_min,
-        } => cmd_scan(&mut repo, &cli, *recent, *loop_min, *stale_min),
+        } => cmd_scan(
+            &mut repo,
+            &cli,
+            headspace.as_ref().expect("scan preloads Headspace"),
+            *recent,
+            *loop_min,
+            *stale_min,
+        ),
         Command::Loops { recent, min_repeat } => cmd_loops(&mut repo, &cli, *recent, *min_repeat),
         Command::Timeline { recent } => cmd_timeline(&mut repo, &cli, *recent),
         Command::Chain => cmd_chain(&mut repo, &cli),
         Command::Turn { turn, full } => cmd_turn(&mut repo, &cli, *turn, *full),
-        Command::Cover { full, tree } => cmd_cover(&mut repo, &cli, *full, *tree),
+        Command::Cover { full, tree } => cmd_cover(
+            &mut repo,
+            &cli,
+            headspace.as_ref().expect("cover preloads Headspace"),
+            *full,
+            *tree,
+        ),
         Command::Chunk { id } => cmd_chunk(&mut repo, &cli, id.as_str()),
-        Command::Context { turn, full, raw } => cmd_context(&mut repo, &cli, *turn, *full, *raw),
+        Command::Context { turn, full, raw } => cmd_context(
+            &mut repo,
+            &cli,
+            headspace.as_ref().expect("context preloads Headspace"),
+            *turn,
+            *full,
+            *raw,
+        ),
         Command::Repair { command } => match command {
             RepairCommand::BranchDuplicates { dry_run } => {
                 cmd_repair_branch_duplicates(&mut repo, &cli, *dry_run)
@@ -2882,4 +2849,178 @@ fn main() -> Result<()> {
     command_result?;
     close_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::File;
+
+    use faculties::schemas::headspace::KIND_CONFIG_ID;
+    use triblespace::macros::entity;
+
+    fn test_id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    struct HeadspaceFixture {
+        _directory: tempfile::TempDir,
+        pile: PathBuf,
+        key: PathBuf,
+    }
+
+    impl HeadspaceFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let pile = directory.path().join("triage.pile");
+            File::create(&pile).unwrap();
+            let key = collection_access::signer_path(&pile, None);
+            collection_access::initialize_signer(&pile, Some(&key)).unwrap();
+            Self {
+                _directory: directory,
+                pile,
+                key,
+            }
+        }
+
+        fn publish(&self, fragment: Fragment) {
+            collection_access::publish_fragment(
+                &self.pile,
+                Some(&self.key),
+                DEFAULT_SCOPE_ID,
+                fragment,
+                Fragment::empty(),
+            )
+            .unwrap();
+        }
+
+        fn load(&self) -> Result<TriageHeadspace> {
+            load_triage_headspace(&self.pile)
+        }
+    }
+
+    #[test]
+    fn typed_config_selects_active_profile_snapshot_not_newest_arbitrary_row_or_anchor() {
+        let fixture = HeadspaceFixture::new();
+        let anchor = test_id(0x11);
+        let persona = test_id(0x12);
+        let mut profile = headspace::default_profile(anchor, "triage");
+        profile.context_window_tokens = 98_765;
+        profile.max_output_tokens = 4_321;
+        profile.context_safety_margin_tokens = 678;
+        profile.chars_per_token = 3;
+        let mut config = headspace::default_config(anchor);
+        config.persona = Some(persona);
+        config.system_prompt = "typed config".to_owned();
+
+        // The legacy projector considered every timestamped row a config
+        // candidate and could therefore lose `persona`; it also queried these
+        // token fields on `anchor` rather than on the immutable profile
+        // snapshot. The typed resolver has neither ambiguity.
+        let mut fragment = headspace::profile_anchor_fragment(anchor);
+        fragment += headspace::profile_snapshot_fragment(&profile, &[])
+            .unwrap()
+            .0;
+        fragment += headspace::config_snapshot_fragment(&config, &[]).unwrap().0;
+        fixture.publish(fragment);
+
+        let projected = fixture.load().unwrap();
+        assert_eq!(projected.persona_id, Some(persona));
+        assert_eq!(projected.budget.context_window_tokens, 98_765);
+        assert_eq!(projected.budget.max_output_tokens, 4_321);
+        assert_eq!(projected.budget.safety_margin_tokens, 678);
+        assert_eq!(projected.budget.chars_per_token, 3);
+        assert_eq!(projected.budget.system_prompt_chars, "typed config".len());
+    }
+
+    #[test]
+    fn missing_config_uses_headspace_defaults() {
+        let fixture = HeadspaceFixture::new();
+        fixture.publish(Fragment::empty());
+
+        let projected = fixture.load().unwrap();
+        assert!(projected.config_missing);
+        assert_eq!(projected.persona_id, None);
+        assert_eq!(
+            projected.budget.context_window_tokens,
+            DEFAULT_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            projected.budget.max_output_tokens,
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(
+            projected.budget.safety_margin_tokens,
+            DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
+        );
+        assert_eq!(projected.budget.chars_per_token, DEFAULT_CHARS_PER_TOKEN);
+        assert_eq!(
+            projected.budget.system_prompt_chars,
+            DEFAULT_SYSTEM_PROMPT.len()
+        );
+    }
+
+    #[test]
+    fn agreed_config_is_usable_without_arbitration() {
+        let fixture = HeadspaceFixture::new();
+        let anchor = test_id(0x21);
+        let profile = headspace::default_profile(anchor, "agreed");
+        let config = headspace::default_config(anchor);
+        let (genesis, _, initial) =
+            headspace::add_profile_fragment(&profile, &config, &[]).unwrap();
+        fixture.publish(genesis);
+        let mut left = config.clone();
+        left.system_prompt = "left".to_owned();
+        let mut right = config.clone();
+        right.system_prompt = "right".to_owned();
+        let (left, left_id) = headspace::config_snapshot_fragment(&left, &[initial]).unwrap();
+        let (right, right_id) = headspace::config_snapshot_fragment(&right, &[initial]).unwrap();
+        fixture.publish(left);
+        fixture.publish(right);
+        fixture.publish(
+            headspace::config_snapshot_fragment(&config, &[left_id])
+                .unwrap()
+                .0,
+        );
+        fixture.publish(
+            headspace::config_snapshot_fragment(&config, &[right_id])
+                .unwrap()
+                .0,
+        );
+
+        let projected = fixture.load().unwrap();
+        assert!(!projected.config_missing);
+    }
+
+    #[test]
+    fn forked_or_invalid_headspace_is_an_error() {
+        let forked = HeadspaceFixture::new();
+        let anchor = test_id(0x31);
+        let profile = headspace::default_profile(anchor, "forked");
+        let config = headspace::default_config(anchor);
+        let (genesis, _, initial) =
+            headspace::add_profile_fragment(&profile, &config, &[]).unwrap();
+        forked.publish(genesis);
+        let mut left = config.clone();
+        left.system_prompt = "left".to_owned();
+        let mut right = config;
+        right.system_prompt = "right".to_owned();
+        forked.publish(
+            headspace::config_snapshot_fragment(&left, &[initial])
+                .unwrap()
+                .0,
+        );
+        forked.publish(
+            headspace::config_snapshot_fragment(&right, &[initial])
+                .unwrap()
+                .0,
+        );
+        assert!(format!("{:#}", forked.load().unwrap_err()).contains("forked"));
+
+        let invalid = HeadspaceFixture::new();
+        invalid.publish(entity! { metadata::tag: &KIND_CONFIG_ID });
+        let error = invalid.load().unwrap_err();
+        assert!(format!("{error:#}").contains("active_model_profile_id"));
+    }
 }

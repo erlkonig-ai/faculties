@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -5,9 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use faculties::collection_access;
-use faculties::schemas::headspace::{
-    playground_config as config_schema, CONFIG_BRANCH, KIND_CONFIG_ID as CONFIG_KIND_ID,
-};
+use faculties::headspace;
+use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use hifitime::Epoch;
 use reqwest::blocking::Client;
@@ -17,7 +17,6 @@ use serde_json::json;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
-use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
@@ -90,13 +89,13 @@ enum Command {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct ApiKeys {
     tavily: Option<String>,
     exa: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct ConfigSnapshot {
     tavily_api_key: Option<String>,
     exa_api_key: Option<String>,
@@ -128,7 +127,7 @@ fn run(cli: Cli) -> Result<()> {
         return cmd_migrate_legacy(storage, *legacy_branch_id);
     }
 
-    let config = load_config_snapshot(&cli.pile)?;
+    let config = load_config_snapshot(&cli.pile, cli.key.as_deref())?;
     let keys = resolve_api_keys(&cli, &config)?;
 
     match cmd {
@@ -258,76 +257,23 @@ fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider>
     }
 }
 
-fn load_config_snapshot(pile_path: &Path) -> Result<ConfigSnapshot> {
+fn load_config_snapshot(pile_path: &Path, key_path: Option<&Path>) -> Result<ConfigSnapshot> {
     let debug = std::env::var_os("PLAYGROUND_WEB_DEBUG").is_some();
-    let Some(view) = collection_access::materialize_named_legacy_branch(pile_path, CONFIG_BRANCH)
-        .context("look up config branch")?
-    else {
-        return Ok(ConfigSnapshot::default());
-    };
-    let Some(config_id) = latest_config_id(&view.facts)? else {
+    let signer = collection_access::load_signer(pile_path, key_path)?;
+    let allowed = HashSet::from([signer.verifying_key()]);
+    let snapshot = collection_access::CollectionSnapshot::open(pile_path)?;
+    let view = snapshot.materialize_scope(HEADSPACE_SCOPE_ID, &allowed)?;
+    let catalog = headspace::project_result(&view.reader, &view.facts)?;
+    let Some(config) = catalog.config.settled_value("Headspace config")? else {
         return Ok(ConfigSnapshot::default());
     };
     if debug {
-        eprintln!("[web] latest config id: {config_id:x}");
+        eprintln!("[web] resolved immutable Headspace config");
     }
     Ok(ConfigSnapshot {
-        tavily_api_key: load_string_attr(
-            &view.reader,
-            &view.facts,
-            config_id,
-            &config_schema::tavily_api_key,
-        )?,
-        exa_api_key: load_string_attr(
-            &view.reader,
-            &view.facts,
-            config_id,
-            &config_schema::exa_api_key,
-        )?,
+        tavily_api_key: config.tavily_api_key.clone(),
+        exa_api_key: config.exa_api_key.clone(),
     })
-}
-
-fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
-    let mut latest: Option<(i128, Id)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(space, [{
-            ?config_id @
-            metadata::tag: CONFIG_KIND_ID,
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let candidate = (interval_key(updated_at), config_id);
-        if latest.is_none_or(|current| candidate > current) {
-            latest = Some(candidate);
-        }
-    }
-    Ok(latest.map(|(_, id)| id))
-}
-
-fn interval_key(value: Inline<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = value.try_from_inline().unwrap();
-    lower.to_tai_duration().total_nanoseconds()
-}
-
-fn load_string_attr(
-    reader: &PileReader,
-    space: &TribleSet,
-    entity: Id,
-    attr: &Attribute<Handle<LongString>>,
-) -> Result<Option<String>> {
-    let handle = match find!(
-        (handle: Inline<Handle<LongString>>),
-        pattern!(space, [{ entity @ attr: ?handle }])
-    )
-    .into_iter()
-    .next()
-    {
-        Some((handle,)) => handle,
-        None => return Ok(None),
-    };
-    let view: View<str> = reader.get(handle).context("read config string")?;
-    Ok(Some(view.to_string()))
 }
 
 #[derive(Clone, Debug)]
@@ -800,6 +746,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace::core::collection::{discover_collection_records, simplearchive_union};
     use triblespace::core::repo::{PinStore, Repository};
+    use triblespace::macros::{find, pattern};
 
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -1005,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_web_migration_preserves_raw_deltas_and_excludes_config() {
+    fn legacy_web_migration_preserves_raw_deltas() {
         let directory = tempfile::tempdir().unwrap();
         let pile_path = directory.path().join("legacy-web.pile");
         let key_path = directory.path().join("collection.key");
@@ -1015,7 +962,6 @@ mod tests {
         let mut repo =
             Repository::new(pile, SigningKey::from_bytes(&[0x71; 32]), Fragment::empty()).unwrap();
         let web_branch = *repo.create_branch(LEGACY_WEB_BRANCH_NAME, None).unwrap();
-        let config_branch = *repo.create_branch(CONFIG_BRANCH, None).unwrap();
 
         // Deliberately split one logical search across raw historical deltas.
         // Migration must preserve exactly these facts, not rebuild a modern
@@ -1069,18 +1015,6 @@ mod tests {
             fetch
         };
 
-        // Provider credentials remain a separate legacy config concern and
-        // must never enter the web collection migration.
-        {
-            let mut workspace = repo.pull(config_branch).unwrap();
-            let config = entity! { _ @
-                metadata::tag: &CONFIG_KIND_ID,
-                metadata::updated_at: at_unix(70.0),
-                config_schema::tavily_api_key: "not-web-data",
-            };
-            workspace.commit(config, "legacy web config");
-            repo.push(&mut workspace).unwrap();
-        }
         repo.close().unwrap();
 
         collection_access::initialize_signer(&pile_path, Some(&key_path)).unwrap();
@@ -1110,9 +1044,6 @@ mod tests {
         let view = collection_access::materialize_scope(&pile_path, scope, &allowed).unwrap();
         assert_eq!(view.facts, expected);
         preflight_legacy_web_payloads(&view.reader, &view.facts).unwrap();
-        assert!(!exists!(pattern!(&view.facts, [{
-            _?config @ metadata::tag: &CONFIG_KIND_ID,
-        }])));
     }
 
     #[test]
@@ -1232,78 +1163,92 @@ mod tests {
     }
 
     #[test]
-    fn config_is_found_by_name_and_equal_times_choose_greater_entity_id() {
+    fn headspace_agreement_resolves_and_divergence_remains_a_fork() {
         let directory = tempfile::tempdir().unwrap();
         let pile_path = directory.path().join("config.pile");
         File::create(&pile_path).unwrap();
-        let pile = collection_access::open_pile_strict(&pile_path).unwrap();
-        let mut repo =
-            Repository::new(pile, SigningKey::from_bytes(&[0x61; 32]), Fragment::empty()).unwrap();
-        let branch = *repo.create_branch(CONFIG_BRANCH, None).unwrap();
-        let updated = at_unix(40.0);
-        let first = entity! { _ @
-            metadata::tag: &CONFIG_KIND_ID,
-            metadata::updated_at: updated,
-            config_schema::tavily_api_key: "first-tavily",
-            config_schema::exa_api_key: "first-exa",
-        };
-        let first_id = first.root().unwrap();
-        let second = entity! { _ @
-            metadata::tag: &CONFIG_KIND_ID,
-            metadata::updated_at: updated,
-            config_schema::tavily_api_key: "second-tavily",
-            config_schema::exa_api_key: "second-exa",
-        };
-        let second_id = second.root().unwrap();
-        let mut facts = first.facts().clone();
-        facts += second.facts().clone();
-        assert_eq!(
-            latest_config_id(&facts).unwrap(),
-            Some(first_id.max(second_id))
-        );
-        let expected = if first_id > second_id {
-            ("first-tavily", "first-exa")
-        } else {
-            ("second-tavily", "second-exa")
-        };
-        let mut workspace = repo.pull(branch).unwrap();
-        workspace.commit(first + second, "two equal-time configs");
-        repo.push(&mut workspace).unwrap();
-        repo.close().unwrap();
+        collection_access::initialize_signer(&pile_path, None).unwrap();
+        let anchor = test_id(0x61);
+        let profile = headspace::default_profile(anchor, "web");
+        let mut genesis = headspace::default_config(anchor);
+        genesis.tavily_api_key = Some("genesis-tavily".to_owned());
+        genesis.exa_api_key = Some("genesis-exa".to_owned());
+        let (fragment, _, genesis_id) =
+            headspace::add_profile_fragment(&profile, &genesis, &[]).unwrap();
+        collection_access::publish_fragment(
+            &pile_path,
+            None,
+            HEADSPACE_SCOPE_ID,
+            fragment,
+            Fragment::empty(),
+        )
+        .unwrap();
 
-        let length = std::fs::metadata(&pile_path).unwrap().len();
-        let snapshot = load_config_snapshot(&pile_path).unwrap();
-        assert_eq!(snapshot.tavily_api_key.as_deref(), Some(expected.0));
-        assert_eq!(snapshot.exa_api_key.as_deref(), Some(expected.1));
-        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
+        let mut left = genesis.clone();
+        left.tavily_api_key = Some("left-tavily".to_owned());
+        let mut right = genesis.clone();
+        right.tavily_api_key = Some("right-tavily".to_owned());
+        let (left, left_id) = headspace::config_snapshot_fragment(&left, &[genesis_id]).unwrap();
+        let (right, right_id) = headspace::config_snapshot_fragment(&right, &[genesis_id]).unwrap();
+        for fragment in [left, right] {
+            collection_access::publish_fragment(
+                &pile_path,
+                None,
+                HEADSPACE_SCOPE_ID,
+                fragment,
+                Fragment::empty(),
+            )
+            .unwrap();
+        }
+
+        let mut agreed = genesis.clone();
+        agreed.tavily_api_key = Some("agreed-tavily".to_owned());
+        agreed.exa_api_key = Some("agreed-exa".to_owned());
+        let (first, first_id) = headspace::config_snapshot_fragment(&agreed, &[left_id]).unwrap();
+        let (second, _) = headspace::config_snapshot_fragment(&agreed, &[right_id]).unwrap();
+        for fragment in [first, second] {
+            collection_access::publish_fragment(
+                &pile_path,
+                None,
+                HEADSPACE_SCOPE_ID,
+                fragment,
+                Fragment::empty(),
+            )
+            .unwrap();
+        }
+
+        let snapshot = load_config_snapshot(&pile_path, None).unwrap();
+        assert_eq!(snapshot.tavily_api_key.as_deref(), Some("agreed-tavily"));
+        assert_eq!(snapshot.exa_api_key.as_deref(), Some("agreed-exa"));
+
+        let mut divergent = agreed;
+        divergent.tavily_api_key = Some("forked-tavily".to_owned());
+        let (fragment, _) = headspace::config_snapshot_fragment(&divergent, &[first_id]).unwrap();
+        collection_access::publish_fragment(
+            &pile_path,
+            None,
+            HEADSPACE_SCOPE_ID,
+            fragment,
+            Fragment::empty(),
+        )
+        .unwrap();
+        let error = match load_config_snapshot(&pile_path, None) {
+            Ok(_) => panic!("divergent Headspace config unexpectedly resolved"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("forked"));
     }
 
     #[test]
-    fn missing_config_branch_returns_defaults_and_ambiguity_is_an_error() {
+    fn missing_headspace_track_returns_defaults_without_appending() {
         let directory = tempfile::tempdir().unwrap();
         let empty = directory.path().join("empty.pile");
         File::create(&empty).unwrap();
+        collection_access::initialize_signer(&empty, None).unwrap();
         let empty_length = std::fs::metadata(&empty).unwrap().len();
-        let snapshot = load_config_snapshot(&empty).unwrap();
+        let snapshot = load_config_snapshot(&empty, None).unwrap();
         assert!(snapshot.tavily_api_key.is_none());
         assert!(snapshot.exa_api_key.is_none());
         assert_eq!(std::fs::metadata(&empty).unwrap().len(), empty_length);
-
-        let ambiguous = directory.path().join("ambiguous.pile");
-        File::create(&ambiguous).unwrap();
-        let pile = collection_access::open_pile_strict(&ambiguous).unwrap();
-        let mut repo =
-            Repository::new(pile, SigningKey::from_bytes(&[0x62; 32]), Fragment::empty()).unwrap();
-        repo.create_branch(CONFIG_BRANCH, None).unwrap();
-        repo.create_branch(CONFIG_BRANCH, None).unwrap();
-        repo.close().unwrap();
-
-        let ambiguous_length = std::fs::metadata(&ambiguous).unwrap().len();
-        let error = load_config_snapshot(&ambiguous).unwrap_err();
-        assert!(format!("{error:#}").contains("look up config branch"));
-        assert_eq!(
-            std::fs::metadata(&ambiguous).unwrap().len(),
-            ambiguous_length
-        );
     }
 }

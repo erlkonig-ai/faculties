@@ -1,6 +1,7 @@
 //! Triage schema: doctor-style diagnostic attributes plus the kind markers
 //! and foreign attribute views the faculty reads when cross-referencing
-//! cognition, compass, message, and relations branches.
+//! cognition, compass, message, and relations branches. Headspace is resolved
+//! through its owning shared schema and projector rather than duplicated here.
 //!
 //! Used by `triage.rs` (the faculty CLI). Most of these kind/attribute
 //! IDs are duplicated from the faculties that own them; triage keeps its
@@ -24,20 +25,6 @@ pub const KIND_CONTEXT_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC"
 pub const REPO_HEAD_ATTR: Id = id_hex!("272FBC56108F336C4D2E17289468C35F");
 pub const REPO_PARENT_ATTR: Id = id_hex!("317044B612C690000D798CA660ECFD2A");
 pub const REPO_CONTENT_ATTR: Id = id_hex!("4DD4DDD05CC31734B03ABB4E43188B1F");
-
-pub mod config {
-    use super::*;
-    attributes! {
-        "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: inlineencodings::GenId;
-        "950B556A74F71AC7CB008AB23FBB6544" as system_prompt: inlineencodings::Handle<blobencodings::LongString>;
-        "79E1B50756FB64A30916E9353225E179" as active_model_profile_id: inlineencodings::GenId;
-        "6691CF3F872C6107DCFAD0BCF7CDC1A0" as model_profile_id: inlineencodings::GenId;
-        "F9CEA1A2E81D738BB125B4D144B7A746" as model_context_window_tokens: inlineencodings::U256BE;
-        "4200F6746B36F2784DEBA1555595D6AC" as model_max_output_tokens: inlineencodings::U256BE;
-        "1FF004BB48F7A4F8F72541F4D4FA75FF" as model_context_safety_margin_tokens: inlineencodings::U256BE;
-        "095FAECDB8FF205DF591DF594E593B01" as model_chars_per_token: inlineencodings::U256BE;
-    }
-}
 
 pub mod local {
     use super::*;

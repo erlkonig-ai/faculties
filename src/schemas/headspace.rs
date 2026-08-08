@@ -1,9 +1,8 @@
-//! Headspace (playground config) schema: active profile, model parameters,
-//! API keys, execution context.
+//! Headspace schema: fork-visible active configuration and model profiles.
 //!
-//! Used by `headspace.rs` (the faculty CLI) and by any runtime that needs
-//! to read the active model profile, system prompt, persona id, or related
-//! settings from a pile.
+//! One authored profile anchor names each logical profile. Intrinsic complete
+//! profile and config snapshots form predecessor DAGs through
+//! [`metadata::supersedes`](triblespace::core::metadata::supersedes).
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
@@ -19,14 +18,27 @@ pub const DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS: u64 = 512;
 pub const DEFAULT_CHARS_PER_TOKEN: u64 = 4;
 /// Minimal starting prompt used when no system prompt has been configured.
 /// Intentionally short and generic — specific agent runtimes should override
-/// this with their own prompt via `headspace set system-prompt @<file>`.
+/// it through their own configuration boundary.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a terminal-based agent. Respond with exactly one shell command per turn. You can include an optional leading comment block for context. Faculties are executable helper scripts in ./faculties; run them with no arguments to see usage and prefer them over ad-hoc commands when applicable.";
 
-pub const DEFAULT_BRANCH: &str = "cognition";
 pub const DEFAULT_AUTHOR: &str = "agent";
 pub const DEFAULT_AUTHOR_ROLE: &str = "user";
 pub const DEFAULT_POLL_MS: u64 = 1;
-pub const CONFIG_BRANCH: &str = "config";
+
+/// Stable extrinsic scope for the Headspace collection.
+///
+/// Minted with `trible genid` on 2026-08-08:
+/// `0A497071DF78800A265608C70849828A`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("0A497071DF78800A265608C70849828A");
+
+/// Kind of an authored stable model-profile anchor.
+///
+/// Minted with `trible genid` on 2026-08-08:
+/// `140BB1AF97C1971819CAB83D8ACA6B65`.
+pub const KIND_PROFILE_ANCHOR_ID: Id = id_hex!("140BB1AF97C1971819CAB83D8ACA6B65");
+
+// These existing kind ids already meant one immutable config/profile record;
+// the collection cutover makes their full-state and lineage semantics exact.
 pub const KIND_CONFIG_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 pub const KIND_MODEL_PROFILE_ID: Id = id_hex!("B08E356C4B08F44AB7EC177D47129447");
 
@@ -34,7 +46,9 @@ pub mod playground_config {
     use super::*;
     attributes! {
         "950B556A74F71AC7CB008AB23FBB6544" as system_prompt: Handle<LongString>;
-        "35E36AE7B60AD946661BD63B3CD64672" as branch: Handle<LongString>;
+        // Minted with `trible genid` on 2026-08-08:
+        // `DAE53BDA7C5D7878AF846490BF3DC62F`.
+        "DAE53BDA7C5D7878AF846490BF3DC62F" as cognition_scope: GenId;
         "F0F90572249284CD57E48580369DEB6D" as author: Handle<LongString>;
         "98A194178CFD7CBB915C1BC9EB561A7F" as author_role: Handle<LongString>;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: GenId;

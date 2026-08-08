@@ -24,6 +24,7 @@ use crate::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
 use crate::schemas::decide::DEFAULT_SCOPE_ID as DECIDE_SCOPE_ID;
 use crate::schemas::discord::DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID;
 use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
+use crate::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
 use crate::schemas::message::DEFAULT_SCOPE_ID as MESSAGES_SCOPE_ID;
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
@@ -193,6 +194,11 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         label: "Files",
     },
     CollectionSource {
+        key: SourceKey::Headspace,
+        scope: HEADSPACE_SCOPE_ID,
+        label: "Headspace",
+    },
+    CollectionSource {
         key: SourceKey::Messages,
         scope: MESSAGES_SCOPE_ID,
         label: "Messages",
@@ -221,10 +227,6 @@ const LEGACY_SOURCE_CATALOG: &[LegacySource] = &[
     LegacySource {
         key: SourceKey::Archive,
         branches: &["archive"],
-    },
-    LegacySource {
-        key: SourceKey::Headspace,
-        branches: &["config"],
     },
     LegacySource {
         key: SourceKey::Memory,
@@ -502,6 +504,10 @@ fn load_collection_catalog(
                 crate::decide::validate_catalog(&dataset.reader, &dataset.facts)
                     .map_err(|error| format!("validate Decide collection: {error:#}"))?
             }
+            SourceKey::Headspace => {
+                crate::headspace::validate_catalog(&dataset.reader, &dataset.facts)
+                    .map_err(|error| format!("validate Headspace collection: {error:#}"))?
+            }
             _ => {}
         }
         datasets.insert(source.key, dataset);
@@ -669,6 +675,7 @@ mod tests {
                 ("atlas", "legacy atlas"),
                 ("discord", "legacy discord"),
                 ("files", "legacy files"),
+                ("config", "legacy headspace"),
                 ("message", "legacy messages"),
                 ("relations", "legacy relations"),
                 ("status", "legacy status"),
@@ -682,6 +689,7 @@ mod tests {
             SourceKey::Atlas,
             SourceKey::Discord,
             SourceKey::Files,
+            SourceKey::Headspace,
             SourceKey::Messages,
             SourceKey::Relations,
             SourceKey::Status,
@@ -846,6 +854,28 @@ mod tests {
     }
 
     #[test]
+    fn malformed_headspace_collection_is_a_load_error_not_an_empty_dataset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("malformed-headspace.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+        collection_access::publish_fragment(
+            &path,
+            None,
+            HEADSPACE_SCOPE_ID,
+            entity! { metadata::tag: &crate::schemas::headspace::KIND_CONFIG_ID },
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let mut storage = StorageState::new(&path);
+        assert!(storage.context().dataset(SourceKey::Headspace).is_none());
+        let error = storage.error().unwrap();
+        assert!(error.contains("validate Headspace collection"));
+        assert!(error.contains("active_model_profile_id"));
+    }
+
+    #[test]
     fn failed_live_reload_retains_the_last_coherent_collection_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("retain-last-good.pile");
@@ -913,14 +943,14 @@ mod tests {
         let triage = context.dataset(SourceKey::Triage).unwrap();
         assert_eq!(memory.revision, reason.revision);
         assert_eq!(memory.revision, triage.revision);
-        for key in [
-            SourceKey::Archive,
-            SourceKey::Headspace,
-            SourceKey::Planner,
-            SourceKey::Wiki,
-        ] {
+        for key in [SourceKey::Archive, SourceKey::Planner, SourceKey::Wiki] {
             assert!(context.dataset(key).is_none());
         }
+        assert!(context
+            .dataset(SourceKey::Headspace)
+            .unwrap()
+            .facts
+            .is_empty());
     }
 
     #[test]
@@ -937,7 +967,6 @@ mod tests {
             legacy,
             BTreeSet::from([
                 SourceKey::Archive,
-                SourceKey::Headspace,
                 SourceKey::Memory,
                 SourceKey::Planner,
                 SourceKey::Reason,
@@ -953,6 +982,7 @@ mod tests {
                 SourceKey::Decide,
                 SourceKey::Discord,
                 SourceKey::Files,
+                SourceKey::Headspace,
                 SourceKey::Messages,
                 SourceKey::Relations,
                 SourceKey::Status,

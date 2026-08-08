@@ -1,59 +1,48 @@
-use std::collections::HashMap;
-use std::fs;
-use std::io::Read;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::headspace::{
-    playground_config, CONFIG_BRANCH, DEFAULT_AUTHOR, DEFAULT_AUTHOR_ROLE, DEFAULT_BASE_URL,
-    DEFAULT_BRANCH, DEFAULT_CHARS_PER_TOKEN, DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
-    DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MODEL, DEFAULT_POLL_MS,
-    DEFAULT_STREAM, DEFAULT_SYSTEM_PROMPT, KIND_CONFIG_ID, KIND_MODEL_PROFILE_ID,
-};
-use hifitime::Epoch;
-use rand_core::OsRng;
+use faculties::collection_access;
+use faculties::headspace::{self, Catalog, ConfigValue, ProfileValue, Resolution};
+use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     version = faculties::GIT_VERSION,
     name = "headspace",
     bin_name = "headspace",
-    about = "Manage active headspace (profile/model/reasoning)."
+    about = "Manage fork-visible Headspace configuration and model profiles."
 )]
 struct Cli {
-    /// Path to the pile file to use
+    /// Existing pile file. Reads never create a pile or signing identity.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Clone)]
 enum Command {
-    /// Show active headspace settings and available profiles
+    /// Show the resolved active Headspace and available profiles.
     Show {
         #[arg(long, default_value_t = false)]
         show_secrets: bool,
     },
-    /// List available profiles
+    /// List profile anchors and their current resolution.
     List,
-    /// Switch active profile by id or name
+    /// Switch the active profile by anchor id or settled profile name.
     Use {
         #[arg(value_name = "PROFILE")]
         profile: String,
     },
-    /// Add a new profile and make it active
+    /// Author a fresh profile anchor and activate it in one signed COMMIT.
+    /// After an ambiguous transport failure, inspect `list` before retrying:
+    /// every invocation intentionally creates a new logical profile.
     Add(AddArgs),
-    /// Set one field on the active profile
+    /// Set one field on the resolved active profile.
     Set {
         #[arg(value_enum, value_name = "FIELD")]
         field: SetField,
@@ -63,14 +52,20 @@ enum Command {
         )]
         value: String,
     },
-    /// Clear one optional field on the active profile
+    /// Clear one optional field on the resolved active profile.
     Unset {
         #[arg(value_enum, value_name = "FIELD")]
         field: UnsetField,
     },
+    /// Choose any existing complete snapshot as the intended state of its
+    /// track and supersede every live head on that track.
+    Reconcile {
+        #[arg(value_name = "SNAPSHOT")]
+        snapshot: String,
+    },
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Clone)]
 struct AddArgs {
     #[arg(value_name = "NAME")]
     name: String,
@@ -115,50 +110,16 @@ enum UnsetField {
     ReasoningEffort,
 }
 
-#[derive(Clone, Debug)]
-struct Config {
-    pile_path: PathBuf,
-    model: ModelConfig,
-    model_profile_id: Option<Id>,
-    model_profile_name: String,
-    tavily_api_key: Option<String>,
-    exa_api_key: Option<String>,
-    exec: ExecConfig,
-    system_prompt: String,
-    branch: String,
-    author: String,
-    author_role: String,
-    persona_id: Option<Id>,
-    poll_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-struct ModelConfig {
-    model: String,
-    base_url: String,
-    api_key: Option<String>,
-    reasoning_effort: Option<String>,
-    stream: bool,
-    context_window_tokens: u64,
-    max_output_tokens: u64,
-    context_safety_margin_tokens: u64,
-    chars_per_token: u64,
-}
-
-#[derive(Clone, Debug)]
-struct ExecConfig {
-    default_cwd: Option<PathBuf>,
-    sandbox_profile: Option<Id>,
-}
-
-#[derive(Clone, Debug)]
-struct ModelProfileSummary {
-    id: Id,
-    name: String,
+struct LoadedHeadspace {
+    view: collection_access::CollectionView,
+    catalog: Catalog,
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    run(Cli::parse())
+}
+
+fn run(cli: Cli) -> Result<()> {
     let Some(command) = cli.command.as_ref() else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -168,814 +129,400 @@ fn main() -> Result<()> {
 
     match command {
         Command::Show { show_secrets } => {
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, *show_secrets)?;
+            let state = load_headspace(&cli.pile)?;
+            print_headspace(&state.catalog, *show_secrets)
         }
         Command::List => {
-            let config = load_config(cli.pile.as_path())?;
-            print_profile_list(&config)?;
+            let state = load_headspace(&cli.pile)?;
+            print_profile_list(&state.catalog)
         }
         Command::Use { profile } => {
-            let mut config = load_config(cli.pile.as_path())?;
-            let profile_id = resolve_profile_selector(cli.pile.as_path(), profile.as_str())?;
-            let Some((model, name)) = load_model_profile(cli.pile.as_path(), profile_id)? else {
-                return Err(anyhow!("unknown profile {profile_id:x}"));
-            };
-            config.model_profile_id = Some(profile_id);
-            config.model_profile_name = name;
-            config.model = model;
-            store_config_to_pile(config)?;
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, false)?;
+            let state = load_headspace(&cli.pile)?;
+            let anchor = resolve_profile_selector(&state.catalog, profile)?;
+            require_profile(&state.catalog, anchor)?;
+            let existing = settled_config(&state.catalog)?;
+            if existing.is_some_and(|config| config.active_profile == anchor) {
+                return print_headspace(&state.catalog, false);
+            }
+            let mut config = existing
+                .cloned()
+                .unwrap_or_else(|| headspace::default_config(anchor));
+            config.active_profile = anchor;
+            let (fragment, _) =
+                headspace::config_snapshot_fragment(&config, &state.catalog.config.head_ids())?;
+            publish(
+                &cli.pile,
+                &state,
+                fragment,
+                "switch active Headspace profile",
+            )?;
+            print_reloaded(&cli.pile)
         }
         Command::Add(args) => {
-            let mut config = load_config(cli.pile.as_path())?;
-            config.model_profile_id = Some(*genid());
-            config.model_profile_name = args.name.clone();
-            apply_add_overrides(&mut config, args)?;
-            store_config_to_pile(config)?;
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, false)?;
+            let state = load_headspace(&cli.pile)?;
+            let anchor = genid().id;
+            let mut profile = match settled_config(&state.catalog)? {
+                Some(config) => require_profile(&state.catalog, config.active_profile)?.clone(),
+                None => headspace::default_profile(anchor, args.name.clone()),
+            };
+            profile.anchor = anchor;
+            profile.name = args.name.clone();
+            apply_add_overrides(&mut profile, args)?;
+            let mut config = settled_config(&state.catalog)?
+                .cloned()
+                .unwrap_or_else(|| headspace::default_config(anchor));
+            config.active_profile = anchor;
+            let (fragment, _, _) = headspace::add_profile_fragment(
+                &profile,
+                &config,
+                &state.catalog.config.head_ids(),
+            )?;
+            publish(
+                &cli.pile,
+                &state,
+                fragment,
+                "add and activate Headspace profile",
+            )?;
+            print_reloaded(&cli.pile)
         }
         Command::Set { field, value } => {
-            let mut config = load_config(cli.pile.as_path())?;
-            apply_set(&mut config, *field, value.as_str())?;
-            store_config_to_pile(config)?;
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, false)?;
+            let state = load_headspace(&cli.pile)?;
+            let config = settled_config(&state.catalog)?.ok_or_else(|| {
+                anyhow!("Headspace has no active configuration; add a profile first")
+            })?;
+            let current = require_profile(&state.catalog, config.active_profile)?;
+            let mut changed = current.clone();
+            apply_set(&mut changed, *field, value)?;
+            if changed == *current {
+                return print_headspace(&state.catalog, false);
+            }
+            let resolution = &state.catalog.profiles[&config.active_profile];
+            let (fragment, _) =
+                headspace::profile_snapshot_fragment(&changed, &resolution.head_ids())?;
+            publish(&cli.pile, &state, fragment, "update Headspace profile")?;
+            print_reloaded(&cli.pile)
         }
         Command::Unset { field } => {
-            let mut config = load_config(cli.pile.as_path())?;
-            apply_unset(&mut config, *field)?;
-            store_config_to_pile(config)?;
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, false)?;
+            let state = load_headspace(&cli.pile)?;
+            let config = settled_config(&state.catalog)?.ok_or_else(|| {
+                anyhow!("Headspace has no active configuration; add a profile first")
+            })?;
+            let current = require_profile(&state.catalog, config.active_profile)?;
+            let mut changed = current.clone();
+            apply_unset(&mut changed, *field);
+            if changed == *current {
+                return print_headspace(&state.catalog, false);
+            }
+            let resolution = &state.catalog.profiles[&config.active_profile];
+            let (fragment, _) =
+                headspace::profile_snapshot_fragment(&changed, &resolution.head_ids())?;
+            publish(&cli.pile, &state, fragment, "unset Headspace profile field")?;
+            print_reloaded(&cli.pile)
+        }
+        Command::Reconcile { snapshot } => {
+            let state = load_headspace(&cli.pile)?;
+            let chosen = faculties::resolve_id_prefix(snapshot, state.catalog.snapshot_ids())?;
+            let Some((fragment, _)) = state.catalog.reconcile_fragment(chosen)? else {
+                return print_headspace(&state.catalog, false);
+            };
+            publish(
+                &cli.pile,
+                &state,
+                fragment,
+                "reconcile Headspace snapshot track",
+            )?;
+            print_reloaded(&cli.pile)
         }
     }
+}
 
+fn load_headspace(pile: &Path) -> Result<LoadedHeadspace> {
+    // Resolve authority before opening storage so a missing key cannot create
+    // or mutate the requested pile.
+    let signer = collection_access::load_signer(pile, None)?;
+    let allowed = HashSet::from([signer.verifying_key()]);
+    let snapshot = collection_access::CollectionSnapshot::open(pile)?;
+    let view = snapshot.materialize_scope(DEFAULT_SCOPE_ID, &allowed)?;
+    let catalog = headspace::project_result(&view.reader, &view.facts)?;
+    Ok(LoadedHeadspace { view, catalog })
+}
+
+fn publish(pile: &Path, state: &LoadedHeadspace, fragment: Fragment, message: &str) -> Result<()> {
+    headspace::validate_catalog_union(&state.view.reader, &state.view.facts, &fragment)
+        .context("validate Headspace successor")?;
+    collection_access::publish_fragment(
+        pile,
+        None,
+        DEFAULT_SCOPE_ID,
+        fragment,
+        entity! { metadata::description: message.to_owned() },
+    )?;
     Ok(())
 }
 
-fn apply_add_overrides(config: &mut Config, args: &AddArgs) -> Result<()> {
+fn print_reloaded(pile: &Path) -> Result<()> {
+    let state = load_headspace(pile)?;
+    print_headspace(&state.catalog, false)
+}
+
+fn settled_config(catalog: &Catalog) -> Result<Option<&ConfigValue>> {
+    catalog.config.settled_value("Headspace config")
+}
+
+fn require_profile(catalog: &Catalog, anchor: Id) -> Result<&ProfileValue> {
+    let resolution = catalog
+        .profiles
+        .get(&anchor)
+        .ok_or_else(|| anyhow!("unknown profile {anchor:x}"))?;
+    resolution
+        .settled_value(&format!("profile {anchor:x}"))?
+        .ok_or_else(|| anyhow!("profile {anchor:x} has no snapshot"))
+}
+
+fn resolve_profile_selector(catalog: &Catalog, raw: &str) -> Result<Id> {
+    if let Some(id) = Id::from_hex(raw.trim()) {
+        if catalog.profiles.contains_key(&id) {
+            return Ok(id);
+        }
+        bail!("unknown profile {id:x}");
+    }
+    let needle = raw.trim().to_lowercase();
+    let mut matches = Vec::new();
+    for (&anchor, resolution) in &catalog.profiles {
+        let profile = match resolution {
+            Resolution::Unique(snapshot) => Some(&snapshot.value),
+            Resolution::Agreed(snapshots) => snapshots.first().map(|snapshot| &snapshot.value),
+            Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
+        };
+        if profile.is_some_and(|profile| profile.name.to_lowercase() == needle) {
+            matches.push(anchor);
+        }
+    }
+    match matches.as_slice() {
+        [] => bail!("unknown profile '{raw}'"),
+        [id] => Ok(*id),
+        _ => bail!("profile name '{raw}' is ambiguous; use the hex anchor id"),
+    }
+}
+
+fn apply_add_overrides(profile: &mut ProfileValue, args: &AddArgs) -> Result<()> {
     if let Some(value) = args.model.as_deref() {
-        config.model.model = value.to_string();
+        profile.model = value.to_owned();
     }
     if let Some(value) = args.base_url.as_deref() {
-        config.model.base_url = value.to_string();
+        profile.base_url = value.to_owned();
     }
     if let Some(value) = args.api_key.as_deref() {
-        config.model.api_key = Some(value.trim().to_string());
+        profile.api_key = Some(value.trim().to_owned());
     }
     if let Some(value) = args.reasoning_effort.as_deref() {
-        config.model.reasoning_effort = Some(value.trim().to_string());
+        profile.reasoning_effort = Some(value.trim().to_owned());
     }
     if let Some(value) = args.stream {
-        config.model.stream = value;
+        profile.stream = value;
     }
     if let Some(value) = args.context_window_tokens {
-        config.model.context_window_tokens = value;
+        profile.context_window_tokens = value;
     }
     if let Some(value) = args.max_output_tokens {
-        config.model.max_output_tokens = value;
+        profile.max_output_tokens = value;
     }
     if let Some(value) = args.context_safety_margin_tokens {
-        config.model.context_safety_margin_tokens = value;
+        profile.context_safety_margin_tokens = value;
     }
     if let Some(value) = args.chars_per_token {
-        config.model.chars_per_token = value;
+        profile.chars_per_token = value;
     }
     Ok(())
 }
 
-fn apply_set(config: &mut Config, field: SetField, value: &str) -> Result<()> {
+fn apply_set(profile: &mut ProfileValue, field: SetField, raw: &str) -> Result<()> {
     match field {
-        SetField::Model => config.model.model = load_value_or_file(value, "model_name")?,
-        SetField::BaseUrl => config.model.base_url = load_value_or_file(value, "model_base_url")?,
+        SetField::Model => profile.model = faculties::text_arg(raw, "model name")?,
+        SetField::BaseUrl => profile.base_url = faculties::text_arg(raw, "model base URL")?,
         SetField::ApiKey => {
-            config.model.api_key = Some(load_value_or_file_trimmed(value, "model_api_key")?)
+            profile.api_key = Some(faculties::text_arg(raw, "model API key")?.trim().to_owned())
         }
         SetField::ReasoningEffort => {
-            config.model.reasoning_effort =
-                Some(load_value_or_file_trimmed(value, "model_reasoning_effort")?)
+            profile.reasoning_effort = Some(
+                faculties::text_arg(raw, "model reasoning effort")?
+                    .trim()
+                    .to_owned(),
+            )
         }
-        SetField::Stream => config.model.stream = parse_bool(value, "model_stream")?,
+        SetField::Stream => profile.stream = parse_bool(raw, "model_stream")?,
         SetField::ContextWindowTokens => {
-            config.model.context_window_tokens = parse_u64(value, "model_context_window_tokens")?
+            profile.context_window_tokens = parse_u64(raw, "model_context_window_tokens")?
         }
         SetField::MaxOutputTokens => {
-            config.model.max_output_tokens = parse_u64(value, "model_max_output_tokens")?
+            profile.max_output_tokens = parse_u64(raw, "model_max_output_tokens")?
         }
         SetField::PromptSafetyMarginTokens => {
-            config.model.context_safety_margin_tokens =
-                parse_u64(value, "model_context_safety_margin_tokens")?
+            profile.context_safety_margin_tokens =
+                parse_u64(raw, "model_context_safety_margin_tokens")?
         }
         SetField::PromptCharsPerToken => {
-            config.model.chars_per_token = parse_u64(value, "model_chars_per_token")?
+            profile.chars_per_token = parse_u64(raw, "model_chars_per_token")?
         }
     }
     Ok(())
 }
 
-fn apply_unset(config: &mut Config, field: UnsetField) -> Result<()> {
+fn apply_unset(profile: &mut ProfileValue, field: UnsetField) {
     match field {
-        UnsetField::ApiKey => config.model.api_key = None,
-        UnsetField::ReasoningEffort => config.model.reasoning_effort = None,
-    }
-    Ok(())
-}
-
-fn resolve_profile_selector(pile_path: &Path, raw: &str) -> Result<Id> {
-    if let Ok(id) = parse_hex_id(raw, "profile_id") {
-        return Ok(id);
-    }
-
-    let needle = raw.trim().to_lowercase();
-    let profiles = list_model_profiles(pile_path)?;
-    let mut matches = profiles
-        .into_iter()
-        .filter(|profile| profile.name.to_lowercase() == needle);
-    let Some(first) = matches.next() else {
-        return Err(anyhow!("unknown profile '{raw}'"));
-    };
-    if matches.next().is_some() {
-        return Err(anyhow!("profile name '{raw}' is ambiguous; use the hex id"));
-    }
-    Ok(first.id)
-}
-
-fn format_option_quoted(value: Option<&str>) -> String {
-    value
-        .map(|v| format!("\"{v}\""))
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn redact_option(value: Option<&str>) -> String {
-    match value {
-        Some(_) => "\"<redacted>\"".to_string(),
-        None => "null".to_string(),
+        UnsetField::ApiKey => profile.api_key = None,
+        UnsetField::ReasoningEffort => profile.reasoning_effort = None,
     }
 }
 
-fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
+fn print_headspace(catalog: &Catalog, show_secrets: bool) -> Result<()> {
     println!("active:");
+    let Some(config) = settled_config(catalog)? else {
+        print_profile(
+            None,
+            &headspace::default_profile(Id::new([1; 16]).unwrap(), "default"),
+            show_secrets,
+        );
+        println!();
+        println!("profiles:");
+        return print_profile_list(catalog);
+    };
+    let profile = require_profile(catalog, config.active_profile)?;
+    print_profile(Some(config.active_profile), profile, show_secrets);
+    println!();
+    println!("profiles:");
+    print_profile_list(catalog)
+}
+
+fn print_profile(anchor: Option<Id>, profile: &ProfileValue, show_secrets: bool) {
     println!(
         "  profile_id = {}",
-        config
-            .model_profile_id
+        anchor
             .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
+            .unwrap_or_else(|| "null".to_owned())
     );
-    println!("  profile_name = \"{}\"", config.model_profile_name);
-    println!("  model = \"{}\"", config.model.model);
-    println!("  base_url = \"{}\"", config.model.base_url);
+    println!("  profile_name = \"{}\"", profile.name);
+    println!("  model = \"{}\"", profile.model);
+    println!("  base_url = \"{}\"", profile.base_url);
     println!(
         "  api_key = {}",
-        if show_secrets {
-            format_option_quoted(config.model.api_key.as_deref())
-        } else {
-            redact_option(config.model.api_key.as_deref())
+        match (show_secrets, profile.api_key.as_deref()) {
+            (_, None) => "null".to_owned(),
+            (true, Some(value)) => format!("\"{value}\""),
+            (false, Some(_)) => "\"<redacted>\"".to_owned(),
         }
     );
     println!(
         "  reasoning_effort = {}",
-        format_option_quoted(config.model.reasoning_effort.as_deref())
+        profile
+            .reasoning_effort
+            .as_deref()
+            .map(|value| format!("\"{value}\""))
+            .unwrap_or_else(|| "null".to_owned())
     );
-    println!("  stream = {}", config.model.stream);
+    println!("  stream = {}", profile.stream);
     println!(
         "  context_window_tokens = {}",
-        config.model.context_window_tokens
+        profile.context_window_tokens
     );
-    println!("  max_output_tokens = {}", config.model.max_output_tokens);
+    println!("  max_output_tokens = {}", profile.max_output_tokens);
     println!(
         "  context_safety_margin_tokens = {}",
-        config.model.context_safety_margin_tokens
+        profile.context_safety_margin_tokens
     );
-    println!("  chars_per_token = {}", config.model.chars_per_token);
-    println!();
-    println!("profiles:");
-    print_profile_list(config)
+    println!("  chars_per_token = {}", profile.chars_per_token);
 }
 
-fn print_profile_list(config: &Config) -> Result<()> {
-    let profiles = list_model_profiles(config.pile_path.as_path())?;
-    for profile in profiles {
-        let active = (config.model_profile_id == Some(profile.id)).then_some("*");
-        let active = active.unwrap_or(" ");
-        println!("{active} {}\t{:x}", profile.name, profile.id);
+fn print_profile_list(catalog: &Catalog) -> Result<()> {
+    let active = match &catalog.config {
+        Resolution::Unique(snapshot) => Some(snapshot.value.active_profile),
+        Resolution::Agreed(snapshots) => snapshots
+            .first()
+            .map(|snapshot| snapshot.value.active_profile),
+        Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
+    };
+    match &catalog.config {
+        Resolution::Missing => println!("config\t<missing>"),
+        Resolution::Unique(snapshot) => println!(
+            "config\t{:x}\tactive={:x}",
+            snapshot.id, snapshot.value.active_profile
+        ),
+        Resolution::Agreed(snapshots) => println!(
+            "config\t<agreed:{}>\theads={}",
+            snapshots.len(),
+            format_snapshot_ids(snapshots.iter().map(|snapshot| snapshot.id))
+        ),
+        Resolution::Forked(snapshots) => {
+            println!(
+                "config\t<forked:{}>\theads={}",
+                snapshots.len(),
+                format_snapshot_ids(snapshots.iter().map(|snapshot| snapshot.id))
+            );
+            for snapshot in snapshots {
+                println!(
+                    "  head\t{:x}\tactive={:x}",
+                    snapshot.id, snapshot.value.active_profile
+                );
+            }
+        }
+        Resolution::Invalid(error) => println!("config\t<invalid>\t{error}"),
+    }
+    let mut rows = Vec::new();
+    for (&anchor, resolution) in &catalog.profiles {
+        let marker = if active == Some(anchor) { '*' } else { ' ' };
+        match resolution {
+            Resolution::Unique(snapshot) => rows.push((
+                snapshot.value.name.to_lowercase(),
+                format!(
+                    "{marker} {}\t{anchor:x}\tsnapshot={:x}",
+                    snapshot.value.name, snapshot.id
+                ),
+            )),
+            Resolution::Agreed(snapshots) => {
+                let profile = &snapshots[0].value;
+                rows.push((
+                    profile.name.to_lowercase(),
+                    format!(
+                        "{marker} {}\t{anchor:x}\t[agreed:{}]\theads={}",
+                        profile.name,
+                        snapshots.len(),
+                        format_snapshot_ids(snapshots.iter().map(|snapshot| snapshot.id))
+                    ),
+                ));
+            }
+            Resolution::Forked(snapshots) => {
+                let names: BTreeSet<_> = snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.value.name.as_str())
+                    .collect();
+                rows.push((
+                    String::new(),
+                    format!(
+                        "! <forked:{}>\t{anchor:x}\theads={}\t{}",
+                        snapshots.len(),
+                        format_snapshot_ids(snapshots.iter().map(|snapshot| snapshot.id)),
+                        names.into_iter().collect::<Vec<_>>().join(" | ")
+                    ),
+                ));
+            }
+            Resolution::Missing => rows.push((String::new(), format!("! <missing>\t{anchor:x}"))),
+            Resolution::Invalid(error) => {
+                rows.push((String::new(), format!("! <invalid>\t{anchor:x}\t{error}")))
+            }
+        }
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, row) in rows {
+        println!("{row}");
     }
     Ok(())
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
-    (epoch, epoch).try_to_inline().unwrap()
-}
-
-fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
-    lower.to_tai_duration().total_nanoseconds()
-}
-
-fn push_workspace(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>) -> Result<()> {
-    while let Some(mut conflict) = repo
-        .try_push(ws)
-        .map_err(|err| anyhow!("push workspace: {err:?}"))?
-    {
-        conflict
-            .merge(ws)
-            .map_err(|err| anyhow!("merge workspace: {err:?}"))?;
-        *ws = conflict;
-    }
-    Ok(())
-}
-
-fn close_repo(repo: Repository<Pile>) -> Result<()> {
-    repo.into_storage().close().context("close pile")
-}
-
-fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile>, Id)> {
-    let mut pile = Pile::open(pile_path).context("open pile")?;
-    if let Err(err) = pile.refresh() {
-        let close_res = pile.close().context("close pile after refresh failure");
-        if let Err(close_err) = close_res {
-            eprintln!("warning: failed to close pile cleanly: {close_err:#}");
-        }
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                pile_path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", pile_path.display()),
-        });
-    }
-
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))?;
-    let branch_id = repo
-        .ensure_branch(CONFIG_BRANCH, None)
-        .map_err(|e| anyhow!("ensure config branch: {e:?}"))?;
-    Ok((repo, branch_id))
-}
-
-fn load_config(pile_path: &Path) -> Result<Config> {
-    let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Config> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout config workspace")?;
-
-        let config = if let Some(config) = load_latest_config(&mut ws, &catalog, pile_path)? {
-            config
-        } else {
-            default_config(pile_path.to_path_buf())
-        };
-
-        Ok(config)
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
-}
-
-fn store_config_to_pile(config: Config) -> Result<()> {
-    let (mut repo, branch_id) = open_config_repo(config.pile_path.as_path())?;
-    let result = (|| -> Result<()> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        store_config(&mut ws, &config).context("store config")?;
-        push_workspace(&mut repo, &mut ws).context("push config")?;
-        Ok(())
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
-}
-
-fn list_model_profiles(pile_path: &Path) -> Result<Vec<ModelProfileSummary>> {
-    let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Vec<ModelProfileSummary>> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout config workspace")?;
-
-        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-        for (entry_id, profile_id, updated_at) in find!(
-            (entry_id: Id, profile_id: Id, updated_at: Inline<NsTAIInterval>),
-            pattern!(&catalog, [{
-                ?entry_id @
-                metadata::tag: KIND_MODEL_PROFILE_ID,
-                metadata::updated_at: ?updated_at,
-                playground_config::model_profile_id: ?profile_id,
-            }])
-        ) {
-            let key = interval_key(updated_at);
-            latest
-                .entry(profile_id)
-                .and_modify(|slot| {
-                    if key > slot.1 {
-                        *slot = (entry_id, key);
-                    }
-                })
-                .or_insert((entry_id, key));
-        }
-
-        let mut profiles = Vec::new();
-        for (profile_id, (entry_id, _updated_key)) in latest {
-            let name = load_string_attr(&mut ws, &catalog, entry_id, &metadata::name)?
-                .unwrap_or_else(|| format!("profile-{profile_id:x}"));
-            profiles.push(ModelProfileSummary {
-                id: profile_id,
-                name,
-            });
-        }
-        profiles.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-        Ok(profiles)
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
-}
-
-fn load_model_profile(pile_path: &Path, profile_id: Id) -> Result<Option<(ModelConfig, String)>> {
-    let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Option<(ModelConfig, String)>> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout config workspace")?;
-        load_latest_model_profile(&mut ws, &catalog, profile_id)
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
-}
-
-fn load_latest_config(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    pile_path: &Path,
-) -> Result<Option<Config>> {
-    let mut latest: Option<(Id, i128)> = None;
-
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?config_id @
-            metadata::tag: KIND_CONFIG_ID,
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest {
-            Some((current_id, current_key))
-                if current_key > key || (current_key == key && current_id >= config_id) => {}
-            _ => latest = Some((config_id, key)),
-        }
-    }
-
-    let Some((config_id, _)) = latest else {
-        return Ok(None);
-    };
-
-    let mut config = default_config(pile_path.to_path_buf());
-
-    if let Some(prompt) =
-        load_string_attr(ws, catalog, config_id, &playground_config::system_prompt)?
-    {
-        config.system_prompt = prompt;
-    }
-    if let Some(branch) = load_string_attr(ws, catalog, config_id, &playground_config::branch)? {
-        config.branch = branch;
-    }
-    if let Some(author) = load_string_attr(ws, catalog, config_id, &playground_config::author)? {
-        config.author = author;
-    }
-    if let Some(role) = load_string_attr(ws, catalog, config_id, &playground_config::author_role)? {
-        config.author_role = role;
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::persona_id) {
-        config.persona_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(
-        catalog,
-        config_id,
-        &playground_config::active_model_profile_id,
-    ) {
-        config.model_profile_id = Some(id);
-    }
-    if let Some(model) = load_string_attr(ws, catalog, config_id, &playground_config::model_name)? {
-        config.model.model = model;
-    }
-    if let Some(url) = load_string_attr(ws, catalog, config_id, &playground_config::model_base_url)?
-    {
-        config.model.base_url = url;
-    }
-    if let Some(effort) = load_string_attr(
-        ws,
-        catalog,
-        config_id,
-        &playground_config::model_reasoning_effort,
-    )? {
-        config.model.reasoning_effort = Some(effort);
-    }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::model_api_key)?
-    {
-        config.model.api_key = Some(key);
-    }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::tavily_api_key)?
-    {
-        config.tavily_api_key = Some(key);
-    }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::exa_api_key)? {
-        config.exa_api_key = Some(key);
-    }
-    if let Some(cwd) =
-        load_string_attr(ws, catalog, config_id, &playground_config::exec_default_cwd)?
-    {
-        config.exec.default_cwd = Some(PathBuf::from(cwd));
-    }
-
-    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::exec_sandbox_profile) {
-        config.exec.sandbox_profile = Some(id);
-    }
-    if let Some(poll_ms) =
-        load_u256_attr(catalog, config_id, &playground_config::poll_ms).and_then(u256be_to_u64)
-    {
-        config.poll_ms = poll_ms;
-    }
-    if let Some(stream) =
-        load_u256_attr(catalog, config_id, &playground_config::model_stream).and_then(u256be_to_u64)
-    {
-        config.model.stream = stream != 0;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        config_id,
-        &playground_config::model_context_window_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.model.context_window_tokens = tokens;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        config_id,
-        &playground_config::model_max_output_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.model.max_output_tokens = tokens;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        config_id,
-        &playground_config::model_context_safety_margin_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.model.context_safety_margin_tokens = tokens;
-    }
-    if let Some(chars) = load_u256_attr(
-        catalog,
-        config_id,
-        &playground_config::model_chars_per_token,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.model.chars_per_token = chars;
-    }
-    if let Some(profile_id) = config.model_profile_id {
-        if let Some((model, name)) = load_latest_model_profile(ws, catalog, profile_id)? {
-            config.model = model;
-            config.model_profile_name = name;
-        }
-    }
-
-    Ok(Some(config))
-}
-
-fn load_latest_model_profile(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    profile_id: Id,
-) -> Result<Option<(ModelConfig, String)>> {
-    let mut latest: Option<(Id, i128)> = None;
-
-    for (entry_id, updated_at) in find!(
-        (entry_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?entry_id @
-            metadata::tag: KIND_MODEL_PROFILE_ID,
-            metadata::updated_at: ?updated_at,
-            playground_config::model_profile_id: profile_id,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest {
-            Some((current_id, current_key))
-                if current_key > key || (current_key == key && current_id >= entry_id) => {}
-            _ => latest = Some((entry_id, key)),
-        }
-    }
-
-    let Some((entry_id, _)) = latest else {
-        return Ok(None);
-    };
-
-    let mut mc = ModelConfig::default();
-    if let Some(model) = load_string_attr(ws, catalog, entry_id, &playground_config::model_name)? {
-        mc.model = model;
-    }
-    if let Some(url) = load_string_attr(ws, catalog, entry_id, &playground_config::model_base_url)?
-    {
-        mc.base_url = url;
-    }
-    if let Some(effort) = load_string_attr(
-        ws,
-        catalog,
-        entry_id,
-        &playground_config::model_reasoning_effort,
-    )? {
-        mc.reasoning_effort = Some(effort);
-    }
-    if let Some(key) = load_string_attr(ws, catalog, entry_id, &playground_config::model_api_key)? {
-        mc.api_key = Some(key);
-    }
-    if let Some(stream) =
-        load_u256_attr(catalog, entry_id, &playground_config::model_stream).and_then(u256be_to_u64)
-    {
-        mc.stream = stream != 0;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        entry_id,
-        &playground_config::model_context_window_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        mc.context_window_tokens = tokens;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        entry_id,
-        &playground_config::model_max_output_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        mc.max_output_tokens = tokens;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        entry_id,
-        &playground_config::model_context_safety_margin_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        mc.context_safety_margin_tokens = tokens;
-    }
-    if let Some(chars) =
-        load_u256_attr(catalog, entry_id, &playground_config::model_chars_per_token)
-            .and_then(u256be_to_u64)
-    {
-        mc.chars_per_token = chars;
-    }
-    let name = load_string_attr(ws, catalog, entry_id, &metadata::name)?
-        .unwrap_or_else(|| format!("profile-{profile_id:x}"));
-    Ok(Some((mc, name)))
-}
-
-fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
-    let now = epoch_interval(now_epoch());
-    let config_id = ufoid();
-    let profile_id = config
-        .model_profile_id
-        .ok_or_else(|| anyhow!("config missing active model profile id"))?;
-
-    let system_prompt = ws.put(config.system_prompt.clone());
-    let branch = ws.put(config.branch.clone());
-    let author = ws.put(config.author.clone());
-    let author_role = ws.put(config.author_role.clone());
-    let poll_ms: Inline<U256BE> = config.poll_ms.to_inline();
-
-    let mut change = TribleSet::new();
-    change += entity! { &config_id @
-        metadata::tag: KIND_CONFIG_ID,
-        metadata::updated_at: now,
-        playground_config::system_prompt: system_prompt,
-        playground_config::branch: branch,
-        playground_config::author: author,
-        playground_config::author_role: author_role,
-        playground_config::poll_ms: poll_ms,
-        playground_config::active_model_profile_id: profile_id,
-    };
-
-    if let Some(id) = config.persona_id {
-        change += entity! { &config_id @ playground_config::persona_id: id };
-    }
-    if let Some(key) = config.tavily_api_key.as_ref() {
-        let handle = ws.put(key.clone());
-        change += entity! { &config_id @ playground_config::tavily_api_key: handle };
-    }
-    if let Some(key) = config.exa_api_key.as_ref() {
-        let handle = ws.put(key.clone());
-        change += entity! { &config_id @ playground_config::exa_api_key: handle };
-    }
-    if let Some(cwd) = config.exec.default_cwd.as_ref() {
-        let handle = ws.put(cwd.to_string_lossy().to_string());
-        change += entity! { &config_id @ playground_config::exec_default_cwd: handle };
-    }
-    if let Some(profile) = config.exec.sandbox_profile {
-        change += entity! { &config_id @ playground_config::exec_sandbox_profile: profile };
-    }
-
-    let profile_entry_id = ufoid();
-    let profile_name = ws.put(config.model_profile_name.clone());
-    let model_name_handle = ws.put(config.model.model.clone());
-    let model_base_url = ws.put(config.model.base_url.clone());
-    let model_stream: Inline<U256BE> = if config.model.stream { 1u64 } else { 0u64 }.to_inline();
-    let model_context_window_tokens: Inline<U256BE> =
-        config.model.context_window_tokens.to_inline();
-    let model_max_output_tokens: Inline<U256BE> = config.model.max_output_tokens.to_inline();
-    let model_context_safety_margin_tokens: Inline<U256BE> =
-        config.model.context_safety_margin_tokens.to_inline();
-    let model_chars_per_token: Inline<U256BE> = config.model.chars_per_token.to_inline();
-
-    change += entity! { &profile_entry_id @
-        metadata::tag: KIND_MODEL_PROFILE_ID,
-        metadata::updated_at: now,
-        playground_config::model_profile_id: profile_id,
-        metadata::name: profile_name,
-        playground_config::model_name: model_name_handle,
-        playground_config::model_base_url: model_base_url,
-        playground_config::model_stream: model_stream,
-        playground_config::model_context_window_tokens: model_context_window_tokens,
-        playground_config::model_max_output_tokens: model_max_output_tokens,
-        playground_config::model_context_safety_margin_tokens: model_context_safety_margin_tokens,
-        playground_config::model_chars_per_token: model_chars_per_token,
-    };
-
-    if let Some(key) = config.model.api_key.as_ref() {
-        let handle = ws.put(key.clone());
-        change += entity! { &profile_entry_id @ playground_config::model_api_key: handle };
-    }
-    if let Some(effort) = config.model.reasoning_effort.as_ref() {
-        let handle = ws.put(effort.clone());
-        change += entity! { &profile_entry_id @ playground_config::model_reasoning_effort: handle };
-    }
-
-    ws.commit(change, "playground config");
-    Ok(())
-}
-
-fn load_string_attr(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    entity_id: Id,
-    attr: &Attribute<Handle<LongString>>,
-) -> Result<Option<String>> {
-    let mut handles = find!(
-        (handle: Inline<Handle<LongString>>),
-        pattern!(catalog, [{ entity_id @ attr: ?handle }])
-    );
-
-    let Some((handle,)) = handles.next() else {
-        return Ok(None);
-    };
-    if handles.next().is_some() {
-        let attr_id = attr.id();
-        return Err(anyhow!(
-            "entity {entity_id:x} has multiple values for attribute {attr_id:x}"
-        ));
-    }
-
-    let view: View<str> = ws.get(handle).context("read config text")?;
-    Ok(Some(view.as_ref().to_string()))
-}
-
-fn load_id_attr(catalog: &TribleSet, entity_id: Id, attr: &Attribute<GenId>) -> Option<Id> {
-    find!(
-        value: Id,
-        pattern!(catalog, [{ entity_id @ attr: ?value }])
-    )
-    .next()
-}
-
-fn load_u256_attr(
-    catalog: &TribleSet,
-    entity_id: Id,
-    attr: &Attribute<U256BE>,
-) -> Option<Inline<U256BE>> {
-    find!(
-        value: Inline<U256BE>,
-        pattern!(catalog, [{ entity_id @ attr: ?value }])
-    )
-    .next()
-}
-
-fn u256be_to_u64(value: Inline<U256BE>) -> Option<u64> {
-    let raw = value.raw;
-    if raw[..24].iter().any(|byte| *byte != 0) {
-        return None;
-    }
-    let bytes: [u8; 8] = raw[24..32].try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
-}
-
-impl Default for ExecConfig {
-    fn default() -> Self {
-        Self {
-            default_cwd: Some(PathBuf::from("/workspace")),
-            sandbox_profile: None,
-        }
-    }
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            model: DEFAULT_MODEL.to_string(),
-            base_url: DEFAULT_BASE_URL.to_string(),
-            api_key: None,
-            reasoning_effort: None,
-            stream: DEFAULT_STREAM,
-            context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-            context_safety_margin_tokens: DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
-            chars_per_token: DEFAULT_CHARS_PER_TOKEN,
-        }
-    }
-}
-
-fn default_config(pile_path: PathBuf) -> Config {
-    Config {
-        pile_path,
-        model: ModelConfig::default(),
-        model_profile_id: None,
-        model_profile_name: "default".to_string(),
-        tavily_api_key: None,
-        exa_api_key: None,
-        exec: ExecConfig::default(),
-        system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-        branch: DEFAULT_BRANCH.to_string(),
-        author: DEFAULT_AUTHOR.to_string(),
-        author_role: DEFAULT_AUTHOR_ROLE.to_string(),
-        persona_id: None,
-        poll_ms: DEFAULT_POLL_MS,
-    }
-}
-
-fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
-    let raw = raw.trim();
-    Id::from_hex(raw).ok_or_else(|| anyhow!("invalid {label} {raw}"))
-}
-
-fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
-    if let Some(path) = raw.strip_prefix('@') {
-        if path == "-" {
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .with_context(|| format!("read {label} from stdin"))?;
-            return Ok(value);
-        }
-        return fs::read_to_string(path).with_context(|| format!("read {label} from {}", path));
-    }
-    Ok(raw.to_string())
-}
-
-fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
-    Ok(load_value_or_file(raw, label)?.trim().to_string())
+fn format_snapshot_ids(ids: impl IntoIterator<Item = Id>) -> String {
+    ids.into_iter()
+        .map(|id| format!("{id:x}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn parse_u64(raw: &str, label: &str) -> Result<u64> {
@@ -987,6 +534,209 @@ fn parse_bool(raw: &str, label: &str) -> Result<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),
-        _ => Err(anyhow!("invalid {label} {raw} (expected true/false)")),
+        _ => bail!("invalid {label} {raw} (expected true/false)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::File;
+
+    fn cli(pile: &Path, command: Command) -> Cli {
+        Cli {
+            pile: pile.to_owned(),
+            command: Some(command),
+        }
+    }
+
+    fn add(name: &str) -> Command {
+        Command::Add(AddArgs {
+            name: name.to_owned(),
+            model: None,
+            base_url: None,
+            api_key: None,
+            reasoning_effort: None,
+            stream: None,
+            context_window_tokens: None,
+            max_output_tokens: None,
+            context_safety_margin_tokens: None,
+            chars_per_token: None,
+        })
+    }
+
+    fn snapshot_counts(catalog: &Catalog) -> (usize, usize) {
+        catalog
+            .snapshot_ids()
+            .into_iter()
+            .fold((0, 0), |(profiles, configs), id| {
+                if catalog.profile_snapshot(id).is_some() {
+                    (profiles + 1, configs)
+                } else {
+                    (
+                        profiles,
+                        configs + usize::from(catalog.config_snapshot(id).is_some()),
+                    )
+                }
+            })
+    }
+
+    #[test]
+    fn immutable_load_does_not_append_or_create_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("headspace.pile");
+        File::create(&pile).unwrap();
+        collection_access::initialize_signer(&pile, None).unwrap();
+        let length = std::fs::metadata(&pile).unwrap().len();
+        let state = load_headspace(&pile).unwrap();
+        assert!(matches!(state.catalog.config, Resolution::Missing));
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
+
+        let absent_pile = directory.path().join("absent.pile");
+        let absent_key = directory.path().join("self.key");
+        std::fs::remove_file(absent_key).unwrap();
+        assert!(load_headspace(&absent_pile).is_err());
+        assert!(!absent_pile.exists());
+    }
+
+    #[test]
+    fn use_authors_config_genesis_when_only_the_profile_track_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("headspace.pile");
+        File::create(&pile).unwrap();
+        collection_access::initialize_signer(&pile, None).unwrap();
+        let anchor = Id::new([0x51; 16]).unwrap();
+        let profile = headspace::default_profile(anchor, "only-profile");
+        let mut fragment = headspace::profile_anchor_fragment(anchor);
+        fragment += headspace::profile_snapshot_fragment(&profile, &[])
+            .unwrap()
+            .0;
+        collection_access::publish_fragment(
+            &pile,
+            None,
+            DEFAULT_SCOPE_ID,
+            fragment,
+            Fragment::empty(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_headspace(&pile).unwrap().catalog.config,
+            Resolution::Missing
+        ));
+
+        run(cli(
+            &pile,
+            Command::Use {
+                profile: "only-profile".to_owned(),
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            load_headspace(&pile).unwrap().catalog.config,
+            Resolution::Unique(headspace::Snapshot { ref value, .. })
+                if value.active_profile == anchor
+        ));
+    }
+
+    #[test]
+    fn name_selection_ignores_an_unrelated_forked_profile_track() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("headspace.pile");
+        File::create(&pile).unwrap();
+        collection_access::initialize_signer(&pile, None).unwrap();
+        run(cli(&pile, add("first"))).unwrap();
+        let first = settled_config(&load_headspace(&pile).unwrap().catalog)
+            .unwrap()
+            .unwrap()
+            .active_profile;
+        run(cli(&pile, add("second"))).unwrap();
+
+        let state = load_headspace(&pile).unwrap();
+        let second = settled_config(&state.catalog)
+            .unwrap()
+            .unwrap()
+            .active_profile;
+        let current = require_profile(&state.catalog, second).unwrap().clone();
+        let predecessor = state.catalog.profiles[&second].head_ids();
+        let mut left = current.clone();
+        left.model = "left".to_owned();
+        let mut right = current;
+        right.model = "right".to_owned();
+        let left = headspace::profile_snapshot_fragment(&left, &predecessor)
+            .unwrap()
+            .0;
+        let right = headspace::profile_snapshot_fragment(&right, &predecessor)
+            .unwrap()
+            .0;
+        publish(&pile, &state, left, "left profile branch").unwrap();
+        let after_left = load_headspace(&pile).unwrap();
+        publish(&pile, &after_left, right, "right profile branch").unwrap();
+
+        let forked = load_headspace(&pile).unwrap();
+        assert!(matches!(
+            forked.catalog.profiles[&second],
+            Resolution::Forked(_)
+        ));
+        assert_eq!(
+            resolve_profile_selector(&forked.catalog, "first").unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn add_use_set_and_idempotent_set_advance_only_their_tracks() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("headspace.pile");
+        File::create(&pile).unwrap();
+        collection_access::initialize_signer(&pile, None).unwrap();
+
+        run(cli(&pile, add("first"))).unwrap();
+        let first_state = load_headspace(&pile).unwrap();
+        let first_anchor = settled_config(&first_state.catalog)
+            .unwrap()
+            .unwrap()
+            .active_profile;
+        run(cli(&pile, add("second"))).unwrap();
+        let second_state = load_headspace(&pile).unwrap();
+        let (profile_count, config_count) = snapshot_counts(&second_state.catalog);
+
+        run(cli(
+            &pile,
+            Command::Use {
+                profile: format!("{first_anchor:x}"),
+            },
+        ))
+        .unwrap();
+        let used = load_headspace(&pile).unwrap();
+        assert_eq!(
+            snapshot_counts(&used.catalog),
+            (profile_count, config_count + 1)
+        );
+
+        run(cli(
+            &pile,
+            Command::Set {
+                field: SetField::Model,
+                value: "changed-model".to_owned(),
+            },
+        ))
+        .unwrap();
+        let set = load_headspace(&pile).unwrap();
+        assert_eq!(
+            snapshot_counts(&set.catalog),
+            (profile_count + 1, config_count + 1)
+        );
+        let commits = set.view.commits.len();
+
+        run(cli(
+            &pile,
+            Command::Set {
+                field: SetField::Model,
+                value: "changed-model".to_owned(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(load_headspace(&pile).unwrap().view.commits.len(), commits);
     }
 }

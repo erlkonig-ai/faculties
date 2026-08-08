@@ -37,6 +37,7 @@ pub mod compass;
 pub mod decide;
 pub mod discord;
 pub mod files;
+pub mod headspace;
 pub mod mail;
 pub mod mail_pop;
 pub mod memory_cover;

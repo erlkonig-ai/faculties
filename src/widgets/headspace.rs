@@ -7,40 +7,21 @@
 //! single "you are here" card plus a compact roster of other
 //! profiles.
 //!
-//! The data lives on the `config` branch (the faculty's
-//! `CONFIG_BRANCH` constant). One `KIND_CONFIG_ID` entity carries
-//! the active configuration; the active model profile is referenced
-//! by `active_model_profile_id` and resolves to a
-//! `KIND_MODEL_PROFILE_ID` entity that holds the model-name,
-//! base-url, token-budget, etc. attributes. The latest entry per
-//! kind is selected by `metadata::updated_at` — appends are
-//! history-preserving so older rows stay readable via timeline.
+//! The data lives in the immutable Headspace collection. Complete profile and
+//! config snapshots form independent supersession DAGs; the shared Headspace
+//! resolver keeps forks visible rather than selecting a timestamp winner.
 //!
 //! ```ignore
 //! let mut panel = HeadspaceViewer::default();
 //! panel.render(ctx, config_ws);
 //! ```
 
-use std::collections::HashMap;
-
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::BlobStoreGet;
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{NsTAIInterval, U256BE};
-use triblespace::prelude::View;
-
-use crate::schemas::headspace::{playground_config, KIND_CONFIG_ID, KIND_MODEL_PROFILE_ID};
+use crate::headspace::{self, Catalog, ProfileValue, Resolution};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
-
-type TextHandle = Inline<Handle<LongString>>;
+use triblespace::core::id::Id;
 
 // ── Palette ──────────────────────────────────────────────────────────
 
@@ -74,264 +55,20 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
-// ── Row structs ──────────────────────────────────────────────────────
-
-#[derive(Clone, Debug)]
-struct ModelProfile {
-    id: Id,
-    name: String,
-    model_name: Option<String>,
-    base_url: Option<String>,
-    reasoning_effort: Option<String>,
-    stream: Option<bool>,
-    context_window_tokens: Option<u64>,
-    max_output_tokens: Option<u64>,
-    context_safety_margin_tokens: Option<u64>,
-    chars_per_token: Option<u64>,
-    has_api_key: bool,
-}
-
-impl ModelProfile {
-    fn empty(id: Id) -> Self {
-        Self {
-            id,
-            name: String::new(),
-            model_name: None,
-            base_url: None,
-            reasoning_effort: None,
-            stream: None,
-            context_window_tokens: None,
-            max_output_tokens: None,
-            context_safety_margin_tokens: None,
-            chars_per_token: None,
-            has_api_key: false,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct ActiveConfig {
-    persona_id: Option<Id>,
-    active_profile_id: Option<Id>,
-}
-
 struct HeadspaceLive {
     cached_revision: DatasetRevision,
-    active: ActiveConfig,
-    /// All known model profiles, keyed by their profile id (the
-    /// `playground_config::model_profile_id` value on the catalog
-    /// entry — distinct from the entry's own entity id, which is
-    /// the timestamped revision row).
-    profiles: HashMap<Id, ModelProfile>,
+    catalog: Catalog,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl HeadspaceLive {
     fn refresh(dataset: DatasetView<'_>) -> Self {
-        let space = dataset.facts;
-        let active = load_active_config(space);
-        let profiles = load_profiles(dataset, space);
         HeadspaceLive {
             cached_revision: dataset.revision,
-            active,
-            profiles,
+            catalog: headspace::project(dataset.reader, dataset.facts),
         }
     }
-}
-
-/// Pick the most-recently-updated `KIND_CONFIG_ID` entity and read
-/// its persona pointer + active-profile pointer. There can be many
-/// historical config rows; `metadata::updated_at` orders them and
-/// the latest wins.
-fn load_active_config(space: &TribleSet) -> ActiveConfig {
-    let mut best: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(space, [{
-            ?config_id @
-            metadata::tag: KIND_CONFIG_ID,
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match best {
-            Some((_, ck)) if ck >= key => {}
-            _ => best = Some((config_id, key)),
-        }
-    }
-    let Some((config_id, _)) = best else {
-        return ActiveConfig::default();
-    };
-    let persona_id = find!(
-        v: Id,
-        pattern!(space, [{ config_id @ playground_config::persona_id: ?v }])
-    )
-    .next();
-    let active_profile_id = find!(
-        v: Id,
-        pattern!(space, [{
-            config_id @ playground_config::active_model_profile_id: ?v
-        }])
-    )
-    .next();
-    ActiveConfig {
-        persona_id,
-        active_profile_id,
-    }
-}
-
-/// Walk every `KIND_MODEL_PROFILE_ID` catalog entry, keep only the
-/// latest per `model_profile_id`, and load its attributes. The
-/// catalog stores append-only revisions per profile id; the latest
-/// `metadata::updated_at` is the live row.
-fn load_profiles(dataset: DatasetView<'_>, space: &TribleSet) -> HashMap<Id, ModelProfile> {
-    // Map profile_id → (entry_id, updated_at key) — pick the latest.
-    let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-    for (entry_id, profile_id, updated_at) in find!(
-        (entry_id: Id, profile_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(space, [{
-            ?entry_id @
-            metadata::tag: KIND_MODEL_PROFILE_ID,
-            metadata::updated_at: ?updated_at,
-            playground_config::model_profile_id: ?profile_id,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        latest
-            .entry(profile_id)
-            .and_modify(|slot| {
-                if key > slot.1 {
-                    *slot = (entry_id, key);
-                }
-            })
-            .or_insert((entry_id, key));
-    }
-
-    let mut out: HashMap<Id, ModelProfile> = HashMap::new();
-    for (profile_id, (entry_id, _)) in latest {
-        let mut p = ModelProfile::empty(profile_id);
-
-        // Friendly name from metadata::name (Handle<LongString>).
-        let name_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ metadata::name: ?h }])
-        )
-        .next();
-        p.name = name_handle
-            .and_then(|h| read_text(dataset, h))
-            .unwrap_or_else(|| format!("profile-{}", short_hex(profile_id)));
-
-        // Model name (Handle<LongString>).
-        let model_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ playground_config::model_name: ?h }])
-        )
-        .next();
-        p.model_name = model_handle.and_then(|h| read_text(dataset, h));
-
-        // Base URL (Handle<LongString>).
-        let url_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ playground_config::model_base_url: ?h }])
-        )
-        .next();
-        p.base_url = url_handle.and_then(|h| read_text(dataset, h));
-
-        // Reasoning effort (Handle<LongString>).
-        let effort_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ playground_config::model_reasoning_effort: ?h }])
-        )
-        .next();
-        p.reasoning_effort = effort_handle.and_then(|h| read_text(dataset, h));
-
-        // API key presence (Handle<LongString>) — we don't surface
-        // the secret, just whether one is configured.
-        p.has_api_key = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ playground_config::model_api_key: ?h }])
-        )
-        .next()
-        .is_some();
-
-        // U256BE numerics — extracted to u64 when the upper 24 bytes
-        // are zero (i.e. the value really fits a u64).
-        p.stream = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ playground_config::model_stream: ?v }])
-            )
-            .next()
-        })
-        .map(|n| n != 0);
-        p.context_window_tokens = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ playground_config::model_context_window_tokens: ?v }])
-            )
-            .next()
-        });
-        p.max_output_tokens = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ playground_config::model_max_output_tokens: ?v }])
-            )
-            .next()
-        });
-        p.context_safety_margin_tokens = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{
-                    id @ playground_config::model_context_safety_margin_tokens: ?v
-                }])
-            )
-            .next()
-        });
-        p.chars_per_token = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ playground_config::model_chars_per_token: ?v }])
-            )
-            .next()
-        });
-        out.insert(profile_id, p);
-    }
-    out
-}
-
-fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
-    // Two i128s packed as big-endian-ordered halves. Use the first
-    // (start) bound as the sort key — matches what headspace.rs does.
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&interval.raw[..16]);
-    i128::from_be_bytes(bytes)
-}
-
-fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
-    dataset
-        .reader
-        .get::<View<str>, LongString>(h)
-        .ok()
-        .map(|v| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        })
-}
-
-/// Decode a 32-byte big-endian U256 to u64 when the value fits.
-/// `query` is a tiny closure that does the per-attribute find!() —
-/// keeps the call sites readable without generic type plumbing.
-fn find_u64<F>(_space: &TribleSet, entity_id: Id, query: F) -> Option<u64>
-where
-    F: FnOnce(Id) -> Option<Inline<U256BE>>,
-{
-    let raw = query(entity_id)?;
-    if raw.raw[..24].iter().any(|b| *b != 0) {
-        return None;
-    }
-    let bytes: [u8; 8] = raw.raw[24..32].try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
 }
 
 fn short_hex(id: Id) -> String {
@@ -383,6 +120,8 @@ impl HeadspaceViewer {
             let Some(live) = self.live.as_ref() else {
                 return;
             };
+            let catalog = &live.catalog;
+            let settled_config = settled(&catalog.config);
 
             ctx.grid(|g| {
                 // Header line — total profile count + persona summary.
@@ -390,9 +129,9 @@ impl HeadspaceViewer {
                     let ui = ctx.ui_mut();
                     let label = format!(
                         "{} PROFILE{}{}",
-                        live.profiles.len(),
-                        if live.profiles.len() == 1 { "" } else { "S" },
-                        match live.active.persona_id {
+                        catalog.profiles.len(),
+                        if catalog.profiles.len() == 1 { "" } else { "S" },
+                        match settled_config.and_then(|config| config.persona) {
                             Some(pid) => format!(" · PERSONA {}", short_hex(pid).to_uppercase()),
                             None => String::new(),
                         },
@@ -407,33 +146,58 @@ impl HeadspaceViewer {
                 });
 
                 // Active-profile hero card.
-                let active = live
-                    .active
-                    .active_profile_id
-                    .and_then(|pid| live.profiles.get(&pid));
-                if let Some(p) = active {
-                    g.full(|ctx| {
-                        render_active_card(ctx.ui_mut(), p, live.active.persona_id);
-                    });
-                } else {
-                    g.full(|ctx| {
-                        let ui = ctx.ui_mut();
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("No active model profile.")
-                                .monospace()
-                                .small()
-                                .color(color_muted(ui)),
+                match &catalog.config {
+                    Resolution::Missing => g.full(|ctx| {
+                        render_diagnostic(
+                            ctx.ui_mut(),
+                            "No Headspace snapshots; built-in defaults are active.",
                         );
-                        ui.add_space(8.0);
-                    });
+                    }),
+                    Resolution::Forked(heads) => g.full(|ctx| {
+                        render_diagnostic(
+                            ctx.ui_mut(),
+                            &format!("Config fork: {} live heads.", heads.len()),
+                        );
+                    }),
+                    Resolution::Invalid(error) => g.full(|ctx| {
+                        render_diagnostic(ctx.ui_mut(), &format!("Invalid Headspace: {error}"));
+                    }),
+                    Resolution::Unique(_) | Resolution::Agreed(_) => {
+                        let config = settled_config.expect("settled resolution has a value");
+                        match catalog.profiles.get(&config.active_profile) {
+                            Some(resolution) if settled(resolution).is_some() => g.full(|ctx| {
+                                render_active_card(
+                                    ctx.ui_mut(),
+                                    settled(resolution).unwrap(),
+                                    config.persona,
+                                );
+                            }),
+                            Some(Resolution::Forked(heads)) => g.full(|ctx| {
+                                render_diagnostic(
+                                    ctx.ui_mut(),
+                                    &format!("Active profile fork: {} live heads.", heads.len()),
+                                );
+                            }),
+                            Some(Resolution::Invalid(error)) => g.full(|ctx| {
+                                render_diagnostic(
+                                    ctx.ui_mut(),
+                                    &format!("Invalid active profile: {error}"),
+                                );
+                            }),
+                            _ => g.full(|ctx| {
+                                render_diagnostic(ctx.ui_mut(), "Active profile is missing.");
+                            }),
+                        }
+                    }
                 }
 
                 // Other profiles roster.
-                let mut others: Vec<&ModelProfile> = live
+                let active_anchor = settled_config.map(|config| config.active_profile);
+                let mut others: Vec<&ProfileValue> = catalog
                     .profiles
-                    .values()
-                    .filter(|p| Some(p.id) != live.active.active_profile_id)
+                    .iter()
+                    .filter(|(anchor, _)| Some(**anchor) != active_anchor)
+                    .filter_map(|(_, resolution)| settled(resolution))
                     .collect();
                 if !others.is_empty() {
                     others.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -454,16 +218,55 @@ impl HeadspaceViewer {
                         });
                     }
                 }
+
+                for (anchor, resolution) in &catalog.profiles {
+                    let message = match resolution {
+                        Resolution::Forked(heads) => Some(format!(
+                            "Profile {} fork: {} live heads.",
+                            short_hex(*anchor),
+                            heads.len()
+                        )),
+                        Resolution::Invalid(error) => {
+                            Some(format!("Profile {} invalid: {error}", short_hex(*anchor)))
+                        }
+                        Resolution::Missing => {
+                            Some(format!("Profile {} is missing.", short_hex(*anchor)))
+                        }
+                        Resolution::Unique(_) | Resolution::Agreed(_) => None,
+                    };
+                    if let Some(message) = message {
+                        g.full(|ctx| render_diagnostic(ctx.ui_mut(), &message));
+                    }
+                }
             });
         });
     }
 }
 
+fn settled<T>(resolution: &Resolution<T>) -> Option<&T> {
+    match resolution {
+        Resolution::Unique(snapshot) => Some(&snapshot.value),
+        Resolution::Agreed(snapshots) => snapshots.first().map(|snapshot| &snapshot.value),
+        Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
+    }
+}
+
+fn render_diagnostic(ui: &mut egui::Ui, message: &str) {
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(message)
+            .monospace()
+            .small()
+            .color(color_muted(ui)),
+    );
+    ui.add_space(8.0);
+}
+
 // ── Active-profile hero card ────────────────────────────────────────
 
-fn render_active_card(ui: &mut egui::Ui, p: &ModelProfile, persona_id: Option<Id>) {
+fn render_active_card(ui: &mut egui::Ui, p: &ProfileValue, persona_id: Option<Id>) {
     let bubble_fill = ui.visuals().window_fill;
-    let accent = profile_color(p.id);
+    let accent = profile_color(p.anchor);
     let text_on_accent = colorhash::text_color_on(accent);
     let body_text = colorhash::text_color_on(bubble_fill);
     let body_muted = mix(body_text, bubble_fill, 0.22);
@@ -521,7 +324,7 @@ fn render_active_card(ui: &mut egui::Ui, p: &ModelProfile, persona_id: Option<Id
                         );
                     });
                     ui.label(
-                        egui::RichText::new(id_hex(p.id))
+                        egui::RichText::new(id_hex(p.anchor))
                             .monospace()
                             .small()
                             .color(text_on_accent),
@@ -543,24 +346,20 @@ fn render_active_card(ui: &mut egui::Ui, p: &ModelProfile, persona_id: Option<Id
                     ui.spacing_mut().item_spacing.y = 4.0;
 
                     // Model name as a primary line.
-                    if let Some(m) = p.model_name.as_ref() {
-                        ui.label(
-                            egui::RichText::new(m)
-                                .monospace()
-                                .strong()
-                                .size(14.0)
-                                .color(body_text),
-                        );
-                    }
+                    ui.label(
+                        egui::RichText::new(&p.model)
+                            .monospace()
+                            .strong()
+                            .size(14.0)
+                            .color(body_text),
+                    );
 
-                    if let Some(url) = p.base_url.as_ref() {
-                        ui.label(
-                            egui::RichText::new(url)
-                                .monospace()
-                                .small()
-                                .color(body_muted),
-                        );
-                    }
+                    ui.label(
+                        egui::RichText::new(&p.base_url)
+                            .monospace()
+                            .small()
+                            .color(body_muted),
+                    );
 
                     // Pill row: reasoning effort, stream/no-stream, api-key indicator.
                     ui.add_space(2.0);
@@ -569,12 +368,8 @@ fn render_active_card(ui: &mut egui::Ui, p: &ModelProfile, persona_id: Option<Id
                         if let Some(eff) = p.reasoning_effort.as_ref() {
                             render_chip(ui, &format!("REASONING {}", eff.to_uppercase()));
                         }
-                        match p.stream {
-                            Some(true) => render_chip(ui, "STREAM"),
-                            Some(false) => render_chip(ui, "NO-STREAM"),
-                            None => {}
-                        }
-                        if p.has_api_key {
+                        render_chip(ui, if p.stream { "STREAM" } else { "NO-STREAM" });
+                        if p.api_key.is_some() {
                             render_chip(ui, "API KEY \u{1F511}"); // 🔑
                         }
                         if let Some(persona) = persona_id {
@@ -588,19 +383,17 @@ fn render_active_card(ui: &mut egui::Ui, p: &ModelProfile, persona_id: Option<Id
                     // Token-budget bar — context window split into
                     // (max output) | (safety margin) | (the rest available
                     // for input). Visual proportion at a glance.
-                    if let Some(window) = p.context_window_tokens {
-                        ui.add_space(6.0);
-                        render_token_budget(
-                            ui,
-                            window,
-                            p.max_output_tokens.unwrap_or(0),
-                            p.context_safety_margin_tokens.unwrap_or(0),
-                            p.chars_per_token.unwrap_or(4),
-                            accent,
-                            body_text,
-                            body_muted,
-                        );
-                    }
+                    ui.add_space(6.0);
+                    render_token_budget(
+                        ui,
+                        p.context_window_tokens,
+                        p.max_output_tokens,
+                        p.context_safety_margin_tokens,
+                        p.chars_per_token,
+                        accent,
+                        body_text,
+                        body_muted,
+                    );
                 });
         });
 }
@@ -679,9 +472,9 @@ fn render_token_budget(
 
 // ── Inactive-profile card ───────────────────────────────────────────
 
-fn render_other_profile_card(ui: &mut egui::Ui, p: &ModelProfile) {
+fn render_other_profile_card(ui: &mut egui::Ui, p: &ProfileValue) {
     let bubble_fill = ui.visuals().window_fill;
-    let accent = profile_color(p.id);
+    let accent = profile_color(p.anchor);
     let body_text = colorhash::text_color_on(bubble_fill);
     let body_muted = mix(body_text, bubble_fill, 0.30);
 
@@ -713,18 +506,21 @@ fn render_other_profile_card(ui: &mut egui::Ui, p: &ModelProfile) {
                         .size(13.0)
                         .color(body_text),
                 );
-                if let Some(m) = p.model_name.as_ref() {
-                    ui.label(
-                        egui::RichText::new("·")
-                            .monospace()
-                            .small()
-                            .color(body_muted),
-                    );
-                    ui.label(egui::RichText::new(m).monospace().small().color(body_muted));
-                }
+                ui.label(
+                    egui::RichText::new("·")
+                        .monospace()
+                        .small()
+                        .color(body_muted),
+                );
+                ui.label(
+                    egui::RichText::new(&p.model)
+                        .monospace()
+                        .small()
+                        .color(body_muted),
+                );
             });
             ui.label(
-                egui::RichText::new(id_hex(p.id))
+                egui::RichText::new(id_hex(p.anchor))
                     .monospace()
                     .small()
                     .color(body_muted),
