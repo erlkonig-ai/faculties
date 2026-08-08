@@ -215,10 +215,10 @@ pub fn block(
 
 /// Construct one exact source-occurrence projection receipt.
 ///
-/// The identity is source namespace + stable locator + exact raw record bytes
-/// + projected canonical block. Replaying the same record is therefore
-/// naturally idempotent, while two source occurrences of one shared block stay
-/// distinguishable.
+/// The identity contains the source namespace, stable locator, exact raw
+/// record bytes, and projected canonical block. Replaying the same record is
+/// therefore naturally idempotent, while two source occurrences of one shared
+/// block stay distinguishable.
 pub fn source_projection<T>(
     source_namespace: Id,
     source_locator: impl Into<String>,
