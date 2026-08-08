@@ -16,7 +16,8 @@
 //! *effective* only if its issuer chains, through admin-grants, back to that
 //! root (the `effective_admins` fixpoint). Strong/transitive removal therefore
 //! falls out for free — retracting an admin drops everything that depended on
-//! it. Transitive group membership is `path!`'s closure over *effective* grants.
+//! it. Transitive group membership is a materialized regular-path relation over
+//! *effective* grants.
 //! Secrets are `(scope, name)` addressed, latest-wins (`secret add` of an
 //! existing name is a new version, sealed to the *current* recipients).
 //!
@@ -58,6 +59,7 @@ use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
+use triblespace_paths::{PathExpr, PathIndex, Step};
 
 // ── schema ──────────────────────────────────────────────────────────────────
 // Minted with `trible genid` 2026-06-19. Reserved-but-unused (for the
@@ -86,8 +88,8 @@ mod schema {
         "D17EC6F6A9F9D6B7A3B9A329A9CFC4CC" as pub wrap_secret: GenId;
         "CAD2A79E7F5B1A870F5814BDEE5C90F8" as pub wrap_recipient: GenId;
         "B30CE37D4DC3CAACC34D946B3D71E37C" as pub wrap_dek: Handle<RawBytes>;
-        // Ephemeral edge, only ever asserted into an in-memory TribleSet for
-        // `path!` transitive closure — never persisted. (minted 2026-06-19)
+        // Ephemeral edge, only ever asserted into an in-memory TribleSet for a
+        // materialized regular-path closure — never persisted. (minted 2026-06-19)
         "ABAF427C4F1CB01AA7091A9C38F0DA3A" as pub reaches: GenId;
         // A scope is a content-derived entity: id = Blake3(creator_pk, name).
         // The creator is the implicit root admin. (minted 2026-06-19)
@@ -307,8 +309,9 @@ fn grant_is_live(space: &TribleSet, grant: Id) -> bool {
 /// grants. A "group" is just a scope that is itself a grant subject elsewhere;
 /// any id can be both object and subject, so membership nests with no extra
 /// entity kind. We project live grants into an ephemeral object->subject edge
-/// set and let the engine's `path!` take the transitive closure — the edge set
-/// is never persisted (work as its own ledger: recipients are a derived view).
+/// set and materialize its `reaches+` endpoint relation — the edge set and path
+/// index are never persisted (work as its own ledger: recipients are a derived
+/// view).
 fn interval_start(iv: IntervalValue) -> Epoch {
     let (start, _end): (Epoch, Epoch) = iv.try_from_inline().unwrap();
     start
@@ -394,7 +397,7 @@ fn effective_admins(space: &TribleSet, scope: Id) -> HashSet<Id> {
 /// A grant is *effective* iff it is not retracted AND its issuer is an
 /// effective admin of its object. (Issuerless grants never match the
 /// pattern, so they are inert.)
-fn recipients_of(space: &TribleSet, scope: Id) -> Vec<Id> {
+fn recipients_of(space: &TribleSet, scope: Id) -> Result<Vec<Id>> {
     let mut admin_cache: HashMap<Id, HashSet<Id>> = HashMap::new();
     let mut edges = TribleSet::new();
     for (g, obj, subj, iss) in find!(
@@ -411,17 +414,25 @@ fn recipients_of(space: &TribleSet, scope: Id) -> Vec<Id> {
             edges += entity! { ExclusiveId::force_ref(&obj) @ reaches: &subj };
         }
     }
-    let mut out: Vec<Id> = find!(
-        (start: Id, leaf: Id),
-        and!(start.is(scope.to_inline()), path!(edges, start reaches+ leaf))
-    )
-    .map(|(_, leaf)| leaf)
-    // keep only identity leaves (intermediate groups carry no signing key)
-    .filter(|l| {
-        let lid = *l;
-        exists!(pattern!(space, [{ lid @ identity_sign_pk: _?p }]))
-    })
-    .collect();
+    let reaches_plus = PathExpr::from(Step::Forward(reaches.id().into()))
+        .plus()
+        .compile();
+    let paths = PathIndex::from_tribles(reaches_plus, edges.iter())
+        .context("materialize effective grant reachability")?;
+    let start: Inline<inlineencodings::GenId> = scope.to_inline();
+    let mut out: Vec<Id> = paths
+        .reachable_from(&start.raw)
+        .filter_map(|raw| {
+            Inline::<inlineencodings::GenId>::new(raw)
+                .try_from_inline::<Id>()
+                .ok()
+        })
+        // keep only identity leaves (intermediate groups carry no signing key)
+        .filter(|l| {
+            let lid = *l;
+            exists!(pattern!(space, [{ lid @ identity_sign_pk: _?p }]))
+        })
+        .collect();
     // The root admin (creator) is always a recipient of her own scope, even
     // though she is never a grant *subject*.
     if let Some(creator) = scope_creator_of(space, scope) {
@@ -429,7 +440,7 @@ fn recipients_of(space: &TribleSet, scope: Id) -> Vec<Id> {
     }
     out.sort();
     out.dedup();
-    out
+    Ok(out)
 }
 
 // ── commands ──────────────────────────────────────────────────────────────────
@@ -763,7 +774,7 @@ fn cmd_scope_members(pile: &Path, branch: &str, scope: String) -> Result<()> {
         let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
         let creator = scope_creator_of(&space, scope_id);
         let admins = effective_admins(&space, scope_id);
-        let recipients = recipients_of(&space, scope_id);
+        let recipients = recipients_of(&space, scope_id)?;
         if recipients.is_empty() {
             println!("(no members)");
         }
@@ -955,7 +966,7 @@ fn build_seal_change(
     name: &str,
     plaintext: &[u8],
 ) -> Result<(TribleSet, Id, usize)> {
-    let recipients = recipients_of(space, scope_id);
+    let recipients = recipients_of(space, scope_id)?;
     if recipients.is_empty() {
         bail!(
             "scope {} has no live recipients; grant access first",
@@ -1088,7 +1099,7 @@ fn cmd_secret_rotate(pile: &Path, branch: &str, scope: Option<String>) -> Result
                 Some(l) => l,
                 None => continue,
             };
-            let current: HashSet<Id> = recipients_of(&space, sc).into_iter().collect();
+            let current: HashSet<Id> = recipients_of(&space, sc)?.into_iter().collect();
             let exposed: Vec<Id> = wrap_holders(&space, latest)
                 .into_iter()
                 .filter(|h| !current.contains(h))
@@ -1199,7 +1210,7 @@ fn cmd_secret_share(
         let dek = Key::try_from(&dek_bytes[..]).context("dek")?;
 
         // Current recipients minus those who already hold a wrap.
-        let recipients = recipients_of(&space, scope_id);
+        let recipients = recipients_of(&space, scope_id)?;
         let existing: HashSet<Id> = find!(
             (w: Id, r: Id),
             pattern!(&space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: ?r }])
@@ -1275,7 +1286,7 @@ fn cmd_secret_list(pile: &Path, branch: &str) -> Result<()> {
                 continue;
             }
             let versions = secret_versions(&space, sc, &name);
-            let recips = recipients_of(&space, sc).len();
+            let recips = recipients_of(&space, sc)?.len();
             println!(
                 "{}  scope {}  (v{}, {} recipient(s))",
                 name,
@@ -1492,6 +1503,25 @@ mod tests {
             effective_admins(&space, s),
             HashSet::from([alice, bob, carol, dave])
         );
+    }
+
+    #[test]
+    fn materialized_path_preserves_transitive_recipient_semantics() {
+        let (root_creator, group_creator, recipient) = (ufoid().id, ufoid().id, ufoid().id);
+        let mut space = TribleSet::new();
+        let root = mk_scope(&mut space, &root_creator);
+        let group = mk_scope(&mut space, &group_creator);
+        mk_grant(&mut space, &root, &root_creator, "member", &group);
+        mk_grant(&mut space, &group, &group_creator, "member", &recipient);
+
+        for (identity, byte) in [(root_creator, 1), (recipient, 2)] {
+            let key = Inline::<Handle<RawBytes>>::new([byte; 32]);
+            space += entity! { ExclusiveId::force_ref(&identity) @ identity_sign_pk: key };
+        }
+
+        let mut expected = vec![root_creator, recipient];
+        expected.sort();
+        assert_eq!(recipients_of(&space, root).unwrap(), expected);
     }
 
     #[test]
