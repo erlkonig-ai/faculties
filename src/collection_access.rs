@@ -40,7 +40,8 @@ use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{entity, find, pattern};
 
-use crate::collection_recipes::{succinctarchive_kind, RecipeCatalog};
+use crate::collection_recipes::{archive_bm25_kind, succinctarchive_kind, RecipeCatalog};
+use crate::schemas::blockdag;
 
 pub use crate::collection_recipes::{
     derive_succinctarchive_union_element, CollectionValidationExhaust,
@@ -365,6 +366,13 @@ impl CollectionSnapshot {
 /// set-union recipe for one extrinsic scope.
 pub fn succinctarchive_union_definition(scope: Id) -> CollectionDefinition {
     succinctarchive_kind().definition(scope)
+}
+
+/// Construct the portable exact-TF BM25 collection for canonical Archive
+/// blocks. Unlike the representation-generic Succinct helper, this recipe is
+/// closed over Archive's stable scope and block-text projection law.
+pub fn archive_block_text_bm25_definition() -> CollectionDefinition {
+    archive_bm25_kind().definition(blockdag::DEFAULT_SCOPE_ID)
 }
 
 /// Publish one self-contained content fragment and metadata fragment.

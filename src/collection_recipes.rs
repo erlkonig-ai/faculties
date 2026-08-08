@@ -15,7 +15,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     SuccinctArchiveBlob, SuccinctArchiveRawBuildError,
 };
-use triblespace::core::blob::{Blob, BlobEncoding};
+use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace::core::collection::simplearchive_union::{
     validate_commit, validate_merge, TRIBLE_SET_UNION_RECIPE_V1,
 };
@@ -29,6 +29,11 @@ use triblespace::core::inline::InlineEncoding;
 use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
+use triblespace_search::tokens::WordHash;
+
+use crate::archive_bm25::{self, DeriveValidation, ARCHIVE_BLOCK_TEXT_BM25_RECIPE_V1};
+use crate::schemas::blockdag;
 
 pub(crate) type ValidationVerdict = CollectionClaimValidation<String>;
 
@@ -107,8 +112,15 @@ pub(crate) struct RecipeCatalog {
 impl RecipeCatalog {
     pub(crate) fn faculties() -> Self {
         Self::new(
-            [simplearchive_descriptor(), succinctarchive_descriptor()],
-            [simplearchive_to_succinct_descriptor()],
+            [
+                simplearchive_descriptor(),
+                succinctarchive_descriptor(),
+                archive_bm25_descriptor(),
+            ],
+            [
+                simplearchive_to_succinct_descriptor(),
+                simplearchive_to_archive_bm25_descriptor(),
+            ],
         )
         .expect("the built-in collection recipe catalog has unique keys")
     }
@@ -379,6 +391,13 @@ pub(crate) fn succinctarchive_kind() -> CollectionKind {
     }
 }
 
+pub(crate) fn archive_bm25_kind() -> CollectionKind {
+    CollectionKind {
+        representation: <PortableBM25Blob as MetaDescribe>::id(),
+        recipe: ARCHIVE_BLOCK_TEXT_BM25_RECIPE_V1,
+    }
+}
+
 /// Build the canonical raw-SuccinctArchive representation of one canonical
 /// SimpleArchive union element.
 ///
@@ -434,12 +453,31 @@ fn succinctarchive_descriptor() -> KindDescriptor {
     }
 }
 
+fn archive_bm25_descriptor() -> KindDescriptor {
+    KindDescriptor {
+        kind: archive_bm25_kind(),
+        epoch: ValidatorEpoch("archive-block-text-portable-bm25-v1/validator-v1"),
+        roots: RootPolicy::DerivedOnly,
+        validate_commit: None,
+        validate_merge: validate_archive_bm25_merge,
+    }
+}
+
 fn simplearchive_to_succinct_descriptor() -> DeriveDescriptor {
     DeriveDescriptor {
         source: simplearchive_kind(),
         target: succinctarchive_kind(),
         epoch: ValidatorEpoch("simplearchive-to-portable-succinctarchive-v2/validator-v1"),
         validate: validate_simplearchive_to_succinct,
+    }
+}
+
+fn simplearchive_to_archive_bm25_descriptor() -> DeriveDescriptor {
+    DeriveDescriptor {
+        source: simplearchive_kind(),
+        target: archive_bm25_kind(),
+        epoch: ValidatorEpoch("simplearchive-to-archive-block-text-bm25-v1/validator-v1"),
+        validate: validate_simplearchive_to_archive_bm25,
     }
 }
 
@@ -564,11 +602,222 @@ fn validate_simplearchive_to_succinct(
     })
 }
 
+type AttachedArchiveBM25 =
+    PortableBM25Index<triblespace::core::inline::encodings::genid::GenId, WordHash>;
+
+fn validate_archive_bm25_merge(
+    reader: &PileReader,
+    definition: &CollectionDefinition,
+    claim: &CollectionMerge,
+) -> Result<ValidationVerdict> {
+    if definition.scope() != blockdag::DEFAULT_SCOPE_ID
+        || CollectionKind::of(definition) != archive_bm25_kind()
+    {
+        return Ok(ValidationVerdict::Rejected(
+            "Archive BM25 merge definition does not name the exact Archive recipe".to_owned(),
+        ));
+    }
+    if claim.collection() != definition.id() {
+        return Ok(ValidationVerdict::Rejected(
+            "Archive BM25 merge names a different collection".to_owned(),
+        ));
+    }
+
+    let (low_data, high_data) = claim.inputs();
+    let low = load_blob::<PortableBM25Blob>(reader, low_data)?;
+    let high = load_blob::<PortableBM25Blob>(reader, high_data)?;
+    let result = load_blob::<PortableBM25Blob>(reader, claim.result())?;
+
+    // Parse every resident endpoint before returning Pending for another. A
+    // malformed resident proof is durable rejection, not hidden by eviction.
+    let low = match low {
+        Some(blob) => match AttachedArchiveBM25::try_from_blob(blob) {
+            Ok(index) => Some(index),
+            Err(error) => {
+                return Ok(ValidationVerdict::Rejected(format!(
+                    "invalid Archive BM25 merge low input: {error}"
+                )))
+            }
+        },
+        None => None,
+    };
+    let high = match high {
+        Some(blob) => match AttachedArchiveBM25::try_from_blob(blob) {
+            Ok(index) => Some(index),
+            Err(error) => {
+                return Ok(ValidationVerdict::Rejected(format!(
+                    "invalid Archive BM25 merge high input: {error}"
+                )))
+            }
+        },
+        None => None,
+    };
+    let result = match result {
+        Some(blob) => match AttachedArchiveBM25::try_from_blob(blob) {
+            Ok(index) => Some(index),
+            Err(error) => {
+                return Ok(ValidationVerdict::Rejected(format!(
+                    "invalid Archive BM25 merge result: {error}"
+                )))
+            }
+        },
+        None => None,
+    };
+    let (Some(low), Some(high), Some(result)) = (low, high, result) else {
+        return Ok(ValidationVerdict::Pending);
+    };
+
+    let expected = match low.merged(&high) {
+        Ok(expected) => expected,
+        Err(error) => {
+            return Ok(ValidationVerdict::Rejected(format!(
+                "Archive BM25 exact merge failed: {error}"
+            )))
+        }
+    };
+    let expected: Blob<PortableBM25Blob> = expected.to_blob();
+    let result: Blob<PortableBM25Blob> = result.to_blob();
+    Ok(if result.bytes == expected.bytes {
+        ValidationVerdict::Accepted
+    } else {
+        ValidationVerdict::Rejected(
+            "Archive BM25 merge result is not the exact document-union/pointwise-max join"
+                .to_owned(),
+        )
+    })
+}
+
+fn validate_simplearchive_to_archive_bm25(
+    reader: &PileReader,
+    source_definition: &CollectionDefinition,
+    target_definition: &CollectionDefinition,
+    claim: &CollectionDerive,
+) -> Result<ValidationVerdict> {
+    if source_definition.scope() != blockdag::DEFAULT_SCOPE_ID
+        || target_definition.scope() != blockdag::DEFAULT_SCOPE_ID
+        || CollectionKind::of(source_definition) != simplearchive_kind()
+        || CollectionKind::of(target_definition) != archive_bm25_kind()
+    {
+        return Ok(ValidationVerdict::Rejected(
+            "Archive BM25 derive endpoints do not name the exact Archive recipes".to_owned(),
+        ));
+    }
+    if claim.source() != source_definition.id() || claim.target() != target_definition.id() {
+        return Ok(ValidationVerdict::Rejected(
+            "Archive BM25 derive record does not name its exact definitions".to_owned(),
+        ));
+    }
+
+    let (input, output) = claim.mapping();
+    let Some(source) = load_blob::<SimpleArchive>(reader, input)? else {
+        return Ok(ValidationVerdict::Pending);
+    };
+    let expected = match archive_bm25::derive_for_validation(reader, source)? {
+        DeriveValidation::Ready(expected) => expected,
+        DeriveValidation::Pending => return Ok(ValidationVerdict::Pending),
+        DeriveValidation::Rejected(reason) => return Ok(ValidationVerdict::Rejected(reason)),
+    };
+
+    // Source structure and all selected payloads are validated before target
+    // residency is consulted, so a missing cache cannot mask malformed truth.
+    let Some(target) = load_blob::<PortableBM25Blob>(reader, output)? else {
+        return Ok(ValidationVerdict::Pending);
+    };
+    let target = match AttachedArchiveBM25::try_from_blob(target) {
+        Ok(target) => target,
+        Err(error) => {
+            return Ok(ValidationVerdict::Rejected(format!(
+                "invalid Archive BM25 derive output: {error}"
+            )))
+        }
+    };
+    let target: Blob<PortableBM25Blob> = target.to_blob();
+    Ok(if target.bytes == expected.bytes {
+        ValidationVerdict::Accepted
+    } else {
+        ValidationVerdict::Rejected(
+            "Archive BM25 derive output is not the exact canonical block-text projection"
+                .to_owned(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use anybytes::Bytes;
+    use tempfile::TempDir;
+    use triblespace::core::blob::encodings::UnknownBlob;
+    use triblespace::core::inline::encodings::genid::GenId;
+    use triblespace::core::repo::{BlobStore, BlobStorePut};
+    use triblespace::prelude::{entity, ExclusiveId, Fragment, Inline, IntoBlob, IntoInline};
+    use triblespace_search::tokens::hash_tokens;
+
     use super::*;
+    use crate::blockdag as archive;
+
+    struct StoredBlobs {
+        _directory: TempDir,
+        reader: PileReader,
+    }
+
+    impl StoredBlobs {
+        fn new(blobs: impl IntoIterator<Item = Blob<UnknownBlob>>) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("archive-bm25-test.pile");
+            File::create(&path).unwrap();
+            let mut pile = crate::collection_access::open_pile_strict(&path).unwrap();
+            for blob in blobs {
+                pile.put::<UnknownBlob, _>(blob).unwrap();
+            }
+            pile.flush().unwrap();
+            let reader = pile.reader().unwrap();
+            pile.close().unwrap();
+            Self {
+                _directory: directory,
+                reader,
+            }
+        }
+    }
+
+    fn source_and_attachments(fragment: Fragment) -> (Blob<SimpleArchive>, Vec<Blob<UnknownBlob>>) {
+        let (facts, mut blobs) = fragment.into_facts_and_blobs();
+        let source: Blob<SimpleArchive> = facts.to_blob();
+        let attachments = blobs
+            .reader()
+            .unwrap()
+            .into_iter()
+            .map(|(_, blob)| blob)
+            .collect();
+        (source, attachments)
+    }
+
+    fn text_block(parts: &[(Id, &str)]) -> Fragment {
+        let mut occurrences = Fragment::empty();
+        for (ordinal, (modality, text)) in parts.iter().enumerate() {
+            let fact = archive::text_fact(
+                *modality,
+                blockdag::content_fact::direction::IN,
+                (*text).to_owned(),
+            )
+            .unwrap();
+            occurrences += archive::content_part(ordinal as u64, fact, None).unwrap();
+        }
+        archive::block(std::iter::empty::<Id>(), None, occurrences).unwrap()
+    }
+
+    fn parse_archive_bm25(blob: Blob<PortableBM25Blob>) -> AttachedArchiveBM25 {
+        AttachedArchiveBM25::try_from_blob(blob).unwrap()
+    }
+
+    fn derive_archive_bm25(
+        reader: &PileReader,
+        source: Blob<SimpleArchive>,
+    ) -> Blob<PortableBM25Blob> {
+        archive_bm25::derive_archive_block_text_bm25_element(reader, source).unwrap()
+    }
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -607,6 +856,284 @@ mod tests {
             epoch: ValidatorEpoch("closure-test-derive"),
             validate: accept_derive,
         }
+    }
+
+    #[test]
+    fn archive_bm25_empty_corpus_and_textless_blocks_remain_documents() {
+        let (empty_source, empty_attachments) = source_and_attachments(Fragment::empty());
+        let empty_store = StoredBlobs::new(empty_attachments);
+        let empty = parse_archive_bm25(derive_archive_bm25(&empty_store.reader, empty_source));
+        assert_eq!(empty.doc_count(), 0);
+        assert_eq!(empty.term_count(), 0);
+
+        let empty_text = text_block(&[(blockdag::content_fact::modality::TEXT, "")]);
+        let empty_text_id = empty_text.root().unwrap();
+        let binary_fact = archive::blob_fact(
+            blockdag::content_fact::modality::IMAGE,
+            blockdag::content_fact::direction::IN,
+            vec![0, 1, 2, 3],
+            "application/octet-stream",
+        )
+        .unwrap();
+        let binary_part = archive::content_part(0, binary_fact, None).unwrap();
+        let binary_block = archive::block(std::iter::empty::<Id>(), None, binary_part).unwrap();
+        let binary_id = binary_block.root().unwrap();
+        let mut corpus = empty_text;
+        corpus += binary_block;
+        let (source, attachments) = source_and_attachments(corpus);
+        let store = StoredBlobs::new(attachments);
+        let index = parse_archive_bm25(derive_archive_bm25(&store.reader, source));
+        let documents: BTreeSet<_> = index.document_keys().map(|doc| doc.raw).collect();
+        assert_eq!(index.doc_count(), 2);
+        assert_eq!(index.term_count(), 0);
+        assert_eq!(
+            documents,
+            BTreeSet::from([
+                IntoInline::<GenId>::to_inline(&empty_text_id).raw,
+                IntoInline::<GenId>::to_inline(&binary_id).raw,
+            ])
+        );
+    }
+
+    #[test]
+    fn archive_bm25_sums_repeated_part_occurrences_across_modalities() {
+        let block = text_block(&[
+            (blockdag::content_fact::modality::THINKING, "echo"),
+            (blockdag::content_fact::modality::TOOL_RESULT, "echo"),
+        ]);
+        let block_id = block.root().unwrap();
+        let (source, attachments) = source_and_attachments(block);
+        let store = StoredBlobs::new(attachments);
+        let index = parse_archive_bm25(derive_archive_bm25(&store.reader, source));
+        let document: Inline<GenId> = block_id.to_inline();
+        let term = hash_tokens("echo")[0];
+        assert_eq!(index.doc_count(), 1);
+        assert_eq!(index.term_frequency(&document, &term), 2);
+
+        // Repeated source leaves converge rather than summing again.
+        assert_eq!(index.merged(&index).unwrap(), index);
+    }
+
+    #[test]
+    fn archive_bm25_derivation_commutes_with_source_union_and_carrier_merge() {
+        let left = text_block(&[(blockdag::content_fact::modality::TEXT, "alpha alpha")]);
+        let right = text_block(&[(blockdag::content_fact::modality::TEXT, "beta")]);
+        let left_source: Blob<SimpleArchive> = left.facts().clone().to_blob();
+        let right_source: Blob<SimpleArchive> = right.facts().clone().to_blob();
+        let mut union = left;
+        union += right;
+        let (union_source, attachments) = source_and_attachments(union);
+        let store = StoredBlobs::new(attachments);
+
+        let left = parse_archive_bm25(derive_archive_bm25(&store.reader, left_source.clone()));
+        let right = parse_archive_bm25(derive_archive_bm25(&store.reader, right_source.clone()));
+        let direct = derive_archive_bm25(&store.reader, union_source);
+        let merged: Blob<PortableBM25Blob> = left.merged(&right).unwrap().to_blob();
+        let reverse: Blob<PortableBM25Blob> = right.merged(&left).unwrap().to_blob();
+        assert_eq!(merged.bytes, direct.bytes);
+        assert_eq!(reverse.bytes, direct.bytes);
+    }
+
+    #[test]
+    fn archive_bm25_validators_are_exact_and_use_pointwise_max() {
+        let source_definition = simplearchive_kind().definition(blockdag::DEFAULT_SCOPE_ID);
+        let target_definition = archive_bm25_kind().definition(blockdag::DEFAULT_SCOPE_ID);
+        let block = text_block(&[(blockdag::content_fact::modality::TEXT, "alpha")]);
+        let (source, attachments) = source_and_attachments(block);
+        let attachment_store = StoredBlobs::new(attachments.clone());
+        let target = derive_archive_bm25(&attachment_store.reader, source.clone());
+        let wrong_target: Blob<PortableBM25Blob> = AttachedArchiveBM25::from_exact_counts([], [])
+            .unwrap()
+            .to_blob();
+
+        let mut blobs = attachments;
+        blobs.push(source.clone().transmute::<UnknownBlob>());
+        blobs.push(target.clone().transmute::<UnknownBlob>());
+        blobs.push(wrong_target.clone().transmute::<UnknownBlob>());
+        let store = StoredBlobs::new(blobs);
+        let derive = CollectionDerive::new(
+            source_definition.id(),
+            target_definition.id(),
+            source.get_handle().into(),
+            target.get_handle().into(),
+        );
+        assert_eq!(
+            validate_simplearchive_to_archive_bm25(
+                &store.reader,
+                &source_definition,
+                &target_definition,
+                &derive,
+            )
+            .unwrap(),
+            ValidationVerdict::Accepted
+        );
+        let wrong_output_derive = CollectionDerive::new(
+            source_definition.id(),
+            target_definition.id(),
+            source.get_handle().into(),
+            wrong_target.get_handle().into(),
+        );
+        assert!(matches!(
+            validate_simplearchive_to_archive_bm25(
+                &store.reader,
+                &source_definition,
+                &target_definition,
+                &wrong_output_derive,
+            )
+            .unwrap(),
+            ValidationVerdict::Rejected(_)
+        ));
+
+        let document: Inline<GenId> = id(0x71).to_inline();
+        let term = hash_tokens("maximum")[0];
+        let low = AttachedArchiveBM25::from_exact_counts([document], [(document, term, 2)])
+            .unwrap()
+            .to_blob();
+        let high = AttachedArchiveBM25::from_exact_counts([document], [(document, term, 5)])
+            .unwrap()
+            .to_blob();
+        let joined = parse_archive_bm25(low.clone())
+            .merged(&parse_archive_bm25(high.clone()))
+            .unwrap();
+        assert_eq!(joined.term_frequency(&document, &term), 5);
+        let joined: Blob<PortableBM25Blob> = joined.to_blob();
+        let merge_store = StoredBlobs::new([
+            low.clone().transmute::<UnknownBlob>(),
+            high.clone().transmute::<UnknownBlob>(),
+            joined.clone().transmute::<UnknownBlob>(),
+        ]);
+        let merge = CollectionMerge::new(
+            target_definition.id(),
+            low.get_handle().into(),
+            high.get_handle().into(),
+            joined.get_handle().into(),
+        );
+        assert_eq!(
+            validate_archive_bm25_merge(&merge_store.reader, &target_definition, &merge).unwrap(),
+            ValidationVerdict::Accepted
+        );
+        let wrong_merge = CollectionMerge::new(
+            target_definition.id(),
+            low.get_handle().into(),
+            high.get_handle().into(),
+            low.get_handle().into(),
+        );
+        assert!(matches!(
+            validate_archive_bm25_merge(&merge_store.reader, &target_definition, &wrong_merge)
+                .unwrap(),
+            ValidationVerdict::Rejected(_)
+        ));
+
+        let alien_definition = CollectionDefinition::new(
+            blockdag::DEFAULT_SCOPE_ID,
+            <PortableBM25Blob as MetaDescribe>::id(),
+            id(0x72),
+        );
+        assert!(matches!(
+            validate_archive_bm25_merge(&merge_store.reader, &alien_definition, &merge).unwrap(),
+            ValidationVerdict::Rejected(_)
+        ));
+        let wrong_derive = CollectionDerive::new(
+            source_definition.id(),
+            id(0x73),
+            source.get_handle().into(),
+            target.get_handle().into(),
+        );
+        assert!(matches!(
+            validate_simplearchive_to_archive_bm25(
+                &store.reader,
+                &source_definition,
+                &target_definition,
+                &wrong_derive,
+            )
+            .unwrap(),
+            ValidationVerdict::Rejected(_)
+        ));
+
+        let catalog = RecipeCatalog::faculties();
+        let descriptor = catalog.kinds.get(&archive_bm25_kind()).unwrap();
+        assert_eq!(descriptor.roots, RootPolicy::DerivedOnly);
+        assert!(descriptor.validate_commit.is_none());
+        assert!(catalog
+            .derives
+            .contains_key(&(simplearchive_kind(), archive_bm25_kind())));
+    }
+
+    #[test]
+    fn archive_bm25_missing_payload_is_pending_but_malformed_source_rejects_first() {
+        let source_definition = simplearchive_kind().definition(blockdag::DEFAULT_SCOPE_ID);
+        let target_definition = archive_bm25_kind().definition(blockdag::DEFAULT_SCOPE_ID);
+        let absent_target: Blob<PortableBM25Blob> = AttachedArchiveBM25::from_exact_counts([], [])
+            .unwrap()
+            .to_blob();
+
+        let block = text_block(&[(blockdag::content_fact::modality::TEXT, "not resident")]);
+        let (source, _attachments) = source_and_attachments(block);
+        let missing_store = StoredBlobs::new([source.clone().transmute::<UnknownBlob>()]);
+        let missing_claim = CollectionDerive::new(
+            source_definition.id(),
+            target_definition.id(),
+            source.get_handle().into(),
+            absent_target.get_handle().into(),
+        );
+        assert_eq!(
+            validate_simplearchive_to_archive_bm25(
+                &missing_store.reader,
+                &source_definition,
+                &target_definition,
+                &missing_claim,
+            )
+            .unwrap(),
+            ValidationVerdict::Pending
+        );
+
+        // A canonical SimpleArchive can still carry a malformed Archive graph.
+        // Its absent text payload must not downgrade structural failure to
+        // Pending merely because attachment resolution happens later.
+        let mut malformed_graph =
+            text_block(&[(blockdag::content_fact::modality::TEXT, "also absent")]);
+        let block_id = malformed_graph.root().unwrap();
+        malformed_graph += entity! { ExclusiveId::force_ref(&block_id) @
+            triblespace::core::metadata::name: "unexpected block field",
+        };
+        let (malformed_graph, _attachments) = source_and_attachments(malformed_graph);
+        let malformed_graph_store =
+            StoredBlobs::new([malformed_graph.clone().transmute::<UnknownBlob>()]);
+        let malformed_graph_claim = CollectionDerive::new(
+            source_definition.id(),
+            target_definition.id(),
+            malformed_graph.get_handle().into(),
+            absent_target.get_handle().into(),
+        );
+        let verdict = validate_simplearchive_to_archive_bm25(
+            &malformed_graph_store.reader,
+            &source_definition,
+            &target_definition,
+            &malformed_graph_claim,
+        )
+        .unwrap();
+        assert!(
+            matches!(verdict, ValidationVerdict::Rejected(reason) if reason.contains("unknown attribute"))
+        );
+
+        let malformed = Blob::<SimpleArchive>::new(Bytes::from(vec![0xFF]));
+        let malformed_store = StoredBlobs::new([malformed.clone().transmute::<UnknownBlob>()]);
+        let malformed_claim = CollectionDerive::new(
+            source_definition.id(),
+            target_definition.id(),
+            malformed.get_handle().into(),
+            absent_target.get_handle().into(),
+        );
+        let verdict = validate_simplearchive_to_archive_bm25(
+            &malformed_store.reader,
+            &source_definition,
+            &target_definition,
+            &malformed_claim,
+        )
+        .unwrap();
+        assert!(
+            matches!(verdict, ValidationVerdict::Rejected(reason) if reason.contains("canonical SimpleArchive"))
+        );
     }
 
     #[test]

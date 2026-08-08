@@ -12,6 +12,16 @@ All notable changes to this project will be documented in this file.
   Shared constructors keep kind markers, paths, actors, and source labels as
   monotone nonidentity annotations, while binary facts reuse Files' intrinsic
   normalized media-type entities.
+- **Archive gains its first portable collection-native search recipe.** The
+  derived-only Archive block-text BM25 collection projects every canonical
+  block—including textless blocks—through ordinal parts into all resident
+  `LongString` payloads, sums repeated occurrences within a block, and joins
+  repeated leaves by pointwise maximum in TribleSpace's exact-TF portable
+  carrier. The versioned recipe freezes `hash_tokens` behavior and admits only
+  exact DERIVE and MERGE equations; malformed resident structure rejects before
+  missing attachments or cache outputs can yield a retryable Pending verdict.
+  Importer/source-projection policy remains at Archive's domain-validation
+  boundary rather than leaking into the representation recipe.
 - **Collection Succinct derivation and merge validation stay in the portable
   carrier.** Faculties now calls TribleSpace's direct SimpleArchive-to-raw
   builder and exact raw-blob MERGE proof, avoiding native query arenas and
