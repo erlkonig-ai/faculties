@@ -2191,6 +2191,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::fs::File;
+    use std::io::{self, Cursor, Read, Write};
     use std::path::PathBuf;
     use std::rc::Rc;
 
@@ -2722,6 +2723,55 @@ mod tests {
             deleted: Vec::new(),
             quit: false,
         }
+    }
+
+    struct ScriptedPopStream {
+        reads: Cursor<Vec<u8>>,
+        writes: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl Read for ScriptedPopStream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads.read(buffer)
+        }
+    }
+
+    impl Write for ScriptedPopStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writes.borrow_mut().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn real_pop_session_runs_through_transactional_drain() {
+        let mut script =
+            b"+OK ready\r\n+OK listing\r\n1 Uidl-Bridge\r\n.\r\n+OK message follows\r\n".to_vec();
+        script.extend_from_slice(RAW_INBOUND);
+        script.extend_from_slice(b".\r\n+OK deleted\r\n+OK bye\r\n");
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let session = crate::mail_pop::PopSession::new(ScriptedPopStream {
+            reads: Cursor::new(script),
+            writes: writes.clone(),
+        })
+        .unwrap();
+        let mut published = Vec::new();
+
+        drain_pop(session, id(9), |publication| {
+            published.push((publication.wire, publication.observation));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            writes.borrow().as_slice(),
+            b"UIDL\r\nRETR 1\r\nDELE 1\r\nQUIT\r\n"
+        );
     }
 
     #[test]
