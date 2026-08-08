@@ -234,22 +234,15 @@ fn import_claude_code_records(
         change += conversation_fragment;
 
         // Attach message edges and raw provenance as non-identity attributes.
-        {
-            let conversation_entity = conversation_id
-                .acquire()
-                .expect("entity! root ids should be acquired in current thread");
-            let msg_id_list: Vec<Id> = message_ids.iter().map(|(id, _)| *id).collect();
-            change += entity! { &conversation_entity @
-                common::import_schema::message*: msg_id_list,
-                common::import_schema::source_raw_root: raw_root,
-            };
-        }
+        let msg_id_list: Vec<Id> = message_ids.iter().map(|(id, _)| *id).collect();
+        change += entity! { ExclusiveId::force_ref(&conversation_id) @
+            common::import_schema::message*: msg_id_list,
+            common::import_schema::source_raw_root: raw_root,
+        };
 
         // --- Pass 3: attach content attributes to messages. ---
         for (message_id, msg) in &message_ids {
-            let message_entity = message_id
-                .acquire()
-                .expect("entity! root ids should be acquired in current thread");
+            let message_entity = ExclusiveId::force_ref(message_id);
 
             let author_key = format!("{}::{}", msg.author, msg.role);
             let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
@@ -278,7 +271,7 @@ fn import_claude_code_records(
 
             let model_handle = msg.model.as_ref().map(|m| ws.put(m.clone()));
 
-            change += entity! { &message_entity @
+            change += entity! { message_entity @
                 common::metadata::tag: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,

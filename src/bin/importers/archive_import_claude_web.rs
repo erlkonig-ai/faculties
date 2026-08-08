@@ -151,10 +151,7 @@ fn import_one_conversation(
             .and_then(JsonValue::as_str)
             .filter(|s| !s.is_empty())
             .map(|s| ws.put(s.to_string()));
-        let conversation_entity = conversation_id
-            .acquire()
-            .expect("entity! root ids should be acquired in current thread");
-        change += entity! { &conversation_entity @
+        change += entity! { ExclusiveId::force_ref(&conversation_id) @
             common::import_schema::source_raw_root: raw_root,
             common::import_schema::source_conversation_title?: title,
             common::import_schema::source_conversation_summary?: summary,
@@ -190,9 +187,7 @@ fn import_one_conversation(
             .root()
             .expect("entity! must export a single root id");
         change += message_fragment;
-        let message_entity = message_id
-            .acquire()
-            .expect("entity! root ids should be acquired in current thread");
+        let message_entity = ExclusiveId::force_ref(&message_id);
 
         let role = message
             .get("sender")
@@ -231,9 +226,7 @@ fn import_one_conversation(
             let attachment_id = attachment_fragment
                 .root()
                 .expect("entity! must export a single root id");
-            let attachment_entity = attachment_id
-                .acquire()
-                .expect("entity! root ids should be acquired in current thread");
+            let attachment_entity = ExclusiveId::force_ref(&attachment_id);
             attachment_ids.push(attachment_id);
             change += attachment_fragment;
 
@@ -246,7 +239,7 @@ fn import_one_conversation(
             if data.is_some() {
                 stats.attachments += 1;
             }
-            change += entity! { &attachment_entity @
+            change += entity! { attachment_entity @
                 common::archive::attachment_name: name_handle,
                 common::archive::attachment_mime?: mime,
                 common::archive::attachment_size_bytes?: attachment.file_size,
@@ -259,7 +252,7 @@ fn import_one_conversation(
             None => (None, None),
         };
 
-        change += entity! { &message_entity @
+        change += entity! { message_entity @
             common::metadata::tag: common::archive::kind_message,
             common::import_schema::conversation: conversation_id,
             common::archive::author: author_id,

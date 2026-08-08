@@ -156,9 +156,7 @@ fn import_gemini_parsed_file(
         let message_id = message_fragment
             .root()
             .expect("entity! must export a single root id");
-        let message_entity = message_id
-            .acquire()
-            .expect("entity! root ids should be acquired in current thread");
+        let message_entity = ExclusiveId::force_ref(&message_id);
         change += message_fragment;
         let author_key = format!("{}::{}", message.author, message.role);
         let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
@@ -177,7 +175,7 @@ fn import_gemini_parsed_file(
             .as_ref()
             .map(|(_, parent_source_id)| ws.put(parent_source_id.clone()));
         let content_handle = ws.put(message.content.clone());
-        change += entity! { &message_entity @
+        change += entity! { message_entity @
             common::metadata::tag: common::archive::kind_message,
             common::archive::author: author_id,
             common::archive::content: content_handle,

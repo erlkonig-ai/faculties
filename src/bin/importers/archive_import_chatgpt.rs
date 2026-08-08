@@ -187,15 +187,13 @@ fn import_chatgpt_parsed_file(
         let mut change = TribleSet::new();
         change += conversation_fragment;
         // Raw provenance is a non-identity attribute: each export's raw root
-        // accumulates on the same conversation (monotone g-set).
-        {
-            let conversation_entity = conversation_id
-                .acquire()
-                .expect("entity! root ids should be acquired in current thread");
-            change += entity! { &conversation_entity @
-                common::import_schema::source_raw_root: raw_root,
-            };
-        }
+        // accumulates on the same conversation (monotone g-set). Intrinsic
+        // entity roots are reproducible plain IDs and deliberately carry no
+        // thread-local ExclusiveId capability, so extending their annotation
+        // set is an explicit force at this domain boundary.
+        change += entity! { ExclusiveId::force_ref(&conversation_id) @
+            common::import_schema::source_raw_root: raw_root,
+        };
         let mut author_cache: HashMap<String, Id> = HashMap::new();
 
         let mut node_to_message = HashMap::new();
@@ -229,9 +227,7 @@ fn import_chatgpt_parsed_file(
             let Some(message_id) = node_to_message.get(node_id.as_str()).copied() else {
                 continue;
             };
-            let message_entity = message_id
-                .acquire()
-                .expect("entity! root ids should be acquired in current thread");
+            let message_entity = ExclusiveId::force_ref(&message_id);
 
             let role = message
                 .get("author")
@@ -286,9 +282,7 @@ fn import_chatgpt_parsed_file(
                 let attachment_id = attachment_fragment
                     .root()
                     .expect("entity! must export a single root id");
-                let attachment_entity = attachment_id
-                    .acquire()
-                    .expect("entity! root ids should be acquired in current thread");
+                let attachment_entity = ExclusiveId::force_ref(&attachment_id);
                 attachment_ids.push(attachment_id);
 
                 let source_pointer_handle = source_pointer.map(|pointer| ws.put(pointer));
@@ -312,7 +306,7 @@ fn import_chatgpt_parsed_file(
                     }
                 }
 
-                change += entity! { &attachment_entity @
+                change += entity! { attachment_entity @
                     common::metadata::tag: common::archive::kind_attachment,
                     common::archive::attachment_source_id: source_id_handle,
                     common::archive::attachment_source_pointer?: source_pointer_handle,
@@ -336,7 +330,7 @@ fn import_chatgpt_parsed_file(
                 })
                 .unwrap_or((None, None));
 
-            change += entity! { &message_entity @
+            change += entity! { message_entity @
                 common::metadata::tag: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,

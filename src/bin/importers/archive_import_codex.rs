@@ -197,14 +197,9 @@ fn import_codex_records(
             .expect("entity! must export a single root id");
 
         change += conversation_fragment;
-        {
-            let conversation_entity = conversation_id
-                .acquire()
-                .expect("entity! root ids should be acquired in current thread");
-            change += entity! { &conversation_entity @
-                common::import_schema::source_raw_root: raw_root,
-            };
-        }
+        change += entity! { ExclusiveId::force_ref(&conversation_id) @
+            common::import_schema::source_raw_root: raw_root,
+        };
 
         let mut previous: Option<(Id, String)> = None;
         for message in convo_messages {
@@ -216,9 +211,7 @@ fn import_codex_records(
             let message_id = message_fragment
                 .root()
                 .expect("entity! must export a single root id");
-            let message_entity = message_id
-                .acquire()
-                .expect("entity! root ids should be acquired in current thread");
+            let message_entity = ExclusiveId::force_ref(&message_id);
             change += message_fragment;
             let content_handle = ws.put(message.content.clone());
 
@@ -240,7 +233,7 @@ fn import_codex_records(
                 .as_ref()
                 .map(|(_, parent_source_id)| ws.put(parent_source_id.clone()));
 
-            change += entity! { &message_entity @
+            change += entity! { message_entity @
                 common::metadata::tag: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,
