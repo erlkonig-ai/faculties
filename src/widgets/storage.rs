@@ -525,6 +525,9 @@ fn load_collection_catalog(
     let messages = dataset(MESSAGES_SCOPE_ID);
     crate::message::validate_catalog(&messages.reader, &messages.facts, &relations.facts)
         .map_err(|error| format!("validate Messages collection: {error:#}"))?;
+    let status = dataset(STATUS_SCOPE_ID);
+    crate::status::validate_catalog(&status.reader, &status.facts)
+        .map_err(|error| format!("validate Status collection: {error:#}"))?;
 
     let datasets = COLLECTION_SOURCE_CATALOG
         .iter()
@@ -1206,5 +1209,30 @@ mod tests {
         let error = load_collection_catalog(&snapshot, &allowed).unwrap_err();
         assert!(error.contains("validate Messages collection"));
         assert!(error.contains("sender"));
+    }
+
+    #[test]
+    fn status_validation_rejects_non_status_facts_from_the_frozen_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status-validation-rejects.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+        let unrelated_kind = Id::new([0x99; 16]).unwrap();
+        collection_access::publish_fragment(
+            &path,
+            None,
+            STATUS_SCOPE_ID,
+            entity! { metadata::tag: &unrelated_kind },
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let signer = collection_access::load_signer(&path, None).unwrap();
+        let allowed = HashSet::from([signer.verifying_key()]);
+        let snapshot = collection_access::CollectionSnapshot::open(&path).unwrap();
+        let error = load_collection_catalog(&snapshot, &allowed).unwrap_err();
+
+        assert!(error.contains("validate Status collection"));
+        assert!(error.contains("outside canonical Status events"));
     }
 }
