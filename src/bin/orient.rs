@@ -14,19 +14,19 @@ use faculties::collection_access::{
 };
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::compass::{KIND_GOAL, KIND_NOTE, KIND_STATUS_SNAPSHOT};
-use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
+use faculties::schemas::mail::KIND_WIRE_MESSAGE;
 use faculties::schemas::memory::DEFAULT_MEMORY_BRANCH;
-use faculties::schemas::message::{local as message_attrs, KIND_MESSAGE_ID, KIND_READ_ID};
+use faculties::schemas::message::KIND_MESSAGE_ID;
 use faculties::schemas::orient::DEFAULT_SCOPE_ID as ORIENT_SCOPE_ID;
 use faculties::schemas::relations::KIND_PERSON_ID;
 use faculties::schemas::status::{status as status_attrs, KIND_STATUS_UPDATE};
 use faculties::schemas::wiki::{cover_fragments, WIKI_BRANCH_NAME};
-use faculties::{compass, message, orient, relations};
+use faculties::{compass, decide, files, mail, message, orient, relations};
 use hifitime::Epoch;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::macros::{exists, find, pattern};
+use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
@@ -102,15 +102,17 @@ enum WaitTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Revisions {
     message: CollectionRevision,
+    mail: CollectionRevision,
     compass: CollectionRevision,
     relations: CollectionRevision,
     orient: CollectionRevision,
 }
 
-/// One coherent four-scope view. All materializations reuse exactly one
+/// One coherent seven-scope view. All materializations reuse exactly one
 /// immutable `CollectionSnapshot` and one durable signer authority.
 struct CurrentCollections {
     message: CollectionView,
+    mail: CollectionView,
     compass: CollectionView,
     relations: CollectionView,
     orient: CollectionView,
@@ -128,6 +130,30 @@ impl CurrentCollections {
             .context("materialize Relations collection")?;
         relations::validate_catalog(&relations.reader, &relations.facts)
             .context("validate Relations collection")?;
+
+        let files = snapshot
+            .materialize_scope(faculties::schemas::files::DEFAULT_SCOPE_ID, &allowed)
+            .context("materialize Files collection")?;
+        files::validate_catalog(&files.reader, &files.facts)
+            .context("validate Files collection")?;
+
+        let decide = snapshot
+            .materialize_scope(faculties::schemas::decide::DEFAULT_SCOPE_ID, &allowed)
+            .context("materialize Decide collection")?;
+        decide::validate_catalog(&decide.reader, &decide.facts)
+            .context("validate Decide collection")?;
+
+        let mail = snapshot
+            .materialize_scope(faculties::schemas::mail::DEFAULT_SCOPE_ID, &allowed)
+            .context("materialize Mail collection")?;
+        mail::validate_catalog(
+            &mail.reader,
+            &mail.facts,
+            &files.facts,
+            &decide.facts,
+            &relations.facts,
+        )
+        .context("validate Mail collection")?;
 
         let message = snapshot
             .materialize_scope(faculties::schemas::message::DEFAULT_SCOPE_ID, &allowed)
@@ -147,6 +173,7 @@ impl CurrentCollections {
         let orient_catalog = orient::validate_catalog(
             &orient_view.facts,
             &message.facts,
+            &mail.facts,
             &compass.facts,
             &relations.facts,
         )
@@ -154,6 +181,7 @@ impl CurrentCollections {
 
         Ok(Self {
             message,
+            mail,
             compass,
             relations,
             orient: orient_view,
@@ -164,6 +192,7 @@ impl CurrentCollections {
     fn revisions(&self) -> Revisions {
         Revisions {
             message: self.message.revision,
+            mail: self.mail.revision,
             compass: self.compass.revision,
             relations: self.relations.revision,
             orient: self.orient.revision,
@@ -349,6 +378,7 @@ struct PersonaView {
     component: BTreeSet<Id>,
     label: String,
     unread: BTreeMap<Id, message::MessageRow>,
+    mail_unread: BTreeMap<Id, Vec<mail::ProjectionView>>,
     goals: BTreeMap<Id, GoalView>,
     notes: BTreeMap<Id, Id>,
     roster: BTreeSet<Id>,
@@ -376,6 +406,31 @@ fn current_persona_view(collections: &CurrentCollections, persona: Id) -> Result
         {
             unread.insert(row.id, row);
         }
+    }
+
+    let mut mail_unread = BTreeMap::<Id, Vec<mail::ProjectionView>>::new();
+    for row in mail::inbox_projection(
+        &collections.mail.facts,
+        &collections.relations.facts,
+        persona,
+    )? {
+        if !row.unread {
+            continue;
+        }
+        let projection = mail::projection_view(
+            &collections.mail.reader,
+            &collections.mail.facts,
+            row.projection,
+        )?;
+        // Spam is durable parser evidence rather than a mutable mailbox
+        // folder.  Orient keeps it out of the attention stream while `mail
+        // list --spam` remains the explicit view.
+        if !projection.spam {
+            mail_unread.entry(row.wire).or_default().push(projection);
+        }
+    }
+    for projections in mail_unread.values_mut() {
+        projections.sort_unstable_by_key(|projection| (projection.source, projection.id));
     }
 
     let mut goals = BTreeMap::new();
@@ -445,6 +500,12 @@ fn current_persona_view(collections: &CurrentCollections, persona: Id) -> Result
             .copied()
             .map(|id| orient::Observation::new(KIND_MESSAGE_ID, id)),
     );
+    observations.extend(
+        mail_unread
+            .keys()
+            .copied()
+            .map(|id| orient::Observation::new(KIND_WIRE_MESSAGE, id)),
+    );
     for goal in goals.values() {
         // Goal anchors and every current status head are observed even when
         // irrelevant or self-authored. If relevance expands later, old state
@@ -470,6 +531,7 @@ fn current_persona_view(collections: &CurrentCollections, persona: Id) -> Result
         component,
         label: person_label(collections, persona),
         unread,
+        mail_unread,
         goals,
         notes,
         roster,
@@ -656,6 +718,7 @@ fn status_change_reason(
 struct NewsReport {
     reasons: Vec<String>,
     messages: Vec<Id>,
+    mail: Vec<Id>,
     people: Vec<Id>,
 }
 
@@ -670,6 +733,13 @@ fn news_report(
         if !seen.contains(&marker) {
             report.reasons.push(format!("new message [{id:x}]"));
             report.messages.push(*id);
+        }
+    }
+    for id in view.mail_unread.keys() {
+        let marker = orient::Observation::new(KIND_WIRE_MESSAGE, *id);
+        if !seen.contains(&marker) {
+            report.reasons.push(format!("new mail [{id:x}]"));
+            report.mail.push(*id);
         }
     }
     for goal in view.goals.values() {
@@ -753,6 +823,7 @@ fn publish_evaluation(
         &collections.orient.facts,
         &fragment,
         &collections.message.facts,
+        &collections.mail.facts,
         &collections.compass.facts,
         &collections.relations.facts,
     )
@@ -915,107 +986,56 @@ fn read_legacy_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
     Ok(value.to_string())
 }
 
-/// Isolated legacy Mail read. It never supplies Message/Relations fallback and
-/// never writes or creates a repository branch.
-fn render_legacy_mail(
-    pile: &Path,
-    collections: &CurrentCollections,
+/// Render the same validated collection-native inbox projection that drives
+/// Orient observations.  One WireMessage is one attention item even when the
+/// same raw message was observed by several POP transactions.
+fn render_mail(
+    evaluation: Option<&PersonaEvaluation>,
     message_limit: usize,
     now: i128,
 ) -> Result<String> {
     let mut out = String::new();
-    let mail_user = match std::env::var("MAIL_USER") {
-        Ok(user) => user,
-        Err(_) => {
-            writeln!(out, "Mail:").unwrap();
-            writeln!(out, "- MAIL_USER env var not set; skipping").unwrap();
-            return Ok(out);
-        }
-    };
-    let needle = mail_user.trim().to_ascii_lowercase();
-    let mut self_ids = Vec::new();
-    for person in relations::person_anchors(&collections.relations.facts) {
-        if let Ok(profile) = profile_for(collections, person) {
-            if profile
-                .emails
-                .iter()
-                .any(|email| email.to_ascii_lowercase() == needle)
-            {
-                self_ids.push(person);
-            }
-        }
-    }
-    self_ids.sort_unstable();
-    let Some(self_id) = self_ids.first().copied() else {
+    let Some(evaluation) = evaluation else {
         writeln!(out, "Mail:").unwrap();
         writeln!(
             out,
-            "- No Relations entry for {mail_user} yet (run `mail fetch` or `mail send` once)"
+            "- Unavailable: no persona (pass --persona <label-or-hex> or set $PERSONA)"
         )
         .unwrap();
         return Ok(out);
     };
-    let identities = relations::IdentityComponents::from_facts(&collections.relations.facts)?;
-    let component = identities.component(self_id)?;
-    let Some(mail_view) = collection_access::materialize_named_legacy_branch(pile, "mail")? else {
-        writeln!(out, "Mail (unread for {mail_user}):").unwrap();
-        writeln!(out, "- mail branch not present yet").unwrap();
-        return Ok(out);
-    };
 
     let mut rows = Vec::new();
-    for (id, from, sent_at, subject) in find!(
-        (
-            id: Id,
-            from: Id,
-            sent_at: IntervalValue,
-            subject: TextHandle
-        ),
-        pattern!(&mail_view.facts, [{ ?id @
-            metadata::tag: &KIND_MAIL_MESSAGE,
-            mail::from: ?from,
-            mail::sent_at: ?sent_at,
-            mail::subject: ?subject,
-        }])
-    ) {
-        if component.contains(&from)
-            || exists!(pattern!(&mail_view.facts, [{ id @ metadata::tag: &KIND_SPAM }]))
-        {
-            continue;
-        }
-        let was_read = find!(
-            reader: Id,
-            pattern!(&mail_view.facts, [{ _?read @
-                metadata::tag: &KIND_READ_ID,
-                message_attrs::about_message: &id,
-                message_attrs::reader: ?reader,
-            }])
-        )
-        .any(|reader| component.contains(&reader));
-        if was_read {
-            continue;
-        }
-        rows.push((
-            interval_key(sent_at)?,
-            id,
-            from,
-            read_legacy_text(&mail_view.reader, subject).unwrap_or_default(),
-        ));
+    for (&wire, projections) in &evaluation.view.mail_unread {
+        let primary = projections
+            .first()
+            .expect("mail_unread never stores an empty projection group");
+        let claimed_at = primary
+            .claimed_date
+            .map(interval_key)
+            .transpose()?
+            .unwrap_or(i128::MIN);
+        rows.push((claimed_at, wire, primary, projections.len()));
     }
     rows.sort_by_key(|row| std::cmp::Reverse((row.0, row.1)));
-    writeln!(out, "Mail (unread for {mail_user}):").unwrap();
+    writeln!(out, "Mail (unread for {}):", evaluation.view.label).unwrap();
     if rows.is_empty() {
         writeln!(out, "- None").unwrap();
     } else {
-        for (sent_at, id, from, subject) in rows.into_iter().take(message_limit) {
-            let email = profile_for(collections, from)
-                .ok()
-                .and_then(|profile| profile.emails.into_iter().next())
-                .unwrap_or_else(|| "?".to_owned());
+        for (claimed_at, wire, projection, sources) in rows.into_iter().take(message_limit) {
+            let age = if claimed_at == i128::MIN {
+                "unknown-date".to_owned()
+            } else {
+                format_age(now, claimed_at)
+            };
+            let source_note = (sources > 1)
+                .then(|| format!(" ({sources} source observations)"))
+                .unwrap_or_default();
             writeln!(
                 out,
-                "- [{id:x}] {} {email} — {subject}",
-                format_age(now, sent_at)
+                "- [{wire:x}] {age} {} — {}{source_note}",
+                projection.from.as_deref().unwrap_or("(no From)"),
+                projection.subject,
             )
             .unwrap();
         }
@@ -1126,7 +1146,7 @@ fn render_show(
         )
         .unwrap();
     }
-    out.push_str(&render_legacy_mail(pile, collections, message_limit, now)?);
+    out.push_str(&render_mail(evaluation.as_ref(), message_limit, now)?);
     writeln!(out).unwrap();
     out.push_str(&render_compass_goals(collections, doing_limit, todo_limit)?);
     out.push_str(&render_legacy_colony(pile, collections)?);
@@ -1145,6 +1165,31 @@ fn render_news(collections: &CurrentCollections, evaluation: &PersonaEvaluation)
             if let Some(row) = evaluation.view.unread.get(id) {
                 let body = message::read_body(&collections.message.reader, row.body)?;
                 writeln!(out, "- {}: {body}", person_label(collections, row.from)).unwrap();
+            }
+        }
+    }
+    if !evaluation.news.mail.is_empty() {
+        writeln!(out).unwrap();
+        writeln!(out, "New mail:").unwrap();
+        for wire in &evaluation.news.mail {
+            let Some(projections) = evaluation.view.mail_unread.get(wire) else {
+                continue;
+            };
+            let projection = projections
+                .first()
+                .expect("mail_unread never stores an empty projection group");
+            writeln!(
+                out,
+                "- [{wire:x}] {} — {}",
+                projection.from.as_deref().unwrap_or("(no From)"),
+                projection.subject,
+            )
+            .unwrap();
+            for line in projection.body.lines() {
+                writeln!(out, "    {}", line.trim_end_matches('\r')).unwrap();
+            }
+            if projections.len() > 1 {
+                writeln!(out, "    ({} source observations)", projections.len()).unwrap();
             }
         }
     }
@@ -1611,6 +1656,67 @@ mod tests {
         assert!(output.starts_with("Orient\n"));
         assert!(evaluation.is_none());
         assert_eq!(pile_length(&fixture.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn inbound_mail_wakes_once_per_wire_and_read_evidence_removes_it() {
+        let fixture = Fixture::new();
+        let persona = test_id(40);
+        let account = test_id(41);
+        let credential = test_id(42);
+        fixture.person(persona, "me", true);
+        cmd_poll(&fixture.pile, Some(&format!("{persona:x}")), false).unwrap();
+
+        let mut account_fragment =
+            mail::credential_fragment(credential, b"orient-test", "secret").unwrap();
+        let (config_fragment, config) = mail::account_config_fragment(
+            account,
+            mail::AccountConfigInput {
+                address: "me@example.com".to_owned(),
+                display_name: "Me".to_owned(),
+                pop_endpoint: "pop.example.com:995".to_owned(),
+                smtp_endpoint: "smtp.example.com:465".to_owned(),
+                username: "me@example.com".to_owned(),
+                credential,
+                enabled: true,
+                predecessors: Vec::new(),
+            },
+        )
+        .unwrap();
+        account_fragment += config_fragment;
+        fixture.publish(faculties::schemas::mail::DEFAULT_SCOPE_ID, account_fragment);
+
+        let publication = mail::pop_publication(
+            account,
+            config,
+            "uid-1",
+            b"From: Sender <sender@example.com>\r\nTo: me@example.com\r\nMessage-ID: <orient-test@example.com>\r\nDate: Thu, 01 Jan 1970 00:00:01 +0000\r\nSubject: Hello\r\n\r\nbody\r\n",
+        )
+        .unwrap();
+        let wire = publication.wire;
+        if !publication.files.facts().is_empty() {
+            fixture.publish(
+                faculties::schemas::files::DEFAULT_SCOPE_ID,
+                publication.files,
+            );
+        }
+        fixture.publish(faculties::schemas::mail::DEFAULT_SCOPE_ID, publication.mail);
+
+        let (collections, _) = stable_collections(&fixture.pile).unwrap();
+        let evaluation = evaluate_persona(&collections, persona).unwrap();
+        assert!(evaluation.view.mail_unread.contains_key(&wire));
+        assert_eq!(evaluation.news.mail, vec![wire]);
+        assert!(render_news(&collections, &evaluation)
+            .unwrap()
+            .contains("New mail:"));
+
+        cmd_poll(&fixture.pile, Some(&format!("{persona:x}")), false).unwrap();
+        let (read, _) = mail::read_observation_fragment(wire, persona);
+        fixture.publish(faculties::schemas::mail::DEFAULT_SCOPE_ID, read);
+        let (collections, _) = stable_collections(&fixture.pile).unwrap();
+        let evaluation = evaluate_persona(&collections, persona).unwrap();
+        assert!(!evaluation.view.mail_unread.contains_key(&wire));
+        assert!(evaluation.news.mail.is_empty());
     }
 
     #[test]

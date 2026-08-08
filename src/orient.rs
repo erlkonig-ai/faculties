@@ -14,6 +14,7 @@ use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
 use crate::schemas::compass::{KIND_GOAL, KIND_NOTE, KIND_STATUS_SNAPSHOT};
+use crate::schemas::mail::KIND_WIRE_MESSAGE;
 use crate::schemas::message::KIND_MESSAGE_ID;
 use crate::schemas::orient::{observation, KIND_BASELINE, KIND_SEEN};
 use crate::schemas::relations::KIND_PERSON_ID;
@@ -146,11 +147,14 @@ fn ids_of_kind(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
 fn upstream_items(
     source_kind: Id,
     message_facts: &TribleSet,
+    mail_facts: &TribleSet,
     compass_facts: &TribleSet,
     relations_facts: &TribleSet,
 ) -> Option<BTreeSet<Id>> {
     let facts = if source_kind == KIND_MESSAGE_ID {
         message_facts
+    } else if source_kind == KIND_WIRE_MESSAGE {
+        mail_facts
     } else if source_kind == KIND_GOAL
         || source_kind == KIND_STATUS_SNAPSHOT
         || source_kind == KIND_NOTE
@@ -164,7 +168,7 @@ fn upstream_items(
     Some(ids_of_kind(facts, source_kind))
 }
 
-/// Validate an exact materialized Orient catalog against the three exact
+/// Validate an exact materialized Orient catalog against the four exact
 /// upstream catalogs from the same immutable pile snapshot.
 ///
 /// Every record is reconstructed byte-for-byte, every entity id must be its
@@ -174,6 +178,7 @@ fn upstream_items(
 pub fn validate_catalog(
     facts: &TribleSet,
     message_facts: &TribleSet,
+    mail_facts: &TribleSet,
     compass_facts: &TribleSet,
     relations_facts: &TribleSet,
 ) -> Result<Catalog> {
@@ -223,10 +228,16 @@ pub fn validate_catalog(
             "observation::source_item",
         )?;
         if let std::collections::btree_map::Entry::Vacant(entry) = item_cache.entry(source_kind) {
-            let items = upstream_items(source_kind, message_facts, compass_facts, relations_facts)
-                .ok_or_else(|| {
-                    anyhow!("Orient Seen marker {id:x} uses unknown source kind {source_kind:x}")
-                })?;
+            let items = upstream_items(
+                source_kind,
+                message_facts,
+                mail_facts,
+                compass_facts,
+                relations_facts,
+            )
+            .ok_or_else(|| {
+                anyhow!("Orient Seen marker {id:x} uses unknown source kind {source_kind:x}")
+            })?;
             entry.insert(items);
         }
         if !item_cache[&source_kind].contains(&source_item) {
@@ -256,12 +267,19 @@ pub fn validate_catalog_union(
     current: &TribleSet,
     fragment: &Fragment,
     message_facts: &TribleSet,
+    mail_facts: &TribleSet,
     compass_facts: &TribleSet,
     relations_facts: &TribleSet,
 ) -> Result<(TribleSet, Catalog)> {
     let mut union = current.clone();
     union += fragment.facts().clone();
-    let catalog = validate_catalog(&union, message_facts, compass_facts, relations_facts)?;
+    let catalog = validate_catalog(
+        &union,
+        message_facts,
+        mail_facts,
+        compass_facts,
+        relations_facts,
+    )?;
     Ok((union, catalog))
 }
 
@@ -294,13 +312,22 @@ mod tests {
         let messages = anchor(message, KIND_MESSAGE_ID).into_facts();
         let compass = TribleSet::new();
         let valid = marker_fragment(persona, true, [Observation::new(KIND_MESSAGE_ID, message)]);
-        validate_catalog(valid.facts(), &messages, &compass, &relations).unwrap();
+        validate_catalog(
+            valid.facts(),
+            &messages,
+            &TribleSet::new(),
+            &compass,
+            &relations,
+        )
+        .unwrap();
 
         let mut extra = valid.facts().clone();
         let bogus = ufoid().id;
         extra +=
             entity! { ExclusiveId::force_ref(&bogus) @ metadata::tag: &KIND_BASELINE }.into_facts();
-        assert!(validate_catalog(&extra, &messages, &compass, &relations).is_err());
+        assert!(
+            validate_catalog(&extra, &messages, &TribleSet::new(), &compass, &relations,).is_err()
+        );
 
         let mut wrong = TribleSet::new();
         wrong += entity! { ExclusiveId::force_ref(&bogus) @
@@ -310,7 +337,9 @@ mod tests {
             observation::source_item: message,
         }
         .into_facts();
-        assert!(validate_catalog(&wrong, &messages, &compass, &relations).is_err());
+        assert!(
+            validate_catalog(&wrong, &messages, &TribleSet::new(), &compass, &relations,).is_err()
+        );
     }
 
     #[test]
@@ -321,6 +350,7 @@ mod tests {
         let marker = marker_fragment(persona, true, [Observation::new(KIND_NOTE, missing)]);
         assert!(validate_catalog(
             marker.facts(),
+            &TribleSet::new(),
             &TribleSet::new(),
             &TribleSet::new(),
             &relations,

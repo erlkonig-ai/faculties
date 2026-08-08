@@ -35,7 +35,6 @@ pub enum SourceKey {
     Discord,
     Files,
     Headspace,
-    Mail,
     Memory,
     Messages,
     Planner,
@@ -49,7 +48,7 @@ pub enum SourceKey {
 
 impl SourceKey {
     /// Every logical input understood by the viewer core.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 16] = [
         Self::Archive,
         Self::Atlas,
         Self::Compass,
@@ -57,7 +56,6 @@ impl SourceKey {
         Self::Discord,
         Self::Files,
         Self::Headspace,
-        Self::Mail,
         Self::Memory,
         Self::Messages,
         Self::Planner,
@@ -172,10 +170,6 @@ const LEGACY_SOURCE_CATALOG: &[LegacySource] = &[
     LegacySource {
         key: SourceKey::Headspace,
         branches: &["config"],
-    },
-    LegacySource {
-        key: SourceKey::Mail,
-        branches: &["mail"],
     },
     LegacySource {
         key: SourceKey::Memory,

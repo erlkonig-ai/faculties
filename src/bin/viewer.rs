@@ -18,9 +18,8 @@ use std::path::PathBuf;
 
 use faculties::widgets::{
     AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
-    GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
-    RelationsViewer, SourceKey, StatusViewer, StorageState, TeamsViewer, TimelineSource,
-    TriageViewer, WikiViewer,
+    GaugeViewer, HeadspaceViewer, MemoryViewer, MessagesPanel, PlannerViewer, RelationsViewer,
+    SourceKey, StatusViewer, StorageState, TeamsViewer, TimelineSource, TriageViewer, WikiViewer,
 };
 use GORBIE::notebook;
 use GORBIE::prelude::*;
@@ -175,15 +174,6 @@ fn main(nb: &mut NotebookCtx) {
             return;
         };
         panel.render(ctx, view);
-    });
-
-    nb.state("mail", MailViewer::default(), move |ctx, panel| {
-        let mut st = storage.read_mut(ctx);
-        let sources = st.context();
-        let Some(view) = sources.dataset(SourceKey::Mail) else {
-            return;
-        };
-        panel.render(ctx, view, sources.dataset(SourceKey::Relations));
     });
 
     nb.state("planner", PlannerViewer::default(), move |ctx, panel| {
