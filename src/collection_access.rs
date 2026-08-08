@@ -1,9 +1,11 @@
-//! Shared access to `SimpleArchive`-union collections in a pile.
+//! Shared authenticated access to typed collections in a pile.
 //!
 //! This is intentionally a composition boundary, not another repository
 //! model. Callers supply an extrinsic scope and explicit signer authority;
 //! the collection definition, signed commits, reproducible merge equations,
-//! and physical cover remain the canonical TribleSpace objects.
+//! derivations, and physical cover remain the canonical TribleSpace objects.
+//! Existing faculties use the thin `SimpleArchive` union adapter; indexed
+//! consumers may resolve the raw-SuccinctArchive representation directly.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,13 +20,13 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, IntoBlob, MemoryBlobStore};
 use triblespace::core::collection::simplearchive_union::{
-    self, prepare_fragment_commit, publish_fragment_commit, validate_commit, validate_merge,
-    StagedCollectionCommit,
+    self, prepare_fragment_commit, publish_fragment_commit, validate_commit, StagedCollectionCommit,
 };
 use triblespace::core::collection::{
-    discover_collection_records, plan_collection_retention, resolve_collection_semantics,
-    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDefinition,
-    CollectionResolution, CollectionValidationRequest, DiscoveredCollectionRecords,
+    collection_physical_cover, discover_collection_records, plan_collection_retention,
+    resolve_collection_semantics, CollectionClaimValidation, CollectionCommit, CollectionData,
+    CollectionDefinition, CollectionResolution, CollectionValidationRequest,
+    DiscoveredCollectionRecords,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -38,18 +40,19 @@ use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{entity, find, pattern};
 
+use crate::collection_recipes::{succinctarchive_kind, RecipeCatalog};
+
+pub use crate::collection_recipes::{
+    derive_succinctarchive_union_element, CollectionValidationExhaust,
+};
+
 /// Canonical identity of one authorized collection view.
 ///
-/// The digest commits to the exact intrinsic collection-definition id, sorted
-/// authorization roster, and sorted ids of every authorized, admitted target
-/// [`CollectionCommit`]. It deliberately excludes unsigned equations and
-/// unauthorized records.
-///
-/// Version 1 describes direct target-COMMIT roots: this module currently keeps
-/// every `DERIVE` claim pending. Admitting cross-collection derives in the
-/// future requires a new transcript version covering the relevant active claim
-/// ids and supporting source commits; the v1 formula must not be silently
-/// extended.
+/// Version 2 commits to the exact target definition, authorization roster, and
+/// every authorized signed root supporting the resolved target. Each root
+/// commit already binds its exact source definition. Unsigned construction
+/// history and the process-local route catalog are deliberately absent:
+/// equivalent MERGE/DERIVE paths do not change the semantic revision.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CollectionRevision([u8; 32]);
 
@@ -77,6 +80,22 @@ pub struct CollectionView {
     pub facts: TribleSet,
     pub reader: PileReader,
     pub commits: Vec<CollectionCommit>,
+    pub revision: CollectionRevision,
+}
+
+/// Representation-neutral resolution of one exact collection definition.
+///
+/// `cover` is a deterministic resident physical cover of the target frontier.
+/// `root_commits` are the exact authorized signed roots across the definition's
+/// registered backward closure. Consumers decode `cover` according to the
+/// target representation; [`CollectionSnapshot::materialize_scope`] remains
+/// the thin `SimpleArchive` adapter used by existing faculties.
+#[derive(Debug)]
+pub struct ResolvedCollectionView {
+    pub definition: CollectionDefinition,
+    pub reader: PileReader,
+    pub cover: BTreeSet<CollectionData>,
+    pub root_commits: Vec<CollectionCommit>,
     pub revision: CollectionRevision,
 }
 
@@ -113,6 +132,7 @@ pub struct LegacyBranchView {
 pub struct CollectionSnapshot {
     reader: PileReader,
     records: DiscoveredCollectionRecords,
+    validation_exhaust: CollectionValidationExhaust,
 }
 
 /// An explicitly closed writer for repeated publications into one collection.
@@ -257,14 +277,54 @@ impl CollectionSnapshot {
     /// Discovery happens exactly once here. Later materializations reuse both
     /// these canonicalized records and this snapshot-owned attachment reader.
     pub fn open(pile_path: &Path) -> Result<Self> {
+        Self::open_with_validation_exhaust(pile_path, CollectionValidationExhaust::default())
+    }
+
+    /// Open a snapshot sharing explicit process-local validation exhaust.
+    ///
+    /// Cloning one exhaust into successive snapshots reuses deterministic
+    /// Accepted/Rejected verdicts while Pending and operational failures are
+    /// always retried against the new immutable world.
+    pub fn open_with_validation_exhaust(
+        pile_path: &Path,
+        validation_exhaust: CollectionValidationExhaust,
+    ) -> Result<Self> {
         let mut pile = open_pile_strict(pile_path)?;
         let result = (|| {
             let reader = pile.reader().context("snapshot pile for collection read")?;
             let records =
                 discover_collection_records(&reader).context("discover collection records")?;
-            Ok(Self { reader, records })
+            Ok(Self {
+                reader,
+                records,
+                validation_exhaust,
+            })
         })();
         finish_pile(pile, result)
+    }
+
+    /// Resolve one exact typed collection through its registered same-scope
+    /// backward derivation closure.
+    pub fn resolve_definition(
+        &self,
+        definition: CollectionDefinition,
+        allowed_signers: &HashSet<VerifyingKey>,
+    ) -> Result<ResolvedCollectionView> {
+        let resolved = resolve_reader_definition(
+            &self.reader,
+            &self.records,
+            definition,
+            allowed_signers,
+            &RecipeCatalog::faculties(),
+            &self.validation_exhaust,
+        )?;
+        Ok(ResolvedCollectionView {
+            definition: resolved.definition,
+            reader: self.reader.clone(),
+            cover: resolved.cover,
+            root_commits: resolved.root_commits,
+            revision: resolved.revision,
+        })
     }
 
     /// Materialize one scope under an independent explicit signer roster.
@@ -277,34 +337,34 @@ impl CollectionSnapshot {
         scope: Id,
         allowed_signers: &HashSet<VerifyingKey>,
     ) -> Result<CollectionView> {
-        let resolved = resolve_reader_scope(&self.reader, &self.records, scope, allowed_signers)?;
+        let resolved = resolve_reader_definition(
+            &self.reader,
+            &self.records,
+            simplearchive_union::definition(scope),
+            allowed_signers,
+            &RecipeCatalog::faculties(),
+            &self.validation_exhaust,
+        )?;
         let facts = simplearchive_union::materialize(
             resolved.resolution.semantics(),
             &resolved.definition,
             &self.reader,
         )
         .context("materialize collection physical cover")?;
-        let admitted = resolved.resolution.admitted_claims();
-        let mut commits: Vec<_> = self
-            .records
-            .commits()
-            .iter()
-            .filter(|commit| {
-                resolved.authorized_target_commits.contains(&commit.id())
-                    && admitted.contains(&commit.id())
-            })
-            .cloned()
-            .collect();
-        commits.sort_unstable_by_key(CollectionCommit::id);
-        let revision = collection_revision(resolved.definition.id(), allowed_signers, &commits);
 
         Ok(CollectionView {
             facts,
             reader: self.reader.clone(),
-            commits,
-            revision,
+            commits: resolved.root_commits,
+            revision: resolved.revision,
         })
     }
+}
+
+/// Construct the raw-SuccinctArchive representation of the canonical trible
+/// set-union recipe for one extrinsic scope.
+pub fn succinctarchive_union_definition(scope: Id) -> CollectionDefinition {
+    succinctarchive_kind().definition(scope)
 }
 
 /// Publish one self-contained content fragment and metadata fragment.
@@ -1025,10 +1085,10 @@ fn verify_resident_collection_closure(
     Ok(())
 }
 
-const COLLECTION_REVISION_CONTEXT: &str = "triblespace.faculties.collection-snapshot.revision.v1";
+const COLLECTION_REVISION_CONTEXT: &str = "triblespace.faculties.collection-snapshot.revision.v2";
 
 fn collection_revision(
-    definition_id: Id,
+    target_definition_id: Id,
     allowed_signers: &HashSet<VerifyingKey>,
     commits: &[CollectionCommit],
 ) -> CollectionRevision {
@@ -1042,14 +1102,14 @@ fn collection_revision(
     let commit_count = u64::try_from(commit_ids.len()).expect("commit roster fits u64");
 
     let mut hasher = blake3::Hasher::new_derive_key(COLLECTION_REVISION_CONTEXT);
-    hasher.update(b"definition-id\0");
-    hasher.update(&definition_id.raw());
+    hasher.update(b"target-definition-id\0");
+    hasher.update(&target_definition_id.raw());
     hasher.update(b"authorization-roster\0");
     hasher.update(&roster_len.to_be_bytes());
     for public_key in roster {
         hasher.update(&public_key);
     }
-    hasher.update(b"admitted-commit-ids\0");
+    hasher.update(b"authorized-root-commit-ids\0");
     hasher.update(&commit_count.to_be_bytes());
     for commit_id in commit_ids {
         hasher.update(&commit_id.raw());
@@ -1057,47 +1117,121 @@ fn collection_revision(
     CollectionRevision(*hasher.finalize().as_bytes())
 }
 
-struct ResolvedScope {
+#[derive(Debug)]
+struct ResolvedDefinition {
     definition: CollectionDefinition,
     resolution: CollectionResolution<String>,
-    authorized_target_commits: BTreeSet<Id>,
+    cover: BTreeSet<CollectionData>,
+    root_commits: Vec<CollectionCommit>,
+    revision: CollectionRevision,
 }
 
-fn resolve_reader_scope(
+fn resolve_reader_definition(
     reader: &PileReader,
     records: &DiscoveredCollectionRecords,
-    scope: Id,
+    definition: CollectionDefinition,
     allowed_signers: &HashSet<VerifyingKey>,
-) -> Result<ResolvedScope> {
-    let definition = simplearchive_union::definition(scope);
+    catalog: &RecipeCatalog,
+    validation_exhaust: &CollectionValidationExhaust,
+) -> Result<ResolvedDefinition> {
+    let participating_definitions = catalog.backward_definitions(&definition)?;
+    let participating_ids: BTreeSet<Id> = participating_definitions
+        .iter()
+        .map(CollectionDefinition::id)
+        .collect();
 
     // Discovery already established strict self-signatures. Authorization is
-    // a separate exact byte comparison against caller-supplied keys.
+    // a separate exact byte comparison against caller-supplied keys. Roots
+    // across the whole registered backward closure are obligations; direct
+    // roots into a derived-only kind are included so its validator can reject
+    // them loudly instead of silently erasing authority.
     let allowed_key_bytes: HashSet<[u8; 32]> =
         allowed_signers.iter().map(VerifyingKey::to_bytes).collect();
-    let authorized_target_commits: BTreeSet<Id> = records
+    let authorized_commits: BTreeSet<Id> = records
         .commits()
         .iter()
-        .filter(|commit| commit.collection() == definition.id())
+        .filter(|commit| participating_ids.contains(&commit.collection()))
         .filter(|commit| allowed_key_bytes.contains(&commit.public_key().raw))
         .map(CollectionCommit::id)
         .collect();
 
     let resolution: CollectionResolution<String> =
-        resolve_collection_semantics(records, &authorized_target_commits, |request| {
-            validate_scope_request(reader, definition.id(), &authorized_target_commits, request)
+        resolve_collection_semantics(records, &authorized_commits, |request| {
+            catalog.validate_request(validation_exhaust, reader, &participating_ids, request)
         })
         .map_err(|error| anyhow!("resolve collection semantics: {error}"))?;
 
-    // Only policy-eligible signed roots are mandatory. Unsigned equations may
-    // be inert, incomplete, or malicious append noise; unless positively
-    // validated and activated they are diagnostics, not a global stop switch.
-    require_authorized_commits(&resolution, &authorized_target_commits)?;
+    require_authorized_commits(&resolution, &authorized_commits)?;
 
-    Ok(ResolvedScope {
+    let mut resident = BTreeSet::new();
+    for data in resolution
+        .semantics()
+        .members(definition.id())
+        .into_iter()
+        .flatten()
+        .copied()
+    {
+        let handle = Handle::<UnknownBlob>::from_hash(data);
+        if reader.metadata(handle)?.is_some() {
+            resident.insert(data);
+        }
+    }
+    let physical = collection_physical_cover(resolution.semantics(), definition.id(), &resident);
+    if !physical.missing.is_empty() {
+        bail!(
+            "target collection has {} semantic frontier obligation(s) without a resident physical cover",
+            physical.missing.len(),
+        );
+    }
+
+    // Completeness is checked on the bytes this read will actually consume,
+    // not merely on remembered semantic membership. Cached Accepted evidence
+    // may outlive an endpoint, but a vanished target can never satisfy a read.
+    // The union of provenance under the selected resident cover must equal all
+    // authorized roots in the backward closure.
+    let supported_commits: BTreeSet<Id> = physical
+        .cover
+        .iter()
+        .flat_map(|data| {
+            resolution
+                .semantics()
+                .supporting_commit_ids(definition.id(), *data)
+        })
+        .collect();
+    if supported_commits != authorized_commits {
+        let missing: Vec<String> = authorized_commits
+            .difference(&supported_commits)
+            .map(|id| format!("{id:X}"))
+            .collect();
+        let foreign: Vec<String> = supported_commits
+            .difference(&authorized_commits)
+            .map(|id| format!("{id:X}"))
+            .collect();
+        bail!(
+            "target collection has incomplete support coverage (missing authorized roots: [{}]; unsupported roots: [{}])",
+            missing.join(", "),
+            foreign.join(", "),
+        );
+    }
+
+    let admitted = resolution.admitted_claims();
+    let mut root_commits: Vec<_> = records
+        .commits()
+        .iter()
+        .filter(|commit| {
+            authorized_commits.contains(&commit.id()) && admitted.contains(&commit.id())
+        })
+        .cloned()
+        .collect();
+    root_commits.sort_unstable_by_key(CollectionCommit::id);
+    let revision = collection_revision(definition.id(), allowed_signers, &root_commits);
+
+    Ok(ResolvedDefinition {
         definition,
         resolution,
-        authorized_target_commits,
+        cover: physical.cover,
+        root_commits,
+        revision,
     })
 }
 
@@ -1151,47 +1285,6 @@ fn validate_retention_request(
     }
 }
 
-fn validate_scope_request(
-    reader: &PileReader,
-    target_collection: Id,
-    authorized_commits: &BTreeSet<Id>,
-    request: CollectionValidationRequest<'_>,
-) -> Result<CollectionClaimValidation<String>> {
-    match request {
-        CollectionValidationRequest::Commit { definition, claim } => {
-            if !authorized_commits.contains(&claim.id()) {
-                return Ok(CollectionClaimValidation::Pending);
-            }
-            validate_commit_request(reader, definition, claim)
-        }
-        CollectionValidationRequest::Merge { definition, claim } => {
-            if claim.collection() != target_collection {
-                return Ok(CollectionClaimValidation::Pending);
-            }
-            let (low, high) = claim.inputs();
-            let Some(low) = load_element(reader, low)? else {
-                return Ok(CollectionClaimValidation::Pending);
-            };
-            let Some(high) = load_element(reader, high)? else {
-                return Ok(CollectionClaimValidation::Pending);
-            };
-            let Some(result) = load_element(reader, claim.result())? else {
-                return Ok(CollectionClaimValidation::Pending);
-            };
-            Ok(
-                match validate_merge(definition, claim, &low, &high, &result) {
-                    Ok(()) => CollectionClaimValidation::Accepted,
-                    Err(error) => CollectionClaimValidation::Rejected(error.to_string()),
-                },
-            )
-        }
-        // This first boundary has no cross-representation recipe oracle. The
-        // generic resolver must not infer DERIVE validity, and claims for
-        // unrelated collections must not trigger arbitrary blob reads.
-        CollectionValidationRequest::Derive { .. } => Ok(CollectionClaimValidation::Pending),
-    }
-}
-
 fn load_element(reader: &PileReader, data: CollectionData) -> Result<Option<Blob<SimpleArchive>>> {
     let handle = Handle::<SimpleArchive>::from_hash(data);
     let metadata = match reader.metadata(handle) {
@@ -1240,11 +1333,17 @@ mod tests {
 
     use anybytes::View;
     use triblespace::core::blob::encodings::longstring::LongString;
-    use triblespace::core::collection::{empty_metadata_handle, CollectionMerge};
+    use triblespace::core::blob::encodings::succinctarchive::{
+        OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
+    };
+    use triblespace::core::blob::TryFromBlob;
+    use triblespace::core::collection::{empty_metadata_handle, CollectionDerive, CollectionMerge};
     use triblespace::core::inline::Inline;
     use triblespace::core::metadata;
     use triblespace::core::repo::BlobStorePut;
     use triblespace::prelude::*;
+
+    use crate::collection_recipes::permissive_derive_catalog;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -1258,6 +1357,35 @@ mod tests {
 
     fn allowed(key: &SigningKey) -> HashSet<VerifyingKey> {
         HashSet::from([key.verifying_key()])
+    }
+
+    fn store_succinct_projection(
+        pile_path: &Path,
+        scope: Id,
+        source_commit: &CollectionCommit,
+    ) -> (CollectionDefinition, CollectionData, CollectionDerive) {
+        let mut pile = open_pile_strict(pile_path).unwrap();
+        let reader = pile.reader().unwrap();
+        let source: Blob<SimpleArchive> = reader
+            .get(Handle::<SimpleArchive>::from_hash(source_commit.data()))
+            .unwrap();
+        let output = derive_succinctarchive_union_element(source).unwrap();
+        let output_data: CollectionData = output.get_handle().into();
+        let target = succinctarchive_union_definition(scope);
+        let derive = CollectionDerive::new(
+            simplearchive_union::definition(scope).id(),
+            target.id(),
+            source_commit.data(),
+            output_data,
+        );
+        pile.put::<SimpleArchive, _>(CollectionDefinition::to_blob(&target))
+            .unwrap();
+        pile.put::<SuccinctArchiveBlob, _>(output).unwrap();
+        pile.put::<SimpleArchive, _>(CollectionDerive::to_blob(&derive))
+            .unwrap();
+        pile.flush().unwrap();
+        pile.close().unwrap();
+        (target, output_data, derive)
     }
 
     fn description_fragment(kind: Id, text: &str) -> Fragment {
@@ -2118,13 +2246,10 @@ mod tests {
 
         let mut reversed = union.commits.clone();
         reversed.reverse();
+        let definition = simplearchive_union::definition(first_scope);
         assert_eq!(
             union.revision,
-            collection_revision(
-                simplearchive_union::definition(first_scope).id(),
-                &both,
-                &reversed,
-            )
+            collection_revision(definition.id(), &both, &reversed)
         );
     }
 
@@ -2238,28 +2363,397 @@ mod tests {
     }
 
     #[test]
-    fn collection_revision_v1_transcript_is_stable() {
+    fn authenticated_succinct_projection_resolves_exact_source_support() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("writer.key");
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let scope = id(60);
+        let first_kind = id(61);
+        let second_kind = id(62);
+        let content = entity! {
+            metadata::tag: &first_kind,
+            metadata::tag: &second_kind,
+        };
+        let expected = content.facts().clone();
+        let commit =
+            publish_fragment(&pile, Some(&key), scope, content, Fragment::empty()).unwrap();
+        let (target, output, _) = store_succinct_projection(&pile, scope, &commit);
+
+        let view = CollectionSnapshot::open(&pile)
+            .unwrap()
+            .resolve_definition(target.clone(), &allowed(&signer))
+            .unwrap();
+
+        assert_eq!(view.definition, target);
+        assert_eq!(view.cover, BTreeSet::from([output]));
+        assert_eq!(view.root_commits, vec![commit]);
+        let raw: Blob<SuccinctArchiveBlob> = view
+            .reader
+            .get(Handle::<SuccinctArchiveBlob>::from_hash(output))
+            .unwrap();
+        let archive = SuccinctArchive::<OrderedUniverse>::try_from_blob(raw).unwrap();
+        assert_eq!(archive.iter().collect::<TribleSet>(), expected);
+    }
+
+    #[test]
+    fn partial_succinct_projection_fails_exact_support_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("writer.key");
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let scope = id(63);
+        let first = publish_fragment(
+            &pile,
+            Some(&key),
+            scope,
+            entity! { metadata::tag: &id(64) },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let second = publish_fragment(
+            &pile,
+            Some(&key),
+            scope,
+            entity! { metadata::tag: &id(65) },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let (target, _, _) = store_succinct_projection(&pile, scope, &first);
+
+        let error = CollectionSnapshot::open(&pile)
+            .unwrap()
+            .resolve_definition(target, &allowed(&signer))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("incomplete support coverage"));
+        assert!(message.contains(&format!("{:X}", second.id())));
+    }
+
+    #[test]
+    fn succinct_derive_validator_streams_and_rejects_a_different_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("writer.key");
+        let _signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let scope = id(75);
+        let commit = publish_fragment(
+            &pile,
+            Some(&key),
+            scope,
+            entity! { metadata::tag: &id(76) },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let wrong_source: Blob<SimpleArchive> =
+            entity! { metadata::tag: &id(77) }.into_facts().to_blob();
+        let wrong_output = derive_succinctarchive_union_element(wrong_source).unwrap();
+        let wrong_data: CollectionData = wrong_output.get_handle().into();
+        let source_definition = simplearchive_union::definition(scope);
+        let target = succinctarchive_union_definition(scope);
+        let derive = CollectionDerive::new(
+            source_definition.id(),
+            target.id(),
+            commit.data(),
+            wrong_data,
+        );
+        let mut store = open_pile_strict(&pile).unwrap();
+        store
+            .put::<SimpleArchive, _>(CollectionDefinition::to_blob(&target))
+            .unwrap();
+        store.put::<SuccinctArchiveBlob, _>(wrong_output).unwrap();
+        store
+            .put::<SimpleArchive, _>(CollectionDerive::to_blob(&derive))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+
+        let snapshot = CollectionSnapshot::open(&pile).unwrap();
+        let catalog = RecipeCatalog::faculties();
+        let definitions = catalog.backward_definitions(&target).unwrap();
+        let definition_ids = definitions.iter().map(CollectionDefinition::id).collect();
+        let resolution = resolve_collection_semantics(
+            &snapshot.records,
+            &BTreeSet::from([commit.id()]),
+            |request| {
+                catalog.validate_request(
+                    &snapshot.validation_exhaust,
+                    &snapshot.reader,
+                    &definition_ids,
+                    request,
+                )
+            },
+        )
+        .unwrap();
+        let reason = resolution.rejected().get(&derive.id()).unwrap();
+        assert!(
+            reason.contains("differs from its source stream"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn empty_source_requires_and_accepts_canonical_empty_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("writer.key");
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let scope = id(66);
+        let commit = publish_fragment(
+            &pile,
+            Some(&key),
+            scope,
+            Fragment::empty(),
+            Fragment::empty(),
+        )
+        .unwrap();
+        let (target, output, _) = store_succinct_projection(&pile, scope, &commit);
+
+        let view = CollectionSnapshot::open(&pile)
+            .unwrap()
+            .resolve_definition(target, &allowed(&signer))
+            .unwrap();
+        assert_eq!(view.cover, BTreeSet::from([output]));
+        assert_eq!(view.root_commits, vec![commit]);
+        let raw: Blob<SuccinctArchiveBlob> = view
+            .reader
+            .get(Handle::<SuccinctArchiveBlob>::from_hash(output))
+            .unwrap();
+        assert!(SuccinctArchive::<OrderedUniverse>::try_from_blob(raw)
+            .unwrap()
+            .iter()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn raw_succinct_collection_rejects_direct_signed_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("writer.key");
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let scope = id(73);
+        let source = publish_fragment(
+            &pile,
+            Some(&key),
+            scope,
+            entity! { metadata::tag: &id(74) },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let (target, output, _) = store_succinct_projection(&pile, scope, &source);
+        let forbidden =
+            CollectionCommit::sign(&signer, target.id(), output, empty_metadata_handle());
+        let mut store = open_pile_strict(&pile).unwrap();
+        store
+            .put::<SimpleArchive, _>(CollectionCommit::to_blob(&forbidden))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+
+        let error = CollectionSnapshot::open(&pile)
+            .unwrap()
+            .resolve_definition(target, &allowed(&signer))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("derived-only"), "{error:#}");
+    }
+
+    #[test]
+    fn unsigned_construction_history_does_not_change_revision_v2() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key = directory.path().join("writer.key");
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let scope = id(67);
+        let commit = publish_fragment(
+            &pile,
+            Some(&key),
+            scope,
+            entity! { metadata::tag: &id(68) },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let (target, output, _) = store_succinct_projection(&pile, scope, &commit);
+        let roster = allowed(&signer);
+        let before = CollectionSnapshot::open(&pile)
+            .unwrap()
+            .resolve_definition(target.clone(), &roster)
+            .unwrap();
+
+        // A valid idempotent join is a distinct construction-history claim,
+        // but it changes neither the target value nor its signed provenance.
+        let identity = CollectionMerge::new(target.id(), output, output, output);
+        let mut store = open_pile_strict(&pile).unwrap();
+        store
+            .put::<SimpleArchive, _>(CollectionMerge::to_blob(&identity))
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+
+        let after = CollectionSnapshot::open(&pile)
+            .unwrap()
+            .resolve_definition(target, &roster)
+            .unwrap();
+        assert_eq!(after.cover, before.cover);
+        assert_eq!(after.root_commits, before.root_commits);
+        assert_eq!(after.revision, before.revision);
+    }
+
+    #[test]
+    fn cached_validation_never_substitutes_for_a_resident_target_cover() {
+        let directory = tempfile::tempdir().unwrap();
+        let complete_pile = fresh_pile(&directory);
+        let key = directory.path().join("writer.key");
+        let signer = initialize_signer(&complete_pile, Some(&key)).unwrap();
+        let scope = id(71);
+        let commit = publish_fragment(
+            &complete_pile,
+            Some(&key),
+            scope,
+            entity! { metadata::tag: &id(72) },
+            Fragment::empty(),
+        )
+        .unwrap();
+        let (target, output, derive) = store_succinct_projection(&complete_pile, scope, &commit);
+        let exhaust = CollectionValidationExhaust::default();
+        let complete =
+            CollectionSnapshot::open_with_validation_exhaust(&complete_pile, exhaust.clone())
+                .unwrap()
+                .resolve_definition(target.clone(), &allowed(&signer))
+                .unwrap();
+        assert_eq!(complete.cover, BTreeSet::from([output]));
+
+        // Reproduce the authenticated records and source dependencies in a
+        // second pile, deliberately omitting only the raw target blob. The
+        // shared exhaust remembers Accepted, but physical completeness must
+        // still be recomputed from this snapshot's actual residency.
+        let missing_pile = directory.path().join("missing-target.pile");
+        File::create(&missing_pile).unwrap();
+        let source_definition = simplearchive_union::definition(scope);
+        let source: Blob<SimpleArchive> = complete
+            .reader
+            .get(Handle::<SimpleArchive>::from_hash(commit.data()))
+            .unwrap();
+        let metadata: Blob<SimpleArchive> = complete.reader.get(commit.metadata()).unwrap();
+        let mut missing = open_pile_strict(&missing_pile).unwrap();
+        for record in [
+            CollectionDefinition::to_blob(&source_definition),
+            CollectionDefinition::to_blob(&target),
+            CollectionCommit::to_blob(&commit),
+            CollectionDerive::to_blob(&derive),
+        ] {
+            missing.put::<SimpleArchive, _>(record).unwrap();
+        }
+        missing.put::<SimpleArchive, _>(source).unwrap();
+        missing.put::<SimpleArchive, _>(metadata).unwrap();
+        missing.flush().unwrap();
+        missing.close().unwrap();
+
+        let error = CollectionSnapshot::open_with_validation_exhaust(&missing_pile, exhaust)
+            .unwrap()
+            .resolve_definition(target, &allowed(&signer))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("without a resident physical cover"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn unrelated_scope_conflicts_are_isolated_but_relevant_ones_are_hard() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let quiet_scope = id(69);
+        let poisoned_scope = id(70);
+        let quiet_source = simplearchive_union::definition(quiet_scope);
+        let quiet_target = succinctarchive_union_definition(quiet_scope);
+        let poisoned_source = simplearchive_union::definition(poisoned_scope);
+        let poisoned_target = succinctarchive_union_definition(poisoned_scope);
+        let first = CollectionDerive::new(
+            poisoned_source.id(),
+            poisoned_target.id(),
+            Inline::new([0xB1; 32]),
+            Inline::new([0xB2; 32]),
+        );
+        let second = CollectionDerive::new(
+            poisoned_source.id(),
+            poisoned_target.id(),
+            Inline::new([0xB1; 32]),
+            Inline::new([0xB3; 32]),
+        );
+        let mut store = open_pile_strict(&pile).unwrap();
+        for definition in [
+            &quiet_source,
+            &quiet_target,
+            &poisoned_source,
+            &poisoned_target,
+        ] {
+            store
+                .put::<SimpleArchive, _>(CollectionDefinition::to_blob(definition))
+                .unwrap();
+        }
+        for derive in [&first, &second] {
+            store
+                .put::<SimpleArchive, _>(CollectionDerive::to_blob(derive))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let reader = store.reader().unwrap();
+        store.close().unwrap();
+        let records = discover_collection_records(&reader).unwrap();
+        let catalog = permissive_derive_catalog();
+        let exhaust = CollectionValidationExhaust::default();
+
+        let quiet = resolve_reader_definition(
+            &reader,
+            &records,
+            quiet_target,
+            &HashSet::new(),
+            &catalog,
+            &exhaust,
+        )
+        .unwrap();
+        assert!(quiet.cover.is_empty());
+
+        let error = resolve_reader_definition(
+            &reader,
+            &records,
+            poisoned_target,
+            &HashSet::new(),
+            &catalog,
+            &exhaust,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("conflicting derive claims"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn collection_revision_v2_transcript_is_stable() {
         let first = SigningKey::from_bytes(&[0x51; 32]);
         let second = SigningKey::from_bytes(&[0x52; 32]);
-        let definition_id = id(5);
+        let definition = simplearchive_union::definition(id(5));
         let first_commit = CollectionCommit::sign(
             &first,
-            definition_id,
+            definition.id(),
             Inline::new([0x61; 32]),
             Inline::new([0x71; 32]),
         );
         let second_commit = CollectionCommit::sign(
             &second,
-            definition_id,
+            definition.id(),
             Inline::new([0x62; 32]),
             Inline::new([0x72; 32]),
         );
         let roster = HashSet::from([second.verifying_key(), first.verifying_key()]);
-        let revision = collection_revision(definition_id, &roster, &[second_commit, first_commit]);
+        let revision =
+            collection_revision(definition.id(), &roster, &[second_commit, first_commit]);
 
         assert_eq!(
             hex::encode_upper(revision.as_bytes()),
-            "7C701F2FC9FF707C1A8D384F4D4D1730AE03476F56147597FA8CC1C5AABE3947"
+            "F8A0996C0B39F0BE2F574E6D70B2FB4D20989E8534696F3079A35B07544FCA26"
         );
     }
 
