@@ -188,6 +188,34 @@ pub struct SendAttemptRecord {
     pub bcc: Vec<TextHandle>,
 }
 
+/// A locally validated, immutable SMTP effect plan.
+///
+/// Its fields are private so the exact attempt, envelope, wire bytes, and
+/// outgoing evidence cannot be mixed with pieces from another plan between
+/// validation and the irreversible transport call.
+#[derive(Debug)]
+pub struct PreparedSend {
+    attempt: Fragment,
+    attempt_id: Id,
+    outgoing: SourcePublication,
+    envelope: SmtpEnvelope,
+    raw: Vec<u8>,
+}
+
+impl PreparedSend {
+    pub fn attempt_fragment(&self) -> &Fragment {
+        &self.attempt
+    }
+
+    pub fn attempt_id(&self) -> Id {
+        self.attempt_id
+    }
+
+    pub fn outgoing_files(&self) -> &Fragment {
+        &self.outgoing.files
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InboxProjection {
     pub wire: Id,
@@ -975,6 +1003,9 @@ pub fn smtp_acceptance_fragment(
     response_code: u64,
     response: impl Into<String>,
 ) -> Result<(Fragment, Id)> {
+    if !(200..=299).contains(&response_code) {
+        bail!("SMTP acceptance code must be a final positive 2xx reply");
+    }
     let mut fragment = Fragment::empty();
     let response = fragment.put(canonical_nonempty(response, "SMTP acceptance response")?);
     let acceptance = entity! {
@@ -1289,6 +1320,7 @@ fn validate_send_heads(
     if heads.is_empty() {
         bail!("send attempt records no decision frontier");
     }
+    let selected: BTreeSet<Id> = heads.iter().copied().collect();
     let mut forced = BTreeSet::new();
     for &head in heads {
         let snapshot = decide::resolution_snapshot(decide_facts, head)?;
@@ -1302,6 +1334,29 @@ fn validate_send_heads(
     }
     if forced.len() != 1 {
         bail!("stored send frontier does not have Agreed semantics");
+    }
+
+    // A genuine frontier is an antichain. Completeness at the historical
+    // executor snapshot is an attestation, but an ancestor and descendant can
+    // never both have been heads of the same resolution DAG.
+    for &head in heads {
+        let mut stack = decide::resolution_snapshot(decide_facts, head)?.predecessors;
+        let mut visited = BTreeSet::new();
+        while let Some(ancestor) = stack.pop() {
+            if !visited.insert(ancestor) {
+                continue;
+            }
+            if selected.contains(&ancestor) {
+                bail!(
+                    "stored send frontier contains both resolution {ancestor:x} and a descendant"
+                );
+            }
+            let snapshot = decide::resolution_snapshot(decide_facts, ancestor)?;
+            if snapshot.decision != decision {
+                bail!("resolution {ancestor:x} belongs to another decision");
+            }
+            stack.extend(snapshot.predecessors);
+        }
     }
     Ok(())
 }
@@ -1617,6 +1672,12 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
         if config.account != draft.account {
             bail!("attempt {id:x} config and draft belong to different accounts");
         }
+        if !config.enabled {
+            bail!("attempt {id:x} cites a disabled account configuration");
+        }
+        if config.address != draft.envelope_from {
+            bail!("attempt {id:x} draft sender differs from its account configuration");
+        }
         if record.decision != draft_decision_id(record.draft) {
             bail!("attempt {id:x} names the wrong deterministic decision");
         }
@@ -1661,6 +1722,25 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
                 .collect(),
             "SMTP acceptance response code",
         )?;
+        let numeric_code = u64::try_from_inline(&code)
+            .map_err(|_| anyhow!("SMTP acceptance {id:x} response code exceeds u64"))?;
+        if !(200..=299).contains(&numeric_code) {
+            bail!("SMTP acceptance {id:x} has non-positive reply code {numeric_code}");
+        }
+        let outgoing: BTreeSet<Id> = find!(
+            source: Id,
+            pattern!(facts, [{ ?source @
+                metadata::tag: &KIND_OUTGOING_OBSERVATION,
+                observation::attempt: &attempt_id,
+            }])
+        )
+        .collect();
+        if outgoing.len() != 1 {
+            bail!(
+                "SMTP acceptance {id:x} must have exactly one outgoing observation, found {}",
+                outgoing.len()
+            );
+        }
         expected += ensure_intrinsic(
             id,
             entity! {
@@ -1676,6 +1756,17 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
         let receipts = acceptances_for_attempt(facts, attempt_id);
         if receipts.len() > 1 {
             bail!("send attempt {attempt_id:x} has multiple SMTP acceptance receipts");
+        }
+        let outgoing: BTreeSet<Id> = find!(
+            source: Id,
+            pattern!(facts, [{ ?source @
+                metadata::tag: &KIND_OUTGOING_OBSERVATION,
+                observation::attempt: &attempt_id,
+            }])
+        )
+        .collect();
+        if outgoing.len() > 1 {
+            bail!("send attempt {attempt_id:x} has multiple outgoing observations");
         }
     }
 
@@ -2146,19 +2237,101 @@ pub struct AcceptedReply {
 }
 
 pub trait SmtpSubmit {
+    /// Return only a final positive SMTP completion reply. Rejection or an
+    /// indeterminate transport outcome is an error, after which the durable
+    /// attempt must not be retried automatically.
     fn submit(&mut self, envelope: &SmtpEnvelope, raw: &[u8]) -> Result<AcceptedReply>;
+}
+
+fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
+    let senders = normalized_mailboxes([input.envelope_from.clone()])?;
+    let [(_, from)] = senders.as_slice() else {
+        bail!("attempt envelope sender must contain exactly one mailbox");
+    };
+    let recipients =
+        normalized_mailboxes(input.to.iter().chain(&input.cc).chain(&input.bcc).cloned())?
+            .into_iter()
+            .map(|(_, address)| address)
+            .collect::<Vec<_>>();
+    if recipients.is_empty() {
+        bail!("send attempt has no envelope recipients");
+    }
+    Ok(SmtpEnvelope {
+        from: from.clone(),
+        recipients,
+    })
+}
+
+/// Freeze and validate one exact SMTP effect plan against one local snapshot.
+///
+/// The stored Decide heads are the complete frontier observed by this
+/// executor at preparation time. A later resolution does not retroactively
+/// invalidate that historical authorization. Conversely, the eventual union
+/// cannot prove that this local snapshot was globally fresh or complete: SMTP
+/// execution is therefore an affine authority which deployments must
+/// serialize per account rather than running concurrently on replicas.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_send(
+    mail_reader: &PileReader,
+    decide_reader: &PileReader,
+    mail_facts: &TribleSet,
+    files_facts: &TribleSet,
+    decide_facts: &TribleSet,
+    relations_facts: &TribleSet,
+    input: SendAttemptInput,
+) -> Result<PreparedSend> {
+    let draft = draft_from_facts(mail_facts, input.draft)
+        .with_context(|| format!("prepare send for unknown draft {:x}", input.draft))?;
+    match account_head(mail_facts, draft.account)? {
+        Head::Unique(current) if current == input.config => {}
+        Head::Unique(current) => bail!(
+            "send config {:x} is stale; current account config is {current:x}",
+            input.config
+        ),
+        Head::Missing => bail!("draft account {:x} has no configuration", draft.account),
+        Head::Forked(heads) => bail!(
+            "draft account {:x} has forked configurations {heads:?}",
+            draft.account
+        ),
+    }
+    let (current_decision, current_heads) =
+        authorized_send(decide_reader, decide_facts, input.draft)?;
+    if input.decision != current_decision
+        || sorted_ids(input.decision_heads.iter().copied()) != current_heads
+    {
+        bail!("send attempt does not cite the exact locally observed Decide frontier");
+    }
+
+    let envelope = smtp_envelope_for_attempt(&input)?;
+    let raw = input.raw.clone();
+    let (attempt, attempt_id) = send_attempt_fragment(input)?;
+    let outgoing = outgoing_publication(attempt_id, &raw)?;
+    let mut files_union = files_facts.clone();
+    files_union += outgoing.files.facts().clone();
+    validate_catalog_union(
+        mail_reader,
+        mail_facts,
+        &attempt,
+        &files_union,
+        decide_facts,
+        relations_facts,
+    )?;
+    Ok(PreparedSend {
+        attempt,
+        attempt_id,
+        outgoing,
+        envelope,
+        raw,
+    })
 }
 
 /// Persist attempt-before-effect and acceptance-after-effect.  Any error after
 /// attempt publication leaves an intentionally uncertain attempt which callers
-/// must never retry automatically.
+/// must never retry automatically. The prepared value binds every byte and
+/// address crossing the effect boundary to the exact validated attempt.
 pub fn submit_once<T, PA, PC>(
     transport: &mut T,
-    attempt_fragment: &Fragment,
-    attempt_id: Id,
-    outgoing: &SourcePublication,
-    envelope: &SmtpEnvelope,
-    raw: &[u8],
+    prepared: &PreparedSend,
     mut publish_attempt: PA,
     mut publish_acceptance: PC,
 ) -> Result<AcceptedReply>
@@ -2167,20 +2340,20 @@ where
     PA: FnMut(&Fragment) -> Result<()>,
     PC: FnMut(&Fragment) -> Result<()>,
 {
-    let expected = outgoing_publication(attempt_id, raw)?;
-    if expected.observation != outgoing.observation
-        || expected.mail.facts() != outgoing.mail.facts()
-    {
-        bail!("prepared outgoing publication does not match attempt and exact wire bytes");
+    publish_attempt(&prepared.attempt)?;
+    let accepted = transport.submit(&prepared.envelope, &prepared.raw)?;
+    if !(200..=299).contains(&accepted.code) {
+        bail!(
+            "SMTP submitter returned non-acceptance code {}; attempt outcome remains uncertain",
+            accepted.code
+        );
     }
-    publish_attempt(attempt_fragment)?;
-    let accepted = transport.submit(envelope, raw)?;
     let (mut fragment, _) = smtp_acceptance_fragment(
-        attempt_id,
+        prepared.attempt_id,
         u64::from(accepted.code),
         accepted.message.clone(),
     )?;
-    fragment += outgoing.mail.clone();
+    fragment += prepared.outgoing.mail.clone();
     publish_acceptance(&fragment)?;
     Ok(accepted)
 }
@@ -2413,6 +2586,14 @@ mod tests {
     }
 
     #[test]
+    fn smtp_acceptance_requires_a_final_positive_reply() {
+        assert!(smtp_acceptance_fragment(id(85), 199, "not accepted").is_err());
+        assert!(smtp_acceptance_fragment(id(85), 300, "not accepted").is_err());
+        assert!(smtp_acceptance_fragment(id(85), 550, "rejected").is_err());
+        assert!(smtp_acceptance_fragment(id(85), 250, "queued").is_ok());
+    }
+
+    #[test]
     fn collection_roundtrip_enforces_unread_and_exact_outbound_bytes() {
         let fixture = Fixture::new();
         let persona = id(1);
@@ -2561,6 +2742,44 @@ mod tests {
             bcc: materialized.bcc.clone(),
         };
 
+        // A frozen attempt must cite an enabled config whose sender is the
+        // draft sender, even if the config itself is otherwise canonical.
+        for (address, enabled, needle) in [
+            ("sender@example.test", false, "disabled"),
+            ("other@example.test", true, "sender differs"),
+        ] {
+            let (mut config_fragment, config_id) = account_config_fragment(
+                account_id,
+                AccountConfigInput {
+                    address: address.into(),
+                    display_name: "Sender".into(),
+                    pop_endpoint: "pop.example.test:995".into(),
+                    smtp_endpoint: "smtp.example.test:465".into(),
+                    username: "sender@example.test".into(),
+                    credential: credential_id,
+                    enabled,
+                    predecessors: vec![account.config],
+                },
+            )
+            .unwrap();
+            let (attempt, _) = send_attempt_fragment(SendAttemptInput {
+                config: config_id,
+                ..base_attempt.clone()
+            })
+            .unwrap();
+            config_fragment += attempt;
+            let error = validate_catalog_union(
+                &views.mail.reader,
+                &views.mail.facts,
+                &config_fragment,
+                &views.files.facts,
+                &views.decide.facts,
+                &views.relations.facts,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(needle));
+        }
+
         // Substituting the body while preserving the envelope and authorization
         // is rejected before a byte is published or SMTP is touched.
         let mut corrupt = rendered.raw.clone();
@@ -2572,34 +2791,33 @@ mod tests {
             offset..offset + "Authorized body".len(),
             b"Substituted body".iter().copied(),
         );
-        let (bad_fragment, _) = send_attempt_fragment(SendAttemptInput {
-            raw: corrupt,
-            ..base_attempt.clone()
-        })
-        .unwrap();
-        let error = validate_catalog_union(
+        let error = prepare_send(
             &views.mail.reader,
+            &views.decide.reader,
             &views.mail.facts,
-            &bad_fragment,
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
+            SendAttemptInput {
+                raw: corrupt,
+                ..base_attempt.clone()
+            },
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("subject/body"));
 
-        let (attempt_fragment, attempt_id) = send_attempt_fragment(base_attempt).unwrap();
-        let outgoing = outgoing_publication(attempt_id, &rendered.raw).unwrap();
-        assert!(outgoing.files.facts().is_empty());
-        validate_catalog_union(
+        let prepared = prepare_send(
             &views.mail.reader,
+            &views.decide.reader,
             &views.mail.facts,
-            &attempt_fragment,
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
+            base_attempt,
         )
         .unwrap();
+        let attempt_id = prepared.attempt_id();
+        assert!(prepared.outgoing_files().facts().is_empty());
 
         let events = Rc::new(RefCell::new(Vec::new()));
         let mut smtp = FakeSmtp {
@@ -2607,14 +2825,31 @@ mod tests {
             fail: false,
         };
         let mut after_attempt = views.mail.facts.clone();
-        after_attempt += attempt_fragment.facts().clone();
+        after_attempt += prepared.attempt_fragment().facts().clone();
+
+        // Acceptance is inseparable from exact outgoing evidence.
+        let (receipt_only, _) =
+            smtp_acceptance_fragment(attempt_id, 250, "queued without evidence").unwrap();
+        let mut malformed_post_effect = prepared.attempt_fragment().clone();
+        malformed_post_effect += receipt_only;
+        let error = validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &malformed_post_effect,
+            &views.files.facts,
+            &views.decide.facts,
+            &views.relations.facts,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("exactly one outgoing observation"),
+            "{error}"
+        );
+
         submit_once(
             &mut smtp,
-            &attempt_fragment,
-            attempt_id,
-            &outgoing,
-            &rendered.envelope,
-            &rendered.raw,
+            &prepared,
             |fragment| {
                 events.borrow_mut().push("publish-attempt");
                 fixture.publish(mail_schema::DEFAULT_SCOPE_ID, fragment.clone());
@@ -2652,6 +2887,146 @@ mod tests {
             acceptances_for_attempt(&views.mail.facts, attempt_id).len(),
             1
         );
+    }
+
+    #[test]
+    fn send_authorization_is_current_at_effect_time_but_historical_after_publication() {
+        let fixture = Fixture::new();
+        let account_id = id(90);
+        let credential_id = id(91);
+        let passphrase = b"frontier trust";
+        add_account(&fixture, account_id, credential_id, passphrase);
+
+        let draft = draft_publication(DraftInput {
+            nonce: id(92),
+            account: account_id,
+            envelope_from: "sender@example.test".into(),
+            to: vec!["receiver@example.test".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Snapshot authorization".into(),
+            body: "The authorization is historical after the effect starts.".into(),
+            attachments: Vec::new(),
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
+            created_at: at(1),
+        })
+        .unwrap();
+        let views = fixture.views();
+        let decide_union = decide::validate_catalog_union(
+            &views.decide.reader,
+            &views.decide.facts,
+            &draft.decide,
+        )
+        .unwrap();
+        validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &draft.mail,
+            &views.files.facts,
+            &decide_union,
+            &views.relations.facts,
+        )
+        .unwrap();
+        fixture.publish(decide_schema::DEFAULT_SCOPE_ID, draft.decide);
+        fixture.publish(mail_schema::DEFAULT_SCOPE_ID, draft.mail);
+
+        let (send, send_id) =
+            decide::resolution_fragment(draft.decision, "send", true, &[], &[], at(2)).unwrap();
+        fixture.publish(decide_schema::DEFAULT_SCOPE_ID, send);
+        let views = fixture.views();
+        let account = open_account(
+            &views.mail.reader,
+            &views.mail.facts,
+            account_id,
+            passphrase,
+        )
+        .unwrap();
+        let materialized = materialize_draft(
+            &views.mail.reader,
+            &views.mail.facts,
+            &views.files.facts,
+            draft.draft,
+        )
+        .unwrap();
+        let rendered = render_draft(&materialized, &account).unwrap();
+        let (decision, heads) =
+            authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap();
+        assert_eq!(heads, vec![send_id]);
+        let prepared = prepare_send(
+            &views.mail.reader,
+            &views.decide.reader,
+            &views.mail.facts,
+            &views.files.facts,
+            &views.decide.facts,
+            &views.relations.facts,
+            SendAttemptInput {
+                draft: draft.draft,
+                config: account.config,
+                decision,
+                decision_heads: heads,
+                raw: rendered.raw,
+                envelope_from: materialized.envelope_from,
+                to: materialized.to,
+                cc: materialized.cc,
+                bcc: materialized.bcc,
+            },
+        )
+        .unwrap();
+        fixture.publish(
+            mail_schema::DEFAULT_SCOPE_ID,
+            prepared.attempt_fragment().clone(),
+        );
+
+        // A concurrent disagreeing resolution makes the current frontier a
+        // fork. It prevents a new effect, but it cannot rewrite the evidence
+        // of which genuine send head the executor previously observed.
+        let (reject, reject_id) =
+            decide::resolution_fragment(draft.decision, "reject", true, &[], &[], at(3)).unwrap();
+        fixture.publish(decide_schema::DEFAULT_SCOPE_ID, reject);
+        let views = fixture.views();
+        assert!(format!(
+            "{:#}",
+            authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap_err()
+        )
+        .contains("divergent heads"));
+        validate_catalog(
+            &views.mail.reader,
+            &views.mail.facts,
+            &views.files.facts,
+            &views.decide.facts,
+            &views.relations.facts,
+        )
+        .unwrap();
+
+        // Joining that fork as a rejection likewise governs only future
+        // effects. The final union cannot reconstruct whether the executor's
+        // earlier local frontier was globally complete; that is its affine
+        // authority attestation, not a fact derivable after the event.
+        let (reject_join, _) = decide::resolution_fragment(
+            draft.decision,
+            "reject",
+            true,
+            &[],
+            &[send_id, reject_id],
+            at(4),
+        )
+        .unwrap();
+        fixture.publish(decide_schema::DEFAULT_SCOPE_ID, reject_join);
+        let views = fixture.views();
+        assert!(format!(
+            "{:#}",
+            authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap_err()
+        )
+        .contains("not exact outcome \"send\""));
+        validate_catalog(
+            &views.mail.reader,
+            &views.mail.facts,
+            &views.files.facts,
+            &views.decide.facts,
+            &views.relations.facts,
+        )
+        .unwrap();
     }
 
     struct FakeSmtp {

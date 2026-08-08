@@ -647,39 +647,39 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
     let rendered = mail::render_draft(&draft, &account)?;
     let (decision, heads) =
         mail::authorized_send(&views.decide.reader, &views.decide.facts, draft_id)?;
-    let (attempt_fragment, attempt_id) = mail::send_attempt_fragment(SendAttemptInput {
-        draft: draft_id,
-        config: account.config,
-        decision,
-        decision_heads: heads,
-        raw: rendered.raw.clone(),
-        envelope_from: draft.envelope_from.clone(),
-        to: draft.to.clone(),
-        cc: draft.cc.clone(),
-        bcc: draft.bcc.clone(),
-    })?;
-    let outgoing = mail::outgoing_publication(attempt_id, &rendered.raw)?;
-    let mut files_union = views.files.facts.clone();
-    files_union += outgoing.files.facts().clone();
-    mail::validate_catalog_union(
+    let prepared = mail::prepare_send(
         &views.mail.reader,
+        &views.decide.reader,
         &views.mail.facts,
-        &attempt_fragment,
-        &files_union,
+        &views.files.facts,
         &views.decide.facts,
         &views.relations.facts,
+        SendAttemptInput {
+            draft: draft_id,
+            config: account.config,
+            decision,
+            decision_heads: heads,
+            raw: rendered.raw.clone(),
+            envelope_from: draft.envelope_from.clone(),
+            to: draft.to.clone(),
+            cc: draft.cc.clone(),
+            bcc: draft.bcc.clone(),
+        },
     )?;
+    let attempt_id = prepared.attempt_id();
+    let mut files_union = views.files.facts.clone();
+    files_union += prepared.outgoing_files().facts().clone();
     // Any Files evidence needed by the post-effect outgoing projection is
     // durable before SMTP. Most drafts reuse already-published file values.
-    if !outgoing.files.facts().is_empty() {
+    if !prepared.outgoing_files().facts().is_empty() {
         storage.publish(
             storage.scopes.files,
-            outgoing.files.clone(),
+            prepared.outgoing_files().clone(),
             "mail: outgoing attachment evidence",
         )?;
     }
     let mut after_attempt = views.mail.facts.clone();
-    after_attempt += attempt_fragment.facts().clone();
+    after_attempt += prepared.attempt_fragment().facts().clone();
     let smtp_endpoint = account.smtp_endpoint.clone();
     let (host, port) = endpoint(&smtp_endpoint, "SMTP")?;
     let creds = Credentials::new(account.username.clone(), account.password.clone());
@@ -691,11 +691,7 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
     let mut submitter = LettreSubmit { transport };
     let response = mail::submit_once(
         &mut submitter,
-        &attempt_fragment,
-        attempt_id,
-        &outgoing,
-        &rendered.envelope,
-        &rendered.raw,
+        &prepared,
         |fragment| {
             storage.publish(
                 storage.scopes.mail,
