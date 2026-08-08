@@ -156,12 +156,15 @@ hex = "0.4"                 # gauge
 humantime = "2.3.0"         # orient, patience
 ical = "0.11"               # planner
 itertools = "0.14"          # wiki
+kamadak-exif = "0.6"        # posture (EXIF/TIFF tags on images)
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }  # mail (SMTP send)
 libc = "0.2"                # teams
+lopdf = { version = "0.44", default-features = false }  # posture (PDF objects + content streams)
 mailparse = "0.16"          # mail (RFC 5322 parser)
 mime = "0.3"                # shared canonical file media-type parsing
 rust-pop3-client = "0.3"    # mail (POP3 fetch, rustls-backed)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }  # mail (crypto provider for rust-pop3-client)
+quick-xml = "0.37"          # posture (OOXML part parsing)
 rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
@@ -174,6 +177,7 @@ tracing = "0.1"             # archive
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # archive
 typst = "0.14"              # wiki
 typst-syntax = "0.14"       # wiki
+zip = { version = "2", default-features = false, features = ["deflate"] }  # posture (OOXML is a zip of XML)
 
 # Widgets-only (optional): GORBIE viewer stack.
 GORBIE = { version = "0.18.1", default-features = false, features = ["typst", "markdown"], optional = true }

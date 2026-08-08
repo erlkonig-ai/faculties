@@ -17,6 +17,7 @@ pub mod message;
 pub mod orient;
 pub mod patience;
 pub mod planner;
+pub mod posture;
 pub mod reason;
 pub mod relations;
 pub mod selfimage;
