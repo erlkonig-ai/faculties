@@ -287,30 +287,37 @@ fn account_set(
 ) -> Result<()> {
     let views = storage.views()?;
     let master = passphrase()?;
-    let (anchor, predecessors, old_credential, old_secret) = if let Some(selector) =
-        account_selector
-    {
-        let anchor = resolve_account(&views, &selector)?;
-        let head = match mail::account_head(&views.mail.facts, anchor)? {
-            Head::Unique(id) => id,
-            Head::Missing => bail!("account {anchor:x} has no configuration"),
-            Head::Forked(ids) => bail!("account {anchor:x} has forked configurations {ids:?}"),
+    let (anchor, predecessors, old_credential, old_secret, replacing_fork) =
+        if let Some(selector) = account_selector {
+            let anchor = resolve_account(&views, &selector)?;
+            match mail::account_head(&views.mail.facts, anchor)? {
+                Head::Unique(head) => {
+                    let config = mail::account_config(&views.mail.facts, head)?;
+                    let opened =
+                        mail::open_account(&views.mail.reader, &views.mail.facts, anchor, &master)?;
+                    (
+                        anchor,
+                        vec![head],
+                        Some(config.credential),
+                        Some(opened.password),
+                        false,
+                    )
+                }
+                Head::Missing => bail!("account {anchor:x} has no configuration"),
+                // A complete new snapshot can reconcile every observed branch,
+                // but no branch may be selected as the credential donor.
+                Head::Forked(heads) => (anchor, heads, None, None, true),
+            }
+        } else {
+            (genid().id, Vec::new(), None, None, false)
         };
-        let config = mail::account_config(&views.mail.facts, head)?;
-        let opened = mail::open_account(&views.mail.reader, &views.mail.facts, anchor, &master)?;
-        (
-            anchor,
-            vec![head],
-            Some(config.credential),
-            Some(opened.password),
-        )
-    } else {
-        (genid().id, Vec::new(), None, None)
-    };
 
     let mut fragment = Fragment::empty();
     let credential_id = match (password, old_credential, old_secret) {
         (None, Some(id), _) => id,
+        (None, None, _) if replacing_fork => {
+            bail!("MAIL_PASS/--password is required to reconcile a forked account")
+        }
         (None, None, _) => bail!("MAIL_PASS/--password is required for a new account"),
         (Some(value), Some(id), Some(old)) if value == old => id,
         (Some(value), _, _) => {

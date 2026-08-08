@@ -2377,6 +2377,41 @@ mod tests {
     }
 
     #[test]
+    fn account_snapshot_superseding_every_fork_head_rejoins_the_dag() {
+        let anchor = id(83);
+        let credential = id(84);
+        let input = |display_name: &str, predecessors: Vec<Id>| AccountConfigInput {
+            address: "me@example.test".into(),
+            display_name: display_name.into(),
+            pop_endpoint: "pop.example.test:995".into(),
+            smtp_endpoint: "smtp.example.test:465".into(),
+            username: "me@example.test".into(),
+            credential,
+            enabled: true,
+            predecessors,
+        };
+        let (first, first_id) =
+            account_config_fragment(anchor, input("First branch", Vec::new())).unwrap();
+        let (second, second_id) =
+            account_config_fragment(anchor, input("Second branch", Vec::new())).unwrap();
+        let mut facts = first.into_facts();
+        facts += second.into_facts();
+        assert_eq!(
+            account_head(&facts, anchor).unwrap(),
+            Head::Forked(vec![first_id, second_id])
+        );
+
+        let (joined, joined_id) =
+            account_config_fragment(anchor, input("Reconciled", vec![second_id, first_id]))
+                .unwrap();
+        facts += joined.into_facts();
+        assert_eq!(
+            account_head(&facts, anchor).unwrap(),
+            Head::Unique(joined_id)
+        );
+    }
+
+    #[test]
     fn collection_roundtrip_enforces_unread_and_exact_outbound_bytes() {
         let fixture = Fixture::new();
         let persona = id(1);
