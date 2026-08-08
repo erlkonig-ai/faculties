@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Archive gains a canonical ordered block-DAG value model.** Semantic content
+  facts are hash-consed independently, ordinal-bearing parts preserve order and
+  repeated equal payloads, blocks identify predecessor structure plus genuine
+  optional event time, and exact source-projection receipts preserve vendor
+  multiplicity and raw evidence without contaminating shared block identity.
+  Shared constructors keep kind markers, paths, actors, and source labels as
+  monotone nonidentity annotations, while binary facts reuse Files' intrinsic
+  normalized media-type entities.
 - **Faculties can use the collection calculus without a compatibility model.**
   A narrow shared module opens piles without auto-repair, keeps durable signer
   initialization explicit, publishes self-contained fragments as signed

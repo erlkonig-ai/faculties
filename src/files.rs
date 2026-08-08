@@ -331,12 +331,26 @@ pub fn media_type_name_handle_strict(space: &TribleSet, file_id: Id) -> Result<O
     one(values, "file media type").map(|value| value.map(|(_, name)| name))
 }
 
-fn file_record(content: ContentHandle, name: NameHandle, media_type_name: NameHandle) -> Fragment {
-    let media_type = entity! {
+/// Construct the canonical intrinsic entity for one normalized IANA media
+/// type.
+///
+/// This is public because Files owns the shared media-type vocabulary even
+/// when another faculty (Archive, Mail, Teams, ...) needs to describe bytes
+/// that are not themselves a `KIND_FILE` entity. Spreading the returned
+/// fragment into a parent preserves both the media-type facts and its name
+/// attachment.
+pub fn media_type_fragment(media_type: &str) -> Result<Fragment> {
+    let media_type = normalize_media_type(media_type)?;
+    let mut fragment = Fragment::empty();
+    let name = fragment.put::<LongString, _>(media_type);
+    fragment += entity! {
         metadata::tag: &KIND_MEDIA_TYPE,
-        metadata::name: media_type_name,
+        metadata::name: name,
     };
+    Ok(fragment)
+}
 
+fn file_record(content: ContentHandle, name: NameHandle, media_type: Fragment) -> Fragment {
     // Spreading the child fragment consumes its exported id into the relation
     // while folding its facts into the returned fragment. The file remains the
     // fragment's sole exported root.
@@ -359,12 +373,11 @@ pub fn fragment<T>(bytes: T, name: impl Into<String>, media_type: &str) -> Resul
 where
     T: triblespace::core::blob::IntoBlob<RawBytes>,
 {
-    let media_type = normalize_media_type(media_type)?;
     let mut fragment = Fragment::empty();
     let content = fragment.put::<RawBytes, _>(bytes);
     let name = fragment.put::<LongString, _>(leaf_name(&name.into()));
-    let media_type_name = fragment.put::<LongString, _>(media_type);
-    fragment += file_record(content, name, media_type_name);
+    let media_type = media_type_fragment(media_type)?;
+    fragment += file_record(content, name, media_type);
     Ok(fragment)
 }
 
