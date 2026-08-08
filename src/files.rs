@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, Workspace};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
@@ -366,28 +366,6 @@ where
     let media_type_name = fragment.put::<LongString, _>(media_type);
     fragment += file_record(content, name, media_type_name);
     Ok(fragment)
-}
-
-/// Stage a file's blobs in a legacy repository workspace and return its facts.
-///
-/// New collection-native producers should use [`fragment`]. This adapter stays
-/// while the coordinated faculty cutover is prepared because Mail, Teams, and
-/// Discord still compose file facts into legacy multi-branch transactions.
-pub fn stage<Blobs, T>(
-    workspace: &mut Workspace<Blobs>,
-    bytes: T,
-    name: impl Into<String>,
-    media_type: &str,
-) -> Result<Fragment>
-where
-    Blobs: BlobStore,
-    T: triblespace::core::blob::IntoBlob<RawBytes>,
-{
-    let media_type = normalize_media_type(media_type)?;
-    let content = workspace.put::<RawBytes, _>(bytes);
-    let name = workspace.put::<LongString, _>(leaf_name(&name.into()));
-    let media_type_name = workspace.put::<LongString, _>(media_type);
-    Ok(file_record(content, name, media_type_name))
 }
 
 /// The result of wrapping one immutable file/directory tree in an import
@@ -948,18 +926,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::Repository;
-
-    fn workspace() -> Workspace<MemoryRepo> {
-        let mut repo = Repository::new(
-            MemoryRepo::default(),
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        )
-        .expect("repository");
-        let branch = repo.create_branch("files", None).expect("branch");
-        repo.pull(*branch).expect("workspace")
-    }
+    use triblespace::core::repo::{BlobStore, Repository};
 
     fn content_of(fragment: &Fragment) -> ContentHandle {
         find!(
@@ -1004,14 +971,7 @@ mod tests {
 
     #[test]
     fn entity_and_content_prefixes_resolve_without_a_minimum_length() {
-        let mut workspace = workspace();
-        let file = stage(
-            &mut workspace,
-            b"selector bytes".to_vec(),
-            "selector.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let file = fragment(b"selector bytes".to_vec(), "selector.txt", "text/plain").unwrap();
         let file_id = file.root().unwrap();
         let content = content_of(&file);
         let hash = content_hash_hex(content);
@@ -1058,21 +1018,8 @@ mod tests {
 
     #[test]
     fn duplicate_content_is_ambiguous_by_entity_even_for_a_complete_hash() {
-        let mut workspace = workspace();
-        let first = stage(
-            &mut workspace,
-            b"shared bytes".to_vec(),
-            "first.txt",
-            "text/plain",
-        )
-        .unwrap();
-        let second = stage(
-            &mut workspace,
-            b"shared bytes".to_vec(),
-            "second.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let first = fragment(b"shared bytes".to_vec(), "first.txt", "text/plain").unwrap();
+        let second = fragment(b"shared bytes".to_vec(), "second.txt", "text/plain").unwrap();
         let content = content_of(&first);
         let hash = content_hash_hex(content);
         let mut expected = vec![first.root().unwrap(), second.root().unwrap()];
@@ -1127,21 +1074,8 @@ mod tests {
 
     #[test]
     fn identical_file_records_have_identical_intrinsic_ids() {
-        let mut workspace = workspace();
-        let left = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "report.txt",
-            "text/plain",
-        )
-        .unwrap();
-        let right = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "report.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let left = fragment(b"same bytes".to_vec(), "report.txt", "text/plain").unwrap();
+        let right = fragment(b"same bytes".to_vec(), "report.txt", "text/plain").unwrap();
 
         assert_eq!(left.root(), right.root());
         assert_eq!(left, right);
@@ -1149,23 +1083,9 @@ mod tests {
 
     #[test]
     fn name_and_media_type_are_identity_but_bytes_still_deduplicate() {
-        let mut workspace = workspace();
-        let text = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "report.txt",
-            "text/plain",
-        )
-        .unwrap();
-        let renamed = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "renamed.txt",
-            "text/plain",
-        )
-        .unwrap();
-        let retyped = stage(
-            &mut workspace,
+        let text = fragment(b"same bytes".to_vec(), "report.txt", "text/plain").unwrap();
+        let renamed = fragment(b"same bytes".to_vec(), "renamed.txt", "text/plain").unwrap();
+        let retyped = fragment(
             b"same bytes".to_vec(),
             "report.txt",
             "application/octet-stream",
@@ -1182,28 +1102,19 @@ mod tests {
 
     #[test]
     fn containing_paths_never_enter_file_identity() {
-        let mut workspace = workspace();
-        let unix = stage(
-            &mut workspace,
+        let unix = fragment(
             b"same bytes".to_vec(),
             "/tmp/archive/report.txt",
             "text/plain",
         )
         .unwrap();
-        let windows = stage(
-            &mut workspace,
+        let windows = fragment(
             b"same bytes".to_vec(),
             r"C:\archive\report.txt",
             "text/plain",
         )
         .unwrap();
-        let bare = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "report.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let bare = fragment(b"same bytes".to_vec(), "report.txt", "text/plain").unwrap();
 
         assert_eq!(unix.root(), bare.root());
         assert_eq!(windows.root(), bare.root());
@@ -1211,34 +1122,15 @@ mod tests {
 
     #[test]
     fn directories_are_path_independent_merkle_values_including_empty_ones() {
-        let mut workspace = workspace();
-        let first = stage(
-            &mut workspace,
-            b"first".to_vec(),
-            "/tmp/one/first.txt",
-            "text/plain",
-        )
-        .unwrap();
-        let second = stage(
-            &mut workspace,
-            b"second".to_vec(),
-            r"C:\two\second.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let first = fragment(b"first".to_vec(), "/tmp/one/first.txt", "text/plain").unwrap();
+        let second = fragment(b"second".to_vec(), r"C:\two\second.txt", "text/plain").unwrap();
 
         let forward = directory_fragment("/snapshot/root", first.clone() + second.clone());
         let reverse = directory_fragment("root", second.clone() + first.clone());
         assert_eq!(forward.root(), reverse.root());
         assert_eq!(forward, reverse);
 
-        let changed_child = stage(
-            &mut workspace,
-            b"changed".to_vec(),
-            "second.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let changed_child = fragment(b"changed".to_vec(), "second.txt", "text/plain").unwrap();
         let changed = directory_fragment("root", first + changed_child);
         assert_ne!(forward.root(), changed.root());
 
@@ -1252,14 +1144,7 @@ mod tests {
 
     #[test]
     fn imports_are_occurrence_snapshots_while_tags_are_annotations() {
-        let mut workspace = workspace();
-        let tree = stage(
-            &mut workspace,
-            b"snapshot".to_vec(),
-            "snapshot.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let tree = fragment(b"snapshot".to_vec(), "snapshot.txt", "text/plain").unwrap();
         let instant = hifitime::Epoch::from_unix_seconds(10.0);
         let at: Inline<inlineencodings::NsTAIInterval> =
             (instant, instant).try_to_inline().unwrap();
@@ -1286,9 +1171,7 @@ mod tests {
 
     #[test]
     fn invalid_media_type_is_reported_instead_of_panicking() {
-        let mut workspace = workspace();
-        let error = stage(
-            &mut workspace,
+        let error = fragment(
             Vec::<u8>::new(),
             "document.bin",
             "application/invalid\0mime",
@@ -1324,16 +1207,8 @@ mod tests {
 
     #[test]
     fn normalized_variants_converge_and_long_suffixes_remain_identity() {
-        let mut workspace = workspace();
-        let plain = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "document.bin",
-            "text/plain",
-        )
-        .unwrap();
-        let decorated = stage(
-            &mut workspace,
+        let plain = fragment(b"same bytes".to_vec(), "document.bin", "text/plain").unwrap();
+        let decorated = fragment(
             b"same bytes".to_vec(),
             "document.bin",
             " TEXT/PLAIN; charset=UTF-8",
@@ -1342,15 +1217,13 @@ mod tests {
         assert_eq!(plain.root(), decorated.root());
         assert_eq!(media_type_of(&plain), media_type_of(&decorated));
 
-        let document = stage(
-            &mut workspace,
+        let document = fragment(
             b"same bytes".to_vec(),
             "document.bin",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
         .unwrap();
-        let sheet = stage(
-            &mut workspace,
+        let sheet = fragment(
             b"same bytes".to_vec(),
             "document.bin",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1362,9 +1235,7 @@ mod tests {
 
     #[test]
     fn media_type_is_a_joinable_intrinsic_entity() {
-        let mut workspace = workspace();
-        let file = stage(
-            &mut workspace,
+        let mut file = fragment(
             b"slides".to_vec(),
             "deck.pptx",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -1393,9 +1264,13 @@ mod tests {
             .next()
             .map(|(name,)| name)
         );
-        let name: anybytes::View<str> = workspace
+        let reader = file
+            .blobs_mut()
+            .reader()
+            .expect("fragment blob reader creation is infallible");
+        let name: anybytes::View<str> = reader
             .get::<anybytes::View<str>, LongString>(name_handle)
-            .expect("staged media type name");
+            .expect("fragment-local media type name");
         assert_eq!(
             name.as_ref(),
             "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -1403,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn media_type_name_survives_tribleset_commit_and_checkout() {
+    fn media_type_name_survives_fragment_commit_and_checkout() {
         let mut repo = Repository::new(
             MemoryRepo::default(),
             SigningKey::generate(&mut OsRng),
@@ -1412,8 +1287,7 @@ mod tests {
         .expect("repository");
         let branch = *repo.create_branch("files", None).expect("branch");
         let mut workspace = repo.pull(branch).expect("workspace");
-        let file = stage(
-            &mut workspace,
+        let file = fragment(
             b"slides".to_vec(),
             "deck.pptx",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -1421,12 +1295,9 @@ mod tests {
         .unwrap();
         let file_id = file.root().expect("file root");
 
-        // Mail, Teams, and Discord currently accumulate facts in a TribleSet.
-        // The constructor therefore stages blobs in the Workspace rather than
-        // relying on Fragment-local blob propagation alone.
-        let mut facts = TribleSet::new();
-        facts += file;
-        workspace.commit(facts, "store canonical file");
+        // Workspace::commit absorbs a Fragment's self-contained blobs. There
+        // is no separate workspace-staging constructor or compatibility path.
+        workspace.commit(file, "store canonical file");
         repo.push(&mut workspace).expect("push");
 
         let mut reopened = repo.pull(branch).expect("reopen");
