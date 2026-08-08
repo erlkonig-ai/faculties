@@ -25,7 +25,7 @@ use rand_core::OsRng;
 use triblespace::core::blob::Bytes;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::{BlobStore, Repository, Workspace};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
@@ -1855,6 +1855,11 @@ fn build_context_cover(
     if collect_chunk_spans(&space).is_empty() {
         return Ok(format!("no memory chunks on branch {branch_id:x}\n"));
     }
+    drop(ws);
+    let reader = repo
+        .storage_mut()
+        .reader()
+        .map_err(|e| anyhow!("snapshot memory blobs: {e:?}"))?;
 
     let opts = CoverOpts {
         budget_chars,
@@ -1863,7 +1868,7 @@ fn build_context_cover(
         remove: remove_q.map(str::to_string),
         sim_threshold,
     };
-    faculties::memory_cover::render_cover(&space, &mut ws, &opts)
+    faculties::memory_cover::render_cover(&space, &reader, &opts)
 }
 
 // ---------------------------------------------------------------------------

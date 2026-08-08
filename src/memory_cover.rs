@@ -11,17 +11,19 @@
 //!
 //! Everything below is the post-checkout half of what used to be
 //! `build_context_cover` in `memory.rs`: the caller does the branch
-//! resolution / pull / checkout, then hands us the already-checked-out `space`
-//! and `&mut ws` plus the parsed [`CoverOpts`]; we return the cover TEXT.
+//! resolution / pull / checkout, then hands us the already-checked-out `space`,
+//! a read-only blob snapshot, and the parsed [`CoverOpts`]; we return the cover
+//! TEXT.
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "local-embed")]
+use anyhow::anyhow;
+use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
 
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Workspace;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
@@ -196,8 +198,8 @@ pub const IMAGE_CHUNK_CHAR_COST: usize = 64;
 /// Character-cost of a chunk (its budget weight), loaded lazily and cached by
 /// span index. Cost is the summary's exact character count, so the budget and
 /// the per-chunk weights are in the same, unambiguous CHARACTER units.
-pub fn context_chunk_cost(
-    ws: &mut Workspace<Pile>,
+pub fn context_chunk_cost<B: BlobStoreGet>(
+    ws: &B,
     space: &TribleSet,
     spans: &[(i128, i128, Id)],
     cache: &mut [Option<usize>],
@@ -232,9 +234,9 @@ pub const DEFAULT_SIM_THRESHOLD: f32 = 0.55;
 /// cosine over the stored shared-space embeddings) when they exist, else LEXICAL
 /// (BM25). Both are non-negative; the cover propagates subtree maxima over them,
 /// so a node is worth descending into iff some memory beneath it is relevant.
-pub fn about_relevance_scores(
+pub fn about_relevance_scores<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    ws: &B,
     query: &str,
 ) -> Result<HashMap<Id, f32>> {
     #[cfg(feature = "local-embed")]
@@ -267,9 +269,9 @@ pub fn about_relevance_scores(
 /// BM25). Negative cosines clamp to 0 so "unrelated" is uniform and subtree-max
 /// stays meaningful (matching BM25's non-negative scores).
 #[cfg(feature = "local-embed")]
-pub fn semantic_about_scores(
+pub fn semantic_about_scores<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    ws: &B,
     query: &str,
 ) -> Result<Option<HashMap<Id, f32>>> {
     let mut handles: Vec<(Id, Inline<Handle<Embedding768>>)> = Vec::new();
@@ -311,9 +313,9 @@ pub fn semantic_about_scores(
 /// `universe` is the exact set of chunks that can appear in the cover (non-
 /// superseded, non-lens — what `collect_chunk_spans` selects), so the unscorable
 /// warning never lists chunks that could never surface anyway.
-pub fn eligibility_scores(
+pub fn eligibility_scores<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    ws: &B,
     query: &str,
     universe: &[Id],
 ) -> Result<(HashMap<Id, f32>, Vec<Id>)> {
@@ -353,9 +355,9 @@ pub fn eligibility_scores(
 /// keep them (fail-open) and warn — the honest, guardrail-safe behavior. Returns
 /// `None` when no chunk is embedded at all (caller drops to pure lexical).
 #[cfg(feature = "local-embed")]
-pub fn semantic_eligibility_scores(
+pub fn semantic_eligibility_scores<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    ws: &B,
     query: &str,
     universe: &[Id],
 ) -> Result<Option<(HashMap<Id, f32>, Vec<Id>)>> {
@@ -440,8 +442,8 @@ impl CoverOpts {
 }
 
 /// Render the context-cover TEXT from an already-checked-out memory `space`
-/// (and its `&mut ws`, needed to read summaries / embeddings / the search
-/// index) — the antichain cover over ALL memories, coarse → fine, fit to
+/// and a read-only blob snapshot needed to read summaries, embeddings, and the
+/// search index — the antichain cover over ALL memories, coarse → fine, fit to
 /// `opts.budget_chars` characters.
 ///
 /// This is the post-checkout half of the old `build_context_cover`: the caller
@@ -450,9 +452,9 @@ impl CoverOpts {
 /// Completeness is invariant — a memory is never dropped to fit. If even the
 /// coarsest cover (all roots) overflows the budget, this ERRORS with
 /// instructions for raising a coarser apex rather than silently losing the past.
-pub fn render_cover(
+pub fn render_cover<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    ws: &B,
     opts: &CoverOpts,
 ) -> Result<String> {
     use std::fmt::Write as _;

@@ -24,6 +24,22 @@ All notable changes to this project will be documented in this file.
   values stay visibly forked until a successor names every head. Exact catalog
   validation rejects foreign facts, malformed records, missing attachments,
   cycles, and invalid priority orders before publication.
+- **Orient observation state is a monotone collection.** Persona checkpoints
+  are now intrinsic `Baseline(persona)` and
+  `Seen(persona, source-kind, source-item)` records rather than timestamped
+  repository snapshots. One immutable snapshot validates Relations, Message,
+  Compass, and Orient under the durable signer; settled identity-equivalent
+  personas union their markers. Poll/show/wait flush complete output before
+  publishing unseen observations, peeks and persona-less shows remain
+  read-only, and first consumption establishes a quiet complete baseline.
+  Wait combines append-length race checks with all four collection revisions,
+  while Compass news compares the maximal Seen semantic status frontier so
+  same-valued agreement and own transitions stay quiet, genuine forks and
+  foreign reconciliation remain visible, and resolved unseen transients do
+  not replay.
+- **Message chronology now fails closed.** Sending, acknowledging, and listing
+  propagate clock failures instead of fabricating a 1970 timestamp, while
+  exact Message validation rejects non-point creation and read intervals.
 - **Decisions are collection-native and preserve concurrent resolution.** A
   stable decision anchor has one immutable intrinsic genesis, while factors are
   additive occurrence records and resolutions form intrinsic predecessor DAGs.

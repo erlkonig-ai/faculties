@@ -7,8 +7,7 @@
 use std::collections::HashMap;
 use triblespace::core::inline::encodings::time::Lower;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Workspace;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
@@ -52,7 +51,7 @@ pub mod attrs {
 // surfaces `cover`-tagged fragments — ambient principles/beliefs — on wake).
 
 /// Resolve a tag entity id by its `metadata::name` (case-insensitive).
-pub fn find_tag_by_name(space: &TribleSet, ws: &mut Workspace<Pile>, name: &str) -> Option<Id> {
+pub fn find_tag_by_name<B: BlobStoreGet>(space: &TribleSet, ws: &B, name: &str) -> Option<Id> {
     for (id, handle) in find!(
         (id: Id, h: TextHandle),
         pattern!(space, [{ ?id @ metadata::name: ?h }])
@@ -74,14 +73,14 @@ pub fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
 }
 
 /// Read the title string of a version entity.
-pub fn read_title(space: &TribleSet, ws: &mut Workspace<Pile>, vid: Id) -> Option<String> {
+pub fn read_title<B: BlobStoreGet>(space: &TribleSet, ws: &B, vid: Id) -> Option<String> {
     let (h,) = find!((h: TextHandle), pattern!(space, [{ vid @ attrs::title: ?h }])).next()?;
     let view: View<str> = ws.get(h).ok()?;
     Some(view.as_ref().to_string())
 }
 
 /// Read the content string of a version entity.
-pub fn read_content(space: &TribleSet, ws: &mut Workspace<Pile>, vid: Id) -> Option<String> {
+pub fn read_content<B: BlobStoreGet>(space: &TribleSet, ws: &B, vid: Id) -> Option<String> {
     let (h,) = find!((h: TextHandle), pattern!(space, [{ vid @ attrs::content: ?h }])).next()?;
     let view: View<str> = ws.get(h).ok()?;
     Some(view.as_ref().to_string())
@@ -114,7 +113,7 @@ pub fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
 /// Every fragment whose *latest* version carries the `cover` tag, as
 /// `(title, content)` pairs sorted by title — the ambient set the wake ritual
 /// surfaces. Empty if there is no `cover` tag in the pile yet.
-pub fn cover_fragments(space: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<(String, String)> {
+pub fn cover_fragments<B: BlobStoreGet>(space: &TribleSet, ws: &B) -> Vec<(String, String)> {
     let cover_tag = match find_tag_by_name(space, ws, "cover") {
         Some(id) => id,
         None => return Vec::new(),

@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::collection_access::{self, CollectionSnapshot, CollectionView};
 use faculties::message::{self, IntervalValue, MessageRow};
@@ -137,8 +137,8 @@ fn parse_id_arg(raw: &str) -> std::result::Result<Id, String> {
     Id::from_hex(raw.trim()).ok_or_else(|| format!("invalid id '{raw}'"))
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
+fn now_epoch() -> Result<Epoch> {
+    Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))
 }
 
 fn epoch_interval(epoch: Epoch) -> IntervalValue {
@@ -222,7 +222,7 @@ fn cmd_send(storage: MessageStorage<'_>, text: String, from: String, to: String)
         from_id,
         &recipient,
         &text,
-        epoch_interval(now_epoch()),
+        epoch_interval(now_epoch()?),
     );
     storage.publish(&views, fragment, "local message")?;
     println!(
@@ -259,7 +259,7 @@ fn cmd_ack(storage: MessageStorage<'_>, id: String, by: String) -> Result<()> {
         return Ok(());
     }
     let (fragment, _) =
-        message::read_fragment(message_id, reader, Some(epoch_interval(now_epoch())));
+        message::read_fragment(message_id, reader, Some(epoch_interval(now_epoch()?)));
     storage.publish(&views, fragment, "local message read")?;
     println!(
         "Marked {} as read by {}.",
@@ -282,7 +282,7 @@ fn cmd_ack_all(storage: MessageStorage<'_>, by: String, from: Option<String>) ->
         .transpose()?;
     let identities = IdentityComponents::from_facts(&views.relations.facts)?;
     let reads = message::load_read_rows(&views.messages.facts)?;
-    let observed_at = epoch_interval(now_epoch());
+    let observed_at = epoch_interval(now_epoch()?);
     let mut fragment = Fragment::empty();
     let mut count = 0usize;
     for row in message::load_message_rows(&views.messages.facts)? {
@@ -322,7 +322,7 @@ fn cmd_list(storage: MessageStorage<'_>, reader: String, unread: bool, limit: us
             .then_with(|| left.id.cmp(&right.id))
     });
 
-    let now = interval_key(epoch_interval(now_epoch()));
+    let now = interval_key(epoch_interval(now_epoch()?));
     let mut shown = 0usize;
     for row in messages {
         let incoming =

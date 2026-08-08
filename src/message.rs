@@ -138,6 +138,16 @@ fn at_most_one<T>(entity: Id, field: &str, values: Vec<T>) -> Result<Option<T>> 
     }
 }
 
+fn point_interval(value: IntervalValue, entity: Id, field: &str) -> Result<()> {
+    let (lower, upper): (i128, i128) = value
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode {field} on Message entity {entity:x}: {error:?}"))?;
+    if lower != upper {
+        bail!("{field} on Message entity {entity:x} must be a point interval");
+    }
+    Ok(())
+}
+
 fn sorted_ids(values: impl IntoIterator<Item = Id>) -> Vec<Id> {
     let mut values: Vec<Id> = values.into_iter().collect();
     values.sort_unstable();
@@ -406,6 +416,7 @@ fn validate_structure(facts: &TribleSet, relation_facts: &TribleSet) -> Result<V
     let mut expected = TribleSet::new();
     let mut bodies = Vec::with_capacity(messages.len());
     for row in messages {
+        point_interval(row.created_at, row.id, "metadata::created_at")?;
         if !people.contains(&row.from) {
             bail!(
                 "message {} names undeclared sender {}",
@@ -515,6 +526,7 @@ fn validate_structure(facts: &TribleSet, relation_facts: &TribleSet) -> Result<V
             value: IntervalValue,
             pattern!(facts, [{ row.id @ local::read_at: ?value }])
         ) {
+            point_interval(observed_at, row.id, "local::read_at")?;
             expected += entity! { ExclusiveId::force_ref(&row.id) @
                 local::read_at: observed_at,
             }
@@ -694,6 +706,15 @@ mod tests {
     fn at_unix(seconds: f64) -> IntervalValue {
         let epoch = Epoch::from_unix_seconds(seconds);
         (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    fn between_unix(lower: f64, upper: f64) -> IntervalValue {
+        (
+            Epoch::from_unix_seconds(lower),
+            Epoch::from_unix_seconds(upper),
+        )
+            .try_to_inline()
+            .unwrap()
     }
 
     fn person_anchor(person: Id) -> Fragment {
@@ -982,5 +1003,46 @@ mod tests {
             .to_string();
         assert!(error.contains("local::from"), "{error}");
         assert!(error.contains("expected exactly one"), "{error}");
+    }
+
+    #[test]
+    fn authored_chronology_requires_point_intervals() {
+        let sender = test_id(0x51);
+        let recipient = test_id(0x52);
+        let message = test_id(0x53);
+        let mut relation_facts = TribleSet::new();
+        for person in [sender, recipient] {
+            relation_facts += person_anchor(person).facts().clone();
+        }
+
+        let body = "body".to_owned().to_blob().get_handle();
+        let envelope = envelope_fragment(
+            message,
+            sender,
+            recipient,
+            body,
+            between_unix(15.0, 16.0),
+            None,
+            None,
+        )
+        .into_facts();
+        let error = validate_structure(&envelope, &relation_facts)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("metadata::created_at"), "{error}");
+        assert!(error.contains("point interval"), "{error}");
+
+        let mut facts =
+            envelope_fragment(message, sender, recipient, body, at_unix(15.0), None, None)
+                .into_facts();
+        facts += read_fragment(message, recipient, Some(between_unix(16.0, 17.0)))
+            .0
+            .facts()
+            .clone();
+        let error = validate_structure(&facts, &relation_facts)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("local::read_at"), "{error}");
+        assert!(error.contains("point interval"), "{error}");
     }
 }

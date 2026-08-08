@@ -41,6 +41,7 @@ pub mod memory_cover;
 pub mod message;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
+pub mod orient;
 pub mod relations;
 pub mod schemas;
 pub mod tokens;

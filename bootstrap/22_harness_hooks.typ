@@ -24,7 +24,7 @@ this fragment extends.
   + *Poll* — `orient --persona <you> poll` (faculties
     `f1a237c`) is the non-blocking sibling for *per-turn*
     hooks: it prints the same terse news `wait` would print
-    and advances the persona's checkpoint, or prints *nothing*
+    and records the persona's newly seen observations, or prints *nothing*
     when quiet. Wired into a turn-boundary hook it gives a
     busy session passive news ingestion — you hear the colony
     while working, without ever blocking on it.
@@ -34,7 +34,8 @@ this fragment extends.
 
 Watcher and poll are complementary, not redundant: `wait`
 covers the idle gap between turns, `poll` covers the busy
-stretch within them, and both may surface the same item —
+stretch within them, and concurrent consumers may surface the
+same item before either Seen publication becomes visible —
 that's expected, not a bug.
 
 == Attribution: everything runs as your persona
@@ -114,7 +115,7 @@ fire, and subagents must not start competing watchers.
 
 `orient_session_start.sh` pkills watchers inherited from
 older, now-unreachable Codex exec sessions (a stale watcher
-would keep advancing the persona checkpoint while its output
+would keep publishing persona observations while its output
 is attached to a session nobody can read), then prints the
 watcher-first instruction as developer context. Codex command
 hooks are synchronous, so the hook *cannot* start the watcher
@@ -130,7 +131,7 @@ Codex currently fires `UserPromptSubmit` hooks for root and
 subagents alike without exposing which one fired
 (openai/codex#16226). The prompt hook therefore uses
 `orient poll --peek`: it reports the same directed news but
-never advances or initializes the persona checkpoint. A
+never publishes `Baseline` or `Seen` facts. A
 worker may see repeated news, but cannot steal it from the
 root watcher. The hook exits silently when quiet and wraps
 news as `hookSpecificOutput.additionalContext` when present.
