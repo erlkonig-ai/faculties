@@ -57,8 +57,12 @@ use triblespace::prelude::View;
 use GORBIE::card_ctx::GRID_ROW_MODULE;
 use GORBIE::prelude::CardCtx;
 
+use crate::compass::{self, StatusResolution};
 use crate::schemas::archive::archive as archive_attrs;
-use crate::schemas::compass::{board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
+use crate::schemas::compass::{
+    goal as compass_goal, note as compass_note, status as compass_status, KIND_GOAL_GENESIS,
+    KIND_NOTE, KIND_STATUS_SNAPSHOT,
+};
 use crate::schemas::message::{local as local_attrs, KIND_MESSAGE_ID};
 use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
 use crate::schemas::wiki::{attrs as wiki_attrs, KIND_VERSION_ID};
@@ -104,11 +108,12 @@ fn format_time_marker(key: i128) -> String {
     format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}")
 }
 
-/// Current TAI time as a ns key, or 0 if the system clock is unavailable.
-fn now_key() -> i128 {
+/// Current TAI time as a ns key. Clock failure remains absence rather than a
+/// fabricated Unix/TAI epoch event.
+fn now_key() -> Option<i128> {
     Epoch::now()
         .map(|e| e.to_tai_duration().total_nanoseconds())
-        .unwrap_or(0)
+        .ok()
 }
 
 /// First 8 hex chars of an Id — compact label for pills / hover.
@@ -252,6 +257,10 @@ fn status_color(status: &str) -> egui::Color32 {
         "blocked" => egui::Color32::from_rgb(0xcc, 0x0a, 0x17),
         // RAL 5005 signal blue
         "done" => egui::Color32::from_rgb(0x15, 0x4e, 0xa1),
+        "invalid" => egui::Color32::from_rgb(0xcc, 0x0a, 0x17),
+        "missing" => egui::Color32::from_rgb(0x80, 0x80, 0x80),
+        value if value.starts_with("agree:") => egui::Color32::from_rgb(0x15, 0x4e, 0xa1),
+        value if value.starts_with("fork:") => egui::Color32::from_rgb(0xb0, 0x55, 0xc9),
         // RAL 7012 basalt grey (muted)
         _ => egui::Color32::from_rgb(0x4d, 0x55, 0x59),
     }
@@ -348,17 +357,59 @@ fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> String {
         .unwrap_or_default()
 }
 
-/// Emit a Compass event per status-change entity. Also records "goal
-/// created" and "note" events so quiet boards still show up.
+fn compass_status_decoration(
+    resolution: Option<&StatusResolution>,
+    event_id: Id,
+    status: String,
+    title: &str,
+) -> (String, String) {
+    let is_fork_head = matches!(
+        resolution,
+        Some(StatusResolution::Forked(heads)) if heads.iter().any(|head| head.id == event_id)
+    );
+    let is_agreed_head = matches!(
+        resolution,
+        Some(StatusResolution::Agreed(heads)) if heads.iter().any(|head| head.id == event_id)
+    );
+    if is_fork_head {
+        (
+            preview(
+                &format!("{title} — fork head {}={status}", id_hex(event_id)),
+                80,
+            ),
+            format!("fork:{status}"),
+        )
+    } else if is_agreed_head {
+        (
+            preview(
+                &format!("{title} — agreeing head {}={status}", id_hex(event_id)),
+                80,
+            ),
+            format!("agree:{status}"),
+        )
+    } else {
+        (preview(title, 80), status)
+    }
+}
+
+/// Emit every immutable Compass status snapshot, goal genesis, and note.
+/// Concurrent status heads are labelled as a fork rather than timestamp-
+/// arbitrated into one event.
 fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
     let mut title_by_goal: HashMap<Id, String> = HashMap::new();
+    let mut created_by_goal: HashMap<Id, i128> = HashMap::new();
+    let status_by_goal: HashMap<Id, StatusResolution> = compass::goal_anchors(dataset.facts)
+        .into_iter()
+        .map(|goal| (goal, compass::status_resolution(dataset.facts, goal)))
+        .collect();
 
     let goal_rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
         (gid: Id, title: TextHandle, ts: (i128, i128)),
         pattern!(dataset.facts, [{
-            ?gid @
-            metadata::tag: &KIND_GOAL_ID,
-            compass_attrs::title: ?title,
+            _?genesis @
+            metadata::tag: &KIND_GOAL_GENESIS,
+            compass_goal::of: ?gid,
+            compass_goal::title: ?title,
             metadata::created_at: ?ts,
         }])
     )
@@ -367,13 +418,19 @@ fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
     for (gid, title_h, ts) in goal_rows {
         let title = read_text(dataset, title_h);
         title_by_goal.insert(gid, title.clone());
+        created_by_goal.insert(gid, ts.0);
+        let status = match status_by_goal.get(&gid) {
+            Some(StatusResolution::Missing) => "missing",
+            Some(StatusResolution::Invalid(_)) => "invalid",
+            _ => "created",
+        };
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::Compass,
             entity_id: gid,
             ts_ns: ts.0,
             summary: preview(&title, 80),
-            status: Some("created".to_string()),
+            status: Some(status.to_owned()),
             from_to: None,
         });
     }
@@ -382,9 +439,9 @@ fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
         (event_id: Id, gid: Id, status: String, ts: (i128, i128)),
         pattern!(dataset.facts, [{
             ?event_id @
-            metadata::tag: &KIND_STATUS_ID,
-            compass_attrs::task: ?gid,
-            compass_attrs::status: ?status,
+            metadata::tag: &KIND_STATUS_SNAPSHOT,
+            compass_status::of: ?gid,
+            compass_status::value: ?status,
             metadata::created_at: ?ts,
         }])
     )
@@ -395,24 +452,52 @@ fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
             .get(&gid)
             .cloned()
             .unwrap_or_else(|| "(untitled)".to_string());
+        let (summary, pill) =
+            compass_status_decoration(status_by_goal.get(&gid), event_id, status, &title);
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::Compass,
             entity_id: event_id,
             ts_ns: ts.0,
-            summary: preview(&title, 80),
-            status: Some(status),
+            summary,
+            status: Some(pill),
             from_to: None,
         });
+    }
+
+    // A malformed track may not have a parseable snapshot event to carry its
+    // diagnostic. Surface one explicit marker at the goal's genesis instead.
+    for (&gid, resolution) in &status_by_goal {
+        if let StatusResolution::Invalid(reason) = resolution {
+            let Some(ts_ns) = created_by_goal.get(&gid).copied() else {
+                // A timeline cannot truthfully place an event without a time.
+                // The containing collection/widget validation still exposes
+                // the malformed goal globally.
+                continue;
+            };
+            let title = title_by_goal
+                .get(&gid)
+                .cloned()
+                .unwrap_or_else(|| "(untitled)".to_owned());
+            out.push(Event {
+                source_idx: idx,
+                kind: SourceKind::Compass,
+                entity_id: gid,
+                ts_ns,
+                summary: preview(&format!("{title} — status invalid: {reason}"), 80),
+                status: Some("invalid".to_owned()),
+                from_to: None,
+            });
+        }
     }
 
     let note_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
         (event_id: Id, gid: Id, note: TextHandle, ts: (i128, i128)),
         pattern!(dataset.facts, [{
             ?event_id @
-            metadata::tag: &KIND_NOTE_ID,
-            compass_attrs::task: ?gid,
-            compass_attrs::note: ?note,
+            metadata::tag: &KIND_NOTE,
+            compass_note::of: ?gid,
+            compass_note::body: ?note,
             metadata::created_at: ?ts,
         }])
     )
@@ -620,10 +705,6 @@ impl BranchTimeline {
     /// Render the timeline from immutable datasets resolved by stable key.
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, datasets: &WidgetContext<'_>) {
         let now = now_key();
-        if self.first_render {
-            self.timeline_start = now;
-            self.first_render = false;
-        }
 
         // Refresh if any keyed dataset appeared, disappeared, or changed.
         let revisions = source_revisions(&self.sources, datasets);
@@ -640,6 +721,12 @@ impl BranchTimeline {
             .as_ref()
             .map(|l| l.events.clone())
             .unwrap_or_default();
+        if self.first_render {
+            if let Some(anchor) = now.or_else(|| events.last().map(|event| event.ts_ns)) {
+                self.timeline_start = anchor;
+            }
+            self.first_render = false;
+        }
         let sources = self.sources.clone();
         let viewport_height = self.viewport_height;
 
@@ -662,7 +749,7 @@ impl BranchTimeline {
         &mut self,
         ctx: &mut CardCtx<'_>,
         viewport_height: f32,
-        now: i128,
+        now: Option<i128>,
         events: &[Event],
         sources: &[TimelineSource],
     ) {
@@ -760,7 +847,9 @@ impl BranchTimeline {
             }
 
             if viewport_response.double_clicked() {
-                self.timeline_start = now;
+                if let Some(now) = now {
+                    self.timeline_start = now;
+                }
             }
         }
 
@@ -856,7 +945,7 @@ impl BranchTimeline {
         // NOW marker — a dashed horizontal guideline at current time
         // so the viewer can orient immediately. Only painted when
         // `now` falls inside the visible window.
-        if now >= view_end && now <= view_start {
+        if let Some(now) = now.filter(|now| *now >= view_end && *now <= view_start) {
             // egui only repaints on input events, which froze the
             // marker until the mouse moved. Schedule a repaint for
             // when the marker will have travelled ~1px at the current
@@ -1121,6 +1210,11 @@ fn format_span(secs: f64) -> String {
 mod tests {
     use super::*;
 
+    use std::fs::File;
+
+    use hifitime::Epoch;
+    use triblespace::prelude::*;
+
     fn kind(source: &TimelineSource) -> SourceKind {
         match source {
             TimelineSource::Compass { .. } => SourceKind::Compass,
@@ -1205,5 +1299,82 @@ mod tests {
         };
 
         assert_eq!(route(&forward), route(&reverse));
+    }
+
+    #[test]
+    fn agreeing_status_heads_are_diagnostic_not_divergent() {
+        let goal = Id::new([0x70; 16]).unwrap();
+        let head = Id::new([0x71; 16]).unwrap();
+        let epoch = Epoch::from_unix_seconds(1.0);
+        let resolution = StatusResolution::Agreed(
+            [head, Id::new([0x72; 16]).unwrap()]
+                .into_iter()
+                .map(|id| compass::StatusSnapshot {
+                    id,
+                    goal,
+                    value: "doing".to_owned(),
+                    predecessors: vec![],
+                    by: None,
+                    created_at: (epoch, epoch).try_to_inline().unwrap(),
+                })
+                .collect(),
+        );
+
+        let (summary, pill) =
+            compass_status_decoration(Some(&resolution), head, "doing".to_owned(), "Goal");
+        assert_eq!(pill, "agree:doing");
+        assert!(summary.contains("agreeing head"));
+        assert!(!summary.contains("fork head"));
+    }
+
+    #[test]
+    fn compass_timeline_marks_each_concurrent_status_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("timeline-compass.pile");
+        File::create(&pile).unwrap();
+        crate::collection_access::initialize_signer(&pile, None).unwrap();
+
+        let goal = Id::new([0x71; 16]).unwrap();
+        let at = |value: i128| -> crate::compass::IntervalValue {
+            let epoch = Epoch::from_unix_seconds(value as f64);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let (mut initial, _, status) =
+            crate::compass::goal_fragment(goal, "Forked", vec![], None, "todo", None, at(1))
+                .unwrap();
+        initial += crate::compass::priority_snapshot_fragment([], &[])
+            .unwrap()
+            .0;
+        crate::collection_access::publish_fragment(
+            &pile,
+            None,
+            crate::schemas::compass::DEFAULT_SCOPE_ID,
+            initial,
+            Fragment::empty(),
+        )
+        .unwrap();
+        for (value, time) in [("doing", 2), ("blocked", 3)] {
+            crate::collection_access::publish_fragment(
+                &pile,
+                None,
+                crate::schemas::compass::DEFAULT_SCOPE_ID,
+                crate::compass::status_fragment(goal, value, &[status], None, at(time)).unwrap(),
+                Fragment::empty(),
+            )
+            .unwrap();
+        }
+
+        let mut storage = crate::widgets::storage::StorageState::new(&pile);
+        let context = storage.context();
+        let dataset = context.dataset(SourceKey::Compass).unwrap();
+        let mut events = Vec::new();
+        collect_compass_events(0, dataset, &mut events);
+        let mut fork_labels: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.status.as_deref())
+            .filter(|status| status.starts_with("fork:"))
+            .collect();
+        fork_labels.sort_unstable();
+        assert_eq!(fork_labels, ["fork:blocked", "fork:doing"]);
     }
 }

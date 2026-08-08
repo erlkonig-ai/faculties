@@ -2,12 +2,11 @@
 //!
 //! Widgets consume borrowed [`DatasetView`] values through a keyed
 //! [`WidgetContext`]. `StorageState` owns the currently loaded snapshot and the
-//! top-bar path selector; it never constructs a repository or signer and has no
-//! write path. During the feature-branch migration this module has one private,
-//! wholly legacy backend. The eventual collection cutover can replace that
-//! loader without changing widget APIs.
+//! top-bar path selector and has no write path. It loads Compass directly from
+//! its union collection under the existing durable signer; the private legacy
+//! catalog remains only for faculties which have not made that cutover yet.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -15,13 +14,16 @@ use triblespace::core::repo::pile::PileReader;
 use triblespace::core::trible::TribleSet;
 use GORBIE::prelude::CardCtx;
 
-use crate::collection_access::{self, LegacyBranchRevision, LegacyBranchView};
+use crate::collection_access::{
+    self, CollectionRevision, CollectionView, LegacyBranchRevision, LegacyBranchView,
+};
+use crate::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
 
 /// Stable logical input requested by a widget.
 ///
-/// These keys describe consumers, not storage branch names. The temporary
-/// legacy catalog below is the only place where those logical inputs are bound
-/// to legacy branches.
+/// These keys describe consumers, not storage branch names. A source may be
+/// backed by a collection or, during the cutover, by the private legacy
+/// catalog below.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SourceKey {
     Archive,
@@ -69,12 +71,16 @@ impl SourceKey {
 /// Opaque cache identity for one logical dataset view.
 ///
 /// Widgets compare revisions for equality; the storage backend owns their
-/// construction. A later collection-native loader will project
-/// `CollectionRevision` into this same boundary.
+/// construction. Collection and temporary legacy sources both project their
+/// exact semantic revisions into this boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DatasetRevision([u8; 32]);
 
 impl DatasetRevision {
+    fn from_collection(revision: CollectionRevision) -> Self {
+        Self(*revision.as_bytes())
+    }
+
     fn from_legacy(revision: LegacyBranchRevision) -> Self {
         Self(*revision.as_bytes())
     }
@@ -110,6 +116,14 @@ struct LoadedDataset {
 }
 
 impl LoadedDataset {
+    fn from_collection(view: CollectionView) -> Self {
+        Self {
+            facts: view.facts,
+            reader: view.reader,
+            revision: DatasetRevision::from_collection(view.revision),
+        }
+    }
+
     fn from_legacy(view: LegacyBranchView) -> Self {
         Self {
             facts: view.facts,
@@ -133,8 +147,9 @@ struct LegacySource {
     branches: &'static [&'static str],
 }
 
-// Temporary and deliberately private. There is no per-source backend choice:
-// every source in this feature-branch stage is loaded only from legacy state.
+// Temporary and deliberately private. Compass is absent because it has made
+// the collection cutover; every remaining source is loaded only from legacy
+// state until its own schema migration lands.
 const LEGACY_SOURCE_CATALOG: &[LegacySource] = &[
     LegacySource {
         key: SourceKey::Archive,
@@ -143,10 +158,6 @@ const LEGACY_SOURCE_CATALOG: &[LegacySource] = &[
     LegacySource {
         key: SourceKey::Atlas,
         branches: &["atlas"],
-    },
-    LegacySource {
-        key: SourceKey::Compass,
-        branches: &["compass"],
     },
     LegacySource {
         key: SourceKey::Decide,
@@ -281,7 +292,7 @@ impl StorageState {
     }
 
     fn reload_current_path(&mut self) {
-        match load_consistent_legacy_catalog(&self.pile_path) {
+        match load_consistent_catalog(&self.pile_path) {
             Ok((datasets, stamp)) => {
                 self.datasets = Some(datasets);
                 self.stamp = Some(stamp);
@@ -388,12 +399,12 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     })
 }
 
-fn load_consistent_legacy_catalog(
+fn load_consistent_catalog(
     path: &Path,
 ) -> Result<(BTreeMap<SourceKey, LoadedDataset>, FileStamp), String> {
     for _ in 0..2 {
         let before = file_stamp(path)?;
-        let datasets = load_legacy_catalog(path)?;
+        let datasets = load_catalog(path)?;
         let after = file_stamp(path)?;
         if before == after {
             return Ok((datasets, after));
@@ -405,7 +416,7 @@ fn load_consistent_legacy_catalog(
     ))
 }
 
-fn load_legacy_catalog(path: &Path) -> Result<BTreeMap<SourceKey, LoadedDataset>, String> {
+fn load_catalog(path: &Path) -> Result<BTreeMap<SourceKey, LoadedDataset>, String> {
     let mut by_branch: BTreeMap<&'static str, Option<LoadedDataset>> = BTreeMap::new();
     let mut datasets = BTreeMap::new();
     for source in LEGACY_SOURCE_CATALOG {
@@ -426,6 +437,14 @@ fn load_legacy_catalog(path: &Path) -> Result<BTreeMap<SourceKey, LoadedDataset>
             datasets.insert(source.key, dataset);
         }
     }
+    let signer = collection_access::load_signer(path, None)
+        .map_err(|error| format!("load Compass collection signer: {error:#}"))?;
+    let allowed = HashSet::from([signer.verifying_key()]);
+    let compass = collection_access::materialize_scope(path, COMPASS_SCOPE_ID, &allowed)
+        .map_err(|error| format!("materialize Compass collection: {error:#}"))?;
+    crate::compass::validate_catalog(&compass.reader, &compass.facts)
+        .map_err(|error| format!("validate Compass collection: {error:#}"))?;
+    datasets.insert(SourceKey::Compass, LoadedDataset::from_collection(compass));
     Ok(datasets)
 }
 
@@ -464,6 +483,7 @@ mod tests {
     use std::fs::File;
 
     use ed25519_dalek::SigningKey;
+    use hifitime::Epoch;
     use triblespace::core::metadata;
     use triblespace::core::repo::{BlobStoreGet, Repository};
     use triblespace::macros::{entity, find, pattern};
@@ -482,6 +502,7 @@ mod tests {
         );
         repository.push(&mut workspace).unwrap();
         repository.close().unwrap();
+        collection_access::initialize_signer(path, None).unwrap();
         branch
     }
 
@@ -540,12 +561,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mode_ignores_partial_collection_data() {
+    fn compass_has_no_legacy_fallback_and_other_collection_scopes_are_ignored() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("collection-only.pile");
         let key = directory.path().join("writer.key");
         File::create(&path).unwrap();
         collection_access::initialize_signer(&path, Some(&key)).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
         collection_access::publish_fragment(
             &path,
             Some(&key),
@@ -558,10 +580,63 @@ mod tests {
         let mut storage = StorageState::new(&path);
         let context = storage.context();
 
+        let compass = context.dataset(SourceKey::Compass).unwrap();
+        assert!(compass.facts.is_empty());
         assert!(SourceKey::ALL
             .into_iter()
+            .filter(|key| *key != SourceKey::Compass)
             .all(|key| context.dataset(key).is_none()));
         assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
+    }
+
+    #[test]
+    fn compass_source_materializes_the_collection_and_tracks_its_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("compass-collection.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+
+        let goal = Id::new([0x53; 16]).unwrap();
+        let epoch = Epoch::from_unix_seconds(1.0);
+        let at: crate::compass::IntervalValue = (epoch, epoch).try_to_inline().unwrap();
+        let (mut fragment, _, initial) =
+            crate::compass::goal_fragment(goal, "Collection goal", vec![], None, "todo", None, at)
+                .unwrap();
+        fragment += crate::compass::priority_snapshot_fragment([], &[])
+            .unwrap()
+            .0;
+        collection_access::publish_fragment(
+            &path,
+            None,
+            COMPASS_SCOPE_ID,
+            fragment,
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let mut storage = StorageState::new(&path);
+        let first = storage.context().dataset(SourceKey::Compass).unwrap();
+        assert!(crate::compass::goal_anchors(first.facts).contains(&goal));
+        let first_revision = first.revision;
+
+        let epoch = Epoch::from_unix_seconds(2.0);
+        let at: crate::compass::IntervalValue = (epoch, epoch).try_to_inline().unwrap();
+        let moved = crate::compass::status_fragment(goal, "doing", &[initial], None, at).unwrap();
+        collection_access::publish_fragment(
+            &path,
+            None,
+            COMPASS_SCOPE_ID,
+            moved,
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let second = storage.context().dataset(SourceKey::Compass).unwrap();
+        assert_ne!(second.revision, first_revision);
+        assert!(matches!(
+            crate::compass::status_resolution(second.facts, goal),
+            crate::compass::StatusResolution::Unique(snapshot) if snapshot.value == "doing"
+        ));
     }
 
     #[test]
@@ -581,11 +656,14 @@ mod tests {
 
     #[test]
     fn temporary_catalog_covers_every_source_key_once() {
-        let catalog: BTreeSet<_> = LEGACY_SOURCE_CATALOG
+        let legacy: BTreeSet<_> = LEGACY_SOURCE_CATALOG
             .iter()
             .map(|source| source.key)
             .collect();
-        assert_eq!(catalog, SourceKey::ALL.into_iter().collect());
-        assert_eq!(catalog.len(), LEGACY_SOURCE_CATALOG.len());
+        assert!(!legacy.contains(&SourceKey::Compass));
+        let mut complete = legacy.clone();
+        complete.insert(SourceKey::Compass);
+        assert_eq!(complete, SourceKey::ALL.into_iter().collect());
+        assert_eq!(legacy.len(), LEGACY_SOURCE_CATALOG.len());
     }
 }

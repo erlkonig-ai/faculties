@@ -1,81 +1,100 @@
-//! Compass schema: goals, statuses, notes, and priority relations.
+//! Collection-native Compass schema.
 //!
-//! Used by the Compass faculty and by viewers that read Compass boards from a
-//! pile. Status names are intentionally open-ended; the defaults only define
-//! the lanes presented first by clients.
+//! Goal ids are stable extrinsic anchors. Their immutable descriptive fields
+//! live in one intrinsic genesis record. Notes are independent ledger
+//! occurrences. Status and board priority are intrinsic full-state snapshots
+//! whose `metadata::supersedes` edges form explicit predecessor DAGs.
 
-use triblespace::core::metadata;
-use triblespace::macros::{find, id_hex, pattern};
+use triblespace::macros::{attributes, id_hex};
 use triblespace::prelude::*;
 
-pub const KIND_GOAL_LABEL: &str = "goal";
-pub const KIND_STATUS_LABEL: &str = "status";
-pub const KIND_NOTE_LABEL: &str = "note";
-pub const KIND_PRIORITIZE_LABEL: &str = "prioritize";
-pub const KIND_DEPRIORITIZE_LABEL: &str = "deprioritize";
+/// Stable extrinsic scope of the authored Compass collection.
+///
+/// Minted with `trible genid` on 2026-08-08.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("B9566CF892C55CCB0E58411E1B18CD7F");
 
-pub const KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
-pub const KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
-pub const KIND_NOTE_ID: Id = id_hex!("D4E49A6F02A14E66B62076AE4C01715F");
-pub const KIND_PRIORITIZE_ID: Id = id_hex!("6907A81922DA6DF79966616EA60DEC70");
-pub const KIND_DEPRIORITIZE_ID: Id = id_hex!("86C4621538FB0E30CD63BB7A3B847E8B");
-
-pub const KIND_SPECS: [(Id, &str); 5] = [
-    (KIND_GOAL_ID, KIND_GOAL_LABEL),
-    (KIND_STATUS_ID, KIND_STATUS_LABEL),
-    (KIND_NOTE_ID, KIND_NOTE_LABEL),
-    (KIND_PRIORITIZE_ID, KIND_PRIORITIZE_LABEL),
-    (KIND_DEPRIORITIZE_ID, KIND_DEPRIORITIZE_LABEL),
-];
+/// Stable goal anchor.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_GOAL: Id = id_hex!("E28B47D3EEC8AB65F4096E50FCC032C6");
+/// Intrinsic immutable description of one goal anchor.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_GOAL_GENESIS: Id = id_hex!("D0CCD84AEF68BCB1083AD5AB6514FF9E");
+/// Independent additive note occurrence.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_NOTE: Id = id_hex!("846652BA3DEEC9ADC73D0A17F4C18772");
+/// Intrinsic full-state status snapshot for one goal.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_STATUS_SNAPSHOT: Id = id_hex!("C59D4BAB989BBD8A4F509C6103E34027");
+/// Intrinsic full-board priority snapshot.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_PRIORITY_SNAPSHOT: Id = id_hex!("974590991741BA7361EE94E024AC47AE");
+/// Intrinsic ordered pair used by a priority snapshot.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_PRIORITY_EDGE: Id = id_hex!("8E118E43D3BF8310C34BCA71B213775E");
+/// Intrinsic canonical user tag, named through `metadata::name`.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_TAG: Id = id_hex!("58ADB7B29613AC4C594A303767C49A69");
 
 pub const DEFAULT_STATUSES: [&str; 4] = ["todo", "doing", "blocked", "done"];
 
-pub mod board {
+pub mod goal {
     use super::*;
 
     attributes! {
-        "EE18CEC15C18438A2FAB670E2E46E00C" as title: inlineencodings::Handle<blobencodings::LongString>;
-        // TODO: migrate to metadata::tag (GenId) — tags should be entities with
-        // their own ID + metadata::name, not inline strings. See wiki.rs TagIndex
-        // for the correct pattern. This ShortString tag is a legacy design mistake.
-        "5FF4941DCC3F6C35E9B3FD57216F69ED" as tag: inlineencodings::ShortString;
-        "9D2B6EBDA67E9BB6BE6215959D182041" as parent: inlineencodings::GenId;
+        /// Stable goal anchor described by this genesis record.
+        /// Minted with `trible genid` on 2026-08-08.
+        "5B0D4715864A3D29BA461E82D053229F" as of: inlineencodings::GenId;
 
-        "C1EAAA039DA7F486E4A54CC87D42E72C" as task: inlineencodings::GenId;
-        "61C44E0F8A73443ED592A713151E99A4" as status: inlineencodings::ShortString;
-        // Optional acting persona (relations person id) on status and note
-        // events. This is attribution only; it has no workflow semantics.
-        "34718CDC13D0E3D8750DB58105390AB3" as by: inlineencodings::GenId;
-        "47351DF00B3DDA96CB305157CD53D781" as note: inlineencodings::Handle<blobencodings::LongString>;
-        // Opaque, exact references attached to a note. Repeated handles keep
-        // the ledger queryable without assigning any interpretation here.
-        "FD59B704D0F1D06AF14102ADCB5F6FF0" as reference: inlineencodings::Handle<blobencodings::LongString>;
-        "B88842D9D00361A0F2728C478C79D75C" as higher: inlineencodings::GenId;
-        "18F3446C9E9281A248D370A56395A3F0" as lower: inlineencodings::GenId;
+        // These ids retain their already-published meanings; only their
+        // subject moves from a mutable goal anchor to its sealed genesis.
+        "EE18CEC15C18438A2FAB670E2E46E00C" as title: inlineencodings::Handle<blobencodings::LongString>;
+        "9D2B6EBDA67E9BB6BE6215959D182041" as parent: inlineencodings::GenId;
     }
 }
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+pub mod event {
+    use super::*;
 
-pub fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (i128, i128) = interval
-        .try_from_inline()
-        .expect("NsTAIInterval inline values have a lower bound");
-    lower
+    attributes! {
+        /// Optional acting Relations person. Attribution only.
+        "34718CDC13D0E3D8750DB58105390AB3" as by: inlineencodings::GenId;
+    }
 }
 
-/// Deterministic latest status event for one goal. Ties on timestamp are
-/// broken by event id so merged replicas agree.
-pub fn latest_status_event(space: &TribleSet, goal_id: Id) -> Option<(Id, String, IntervalValue)> {
-    find!(
-        (event: Id, status: String, at: IntervalValue),
-        pattern!(space, [{ ?event @
-            metadata::tag: &KIND_STATUS_ID,
-            board::task: &goal_id,
-            board::status: ?status,
-            metadata::created_at: ?at,
-        }])
-    )
-    .max_by(|left, right| (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0)))
+pub mod note {
+    use super::*;
+
+    attributes! {
+        /// Fresh entropy token making otherwise-identical note occurrences
+        /// distinct while leaving the note entity itself intrinsic and sealed.
+        /// Minted with `trible genid` on 2026-08-08.
+        "7DE97CCF8D5EF7C393763BF2B122472C" as occurrence: inlineencodings::GenId;
+        /// Goal to which this ledger occurrence belongs.
+        "C1EAAA039DA7F486E4A54CC87D42E72C" as of: inlineencodings::GenId;
+        "47351DF00B3DDA96CB305157CD53D781" as body: inlineencodings::Handle<blobencodings::LongString>;
+        /// Opaque exact reference such as `wiki:0123abcd`.
+        "FD59B704D0F1D06AF14102ADCB5F6FF0" as reference: inlineencodings::Handle<blobencodings::LongString>;
+    }
+}
+
+pub mod status {
+    use super::*;
+
+    attributes! {
+        /// Goal whose complete scalar status is captured by this snapshot.
+        "C1EAAA039DA7F486E4A54CC87D42E72C" as of: inlineencodings::GenId;
+        "61C44E0F8A73443ED592A713151E99A4" as value: inlineencodings::ShortString;
+    }
+}
+
+pub mod priority {
+    use super::*;
+
+    attributes! {
+        /// Exact set of priority-edge record ids in a board snapshot.
+        /// Minted with `trible genid` on 2026-08-08.
+        "37E63417D1E6781A0FF0B2A95919A56A" as edge: inlineencodings::GenId;
+        "B88842D9D00361A0F2728C478C79D75C" as higher: inlineencodings::GenId;
+        "18F3446C9E9281A248D370A56395A3F0" as lower: inlineencodings::GenId;
+    }
 }

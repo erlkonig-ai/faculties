@@ -16,6 +16,14 @@ All notable changes to this project will be documented in this file.
   commit-last staging seam directly, so a caller can durably place dependencies
   and unsigned cache artifacts before consuming the staged value to publish
   the exact signed root; abandoning it publishes no membership.
+- **Compass state is collection-native and fork-visible.** Goals keep stable
+  anchors with one immutable intrinsic genesis, notes are additive occurrence
+  records, and status plus board priority are intrinsic snapshot DAGs. Reads
+  never arbitrate by time or iteration order: equal live heads remain distinct
+  provenance but resolve as semantic agreement, while genuinely different
+  values stay visibly forked until a successor names every head. Exact catalog
+  validation rejects foreign facts, malformed records, missing attachments,
+  cycles, and invalid priority orders before publication.
 - **Body persistence is collection-native.** Deliberate captures and intents
   now use one stable extrinsic scope and durable signer instead of a branch,
   repository workspace, and ephemeral identity. Publications carry every

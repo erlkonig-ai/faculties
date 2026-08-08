@@ -33,6 +33,7 @@ pub fn model_dir() -> std::path::PathBuf {
 }
 
 pub mod collection_access;
+pub mod compass;
 pub mod discord;
 pub mod files;
 pub mod memory_cover;

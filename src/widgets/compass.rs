@@ -1,15 +1,17 @@
 //! Full-featured GORBIE-embeddable compass (kanban) board widget.
 //!
-//! Renders goals from a triblespace pile's `compass` branch grouped into
-//! kanban columns by their latest status (default: todo / doing / blocked /
-//! done). The widget holds only UI + cached-query state; the host is
-//! responsible for loading the compass dataset and passing its immutable
+//! Renders goals from the Compass collection grouped into kanban columns by
+//! their resolved status (default: todo / doing / blocked / done). Forked,
+//! missing, and invalid state is rendered explicitly and is never settled by
+//! timestamp or iteration order. The widget holds only UI + cached-query
+//! state; the host is responsible for loading the compass dataset and passing its immutable
 //! [`DatasetView`](crate::widgets::DatasetView) at render time.
 //!
 //! Interactive display features:
 //!
 //! - Parent/child indentation with a collapse toggle per subtree
-//! - Priority arrows: `board::higher` / `board::lower` edges rendered as
+//! - Priority arrows rendered from the unique board snapshot plus immutable
+//!   parent edges
 //!   `> over <id_str>` badges on the card
 //! - Tag chips colored via `GORBIE::themes::colorhash::ral_categorical`.
 //!
@@ -19,29 +21,17 @@
 //! board.render(ctx, compass_ws);
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 use GORBIE::widgets::ChoiceToggle;
 
-use crate::schemas::compass::{
-    board as compass, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
-    KIND_STATUS_ID,
-};
+use crate::compass::{self, PriorityResolution, StatusResolution};
+use crate::schemas::compass::DEFAULT_STATUSES;
 use crate::widgets::storage::{DatasetRevision, DatasetView};
-
-/// Handle to a long-string blob (titles, notes).
-type TextHandle = Inline<Handle<LongString>>;
 
 // ── ID / time helpers ────────────────────────────────────────────────
 
@@ -49,14 +39,23 @@ fn fmt_id_full(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn now_tai_ns() -> i128 {
+fn now_tai_ns() -> Option<i128> {
     hifitime::Epoch::now()
         .map(|e| e.to_tai_duration().total_nanoseconds())
-        .unwrap_or(0)
+        .ok()
 }
 
-fn format_age(now_key: i128, maybe_key: Option<i128>) -> String {
-    let Some(key) = maybe_key else {
+fn interval_key(value: compass::IntervalValue) -> Option<i128> {
+    let (lower, _): (i128, i128) = value.try_from_inline().ok()?;
+    Some(lower)
+}
+
+fn status_caption(status: &str) -> &str {
+    status.strip_prefix('!').unwrap_or(status)
+}
+
+fn format_age(now_key: Option<i128>, maybe_key: Option<i128>) -> String {
+    let (Some(now_key), Some(key)) = (now_key, maybe_key) else {
         return "-".to_string();
     };
     let delta_ns = now_key.saturating_sub(key);
@@ -133,6 +132,9 @@ fn status_color(status: &str) -> egui::Color32 {
         "doing" => color_doing(),
         "blocked" => color_blocked(),
         "done" => color_done(),
+        "!forked" => egui::Color32::from_rgb(0xb0, 0x55, 0xc9),
+        "!invalid" => color_blocked(),
+        "!missing" => egui::Color32::from_rgb(0x80, 0x80, 0x80),
         // Mid-grey fallback — legible on both light and dark panels
         // without needing a `&Ui` argument.
         _ => egui::Color32::from_rgb(0x80, 0x80, 0x80),
@@ -166,6 +168,7 @@ struct NoteRow {
 struct CompassLive {
     space: TribleSet,
     cached_revision: DatasetRevision,
+    catalog_error: Option<String>,
 }
 
 impl CompassLive {
@@ -173,39 +176,22 @@ impl CompassLive {
         Self {
             space: dataset.facts.clone(),
             cached_revision: dataset.revision,
+            catalog_error: compass::validate_catalog(dataset.reader, dataset.facts)
+                .err()
+                .map(|error| format!("{error:#}")),
         }
-    }
-
-    fn text(&self, dataset: DatasetView<'_>, h: TextHandle) -> String {
-        dataset
-            .reader
-            .get::<View<str>, LongString>(h)
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
-            .unwrap_or_default()
     }
 
     /// Notes on a specific goal, sorted newest-first.
     fn notes_for(&self, dataset: DatasetView<'_>, goal_id: Id) -> Vec<NoteRow> {
-        let raw: Vec<(TextHandle, (i128, i128))> = find!(
-            (note_handle: TextHandle, ts: (i128, i128)),
-            pattern!(&self.space, [{
-                _?event @
-                metadata::tag: &KIND_NOTE_ID,
-                compass::task: &goal_id,
-                compass::note: ?note_handle,
-                metadata::created_at: ?ts,
-            }])
-        )
-        .collect();
-
-        let mut notes: Vec<NoteRow> = raw
+        let mut notes: Vec<NoteRow> = compass::notes_for_goal(&self.space, goal_id)
+            .unwrap_or_default()
             .into_iter()
-            .map(|(h, ts)| NoteRow {
-                at: Some(ts.0),
-                body: self.text(dataset, h),
+            .filter_map(|note| {
+                Some(NoteRow {
+                    at: interval_key(note.created_at),
+                    body: compass::read_text(dataset.reader, note.body).ok()?,
+                })
             })
             .collect();
         notes.sort_by(|a, b| b.at.cmp(&a.at));
@@ -228,16 +214,10 @@ fn order_rows(lane_ids: Vec<Id>, space: &TribleSet) -> Vec<(Id, usize)> {
     // Iterate the lane in caller-given order so that pushing into
     // `children` and the root set preserves that ordering.
     for &gid in &lane_ids {
-        let parent = find!(
-            (parent: Id),
-            pattern!(space, [{
-                gid @
-                metadata::tag: &KIND_GOAL_ID,
-                compass::parent: ?parent,
-            }])
-        )
-        .next()
-        .map(|(p,)| p);
+        let parent = compass::genesis_for_goal(space, gid)
+            .ok()
+            .flatten()
+            .and_then(|genesis| genesis.parent);
         if let Some(parent) = parent {
             if ids.contains(&parent) {
                 children.entry(parent).or_default().push(gid);
@@ -294,35 +274,173 @@ fn goal_matches_search(
     if fmt_id_full(goal_id).contains(needle) {
         return true;
     }
-    if let Some((handle,)) = find!(
-        (t: TextHandle),
-        pattern!(space, [{
-            goal_id @
-            metadata::tag: &KIND_GOAL_ID,
-            compass::title: ?t,
-        }])
-    )
-    .next()
-    {
-        if let Ok(v) = dataset.reader.get::<View<str>, LongString>(handle) {
-            if v.as_ref().to_lowercase().contains(needle) {
-                return true;
-            }
+    if let Ok(Some(genesis)) = compass::genesis_for_goal(space, goal_id) {
+        if compass::read_text(dataset.reader, genesis.title)
+            .is_ok_and(|title| title.to_lowercase().contains(needle))
+        {
+            return true;
         }
-    }
-    for (tag,) in find!(
-        (tag: String),
-        pattern!(space, [{
-            goal_id @
-            metadata::tag: &KIND_GOAL_ID,
-            compass::tag: ?tag,
-        }])
-    ) {
-        if tag.to_lowercase().contains(needle) {
+        if compass::tag_labels(dataset.reader, space, &genesis.tags)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|tag| tag.to_lowercase().contains(needle))
+        {
             return true;
         }
     }
     false
+}
+
+/// Project a typed status state into a lane label without choosing a winner.
+/// The timestamp only controls visual age ordering and never state semantics.
+fn status_projection(
+    resolution: StatusResolution,
+    genesis_at: Option<i128>,
+) -> (String, Option<i128>, Option<String>) {
+    match resolution {
+        StatusResolution::Unique(snapshot) => (
+            snapshot.value,
+            interval_key(snapshot.created_at).or(genesis_at),
+            None,
+        ),
+        StatusResolution::Agreed(snapshots) => {
+            let value = snapshots
+                .first()
+                .expect("agreed status has at least two heads")
+                .value
+                .clone();
+            let sort_at = snapshots
+                .iter()
+                .filter_map(|snapshot| interval_key(snapshot.created_at))
+                .max()
+                .or(genesis_at);
+            let heads = snapshots
+                .iter()
+                .map(|snapshot| fmt_id_full(snapshot.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                value,
+                sort_at,
+                Some(format!(
+                    "STATUS AGREEMENT · {} concurrent heads · {heads}",
+                    snapshots.len()
+                )),
+            )
+        }
+        StatusResolution::Forked(snapshots) => {
+            let sort_at = snapshots
+                .iter()
+                .filter_map(|snapshot| interval_key(snapshot.created_at))
+                .max()
+                .or(genesis_at);
+            let heads = snapshots
+                .iter()
+                .map(|snapshot| format!("{}={}", fmt_id_full(snapshot.id), snapshot.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                "!forked".to_owned(),
+                sort_at,
+                Some(format!("STATUS FORK · {heads}")),
+            )
+        }
+        StatusResolution::Missing => (
+            "!missing".to_owned(),
+            genesis_at,
+            Some("STATUS MISSING · no snapshot head".to_owned()),
+        ),
+        StatusResolution::Invalid(reason) => (
+            "!invalid".to_owned(),
+            genesis_at,
+            Some(format!("STATUS INVALID · {reason}")),
+        ),
+    }
+}
+
+/// Use explicit priority edges only when the board track has one semantic edge
+/// set. Parent edges remain visible because they are immutable goal facts.
+type PriorityNotice = (&'static str, String, egui::Color32);
+
+fn priority_projection(space: &TribleSet) -> (BTreeSet<(Id, Id)>, Option<PriorityNotice>) {
+    let mut edges = match compass::parent_edges(space) {
+        Ok(edges) => edges,
+        Err(error) => {
+            return (
+                BTreeSet::new(),
+                Some((
+                    "PRIORITY INVALID",
+                    format!("parent hierarchy: {error:#}"),
+                    color_blocked(),
+                )),
+            );
+        }
+    };
+    match compass::priority_resolution(space) {
+        PriorityResolution::Unique(snapshot) => {
+            edges.extend(snapshot.edges);
+            (edges, None)
+        }
+        PriorityResolution::Agreed(snapshots) => {
+            edges.extend(
+                snapshots
+                    .first()
+                    .expect("agreed priority has at least two heads")
+                    .edges
+                    .iter()
+                    .copied(),
+            );
+            let heads = snapshots
+                .iter()
+                .map(|snapshot| fmt_id_full(snapshot.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                edges,
+                Some((
+                    "PRIORITY AGREEMENT",
+                    format!("{} concurrent heads · {heads}", snapshots.len()),
+                    color_done(),
+                )),
+            )
+        }
+        PriorityResolution::Missing => (
+            edges,
+            (!compass::goal_anchors(space).is_empty()).then_some((
+                "PRIORITY MISSING",
+                "no board snapshot head".to_owned(),
+                egui::Color32::from_rgb(0x80, 0x80, 0x80),
+            )),
+        ),
+        PriorityResolution::Forked(snapshots) => {
+            let heads = snapshots
+                .iter()
+                .map(|snapshot| {
+                    let values = snapshot
+                        .edges
+                        .iter()
+                        .map(|(higher, lower)| {
+                            format!("{}>{}", fmt_id_full(*higher), fmt_id_full(*lower))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{}=[{}]", fmt_id_full(snapshot.id), values)
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            (
+                edges,
+                Some((
+                    "PRIORITY FORK",
+                    format!("explicit edges withheld until reconciliation · {heads}"),
+                    egui::Color32::from_rgb(0xb0, 0x55, 0xc9),
+                )),
+            )
+        }
+        PriorityResolution::Invalid(reason) => {
+            (edges, Some(("PRIORITY INVALID", reason, color_blocked())))
+        }
+    }
 }
 
 /// Shape the input goal set into a render stream according to the
@@ -330,7 +448,7 @@ fn goal_matches_search(
 /// `RenderItem`s and dispatches on the variant.
 fn produce_items(
     axis: SortAxis,
-    goals: Vec<(Id, String, i128)>,
+    goals: Vec<(Id, String, Option<i128>)>,
     space: &TribleSet,
 ) -> Vec<RenderItem> {
     let mut sorted = goals;
@@ -344,7 +462,7 @@ fn produce_items(
             // alphabetical. Within each lane keep the global sort_at
             // order, then run the parent forest so children sit under
             // visible parents.
-            let mut by_status: BTreeMap<String, Vec<(Id, i128)>> = BTreeMap::new();
+            let mut by_status: BTreeMap<String, Vec<(Id, Option<i128>)>> = BTreeMap::new();
             for (id, status, sort_at) in sorted {
                 by_status.entry(status).or_default().push((id, sort_at));
             }
@@ -389,7 +507,7 @@ fn produce_items(
                     let status = id_status
                         .get(&id)
                         .cloned()
-                        .unwrap_or_else(|| "todo".to_string());
+                        .expect("parent ordering only returns supplied goal ids");
                     RenderItem { id, status, depth }
                 })
                 .collect()
@@ -472,46 +590,24 @@ impl CompassBoard {
         }
         let live = self.live.as_ref().expect("refreshed above");
 
-        // Top-level query: latest status per goal, then enumerate every
-        // goal as (id, effective_status, sort_at). No row struct — the
-        // renderer reads what it needs from the tribleset inline.
+        // Resolve every goal's typed status track. A fork becomes its own
+        // visible lane and carries every head/value into the card detail.
         let space = &live.space;
-        let mut latest_status: HashMap<Id, (String, i128)> = HashMap::new();
-        for (gid, status, ts) in find!(
-            (gid: Id, status: String, ts: (i128, i128)),
-            pattern!(space, [{
-                _?event @
-                metadata::tag: &KIND_STATUS_ID,
-                compass::task: ?gid,
-                compass::status: ?status,
-                metadata::created_at: ?ts,
-            }])
-        ) {
-            match latest_status.get_mut(&gid) {
-                Some(slot) if slot.1 < ts.0 => *slot = (status, ts.0),
-                Some(_) => {}
-                None => {
-                    latest_status.insert(gid, (status, ts.0));
-                }
+        let mut goals: Vec<(Id, String, Option<i128>)> = Vec::new();
+        let mut status_details: HashMap<Id, String> = HashMap::new();
+        for gid in compass::goal_anchors(space) {
+            let genesis_at = compass::genesis_for_goal(space, gid)
+                .ok()
+                .flatten()
+                .and_then(|genesis| interval_key(genesis.created_at));
+            let (status, sort_at, detail) =
+                status_projection(compass::status_resolution(space, gid), genesis_at);
+            if let Some(detail) = detail {
+                status_details.insert(gid, detail);
             }
-        }
-
-        let mut goals: Vec<(Id, String, i128)> = Vec::new();
-        for (gid, _t, created) in find!(
-            (gid: Id, _t: TextHandle, created: (i128, i128)),
-            pattern!(space, [{
-                ?gid @
-                metadata::tag: &KIND_GOAL_ID,
-                compass::title: ?_t,
-                metadata::created_at: ?created,
-            }])
-        ) {
-            let (status, sort_at) = match latest_status.get(&gid) {
-                Some((s, t)) => (s.clone(), *t),
-                None => ("todo".to_string(), created.0),
-            };
             goals.push((gid, status, sort_at));
         }
+        let (priority_edges, priority_warning) = priority_projection(space);
 
         // Per-status counts for the section header chips.
         let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -591,7 +687,7 @@ impl CompassBoard {
                     ui.painter()
                         .circle_filled(dot.center(), 3.5, status_color(status));
                     ui.label(
-                        egui::RichText::new(status.to_uppercase())
+                        egui::RichText::new(status_caption(status).to_uppercase())
                             .monospace()
                             .strong()
                             .small(),
@@ -604,6 +700,13 @@ impl CompassBoard {
                     );
                 }
             });
+
+            if let Some(error) = live.catalog_error.as_deref() {
+                render_semantic_banner(ctx.ui_mut(), "CATALOG INVALID", error, color_blocked());
+            }
+            if let Some((headline, detail, color)) = priority_warning.as_ref() {
+                render_semantic_banner(ctx.ui_mut(), headline, detail, *color);
+            }
 
             // Toolbar row: axis selector (segmented selector with a lit
             // active segment) + global +ADD button. Status grouping is
@@ -668,9 +771,11 @@ impl CompassBoard {
                             cell_ctx.ui_mut(),
                             id,
                             status_str,
+                            status_details.get(&id).map(String::as_str),
                             depth,
                             space,
                             dataset,
+                            &priority_edges,
                             expanded_goal,
                             expanded_notes.as_ref(),
                             collapsed,
@@ -699,16 +804,10 @@ impl CompassBoard {
                 let base = status_color(&item.status);
                 let edge_color =
                     egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 200);
-                let higher_id = item.id;
-                for (lower,) in find!(
-                    (lower: Id),
-                    pattern!(space, [{
-                        _?event @
-                        metadata::tag: &KIND_PRIORITIZE_ID,
-                        compass::higher: higher_id,
-                        compass::lower: ?lower,
-                    }])
-                ) {
+                for &(_, lower) in priority_edges
+                    .iter()
+                    .filter(|(higher, _)| *higher == item.id)
+                {
                     let Some(to_rect) = card_rects.get(&lower) else {
                         continue;
                     };
@@ -726,9 +825,11 @@ fn render_goal_card(
     ui: &mut egui::Ui,
     goal_id: Id,
     status: &str,
+    status_detail: Option<&str>,
     depth: usize,
     space: &TribleSet,
     dataset: DatasetView<'_>,
+    priority_edges: &BTreeSet<(Id, Id)>,
     expanded_goal: &mut Option<Id>,
     expanded_notes: Option<&(Id, Vec<NoteRow>)>,
     collapsed: &mut HashSet<Id>,
@@ -745,6 +846,17 @@ fn render_goal_card(
         (dep_lines as f32 * DEP_LINE_STEP) + DEP_LINE_BASE
     };
     let id_str = fmt_id_full(goal_id);
+    let genesis = compass::genesis_for_goal(space, goal_id).ok().flatten();
+    let title = genesis
+        .as_ref()
+        .and_then(|genesis| compass::read_text(dataset.reader, genesis.title).ok());
+    let tags = genesis
+        .as_ref()
+        .and_then(|genesis| compass::tag_labels(dataset.reader, space, &genesis.tags).ok())
+        .unwrap_or_default();
+    let note_count = compass::notes_for_goal(space, goal_id)
+        .map(|notes| notes.len())
+        .unwrap_or_default();
 
     let is_expanded = *expanded_goal == Some(goal_id);
     let is_collapsed = collapsed.contains(&goal_id);
@@ -794,43 +906,32 @@ fn render_goal_card(
                     }
                 }
 
-                if let Some((handle,)) = find!(
-                    (t: TextHandle),
-                    pattern!(space, [{
-                        goal_id @
-                        metadata::tag: &KIND_GOAL_ID,
-                        compass::title: ?t,
-                    }])
-                )
-                .next()
-                {
-                    if let Ok(v) = dataset.reader.get::<View<str>, LongString>(handle) {
-                        let base = egui::TextFormat {
-                            font_id: egui::TextStyle::Monospace.resolve(ui.style()),
-                            color: ui.visuals().text_color(),
-                            ..Default::default()
-                        };
-                        let job = GORBIE::search::highlight_match(v.as_ref(), search_needle, base);
-                        ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
-                    }
+                if let Some(title) = title.as_deref() {
+                    let base = egui::TextFormat {
+                        font_id: egui::TextStyle::Monospace.resolve(ui.style()),
+                        color: ui.visuals().text_color(),
+                        ..Default::default()
+                    };
+                    let job = GORBIE::search::highlight_match(title, search_needle, base);
+                    ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
                 }
             });
+
+            if let Some(detail) = status_detail {
+                ui.label(
+                    egui::RichText::new(detail)
+                        .monospace()
+                        .small()
+                        .color(status_color(status)),
+                );
+            }
 
             // Row 2: id prefix · optional parent pointer (left) · note
             // count chip (right). Note count lives on the right edge so
             // it reads like a metadata badge, not a continuation of the
             // id string.
             ui.horizontal(|ui| {
-                let parent_id = find!(
-                    (parent: Id),
-                    pattern!(space, [{
-                        goal_id @
-                        metadata::tag: &KIND_GOAL_ID,
-                        compass::parent: ?parent,
-                    }])
-                )
-                .next()
-                .map(|(p,)| p);
+                let parent_id = genesis.as_ref().and_then(|genesis| genesis.parent);
                 let id_text = match parent_id {
                     Some(parent) => format!("^{} {}", fmt_id_full(parent), id_str),
                     None => id_str.clone(),
@@ -841,15 +942,6 @@ fn render_goal_card(
                         .small()
                         .color(color_muted(ui)),
                 );
-                let note_count = find!(
-                    (event: Id),
-                    pattern!(space, [{
-                        ?event @
-                        metadata::tag: &KIND_NOTE_ID,
-                        compass::task: goal_id,
-                    }])
-                )
-                .count();
                 if note_count > 0 {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         render_chip(ui, &format!("{note_count}n"), color_muted(ui));
@@ -864,41 +956,23 @@ fn render_goal_card(
             // queries are empty it's a near-zero-height no-op.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                for (lower,) in find!(
-                    (lower: Id),
-                    pattern!(space, [{
-                        _?event @
-                        metadata::tag: &KIND_PRIORITIZE_ID,
-                        compass::higher: goal_id,
-                        compass::lower: ?lower,
-                    }])
-                ) {
-                    let target_label = find!(
-                        (t: TextHandle),
-                        pattern!(space, [{
-                            lower @
-                            metadata::tag: &KIND_GOAL_ID,
-                            compass::title: ?t,
-                        }])
-                    )
-                    .next()
-                    .and_then(|(h,)| dataset.reader.get::<View<str>, LongString>(h).ok())
-                    .map(|v| truncate_inline(v.as_ref(), 16))
-                    .unwrap_or_else(|| fmt_id_full(lower));
+                for &(_, lower) in priority_edges
+                    .iter()
+                    .filter(|(higher, _)| *higher == goal_id)
+                {
+                    let target_label = compass::genesis_for_goal(space, lower)
+                        .ok()
+                        .flatten()
+                        .and_then(|genesis| compass::read_text(dataset.reader, genesis.title).ok())
+                        .map(|title| truncate_inline(&title, 16))
+                        .unwrap_or_else(|| fmt_id_full(lower));
                     render_chip(
                         ui,
                         &format!("▲ {target_label}"),
                         egui::Color32::from_rgb(0x55, 0x3f, 0x7f),
                     );
                 }
-                for (tag,) in find!(
-                    (tag: String),
-                    pattern!(space, [{
-                        goal_id @
-                        metadata::tag: &KIND_GOAL_ID,
-                        compass::tag: ?tag,
-                    }])
-                ) {
+                for tag in &tags {
                     let tag_label = truncate_inline(&tag, 18);
                     render_chip(ui, &format!("#{tag_label}"), tag_color(&tag));
                 }
@@ -1050,7 +1124,11 @@ fn render_goal_card(
     // glyphs (avoids text overflowing into the card body).
     let stripe_font = egui::FontId::monospace(9.0);
     let stripe_text_color = colorhash::text_color_on(stripe_color);
-    let galley = painter.layout_no_wrap(status.to_uppercase(), stripe_font, stripe_text_color);
+    let galley = painter.layout_no_wrap(
+        status_caption(status).to_uppercase(),
+        stripe_font,
+        stripe_text_color,
+    );
     if galley.size().x + 6.0 <= frame_rect.height() {
         // egui's `TextShape::angle` rotates the galley around `pos`.
         // For angle = +π/2 (vertices x ↦ -y, y ↦ x in screen-space),
@@ -1145,6 +1223,27 @@ fn render_empty_state(ui: &mut egui::Ui, glyph: &str, headline: &str, hint: Opti
     ui.add_space(16.0);
 }
 
+fn render_semantic_banner(ui: &mut egui::Ui, headline: &str, detail: &str, color: egui::Color32) {
+    let background = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 36);
+    egui::Frame::NONE
+        .fill(background)
+        .stroke(egui::Stroke::new(1.0, color))
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(headline)
+                    .monospace()
+                    .strong()
+                    .small()
+                    .color(color),
+            );
+            ui.add(
+                egui::Label::new(egui::RichText::new(detail).monospace().small().color(color))
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+            );
+        });
+}
+
 fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
     // Bypass `egui::Frame::show` + `ui.label` here because both pad
     // their content to `ui.spacing.interact_size.y` (default ≈ 18 px),
@@ -1168,4 +1267,109 @@ fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
         galley,
         text_color,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use hifitime::Epoch;
+    use triblespace::prelude::*;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn at(value: i128) -> compass::IntervalValue {
+        let epoch = Epoch::from_unix_seconds(value as f64);
+        (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    #[test]
+    fn status_projection_names_every_fork_head_without_arbitration() {
+        let first = compass::StatusSnapshot {
+            id: id(1),
+            goal: id(9),
+            value: "doing".to_owned(),
+            predecessors: vec![],
+            by: None,
+            created_at: at(10),
+        };
+        let second = compass::StatusSnapshot {
+            id: id(2),
+            goal: id(9),
+            value: "blocked".to_owned(),
+            predecessors: vec![],
+            by: None,
+            created_at: at(20),
+        };
+
+        let (lane, _, detail) =
+            status_projection(StatusResolution::Forked(vec![first, second]), None);
+        let detail = detail.unwrap();
+        assert_eq!(lane, "!forked");
+        assert!(detail.contains("doing"));
+        assert!(detail.contains("blocked"));
+        assert!(detail.contains(&fmt_id_full(id(1))));
+        assert!(detail.contains(&fmt_id_full(id(2))));
+    }
+
+    #[test]
+    fn agreeing_heads_stay_in_their_semantic_status_lane() {
+        let snapshots = [1_u8, 2]
+            .into_iter()
+            .map(|byte| compass::StatusSnapshot {
+                id: id(byte),
+                goal: id(9),
+                value: "doing".to_owned(),
+                predecessors: vec![],
+                by: None,
+                created_at: at(byte.into()),
+            })
+            .collect();
+        let (lane, _, detail) = status_projection(StatusResolution::Agreed(snapshots), None);
+        assert_eq!(lane, "doing");
+        let detail = detail.unwrap();
+        assert!(detail.contains("STATUS AGREEMENT"));
+        assert!(detail.contains(&fmt_id_full(id(1))));
+        assert!(detail.contains(&fmt_id_full(id(2))));
+    }
+
+    #[test]
+    fn priority_projection_withholds_disputed_explicit_edges() {
+        let a = id(11);
+        let b = id(12);
+        let (mut facts, _, _) =
+            compass::goal_fragment(a, "A", vec![], None, "todo", None, at(1)).unwrap();
+        facts += compass::goal_fragment(b, "B", vec![], None, "todo", None, at(1))
+            .unwrap()
+            .0;
+        let (initial, initial_id) = compass::priority_snapshot_fragment([], &[]).unwrap();
+        facts += initial;
+        let (first, first_id) =
+            compass::priority_snapshot_fragment([(a, b)], &[initial_id]).unwrap();
+        let (second, second_id) =
+            compass::priority_snapshot_fragment([(b, a)], &[initial_id]).unwrap();
+        facts += first;
+        facts += second;
+
+        let (edges, warning) = priority_projection(facts.facts());
+        assert!(edges.is_empty());
+        let (headline, warning, _) = warning.unwrap();
+        assert_eq!(headline, "PRIORITY FORK");
+        assert!(warning.contains(&format!("{}>{}", fmt_id_full(a), fmt_id_full(b))));
+        assert!(warning.contains(&format!("{}>{}", fmt_id_full(b), fmt_id_full(a))));
+
+        facts += compass::priority_snapshot_fragment([(a, b)], &[first_id])
+            .unwrap()
+            .0;
+        facts += compass::priority_snapshot_fragment([(a, b)], &[second_id])
+            .unwrap()
+            .0;
+        let (edges, notice) = priority_projection(facts.facts());
+        assert_eq!(edges, BTreeSet::from([(a, b)]));
+        let (headline, detail, _) = notice.unwrap();
+        assert_eq!(headline, "PRIORITY AGREEMENT");
+        assert!(detail.contains("2 concurrent heads"));
+    }
 }
