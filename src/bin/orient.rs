@@ -1669,7 +1669,7 @@ mod tests {
 
         let mut account_fragment =
             mail::credential_fragment(credential, b"orient-test", "secret").unwrap();
-        account_fragment += mail::account_config_fragment(
+        let (config_fragment, config) = mail::account_config_fragment(
             account,
             mail::AccountConfigInput {
                 address: "me@example.com".to_owned(),
@@ -1682,12 +1682,13 @@ mod tests {
                 predecessors: Vec::new(),
             },
         )
-        .unwrap()
-        .0;
+        .unwrap();
+        account_fragment += config_fragment;
         fixture.publish(faculties::schemas::mail::DEFAULT_SCOPE_ID, account_fragment);
 
         let publication = mail::pop_publication(
             account,
+            config,
             "uid-1",
             b"From: Sender <sender@example.com>\r\nTo: me@example.com\r\nMessage-ID: <orient-test@example.com>\r\nDate: Thu, 01 Jan 1970 00:00:01 +0000\r\nSubject: Hello\r\n\r\nbody\r\n",
         )

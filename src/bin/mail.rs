@@ -547,7 +547,15 @@ fn cmd_reply(storage: &Storage<'_>, args: ReplyArgs) -> Result<()> {
         format!("Re: {}", parent.subject)
     };
     let mut references = parent.references;
-    references.push(wire_id);
+    let in_reply_to = if parent.message_id.is_some() {
+        references.push(wire_id);
+        vec![wire_id]
+    } else {
+        // A digest-only parent did not claim an RFC Message-ID. It is a valid
+        // local WireMessage identity, but cannot honestly appear in a remote
+        // In-Reply-To or References header.
+        Vec::new()
+    };
     create_draft(
         storage,
         &views,
@@ -558,7 +566,7 @@ fn cmd_reply(storage: &Storage<'_>, args: ReplyArgs) -> Result<()> {
         subject,
         faculties::text_arg(&args.body, "reply body")?,
         &[],
-        vec![wire_id],
+        in_reply_to,
         references,
     )
 }
@@ -811,7 +819,10 @@ fn cmd_show(storage: &Storage<'_>, selector: &str) -> Result<()> {
     for id in projections {
         let view = mail::projection_view(&views.mail.reader, &views.mail.facts, id)?;
         println!("Wire: {}", fmt_id(view.wire));
-        println!("Message-ID: {}", view.message_id);
+        println!(
+            "Message-ID: {}",
+            view.message_id.as_deref().unwrap_or("(not claimed)")
+        );
         println!("Source: {}", fmt_id(view.source));
         println!("From: {}", view.from.unwrap_or_default());
         println!("To: {}", view.to.join(", "));
@@ -948,7 +959,7 @@ fn cmd_fetch(storage: &Storage<'_>) -> Result<()> {
             mail_pop::connect_implicit_tls(host, port, &account.username, &account.password)
                 .with_context(|| format!("connect POP account {}", account.address))?;
         let mut fetched = 0usize;
-        mail::drain_pop(session, account.anchor, |publication| {
+        mail::drain_pop(session, account.anchor, account.config, |publication| {
             publish_pop_publication_with(
                 publication,
                 storage.scopes,
@@ -1051,6 +1062,7 @@ mod tests {
         pile: PathBuf,
         key: PathBuf,
         account: Id,
+        config: Id,
     }
 
     impl Fixture {
@@ -1074,7 +1086,7 @@ mod tests {
                 credential::of: &credential_id,
                 credential::r#box: box_handle,
             };
-            fragment += mail::account_config_fragment(
+            let (config_fragment, config) = mail::account_config_fragment(
                 account,
                 AccountConfigInput {
                     address: "me@example.test".into(),
@@ -1087,8 +1099,8 @@ mod tests {
                     predecessors: Vec::new(),
                 },
             )
-            .unwrap()
-            .0;
+            .unwrap();
+            fragment += config_fragment;
             collection_access::publish_fragment(
                 &pile,
                 Some(&key),
@@ -1103,6 +1115,7 @@ mod tests {
                 pile,
                 key,
                 account,
+                config,
             };
             fixture.storage().views().unwrap();
             fixture
@@ -1237,17 +1250,63 @@ mod tests {
     }
 
     #[test]
+    fn reply_to_digest_only_wire_omits_remote_thread_headers() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let publication = mail::pop_publication(
+            fixture.account,
+            fixture.config,
+            "no-message-id",
+            b"From: Sender <sender@example.test>\r\nTo: me@example.test\r\nSubject: No remote identity\r\n\r\nbody",
+        )
+        .unwrap();
+        let wire = publication.wire;
+        publish_pop_publication_with(
+            &publication,
+            storage.scopes,
+            || storage.views(),
+            |scope, fragment, description| storage.publish(scope, fragment, description),
+        )
+        .unwrap();
+
+        cmd_reply(
+            &storage,
+            ReplyArgs {
+                message: format!("{wire:x}"),
+                account: format!("{:x}", fixture.account),
+                body: "reply without invented Message-ID".into(),
+            },
+        )
+        .unwrap();
+
+        let views = storage.views().unwrap();
+        let drafts: Vec<Id> = find!(
+            draft: Id,
+            pattern!(&views.mail.facts, [{ ?draft @ metadata::tag: &mail_schema::KIND_DRAFT_INTENT }])
+        )
+        .collect();
+        assert_eq!(drafts.len(), 1);
+        let draft = mail::draft_value(&views.mail.facts, drafts[0]).unwrap();
+        assert!(draft.in_reply_to.is_empty());
+        assert!(draft.references.is_empty());
+    }
+
+    #[test]
     fn pop_composition_is_files_then_mail_then_dele_then_quit() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let bytes = raw("ordered@example.test");
-        let expected = mail::pop_publication(fixture.account, "uid-1", &bytes).unwrap();
+        let expected =
+            mail::pop_publication(fixture.account, fixture.config, "uid-1", &bytes).unwrap();
         let state = Rc::new(RefCell::new(PopState::default()));
         let transaction = fake_pop(state.clone(), vec![(1, "uid-1", bytes)]);
 
-        mail::drain_pop(transaction, fixture.account, |publication| {
-            publish_recording(&storage, &state, publication, None)
-        })
+        mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| publish_recording(&storage, &state, publication, None),
+        )
         .unwrap();
 
         assert_eq!(
@@ -1271,27 +1330,34 @@ mod tests {
         let state = Rc::new(RefCell::new(PopState::default()));
         let bytes = raw("files-fail@example.test");
         let transaction = fake_pop(state.clone(), vec![(1, "uid-files", bytes)]);
-        assert!(
-            mail::drain_pop(transaction, fixture.account, |publication| {
+        assert!(mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| {
                 publish_recording(&storage, &state, publication, Some(storage.scopes.files))
-            })
-            .is_err()
-        );
+            }
+        )
+        .is_err());
         assert_eq!(
             state.borrow().events,
             ["uidl", "retr:1", "files", "disconnect"]
         );
 
         let bytes = raw("mail-fail@example.test");
-        let expected = mail::pop_publication(fixture.account, "uid-mail", &bytes).unwrap();
+        let expected =
+            mail::pop_publication(fixture.account, fixture.config, "uid-mail", &bytes).unwrap();
         let state = Rc::new(RefCell::new(PopState::default()));
         let transaction = fake_pop(state.clone(), vec![(2, "uid-mail", bytes.clone())]);
-        assert!(
-            mail::drain_pop(transaction, fixture.account, |publication| {
+        assert!(mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| {
                 publish_recording(&storage, &state, publication, Some(storage.scopes.mail))
-            })
-            .is_err()
-        );
+            }
+        )
+        .is_err());
         assert_eq!(
             state.borrow().events,
             ["uidl", "retr:2", "files", "mail", "disconnect"]
@@ -1305,9 +1371,12 @@ mod tests {
 
         let state = Rc::new(RefCell::new(PopState::default()));
         let transaction = fake_pop(state.clone(), vec![(2, "uid-mail", bytes)]);
-        mail::drain_pop(transaction, fixture.account, |publication| {
-            publish_recording(&storage, &state, publication, None)
-        })
+        mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| publish_recording(&storage, &state, publication, None),
+        )
         .unwrap();
         assert_eq!(
             state.borrow().events,
@@ -1327,14 +1396,18 @@ mod tests {
                 "dele-fail@example.test"
             });
             let uidl = if fail_quit { "uid-quit" } else { "uid-dele" };
-            let expected = mail::pop_publication(fixture.account, uidl, &bytes).unwrap();
+            let expected =
+                mail::pop_publication(fixture.account, fixture.config, uidl, &bytes).unwrap();
             let state = Rc::new(RefCell::new(PopState::default()));
             let mut transaction = fake_pop(state.clone(), vec![(1, uidl, bytes)]);
             transaction.fail_dele = (!fail_quit).then_some(1);
             transaction.fail_quit = fail_quit;
-            let error = mail::drain_pop(transaction, fixture.account, |publication| {
-                publish_recording(&storage, &state, publication, None)
-            })
+            let error = mail::drain_pop(
+                transaction,
+                fixture.account,
+                fixture.config,
+                |publication| publish_recording(&storage, &state, publication, None),
+            )
             .unwrap_err();
             let views = storage.views().unwrap();
             assert!(fragment_is_materialized(&views.mail.facts, &expected.mail));
@@ -1368,6 +1441,7 @@ mod tests {
         mail::drain_pop(
             fake_pop(state.clone(), Vec::new()),
             id(72),
+            id(73),
             |_| unreachable!(),
         )
         .unwrap();
@@ -1384,14 +1458,19 @@ mod tests {
             ],
         );
         let mut seen = 0usize;
-        let error = mail::drain_pop(transaction, fixture.account, |publication| {
-            seen += 1;
-            if seen == 2 {
-                state.borrow_mut().events.push("publish-2-failed".into());
-                bail!("scripted second-message failure");
-            }
-            publish_recording(&storage, &state, publication, None)
-        })
+        let error = mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| {
+                seen += 1;
+                if seen == 2 {
+                    state.borrow_mut().events.push("publish-2-failed".into());
+                    bail!("scripted second-message failure");
+                }
+                publish_recording(&storage, &state, publication, None)
+            },
+        )
         .unwrap_err();
         assert!(format!("{error:#}").contains("second-message"));
         assert_eq!(state.borrow().marked, [1]);

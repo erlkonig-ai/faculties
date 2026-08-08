@@ -45,7 +45,10 @@ pub mod account {
         "B30A3C09EDE7FD84FBC92BD62E2B27B3" as username: inlineencodings::Handle<blobencodings::LongString>;
         /// Stable random authored credential anchor. Randomized ciphertext
         /// lives on separate envelope values and therefore cannot perturb the
-        /// logical full-state configuration id or disclose a password oracle.
+        /// logical full-state configuration id or make ciphertext equality a
+        /// plaintext-equality signal. Each envelope is nevertheless an offline
+        /// passphrase verifier; work factor and passphrase entropy mitigate
+        /// that inherent password-wrapped-secret risk.
         "2902B62BBC51167E42689D95ED417F87" as credential: inlineencodings::GenId;
         "486EFCC641A92842DACE180388FE76DA" as enabled: inlineencodings::Boolean;
     }
@@ -62,7 +65,10 @@ pub mod credential {
 pub mod wire {
     use super::*;
     attributes! {
-        "38F9B28DAE56DB810B2F6866F94E01D8" as message_id: inlineencodings::Handle<blobencodings::LongString>;
+        "38F9B28DAE56DB810B2F6866F94E01D8" as claimed_message_id: inlineencodings::Handle<blobencodings::LongString>;
+        /// Exact raw-byte digest used only when no Message-ID was claimed.
+        /// Minted with `trible genid` on 2026-08-08.
+        "F6DCFD2B486D1238D202380FDA50CDA0" as raw_digest: inlineencodings::Hash<inlineencodings::Blake3>;
     }
 }
 
@@ -71,6 +77,9 @@ pub mod observation {
     attributes! {
         "206FC56B4BC02505FD27821D5A1E9118" as wire: inlineencodings::GenId;
         "0692F397EFA950488D22EDC72AB24C6F" as account: inlineencodings::GenId;
+        /// Exact immutable AccountConfig used for this maildrop session.
+        /// Minted with `trible genid` on 2026-08-08.
+        "C17C00F2BD0C6DAE9598052A809B21A7" as config: inlineencodings::GenId;
         "9AE9A14BA205663A0B85166D6982DC23" as uidl: inlineencodings::Handle<blobencodings::LongString>;
         "C6AA568EBF7BE4D7E98A74C6472710E6" as raw: inlineencodings::Handle<blobencodings::RawBytes>;
         "BEB35E6ED9637B6FB7EC74C3F604DCBC" as attempt: inlineencodings::GenId;

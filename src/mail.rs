@@ -39,6 +39,7 @@ use crate::schemas::mail::{
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 pub type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
+pub type DigestValue = Inline<inlineencodings::Hash<inlineencodings::Blake3>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type CountValue = Inline<inlineencodings::U256BE>;
 
@@ -96,8 +97,16 @@ pub struct AttachmentData {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WireIdentity {
+    /// An opaque identity explicitly claimed in exactly one Message-ID field.
+    Claimed(String),
+    /// A digest of the exact raw bytes, used only when Message-ID is absent.
+    RawDigest(DigestValue),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedMessage {
-    pub canonical_message_id: String,
+    pub identity: WireIdentity,
     pub from: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -251,7 +260,7 @@ pub struct ProjectionView {
     pub id: Id,
     pub source: Id,
     pub wire: Id,
-    pub message_id: String,
+    pub message_id: Option<String>,
     pub from: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -370,6 +379,13 @@ fn unlock(password: &[u8], lockbox: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Build a stable authored credential anchor and one randomized envelope.
+///
+/// Random salt and nonce prevent ciphertext equality from correlating secrets
+/// or perturbing the authored anchor. They do not remove the inherent offline
+/// passphrase verifier: AEAD authentication lets an attacker test guesses
+/// against a copied envelope. Argon2id and a high-entropy passphrase are the
+/// mitigation. Whether two envelopes carry the same plaintext is known only
+/// after opening them or by trusting the executor which authored them.
 pub fn credential_fragment(anchor: Id, passphrase: &[u8], secret: &str) -> Result<Fragment> {
     let secret = canonical_nonempty(secret, "mail credential")?;
     let mut fragment = Fragment::empty();
@@ -564,16 +580,18 @@ fn canonical_message_id_value(raw: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-/// Canonical opaque Message-ID, or a domain-separated full raw-byte digest.
-pub fn canonical_message_id(parsed: &mailparse::ParsedMail<'_>, raw: &[u8]) -> Result<String> {
+/// Canonical opaque Message-ID claim, or a structurally distinct full
+/// raw-byte digest when that header is absent.
+pub fn canonical_wire_identity(
+    parsed: &mailparse::ParsedMail<'_>,
+    raw: &[u8],
+) -> Result<WireIdentity> {
     let values = header_values(parsed, "Message-ID");
     match values.as_slice() {
-        [] => {
-            let mut hasher = blake3::Hasher::new_derive_key("triblespace.mail.raw-message-id.v1");
-            hasher.update(raw);
-            Ok(format!("raw-blake3:{}", hasher.finalize().to_hex()))
-        }
-        [value] => canonical_message_id_value(value),
+        [] => Ok(WireIdentity::RawDigest(Inline::new(
+            *blake3::hash(raw).as_bytes(),
+        ))),
+        [value] => canonical_message_id_value(value).map(WireIdentity::Claimed),
         _ => bail!("message has multiple Message-ID fields"),
     }
 }
@@ -649,7 +667,7 @@ fn collect_parts(
 /// Parse immutable source bytes without inventing clock or identity evidence.
 pub fn parse_rfc5322(raw: &[u8]) -> Result<ParsedMessage> {
     let parsed = mailparse::parse_mail(raw).context("parse RFC 5322")?;
-    let canonical_message_id = canonical_message_id(&parsed, raw)?;
+    let identity = canonical_wire_identity(&parsed, raw)?;
     let singular = |name: &str| -> Result<Option<String>> {
         let values = header_values(&parsed, name);
         match values.as_slice() {
@@ -675,7 +693,7 @@ pub fn parse_rfc5322(raw: &[u8]) -> Result<ParsedMessage> {
         .iter()
         .any(|value| value.trim_start().to_ascii_lowercase().starts_with("yes"));
     Ok(ParsedMessage {
-        canonical_message_id,
+        identity,
         from: singular("From")?,
         to: header_values(&parsed, "To"),
         cc: header_values(&parsed, "Cc"),
@@ -690,17 +708,25 @@ pub fn parse_rfc5322(raw: &[u8]) -> Result<ParsedMessage> {
     })
 }
 
-fn wire_record(message_id: TextHandle) -> Fragment {
-    entity! { metadata::tag: &KIND_WIRE_MESSAGE, wire::message_id: message_id }
+fn claimed_wire_record(message_id: TextHandle) -> Fragment {
+    entity! { metadata::tag: &KIND_WIRE_MESSAGE, wire::claimed_message_id: message_id }
+}
+
+fn digest_wire_record(digest: DigestValue) -> Fragment {
+    entity! { metadata::tag: &KIND_WIRE_MESSAGE, wire::raw_digest: digest }
+}
+
+fn add_claimed_wire(fragment: &mut Fragment, message_id: &str) -> Result<Id> {
+    let message_id = fragment.put(canonical_message_id_value(message_id)?);
+    let wire = claimed_wire_record(message_id);
+    let id = wire.root().expect("claimed wire message has one root");
+    *fragment += wire;
+    Ok(id)
 }
 
 pub fn wire_id_for(message_id: &str) -> Result<Id> {
-    let message_id = canonical_message_id_value(message_id)?;
-    Ok(
-        entity! { metadata::tag: &KIND_WIRE_MESSAGE, wire::message_id: message_id }
-            .root()
-            .expect("wire message has one intrinsic root"),
-    )
+    let mut fragment = Fragment::empty();
+    add_claimed_wire(&mut fragment, message_id)
 }
 
 fn attachment_occurrence_record(source: Id, ordinal: u64, file: Id) -> Fragment {
@@ -748,29 +774,36 @@ fn projection_record(
 
 fn source_publication(
     account_id: Option<Id>,
+    config_id: Option<Id>,
     uidl: Option<&str>,
     attempt_id: Option<Id>,
     raw: &[u8],
 ) -> Result<SourcePublication> {
     let parsed = parse_rfc5322(raw)?;
     let mut mail_fragment = Fragment::empty();
-    let message_id = mail_fragment.put(parsed.canonical_message_id.clone());
-    let wire_fragment = wire_record(message_id);
-    let wire = wire_fragment.root().expect("wire root");
-    mail_fragment += wire_fragment;
+    let wire = match &parsed.identity {
+        WireIdentity::Claimed(message_id) => add_claimed_wire(&mut mail_fragment, message_id)?,
+        WireIdentity::RawDigest(digest) => {
+            let wire_fragment = digest_wire_record(*digest);
+            let wire = wire_fragment.root().expect("digest wire root");
+            mail_fragment += wire_fragment;
+            wire
+        }
+    };
     let raw_handle: BytesHandle = mail_fragment.put(raw.to_vec());
-    let observation_fragment = match (account_id, uidl, attempt_id) {
-        (Some(account_id), Some(uidl), None) => {
+    let observation_fragment = match (account_id, config_id, uidl, attempt_id) {
+        (Some(account_id), Some(config_id), Some(uidl), None) => {
             let uidl = mail_fragment.put(canonical_nonempty(uidl, "POP UIDL")?);
             entity! {
                 metadata::tag: &KIND_POP_OBSERVATION,
                 observation::wire: &wire,
                 observation::account: &account_id,
+                observation::config: &config_id,
                 observation::uidl: uidl,
                 observation::raw: raw_handle,
             }
         }
-        (None, None, Some(attempt_id)) => entity! {
+        (None, None, None, Some(attempt_id)) => entity! {
             metadata::tag: &KIND_OUTGOING_OBSERVATION,
             observation::wire: &wire,
             observation::attempt: &attempt_id,
@@ -814,16 +847,14 @@ fn source_publication(
         .collect();
     let subject = mail_fragment.put(parsed.subject);
     let body = mail_fragment.put(parsed.body);
-    let in_reply_to = parsed
-        .in_reply_to
-        .iter()
-        .map(|value| wire_id_for(value))
-        .collect::<Result<Vec<_>>>()?;
-    let references = parsed
-        .references
-        .iter()
-        .map(|value| wire_id_for(value))
-        .collect::<Result<Vec<_>>>()?;
+    let mut in_reply_to = Vec::new();
+    for value in &parsed.in_reply_to {
+        in_reply_to.push(add_claimed_wire(&mut mail_fragment, value)?);
+    }
+    let mut references = Vec::new();
+    for value in &parsed.references {
+        references.push(add_claimed_wire(&mut mail_fragment, value)?);
+    }
     let projection_fragment = projection_record(
         observation,
         from,
@@ -849,12 +880,17 @@ fn source_publication(
     })
 }
 
-pub fn pop_publication(account: Id, uidl: &str, raw: &[u8]) -> Result<SourcePublication> {
-    source_publication(Some(account), Some(uidl), None, raw)
+pub fn pop_publication(
+    account: Id,
+    config: Id,
+    uidl: &str,
+    raw: &[u8],
+) -> Result<SourcePublication> {
+    source_publication(Some(account), Some(config), Some(uidl), None, raw)
 }
 
 pub fn outgoing_publication(attempt: Id, raw: &[u8]) -> Result<SourcePublication> {
-    source_publication(None, None, Some(attempt), raw)
+    source_publication(None, None, None, Some(attempt), raw)
 }
 
 // ── immutable draft / attempt / acceptance values ─────────────────────────
@@ -1085,6 +1121,31 @@ fn bytes_union<Overlay: BlobStoreGet>(
         return Ok(value.as_ref().to_vec());
     }
     bail!("missing Mail byte blob {}", hex::encode(handle.raw))
+}
+
+fn validate_source_text_payloads<Overlay: BlobStoreGet>(
+    reader: &PileReader,
+    overlay: Option<&Overlay>,
+    source_facts: &TribleSet,
+) -> Result<()> {
+    let attributes = BTreeSet::from([
+        wire::claimed_message_id.id(),
+        projection::from.id(),
+        projection::to.id(),
+        projection::cc.id(),
+        projection::bcc.id(),
+        projection::subject.id(),
+        projection::body.id(),
+    ]);
+    let handles: BTreeSet<TextHandle> = source_facts
+        .iter()
+        .filter(|fact| attributes.contains(fact.a()))
+        .map(|fact| *fact.v::<inlineencodings::Handle<blobencodings::LongString>>())
+        .collect();
+    for handle in handles {
+        text_union(reader, overlay, handle)?;
+    }
+    Ok(())
 }
 
 fn credential_envelope_record(secret: Id, box_handle: BytesHandle) -> Fragment {
@@ -1403,10 +1464,10 @@ fn validate_attempt_rendering(
     let materialized = materialize_draft(reader, mail_facts, files_facts, draft.id)?;
 
     let expected_message_id = format!("mail-{}@triblespace", draft.id);
-    if parsed.canonical_message_id != expected_message_id {
+    if parsed.identity != WireIdentity::Claimed(expected_message_id.clone()) {
         bail!(
             "attempt Message-ID {:?} does not match deterministic draft id {:?}",
-            parsed.canonical_message_id,
+            parsed.identity,
             expected_message_id
         );
     }
@@ -1543,6 +1604,7 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
     let accounts = account_anchors(facts);
     let credentials = ids_of_kind(facts, KIND_CREDENTIAL);
     let configs = config_owner_map(facts)?;
+    let wires: BTreeSet<_> = ids_of_kind(facts, KIND_WIRE_MESSAGE);
     let drafts: BTreeSet<_> = ids_of_kind(facts, KIND_DRAFT_INTENT);
     let attempts: BTreeSet<_> = ids_of_kind(facts, KIND_SEND_ATTEMPT);
     let acceptances: BTreeSet<_> = ids_of_kind(facts, KIND_SMTP_ACCEPTANCE);
@@ -1618,6 +1680,10 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
         }
     }
 
+    for &wire_id in &wires {
+        wire_claimed_message_id_union(reader, overlay, facts, wire_id)?;
+    }
+
     for &id in &drafts {
         let record = draft_from_facts(facts, id)?;
         point_interval(record.created_at, "draft creation time")?;
@@ -1630,6 +1696,14 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
         for attachment in &record.attachments {
             if files::entity_kind(files_facts, *attachment)? != Some(FileEntityKind::File) {
                 bail!("draft {id:x} names non-file attachment {attachment:x}");
+            }
+        }
+        for wire_id in record.in_reply_to.iter().chain(&record.references) {
+            if !wires.contains(wire_id) {
+                bail!("draft {id:x} names non-resident thread wire {wire_id:x}");
+            }
+            if wire_claimed_message_id_union(reader, overlay, facts, *wire_id)?.is_none() {
+                bail!("draft {id:x} names digest-only thread wire {wire_id:x}");
             }
         }
         for handle in record
@@ -1778,6 +1852,19 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
         if !accounts.contains(&account_id) {
             bail!("POP observation {id:x} names unknown account {account_id:x}");
         }
+        let config_id = required(
+            find!(v: Id, pattern!(facts, [{ id @ observation::config: ?v }])).collect(),
+            "POP observation config",
+        )?;
+        let config = configs
+            .get(&config_id)
+            .ok_or_else(|| anyhow!("POP observation {id:x} names unknown config {config_id:x}"))?;
+        if config.account != account_id {
+            bail!("POP observation {id:x} config belongs to another account");
+        }
+        if !config.enabled {
+            bail!("POP observation {id:x} cites a disabled account configuration");
+        }
         let uidl = required(
             find!(v: TextHandle, pattern!(facts, [{ id @ observation::uidl: ?v }])).collect(),
             "POP UIDL",
@@ -1788,10 +1875,11 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
         )?;
         let uidl = text_union(reader, overlay, uidl)?;
         let raw = bytes_union(reader, overlay, raw)?;
-        let publication = pop_publication(account_id, &uidl, &raw)?;
+        let publication = pop_publication(account_id, config_id, &uidl, &raw)?;
         if publication.observation != id {
             bail!("POP observation {id:x} does not match exact source evidence");
         }
+        validate_source_text_payloads(reader, overlay, publication.mail.facts())?;
         for fact in publication.files.facts() {
             if !files_facts.contains(fact) {
                 bail!("POP observation {id:x} has unpublished Files attachment evidence");
@@ -1821,6 +1909,7 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
         if publication.observation != id {
             bail!("outgoing observation {id:x} does not match accepted bytes");
         }
+        validate_source_text_payloads(reader, overlay, publication.mail.facts())?;
         for fact in publication.files.facts() {
             if !files_facts.contains(fact) {
                 bail!("outgoing observation {id:x} has unpublished Files attachment evidence");
@@ -1946,10 +2035,6 @@ pub fn projection_view(
         find!(v: Id, pattern!(facts, [{ source @ observation::wire: ?v }])).collect(),
         "source wire message",
     )?;
-    let message_id_handle = required(
-        find!(v: TextHandle, pattern!(facts, [{ wire_id @ wire::message_id: ?v }])).collect(),
-        "wire Message-ID",
-    )?;
     let from_handle = one(
         find!(v: TextHandle, pattern!(facts, [{ projection_id @ projection::from: ?v }])).collect(),
         "projection From",
@@ -1967,7 +2052,7 @@ pub fn projection_view(
         id: projection_id,
         source,
         wire: wire_id,
-        message_id: read_text(reader, message_id_handle)?,
+        message_id: wire_claimed_message_id(reader, facts, wire_id)?,
         from: from_handle.map(|handle| read_text(reader, handle)).transpose()?,
         to: text_values(reader, facts, projection_id, projection::to.id())?,
         cc: text_values(reader, facts, projection_id, projection::cc.id())?,
@@ -1988,12 +2073,40 @@ pub fn projection_view(
     })
 }
 
-fn wire_message_id(reader: &PileReader, facts: &TribleSet, wire_id: Id) -> Result<String> {
-    let handle = required(
-        find!(v: TextHandle, pattern!(facts, [{ wire_id @ wire::message_id: ?v }])).collect(),
-        "wire Message-ID",
+fn wire_claimed_message_id_union<Overlay: BlobStoreGet>(
+    reader: &PileReader,
+    overlay: Option<&Overlay>,
+    facts: &TribleSet,
+    wire_id: Id,
+) -> Result<Option<String>> {
+    let claimed = one(
+        find!(v: TextHandle, pattern!(facts, [{ wire_id @ wire::claimed_message_id: ?v }]))
+            .collect(),
+        "wire claimed Message-ID",
     )?;
-    read_text(reader, handle)
+    let digest = one(
+        find!(v: DigestValue, pattern!(facts, [{ wire_id @ wire::raw_digest: ?v }])).collect(),
+        "wire raw digest",
+    )?;
+    match (claimed, digest) {
+        (Some(handle), None) => Ok(Some(canonical_message_id_value(&text_union(
+            reader, overlay, handle,
+        )?)?)),
+        (None, Some(_)) => Ok(None),
+        (Some(_), Some(_)) => bail!("wire {wire_id:x} mixes claimed and raw-digest identity"),
+        (None, None) => bail!("wire {wire_id:x} has no identity"),
+    }
+}
+
+pub fn wire_claimed_message_id(
+    reader: &PileReader,
+    facts: &TribleSet,
+    wire_id: Id,
+) -> Result<Option<String>> {
+    if !ids_of_kind(facts, KIND_WIRE_MESSAGE).contains(&wire_id) {
+        bail!("unknown wire message {wire_id:x}");
+    }
+    wire_claimed_message_id_union(reader, None::<&PileReader>, facts, wire_id)
 }
 
 pub fn materialize_draft(
@@ -2037,12 +2150,18 @@ pub fn materialize_draft(
         in_reply_to: record
             .in_reply_to
             .iter()
-            .map(|&wire| wire_message_id(reader, mail_facts, wire))
+            .map(|&wire| {
+                wire_claimed_message_id(reader, mail_facts, wire)?
+                    .ok_or_else(|| anyhow!("draft names digest-only In-Reply-To wire {wire:x}"))
+            })
             .collect::<Result<_>>()?,
         references: record
             .references
             .iter()
-            .map(|&wire| wire_message_id(reader, mail_facts, wire))
+            .map(|&wire| {
+                wire_claimed_message_id(reader, mail_facts, wire)?
+                    .ok_or_else(|| anyhow!("draft names digest-only References wire {wire:x}"))
+            })
             .collect::<Result<_>>()?,
         created_at: record.created_at,
     })
@@ -2164,11 +2283,17 @@ pub trait PopTxn {
     fn quit(self) -> Result<()>;
 }
 
-/// Fetch every UIDL exactly, publish its evidence, then mark it for deletion.
+/// Fetch every UIDL exactly under one frozen account configuration, publish
+/// its evidence, then mark it for deletion.
 /// Duplicate or zero session identities are protocol errors and no deletion is
 /// attempted. A failed explicit QUIT is an uncertain remote transaction, not
 /// evidence that already-marked deletions were rolled back.
-pub fn drain_pop<T, F>(mut transaction: T, account_id: Id, mut publish: F) -> Result<()>
+pub fn drain_pop<T, F>(
+    mut transaction: T,
+    account_id: Id,
+    config_id: Id,
+    mut publish: F,
+) -> Result<()>
 where
     T: PopTxn,
     F: FnMut(&SourcePublication) -> Result<()>,
@@ -2192,7 +2317,7 @@ where
     }
     for item in items {
         let raw = transaction.retrieve_exact(item.session_seq)?;
-        let publication = pop_publication(account_id, &item.uidl, &raw)?;
+        let publication = pop_publication(account_id, config_id, &item.uidl, &raw)?;
         publish(&publication)?;
         transaction.mark_delete(item.session_seq)?;
     }
@@ -2461,10 +2586,10 @@ mod tests {
         fixture.publish(relations_schema::DEFAULT_SCOPE_ID, fragment);
     }
 
-    fn add_account(fixture: &Fixture, account_id: Id, credential_id: Id, passphrase: &[u8]) {
+    fn add_account(fixture: &Fixture, account_id: Id, credential_id: Id, passphrase: &[u8]) -> Id {
         let views = fixture.views();
         let mut fragment = credential_fragment(credential_id, passphrase, "smtp-secret").unwrap();
-        let (config, _) = account_config_fragment(
+        let (config, config_id) = account_config_fragment(
             account_id,
             AccountConfigInput {
                 address: "sender@example.test".into(),
@@ -2489,6 +2614,7 @@ mod tests {
         )
         .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, fragment);
+        config_id
     }
 
     const RAW_INBOUND: &[u8] = b"From: Alice <alice@example.test>\r\nTo: sender@example.test\r\nSubject: Hello\r\nDate: Sat, 8 Aug 2026 00:00:01 +0000\r\nMessage-ID: <CaseSensitive@Example.TEST>\r\nContent-Type: multipart/mixed; boundary=demo\r\n\r\n--demo\r\nContent-Type: text/plain\r\n\r\nhello body\r\n--demo\r\nContent-Type: application/octet-stream; name=note.bin\r\nContent-Disposition: attachment; filename=note.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--demo--\r\n";
@@ -2496,16 +2622,79 @@ mod tests {
     #[test]
     fn message_identity_is_opaque_and_missing_id_hashes_full_raw_bytes() {
         let parsed = parse_rfc5322(RAW_INBOUND).unwrap();
-        assert_eq!(parsed.canonical_message_id, "CaseSensitive@Example.TEST");
+        assert_eq!(
+            parsed.identity,
+            WireIdentity::Claimed("CaseSensitive@Example.TEST".into())
+        );
         assert_eq!(parsed.claimed_date.unwrap(), at(1));
         assert_eq!(parsed.attachments[0].bytes, vec![1, 2, 3]);
 
         let first = parse_rfc5322(b"From: a@b\r\n\r\none").unwrap();
         let same = parse_rfc5322(b"From: a@b\r\n\r\none").unwrap();
         let other = parse_rfc5322(b"From: a@b\r\n\r\ntwo").unwrap();
-        assert_eq!(first.canonical_message_id, same.canonical_message_id);
-        assert_ne!(first.canonical_message_id, other.canonical_message_id);
+        assert_eq!(first.identity, same.identity);
+        assert_ne!(first.identity, other.identity);
+
+        let WireIdentity::RawDigest(digest) = first.identity else {
+            panic!("missing Message-ID must use raw digest identity")
+        };
+        let claimed = format!(
+            "From: a@b\r\nMessage-ID: <raw-blake3:{}>\r\n\r\nclaim",
+            hex::encode(digest.raw)
+        );
+        let fallback =
+            pop_publication(id(86), id(87), "fallback", b"From: a@b\r\n\r\none").unwrap();
+        let deliberate = pop_publication(id(86), id(87), "claimed", claimed.as_bytes()).unwrap();
+        assert_ne!(fallback.wire, deliberate.wire);
+        let rotated = pop_publication(id(86), id(88), "fallback", b"From: a@b\r\n\r\none").unwrap();
+        assert_eq!(fallback.wire, rotated.wire);
+        assert_ne!(fallback.observation, rotated.observation);
         assert!(parse_rfc5322(b"Message-ID: <a@b>\r\nMessage-ID: <c@d>\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn source_validation_requires_every_recomputed_projection_blob_to_be_resident() {
+        let fixture = Fixture::new();
+        let account = id(97);
+        let credential = id(98);
+        let config = add_account(&fixture, account, credential, b"payload residency");
+        let publication = pop_publication(
+            account,
+            config,
+            "missing-subject",
+            b"From: sender@example.test\r\nTo: receiver@example.test\r\nMessage-ID: <missing-payload@example.test>\r\nSubject: uniquely absent projection text\r\n\r\nbody",
+        )
+        .unwrap();
+        let subject = required(
+            find!(v: TextHandle, pattern!(publication.mail.facts(), [{ _?projection @ projection::subject: ?v }])).collect(),
+            "test projection subject",
+        )
+        .unwrap();
+        let SourcePublication { mail, files, .. } = publication;
+        let (facts, mut blobs) = mail.into_facts_and_blobs();
+        let survivors: Vec<_> = blobs
+            .reader()
+            .unwrap()
+            .into_iter()
+            .map(|(handle, _)| handle)
+            .filter(|handle| handle.raw != subject.raw)
+            .collect();
+        blobs.keep(survivors);
+        let broken = Fragment::from_facts_and_blobs(facts, blobs);
+        let views = fixture.views();
+        let mut files_union = views.files.facts.clone();
+        files_union += files.facts().clone();
+        let error = validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &broken,
+            &files_union,
+            &views.decide.facts,
+            &views.relations.facts,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("read staged Mail text"), "{error}");
     }
 
     #[test]
@@ -2601,12 +2790,106 @@ mod tests {
         let credential_id = id(3);
         let passphrase = b"master password";
         add_person(&fixture, persona);
-        add_account(&fixture, account_id, credential_id, passphrase);
+        let account_config = add_account(&fixture, account_id, credential_id, passphrase);
+
+        let missing_thread = draft_publication(DraftInput {
+            nonce: id(93),
+            account: account_id,
+            envelope_from: "sender@example.test".into(),
+            to: vec!["receiver@example.test".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Missing thread anchor".into(),
+            body: "must not materialize later and fail".into(),
+            attachments: Vec::new(),
+            in_reply_to: vec![id(94)],
+            references: Vec::new(),
+            created_at: at(5),
+        })
+        .unwrap();
+        let views = fixture.views();
+        let decide_union = decide::validate_catalog_union(
+            &views.decide.reader,
+            &views.decide.facts,
+            &missing_thread.decide,
+        )
+        .unwrap();
+        let error = validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &missing_thread.mail,
+            &views.files.facts,
+            &decide_union,
+            &views.relations.facts,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("non-resident thread wire"));
+
+        let digest_source = pop_publication(
+            account_id,
+            account_config,
+            "digest-parent",
+            b"From: parent@example.test\r\nTo: sender@example.test\r\nSubject: no id\r\n\r\nbody",
+        )
+        .unwrap();
+        let digest_thread = draft_publication(DraftInput {
+            nonce: id(96),
+            account: account_id,
+            envelope_from: "sender@example.test".into(),
+            to: vec!["parent@example.test".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Re: no id".into(),
+            body: "a digest is local identity, not an RFC thread id".into(),
+            attachments: Vec::new(),
+            in_reply_to: vec![digest_source.wire],
+            references: Vec::new(),
+            created_at: at(6),
+        })
+        .unwrap();
+        let views = fixture.views();
+        let decide_union = decide::validate_catalog_union(
+            &views.decide.reader,
+            &views.decide.facts,
+            &digest_thread.decide,
+        )
+        .unwrap();
+        let mut digest_mail = digest_source.mail;
+        digest_mail += digest_thread.mail;
+        let mut digest_files = views.files.facts.clone();
+        digest_files += digest_source.files.facts().clone();
+        let error = validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &digest_mail,
+            &digest_files,
+            &decide_union,
+            &views.relations.facts,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("digest-only thread wire"));
+
+        let views = fixture.views();
+        let wrong_config =
+            pop_publication(account_id, id(95), "wrong-config", RAW_INBOUND).unwrap();
+        let mut wrong_files = views.files.facts.clone();
+        wrong_files += wrong_config.files.facts().clone();
+        let error = validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &wrong_config.mail,
+            &wrong_files,
+            &views.decide.facts,
+            &views.relations.facts,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown config"));
 
         // POP evidence is precomputed, Files is published before Mail, and one
         // immutable multi-scope snapshot is sufficient for preflight.
         let views = fixture.views();
-        let incoming = pop_publication(account_id, "UidL-CaSe", RAW_INBOUND).unwrap();
+        let incoming =
+            pop_publication(account_id, account_config, "UidL-CaSe", RAW_INBOUND).unwrap();
         let mut files_union = views.files.facts.clone();
         files_union += incoming.files.facts().clone();
         validate_catalog_union(
@@ -2649,7 +2932,8 @@ mod tests {
 
         // A new source observation of the same wire message does not reopen it.
         let views = fixture.views();
-        let replay = pop_publication(account_id, "second-uidl", RAW_INBOUND).unwrap();
+        let replay =
+            pop_publication(account_id, account_config, "second-uidl", RAW_INBOUND).unwrap();
         validate_catalog_union(
             &views.mail.reader,
             &views.mail.facts,
@@ -2846,6 +3130,20 @@ mod tests {
             error.contains("exactly one outgoing observation"),
             "{error}"
         );
+
+        let mut outgoing_only = prepared.attempt_fragment().clone();
+        outgoing_only += prepared.outgoing.mail.clone();
+        let error = validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &outgoing_only,
+            &views.files.facts,
+            &views.decide.facts,
+            &views.relations.facts,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("has no SMTP acceptance"), "{error}");
 
         submit_once(
             &mut smtp,
@@ -3136,7 +3434,7 @@ mod tests {
         .unwrap();
         let mut published = Vec::new();
 
-        drain_pop(session, id(9), |publication| {
+        drain_pop(session, id(9), id(10), |publication| {
             published.push((publication.wire, publication.observation));
             Ok(())
         })
@@ -3152,7 +3450,7 @@ mod tests {
     #[test]
     fn pop_publish_precedes_delete_and_failure_disconnects_without_quit() {
         let events = Rc::new(RefCell::new(Vec::new()));
-        drain_pop(fake_pop(events.clone()), id(9), |_| {
+        drain_pop(fake_pop(events.clone()), id(9), id(10), |_| {
             events.borrow_mut().push("publish");
             Ok(())
         })
@@ -3163,7 +3461,7 @@ mod tests {
         );
 
         let events = Rc::new(RefCell::new(Vec::new()));
-        let error = drain_pop(fake_pop(events.clone()), id(9), |_| {
+        let error = drain_pop(fake_pop(events.clone()), id(9), id(10), |_| {
             events.borrow_mut().push("publish-failed");
             bail!("disk full")
         })
@@ -3212,7 +3510,7 @@ mod tests {
                 deleted: Vec::new(),
                 quit: false,
             };
-            assert!(drain_pop(transaction, id(9), |_| Ok(())).is_err());
+            assert!(drain_pop(transaction, id(9), id(10), |_| Ok(())).is_err());
             assert_eq!(events.borrow().as_slice(), ["uidl", "disconnect"]);
         }
     }
