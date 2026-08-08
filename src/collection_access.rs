@@ -18,7 +18,8 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, IntoBlob, MemoryBlobStore};
 use triblespace::core::collection::simplearchive_union::{
-    self, publish_fragment_commit, validate_commit, validate_merge,
+    self, prepare_fragment_commit, publish_fragment_commit, validate_commit, validate_merge,
+    StagedCollectionCommit,
 };
 use triblespace::core::collection::{
     discover_collection_records, plan_collection_retention, resolve_collection_semantics,
@@ -118,9 +119,10 @@ pub struct CollectionSnapshot {
 ///
 /// This is only an ownership seam around an open [`Pile`], one intrinsic
 /// collection definition, and one durable signer. It does not introduce a
-/// head, staging area, checkout, or mutable workspace. Each call to
-/// [`Self::publish_fragment`] remains an independently signed, crash-ordered
-/// collection commit.
+/// head, checkout, or mutable workspace. [`Self::stage_fragment`] is only a
+/// consuming crash-order seam around one exact commit: it durably writes
+/// dependencies while withholding that record. Each completed call to
+/// [`Self::publish_fragment`] remains an independently signed collection root.
 ///
 /// Call [`Self::finish`] even when the surrounding operation failed so close
 /// errors remain observable. Dropping the writer without finishing delegates
@@ -148,18 +150,40 @@ impl CollectionWriter {
         })
     }
 
+    /// Durably stage one signed fragment while withholding its `COMMIT` record.
+    ///
+    /// Dependencies and attachments are flushed before this returns. The
+    /// returned value keeps this writer's pile mutably borrowed so callers can
+    /// append intervening unsigned collection equations through
+    /// [`StagedCollectionCommit::store_mut`], then consume it with
+    /// [`StagedCollectionCommit::finalize`] to append the exact prepared
+    /// `COMMIT` last. Dropping it is deliberately inert and never publishes
+    /// the withheld record.
+    pub fn stage_fragment(
+        &mut self,
+        content: impl Into<Fragment>,
+        metadata: impl Into<Fragment>,
+    ) -> Result<StagedCollectionCommit<'_, Pile>> {
+        let prepared = prepare_fragment_commit(&self.definition, content, metadata, &self.signer)
+            .context("prepare collection fragment")?;
+        let pile = self
+            .pile
+            .as_mut()
+            .expect("collection writer is open until consumed by finish");
+        prepared
+            .stage(pile)
+            .context("stage collection fragment dependencies")
+    }
+
     /// Publish one independent signed fragment without reopening the pile.
     pub fn publish_fragment(
         &mut self,
         content: impl Into<Fragment>,
         metadata: impl Into<Fragment>,
     ) -> Result<CollectionCommit> {
-        let pile = self
-            .pile
-            .as_mut()
-            .expect("collection writer is open until consumed by finish");
-        publish_fragment_commit(pile, &self.definition, content, metadata, &self.signer)
-            .context("publish collection fragment")
+        self.stage_fragment(content, metadata)?
+            .finalize()
+            .context("finalize collection fragment")
     }
 
     /// Close the pile and combine its result with the surrounding operation.
@@ -2258,6 +2282,47 @@ mod tests {
 
         let view = materialize_scope(&pile, id(1), &allowed(&signer)).unwrap();
         assert_eq!(view.facts, expected.into_facts());
+    }
+
+    #[test]
+    fn writer_can_abandon_or_finalize_the_same_staged_fragment_explicitly() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = fresh_pile(&directory);
+        let key_path = directory.path().join("writer.key");
+        let signer = initialize_signer(&pile, Some(&key_path)).unwrap();
+        let scope = id(1);
+        let kind = id(20);
+        let content = description_fragment(kind, "withheld until commit-last");
+        let expected = content.facts().clone();
+
+        let mut writer = CollectionWriter::open(&pile, Some(&key_path), scope).unwrap();
+        let staged = writer.stage_fragment(content, Fragment::empty()).unwrap();
+        let withheld = staged.commit().clone();
+        drop(staged);
+        writer.close().unwrap();
+
+        let abandoned = materialize_scope(&pile, scope, &allowed(&signer)).unwrap();
+        assert!(abandoned.facts.is_empty());
+        assert!(abandoned.commits.is_empty());
+        assert!(plan_authorized_union_retention(&pile, &allowed(&signer))
+            .unwrap()
+            .is_empty());
+
+        let mut writer = CollectionWriter::open(&pile, Some(&key_path), scope).unwrap();
+        let staged = writer
+            .stage_fragment(
+                description_fragment(kind, "withheld until commit-last"),
+                Fragment::empty(),
+            )
+            .unwrap();
+        assert_eq!(staged.commit(), &withheld);
+        let finalized = staged.finalize().unwrap();
+        assert_eq!(finalized, withheld);
+        writer.close().unwrap();
+
+        let published = materialize_scope(&pile, scope, &allowed(&signer)).unwrap();
+        assert_eq!(published.facts, expected);
+        assert_eq!(published.commits, vec![withheld]);
     }
 
     #[test]

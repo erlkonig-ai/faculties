@@ -12,7 +12,10 @@ All notable changes to this project will be documented in this file.
   plus an attachment-capable pile reader. Strong retention follows every
   authorized strict COMMIT directly, while reproducible MERGE/DERIVE cache
   records root nothing; publication is the durable desire ledger and no
-  separate scope registry is needed.
+  separate scope registry is needed. `CollectionWriter` also exposes the
+  commit-last staging seam directly, so a caller can durably place dependencies
+  and unsigned cache artifacts before consuming the staged value to publish
+  the exact signed root; abandoning it publishes no membership.
 - **Body persistence is collection-native.** Deliberate captures and intents
   now use one stable extrinsic scope and durable signer instead of a branch,
   repository workspace, and ephemeral identity. Publications carry every
