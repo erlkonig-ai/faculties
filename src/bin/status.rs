@@ -6,23 +6,21 @@
 //! this CLI accepts exact persona ids and deliberately does not fall back to a
 //! legacy relations branch for labels.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use faculties::collection_access::{self, CollectionSnapshot, CollectionView};
-use faculties::schemas::status::{status, DEFAULT_SCOPE_ID, KIND_STATUS_UPDATE};
+use faculties::schemas::status::DEFAULT_SCOPE_ID;
+use faculties::status::{
+    latest_per_window, load_status_rows, read_text, status_fragment, IntervalValue, StatusRow,
+    TextHandle,
+};
 use hifitime::Epoch;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::*;
-
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-
-const LEGACY_STATUS_BRANCH_NAME: &str = "status";
 
 #[derive(Parser)]
 #[command(
@@ -65,15 +63,6 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
-    /// Publish the signed legacy `status` branch as collection commits, then
-    /// verify the exact materialized view. Stop all legacy status writers and
-    /// collection-native writers for this scope first. The legacy pin remains.
-    MigrateLegacy {
-        /// Exact legacy branch id, needed only if duplicate `status` names make
-        /// name lookup ambiguous.
-        #[arg(long, value_parser = parse_id_arg)]
-        legacy_branch_id: Option<Id>,
-    },
 }
 
 #[derive(Clone, Copy)]
@@ -87,7 +76,10 @@ impl StatusStorage<'_> {
     fn view(&self) -> Result<CollectionView> {
         let signer = collection_access::load_signer(self.pile, self.key)?;
         let allowed = HashSet::from([signer.verifying_key()]);
-        CollectionSnapshot::open(self.pile)?.materialize_scope(self.scope, &allowed)
+        let view = CollectionSnapshot::open(self.pile)?.materialize_scope(self.scope, &allowed)?;
+        faculties::status::validate_catalog(&view.reader, &view.facts)
+            .context("validate Status collection")?;
+        Ok(view)
     }
 
     fn publish(&self, fragment: Fragment, message: &str) -> Result<CollectionCommit> {
@@ -149,138 +141,13 @@ fn format_age(now_key: i128, past_key: i128) -> String {
     }
 }
 
-fn status_fragment(window: Id, text: &str, at: IntervalValue) -> Fragment {
-    let mut fragment = Fragment::empty();
-    let text: TextHandle = fragment.put(text.to_owned());
-    fragment += entity! {
-        metadata::tag: &KIND_STATUS_UPDATE,
-        status::window: window,
-        status::text: text,
-        metadata::created_at: at,
-    };
-    fragment
-}
-
-#[derive(Clone, Copy, Debug)]
-struct StatusRow {
-    event: Id,
-    window: Id,
-    text: TextHandle,
-    at: IntervalValue,
-}
-
-fn exactly_one<T>(event: Id, field: &str, values: Vec<T>) -> Result<T> {
-    let count = values.len();
-    let mut values = values.into_iter();
-    match (values.next(), count) {
-        (Some(value), 1) => Ok(value),
-        _ => bail!(
-            "status event {} has {count} values for {field}; expected exactly one",
-            fmt_id(event)
-        ),
-    }
-}
-
-fn load_status_rows(space: &TribleSet) -> Result<Vec<StatusRow>> {
-    let mut events: Vec<Id> = find!(
-        event: Id,
-        pattern!(space, [{ ?event @ metadata::tag: &KIND_STATUS_UPDATE }])
-    )
-    .collect();
-    events.sort_unstable();
-    events.dedup();
-
-    events
-        .into_iter()
-        .map(|event| {
-            let window = exactly_one(
-                event,
-                "status::window",
-                find!(
-                    window: Id,
-                    pattern!(space, [{ event @ status::window: ?window }])
-                )
-                .collect(),
-            )?;
-            let text = exactly_one(
-                event,
-                "status::text",
-                find!(
-                    text: TextHandle,
-                    pattern!(space, [{ event @ status::text: ?text }])
-                )
-                .collect(),
-            )?;
-            let at = exactly_one(
-                event,
-                "metadata::created_at",
-                find!(
-                    at: IntervalValue,
-                    pattern!(space, [{ event @ metadata::created_at: ?at }])
-                )
-                .collect(),
-            )?;
-            Ok(StatusRow {
-                event,
-                window,
-                text,
-                at,
-            })
-        })
-        .collect()
-}
-
-/// Latest event per window. Equal-time distinct events are a fork, not an
-/// invitation to smuggle arbitrary iteration order in as last-write-wins.
-fn latest_per_window(rows: impl IntoIterator<Item = StatusRow>) -> Result<HashMap<Id, StatusRow>> {
-    let mut frontiers: HashMap<Id, (i128, BTreeMap<Id, StatusRow>)> = HashMap::new();
-    for row in rows {
-        let at = interval_key(row.at);
-        let entry = frontiers
-            .entry(row.window)
-            .or_insert_with(|| (at, BTreeMap::new()));
-        match at.cmp(&entry.0) {
-            std::cmp::Ordering::Greater => {
-                entry.0 = at;
-                entry.1.clear();
-                entry.1.insert(row.event, row);
-            }
-            std::cmp::Ordering::Equal => {
-                entry.1.insert(row.event, row);
-            }
-            std::cmp::Ordering::Less => {}
-        }
-    }
-
-    let mut latest = HashMap::with_capacity(frontiers.len());
-    for (window, (_, frontier)) in frontiers {
-        let mut rows = frontier.into_values();
-        let row = rows.next().expect("status frontier is never empty");
-        if let Some(other) = rows.next() {
-            bail!(
-                "ambiguous current status for window {}: distinct events {} and {} have the same maximal timestamp",
-                fmt_id(window),
-                fmt_id(row.event),
-                fmt_id(other.event),
-            );
-        }
-        latest.insert(window, row);
-    }
-    Ok(latest)
-}
-
-fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
-    let text: anybytes::View<str> = reader.get(handle).context("read status text")?;
-    Ok(text.to_string())
-}
-
 fn store_status_at(
     storage: StatusStorage<'_>,
     window: Id,
     text: &str,
     at: IntervalValue,
 ) -> Result<CollectionCommit> {
-    storage.publish(status_fragment(window, text, at), "status set")
+    storage.publish(status_fragment(window, text, at)?, "status set")
 }
 
 fn cmd_set(storage: StatusStorage<'_>, persona: Option<&str>, text: String) -> Result<()> {
@@ -353,60 +220,6 @@ fn cmd_show(storage: StatusStorage<'_>, window: String, limit: usize) -> Result<
     Ok(())
 }
 
-fn preflight_legacy_status_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
-    for fact in facts.iter().filter(|fact| fact.a() == &status::text.id()) {
-        let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
-        let _: anybytes::View<str> = reader.get(handle).with_context(|| {
-            format!(
-                "strictly read legacy status::text payload {}",
-                hex::encode_upper(handle.raw)
-            )
-        })?;
-    }
-    Ok(())
-}
-
-fn migrate_legacy(
-    storage: StatusStorage<'_>,
-    explicit_branch: Option<Id>,
-) -> Result<collection_access::LegacyMigrationReport> {
-    collection_access::migrate_legacy_simplearchive_branch(
-        storage.pile,
-        storage.key,
-        storage.scope,
-        LEGACY_STATUS_BRANCH_NAME,
-        explicit_branch,
-        preflight_legacy_status_payloads,
-        |_, _| Ok(()),
-    )
-}
-
-fn cmd_migrate_legacy(storage: StatusStorage<'_>, explicit_branch: Option<Id>) -> Result<()> {
-    let report = migrate_legacy(storage, explicit_branch)?;
-    println!(
-        "migrated {} authored commit{} ({} facts); skipped {} contentless merge{}",
-        report.commits.len(),
-        if report.commits.len() == 1 { "" } else { "s" },
-        report.facts,
-        report.skipped_merges,
-        if report.skipped_merges == 1 { "" } else { "s" },
-    );
-    println!("  legacy branch {}", report.branch_id);
-    println!(
-        "  legacy head   {}",
-        report
-            .head
-            .map(|head| hex::encode_upper(head.raw))
-            .unwrap_or_else(|| "<empty>".to_owned())
-    );
-    println!(
-        "  retention     {} direct + {} recursive roots (verified, not persisted)",
-        report.retention_direct, report.retention_recursive
-    );
-    println!("  legacy pin remains in place until recurring retention policy exists");
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let storage = StatusStorage {
@@ -418,9 +231,6 @@ fn main() -> Result<()> {
         Command::Set { text } => cmd_set(storage, cli.persona.as_deref(), text),
         Command::List => cmd_list(storage),
         Command::Show { window, limit } => cmd_show(storage, window, limit),
-        Command::MigrateLegacy { legacy_branch_id } => {
-            cmd_migrate_legacy(storage, legacy_branch_id)
-        }
     }
 }
 
@@ -430,9 +240,8 @@ mod tests {
 
     use std::fs::File;
 
-    use ed25519_dalek::SigningKey;
+    use faculties::schemas::status::{status as status_attrs, KIND_STATUS_UPDATE};
     use triblespace::core::collection::{discover_collection_records, simplearchive_union};
-    use triblespace::core::repo::{PinStore, Repository};
 
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -463,16 +272,6 @@ mod tests {
             .filter(|commit| commit.collection() == definition.id())
             .filter(|commit| commit.public_key().raw == signer.verifying_key().to_bytes())
             .count()
-    }
-
-    fn legacy_pin(
-        pile: &Path,
-        branch: Id,
-    ) -> Inline<inlineencodings::Handle<blobencodings::SimpleArchive>> {
-        let mut pile_store = collection_access::open_pile_strict(pile).unwrap();
-        let pin = pile_store.head(branch).unwrap().unwrap();
-        pile_store.close().unwrap();
-        pin
     }
 
     #[test]
@@ -525,11 +324,123 @@ mod tests {
     }
 
     #[test]
+    fn status_constructor_rejects_non_point_time() {
+        let at: IntervalValue = (
+            Epoch::from_unix_seconds(20.0),
+            Epoch::from_unix_seconds(21.0),
+        )
+            .try_to_inline()
+            .unwrap();
+
+        let error = status_fragment(test_id(0x90), "range", at).unwrap_err();
+
+        assert!(format!("{error:#}").contains("must be a point interval"));
+    }
+
+    #[test]
+    fn catalog_rejects_non_point_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key, scope) = fresh_storage(&directory);
+        let storage = StatusStorage {
+            pile: &pile,
+            key: Some(&key),
+            scope,
+        };
+        let at: IntervalValue = (
+            Epoch::from_unix_seconds(20.0),
+            Epoch::from_unix_seconds(21.0),
+        )
+            .try_to_inline()
+            .unwrap();
+        let mut fragment = Fragment::empty();
+        let text: TextHandle = fragment.put("range".to_owned());
+        fragment += entity! {
+            metadata::tag: &KIND_STATUS_UPDATE,
+            status_attrs::window: test_id(0x96),
+            status_attrs::text: text,
+            metadata::created_at: at,
+        };
+        storage.publish(fragment, "range status").unwrap();
+
+        let error = storage.view().unwrap_err();
+
+        assert!(format!("{error:#}").contains("must be a point interval"));
+    }
+
+    #[test]
+    fn catalog_rejects_legacy_random_event_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key, scope) = fresh_storage(&directory);
+        let storage = StatusStorage {
+            pile: &pile,
+            key: Some(&key),
+            scope,
+        };
+        let event = ufoid();
+        let mut fragment = Fragment::empty();
+        let text: TextHandle = fragment.put("legacy random event".to_owned());
+        fragment += entity! { &event @
+            metadata::tag: &KIND_STATUS_UPDATE,
+            status_attrs::window: test_id(0x91),
+            status_attrs::text: text,
+            metadata::created_at: at_unix(22.0),
+        };
+        storage.publish(fragment, "legacy-shaped status").unwrap();
+
+        let error = storage.view().unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("is not intrinsic"));
+        assert!(message.contains("explicit stopped-world transforming migration"));
+    }
+
+    #[test]
+    fn catalog_rejects_extra_facts_on_intrinsic_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key, scope) = fresh_storage(&directory);
+        let storage = StatusStorage {
+            pile: &pile,
+            key: Some(&key),
+            scope,
+        };
+        let mut fragment = status_fragment(test_id(0x92), "working", at_unix(23.0)).unwrap();
+        let event = fragment.root().unwrap();
+        let other_kind = test_id(0x93);
+        fragment += entity! { ExclusiveId::force_ref(&event) @
+            metadata::tag: &other_kind,
+        };
+        storage.publish(fragment, "status with extra fact").unwrap();
+
+        let error = storage.view().unwrap_err();
+
+        assert!(format!("{error:#}").contains("expected exactly 4"));
+    }
+
+    #[test]
+    fn catalog_rejects_facts_outside_status_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key, scope) = fresh_storage(&directory);
+        let storage = StatusStorage {
+            pile: &pile,
+            key: Some(&key),
+            scope,
+        };
+        let mut fragment = status_fragment(test_id(0x94), "working", at_unix(24.0)).unwrap();
+        let other_kind = test_id(0x95);
+        fragment += entity! { metadata::tag: &other_kind };
+        storage.publish(fragment, "mixed ontology").unwrap();
+
+        let error = storage.view().unwrap_err();
+
+        assert!(format!("{error:#}").contains("outside canonical Status events"));
+    }
+
+    #[test]
     fn equal_time_distinct_updates_are_reported_as_a_fork() {
         let window = test_id(0x84);
         let at = at_unix(30.0);
-        let left = status_fragment(window, "left", at).into_facts();
-        let right = status_fragment(window, "right", at).into_facts();
+        let left = status_fragment(window, "left", at).unwrap().into_facts();
+        let right = status_fragment(window, "right", at).unwrap().into_facts();
         let mut facts = left;
         facts += right;
 
@@ -569,58 +480,6 @@ mod tests {
             let latest = latest_per_window(rows).unwrap();
             assert_eq!(latest[&window].event, later.event);
         }
-    }
-
-    #[test]
-    fn legacy_migration_is_idempotent_and_preserves_pin_and_payload() {
-        let directory = tempfile::tempdir().unwrap();
-        let pile = directory.path().join("legacy-status.pile");
-        let key = directory.path().join("collection.key");
-        File::create(&pile).unwrap();
-
-        let pile_store = collection_access::open_pile_strict(&pile).unwrap();
-        let mut repository = Repository::new(
-            pile_store,
-            SigningKey::from_bytes(&[0x85; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository
-            .create_branch(LEGACY_STATUS_BRANCH_NAME, None)
-            .unwrap();
-        let expected = {
-            let mut workspace = repository.pull(branch).unwrap();
-            let text: TextHandle = workspace.put("legacy status".to_owned());
-            let facts = entity! { _ @
-                metadata::tag: &KIND_STATUS_UPDATE,
-                status::window: test_id(0x86),
-                status::text: text,
-                metadata::created_at: at_unix(40.0),
-            }
-            .into_facts();
-            workspace.commit(facts.clone(), "legacy status");
-            repository.push(&mut workspace).unwrap();
-            facts
-        };
-        repository.close().unwrap();
-        collection_access::initialize_signer(&pile, Some(&key)).unwrap();
-        let storage = StatusStorage {
-            pile: &pile,
-            key: Some(&key),
-            scope: test_id(0x87),
-        };
-        let pin = legacy_pin(&pile, branch);
-
-        let first = migrate_legacy(storage, None).unwrap();
-        let length = std::fs::metadata(&pile).unwrap().len();
-        let second = migrate_legacy(storage, Some(branch)).unwrap();
-
-        assert_eq!(first.commits, second.commits);
-        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
-        assert_eq!(legacy_pin(&pile, branch), pin);
-        let view = storage.view().unwrap();
-        assert_eq!(view.facts, expected);
-        preflight_legacy_status_payloads(&view.reader, &view.facts).unwrap();
     }
 
     #[test]

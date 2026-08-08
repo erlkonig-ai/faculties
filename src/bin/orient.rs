@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -19,17 +19,13 @@ use faculties::schemas::memory::DEFAULT_MEMORY_BRANCH;
 use faculties::schemas::message::KIND_MESSAGE_ID;
 use faculties::schemas::orient::DEFAULT_SCOPE_ID as ORIENT_SCOPE_ID;
 use faculties::schemas::relations::KIND_PERSON_ID;
-use faculties::schemas::status::{status as status_attrs, KIND_STATUS_UPDATE};
 use faculties::schemas::wiki::{cover_fragments, WIKI_BRANCH_NAME};
-use faculties::{compass, decide, files, mail, message, orient, relations};
+use faculties::{compass, decide, files, mail, message, orient, relations, status};
 use hifitime::Epoch;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 #[derive(Parser)]
@@ -105,16 +101,18 @@ struct Revisions {
     mail: CollectionRevision,
     compass: CollectionRevision,
     relations: CollectionRevision,
+    status: CollectionRevision,
     orient: CollectionRevision,
 }
 
-/// One coherent seven-scope view. All materializations reuse exactly one
+/// One coherent eight-scope view. All materializations reuse exactly one
 /// immutable `CollectionSnapshot` and one durable signer authority.
 struct CurrentCollections {
     message: CollectionView,
     mail: CollectionView,
     compass: CollectionView,
     relations: CollectionView,
+    status: CollectionView,
     orient: CollectionView,
     orient_catalog: orient::Catalog,
 }
@@ -167,6 +165,12 @@ impl CurrentCollections {
         compass::validate_catalog(&compass.reader, &compass.facts)
             .context("validate Compass collection")?;
 
+        let status = snapshot
+            .materialize_scope(faculties::schemas::status::DEFAULT_SCOPE_ID, &allowed)
+            .context("materialize Status collection")?;
+        status::validate_catalog(&status.reader, &status.facts)
+            .context("validate Status collection")?;
+
         let orient_view = snapshot
             .materialize_scope(ORIENT_SCOPE_ID, &allowed)
             .context("materialize Orient collection")?;
@@ -184,6 +188,7 @@ impl CurrentCollections {
             mail,
             compass,
             relations,
+            status,
             orient: orient_view,
             orient_catalog,
         })
@@ -195,6 +200,7 @@ impl CurrentCollections {
             mail: self.mail.revision,
             compass: self.compass.revision,
             relations: self.relations.revision,
+            status: self.status.revision,
             orient: self.orient.revision,
         }
     }
@@ -979,13 +985,6 @@ fn render_compass_goals(
     Ok(out)
 }
 
-fn read_legacy_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
-    let value: anybytes::View<str> = reader
-        .get(handle)
-        .map_err(|error| anyhow!("read legacy text: {error:?}"))?;
-    Ok(value.to_string())
-}
-
 /// Render the same validated collection-native inbox projection that drives
 /// Orient observations.  One WireMessage is one attention item even when the
 /// same raw message was observed by several POP transactions.
@@ -1043,32 +1042,11 @@ fn render_mail(
     Ok(out)
 }
 
-/// Isolated legacy Status read. Relations identity and roster always come from
-/// the validated collection snapshot.
-fn render_legacy_colony(pile: &Path, collections: &CurrentCollections) -> Result<String> {
-    let status = collection_access::materialize_named_legacy_branch(pile, "status")?;
-    let mut latest = HashMap::<Id, (TextHandle, i128)>::new();
-    if let Some(status) = &status {
-        for (window, text, at) in find!(
-            (window: Id, text: TextHandle, at: IntervalValue),
-            pattern!(&status.facts, [{ _?event @
-                metadata::tag: &KIND_STATUS_UPDATE,
-                status_attrs::window: ?window,
-                status_attrs::text: ?text,
-                metadata::created_at: ?at,
-            }])
-        ) {
-            let at = interval_key(at)?;
-            latest
-                .entry(window)
-                .and_modify(|current| {
-                    if at > current.1 {
-                        *current = (text, at);
-                    }
-                })
-                .or_insert((text, at));
-        }
-    }
+/// Render Status from the same immutable collection snapshot as Relations.
+/// The shared Status projection rejects malformed scalar cardinality and
+/// equal-time maximal forks instead of selecting a value by iteration order.
+fn render_colony(collections: &CurrentCollections) -> Result<String> {
+    let latest = status::latest_per_window(status::load_status_rows(&collections.status.facts)?)?;
     let mut out = String::new();
     writeln!(out, "Colony:").unwrap();
     let zooids = active_zooids(collections)?;
@@ -1076,11 +1054,9 @@ fn render_legacy_colony(pile: &Path, collections: &CurrentCollections) -> Result
         writeln!(out, "- (no zooids)").unwrap();
     }
     for person in zooids {
-        let text = match (&status, latest.get(&person)) {
-            (Some(status), Some((handle, _))) => {
-                read_legacy_text(&status.reader, *handle).unwrap_or_else(|_| "—".to_owned())
-            }
-            _ => "—".to_owned(),
+        let text = match latest.get(&person) {
+            Some(row) => status::read_text(&collections.status.reader, row.text)?,
+            None => "—".to_owned(),
         };
         writeln!(out, "- {}: {text}", person_label(collections, person)).unwrap();
     }
@@ -1088,7 +1064,6 @@ fn render_legacy_colony(pile: &Path, collections: &CurrentCollections) -> Result
 }
 
 fn render_show(
-    pile: &Path,
     collections: &CurrentCollections,
     persona: Option<Id>,
     message_limit: usize,
@@ -1149,7 +1124,7 @@ fn render_show(
     out.push_str(&render_mail(evaluation.as_ref(), message_limit, now)?);
     writeln!(out).unwrap();
     out.push_str(&render_compass_goals(collections, doing_limit, todo_limit)?);
-    out.push_str(&render_legacy_colony(pile, collections)?);
+    out.push_str(&render_colony(collections)?);
     Ok((out, evaluation))
 }
 
@@ -1215,7 +1190,6 @@ fn cmd_show(
         .map(|input| resolve_persona(&collections, input))
         .transpose()?;
     let (output, evaluation) = render_show(
-        pile,
         &collections,
         persona,
         message_limit,
@@ -1408,14 +1382,8 @@ fn cmd_wait(
                     observed_length = loaded.1;
                 }
             } else {
-                let (snapshot, _) = render_show(
-                    pile,
-                    &collections,
-                    None,
-                    message_limit,
-                    doing_limit,
-                    todo_limit,
-                )?;
+                let (snapshot, _) =
+                    render_show(&collections, None, message_limit, doing_limit, todo_limit)?;
                 emit(&snapshot)?;
                 return Ok(());
             }
@@ -1424,7 +1392,6 @@ fn cmd_wait(
 
         if timeout.is_some_and(|limit| start.elapsed() >= limit) {
             let (snapshot, evaluation) = render_show(
-                pile,
                 &collections,
                 persona,
                 message_limit,
@@ -1444,7 +1411,8 @@ fn cmd_wait(
 }
 
 /// Legacy Memory and Wiki remain sharply isolated reads. They never supply a
-/// fallback for collection-native Compass, Message, Relations, or Orient.
+/// fallback for collection-native Compass, Message, Relations, Status, or
+/// Orient.
 fn render_legacy_wake(pile: &Path, chars: usize) -> Result<String> {
     let mut out = String::new();
     match collection_access::materialize_named_legacy_branch(pile, DEFAULT_MEMORY_BRANCH)? {
@@ -1584,6 +1552,13 @@ mod tests {
             .0;
             self.publish(faculties::schemas::relations::DEFAULT_SCOPE_ID, fragment);
         }
+
+        fn status(&self, window: Id, text: &str, at: IntervalValue) {
+            self.publish(
+                faculties::schemas::status::DEFAULT_SCOPE_ID,
+                status::status_fragment(window, text, at).unwrap(),
+            );
+        }
     }
 
     fn test_id(byte: u8) -> Id {
@@ -1651,11 +1626,39 @@ mod tests {
         fixture.person(persona, "me", true);
         let (collections, _) = stable_collections(&fixture.pile).unwrap();
         let before = pile_length(&fixture.pile).unwrap();
-        let (output, evaluation) =
-            render_show(&fixture.pile, &collections, None, 10, 5, 5).unwrap();
+        let (output, evaluation) = render_show(&collections, None, 10, 5, 5).unwrap();
         assert!(output.starts_with("Orient\n"));
         assert!(evaluation.is_none());
         assert_eq!(pile_length(&fixture.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn colony_reads_status_from_the_shared_collection_snapshot() {
+        let fixture = Fixture::new();
+        let persona = test_id(28);
+        fixture.person(persona, "agent-test", true);
+        let (before, _) = stable_collections(&fixture.pile).unwrap();
+
+        fixture.status(persona, "mapping the collection lattice", at(5.0));
+        let (after, _) = stable_collections(&fixture.pile).unwrap();
+        let output = render_colony(&after).unwrap();
+
+        assert_ne!(before.revisions().status, after.revisions().status);
+        assert!(output.contains("- agent-test: mapping the collection lattice"));
+    }
+
+    #[test]
+    fn colony_reports_equal_time_collection_status_as_ambiguous() {
+        let fixture = Fixture::new();
+        let persona = test_id(29);
+        fixture.person(persona, "agent-test", true);
+        fixture.status(persona, "left", at(6.0));
+        fixture.status(persona, "right", at(6.0));
+
+        let (collections, _) = stable_collections(&fixture.pile).unwrap();
+        let error = render_colony(&collections).unwrap_err();
+
+        assert!(format!("{error:#}").contains("ambiguous current status"));
     }
 
     #[test]

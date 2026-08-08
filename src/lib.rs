@@ -48,6 +48,7 @@ pub mod nomic;
 pub mod orient;
 pub mod relations;
 pub mod schemas;
+pub mod status;
 pub mod tokens;
 
 /// Resolve a free-text argument that may reference a file or stdin, so every
