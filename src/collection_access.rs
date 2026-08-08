@@ -1334,7 +1334,7 @@ mod tests {
     use anybytes::View;
     use triblespace::core::blob::encodings::longstring::LongString;
     use triblespace::core::blob::encodings::succinctarchive::{
-        OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
+        merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
     };
     use triblespace::core::blob::TryFromBlob;
     use triblespace::core::collection::{empty_metadata_handle, CollectionDerive, CollectionMerge};
@@ -2394,6 +2394,209 @@ mod tests {
             .unwrap();
         let archive = SuccinctArchive::<OrderedUniverse>::try_from_blob(raw).unwrap();
         assert_eq!(archive.iter().collect::<TribleSet>(), expected);
+    }
+
+    #[test]
+    fn succinct_merge_is_exact_and_route_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = fresh_pile(&directory);
+        let key = directory.path().join("writer.key");
+        let signer = initialize_signer(&pile_path, Some(&key)).unwrap();
+        let scope = id(78);
+        let first_content = entity! { metadata::tag: &id(79) };
+        let second_content = entity! { metadata::tag: &id(80) };
+        let expected = first_content.facts().clone() + second_content.facts().clone();
+        let first = publish_fragment(
+            &pile_path,
+            Some(&key),
+            scope,
+            first_content,
+            Fragment::empty(),
+        )
+        .unwrap();
+        let second = publish_fragment(
+            &pile_path,
+            Some(&key),
+            scope,
+            second_content,
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let reader = pile.reader().unwrap();
+        let first_source: Blob<SimpleArchive> = reader
+            .get(Handle::<SimpleArchive>::from_hash(first.data()))
+            .unwrap();
+        let second_source: Blob<SimpleArchive> = reader
+            .get(Handle::<SimpleArchive>::from_hash(second.data()))
+            .unwrap();
+        let first_output = derive_succinctarchive_union_element(first_source.clone()).unwrap();
+        let second_output = derive_succinctarchive_union_element(second_source.clone()).unwrap();
+        let first_output_data: CollectionData = first_output.get_handle().into();
+        let second_output_data: CollectionData = second_output.get_handle().into();
+        let first_archive =
+            SuccinctArchive::<OrderedUniverse>::try_from_blob(first_output.clone()).unwrap();
+        let second_archive =
+            SuccinctArchive::<OrderedUniverse>::try_from_blob(second_output.clone()).unwrap();
+        let merged_output: Blob<SuccinctArchiveBlob> =
+            merge_ordered_archives(&[first_archive, second_archive]).to_blob();
+        let merged_output_data: CollectionData = merged_output.get_handle().into();
+
+        let wrong_source: Blob<SimpleArchive> =
+            entity! { metadata::tag: &id(81) }.into_facts().to_blob();
+        let wrong_output = derive_succinctarchive_union_element(wrong_source).unwrap();
+        let wrong_output_data: CollectionData = wrong_output.get_handle().into();
+        assert_ne!(wrong_output_data, merged_output_data);
+
+        let source_definition = simplearchive_union::definition(scope);
+        let target_definition = succinctarchive_union_definition(scope);
+        let first_derive = CollectionDerive::new(
+            source_definition.id(),
+            target_definition.id(),
+            first.data(),
+            first_output_data,
+        );
+        let second_derive = CollectionDerive::new(
+            source_definition.id(),
+            target_definition.id(),
+            second.data(),
+            second_output_data,
+        );
+        let valid_merge = CollectionMerge::new(
+            target_definition.id(),
+            first_output_data,
+            second_output_data,
+            merged_output_data,
+        );
+        let wrong_merge = CollectionMerge::new(
+            target_definition.id(),
+            first_output_data,
+            second_output_data,
+            wrong_output_data,
+        );
+
+        pile.put::<SimpleArchive, _>(CollectionDefinition::to_blob(&target_definition))
+            .unwrap();
+        for output in [
+            first_output,
+            second_output,
+            merged_output.clone(),
+            wrong_output,
+        ] {
+            pile.put::<SuccinctArchiveBlob, _>(output).unwrap();
+        }
+        for record in [
+            CollectionDerive::to_blob(&first_derive),
+            CollectionDerive::to_blob(&second_derive),
+            CollectionMerge::to_blob(&valid_merge),
+            CollectionMerge::to_blob(&wrong_merge),
+        ] {
+            pile.put::<SimpleArchive, _>(record).unwrap();
+        }
+        pile.flush().unwrap();
+        pile.close().unwrap();
+
+        let roster = allowed(&signer);
+        let snapshot = CollectionSnapshot::open(&pile_path).unwrap();
+        let catalog = RecipeCatalog::faculties();
+        let participating = catalog.backward_definitions(&target_definition).unwrap();
+        let participating_ids = participating.iter().map(CollectionDefinition::id).collect();
+        let authorized = BTreeSet::from([first.id(), second.id()]);
+        let resolution = resolve_collection_semantics(&snapshot.records, &authorized, |request| {
+            catalog.validate_request(
+                &snapshot.validation_exhaust,
+                &snapshot.reader,
+                &participating_ids,
+                request,
+            )
+        })
+        .unwrap();
+        assert!(resolution.admitted_claims().contains(&valid_merge.id()));
+        assert_eq!(
+            resolution
+                .rejected()
+                .get(&wrong_merge.id())
+                .map(String::as_str),
+            Some("succinct merge result is not the exact canonical input union")
+        );
+
+        let derive_first = snapshot
+            .resolve_definition(target_definition.clone(), &roster)
+            .unwrap();
+        assert_eq!(derive_first.cover, BTreeSet::from([merged_output_data]));
+        let mut expected_roots = vec![first.clone(), second.clone()];
+        expected_roots.sort_unstable_by_key(CollectionCommit::id);
+        assert_eq!(derive_first.root_commits, expected_roots);
+        let raw: Blob<SuccinctArchiveBlob> = derive_first
+            .reader
+            .get(Handle::<SuccinctArchiveBlob>::from_hash(merged_output_data))
+            .unwrap();
+        assert_eq!(
+            SuccinctArchive::<OrderedUniverse>::try_from_blob(raw)
+                .unwrap()
+                .iter()
+                .collect::<TribleSet>(),
+            expected,
+        );
+
+        // Add the commuting route: merge the SimpleArchive leaves first, then
+        // derive that exact union. The target bytes, complete signed support,
+        // and revision must remain identical to the derive-first construction.
+        let source_union = simplearchive_union::join(&first_source, &second_source).unwrap();
+        let source_union_data: CollectionData = source_union.get_handle().into();
+        let source_merge = CollectionMerge::new(
+            source_definition.id(),
+            first.data(),
+            second.data(),
+            source_union_data,
+        );
+        let merged_projection = derive_succinctarchive_union_element(source_union.clone()).unwrap();
+        assert_eq!(merged_projection.bytes, merged_output.bytes);
+        let merged_derive = CollectionDerive::new(
+            source_definition.id(),
+            target_definition.id(),
+            source_union_data,
+            merged_output_data,
+        );
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        pile.put::<SimpleArchive, _>(source_union).unwrap();
+        pile.put::<SimpleArchive, _>(CollectionMerge::to_blob(&source_merge))
+            .unwrap();
+        pile.put::<SimpleArchive, _>(CollectionDerive::to_blob(&merged_derive))
+            .unwrap();
+        pile.flush().unwrap();
+        pile.close().unwrap();
+
+        let merge_first_snapshot = CollectionSnapshot::open(&pile_path).unwrap();
+        let merge_first_resolution =
+            resolve_collection_semantics(&merge_first_snapshot.records, &authorized, |request| {
+                catalog.validate_request(
+                    &merge_first_snapshot.validation_exhaust,
+                    &merge_first_snapshot.reader,
+                    &participating_ids,
+                    request,
+                )
+            })
+            .unwrap();
+        assert!(merge_first_resolution
+            .admitted_claims()
+            .contains(&source_merge.id()));
+        assert!(merge_first_resolution
+            .admitted_claims()
+            .contains(&merged_derive.id()));
+        assert_eq!(
+            merge_first_resolution
+                .semantics()
+                .supporting_commit_ids(target_definition.id(), merged_output_data),
+            authorized,
+        );
+        let merge_first = merge_first_snapshot
+            .resolve_definition(target_definition, &roster)
+            .unwrap();
+        assert_eq!(merge_first.cover, derive_first.cover);
+        assert_eq!(merge_first.root_commits, derive_first.root_commits);
+        assert_eq!(merge_first.revision, derive_first.revision);
     }
 
     #[test]
