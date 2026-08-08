@@ -1,57 +1,45 @@
-//! Read-only GORBIE-embeddable viewer for the `decide` faculty.
+//! Read-only GORBIE viewer for the collection-native Decide ledger.
 //!
-//! Renders each decision as a paper card: status stripe (PROPOSED /
-//! RESOLVED / FORCED) on the left, title + context across the top,
-//! pros + cons in two columns (RAL signal green / traffic red), and
-//! the outcome at the bottom when resolved.
-//!
-//! The widget holds UI + cached-query state only; the host supplies
-//! the `decide` workspace at render time. Decisions sort newest-first.
-//!
-//! ```ignore
-//! let mut panel = DecidePanel::default();
-//! panel.render(ctx, decide_ws);
-//! ```
-
-use std::collections::HashMap;
+//! Resolution state is projected through the shared fork-visible model. The
+//! widget never infers forcedness from the current factor set and never picks
+//! one divergent outcome. Every live head retains its own evidence, time, and
+//! predecessor history in the card.
 
 use GORBIE::prelude::CardCtx;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::BlobStoreGet;
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 
-use crate::schemas::decide::{decide as decide_attrs, factor, KIND_CON, KIND_DECISION, KIND_PRO};
+use crate::decide::{self, FactorSide, Resolution, ResolutionSnapshot};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
-
-type TextHandle = Inline<Handle<LongString>>;
 
 // ── Color palette ────────────────────────────────────────────────────
 
-/// RAL 6018 yellow green — "PRO" accent.
 fn color_pro() -> egui::Color32 {
     egui::Color32::from_rgb(0x57, 0xa6, 0x39)
 }
 
-/// RAL 3020 traffic red — "CON" accent.
 fn color_con() -> egui::Color32 {
     egui::Color32::from_rgb(0xcc, 0x0a, 0x17)
 }
 
-/// RAL 1003 signal yellow — RESOLVED status (matches search highlight).
 fn color_resolved() -> egui::Color32 {
     egui::Color32::from_rgb(0xf7, 0xba, 0x0b)
 }
 
-/// RAL 2004 pure orange — FORCED status (override, attention).
 fn color_forced() -> egui::Color32 {
     egui::Color32::from_rgb(0xe2, 0x5b, 0x12)
+}
+
+fn color_agreed() -> egui::Color32 {
+    egui::Color32::from_rgb(0x2f, 0x78, 0xc4)
+}
+
+fn color_forked() -> egui::Color32 {
+    egui::Color32::from_rgb(0xb0, 0x55, 0xc9)
+}
+
+fn color_invalid() -> egui::Color32 {
+    egui::Color32::from_rgb(0xcc, 0x0a, 0x17)
 }
 
 fn color_proposed(ui: &egui::Ui) -> egui::Color32 {
@@ -78,7 +66,7 @@ fn color_frame(ui: &egui::Ui) -> egui::Color32 {
     }
 }
 
-// ── Row structs ──────────────────────────────────────────────────────
+// ── Projection ───────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 struct DecisionRow {
@@ -87,52 +75,117 @@ struct DecisionRow {
     context: Option<String>,
     about: Option<Id>,
     created_at: Option<i128>,
-    finished_at: Option<i128>,
-    outcome: Option<String>,
     pros: Vec<FactorRow>,
     cons: Vec<FactorRow>,
+    resolution: ResolutionView,
 }
 
 #[derive(Clone, Debug)]
 struct FactorRow {
+    id: Id,
     text: String,
-    detail: Option<String>,
     created_at: Option<i128>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
+struct ResolutionHeadRow {
+    id: Id,
+    outcome: String,
+    forced: bool,
+    evidence: Vec<Id>,
+    predecessors: Vec<Id>,
+    finished_at: Option<i128>,
+}
+
+#[derive(Clone, Debug)]
+enum ResolutionView {
+    Missing,
+    Unique(ResolutionHeadRow),
+    Agreed(Vec<ResolutionHeadRow>),
+    Forked(Vec<ResolutionHeadRow>),
+    Invalid(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Status {
     Proposed,
     Resolved,
     Forced,
+    Agreed,
+    ForcedAgreed,
+    Forked,
+    Invalid,
 }
 
 impl DecisionRow {
     fn status(&self) -> Status {
-        let resolved = self.finished_at.is_some()
-            && self
-                .outcome
-                .as_ref()
-                .map_or(false, |s| !s.trim().is_empty());
-        if !resolved {
-            Status::Proposed
-        } else if self.pros.is_empty() && self.cons.is_empty() {
-            Status::Forced
-        } else {
-            Status::Resolved
-        }
+        status_of(&self.resolution)
     }
 
-    /// Raw chronological key: created timestamp, missing → `i128::MIN`
-    /// ("oldest"). Sorted with `Reverse` for newest-first — negating
-    /// would overflow on `i128::MIN` (debug-build panic when a decision
-    /// has no created_at).
     fn sort_key(&self) -> i128 {
         self.created_at.unwrap_or(i128::MIN)
     }
 }
 
-// ── Live snapshot ────────────────────────────────────────────────────
+fn status_of(resolution: &ResolutionView) -> Status {
+    match resolution {
+        ResolutionView::Missing => Status::Proposed,
+        ResolutionView::Unique(head) if head.forced => Status::Forced,
+        ResolutionView::Unique(_) => Status::Resolved,
+        ResolutionView::Agreed(heads) if heads.first().is_some_and(|head| head.forced) => {
+            Status::ForcedAgreed
+        }
+        ResolutionView::Agreed(_) => Status::Agreed,
+        ResolutionView::Forked(_) => Status::Forked,
+        ResolutionView::Invalid(_) => Status::Invalid,
+    }
+}
+
+fn interval_key(value: decide::IntervalValue) -> Option<i128> {
+    let (lower, _): (i128, i128) = value.try_from_inline().ok()?;
+    Some(lower)
+}
+
+fn head_row(
+    dataset: DatasetView<'_>,
+    snapshot: ResolutionSnapshot,
+) -> Result<ResolutionHeadRow, String> {
+    let outcome = decide::read_text(dataset.reader, snapshot.outcome)
+        .map_err(|error| format!("read resolution {} outcome: {error:#}", id_hex(snapshot.id)))?;
+    Ok(ResolutionHeadRow {
+        id: snapshot.id,
+        outcome,
+        forced: snapshot.forced,
+        evidence: snapshot.evidence,
+        predecessors: snapshot.predecessors,
+        finished_at: interval_key(snapshot.finished_at),
+    })
+}
+
+fn resolution_view(dataset: DatasetView<'_>, resolution: Resolution) -> ResolutionView {
+    let convert = |snapshots: Vec<ResolutionSnapshot>| {
+        snapshots
+            .into_iter()
+            .map(|snapshot| head_row(dataset, snapshot))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    match resolution {
+        Resolution::Missing => ResolutionView::Missing,
+        Resolution::Unique(snapshot) => match head_row(dataset, snapshot) {
+            Ok(head) => ResolutionView::Unique(head),
+            Err(error) => ResolutionView::Invalid(error),
+        },
+        Resolution::Agreed(snapshots) => match convert(snapshots) {
+            Ok(heads) => ResolutionView::Agreed(heads),
+            Err(error) => ResolutionView::Invalid(error),
+        },
+        Resolution::Forked(snapshots) => match convert(snapshots) {
+            Ok(heads) => ResolutionView::Forked(heads),
+            Err(error) => ResolutionView::Invalid(error),
+        },
+        Resolution::Invalid(error) => ResolutionView::Invalid(error),
+    }
+}
 
 struct DecideLive {
     cached_revision: DatasetRevision,
@@ -141,217 +194,108 @@ struct DecideLive {
 
 impl DecideLive {
     fn refresh(dataset: DatasetView<'_>) -> Self {
-        let space = dataset.facts;
-
-        // Per-decision rollups — title / description / outcome handles,
-        // about pointer, created/finished timestamps.
-        let mut decisions: HashMap<Id, DecisionRow> = HashMap::new();
-
-        for (id,) in find!(
-            (d: Id,),
-            pattern!(space, [{ ?d @ metadata::tag: KIND_DECISION }])
-        ) {
-            decisions.insert(
-                id,
-                DecisionRow {
-                    id,
-                    title: String::from("(untitled)"),
-                    context: None,
-                    about: None,
-                    created_at: None,
-                    finished_at: None,
-                    outcome: None,
-                    pros: Vec::new(),
-                    cons: Vec::new(),
+        let mut decisions = Vec::new();
+        for id in decide::decision_anchors(dataset.facts) {
+            let genesis = match decide::genesis_for_decision(dataset.facts, id) {
+                Ok(Some(genesis)) => genesis,
+                Ok(None) => {
+                    decisions.push(invalid_row(id, "decision has no genesis"));
+                    continue;
+                }
+                Err(error) => {
+                    decisions.push(invalid_row(id, format!("invalid genesis: {error:#}")));
+                    continue;
+                }
+            };
+            let title = match decide::read_text(dataset.reader, genesis.title) {
+                Ok(title) => title,
+                Err(error) => {
+                    decisions.push(invalid_row(id, format!("read title: {error:#}")));
+                    continue;
+                }
+            };
+            let context = match genesis.context {
+                Some(handle) => match decide::read_text(dataset.reader, handle) {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        decisions.push(invalid_row(id, format!("read context: {error:#}")));
+                        continue;
+                    }
                 },
-            );
-        }
-
-        // Title.
-        let title_rows: Vec<(Id, TextHandle)> = find!(
-            (d: Id, h: TextHandle),
-            pattern!(space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                metadata::name: ?h,
-            }])
-        )
-        .collect();
-        for (id, h) in title_rows {
-            if let Some(row) = decisions.get_mut(&id) {
-                if let Some(text) = read_text(dataset, h) {
-                    row.title = text;
+                None => None,
+            };
+            let factors = match decide::factors_for_decision(dataset.facts, id) {
+                Ok(factors) => factors,
+                Err(error) => {
+                    decisions.push(invalid_row(id, format!("invalid factors: {error:#}")));
+                    continue;
+                }
+            };
+            let mut pros = Vec::new();
+            let mut cons = Vec::new();
+            let mut factor_error = None;
+            for factor in factors {
+                let text = match decide::read_text(dataset.reader, factor.text) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        factor_error =
+                            Some(format!("read factor {}: {error:#}", id_hex(factor.id)));
+                        break;
+                    }
+                };
+                let row = FactorRow {
+                    id: factor.id,
+                    text,
+                    created_at: interval_key(factor.created_at),
+                };
+                match factor.side {
+                    FactorSide::Pro => pros.push(row),
+                    FactorSide::Con => cons.push(row),
                 }
             }
-        }
-
-        // Context (description).
-        let ctx_rows: Vec<(Id, TextHandle)> = find!(
-            (d: Id, h: TextHandle),
-            pattern!(space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                metadata::description: ?h,
-            }])
-        )
-        .collect();
-        for (id, h) in ctx_rows {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.context = read_text(dataset, h);
+            if let Some(error) = factor_error {
+                decisions.push(invalid_row(id, error));
+                continue;
             }
+            pros.sort_by_key(|factor| (factor.created_at.unwrap_or(i128::MAX), factor.id));
+            cons.sort_by_key(|factor| (factor.created_at.unwrap_or(i128::MAX), factor.id));
+            decisions.push(DecisionRow {
+                id,
+                title,
+                context,
+                about: genesis.about,
+                created_at: interval_key(genesis.created_at),
+                pros,
+                cons,
+                resolution: resolution_view(dataset, decide::resolution(dataset.facts, id)),
+            });
         }
-
-        // Outcome (only set on resolved).
-        let outcome_rows: Vec<(Id, TextHandle)> = find!(
-            (d: Id, h: TextHandle),
-            pattern!(space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                decide_attrs::outcome: ?h,
-            }])
-        )
-        .collect();
-        for (id, h) in outcome_rows {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.outcome = read_text(dataset, h);
-            }
-        }
-
-        // About pointer.
-        for (id, target) in find!(
-            (d: Id, a: Id),
-            pattern!(space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                decide_attrs::about: ?a,
-            }])
-        ) {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.about = Some(target);
-            }
-        }
-
-        // Timestamps (intervals — take the start ns).
-        for (id, ts) in find!(
-            (d: Id, ts: (i128, i128)),
-            pattern!(space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                metadata::created_at: ?ts,
-            }])
-        ) {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.created_at = Some(ts.0);
-            }
-        }
-        for (id, ts) in find!(
-            (d: Id, ts: (i128, i128)),
-            pattern!(space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                metadata::finished_at: ?ts,
-            }])
-        ) {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.finished_at = Some(ts.0);
-            }
-        }
-
-        // Pros / cons. Each factor has metadata::name (one-liner),
-        // optional metadata::description (long form), and a
-        // factor::about_decision pointer back to its parent.
-        collect_factors(dataset, space, KIND_PRO, &mut decisions, |row, f| {
-            row.pros.push(f);
-        });
-        collect_factors(dataset, space, KIND_CON, &mut decisions, |row, f| {
-            row.cons.push(f);
-        });
-
-        // Stable factor ordering: oldest-first within each column.
-        for row in decisions.values_mut() {
-            row.pros.sort_by_key(|f| f.created_at.unwrap_or(i128::MAX));
-            row.cons.sort_by_key(|f| f.created_at.unwrap_or(i128::MAX));
-        }
-
-        let mut decisions: Vec<DecisionRow> = decisions.into_values().collect();
-        // Newest first; undated decisions (MIN key) sink to the bottom.
-        decisions.sort_by_key(|d| std::cmp::Reverse(d.sort_key()));
-
-        DecideLive {
+        decisions.sort_by_key(|decision| std::cmp::Reverse((decision.sort_key(), decision.id)));
+        Self {
             cached_revision: dataset.revision,
             decisions,
         }
     }
 }
 
-fn collect_factors(
-    dataset: DatasetView<'_>,
-    space: &TribleSet,
-    kind: Id,
-    decisions: &mut HashMap<Id, DecisionRow>,
-    mut push: impl FnMut(&mut DecisionRow, FactorRow),
-) {
-    // Pull the (factor_id, decision_id, name_handle) triple in one
-    // pass; description and created_at are looked up per-factor since
-    // they're optional.
-    let rows: Vec<(Id, Id, TextHandle)> = find!(
-        (f: Id, d: Id, name: TextHandle),
-        pattern!(space, [{
-            ?f @
-                metadata::tag: kind,
-                metadata::name: ?name,
-                factor::about_decision: ?d,
-        }])
-    )
-    .collect();
-    for (factor_id, decision_id, name) in rows {
-        let text = read_text(dataset, name).unwrap_or_else(|| "(unnamed)".into());
-        let detail = find!(
-            (h: TextHandle,),
-            pattern!(space, [{ factor_id @ metadata::description: ?h }])
-        )
-        .next()
-        .and_then(|(h,)| read_text(dataset, h));
-        let created_at = find!(
-            (ts: (i128, i128),),
-            pattern!(space, [{ factor_id @ metadata::created_at: ?ts }])
-        )
-        .next()
-        .map(|(ts,)| ts.0);
-        if let Some(row) = decisions.get_mut(&decision_id) {
-            push(
-                row,
-                FactorRow {
-                    text,
-                    detail,
-                    created_at,
-                },
-            );
-        }
+fn invalid_row(id: Id, error: impl Into<String>) -> DecisionRow {
+    DecisionRow {
+        id,
+        title: "(invalid decision)".to_owned(),
+        context: None,
+        about: None,
+        created_at: None,
+        pros: Vec::new(),
+        cons: Vec::new(),
+        resolution: ResolutionView::Invalid(error.into()),
     }
-}
-
-fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> Option<String> {
-    dataset
-        .reader
-        .get::<View<str>, LongString>(h)
-        .ok()
-        .map(|v| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        })
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct DecidePanel {
     live: Option<DecideLive>,
-}
-
-impl Default for DecidePanel {
-    fn default() -> Self {
-        Self { live: None }
-    }
 }
 
 impl DecidePanel {
@@ -360,11 +304,11 @@ impl DecidePanel {
     }
 
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
-        let need_refresh = match self.live.as_ref() {
-            None => true,
-            Some(l) => l.cached_revision != dataset.revision,
-        };
-        if need_refresh {
+        if self
+            .live
+            .as_ref()
+            .is_none_or(|live| live.cached_revision != dataset.revision)
+        {
             self.live = Some(DecideLive::refresh(dataset));
         }
 
@@ -376,53 +320,48 @@ impl DecidePanel {
             let resolved = live
                 .decisions
                 .iter()
-                .filter(|d| matches!(d.status(), Status::Resolved | Status::Forced))
+                .filter(|decision| {
+                    matches!(
+                        decision.status(),
+                        Status::Resolved | Status::Forced | Status::Agreed | Status::ForcedAgreed
+                    )
+                })
                 .count();
-            let open = count - resolved;
-
+            let forked = live
+                .decisions
+                .iter()
+                .filter(|decision| decision.status() == Status::Forked)
+                .count();
+            let open = count.saturating_sub(resolved);
             let mut search = ctx.search();
             let needle = search.query().to_lowercase();
             let search_active = !needle.is_empty();
 
-            ctx.grid(|g| {
-                // Header counts.
-                g.full(|ctx| {
+            ctx.grid(|grid| {
+                grid.full(|ctx| {
                     let ui = ctx.ui_mut();
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        ui.label(
-                            egui::RichText::new(format!("{count} DECISIONS"))
-                                .monospace()
-                                .strong()
-                                .small()
-                                .color(color_muted(ui)),
+                        count_label(ui, format!("{count} DECISIONS"), color_muted(ui), true);
+                        count_label(
+                            ui,
+                            format!("{open} OPEN/UNSETTLED"),
+                            color_proposed(ui),
+                            false,
                         );
-                        ui.label(
-                            egui::RichText::new(format!("{open} OPEN"))
-                                .monospace()
-                                .small()
-                                .color(color_proposed(ui)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("{resolved} RESOLVED"))
-                                .monospace()
-                                .small()
-                                .color(color_resolved()),
-                        );
+                        count_label(ui, format!("{resolved} RESOLVED"), color_resolved(), false);
+                        if forked > 0 {
+                            count_label(ui, format!("{forked} FORKED"), color_forked(), false);
+                        }
                     });
                 });
 
                 if live.decisions.is_empty() {
-                    g.full(|ctx| {
+                    grid.full(|ctx| {
                         let ui = ctx.ui_mut();
                         ui.add_space(16.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new("\u{2696}")
-                                    .size(28.0)
-                                    .color(color_muted(ui)),
-                            );
-                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("⚖").size(28.0).color(color_muted(ui)));
                             ui.label(
                                 egui::RichText::new("No decisions yet.")
                                     .monospace()
@@ -436,26 +375,22 @@ impl DecidePanel {
                     return;
                 }
 
-                for dec in &live.decisions {
-                    if search_active && !decision_matches_search(dec, &needle) {
+                for decision in &live.decisions {
+                    if search_active && !decision_matches_search(decision, &needle) {
                         continue;
                     }
-                    let match_info = if search_active {
-                        Some(search.report(egui::Id::new(("decide_match", dec.id))))
-                    } else {
-                        None
-                    };
-                    let is_focused = match_info.as_ref().map_or(false, |i| i.is_focused);
-                    g.full(|ctx| {
+                    let match_info = search_active
+                        .then(|| search.report(egui::Id::new(("decide_match", decision.id))));
+                    let focused = match_info.as_ref().is_some_and(|info| info.is_focused);
+                    grid.full(|ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
-                        render_decision(ui, dec, &needle, is_focused);
+                        render_decision(ui, decision, &needle, focused);
                         if let Some(info) = match_info {
                             if info.should_scroll_to {
-                                let post_y = ui.cursor().min.y;
                                 let rect = egui::Rect::from_min_max(
                                     egui::pos2(ui.min_rect().left(), pre_y),
-                                    egui::pos2(ui.min_rect().right(), post_y),
+                                    egui::pos2(ui.min_rect().right(), ui.cursor().min.y),
                                 );
                                 ui.scroll_to_rect(rect, Some(egui::Align::Center));
                             }
@@ -467,31 +402,33 @@ impl DecidePanel {
     }
 }
 
-fn decision_matches_search(dec: &DecisionRow, needle: &str) -> bool {
-    if dec.title.to_lowercase().contains(needle) {
-        return true;
+fn count_label(ui: &mut egui::Ui, text: String, color: egui::Color32, strong: bool) {
+    let mut text = egui::RichText::new(text).monospace().small().color(color);
+    if strong {
+        text = text.strong();
     }
-    if let Some(c) = &dec.context {
-        if c.to_lowercase().contains(needle) {
-            return true;
+    ui.label(text);
+}
+
+fn decision_matches_search(decision: &DecisionRow, needle: &str) -> bool {
+    decision.title.to_lowercase().contains(needle)
+        || decision
+            .context
+            .as_ref()
+            .is_some_and(|context| context.to_lowercase().contains(needle))
+        || decision
+            .pros
+            .iter()
+            .chain(&decision.cons)
+            .any(|factor| factor.text.to_lowercase().contains(needle))
+        || match &decision.resolution {
+            ResolutionView::Unique(head) => head.outcome.to_lowercase().contains(needle),
+            ResolutionView::Agreed(heads) | ResolutionView::Forked(heads) => heads
+                .iter()
+                .any(|head| head.outcome.to_lowercase().contains(needle)),
+            ResolutionView::Invalid(error) => error.to_lowercase().contains(needle),
+            ResolutionView::Missing => false,
         }
-    }
-    if let Some(outcome) = &dec.outcome {
-        if outcome.to_lowercase().contains(needle) {
-            return true;
-        }
-    }
-    for f in dec.pros.iter().chain(dec.cons.iter()) {
-        if f.text.to_lowercase().contains(needle) {
-            return true;
-        }
-        if let Some(d) = &f.detail {
-            if d.to_lowercase().contains(needle) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
@@ -504,6 +441,10 @@ fn status_color(status: Status, ui: &egui::Ui) -> egui::Color32 {
         Status::Proposed => color_proposed(ui),
         Status::Resolved => color_resolved(),
         Status::Forced => color_forced(),
+        Status::Agreed => color_agreed(),
+        Status::ForcedAgreed => color_forced(),
+        Status::Forked => color_forked(),
+        Status::Invalid => color_invalid(),
     }
 }
 
@@ -512,27 +453,25 @@ fn status_label(status: Status) -> &'static str {
         Status::Proposed => "PROPOSED",
         Status::Resolved => "RESOLVED",
         Status::Forced => "FORCED",
+        Status::Agreed => "AGREED",
+        Status::ForcedAgreed => "FORCED AGREEMENT",
+        Status::Forked => "FORKED",
+        Status::Invalid => "INVALID",
     }
 }
 
-fn render_decision(ui: &mut egui::Ui, dec: &DecisionRow, search_needle: &str, focused: bool) {
-    let frame_fill = ui.visuals().window_fill;
-    let stroke_color = color_frame(ui);
-    let status = dec.status();
-    let stripe_color = status_color(status, ui);
-    let stripe_label = status_label(status);
-
+fn render_decision(ui: &mut egui::Ui, decision: &DecisionRow, needle: &str, focused: bool) {
+    let status = decision.status();
     let inner_margin = egui::Margin {
         left: (STROKE_INSET + STATUS_STRIPE_WIDTH + 8.0) as i8,
         right: 12,
         top: 8,
         bottom: 8,
     };
-
     ui.vertical(|ui| {
-        let frame_resp = egui::Frame::NONE
-            .fill(frame_fill)
-            .stroke(egui::Stroke::new(STROKE_INSET, stroke_color))
+        let frame = egui::Frame::NONE
+            .fill(ui.visuals().window_fill)
+            .stroke(egui::Stroke::new(STROKE_INSET, color_frame(ui)))
             .shadow(egui::epaint::Shadow {
                 offset: [2, 2],
                 blur: 0,
@@ -542,107 +481,69 @@ fn render_decision(ui: &mut egui::Ui, dec: &DecisionRow, search_needle: &str, fo
             .corner_radius(egui::CornerRadius::ZERO)
             .inner_margin(inner_margin)
             .show(ui, |ui| {
-                // Title row: title on the left, optional about → and age
-                // on the right (`Align::Min` cross-axis to avoid the
-                // frame-delayed cell sizing feedback loop).
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                    if let Some(age) = format_relative_age(dec.created_at) {
-                        ui.label(
-                            egui::RichText::new(age)
-                                .monospace()
-                                .small()
-                                .color(color_muted(ui)),
-                        );
-                    }
-                    if let Some(about) = dec.about {
-                        ui.label(
-                            egui::RichText::new(format!("\u{2192} {}", id_hex(about)))
-                                .monospace()
-                                .small()
-                                .color(color_muted(ui)),
-                        );
-                    }
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                        GORBIE::search::highlight_label(
-                            ui,
-                            &dec.title,
-                            search_needle,
-                            title_format(ui),
-                            focused,
-                        );
-                    });
-                });
-
-                if let Some(context_text) = &dec.context {
+                render_title(ui, decision, needle, focused);
+                if let Some(context) = &decision.context {
                     ui.add_space(2.0);
                     GORBIE::search::highlight_label(
                         ui,
-                        context_text,
-                        search_needle,
+                        context,
+                        needle,
                         body_format(ui, color_muted(ui)),
                         focused,
                     );
                 }
-
                 ui.add_space(6.0);
-
-                ui.columns(2, |cols| {
+                ui.columns(2, |columns| {
                     render_factor_column(
-                        &mut cols[0],
+                        &mut columns[0],
                         "PROS",
                         color_pro(),
-                        &dec.pros,
-                        search_needle,
+                        &decision.pros,
+                        needle,
                         focused,
                     );
                     render_factor_column(
-                        &mut cols[1],
+                        &mut columns[1],
                         "CONS",
                         color_con(),
-                        &dec.cons,
-                        search_needle,
+                        &decision.cons,
+                        needle,
                         focused,
                     );
                 });
-
-                if let Some(outcome) = &dec.outcome {
-                    if !outcome.trim().is_empty() {
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(2.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                            if let Some(age) = format_relative_age(dec.finished_at) {
-                                ui.label(
-                                    egui::RichText::new(age)
-                                        .monospace()
-                                        .small()
-                                        .color(color_muted(ui)),
-                                );
-                            }
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                                ui.label(
-                                    egui::RichText::new("OUTCOME")
-                                        .monospace()
-                                        .small()
-                                        .strong()
-                                        .color(color_resolved()),
-                                );
-                            });
-                        });
-                        GORBIE::search::highlight_label(
-                            ui,
-                            outcome,
-                            search_needle,
-                            body_format(ui, ui.visuals().text_color()),
-                            focused,
-                        );
-                    }
-                }
+                render_resolution(ui, &decision.resolution, needle, focused);
             });
+        paint_status_stripe(
+            ui.painter(),
+            frame.response.rect,
+            status_color(status, ui),
+            status_label(status),
+        );
+    });
+}
 
-        // Left status stripe, compass-card idiom.
-        let outer = frame_resp.response.rect;
-        paint_status_stripe(ui.painter(), outer, stripe_color, stripe_label);
+fn render_title(ui: &mut egui::Ui, decision: &DecisionRow, needle: &str, focused: bool) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+        if let Some(age) = format_relative_age(decision.created_at) {
+            ui.label(
+                egui::RichText::new(age)
+                    .monospace()
+                    .small()
+                    .color(color_muted(ui)),
+            );
+        }
+        if let Some(about) = decision.about {
+            ui.label(
+                egui::RichText::new(format!("→ {}", short_id(about)))
+                    .monospace()
+                    .small()
+                    .color(color_muted(ui)),
+            )
+            .on_hover_text(id_hex(about));
+        }
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+            GORBIE::search::highlight_label(ui, &decision.title, needle, title_format(ui), focused);
+        });
     });
 }
 
@@ -651,7 +552,7 @@ fn render_factor_column(
     heading: &str,
     accent: egui::Color32,
     factors: &[FactorRow],
-    search_needle: &str,
+    needle: &str,
     focused: bool,
 ) {
     ui.vertical(|ui| {
@@ -663,41 +564,177 @@ fn render_factor_column(
                 .color(accent),
         );
         if factors.is_empty() {
-            ui.label(
-                egui::RichText::new("\u{2014}") // em dash
-                    .small()
-                    .color(color_muted(ui)),
-            );
+            ui.label(egui::RichText::new("—").small().color(color_muted(ui)));
             return;
         }
-        for f in factors {
+        for factor in factors {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(
-                    egui::RichText::new("\u{2022}") // bullet
-                        .small()
-                        .color(accent),
-                );
+                ui.label(egui::RichText::new("•").small().color(accent));
                 GORBIE::search::highlight_label(
                     ui,
-                    &f.text,
-                    search_needle,
+                    &factor.text,
+                    needle,
                     body_format(ui, ui.visuals().text_color()),
                     focused,
                 );
+                ui.label(
+                    egui::RichText::new(short_id(factor.id))
+                        .monospace()
+                        .small()
+                        .color(color_muted(ui)),
+                )
+                .on_hover_text(id_hex(factor.id));
             });
-            if let Some(detail) = &f.detail {
+        }
+    });
+}
+
+fn render_resolution(ui: &mut egui::Ui, resolution: &ResolutionView, needle: &str, focused: bool) {
+    match resolution {
+        ResolutionView::Missing => {}
+        ResolutionView::Unique(head) => {
+            resolution_separator(
+                ui,
+                if head.forced {
+                    "FORCED OUTCOME"
+                } else {
+                    "OUTCOME"
+                },
+                status_color(status_of(resolution), ui),
+            );
+            render_head(ui, head, true, needle, focused);
+        }
+        ResolutionView::Agreed(heads) => {
+            resolution_separator(
+                ui,
+                &format!("AGREED OUTCOME · {} HEADS", heads.len()),
+                status_color(status_of(resolution), ui),
+            );
+            if let Some(first) = heads.first() {
                 GORBIE::search::highlight_label(
                     ui,
-                    detail,
-                    search_needle,
-                    body_format(ui, color_muted(ui)),
+                    &first.outcome,
+                    needle,
+                    body_format(ui, ui.visuals().text_color()),
                     focused,
                 );
             }
+            for head in heads {
+                render_head(ui, head, false, needle, focused);
+            }
+        }
+        ResolutionView::Forked(heads) => {
+            resolution_separator(ui, &fork_label(heads), color_forked());
+            for head in heads {
+                render_head(ui, head, true, needle, focused);
+            }
+        }
+        ResolutionView::Invalid(error) => {
+            resolution_separator(ui, "INVALID RESOLUTION", color_invalid());
+            ui.label(
+                egui::RichText::new(error)
+                    .monospace()
+                    .small()
+                    .color(color_invalid()),
+            );
+        }
+    }
+}
+
+fn fork_label(heads: &[ResolutionHeadRow]) -> String {
+    format!(
+        "DIVERGENT RESOLUTIONS · {} HEADS · NONE SELECTED",
+        heads.len()
+    )
+}
+
+fn resolution_separator(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(label)
+            .monospace()
+            .small()
+            .strong()
+            .color(color),
+    );
+}
+
+fn render_head(
+    ui: &mut egui::Ui,
+    head: &ResolutionHeadRow,
+    show_outcome: bool,
+    needle: &str,
+    focused: bool,
+) {
+    ui.add_space(3.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new(format!("HEAD {}", short_id(head.id)))
+                .monospace()
+                .small()
+                .strong()
+                .color(color_muted(ui)),
+        )
+        .on_hover_text(id_hex(head.id));
+        ui.label(
+            egui::RichText::new(format!("forced={}", head.forced))
+                .monospace()
+                .small()
+                .color(if head.forced {
+                    color_forced()
+                } else {
+                    color_muted(ui)
+                }),
+        );
+        if let Some(age) = format_relative_age(head.finished_at) {
+            ui.label(
+                egui::RichText::new(age)
+                    .monospace()
+                    .small()
+                    .color(color_muted(ui)),
+            );
         }
     });
+    render_id_set(ui, "evidence", &head.evidence);
+    if !head.predecessors.is_empty() {
+        render_id_set(ui, "supersedes", &head.predecessors);
+    }
+    if show_outcome {
+        GORBIE::search::highlight_label(
+            ui,
+            &head.outcome,
+            needle,
+            body_format(ui, ui.visuals().text_color()),
+            focused,
+        );
+    }
+}
+
+fn render_id_set(ui: &mut egui::Ui, label: &str, ids: &[Id]) {
+    let display = if ids.is_empty() {
+        "(none)".to_owned()
+    } else {
+        ids.iter()
+            .map(|id| short_id(*id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let full = ids
+        .iter()
+        .map(|id| id_hex(*id))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ui.label(
+        egui::RichText::new(format!("{label}: {display}"))
+            .monospace()
+            .small()
+            .color(color_muted(ui)),
+    )
+    .on_hover_text(full);
 }
 
 fn paint_status_stripe(
@@ -706,26 +743,24 @@ fn paint_status_stripe(
     color: egui::Color32,
     label: &str,
 ) {
-    let stripe_rect = egui::Rect::from_min_size(
+    let stripe = egui::Rect::from_min_size(
         outer.min + egui::vec2(STROKE_INSET, STROKE_INSET),
         egui::vec2(STATUS_STRIPE_WIDTH, outer.height() - 2.0 * STROKE_INSET),
     );
-    painter.rect_filled(stripe_rect, egui::CornerRadius::ZERO, color);
-    let font = egui::FontId::monospace(9.0);
+    painter.rect_filled(stripe, egui::CornerRadius::ZERO, color);
     let text_color = GORBIE::themes::colorhash::text_color_on(color);
-    let galley = painter.layout_no_wrap(label.to_string(), font, text_color);
-    if galley.size().x + 6.0 > stripe_rect.height() {
+    let galley = painter.layout_no_wrap(label.to_owned(), egui::FontId::monospace(9.0), text_color);
+    if galley.size().x + 6.0 > stripe.height() {
         return;
     }
-    let gh = galley.size().y;
-    let pos = egui::pos2(
-        stripe_rect.left() + (STATUS_STRIPE_WIDTH + gh) * 0.5,
-        stripe_rect.top() + 5.0,
+    let position = egui::pos2(
+        stripe.left() + (STATUS_STRIPE_WIDTH + galley.size().y) * 0.5,
+        stripe.top() + 5.0,
     );
-    let mut text_shape = egui::epaint::TextShape::new(pos, galley, text_color);
-    text_shape.angle = std::f32::consts::FRAC_PI_2;
-    text_shape.fallback_color = text_color;
-    painter.add(text_shape);
+    let mut text = egui::epaint::TextShape::new(position, galley, text_color);
+    text.angle = std::f32::consts::FRAC_PI_2;
+    text.fallback_color = text_color;
+    painter.add(text);
 }
 
 fn title_format(ui: &egui::Ui) -> egui::TextFormat {
@@ -748,31 +783,94 @@ fn id_hex(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn format_relative_age(ts: Option<i128>) -> Option<String> {
-    let ts = ts?;
-    let now = now_tai_ns();
-    let secs = ((now - ts) / 1_000_000_000).max(0) as i64;
-    Some(format_age_secs(secs))
+fn short_id(id: Id) -> String {
+    id_hex(id)[..8].to_owned()
 }
 
-fn format_age_secs(secs: i64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h", secs / 3600)
-    } else if secs < 86400 * 30 {
-        format!("{}d", secs / 86400)
-    } else if secs < 86400 * 365 {
-        format!("{}mo", secs / (86400 * 30))
+fn format_relative_age(timestamp: Option<i128>) -> Option<String> {
+    let timestamp = timestamp?;
+    let now = hifitime::Epoch::now()
+        .ok()?
+        .to_tai_duration()
+        .total_nanoseconds();
+    let seconds = ((now - timestamp) / 1_000_000_000).max(0) as i64;
+    Some(format_age_secs(seconds))
+}
+
+fn format_age_secs(seconds: i64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds < 86_400 * 30 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds < 86_400 * 365 {
+        format!("{}mo", seconds / (86_400 * 30))
     } else {
-        format!("{}y", secs / (86400 * 365))
+        format!("{}y", seconds / (86_400 * 365))
     }
 }
 
-fn now_tai_ns() -> i128 {
-    use hifitime::Epoch;
-    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_tai_seconds(0.0));
-    now.to_tai_duration().total_nanoseconds()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn head(byte: u8, outcome: &str, forced: bool, evidence: Vec<Id>) -> ResolutionHeadRow {
+        ResolutionHeadRow {
+            id: id(byte),
+            outcome: outcome.to_owned(),
+            forced,
+            evidence,
+            predecessors: Vec::new(),
+            finished_at: Some(byte.into()),
+        }
+    }
+
+    #[test]
+    fn forcedness_comes_only_from_the_explicit_head_bit() {
+        let forced = ResolutionView::Unique(head(1, "yes", true, vec![id(3), id(4)]));
+        assert_eq!(status_of(&forced), Status::Forced);
+        let not_forced = ResolutionView::Unique(head(2, "yes", false, Vec::new()));
+        assert_eq!(status_of(&not_forced), Status::Resolved);
+    }
+
+    #[test]
+    fn agreement_keeps_head_local_evidence() {
+        let view = ResolutionView::Agreed(vec![
+            head(1, "yes", false, vec![id(3), id(4)]),
+            head(2, "yes", false, vec![id(3), id(5)]),
+        ]);
+        assert_eq!(status_of(&view), Status::Agreed);
+        let ResolutionView::Agreed(heads) = view else {
+            unreachable!()
+        };
+        assert_ne!(heads[0].evidence, heads[1].evidence);
+    }
+
+    #[test]
+    fn divergent_heads_are_never_projected_as_resolved() {
+        let view = ResolutionView::Forked(vec![
+            head(1, "yes", false, Vec::new()),
+            head(2, "no", false, Vec::new()),
+        ]);
+        assert_eq!(status_of(&view), Status::Forked);
+    }
+
+    #[test]
+    fn forced_bit_only_fork_is_not_labelled_as_divergent_outcomes() {
+        let heads = vec![
+            head(1, "yes", false, Vec::new()),
+            head(2, "yes", true, Vec::new()),
+        ];
+        assert_eq!(
+            fork_label(&heads),
+            "DIVERGENT RESOLUTIONS · 2 HEADS · NONE SELECTED"
+        );
+    }
 }

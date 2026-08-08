@@ -2,9 +2,10 @@
 //!
 //! Widgets consume borrowed [`DatasetView`] values through a keyed
 //! [`WidgetContext`]. `StorageState` owns the currently loaded snapshot and the
-//! top-bar path selector and has no write path. It loads Compass directly from
-//! its union collection under the existing durable signer; the private legacy
-//! catalog remains only for faculties which have not made that cutover yet.
+//! top-bar path selector and has no write path. It loads Compass and Decide
+//! directly from their union collections under the existing durable signer;
+//! the private legacy catalog remains only for faculties which have not made
+//! that cutover yet.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use crate::collection_access::{
     self, CollectionRevision, CollectionView, LegacyBranchRevision, LegacyBranchView,
 };
 use crate::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
+use crate::schemas::decide::DEFAULT_SCOPE_ID as DECIDE_SCOPE_ID;
 
 /// Stable logical input requested by a widget.
 ///
@@ -147,9 +149,9 @@ struct LegacySource {
     branches: &'static [&'static str],
 }
 
-// Temporary and deliberately private. Compass is absent because it has made
-// the collection cutover; every remaining source is loaded only from legacy
-// state until its own schema migration lands.
+// Temporary and deliberately private. Compass and Decide are absent because
+// they have made the collection cutover; every remaining source is loaded
+// only from legacy state until its own schema migration lands.
 const LEGACY_SOURCE_CATALOG: &[LegacySource] = &[
     LegacySource {
         key: SourceKey::Archive,
@@ -158,10 +160,6 @@ const LEGACY_SOURCE_CATALOG: &[LegacySource] = &[
     LegacySource {
         key: SourceKey::Atlas,
         branches: &["atlas"],
-    },
-    LegacySource {
-        key: SourceKey::Decide,
-        branches: &["decide"],
     },
     LegacySource {
         key: SourceKey::Discord,
@@ -438,13 +436,22 @@ fn load_catalog(path: &Path) -> Result<BTreeMap<SourceKey, LoadedDataset>, Strin
         }
     }
     let signer = collection_access::load_signer(path, None)
-        .map_err(|error| format!("load Compass collection signer: {error:#}"))?;
+        .map_err(|error| format!("load collection signer: {error:#}"))?;
     let allowed = HashSet::from([signer.verifying_key()]);
-    let compass = collection_access::materialize_scope(path, COMPASS_SCOPE_ID, &allowed)
+    let snapshot = collection_access::CollectionSnapshot::open(path)
+        .map_err(|error| format!("open collection snapshot: {error:#}"))?;
+    let compass = snapshot
+        .materialize_scope(COMPASS_SCOPE_ID, &allowed)
         .map_err(|error| format!("materialize Compass collection: {error:#}"))?;
     crate::compass::validate_catalog(&compass.reader, &compass.facts)
         .map_err(|error| format!("validate Compass collection: {error:#}"))?;
     datasets.insert(SourceKey::Compass, LoadedDataset::from_collection(compass));
+    let decide = snapshot
+        .materialize_scope(DECIDE_SCOPE_ID, &allowed)
+        .map_err(|error| format!("materialize Decide collection: {error:#}"))?;
+    crate::decide::validate_catalog(&decide.reader, &decide.facts)
+        .map_err(|error| format!("validate Decide collection: {error:#}"))?;
+    datasets.insert(SourceKey::Decide, LoadedDataset::from_collection(decide));
     Ok(datasets)
 }
 
@@ -561,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn compass_has_no_legacy_fallback_and_other_collection_scopes_are_ignored() {
+    fn collection_sources_have_no_legacy_fallback_and_other_scopes_are_ignored() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("collection-only.pile");
         let key = directory.path().join("writer.key");
@@ -581,10 +588,12 @@ mod tests {
         let context = storage.context();
 
         let compass = context.dataset(SourceKey::Compass).unwrap();
+        let decide = context.dataset(SourceKey::Decide).unwrap();
         assert!(compass.facts.is_empty());
+        assert!(decide.facts.is_empty());
         assert!(SourceKey::ALL
             .into_iter()
-            .filter(|key| *key != SourceKey::Compass)
+            .filter(|key| !matches!(key, SourceKey::Compass | SourceKey::Decide))
             .all(|key| context.dataset(key).is_none()));
         assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
     }
@@ -640,6 +649,107 @@ mod tests {
     }
 
     #[test]
+    fn decide_source_materializes_the_collection_and_tracks_its_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("decide-collection.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+
+        let decision = Id::new([0x61; 16]).unwrap();
+        let epoch = Epoch::from_unix_seconds(1.0);
+        let at: crate::decide::IntervalValue = (epoch, epoch).try_to_inline().unwrap();
+        let fragment = crate::decide::decision_fragment(
+            decision,
+            "Collection decision",
+            Some("Context".into()),
+            None,
+            at,
+        )
+        .unwrap()
+        .0;
+        collection_access::publish_fragment(
+            &path,
+            None,
+            DECIDE_SCOPE_ID,
+            fragment,
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let mut storage = StorageState::new(&path);
+        let first = storage.context().dataset(SourceKey::Decide).unwrap();
+        assert!(crate::decide::decision_anchors(first.facts).contains(&decision));
+        let first_revision = first.revision;
+
+        let epoch = Epoch::from_unix_seconds(2.0);
+        let at: crate::decide::IntervalValue = (epoch, epoch).try_to_inline().unwrap();
+        let factor = crate::decide::factor_fragment(
+            Id::new([0x62; 16]).unwrap(),
+            decision,
+            crate::decide::FactorSide::Pro,
+            "A reason",
+            at,
+        )
+        .unwrap()
+        .0;
+        collection_access::publish_fragment(
+            &path,
+            None,
+            DECIDE_SCOPE_ID,
+            factor,
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let second = storage.context().dataset(SourceKey::Decide).unwrap();
+        assert_ne!(second.revision, first_revision);
+        assert_eq!(
+            crate::decide::factors_for_decision(second.facts, decision)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_decide_collection_is_a_load_error_not_an_empty_dataset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("malformed-decide.pile");
+        File::create(&path).unwrap();
+        collection_access::initialize_signer(&path, None).unwrap();
+
+        let decision = Id::new([0x71; 16]).unwrap();
+        let epoch = Epoch::from_unix_seconds(1.0);
+        let at: crate::decide::IntervalValue = (epoch, epoch).try_to_inline().unwrap();
+        let mut fragment = crate::decide::decision_fragment(decision, "Broken", None, None, at)
+            .unwrap()
+            .0;
+        let outcome = fragment.put("Outcome".to_owned());
+        let bogus = Id::new([0x72; 16]).unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&bogus) @
+            metadata::tag: &crate::schemas::decide::KIND_RESOLUTION_SNAPSHOT,
+            crate::schemas::decide::resolution::of: &decision,
+            crate::schemas::decide::decide::outcome: outcome,
+            crate::schemas::decide::resolution::forced: true,
+            metadata::finished_at: at,
+        };
+        collection_access::publish_fragment(
+            &path,
+            None,
+            DECIDE_SCOPE_ID,
+            fragment,
+            Fragment::empty(),
+        )
+        .unwrap();
+
+        let mut storage = StorageState::new(&path);
+        assert!(storage.context().dataset(SourceKey::Decide).is_none());
+        let error = storage.error().unwrap();
+        assert!(error.contains("validate Decide collection"));
+        assert!(error.contains("does not match intrinsic root"));
+    }
+
+    #[test]
     fn memory_fallback_is_private_to_the_legacy_catalog() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fallback.pile");
@@ -661,8 +771,10 @@ mod tests {
             .map(|source| source.key)
             .collect();
         assert!(!legacy.contains(&SourceKey::Compass));
+        assert!(!legacy.contains(&SourceKey::Decide));
         let mut complete = legacy.clone();
         complete.insert(SourceKey::Compass);
+        complete.insert(SourceKey::Decide);
         assert_eq!(complete, SourceKey::ALL.into_iter().collect());
         assert_eq!(legacy.len(), LEGACY_SOURCE_CATALOG.len());
     }

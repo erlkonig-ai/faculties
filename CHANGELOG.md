@@ -24,6 +24,15 @@ All notable changes to this project will be documented in this file.
   values stay visibly forked until a successor names every head. Exact catalog
   validation rejects foreign facts, malformed records, missing attachments,
   cycles, and invalid priority orders before publication.
+- **Decisions are collection-native and preserve concurrent resolution.** A
+  stable decision anchor has one immutable intrinsic genesis, while factors are
+  additive occurrence records and resolutions form intrinsic predecessor DAGs.
+  Reads expose missing, unique, semantically agreed, forked, and invalid states
+  without timestamp arbitration. Every non-forced resolution freezes the exact
+  same-decision pro and con evidence it used; forcedness is an explicit bit,
+  and agreement quotients heads only by outcome plus forcedness while retaining
+  distinct evidence and history. Publication validates the exact ontology,
+  attachments, closed acyclic history, and all-head reconciliation.
 - **Body persistence is collection-native.** Deliberate captures and intents
   now use one stable extrinsic scope and durable signer instead of a branch,
   repository workspace, and ephemeral identity. Publications carry every
