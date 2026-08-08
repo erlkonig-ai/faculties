@@ -1130,9 +1130,23 @@ pub fn resolve_group(
     Ok(selector_outcome(settled, forked, BTreeSet::new()))
 }
 
+/// Settled semantic relation between two exact person anchors.
+///
+/// `Unknown` means there is no settled path proving either outcome. Mixed
+/// verdict forks and contradictions are errors rather than a fourth value:
+/// callers must keep that evidence visible instead of silently treating it as
+/// absence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentityRelation {
+    Same,
+    Distinct,
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 pub struct IdentityComponents {
     parent: HashMap<Id, Id>,
+    distinct_components: BTreeSet<(Id, Id)>,
     contradictions: BTreeSet<Id>,
     poisoned_components: BTreeSet<Id>,
     forked_pairs: BTreeSet<(Id, Id)>,
@@ -1215,11 +1229,16 @@ impl IdentityComponents {
         }
 
         let mut contradictions = BTreeSet::new();
+        let mut distinct_components = BTreeSet::new();
         for (low, high) in distinct {
             let low_root = find_root(&parent, low);
             let high_root = find_root(&parent, high);
             if low_root == high_root {
                 contradictions.insert(low_root);
+            } else if low_root < high_root {
+                distinct_components.insert((low_root, high_root));
+            } else {
+                distinct_components.insert((high_root, low_root));
             }
         }
         let mut poisoned_components = BTreeSet::new();
@@ -1232,6 +1251,7 @@ impl IdentityComponents {
         }
         Ok(Self {
             parent,
+            distinct_components,
             contradictions,
             poisoned_components,
             forked_pairs,
@@ -1259,13 +1279,10 @@ impl IdentityComponents {
             .collect())
     }
 
-    /// Compare settled identity without replacing either exact anchor with a
-    /// canonical representative. Attribution can therefore keep using the
-    /// configured persona id.
-    pub fn equivalent(&self, first: Id, second: Id) -> Result<bool> {
-        if first == second {
-            return Ok(true);
-        }
+    /// Resolve the settled semantic relation without replacing either exact
+    /// anchor with a canonical representative. Distinctness is lifted through
+    /// settled same-person components in the same way as equality.
+    pub fn relation(&self, first: Id, second: Id) -> Result<IdentityRelation> {
         let first_root = self.root(first)?;
         let second_root = self.root(second)?;
         if self.contradictions.contains(&first_root)
@@ -1276,7 +1293,7 @@ impl IdentityComponents {
             bail!("identity comparison touches a contradictory or unsettled component");
         }
         if first_root == second_root {
-            return Ok(true);
+            return Ok(IdentityRelation::Same);
         }
         let roots = if first_root < second_root {
             (first_root, second_root)
@@ -1297,7 +1314,17 @@ impl IdentityComponents {
         }) {
             bail!("identity comparison is unsettled by a forked pair verdict");
         }
-        Ok(false)
+        if self.distinct_components.contains(&roots) {
+            Ok(IdentityRelation::Distinct)
+        } else {
+            Ok(IdentityRelation::Unknown)
+        }
+    }
+
+    /// Backwards-compatible Boolean projection used by callers that only care
+    /// whether identity is settled as the same person.
+    pub fn equivalent(&self, first: Id, second: Id) -> Result<bool> {
+        Ok(self.relation(first, second)? == IdentityRelation::Same)
     }
 
     pub fn forked_pairs(&self) -> &BTreeSet<(Id, Id)> {
@@ -1624,6 +1651,34 @@ mod tests {
     }
 
     #[test]
+    fn distinctness_propagates_through_settled_same_components() {
+        let fixture = Fixture::new();
+        let a = genid().id;
+        let b = genid().id;
+        let c = genid().id;
+        let unknown = genid().id;
+        publish_person(&fixture, a, "A");
+        publish_person(&fixture, b, "B");
+        publish_person(&fixture, c, "C");
+        publish_person(&fixture, unknown, "Unknown");
+        fixture.publish(identity_verdict_fragment(a, b, false, &[]).unwrap());
+        fixture.publish(identity_verdict_fragment(b, c, true, &[]).unwrap());
+
+        let view = fixture.view();
+        let identities = IdentityComponents::from_facts(&view.facts).unwrap();
+        assert_eq!(identities.relation(b, c).unwrap(), IdentityRelation::Same);
+        assert_eq!(
+            identities.relation(a, c).unwrap(),
+            IdentityRelation::Distinct
+        );
+        assert_eq!(
+            identities.relation(a, unknown).unwrap(),
+            IdentityRelation::Unknown
+        );
+        assert!(!identities.equivalent(a, c).unwrap());
+    }
+
+    #[test]
     fn transitive_same_and_distinct_is_a_visible_contradiction() {
         let fixture = Fixture::new();
         let a = genid().id;
@@ -1662,6 +1717,26 @@ mod tests {
         assert!(identities.mixed_forked_pairs().contains(&pair));
         assert!(identities.equivalent(a, b).is_err());
         assert!(identities.component(c).is_err());
+    }
+
+    #[test]
+    fn mixed_fork_wins_over_distinctness_between_the_same_components() {
+        let fixture = Fixture::new();
+        let a = genid().id;
+        let b = genid().id;
+        let c = genid().id;
+        publish_person(&fixture, a, "A");
+        publish_person(&fixture, b, "B");
+        publish_person(&fixture, c, "C");
+        fixture.publish(identity_verdict_fragment(a, b, false, &[]).unwrap());
+        fixture.publish(identity_verdict_fragment(b, c, true, &[]).unwrap());
+        fixture.publish(identity_verdict_fragment(a, c, true, &[]).unwrap());
+        fixture.publish(identity_verdict_fragment(a, c, false, &[]).unwrap());
+
+        let view = fixture.view();
+        let identities = IdentityComponents::from_facts(&view.facts).unwrap();
+        assert!(identities.relation(a, b).is_err());
+        assert!(identities.relation(a, c).is_err());
     }
 
     #[test]

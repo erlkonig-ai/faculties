@@ -11,6 +11,7 @@ pub mod embeddings;
 pub mod files;
 pub mod gauge;
 pub mod headspace;
+pub mod linkedin;
 pub mod mail;
 pub mod memory;
 pub mod message;

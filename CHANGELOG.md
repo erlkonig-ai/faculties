@@ -40,6 +40,18 @@ All notable changes to this project will be documented in this file.
 - **Message chronology now fails closed.** Sending, acknowledging, and listing
   propagate clock failures instead of fabricating a 1970 timestamp, while
   exact Message validation rejects non-point creation and read intervals.
+- **LinkedIn imports now speak the Relations collection algebra directly.**
+  Each command reads and exactly validates one immutable Relations snapshot,
+  plans the complete import in memory, and publishes one signed fragment
+  through the durable commit-last path. Canonical profile URLs (or email as a
+  fallback) derive stable person anchors; name-only rows honestly mint fresh
+  anchors. Input rows first close as a set under shared canonical keys, settled
+  same-person components are enriched together, repeated stable-key imports are
+  true no-ops, and conflicting or unsettled evidence fails closed. Same-name
+  review is derived from current labels and aliases plus the existing
+  fork-visible verdict DAG rather than persisted as a second ontology. Dry runs
+  perform the same union validation without writing, and the legacy
+  repository/branch plus ephemeral-signer path is gone.
 - **Decisions are collection-native and preserve concurrent resolution.** A
   stable decision anchor has one immutable intrinsic genesis, while factors are
   additive occurrence records and resolutions form intrinsic predecessor DAGs.
