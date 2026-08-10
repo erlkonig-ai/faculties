@@ -387,27 +387,6 @@ pub fn commit_collection(
     .map_err(|error| anyhow!("commit Files collection fragment: {error}"))
 }
 
-/// Publish only facts not already present in a materialized Files view.
-///
-/// Native commits are intrinsically idempotent, so this is an optimization,
-/// not a correctness boundary. It preserves the faculties' historical replay
-/// suppression: a source retry after a Files-first partial success emits no
-/// redundant collection leaf and can proceed directly to its own occurrence
-/// or cursor commit.
-pub fn commit_missing(
-    pile: &mut Pile,
-    signer: &SigningKey,
-    known: &TribleSet,
-    mut fragment: Fragment,
-) -> Result<Option<CollectionCommit>> {
-    let delta = fragment.facts().difference(known);
-    *fragment.facts_mut() = delta;
-    if fragment.is_empty() {
-        return Ok(None);
-    }
-    commit_collection(pile, signer, fragment).map(Some)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

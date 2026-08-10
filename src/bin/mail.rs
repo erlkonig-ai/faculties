@@ -814,7 +814,6 @@ fn collect_parts(
 // ── fetch (POP3) ──────────────────────────────────────────────────────────
 
 fn cmd_fetch(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result<()> {
-    let files_signer = load_signer(pile, None)?;
     let config = load_config()?;
     eprintln!(
         "Connecting to {}:{} as {}...",
@@ -857,6 +856,7 @@ fn cmd_fetch(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result
     }
 
     let mut ingested = 0usize;
+    let mut files_signer = None;
     with_repo(pile, |repo| {
         for (_, bytes) in &retrieved {
             let parsed = match parse_rfc5322(bytes) {
@@ -866,11 +866,14 @@ fn cmd_fetch(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result
                     continue;
                 }
             };
+            if !parsed.attachments.is_empty() && files_signer.is_none() {
+                files_signer = Some(load_signer(pile, None)?);
+            }
             ingest_message(
                 repo,
                 mail_branch_id,
                 relations_branch_id,
-                &files_signer,
+                files_signer.as_ref(),
                 parsed,
             )?;
             ingested += 1;
@@ -906,7 +909,7 @@ fn ingest_message(
     repo: &mut Repository<Pile>,
     mail_branch_id: Id,
     relations_branch_id: Id,
-    files_signer: &SigningKey,
+    files_signer: Option<&SigningKey>,
     parsed: ParsedMail,
 ) -> Result<()> {
     persist_message(
@@ -924,7 +927,7 @@ fn persist_message(
     repo: &mut Repository<Pile>,
     mail_branch_id: Id,
     relations_branch_id: Id,
-    files_signer: &SigningKey,
+    files_signer: Option<&SigningKey>,
     parsed: ParsedMail,
     as_draft: bool,
 ) -> Result<Id> {
@@ -968,13 +971,14 @@ fn persist_message(
     }
 
     // 2. Files collection: publish attachment closure before the source
-    // message can become visible. A replay after a later mail-branch failure
-    // sees these canonical facts and suppresses a redundant Files commit.
+    // message can become visible. Each file is its own canonical fragment;
+    // replay derives the same signed commit id and is an append-free no-op.
     let mut attachment_ids: Vec<Id> = Vec::new();
     if !parsed.attachments.is_empty() {
-        let (files_catalog, _) =
-            file_capability::materialize_collection(repo.storage_mut(), files_signer)?;
-        let mut change = Fragment::empty();
+        let files_signer = files_signer.ok_or_else(|| {
+            anyhow::anyhow!("Files signing authority is required for mail attachments")
+        })?;
+        let mut staged = std::collections::HashSet::new();
         for att in &parsed.attachments {
             let media_type = file_capability::normalize_media_type_or_default(&att.mime);
             let file_fragment =
@@ -982,10 +986,15 @@ fn persist_message(
             let file_ref = file_fragment
                 .root()
                 .expect("canonical file fragment has one root");
-            change += file_fragment;
+            if staged.insert(file_ref) {
+                file_capability::commit_collection(
+                    repo.storage_mut(),
+                    files_signer,
+                    file_fragment,
+                )?;
+            }
             attachment_ids.push(file_ref);
         }
-        file_capability::commit_missing(repo.storage_mut(), files_signer, &files_catalog, change)?;
     }
 
     // 3. mail branch: the message entity.
@@ -1140,7 +1149,6 @@ fn cmd_draft(
     bcc: Vec<String>,
     attach: Vec<PathBuf>,
 ) -> Result<()> {
-    let files_signer = load_signer(pile, None)?;
     let body_text = faculties::text_arg(&body, "body")?;
     let config = load_config()?;
 
@@ -1163,6 +1171,9 @@ fn cmd_draft(
             bytes,
         });
     }
+    let files_signer = (!attachments.is_empty())
+        .then(|| load_signer(pile, None))
+        .transpose()?;
 
     let to_raw: Vec<String> = to
         .split(',')
@@ -1231,7 +1242,7 @@ fn cmd_draft(
             repo,
             mail_branch_id,
             relations_branch_id,
-            &files_signer,
+            files_signer.as_ref(),
             parsed,
             true,
         )?;
@@ -1272,7 +1283,6 @@ fn cmd_reply(
     parent_hex: String,
     body: String,
 ) -> Result<()> {
-    let files_signer = load_signer(pile, None)?;
     let body_text = faculties::text_arg(&body, "reply body")?;
 
     // Pull parent's properties for thread headers.
@@ -1402,7 +1412,7 @@ fn cmd_reply(
             repo,
             mail_branch_id,
             relations_branch_id,
-            &files_signer,
+            None,
             parsed,
             true,
         )?;
@@ -1461,6 +1471,55 @@ fn decision_is_resolved(ws: &mut Workspace<Pile>, space: &TribleSet, decision_id
     has_finished_at && has_outcome
 }
 
+fn load_draft_attachments(
+    pile: &Path,
+    attachment_ids: &[Id],
+) -> Result<Vec<(String, String, Vec<u8>)>> {
+    if attachment_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let files_signer = load_signer(pile, None)?;
+    with_repo(pile, |repo| {
+        let (space, reader) =
+            file_capability::materialize_collection(repo.storage_mut(), &files_signer)?;
+        let mut out = Vec::new();
+        for &fid in attachment_ids {
+            let content_h: FileHandle =
+                find!(h: FileHandle, pattern!(&space, [{ fid @ file::content: ?h }]))
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "attachment file {fid:x} has no canonical content; rebuild the Files collection"
+                        )
+                    })?;
+            let name_h: TextHandle =
+                find!(h: TextHandle, pattern!(&space, [{ fid @ file::name: ?h }]))
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "attachment file {fid:x} has no canonical name; rebuild the Files collection"
+                        )
+                    })?;
+            let bytes: anybytes::Bytes = reader
+                .get::<anybytes::Bytes, _>(content_h)
+                .map_err(|e| anyhow::anyhow!("read attachment blob {fid:x}: {e:?}"))?;
+            let name = read_files_text(&reader, name_h)
+                .ok_or_else(|| anyhow::anyhow!("read name for attachment file {fid:x}"))?;
+            let media_type_handle =
+                file_capability::media_type_name_handle(&space, fid).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "attachment file {fid:x} has no canonical media-type entity; rebuild the Files collection"
+                    )
+                })?;
+            let media_type = read_files_text(&reader, media_type_handle)
+                .ok_or_else(|| anyhow::anyhow!("read media type for attachment file {fid:x}"))?;
+            out.push((name, media_type, bytes.as_ref().to_vec()));
+        }
+        Ok(out)
+    })
+}
+
 fn cmd_send(
     pile: &Path,
     mail_branch_id: Id,
@@ -1468,7 +1527,6 @@ fn cmd_send(
     decide_branch_id: Id,
     draft_hex: String,
 ) -> Result<()> {
-    let files_signer = load_signer(pile, None)?;
     // Resolve the prefix once against the mail space; the rest of the
     // function uses the full Id internally.
     let draft_id = with_repo(pile, |repo| {
@@ -1627,46 +1685,8 @@ fn cmd_send(
         })
     })?;
 
-    // Re-read each referenced attachment's bytes + filename from the native
-    // Files collection, so they can be re-attached to the outbound MIME.
-    let attachments: Vec<(String, String, Vec<u8>)> = with_repo(pile, |repo| {
-        let (space, reader) =
-            file_capability::materialize_collection(repo.storage_mut(), &files_signer)?;
-        let mut out: Vec<(String, String, Vec<u8>)> = Vec::new();
-        for &fid in &attrs.attachment_ids {
-            let content_h: FileHandle =
-                find!(h: FileHandle, pattern!(&space, [{ fid @ file::content: ?h }]))
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "attachment file {fid:x} has no canonical content; rebuild the Files collection"
-                        )
-                    })?;
-            let name_h: TextHandle =
-                find!(h: TextHandle, pattern!(&space, [{ fid @ file::name: ?h }]))
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "attachment file {fid:x} has no canonical name; rebuild the Files collection"
-                        )
-                    })?;
-            let bytes: anybytes::Bytes = reader
-                .get::<anybytes::Bytes, _>(content_h)
-                .map_err(|e| anyhow::anyhow!("read attachment blob {fid:x}: {e:?}"))?;
-            let name = read_files_text(&reader, name_h)
-                .ok_or_else(|| anyhow::anyhow!("read name for attachment file {fid:x}"))?;
-            let media_type_handle =
-                file_capability::media_type_name_handle(&space, fid).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "attachment file {fid:x} has no canonical media-type entity; rebuild the Files collection"
-                    )
-                })?;
-            let media_type = read_files_text(&reader, media_type_handle)
-                .ok_or_else(|| anyhow::anyhow!("read media type for attachment file {fid:x}"))?;
-            out.push((name, media_type, bytes.as_ref().to_vec()));
-        }
-        Ok(out)
-    })?;
+    // Only drafts carrying attachment ids need Files authority or a catalog.
+    let attachments = load_draft_attachments(pile, &attrs.attachment_ids)?;
 
     // 3. Build RFC 5322 message and transmit.
     let from_mb: Mailbox = format!("{} <{}>", config.from_name, config.user)
@@ -2670,6 +2690,17 @@ mod tests {
     }
 
     #[test]
+    fn attachment_free_send_lookup_needs_neither_signer_nor_pile() {
+        let absent = std::env::temp_dir().join(format!(
+            "faculties-mail-no-files-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(load_draft_attachments(&absent, &[]).unwrap().is_empty());
+        assert!(!absent.exists());
+    }
+
+    #[test]
     fn attachment_closure_lands_in_native_files_before_mail_reference() {
         let nonce = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -2710,7 +2741,7 @@ mod tests {
             &mut repo,
             mail_branch,
             relations_branch,
-            &files_signer,
+            Some(&files_signer),
             parsed,
             false,
         )

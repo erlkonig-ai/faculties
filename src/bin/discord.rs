@@ -148,7 +148,6 @@ struct DiscordConfig {
     branch: String,
     branch_id: Id,
     log_branch_id: Id,
-    files_signer: SigningKey,
 }
 
 fn main() -> Result<()> {
@@ -190,10 +189,6 @@ fn main() -> Result<()> {
 
 fn build_config(cli: &Cli) -> Result<DiscordConfig> {
     let pile_path = cli.pile.clone();
-    // Load the durable collection authority before opening the pile. This
-    // keeps signer discovery out of the lifetime of Repository<Pile> and lets
-    // attachment publication borrow that one already-open backend.
-    let files_signer = load_signer(&pile_path, None)?;
     let branch = cli.branch.clone();
     let log_branch = DEFAULT_LOG_BRANCH.to_string();
     let branch_id = with_repo(&pile_path, |repo| {
@@ -212,7 +207,6 @@ fn build_config(cli: &Cli) -> Result<DiscordConfig> {
         branch,
         branch_id,
         log_branch_id,
-        files_signer,
     })
 }
 
@@ -512,15 +506,13 @@ fn pull_channel(
             .checkout(..)
             .map_err(|e| anyhow!("checkout discord: {e:?}"))?
             .into_facts();
-        let (files_catalog, _) =
-            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
-        let (change, files_change) = build_ingest_change(&mut ws, &catalog, incoming, config)?;
-        file_capability::commit_missing(
-            repo.storage_mut(),
-            &config.files_signer,
-            &files_catalog,
-            files_change,
-        )?;
+        let (change, file_fragments) = build_ingest_change(&mut ws, &catalog, incoming, config)?;
+        if !file_fragments.is_empty() {
+            let files_signer = load_signer(&config.pile_path, None)?;
+            for fragment in file_fragments {
+                file_capability::commit_collection(repo.storage_mut(), &files_signer, fragment)?;
+            }
+        }
 
         let delta = change.difference(&catalog);
         if !delta.is_empty() {
@@ -886,9 +878,10 @@ fn build_ingest_change(
     _catalog: &TribleSet,
     messages: Vec<IncomingMessage>,
     config: &DiscordConfig,
-) -> Result<(TribleSet, Fragment)> {
+) -> Result<(TribleSet, Vec<Fragment>)> {
     let mut change = TribleSet::new();
-    let mut files_change = Fragment::empty();
+    let mut file_fragments = Vec::new();
+    let mut staged_file_ids = std::collections::HashSet::new();
     let mut added_attachment_files: std::collections::HashSet<Id> =
         std::collections::HashSet::new();
 
@@ -1021,14 +1014,16 @@ fn build_ingest_change(
             let file_id = file_fragment
                 .root()
                 .expect("canonical file fragment has one root");
-            files_change += file_fragment;
+            if staged_file_ids.insert(file_id) {
+                file_fragments.push(file_fragment);
+            }
             change += entity! { ExclusiveId::force_ref(&attachment_id) @
                 archive::attachment_file: file_id,
             };
         }
     }
 
-    Ok((change, files_change))
+    Ok((change, file_fragments))
 }
 
 // ── per-channel cursor ───────────────────────────────────────────

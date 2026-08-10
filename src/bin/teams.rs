@@ -347,7 +347,6 @@ enum AttachmentsCommand {
 #[derive(Clone, Debug)]
 struct TeamsBridgeConfig {
     pile_path: PathBuf,
-    files_signer: SigningKey,
     branch: String,
     branch_id: Id,
     presentation_context: TeamsPresentationContext,
@@ -558,7 +557,6 @@ fn with_repo<T>(
 
 fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
     let pile_path = cli.pile.clone();
-    let files_signer = load_signer(&pile_path, None)?;
     let branch = std::env::var("TRIBLESPACE_BRANCH")
         .ok()
         .unwrap_or_else(|| cli.branch.clone());
@@ -584,7 +582,6 @@ fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
         .unwrap_or_else(|| cli.token_command.clone());
     Ok(TeamsBridgeConfig {
         pile_path,
-        files_signer,
         branch,
         branch_id,
         presentation_context,
@@ -638,9 +635,6 @@ fn pull_once_with_cache(
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         validate_message_identity_lineage(&catalog)?;
-        let (files_catalog, _) =
-            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
-        let existing_files = file_entity_ids(&files_catalog);
         let cursor_state = load_cursor_from_space(&mut ws, &catalog)?;
         let base_url = resolve_delta_url(&config.delta_url, &app_config.user_id)?;
         let (start_url, using_saved_cursor) = match cursor_state.as_ref() {
@@ -653,24 +647,17 @@ fn pull_once_with_cache(
             fetch_delta_with_cursor_recovery(&token, &start_url, &base_url, using_saved_cursor)?;
         let index = CatalogIndex::build(&catalog);
         let incoming = parse_messages(messages)?;
-        let (mut change, files_change) =
-            build_ingest_change(&mut ws, &catalog, &index, &existing_files, incoming, &token)?;
+        let (mut change, files_plan) =
+            build_ingest_change(&mut ws, &catalog, &index, incoming, &token)?;
         if let Some(cursor_change) =
             build_cursor_change(&mut ws, &catalog, cursor_state.as_ref(), new_cursor)?
         {
             change += cursor_change;
         }
 
-        // The self-contained file fragments are published to the files
-        // workspace before advancing Teams facts and the delta cursor: a later
-        // Teams failure is safely replayable against already-present content-
-        // addressed files.
-        file_capability::commit_missing(
-            repo.storage_mut(),
-            &config.files_signer,
-            &files_catalog,
-            files_change,
-        )?;
+        // Publish complete per-file commits before advancing Teams facts and
+        // the delta cursor. Deterministic commit identity makes replay a no-op.
+        publish_files_plan(repo, &config.pile_path, files_plan)?;
 
         if !change.is_empty() {
             ws.commit(change, "teams ingest");
@@ -2392,6 +2379,7 @@ fn open_pile(path: &PathBuf) -> Result<Pile> {
 fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -> Result<()> {
     let mut app_token_cache = None;
     pull_once_with_cache(&config, &mut app_token_cache)?;
+    let files_signer = load_signer(&config.pile_path, None)?;
 
     let (repo, branch_id) =
         open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
@@ -2399,7 +2387,7 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         let (files_catalog, files_reader) =
-            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
+            file_capability::materialize_collection(repo.storage_mut(), &files_signer)?;
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
@@ -2581,13 +2569,10 @@ fn backfill_attachments(
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         validate_message_identity_lineage(&catalog)?;
         let index = CatalogIndex::build(&catalog);
-        let (files_catalog, _) =
-            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
-        let existing_files = file_entity_ids(&files_catalog);
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
-        let mut files_change = Fragment::empty();
+        let mut files_plan = FilesPlan::default();
 
         let chat_filter_ids = match options.chat_id.as_ref().map(|value| value.trim()) {
             Some(value) if !value.is_empty() => {
@@ -2745,39 +2730,30 @@ fn backfill_attachments(
                 &message_external_id,
                 &raw_json,
             );
-            let before = change.len() + files_change.len();
+            let before = change.len() + files_plan.facts_len();
             ensure_attachments(
                 &mut ws,
                 &mut change,
-                &mut files_change,
+                &mut files_plan,
                 &index,
-                &existing_files,
                 message_id,
                 &attachments,
                 &token,
                 &mut added_attachments,
             )?;
-            if change.len() + files_change.len() > before {
+            if change.len() + files_plan.facts_len() > before {
                 created += 1;
             }
             scanned += 1;
         }
 
         let change = change.difference(&catalog);
-        let files_delta = files_change.facts().difference(&files_catalog);
-        *files_change.facts_mut() = files_delta;
-        if change.is_empty() && files_change.is_empty() {
+        if change.is_empty() && !files_plan.has_work() {
             println!("No attachments to backfill.");
             return Ok(());
         }
 
-        if !files_change.is_empty() {
-            file_capability::commit_collection(
-                repo.storage_mut(),
-                &config.files_signer,
-                files_change,
-            )?;
-        }
+        publish_files_plan(repo, &config.pile_path, files_plan)?;
         if !change.is_empty() {
             ws.commit(change, "teams attachments backfill");
             map_err_debug(repo.push(&mut ws), "push workspace")?;
@@ -2790,6 +2766,7 @@ fn backfill_attachments(
 fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions) -> Result<()> {
     let mut app_token_cache = None;
     pull_once_with_cache(&config, &mut app_token_cache)?;
+    let files_signer = load_signer(&config.pile_path, None)?;
 
     let (repo, branch_id) =
         open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
@@ -2797,7 +2774,7 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         let (files_catalog, files_reader) =
-            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
+            file_capability::materialize_collection(repo.storage_mut(), &files_signer)?;
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
@@ -3423,6 +3400,71 @@ fn file_entity_ids(catalog: &TribleSet) -> HashSet<Id> {
     .collect()
 }
 
+#[derive(Default)]
+struct FilesPlan {
+    fragments: Vec<Fragment>,
+    staged_file_ids: HashSet<Id>,
+    existing_links: HashSet<(Id, Id)>,
+}
+
+impl FilesPlan {
+    fn stage(&mut self, fragment: Fragment) -> Id {
+        let file_id = fragment
+            .root()
+            .expect("canonical file fragment has one root");
+        if self.staged_file_ids.insert(file_id) {
+            self.fragments.push(fragment);
+        }
+        file_id
+    }
+
+    fn validate_existing(&mut self, attachment_id: Id, file_id: Id) {
+        self.existing_links.insert((attachment_id, file_id));
+    }
+
+    fn facts_len(&self) -> usize {
+        self.fragments
+            .iter()
+            .map(|fragment| fragment.facts().len())
+            .sum()
+    }
+
+    fn has_work(&self) -> bool {
+        !self.fragments.is_empty() || !self.existing_links.is_empty()
+    }
+}
+
+/// Validate only source occurrences that already name a canonical file, then
+/// publish each newly staged file as its own deterministic collection commit.
+/// Attachment-free pulls never load the Files signer or enumerate Files.
+fn publish_files_plan(
+    repo: &mut Repository<Pile>,
+    pile_path: &PathBuf,
+    plan: FilesPlan,
+) -> Result<()> {
+    if !plan.has_work() {
+        return Ok(());
+    }
+
+    let signer = load_signer(pile_path, None)?;
+    if !plan.existing_links.is_empty() {
+        let (catalog, _) = file_capability::materialize_collection(repo.storage_mut(), &signer)?;
+        let existing_files = file_entity_ids(&catalog);
+        for (attachment_id, file_id) in &plan.existing_links {
+            if !existing_files.contains(file_id) {
+                bail!(
+                    "Teams attachment occurrence {attachment_id:x} links to incomplete file record {file_id:x}; repair the Files collection before retrying"
+                );
+            }
+        }
+    }
+
+    for fragment in plan.fragments {
+        file_capability::commit_collection(repo.storage_mut(), &signer, fragment)?;
+    }
+    Ok(())
+}
+
 fn validate_message_identity_lineage(catalog: &TribleSet) -> Result<()> {
     for (message_id,) in find!(
         (message: Id),
@@ -3466,10 +3508,9 @@ fn build_ingest_change(
     ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     index: &CatalogIndex,
-    existing_files: &HashSet<Id>,
     incoming: Vec<IncomingMessage>,
     token: &str,
-) -> Result<(TribleSet, Fragment)> {
+) -> Result<(TribleSet, FilesPlan)> {
     let mut by_chat: HashMap<String, Vec<IncomingMessage>> = HashMap::new();
     for message in incoming {
         by_chat
@@ -3479,7 +3520,7 @@ fn build_ingest_change(
     }
 
     let mut change = TribleSet::new();
-    let mut files_change = Fragment::empty();
+    let mut files_plan = FilesPlan::default();
     let mut added_attachments = HashSet::new();
     for (chat_external_id, mut messages) in by_chat {
         // Derive chat_id intrinsically from the external id.
@@ -3540,9 +3581,8 @@ fn build_ingest_change(
             ensure_attachments(
                 ws,
                 &mut change,
-                &mut files_change,
+                &mut files_plan,
                 index,
-                existing_files,
                 message_id,
                 &message.attachments,
                 token,
@@ -3586,7 +3626,7 @@ fn build_ingest_change(
         }
     }
 
-    Ok((change.difference(catalog), files_change))
+    Ok((change.difference(catalog), files_plan))
 }
 
 fn ensure_author(
@@ -3629,9 +3669,8 @@ fn ensure_author(
 fn ensure_attachments(
     ws: &mut Workspace<Pile>,
     change: &mut TribleSet,
-    files_change: &mut Fragment,
+    files_plan: &mut FilesPlan,
     index: &CatalogIndex,
-    existing_files: &HashSet<Id>,
     message_id: Id,
     attachments: &[AttachmentSource],
     token: &str,
@@ -3673,11 +3712,7 @@ fn ensure_attachments(
                 );
             }
             let file_id = *linked_files.iter().next().expect("checked singleton");
-            if !existing_files.contains(&file_id) {
-                bail!(
-                    "Teams attachment occurrence {attachment_id:x} links to incomplete file record {file_id:x}; repair the Files collection before retrying"
-                );
-            }
+            files_plan.validate_existing(attachment_id, file_id);
             continue;
         }
 
@@ -3742,10 +3777,7 @@ fn ensure_attachments(
             .unwrap_or("application/octet-stream");
         let media_type = file_capability::normalize_media_type_or_default(mime);
         let file_fragment = file_capability::stage(bytes, name_str.to_owned(), &media_type)?;
-        let file_id = file_fragment
-            .root()
-            .expect("canonical file fragment has one root");
-        *files_change += file_fragment;
+        let file_id = files_plan.stage(file_fragment);
         *change += entity! { ExclusiveId::force_ref(&attachment_id) @
             archive::attachment_file: file_id,
         };
@@ -4036,6 +4068,14 @@ mod tests {
 
     impl TestPile {
         fn new() -> Self {
+            Self::with_files_signer(true)
+        }
+
+        fn without_files_signer() -> Self {
+            Self::with_files_signer(false)
+        }
+
+        fn with_files_signer(initialize_files: bool) -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -4048,7 +4088,9 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let path = dir.join("test.pile");
             fs::File::create(&path).unwrap();
-            initialize_signer(&path, None).unwrap();
+            if initialize_files {
+                initialize_signer(&path, None).unwrap();
+            }
             Self { dir, path }
         }
 
@@ -4056,7 +4098,6 @@ mod tests {
             let branch_id = ensure_test_branch(&self.path, DEFAULT_BRANCH);
             TeamsBridgeConfig {
                 pile_path: self.path.clone(),
-                files_signer: load_signer(&self.path, None).unwrap(),
                 branch: DEFAULT_BRANCH.to_string(),
                 branch_id,
                 presentation_context: TeamsPresentationContext::default(),
@@ -4119,29 +4160,14 @@ mod tests {
             let mut ws = map_err_debug(repo.pull(config.branch_id), "pull test workspace")?;
             let catalog = map_err_debug(ws.checkout(..), "checkout test workspace")?.into_facts();
             validate_message_identity_lineage(&catalog)?;
-            let (files_catalog, _) =
-                file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
-            let existing_files = file_entity_ids(&files_catalog);
             let index = CatalogIndex::build(&catalog);
             let incoming = parse_messages(messages)?;
-            let (change, mut files_change) = build_ingest_change(
-                &mut ws,
-                &catalog,
-                &index,
-                &existing_files,
-                incoming,
-                "test-token",
-            )?;
-            let files_delta = files_change.facts().difference(&files_catalog);
-            *files_change.facts_mut() = files_delta;
-            let counts = (change.len(), files_change.len());
+            let (change, files_plan) =
+                build_ingest_change(&mut ws, &catalog, &index, incoming, "test-token")?;
+            let counts = (change.len(), files_plan.facts_len());
 
-            if commit_files && !files_change.is_empty() {
-                file_capability::commit_collection(
-                    repo.storage_mut(),
-                    &config.files_signer,
-                    files_change,
-                )?;
+            if commit_files {
+                publish_files_plan(repo, &config.pile_path, files_plan)?;
             }
             if commit_teams && !change.is_empty() {
                 ws.commit(change, "test teams ingest");
@@ -4373,6 +4399,27 @@ mod tests {
     }
 
     #[test]
+    fn attachment_free_ingest_needs_no_files_signer_or_materialization() {
+        let pile = TestPile::without_files_signer();
+        let config = pile.config();
+        let message = graph_message(
+            "chat-a",
+            "1",
+            "2026-07-29T10:00:00Z",
+            "no attachments",
+            vec![],
+        );
+
+        let first = ingest_test_batch(&config, vec![message.clone()], true, true);
+        assert!(first.0 > 0);
+        assert_eq!(first.1, 0);
+        assert_eq!(
+            ingest_test_batch(&config, vec![message], true, true),
+            (0, 0)
+        );
+    }
+
+    #[test]
     fn message_identity_is_scoped_to_chat() {
         let pile = TestPile::new();
         let config = pile.config();
@@ -4582,7 +4629,7 @@ mod tests {
         assert!(first.1 > 0);
         let retry = ingest_test_batch(&config, vec![message.clone()], true, true);
         assert!(retry.0 > 0);
-        assert_eq!(retry.1, 0);
+        assert!(retry.1 > 0, "retry restages the canonical per-file leaf");
         assert_eq!(
             ingest_test_batch(&config, vec![message], true, true),
             (0, 0)

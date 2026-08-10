@@ -647,6 +647,20 @@ fn format_date(ts: Lower) -> String {
 ///   wiki:<type>:HEX32      → `wiki::links_to` + derived attribute named `<type>`
 ///   files:HEX32            → `wiki::references_file` (GenId, points to a file entity)
 ///   files:HEX64            → `wiki::references_file_content` (Blake3 content handle)
+fn legacy_typed_link_attribute(
+    name: &str,
+) -> triblespace::core::attribute::Attribute<inlineencodings::GenId> {
+    // Typed backlinks predate KIND_ATTRIBUTE being part of runtime attribute
+    // identity. Preserve their historical `(name, value_encoding)` id here;
+    // changing that epoch requires an explicit data migration, not a Files
+    // storage cutover.
+    let name_handle = name.to_owned().to_blob().get_handle();
+    triblespace::core::attribute::Attribute::from_fragment_unchecked(entity! {
+        metadata::name: name_handle,
+        metadata::value_encoding: <inlineencodings::GenId as triblespace::core::metadata::MetaDescribe>::id(),
+    })
+}
+
 fn extract_references(content: &str, space: &TribleSet, source_vid: Id) -> TribleSet {
     use regex::Regex;
     let re = Regex::new(
@@ -674,10 +688,7 @@ fn extract_references(content: &str, space: &TribleSet, source_vid: Id) -> Tribl
                 edges += entity! { eid @ wiki::links_to: &target };
                 if !type_prefix.is_empty() {
                     let type_name = type_prefix[..type_prefix.len() - 1].to_owned();
-                    let attr =
-                        triblespace::core::attribute::Attribute::<inlineencodings::GenId>::named(
-                            &type_name,
-                        );
+                    let attr = legacy_typed_link_attribute(&type_name);
                     let eid = ExclusiveId::force_ref(&source_vid);
                     edges += entity! { eid @ attr: &target };
                 }
@@ -927,6 +938,19 @@ impl<'a> ReferenceResolver<'a> {
             _ => bail!("unknown reference scheme '{scheme}'"),
         }
     }
+}
+
+/// Whether this text contains a `files:` selector that cannot be resolved
+/// directly. Full entity ids (32 hex chars) and content hashes (64) carry
+/// their complete identity; only shorter prefixes need the Files catalog.
+fn has_short_files_selector(content: &str) -> bool {
+    content.match_indices("files:").any(|(start, _)| {
+        let hex_len = content[start + "files:".len()..]
+            .bytes()
+            .take_while(u8::is_ascii_hexdigit)
+            .count();
+        (1..32).contains(&hex_len) || (33..64).contains(&hex_len)
+    })
 }
 
 /// Apply lint transforms to content: markdown→typst syntax, expand short IDs.
@@ -2120,7 +2144,6 @@ fn cmd_create(
     files_space: Option<&TribleSet>,
 ) -> Result<()> {
     let title = faculties::text_arg(&title, "title")?;
-    let content = faculties::text_arg(&content, "content")?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     ensure_tag_vocabulary(repo, &mut ws)?;
     let space = ws
@@ -2179,9 +2202,6 @@ fn cmd_edit(
     force: bool,
     files_space: Option<&TribleSet>,
 ) -> Result<()> {
-    let content = content
-        .map(|c| faculties::text_arg(&c, "content"))
-        .transpose()?;
     let new_title = new_title
         .map(|t| faculties::text_arg(&t, "title"))
         .transpose()?;
@@ -2584,10 +2604,7 @@ fn cmd_list(
     // the entity-core mechanism. The hex id is hashed from the
     // `(metadata::name, metadata::value_encoding)` pair so the same name
     // + schema produces the same attribute id deterministically.
-    let attr_from_name =
-        |name: &str| -> triblespace::core::attribute::Attribute<inlineencodings::GenId> {
-            triblespace::core::attribute::Attribute::<inlineencodings::GenId>::named(name)
-        };
+    let attr_from_name = legacy_typed_link_attribute;
     let with_bl_type_attrs: Vec<(
         String,
         triblespace::core::attribute::Attribute<inlineencodings::GenId>,
@@ -3355,6 +3372,48 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_edits_and_full_file_tokens_do_not_request_a_files_view() {
+        let mut title_only = Command::Edit {
+            id: "11111111111111111111111111111111".to_owned(),
+            content: None,
+            title: Some("renamed".to_owned()),
+            tag: Vec::new(),
+            force: false,
+        };
+        assert!(!prepare_files_catalog_need(&mut title_only).unwrap());
+
+        let mut complete_tokens = Command::Create {
+            title: "direct identities".to_owned(),
+            content: format!(
+                "#link(\"files:{}\")[entity] #link(\"files:{}\")[content]",
+                "ab".repeat(16),
+                "cd".repeat(32)
+            ),
+            tag: Vec::new(),
+            force: false,
+            id: None,
+        };
+        assert!(!prepare_files_catalog_need(&mut complete_tokens).unwrap());
+
+        let mut prefix = Command::Create {
+            title: "prefix".to_owned(),
+            content: "#link(\"files:abcd\")[prefix]".to_owned(),
+            tag: Vec::new(),
+            force: false,
+            id: None,
+        };
+        assert!(prepare_files_catalog_need(&mut prefix).unwrap());
+    }
+
+    #[test]
+    fn typed_link_attributes_keep_the_historical_identity_epoch() {
+        let historical = legacy_typed_link_attribute("reviews");
+        let modern =
+            triblespace::core::attribute::Attribute::<inlineencodings::GenId>::named("reviews");
+        assert_ne!(historical.id(), modern.id());
+    }
+
+    #[test]
     fn fix_truncated_preserves_wiki_types_and_reports_file_ambiguity() {
         let fragment = id("abcd0000000000000000000000000000");
         let version = id("12340000000000000000000000000000");
@@ -3499,30 +3558,54 @@ fn lcs_table(old: &[&str], new: &[&str]) -> Vec<Vec<usize>> {
     table
 }
 
+/// Resolve indirect content once and determine whether this invocation needs
+/// prefix expansion from the native Files collection.
+fn prepare_files_catalog_need(command: &mut Command) -> Result<bool> {
+    // Resolve possibly indirect content exactly once before deciding whether
+    // a Files view is necessary. This keeps ordinary/title-only edits and
+    // content containing only complete 32/64-character file identities free
+    // of both signer and collection-materialization requirements.
+    match &mut *command {
+        Command::Create { content, .. } => {
+            *content = faculties::text_arg(content, "content")?;
+        }
+        Command::Edit {
+            content: Some(content),
+            ..
+        } => {
+            *content = faculties::text_arg(content, "content")?;
+        }
+        _ => {}
+    }
+    Ok(match command {
+        Command::Create { content, .. } => has_short_files_selector(content),
+        Command::Edit {
+            content: Some(content),
+            ..
+        } => has_short_files_selector(content),
+        Command::Batch {
+            action: BatchAction::Import { .. },
+        }
+        | Command::FixTruncated { .. }
+        | Command::Lint { .. } => true,
+        _ => false,
+    })
+}
+
 // ── main ───────────────────────────────────────────────────────────────────
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let Some(command) = cli.command else {
+    let Some(mut command) = cli.command else {
         let mut cmd = Cli::command();
         cmd.print_help()?;
         println!();
         return Ok(());
     };
 
-    // Only commands that may canonicalize a `files:` selector need the Files
-    // catalog. Load its durable authority before opening the pile so the
-    // collection view can borrow the one Repository<Pile> backend below.
-    let needs_files = matches!(
-        &command,
-        Command::Create { .. }
-            | Command::Edit { .. }
-            | Command::Batch {
-                action: BatchAction::Import { .. }
-            }
-            | Command::FixTruncated { .. }
-            | Command::Lint { .. }
-    );
+    // Load durable Files authority before opening the pile so materialization
+    // can borrow the one Repository<Pile> backend below.
+    let needs_files = prepare_files_catalog_need(&mut command)?;
     let files_signer = needs_files
         .then(|| load_signer(&cli.pile, None))
         .transpose()?;

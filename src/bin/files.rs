@@ -334,27 +334,19 @@ fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
 
 // ── native collection boundary ───────────────────────────────────────────
 
-fn with_files<T>(
+/// Open the signer-owned Files collection for append-only work, then close its
+/// pile exactly once. Commands that construct a complete fragment locally do
+/// not pay to reconstruct the existing collection value.
+fn with_files_collection<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Collection<Pile>, &TribleSet, &PileReader) -> Result<T>,
+    f: impl FnOnce(&mut Collection<Pile>) -> Result<T>,
 ) -> Result<T> {
     // Authority is durable and explicit: ordinary Files commands never mint a
     // new signer and never fall back to an ephemeral identity.
     let signer = load_signer(pile, None)?;
     let storage = open_pile_strict(pile)?;
     let mut collection = Collection::new(storage, DEFAULT_SCOPE_ID, signer);
-    let result = (|| {
-        // One invocation observes one complete known signer-owned collection
-        // value. Every command below shares this same immutable fact view.
-        let space = collection
-            .materialize()
-            .context("materialize Files collection")?;
-        let reader = collection
-            .storage_mut()
-            .reader()
-            .context("open Files blob reader")?;
-        f(&mut collection, &space, &reader)
-    })();
+    let result = f(&mut collection);
     let close = collection.into_storage().close();
     match (result, close) {
         (Ok(value), Ok(())) => Ok(value),
@@ -364,6 +356,24 @@ fn with_files<T>(
             Err(error.context(format!("closing pile also failed: {close_error}")))
         }
     }
+}
+
+/// Open one immutable materialized Files view for commands whose result or
+/// mutation depends on facts already present in the collection.
+fn with_files_view<T>(
+    pile: &Path,
+    f: impl FnOnce(&mut Collection<Pile>, &TribleSet, &PileReader) -> Result<T>,
+) -> Result<T> {
+    with_files_collection(pile, |collection| {
+        let space = collection
+            .materialize()
+            .context("materialize Files collection")?;
+        let reader = collection
+            .storage_mut()
+            .reader()
+            .context("open Files blob reader")?;
+        f(collection, &space, &reader)
+    })
 }
 
 // ── tree builder ─────────────────────────────────────────────────────────
@@ -655,35 +665,36 @@ fn build_tree(
 
 // ── commands ─────────────────────────────────────────────────────────────
 
+fn cmd_add_dry_run(path: &Path, tags: &[String]) -> Result<()> {
+    let abs_path =
+        fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    let mut stats = TreeStats {
+        files: 0,
+        dirs: 0,
+        bytes: 0,
+    };
+    print_fs_tree(&abs_path, "", "", &mut stats)?;
+    println!();
+    println!(
+        "Would import: {} files, {} dirs, {}",
+        stats.files,
+        stats.dirs,
+        human_size(stats.bytes),
+    );
+    if !tags.is_empty() {
+        println!("Tags: {}", tags.join(", "));
+    }
+    Ok(())
+}
+
 fn cmd_add(
     collection: &mut Collection<Pile>,
     path: &Path,
     mime_override: Option<&str>,
     tags: &[String],
-    dry_run: bool,
 ) -> Result<()> {
     let abs_path =
         fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
-
-    if dry_run {
-        let mut stats = TreeStats {
-            files: 0,
-            dirs: 0,
-            bytes: 0,
-        };
-        print_fs_tree(&abs_path, "", "", &mut stats)?;
-        println!();
-        println!(
-            "Would import: {} files, {} dirs, {}",
-            stats.files,
-            stats.dirs,
-            human_size(stats.bytes),
-        );
-        if !tags.is_empty() {
-            println!("Tags: {}", tags.join(", "));
-        }
-        return Ok(());
-    }
 
     let source = abs_path.to_string_lossy().to_string();
 
@@ -807,7 +818,7 @@ fn cmd_fetch(
     fs::write(&tmp_path, bytes.as_ref())
         .with_context(|| format!("write temp file {}", tmp_path.display()))?;
 
-    let result = cmd_add(collection, &tmp_path, Some(mime.as_str()), tags, false);
+    let result = cmd_add(collection, &tmp_path, Some(mime.as_str()), tags);
     let _ = fs::remove_file(&tmp_path);
     let _ = fs::remove_dir(&tmp_dir);
     result
@@ -1973,35 +1984,32 @@ fn cmd_similar_mm7b(
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    let Some(command) = cli.command else {
-        Cli::command().print_help()?;
-        return Ok(());
-    };
-
-    let pile = &cli.pile;
-
+fn run_command(pile: &Path, command: Command) -> Result<()> {
     match command {
         Command::Add {
             path,
             mime,
             tag,
             dry_run,
-        } => with_files(pile, |collection, _space, _reader| {
-            cmd_add(collection, &path, mime.as_deref(), &tag, dry_run)
-        }),
-        Command::List { tag, mime } => with_files(pile, |_collection, space, reader| {
+        } => {
+            if dry_run {
+                cmd_add_dry_run(&path, &tag)
+            } else {
+                with_files_collection(pile, |collection| {
+                    cmd_add(collection, &path, mime.as_deref(), &tag)
+                })
+            }
+        }
+        Command::List { tag, mime } => with_files_view(pile, |_collection, space, reader| {
             cmd_list(space, reader, &tag, mime.as_deref())
         }),
-        Command::Show { id } => with_files(pile, |_collection, space, reader| {
+        Command::Show { id } => with_files_view(pile, |_collection, space, reader| {
             cmd_show(space, reader, &id)
         }),
-        Command::Get { id, output } => with_files(pile, |_collection, space, reader| {
+        Command::Get { id, output } => with_files_view(pile, |_collection, space, reader| {
             cmd_get(space, reader, &id, output.as_deref())
         }),
-        Command::Tag { id, name } => with_files(pile, |collection, space, reader| {
+        Command::Tag { id, name } => with_files_view(pile, |collection, space, reader| {
             cmd_tag(collection, space, reader, &id, &name)
         }),
         Command::Fetch {
@@ -2010,7 +2018,7 @@ fn main() -> Result<()> {
             name,
             tag,
             max_bytes,
-        } => with_files(pile, |collection, _space, _reader| {
+        } => with_files_collection(pile, |collection| {
             cmd_fetch(
                 collection,
                 &url,
@@ -2020,7 +2028,7 @@ fn main() -> Result<()> {
                 max_bytes,
             )
         }),
-        Command::Search { query } => with_files(pile, |_collection, space, reader| {
+        Command::Search { query } => with_files_view(pile, |_collection, space, reader| {
             cmd_search(space, reader, &query)
         }),
         Command::Similar {
@@ -2030,7 +2038,7 @@ fn main() -> Result<()> {
             limit,
             tag,
             mm7b,
-        } => with_files(pile, |_collection, space, reader| {
+        } => with_files_view(pile, |_collection, space, reader| {
             cmd_similar(
                 space,
                 reader,
@@ -2048,26 +2056,37 @@ fn main() -> Result<()> {
             dpi,
             limit,
             max_pages,
-        } => with_files(pile, |collection, space, reader| {
+        } => with_files_view(pile, |collection, space, reader| {
             if pdf {
                 cmd_embed7b_pdf(collection, space, reader, force, dpi, limit, max_pages)
             } else {
                 cmd_embed7b(collection, space, reader, force)
             }
         }),
-        Command::Imports => with_files(pile, |_collection, space, reader| {
+        Command::Imports => with_files_view(pile, |_collection, space, reader| {
             cmd_imports(space, reader)
         }),
-        Command::Tree { id, depth } => with_files(pile, |_collection, space, reader| {
+        Command::Tree { id, depth } => with_files_view(pile, |_collection, space, reader| {
             cmd_tree(space, reader, &id, depth)
         }),
-        Command::Resolve { input } => with_files(pile, |_collection, space, _reader| {
+        Command::Resolve { input } => with_files_view(pile, |_collection, space, _reader| {
             cmd_resolve(space, &input)
         }),
-        Command::Diff { left, right } => with_files(pile, |_collection, space, reader| {
+        Command::Diff { left, right } => with_files_view(pile, |_collection, space, reader| {
             cmd_diff(space, reader, &left, &right)
         }),
     }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        return Ok(());
+    };
+
+    run_command(&cli.pile, command)
 }
 
 #[cfg(test)]
@@ -2108,11 +2127,38 @@ mod tests {
     #[test]
     fn empty_native_collection_opens_as_an_empty_catalog() {
         let test_pile = TestPile::new();
-        with_files(&test_pile.path, |_collection, space, _reader| {
+        with_files_view(&test_pile.path, |_collection, space, _reader| {
             assert!(space.is_empty());
             cmd_list(space, _reader, &[], None)
         })
         .unwrap();
+    }
+
+    #[test]
+    fn add_dry_run_needs_neither_signer_nor_pile() {
+        let nonce = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "faculties-files-dry-run-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("local.txt");
+        fs::write(&input, b"local preview").unwrap();
+        let absent_pile = dir.join("must-not-be-opened.pile");
+
+        run_command(
+            &absent_pile,
+            Command::Add {
+                path: input,
+                mime: None,
+                tag: vec!["preview".to_owned()],
+                dry_run: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!absent_pile.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2125,8 +2171,7 @@ mod tests {
         let first_id = first.root().unwrap();
         let second_id = second.root().unwrap();
 
-        with_files(&test_pile.path, |collection, space, _reader| {
-            assert!(space.is_empty());
+        with_files_collection(&test_pile.path, |collection| {
             collection.commit(first).context("commit first fixture")?;
             collection.commit(second).context("commit second fixture")?;
             Ok(())
@@ -2135,7 +2180,7 @@ mod tests {
 
         let first_out = test_pile.dir.join("first.png");
         let second_out = test_pile.dir.join("second.txt");
-        with_files(&test_pile.path, |_collection, space, reader| {
+        with_files_view(&test_pile.path, |_collection, space, reader| {
             assert_eq!(
                 find!(
                     entity: Id,
@@ -2172,7 +2217,7 @@ mod tests {
         let file = file_capability::stage(b"same".to_vec(), "same.txt", "text/plain").unwrap();
         let file_id = file.root().unwrap();
 
-        with_files(&test_pile.path, |collection, _space, _reader| {
+        with_files_collection(&test_pile.path, |collection| {
             let first = collection.commit(file.clone()).context("first replay")?;
             let second = collection.commit(file).context("second replay")?;
             assert_eq!(first.id(), second.id());
@@ -2180,7 +2225,7 @@ mod tests {
         })
         .unwrap();
 
-        with_files(&test_pile.path, |_collection, space, _reader| {
+        with_files_view(&test_pile.path, |_collection, space, _reader| {
             assert_eq!(
                 file_capability::resolve_selector(space, &format!("{file_id:x}"))?,
                 file_id
