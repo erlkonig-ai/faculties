@@ -1,3 +1,9 @@
+# This package is also the workspace root so the reusable secrets core can stay
+# independently consumable. The `[patch.crates-io]` below applies workspace-wide.
+[workspace]
+members = ["faculties-secrets"]
+resolver = "2"
+
 [package]
 name = "faculties"
 version = "0.20.2"
@@ -141,6 +147,7 @@ hifitime = "4.2.3"
 rand_core = "0.6.4"
 triblespace = { version = "0.47", path = "../triblespace-rs" }
 triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
+faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
 triblespace-gpu = { version = "0.47.0", path = "../triblespace-rs/triblespace-gpu", optional = true, default-features = false }
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).
@@ -150,7 +157,7 @@ blake3 = "1"                # mail (deterministic entity id from Message-Id)
 chrono = { version = "0.4.39", features = ["clock"] }  # orient
 comemo = "0.5.1"            # wiki
 dirs = "5"                  # wiki
-dryoc = "0.8"               # secrets (libsodium-compatible pure-Rust crypto)
+dryoc = "0.8"               # secrets CLI selftest
 hex = "0.4"                 # gauge
 humantime = "2.3.0"         # orient, patience
 ical = "0.11"               # planner

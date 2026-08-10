@@ -78,6 +78,12 @@ pub fn text_arg(raw: &str, label: &str) -> anyhow::Result<String> {
     Ok(raw.to_string())
 }
 
+/// The `secrets` faculty's capability + envelope-encryption core, re-exported so
+/// faculties consumers can reach it as `faculties::secrets::SecretsRepo`. It
+/// lives in the standalone `faculties-secrets` crate so other consumers can use
+/// the same implementation without pulling the mary/GORBIE/egui stack.
+pub use faculties_secrets as secrets;
+
 #[cfg(feature = "widgets")]
 pub mod widgets;
 
