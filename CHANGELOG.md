@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Native collection publication has a central, pinless seam.** Faculties can
+  discover scoped targets through `CollectionStore` and publish complete
+  `Fragment` values through `Collection<Pile>::commit`, preserving facts,
+  metafacts, and their shared attachments without a target head or CAS cell.
+  Stopped-world migrations get a read-only frozen legacy-pin snapshot whose
+  semantic fingerprint ignores physical pile history.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile
