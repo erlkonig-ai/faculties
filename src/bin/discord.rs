@@ -51,10 +51,10 @@ use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
+use faculties::collection_cutover::load_signer;
 use faculties::files as file_capability;
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{discord, DEFAULT_BRANCH, DEFAULT_LOG_BRANCH};
-use faculties::schemas::files::FILES_BRANCH_NAME;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
@@ -148,7 +148,7 @@ struct DiscordConfig {
     branch: String,
     branch_id: Id,
     log_branch_id: Id,
-    files_branch_id: Id,
+    files_signer: SigningKey,
 }
 
 fn main() -> Result<()> {
@@ -190,6 +190,10 @@ fn main() -> Result<()> {
 
 fn build_config(cli: &Cli) -> Result<DiscordConfig> {
     let pile_path = cli.pile.clone();
+    // Load the durable collection authority before opening the pile. This
+    // keeps signer discovery out of the lifetime of Repository<Pile> and lets
+    // attachment publication borrow that one already-open backend.
+    let files_signer = load_signer(&pile_path, None)?;
     let branch = cli.branch.clone();
     let log_branch = DEFAULT_LOG_BRANCH.to_string();
     let branch_id = with_repo(&pile_path, |repo| {
@@ -203,16 +207,12 @@ fn build_config(cli: &Cli) -> Result<DiscordConfig> {
         repo.ensure_branch(&log_branch, None)
             .map_err(|e| anyhow!("ensure logs branch: {e:?}"))
     })?;
-    let files_branch_id = with_repo(&pile_path, |repo| {
-        repo.ensure_branch(FILES_BRANCH_NAME, None)
-            .map_err(|e| anyhow!("ensure files branch: {e:?}"))
-    })?;
     Ok(DiscordConfig {
         pile_path,
         branch,
         branch_id,
         log_branch_id,
-        files_branch_id,
+        files_signer,
     })
 }
 
@@ -508,29 +508,19 @@ fn pull_channel(
         let mut ws = repo
             .pull(config.branch_id)
             .map_err(|e| anyhow!("pull discord: {e:?}"))?;
-        let mut files_ws = repo
-            .pull(config.files_branch_id)
-            .map_err(|e| anyhow!("pull files: {e:?}"))?;
         let catalog = ws
             .checkout(..)
             .map_err(|e| anyhow!("checkout discord: {e:?}"))?
             .into_facts();
-        let files_catalog = files_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout files: {e:?}"))?
-            .into_facts();
-        let (change, mut files_change) = build_ingest_change(&mut ws, &catalog, incoming, config)?;
-        let files_delta = files_change.facts().difference(&files_catalog);
-        *files_change.facts_mut() = files_delta;
-
-        if !files_change.is_empty() {
-            files_ws.commit(
-                files_change,
-                &format!("discord: attachments from channel {channel_id}"),
-            );
-            repo.push(&mut files_ws)
-                .map_err(|e| anyhow!("push files: {e:?}"))?;
-        }
+        let (files_catalog, _) =
+            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
+        let (change, files_change) = build_ingest_change(&mut ws, &catalog, incoming, config)?;
+        file_capability::commit_missing(
+            repo.storage_mut(),
+            &config.files_signer,
+            &files_catalog,
+            files_change,
+        )?;
 
         let delta = change.difference(&catalog);
         if !delta.is_empty() {

@@ -21,6 +21,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::collection_cutover::load_signer;
 use faculties::files as file_capability;
 use faculties::schemas::decide::{decide as decide_attrs, KIND_DECISION};
 use faculties::schemas::files::file;
@@ -38,7 +39,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::IntoBlob;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::{BlobStoreGet, Repository, Workspace};
 use triblespace::prelude::*;
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -58,9 +60,6 @@ struct Cli {
     /// Branch name for the mail state
     #[arg(long, default_value = "mail")]
     branch: String,
-    /// Branch name for the files state (attachments land here)
-    #[arg(long, default_value = "files")]
-    files_branch: String,
     /// Branch name for relations (auto-registered senders)
     #[arg(long, default_value = "relations")]
     relations_branch: String,
@@ -102,7 +101,7 @@ enum Command {
         /// Relation hex prefix for BCC (repeatable).
         #[arg(long)]
         bcc: Vec<String>,
-        /// File to attach (repeatable). Stored in the files branch
+        /// File to attach (repeatable). Stored in the Files collection
         /// first, then referenced from the draft so `mail send`
         /// attaches it automatically.
         #[arg(long)]
@@ -329,6 +328,13 @@ fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>)
 
 fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
     ws.get::<View<str>, blobencodings::LongString>(h)
+        .ok()
+        .map(|view| view.to_string())
+}
+
+fn read_files_text(reader: &PileReader, h: TextHandle) -> Option<String> {
+    reader
+        .get::<View<str>, blobencodings::LongString>(h)
         .ok()
         .map(|view| view.to_string())
 }
@@ -807,12 +813,8 @@ fn collect_parts(
 
 // ── fetch (POP3) ──────────────────────────────────────────────────────────
 
-fn cmd_fetch(
-    pile: &Path,
-    mail_branch_id: Id,
-    files_branch_id: Id,
-    relations_branch_id: Id,
-) -> Result<()> {
+fn cmd_fetch(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result<()> {
+    let files_signer = load_signer(pile, None)?;
     let config = load_config()?;
     eprintln!(
         "Connecting to {}:{} as {}...",
@@ -867,8 +869,8 @@ fn cmd_fetch(
             ingest_message(
                 repo,
                 mail_branch_id,
-                files_branch_id,
                 relations_branch_id,
+                &files_signer,
                 parsed,
             )?;
             ingested += 1;
@@ -903,15 +905,15 @@ fn cmd_fetch(
 fn ingest_message(
     repo: &mut Repository<Pile>,
     mail_branch_id: Id,
-    files_branch_id: Id,
     relations_branch_id: Id,
+    files_signer: &SigningKey,
     parsed: ParsedMail,
 ) -> Result<()> {
     persist_message(
         repo,
         mail_branch_id,
-        files_branch_id,
         relations_branch_id,
+        files_signer,
         parsed,
         false,
     )
@@ -921,8 +923,8 @@ fn ingest_message(
 fn persist_message(
     repo: &mut Repository<Pile>,
     mail_branch_id: Id,
-    files_branch_id: Id,
     relations_branch_id: Id,
+    files_signer: &SigningKey,
     parsed: ParsedMail,
     as_draft: bool,
 ) -> Result<Id> {
@@ -965,13 +967,13 @@ fn persist_message(
         }
     }
 
-    // 2. files branch: store attachments.
+    // 2. Files collection: publish attachment closure before the source
+    // message can become visible. A replay after a later mail-branch failure
+    // sees these canonical facts and suppresses a redundant Files commit.
     let mut attachment_ids: Vec<Id> = Vec::new();
     if !parsed.attachments.is_empty() {
-        let mut ws = repo
-            .pull(files_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull files: {e:?}"))?;
-
+        let (files_catalog, _) =
+            file_capability::materialize_collection(repo.storage_mut(), files_signer)?;
         let mut change = Fragment::empty();
         for att in &parsed.attachments {
             let media_type = file_capability::normalize_media_type_or_default(&att.mime);
@@ -983,9 +985,7 @@ fn persist_message(
             change += file_fragment;
             attachment_ids.push(file_ref);
         }
-        ws.commit(change, "mail: store attachments");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push files: {e:?}"))?;
+        file_capability::commit_missing(repo.storage_mut(), files_signer, &files_catalog, change)?;
     }
 
     // 3. mail branch: the message entity.
@@ -1131,7 +1131,6 @@ fn synthesize_message_id(local_part_seed: &str) -> String {
 fn cmd_draft(
     pile: &Path,
     mail_branch_id: Id,
-    files_branch_id: Id,
     relations_branch_id: Id,
     decide_branch_id: Id,
     to: String,
@@ -1141,10 +1140,11 @@ fn cmd_draft(
     bcc: Vec<String>,
     attach: Vec<PathBuf>,
 ) -> Result<()> {
+    let files_signer = load_signer(pile, None)?;
     let body_text = faculties::text_arg(&body, "body")?;
     let config = load_config()?;
 
-    // Read each attachment off disk and store it in the files branch
+    // Read each attachment off disk and store it in the Files collection
     // (via persist_message below); the draft references them so that
     // `mail send` re-reads and attaches them automatically.
     let mut attachments: Vec<Attachment> = Vec::new();
@@ -1230,8 +1230,8 @@ fn cmd_draft(
         let draft_id = persist_message(
             repo,
             mail_branch_id,
-            files_branch_id,
             relations_branch_id,
+            &files_signer,
             parsed,
             true,
         )?;
@@ -1267,12 +1267,12 @@ fn send_via_smtp(config: &MailConfig, message: &Message) -> Result<()> {
 fn cmd_reply(
     pile: &Path,
     mail_branch_id: Id,
-    files_branch_id: Id,
     relations_branch_id: Id,
     decide_branch_id: Id,
     parent_hex: String,
     body: String,
 ) -> Result<()> {
+    let files_signer = load_signer(pile, None)?;
     let body_text = faculties::text_arg(&body, "reply body")?;
 
     // Pull parent's properties for thread headers.
@@ -1401,8 +1401,8 @@ fn cmd_reply(
         let draft_id = persist_message(
             repo,
             mail_branch_id,
-            files_branch_id,
             relations_branch_id,
+            &files_signer,
             parsed,
             true,
         )?;
@@ -1464,11 +1464,11 @@ fn decision_is_resolved(ws: &mut Workspace<Pile>, space: &TribleSet, decision_id
 fn cmd_send(
     pile: &Path,
     mail_branch_id: Id,
-    files_branch_id: Id,
     relations_branch_id: Id,
     decide_branch_id: Id,
     draft_hex: String,
 ) -> Result<()> {
+    let files_signer = load_signer(pile, None)?;
     // Resolve the prefix once against the mail space; the rest of the
     // function uses the full Id internally.
     let draft_id = with_repo(pile, |repo| {
@@ -1627,15 +1627,11 @@ fn cmd_send(
         })
     })?;
 
-    // Re-read each referenced attachment's bytes + filename from the
-    // files branch, so they can be re-attached to the outbound MIME.
+    // Re-read each referenced attachment's bytes + filename from the native
+    // Files collection, so they can be re-attached to the outbound MIME.
     let attachments: Vec<(String, String, Vec<u8>)> = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(files_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull files: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout files: {e:?}"))?;
+        let (space, reader) =
+            file_capability::materialize_collection(repo.storage_mut(), &files_signer)?;
         let mut out: Vec<(String, String, Vec<u8>)> = Vec::new();
         for &fid in &attrs.attachment_ids {
             let content_h: FileHandle =
@@ -1643,7 +1639,7 @@ fn cmd_send(
                     .next()
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "attachment file {fid:x} has no canonical content; rebuild the files branch"
+                            "attachment file {fid:x} has no canonical content; rebuild the Files collection"
                         )
                     })?;
             let name_h: TextHandle =
@@ -1651,21 +1647,21 @@ fn cmd_send(
                     .next()
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "attachment file {fid:x} has no canonical name; rebuild the files branch"
+                            "attachment file {fid:x} has no canonical name; rebuild the Files collection"
                         )
                     })?;
-            let bytes: anybytes::Bytes = ws
+            let bytes: anybytes::Bytes = reader
                 .get::<anybytes::Bytes, _>(content_h)
                 .map_err(|e| anyhow::anyhow!("read attachment blob {fid:x}: {e:?}"))?;
-            let name = read_text(&mut ws, name_h)
+            let name = read_files_text(&reader, name_h)
                 .ok_or_else(|| anyhow::anyhow!("read name for attachment file {fid:x}"))?;
             let media_type_handle =
                 file_capability::media_type_name_handle(&space, fid).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "attachment file {fid:x} has no canonical media-type entity; rebuild the files branch"
+                        "attachment file {fid:x} has no canonical media-type entity; rebuild the Files collection"
                     )
                 })?;
-            let media_type = read_text(&mut ws, media_type_handle)
+            let media_type = read_files_text(&reader, media_type_handle)
                 .ok_or_else(|| anyhow::anyhow!("read media type for attachment file {fid:x}"))?;
             out.push((name, media_type, bytes.as_ref().to_vec()));
         }
@@ -2568,17 +2564,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cmd = cli.command.unwrap_or(Command::Today);
 
-    let (mail_branch, files_branch, relations_branch, decide_branch) =
-        with_repo(&cli.pile, |repo| {
-            let m = resolve_branch(repo, &cli.branch)?;
-            let f = resolve_branch(repo, &cli.files_branch)?;
-            let r = resolve_branch(repo, &cli.relations_branch)?;
-            let d = resolve_branch(repo, &cli.decide_branch)?;
-            Ok((m, f, r, d))
-        })?;
+    let (mail_branch, relations_branch, decide_branch) = with_repo(&cli.pile, |repo| {
+        let m = resolve_branch(repo, &cli.branch)?;
+        let r = resolve_branch(repo, &cli.relations_branch)?;
+        let d = resolve_branch(repo, &cli.decide_branch)?;
+        Ok((m, r, d))
+    })?;
 
     match cmd {
-        Command::Fetch => cmd_fetch(&cli.pile, mail_branch, files_branch, relations_branch),
+        Command::Fetch => cmd_fetch(&cli.pile, mail_branch, relations_branch),
         Command::Draft {
             to,
             subject,
@@ -2589,7 +2583,6 @@ fn main() -> Result<()> {
         } => cmd_draft(
             &cli.pile,
             mail_branch,
-            files_branch,
             relations_branch,
             decide_branch,
             to,
@@ -2602,7 +2595,6 @@ fn main() -> Result<()> {
         Command::Send { draft } => cmd_send(
             &cli.pile,
             mail_branch,
-            files_branch,
             relations_branch,
             decide_branch,
             draft,
@@ -2610,7 +2602,6 @@ fn main() -> Result<()> {
         Command::Reply { message, body } => cmd_reply(
             &cli.pile,
             mail_branch,
-            files_branch,
             relations_branch,
             decide_branch,
             message,
@@ -2651,6 +2642,9 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn message_entity_id_is_deterministic_and_message_id_bound() {
@@ -2673,5 +2667,76 @@ mod tests {
             entity_id_for_message("<other@example.com>"),
             "message-id-bound"
         );
+    }
+
+    #[test]
+    fn attachment_closure_lands_in_native_files_before_mail_reference() {
+        let nonce = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "faculties-mail-native-files-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.pile");
+        std::fs::File::create(&path).unwrap();
+
+        let pile = Pile::open(&path).unwrap();
+        let mut repo =
+            Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        let mail_branch = repo.ensure_branch("mail", None).unwrap();
+        let relations_branch = repo.ensure_branch("relations", None).unwrap();
+        let files_signer = SigningKey::generate(&mut OsRng);
+        let parsed = ParsedMail {
+            message_id: "native-files@example.test".to_owned(),
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "attachment closure".to_owned(),
+            body: "body".to_owned(),
+            sent_at: now_epoch(),
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
+            is_spam: false,
+            raw: b"raw message".to_vec(),
+            attachments: vec![Attachment {
+                filename: "proof.txt".to_owned(),
+                mime: "text/plain".to_owned(),
+                bytes: b"native closure".to_vec(),
+            }],
+        };
+
+        let message_id = persist_message(
+            &mut repo,
+            mail_branch,
+            relations_branch,
+            &files_signer,
+            parsed,
+            false,
+        )
+        .unwrap();
+        let (files, reader) =
+            file_capability::materialize_collection(repo.storage_mut(), &files_signer).unwrap();
+        let mut mail_ws = repo.pull(mail_branch).unwrap();
+        let mail_space = mail_ws.checkout(..).unwrap().into_facts();
+        let file_id = find!(
+            attachment: Id,
+            pattern!(&mail_space, [{ message_id @ mail::attachment: ?attachment }])
+        )
+        .next()
+        .expect("mail attachment reference");
+        let content = find!(
+            handle: FileHandle,
+            pattern!(&files, [{ file_id @ file::content: ?handle }])
+        )
+        .next()
+        .expect("native Files content");
+        let bytes: anybytes::Bytes = reader.get(content).unwrap();
+        assert_eq!(bytes.as_ref(), b"native closure");
+
+        drop(mail_ws);
+        drop(reader);
+        repo.close().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

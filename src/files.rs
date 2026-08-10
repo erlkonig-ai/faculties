@@ -13,9 +13,13 @@
 //! to imports or source-specific occurrence entities instead.
 
 use anyhow::{anyhow, Result};
+use ed25519_dalek::SigningKey;
 use std::collections::BTreeSet;
 use std::path::Path;
+use triblespace::core::collection::{Collection, CollectionCommit};
 use triblespace::core::metadata;
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStore;
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
@@ -337,6 +341,71 @@ where
         file::media_type*: media_type,
     };
     Ok(fragment)
+}
+
+/// Materialize the complete signer-owned Files collection through an already
+/// open pile.
+///
+/// The borrowed collection facade introduces no second pile handle and owns no
+/// lifecycle policy. Callers can drop the borrow immediately, continue using
+/// their source repository, and still retain the returned immutable reader for
+/// attachment access.
+pub fn materialize_collection(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<(TribleSet, PileReader)> {
+    let facts = Collection::new(
+        &mut *pile,
+        crate::schemas::files::DEFAULT_SCOPE_ID,
+        signer.clone(),
+    )
+    .materialize()
+    .map_err(|error| anyhow!("materialize Files collection: {error}"))?;
+    let reader = pile
+        .reader()
+        .map_err(|error| anyhow!("open Files attachment reader: {error}"))?;
+    Ok((facts, reader))
+}
+
+/// Publish one complete Files fragment through an already open pile.
+///
+/// This is the Files-first boundary used by attachment producers. The native
+/// collection commit is crash-durable before this returns; callers may then
+/// publish the source occurrence or cursor through whatever independent
+/// collection/legacy path owns it.
+pub fn commit_collection(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    fragment: Fragment,
+) -> Result<CollectionCommit> {
+    Collection::new(
+        pile,
+        crate::schemas::files::DEFAULT_SCOPE_ID,
+        signer.clone(),
+    )
+    .commit(fragment)
+    .map_err(|error| anyhow!("commit Files collection fragment: {error}"))
+}
+
+/// Publish only facts not already present in a materialized Files view.
+///
+/// Native commits are intrinsically idempotent, so this is an optimization,
+/// not a correctness boundary. It preserves the faculties' historical replay
+/// suppression: a source retry after a Files-first partial success emits no
+/// redundant collection leaf and can proceed directly to its own occurrence
+/// or cursor commit.
+pub fn commit_missing(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    known: &TribleSet,
+    mut fragment: Fragment,
+) -> Result<Option<CollectionCommit>> {
+    let delta = fragment.facts().difference(known);
+    *fragment.facts_mut() = delta;
+    if fragment.is_empty() {
+        return Ok(None);
+    }
+    commit_collection(pile, signer, fragment).map(Some)
 }
 
 #[cfg(test)]

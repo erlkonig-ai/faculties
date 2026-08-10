@@ -70,8 +70,8 @@ fn main(nb: &mut NotebookCtx) {
         let Some(mut ws) = st.workspace("wiki") else {
             return;
         };
-        let mut files = st.workspace("files");
-        wiki.render(ctx, &mut ws, files.as_mut());
+        let files = st.files_view();
+        wiki.render(ctx, &mut ws, files);
         st.push(&mut ws);
     });
 

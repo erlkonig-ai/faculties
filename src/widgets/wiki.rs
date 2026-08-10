@@ -2,13 +2,13 @@
 //!
 //! Renders wiki fragments from a triblespace pile. The widget holds only
 //! UI state plus cached query results; the host is responsible for
-//! pulling the wiki branch (and optionally a files branch) and passing
-//! the workspaces in at render time:
+//! pulling the wiki branch and borrowing the native Files collection view at
+//! render time:
 //!
 //! ```ignore
 //! let mut viewer = WikiViewer::default();
-//! // Inside a GORBIE card, with `wiki_ws` and optional `files_ws`:
-//! viewer.render(ctx, wiki_ws, files_ws);
+//! // Inside a GORBIE card, with `wiki_ws` and optional native `files_view`:
+//! viewer.render(ctx, wiki_ws, files_view);
 //! ```
 //!
 //! Features:
@@ -19,7 +19,7 @@
 //!   `wiki:<hex>` link in typst content, or a file entry
 //! - Version navigation (prev/next/latest) on fragments with history
 //! - `files:` link handling — resolves the shared file selector language to a
-//!   file blob (against the optional files workspace),
+//!   file blob (against the optional native Files view),
 //!   writes it to `$TMPDIR/faculties-files/`, and opens it via the platform
 //!   `open` command.
 
@@ -32,8 +32,8 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::{BlobStoreGet, CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
@@ -43,6 +43,7 @@ use GORBIE::themes::colorhash;
 
 use crate::schemas::files::{file, KIND_FILE};
 use crate::schemas::wiki::{attrs as wiki, KIND_VERSION_ID, TAG_ARCHIVED_ID};
+use crate::widgets::storage::{FilesRevision, FilesView};
 
 /// Handle to a long-string blob living in a pile.
 type TextHandle = Inline<Handle<LongString>>;
@@ -71,13 +72,13 @@ struct WikiLive {
     wiki_space: TribleSet,
     files_space: TribleSet,
     cached_head: Option<CommitHandle>,
-    files_cached_head: Option<CommitHandle>,
+    files_cached_revision: Option<FilesRevision>,
 }
 
 impl WikiLive {
     /// Refresh cached fact spaces from the provided workspaces. Pulls
     /// fresh `TribleSet`s via `checkout(..)`.
-    fn refresh(wiki_ws: &mut Workspace<Pile>, files_ws: Option<&mut Workspace<Pile>>) -> Self {
+    fn refresh(wiki_ws: &mut Workspace<Pile>, files_view: Option<FilesView<'_>>) -> Self {
         let wiki_space = wiki_ws
             .checkout(..)
             .map(|co| co.into_facts())
@@ -87,18 +88,8 @@ impl WikiLive {
             });
         let cached_head = wiki_ws.head();
 
-        let (files_space, files_cached_head) = match files_ws {
-            Some(ws) => {
-                let head = ws.head();
-                let space = ws
-                    .checkout(..)
-                    .map(|co| co.into_facts())
-                    .unwrap_or_else(|e| {
-                        eprintln!("[files] checkout: {e:?}");
-                        TribleSet::new()
-                    });
-                (space, head)
-            }
+        let (files_space, files_cached_revision) = match files_view {
+            Some(view) => (view.facts.clone(), Some(view.revision)),
             None => (TribleSet::new(), None),
         };
 
@@ -106,7 +97,7 @@ impl WikiLive {
             wiki_space,
             files_space,
             cached_head,
-            files_cached_head,
+            files_cached_revision,
         }
     }
 
@@ -119,9 +110,9 @@ impl WikiLive {
             .unwrap_or_default()
     }
 
-    fn file_text(&self, files_ws: Option<&mut Workspace<Pile>>, h: TextHandle) -> String {
-        files_ws
-            .and_then(|ws| ws.get::<View<str>, LongString>(h).ok())
+    fn file_text(&self, files_reader: Option<&PileReader>, h: TextHandle) -> String {
+        files_reader
+            .and_then(|reader| reader.get::<View<str>, LongString>(h).ok())
             .map(|v| {
                 let s: &str = v.as_ref();
                 s.to_string()
@@ -271,7 +262,7 @@ impl WikiLive {
     /// if none is known).
     fn resolve_file(
         &self,
-        files_ws: Option<&mut Workspace<Pile>>,
+        files_reader: Option<&PileReader>,
         hex: &str,
     ) -> Option<(FileHandle, String)> {
         let (entity_id, handle) =
@@ -309,7 +300,7 @@ impl WikiLive {
                 )
                 .next()
             })
-            .map(|h| self.file_text(files_ws, h))
+            .map(|h| self.file_text(files_reader, h))
             .unwrap_or_else(|| "file".to_string());
 
         Some((handle, name))
@@ -318,20 +309,19 @@ impl WikiLive {
     /// Resolve `files:<selector>`, write the blob to `$TMPDIR/faculties-files/<name>`,
     /// and fire `open` on it. Logs errors to stderr rather than surfacing
     /// them through the UI (this is a best-effort side channel).
-    fn open_file(&self, files_ws: Option<&mut Workspace<Pile>>, hex: &str) {
-        let Some(ws) = files_ws else {
-            eprintln!("[files] no files workspace available");
+    fn open_file(&self, files_reader: Option<&PileReader>, hex: &str) {
+        let Some(reader) = files_reader else {
+            eprintln!("[files] no Files collection available");
             return;
         };
-        // Resolve using a re-borrow so we can still use the workspace for
-        // the blob read below.
-        let Some((handle, name)) = self.resolve_file(Some(&mut *ws), hex) else {
+        let Some((handle, name)) = self.resolve_file(Some(reader), hex) else {
             eprintln!("[files] could not resolve files:{hex}");
             return;
         };
 
         let result = (|| -> Result<std::path::PathBuf, String> {
-            let blob: Blob<RawBytes> = ws.get(handle).map_err(|e| format!("get blob: {e:?}"))?;
+            let blob: Blob<RawBytes> =
+                reader.get(handle).map_err(|e| format!("get blob: {e:?}"))?;
             let tmp_dir = std::env::temp_dir().join("faculties-files");
             std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir: {e}"))?;
             let path = tmp_dir.join(&name);
@@ -1261,14 +1251,14 @@ struct OpenPage {
 /// GORBIE-embeddable wiki viewer.
 ///
 /// Holds pure UI state plus a cached query snapshot. The wiki workspace
-/// (and optionally a files workspace, for `files:` link resolution) are
+/// (and optionally a native Files view, for `files:` link resolution) are
 /// passed in at render time; the viewer refreshes its cached fact space
 /// whenever the wiki workspace's head advances.
 ///
 /// ```ignore
 /// let mut viewer = WikiViewer::default();
-/// // Inside a GORBIE card, with `wiki_ws` and optional `files_ws`:
-/// viewer.render(ctx, wiki_ws, files_ws);
+/// // Inside a GORBIE card, with `wiki_ws` and optional `files_view`:
+/// viewer.render(ctx, wiki_ws, files_view);
 /// ```
 #[derive(Default)]
 pub struct WikiViewer {
@@ -1292,29 +1282,28 @@ impl WikiViewer {
     }
 
     /// Render the viewer into a GORBIE card context. `wiki_ws` must point
-    /// at the wiki branch; `files_ws` is optional — when provided, the
+    /// at the wiki branch; `files_view` is optional — when provided, the
     /// viewer will resolve `files:<selector>` links and open the resulting
     /// blobs via the platform `open` command.
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
         wiki_ws: &mut Workspace<Pile>,
-        mut files_ws: Option<&mut Workspace<Pile>>,
+        files_view: Option<FilesView<'_>>,
     ) {
         ctx.section("Wiki", |ctx| {
         // Refresh cached spaces if the wiki head has advanced since the
         // last frame (push happened, external write, or first render).
         let wiki_head = wiki_ws.head();
-        let files_head = files_ws.as_ref().and_then(|ws| ws.head());
+        let files_revision = files_view.map(|view| view.revision);
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != wiki_head || l.files_cached_head != files_head,
+            Some(l) => {
+                l.cached_head != wiki_head || l.files_cached_revision != files_revision
+            }
         };
         if need_refresh {
-            self.live = Some(WikiLive::refresh(
-                wiki_ws,
-                files_ws.as_mut().map(|w| &mut **w),
-            ));
+            self.live = Some(WikiLive::refresh(wiki_ws, files_view));
             self.graph = None;
         }
 
@@ -1744,7 +1733,7 @@ impl WikiViewer {
             });
         }
         for hex in to_open_file {
-            live.open_file(files_ws.as_mut().map(|w| &mut **w), &hex);
+            live.open_file(files_view.map(|view| view.reader), &hex);
         }
         });
     }

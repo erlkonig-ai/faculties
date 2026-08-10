@@ -19,8 +19,8 @@ use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 use triblespace::core::blob::Bytes;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::{BlobStoreGet, Repository, Workspace};
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString, U256BE};
@@ -32,9 +32,12 @@ use triblespace::prelude::*;
 /// message-revision model rather than additive mutation of the first snapshot.
 const TEAMS_UNKNOWN_AUTHOR_ID: Id = id_hex!("04217F0E5F75F57B8A7CBFD824D5FF31");
 
+#[cfg(test)]
+use faculties::collection_cutover::initialize_signer;
+use faculties::collection_cutover::load_signer;
 use faculties::files as file_capability;
 use faculties::schemas::archive::{archive, RawBytes};
-use faculties::schemas::files::{file, FILES_BRANCH_NAME, KIND_FILE, KIND_MEDIA_TYPE};
+use faculties::schemas::files::{file, KIND_FILE, KIND_MEDIA_TYPE};
 use faculties::schemas::teams::{teams, DEFAULT_BRANCH, DEFAULT_DELTA_URL};
 
 #[derive(Parser)]
@@ -344,6 +347,7 @@ enum AttachmentsCommand {
 #[derive(Clone, Debug)]
 struct TeamsBridgeConfig {
     pile_path: PathBuf,
+    files_signer: SigningKey,
     branch: String,
     branch_id: Id,
     presentation_context: TeamsPresentationContext,
@@ -554,6 +558,7 @@ fn with_repo<T>(
 
 fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
     let pile_path = cli.pile.clone();
+    let files_signer = load_signer(&pile_path, None)?;
     let branch = std::env::var("TRIBLESPACE_BRANCH")
         .ok()
         .unwrap_or_else(|| cli.branch.clone());
@@ -579,6 +584,7 @@ fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
         .unwrap_or_else(|| cli.token_command.clone());
     Ok(TeamsBridgeConfig {
         pile_path,
+        files_signer,
         branch,
         branch_id,
         presentation_context,
@@ -632,12 +638,8 @@ fn pull_once_with_cache(
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         validate_message_identity_lineage(&catalog)?;
-        let files_branch_id = repo
-            .ensure_branch(FILES_BRANCH_NAME, None)
-            .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
-        let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
-        let files_catalog =
-            map_err_debug(files_ws.checkout(..), "checkout files workspace")?.into_facts();
+        let (files_catalog, _) =
+            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
         let existing_files = file_entity_ids(&files_catalog);
         let cursor_state = load_cursor_from_space(&mut ws, &catalog)?;
         let base_url = resolve_delta_url(&config.delta_url, &app_config.user_id)?;
@@ -651,7 +653,7 @@ fn pull_once_with_cache(
             fetch_delta_with_cursor_recovery(&token, &start_url, &base_url, using_saved_cursor)?;
         let index = CatalogIndex::build(&catalog);
         let incoming = parse_messages(messages)?;
-        let (mut change, mut files_change) =
+        let (mut change, files_change) =
             build_ingest_change(&mut ws, &catalog, &index, &existing_files, incoming, &token)?;
         if let Some(cursor_change) =
             build_cursor_change(&mut ws, &catalog, cursor_state.as_ref(), new_cursor)?
@@ -663,12 +665,12 @@ fn pull_once_with_cache(
         // workspace before advancing Teams facts and the delta cursor: a later
         // Teams failure is safely replayable against already-present content-
         // addressed files.
-        let files_delta = files_change.facts().difference(&files_catalog);
-        *files_change.facts_mut() = files_delta;
-        if !files_change.is_empty() {
-            files_ws.commit(files_change, "teams attachment files");
-            map_err_debug(repo.push(&mut files_ws), "push files workspace")?;
-        }
+        file_capability::commit_missing(
+            repo.storage_mut(),
+            &config.files_signer,
+            &files_catalog,
+            files_change,
+        )?;
 
         if !change.is_empty() {
             ws.commit(change, "teams ingest");
@@ -1498,6 +1500,14 @@ fn build_config_change(
 
 fn load_longstring(ws: &mut Workspace<Pile>, handle: Inline<Handle<LongString>>) -> Result<String> {
     let view: View<str> = map_err_debug(ws.get(handle), "load longstring")?;
+    Ok(view.to_string())
+}
+
+fn load_files_longstring(
+    reader: &PileReader,
+    handle: Inline<Handle<LongString>>,
+) -> Result<String> {
+    let view: View<str> = map_err_debug(reader.get(handle), "load Files longstring")?;
     Ok(view.to_string())
 }
 
@@ -2388,12 +2398,8 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-        let files_branch_id = repo
-            .ensure_branch(FILES_BRANCH_NAME, None)
-            .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
-        let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
-        let files_catalog =
-            map_err_debug(files_ws.checkout(..), "checkout files workspace")?.into_facts();
+        let (files_catalog, files_reader) =
+            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
@@ -2531,7 +2537,7 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                 .transpose()?;
             let media_type = row
                 .media_type
-                .map(|handle| load_longstring(&mut files_ws, handle))
+                .map(|handle| load_files_longstring(&files_reader, handle))
                 .transpose()?;
             let size = row
                 .size
@@ -2575,12 +2581,8 @@ fn backfill_attachments(
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         validate_message_identity_lineage(&catalog)?;
         let index = CatalogIndex::build(&catalog);
-        let files_branch_id = repo
-            .ensure_branch(FILES_BRANCH_NAME, None)
-            .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
-        let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
-        let files_catalog =
-            map_err_debug(files_ws.checkout(..), "checkout files workspace")?.into_facts();
+        let (files_catalog, _) =
+            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
         let existing_files = file_entity_ids(&files_catalog);
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
@@ -2770,8 +2772,11 @@ fn backfill_attachments(
         }
 
         if !files_change.is_empty() {
-            files_ws.commit(files_change, "teams attachment files backfill");
-            map_err_debug(repo.push(&mut files_ws), "push files workspace")?;
+            file_capability::commit_collection(
+                repo.storage_mut(),
+                &config.files_signer,
+                files_change,
+            )?;
         }
         if !change.is_empty() {
             ws.commit(change, "teams attachments backfill");
@@ -2791,12 +2796,8 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-        let files_branch_id = repo
-            .ensure_branch(FILES_BRANCH_NAME, None)
-            .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
-        let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
-        let files_catalog =
-            map_err_debug(files_ws.checkout(..), "checkout files workspace")?.into_facts();
+        let (files_catalog, files_reader) =
+            file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
@@ -2924,7 +2925,7 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
         let candidate = candidates.remove(0);
         let media_type = candidate
             .media_type
-            .map(|handle| load_longstring(&mut files_ws, handle))
+            .map(|handle| load_files_longstring(&files_reader, handle))
             .transpose()?;
         let mut filename = options
             .filename
@@ -2932,7 +2933,7 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
             .or_else(|| {
                 candidate
                     .name
-                    .map(|handle| load_longstring(&mut files_ws, handle))
+                    .map(|handle| load_files_longstring(&files_reader, handle))
                     .transpose()
                     .ok()
                     .flatten()
@@ -2956,7 +2957,7 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
         }
 
         let bytes: Bytes = map_err_debug(
-            files_ws.get::<Bytes, RawBytes>(candidate.data_handle),
+            files_reader.get::<Bytes, RawBytes>(candidate.data_handle),
             "load attachment bytes",
         )?;
         fs::write(&path, bytes.as_ref())
@@ -3674,7 +3675,7 @@ fn ensure_attachments(
             let file_id = *linked_files.iter().next().expect("checked singleton");
             if !existing_files.contains(&file_id) {
                 bail!(
-                    "Teams attachment occurrence {attachment_id:x} links to incomplete file record {file_id:x}; repair the files branch before retrying"
+                    "Teams attachment occurrence {attachment_id:x} links to incomplete file record {file_id:x}; repair the Files collection before retrying"
                 );
             }
             continue;
@@ -4047,6 +4048,7 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let path = dir.join("test.pile");
             fs::File::create(&path).unwrap();
+            initialize_signer(&path, None).unwrap();
             Self { dir, path }
         }
 
@@ -4054,6 +4056,7 @@ mod tests {
             let branch_id = ensure_test_branch(&self.path, DEFAULT_BRANCH);
             TeamsBridgeConfig {
                 pile_path: self.path.clone(),
+                files_signer: load_signer(&self.path, None).unwrap(),
                 branch: DEFAULT_BRANCH.to_string(),
                 branch_id,
                 presentation_context: TeamsPresentationContext::default(),
@@ -4116,13 +4119,8 @@ mod tests {
             let mut ws = map_err_debug(repo.pull(config.branch_id), "pull test workspace")?;
             let catalog = map_err_debug(ws.checkout(..), "checkout test workspace")?.into_facts();
             validate_message_identity_lineage(&catalog)?;
-            let files_branch_id = repo
-                .ensure_branch(FILES_BRANCH_NAME, None)
-                .map_err(|err| anyhow::anyhow!("ensure test files branch: {err:?}"))?;
-            let mut files_ws =
-                map_err_debug(repo.pull(files_branch_id), "pull test files workspace")?;
-            let files_catalog =
-                map_err_debug(files_ws.checkout(..), "checkout test files workspace")?.into_facts();
+            let (files_catalog, _) =
+                file_capability::materialize_collection(repo.storage_mut(), &config.files_signer)?;
             let existing_files = file_entity_ids(&files_catalog);
             let index = CatalogIndex::build(&catalog);
             let incoming = parse_messages(messages)?;
@@ -4139,8 +4137,11 @@ mod tests {
             let counts = (change.len(), files_change.len());
 
             if commit_files && !files_change.is_empty() {
-                files_ws.commit(files_change, "test teams files ingest");
-                map_err_debug(repo.push(&mut files_ws), "push test files workspace")?;
+                file_capability::commit_collection(
+                    repo.storage_mut(),
+                    &config.files_signer,
+                    files_change,
+                )?;
             }
             if commit_teams && !change.is_empty() {
                 ws.commit(change, "test teams ingest");
@@ -4158,6 +4159,15 @@ mod tests {
                 .map_err(|err| anyhow::anyhow!("ensure test branch: {err:?}"))?;
             let mut ws = map_err_debug(repo.pull(branch_id), "pull test branch")?;
             Ok(map_err_debug(ws.checkout(..), "checkout test branch")?.into_facts())
+        })
+        .unwrap()
+    }
+
+    fn test_files_catalog(path: &Path) -> TribleSet {
+        let signer = load_signer(path, None).unwrap();
+        with_repo(&path.to_path_buf(), |repo| {
+            file_capability::materialize_collection(repo.storage_mut(), &signer)
+                .map(|(facts, _)| facts)
         })
         .unwrap()
     }
@@ -4464,7 +4474,7 @@ mod tests {
                 .len(),
             2
         );
-        let files_catalog = test_branch_catalog(&pile.path, FILES_BRANCH_NAME);
+        let files_catalog = test_files_catalog(&pile.path);
         assert_eq!(file_entity_ids(&files_catalog).len(), 2);
         let occurrence_files = find!(
             (attachment: Id, file_id: Id),
@@ -4518,7 +4528,7 @@ mod tests {
                 .len(),
             1
         );
-        let files_catalog = test_branch_catalog(&pile.path, FILES_BRANCH_NAME);
+        let files_catalog = test_files_catalog(&pile.path);
         assert_eq!(file_entity_ids(&files_catalog).len(), 1);
     }
 
@@ -4577,7 +4587,7 @@ mod tests {
             ingest_test_batch(&config, vec![message], true, true),
             (0, 0)
         );
-        let files_catalog = test_branch_catalog(&pile.path, FILES_BRANCH_NAME);
+        let files_catalog = test_files_catalog(&pile.path);
         assert_eq!(file_entity_ids(&files_catalog).len(), 1);
         let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
         assert_eq!(

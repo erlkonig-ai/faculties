@@ -171,8 +171,8 @@ fn main(nb: &mut NotebookCtx) {
         let Some(mut ws) = st.workspace("wiki") else {
             return;
         };
-        let mut files = st.workspace("files");
-        wiki.render(ctx, &mut ws, files.as_mut());
+        let files = st.files_view();
+        wiki.render(ctx, &mut ws, files);
         st.push(&mut ws);
     });
 
@@ -267,11 +267,10 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("files", FilesViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("files") else {
+        let Some(files) = st.files_view() else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, files);
     });
 
     nb.state("triage", TriageViewer::default(), move |ctx, panel| {

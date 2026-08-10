@@ -34,7 +34,7 @@ pub use messages::MessagesPanel;
 pub use planner::PlannerViewer;
 pub use relations::RelationsViewer;
 pub use status::StatusViewer;
-pub use storage::StorageState;
+pub use storage::{FilesView, StorageState};
 pub use teams::TeamsViewer;
 pub use timeline::{BranchTimeline, SourceKind, TimelineSource};
 pub use triage::TriageViewer;

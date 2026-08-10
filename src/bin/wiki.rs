@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::collection_cutover::load_signer;
 use faculties::schemas::embeddings::{self, Embedding768};
-use faculties::schemas::files::FILES_BRANCH_NAME;
 use hifitime::efmt::consts::ISO8601_DATE;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -674,13 +674,9 @@ fn extract_references(content: &str, space: &TribleSet, source_vid: Id) -> Tribl
                 edges += entity! { eid @ wiki::links_to: &target };
                 if !type_prefix.is_empty() {
                     let type_name = type_prefix[..type_prefix.len() - 1].to_owned();
-                    let name_handle = type_name.to_blob().get_handle();
                     let attr =
-                        triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from(
-                            entity! {
-                                metadata::name: name_handle,
-                                metadata::value_encoding: <inlineencodings::GenId as triblespace::core::metadata::MetaDescribe>::id(),
-                            },
+                        triblespace::core::attribute::Attribute::<inlineencodings::GenId>::named(
+                            &type_name,
                         );
                     let eid = ExclusiveId::force_ref(&source_vid);
                     edges += entity! { eid @ attr: &target };
@@ -719,30 +715,6 @@ fn is_fragment(space: &TribleSet, id: Id) -> bool {
 }
 
 type Repo = Repository<Pile>;
-
-/// Load the shared file catalog when it already exists.
-///
-/// Wiki lint only needs this branch to expand short `files:` selectors. Full
-/// entity ids and content hashes are self-describing, so an absent catalog is
-/// not an error. In particular this must use `lookup_branch`, not
-/// `ensure_branch`: linting prose must never create a bookkeeping branch as a
-/// side effect.
-fn load_files_catalog(repo: &mut Repo) -> Result<Option<TribleSet>> {
-    let Some(branch_id) = repo
-        .lookup_branch(FILES_BRANCH_NAME)
-        .map_err(|e| anyhow::anyhow!("look up files branch: {e:?}"))?
-    else {
-        return Ok(None);
-    };
-    let mut workspace = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull files branch: {e:?}"))?;
-    let catalog = workspace
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout files branch: {e:?}"))?
-        .into_facts();
-    Ok(Some(catalog))
-}
 
 /// Ensure all built-in tag/kind IDs have metadata::name entries.
 fn ensure_tag_vocabulary(repo: &mut Repo, ws: &mut Workspace<Pile>) -> Result<()> {
@@ -914,7 +886,7 @@ mod typst_validate {
 
 /// Resolution context for the two reference languages understood by wiki
 /// prose. Wiki ids live in the wiki branch; short file selectors live in the
-/// optional files branch.
+/// optional native Files collection.
 #[derive(Clone, Copy)]
 struct ReferenceResolver<'a> {
     wiki: &'a TribleSet,
@@ -928,7 +900,7 @@ impl<'a> ReferenceResolver<'a> {
 
     /// Expand the part after `wiki:` / `files:` and return its canonical
     /// spelling. Full file entity ids and hashes resolve without a catalog;
-    /// only prefixes need the files branch.
+    /// only prefixes need the Files collection.
     fn expand(&self, scheme: &str, rest: &str) -> Result<String> {
         match scheme {
             "wiki" => {
@@ -947,7 +919,7 @@ impl<'a> ReferenceResolver<'a> {
                         faculties::files::resolve_reference(&TribleSet::new(), &clean)
                     }
                     None => bail!(
-                        "cannot resolve short files selector '{clean}': the files branch is absent"
+                        "cannot resolve short files selector '{clean}': the Files collection is unavailable"
                     ),
                 }?;
                 Ok(reference.hex())
@@ -957,22 +929,9 @@ impl<'a> ReferenceResolver<'a> {
     }
 }
 
-/// Whether linting this text can actually benefit from the files catalog.
-/// Exact entity ids (32 hex chars) and content hashes (64) are direct, so only
-/// the two prefix ranges require a branch checkout.
-fn has_short_files_selector(content: &str) -> bool {
-    content.match_indices("files:").any(|(start, _)| {
-        let hex_len = content[start + "files:".len()..]
-            .bytes()
-            .take_while(u8::is_ascii_hexdigit)
-            .count();
-        (1..32).contains(&hex_len) || (33..64).contains(&hex_len)
-    })
-}
-
 /// Apply lint transforms to content: markdown→typst syntax, expand short IDs.
 /// Returns the transformed content. Short file selectors are expanded from
-/// `files_space` when that branch exists; full 32/64-character file tokens are
+/// `files_space` when that collection is available; full 32/64-character file tokens are
 /// canonicalized without it.
 fn lint_fix(content: &str, wiki_space: &TribleSet, files_space: Option<&TribleSet>) -> String {
     let resolver = ReferenceResolver::new(wiki_space, files_space);
@@ -1557,15 +1516,19 @@ fn resolve_reference_line(
     }
 }
 
-fn cmd_fix_truncated(repo: &mut Repo, bid: Id, raw_input: String) -> Result<()> {
+fn cmd_fix_truncated(
+    repo: &mut Repo,
+    bid: Id,
+    raw_input: String,
+    files_space: Option<&TribleSet>,
+) -> Result<()> {
     let input = faculties::text_arg(&raw_input, "input")?;
-    let files_space = load_files_catalog(repo)?;
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let resolver = ReferenceResolver::new(&space, files_space.as_ref());
+    let resolver = ReferenceResolver::new(&space, files_space);
 
     let mut resolved = 0u32;
     let mut failed = 0u32;
@@ -1786,9 +1749,13 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<()> {
-    let files_space = load_files_catalog(repo)?;
-
+fn cmd_lint(
+    repo: &mut Repo,
+    bid: Id,
+    do_fix: bool,
+    check_only: bool,
+    files_space: Option<&TribleSet>,
+) -> Result<()> {
     // Dry-run and check modes: single pull, no commits.
     if !do_fix {
         let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
@@ -1811,7 +1778,7 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
             let original = content.as_ref().to_string();
             checked += 1;
 
-            let fixed = lint_fix(&original, &space, files_space.as_ref());
+            let fixed = lint_fix(&original, &space, files_space);
             if fixed != original {
                 changed += 1;
                 let title = read_title(&space, &mut ws, vid).unwrap_or_default();
@@ -1880,7 +1847,7 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
             let original = content.as_ref().to_string();
             checked += 1;
 
-            let fixed = lint_fix(&original, &space, files_space.as_ref());
+            let fixed = lint_fix(&original, &space, files_space);
             if fixed == original {
                 // Text already clean: rebuild the desired link tribles and subtract
                 // what's already in the space — add only the missing ones.
@@ -1998,8 +1965,12 @@ fn cmd_export_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
-    let files_space = load_files_catalog(repo)?;
+fn cmd_import_all(
+    repo: &mut Repo,
+    bid: Id,
+    dir: PathBuf,
+    files_space: Option<&TribleSet>,
+) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws
         .checkout(..)
@@ -2082,7 +2053,7 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
             }
 
             // Lint-fix then validate typst
-            let new_content = lint_fix(&new_content, &space, files_space.as_ref());
+            let new_content = lint_fix(&new_content, &space, files_space);
             if let Err(e) = validate_typst(&new_content) {
                 eprintln!("TYPST_ERROR {}: {}", path.display(), e);
                 continue;
@@ -2146,15 +2117,10 @@ fn cmd_create(
     tags: Vec<String>,
     force: bool,
     id: Option<String>,
+    files_space: Option<&TribleSet>,
 ) -> Result<()> {
     let title = faculties::text_arg(&title, "title")?;
     let content = faculties::text_arg(&content, "content")?;
-    let files_space = if has_short_files_selector(&content) {
-        load_files_catalog(repo)?
-    } else {
-        None
-    };
-
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     ensure_tag_vocabulary(repo, &mut ws)?;
     let space = ws
@@ -2164,7 +2130,7 @@ fn cmd_create(
     let tag_ids = resolve_tags(&space, &mut ws, &tags, &mut change);
 
     // Lint-fix then validate typst compilation and link targets.
-    let content = lint_fix(&content, &space, files_space.as_ref());
+    let content = lint_fix(&content, &space, files_space);
     validate_typst(&content)?;
     validate_wiki_links(&content, &space, force)?;
     warn_bare_refs(&content);
@@ -2211,6 +2177,7 @@ fn cmd_edit(
     new_title: Option<String>,
     tags: Vec<String>,
     force: bool,
+    files_space: Option<&TribleSet>,
 ) -> Result<()> {
     let content = content
         .map(|c| faculties::text_arg(&c, "content"))
@@ -2221,12 +2188,6 @@ fn cmd_edit(
     if content.is_none() && new_title.is_none() && tags.is_empty() {
         bail!("nothing to change — provide content, --title, or --tag");
     }
-    let files_space = if content.as_deref().is_some_and(has_short_files_selector) {
-        load_files_catalog(repo)?
-    } else {
-        None
-    };
-
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws
         .checkout(..)
@@ -2250,7 +2211,7 @@ fn cmd_edit(
     let content_handle = match &content {
         Some(text) => {
             // Lint-fix then validate typst compilation and link targets.
-            let fixed = lint_fix(text, &space, files_space.as_ref());
+            let fixed = lint_fix(text, &space, files_space);
             validate_typst(&fixed)?;
             validate_wiki_links(&fixed, &space, force)?;
             warn_bare_refs(&fixed);
@@ -2625,11 +2586,7 @@ fn cmd_list(
     // + schema produces the same attribute id deterministically.
     let attr_from_name =
         |name: &str| -> triblespace::core::attribute::Attribute<inlineencodings::GenId> {
-            let name_handle = name.to_owned().to_blob().get_handle();
-            triblespace::core::attribute::Attribute::<inlineencodings::GenId>::from(entity! {
-                metadata::name: name_handle,
-                metadata::value_encoding: <inlineencodings::GenId as triblespace::core::metadata::MetaDescribe>::id(),
-            })
+            triblespace::core::attribute::Attribute::<inlineencodings::GenId>::named(name)
         };
     let with_bl_type_attrs: Vec<(
         String,
@@ -3337,8 +3294,6 @@ mod tests {
         let hash = content_hash_hex(handle);
         let files = file_catalog(&[("11111111111111111111111111111111", handle)]);
         let prefix = hash[..40].to_ascii_uppercase();
-        assert!(has_short_files_selector(&format!("files:{prefix}")));
-
         assert_eq!(
             lint_fix(&format!("[paper](files:{prefix})"), &wiki, Some(&files)),
             format!("#link(\"files:{hash}\")[paper]")
@@ -3376,10 +3331,6 @@ mod tests {
         let resolver = ReferenceResolver::new(&wiki, None);
         let entity = "ABCDEF0123456789ABCDEF0123456789";
         let hash = "AB".repeat(32);
-        assert!(!has_short_files_selector(&format!(
-            "files:{entity} files:{hash}"
-        )));
-
         assert_eq!(
             lint_fix(
                 &format!("[entity](files:{entity}) [bytes](files:{hash})"),
@@ -3442,18 +3393,19 @@ mod tests {
     }
 
     #[test]
-    fn loading_an_absent_files_catalog_does_not_create_it() {
+    fn materializing_an_empty_native_files_collection_is_read_only() {
         let path = std::env::temp_dir().join(format!("wiki-files-catalog-{}.pile", fucid()));
         std::fs::File::create(&path).expect("create test pile");
         let pile = Pile::open(&path).expect("open test pile");
+        let files_signer = SigningKey::generate(&mut OsRng);
         let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
             .expect("repository");
         repo.ensure_branch(WIKI_BRANCH_NAME, None)
             .expect("wiki branch");
 
-        assert!(repo.lookup_branch(FILES_BRANCH_NAME).unwrap().is_none());
-        assert!(load_files_catalog(&mut repo).unwrap().is_none());
-        assert!(repo.lookup_branch(FILES_BRANCH_NAME).unwrap().is_none());
+        let (facts, _) =
+            faculties::files::materialize_collection(repo.storage_mut(), &files_signer).unwrap();
+        assert!(facts.is_empty());
 
         repo.close().expect("close test pile");
         std::fs::remove_file(path).expect("remove test pile");
@@ -3558,6 +3510,23 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
+    // Only commands that may canonicalize a `files:` selector need the Files
+    // catalog. Load its durable authority before opening the pile so the
+    // collection view can borrow the one Repository<Pile> backend below.
+    let needs_files = matches!(
+        &command,
+        Command::Create { .. }
+            | Command::Edit { .. }
+            | Command::Batch {
+                action: BatchAction::Import { .. }
+            }
+            | Command::FixTruncated { .. }
+            | Command::Lint { .. }
+    );
+    let files_signer = needs_files
+        .then(|| load_signer(&cli.pile, None))
+        .transpose()?;
+
     let pile = Pile::open(&cli.pile).map_err(|e| anyhow::anyhow!("open pile: {e:?}"))?;
     let signing_key = SigningKey::generate(&mut OsRng);
     let mut repo = Repository::new(pile, signing_key, TribleSet::new())
@@ -3569,6 +3538,13 @@ fn main() -> Result<()> {
         repo.ensure_branch(WIKI_BRANCH_NAME, None)
             .map_err(|e| anyhow::anyhow!("ensure wiki branch: {e:?}"))?
     };
+    let files_space = files_signer
+        .as_ref()
+        .map(|signer| {
+            faculties::files::materialize_collection(repo.storage_mut(), signer)
+                .map(|(facts, _)| facts)
+        })
+        .transpose()?;
 
     let result = match command {
         Command::Create {
@@ -3577,14 +3553,32 @@ fn main() -> Result<()> {
             tag,
             force,
             id,
-        } => cmd_create(&mut repo, branch_id, title, content, tag, force, id),
+        } => cmd_create(
+            &mut repo,
+            branch_id,
+            title,
+            content,
+            tag,
+            force,
+            id,
+            files_space.as_ref(),
+        ),
         Command::Edit {
             id,
             content,
             title,
             tag,
             force,
-        } => cmd_edit(&mut repo, branch_id, id, content, title, tag, force),
+        } => cmd_edit(
+            &mut repo,
+            branch_id,
+            id,
+            content,
+            title,
+            tag,
+            force,
+            files_space.as_ref(),
+        ),
         Command::Show { id, latest } => cmd_show(&mut repo, branch_id, id, latest),
         Command::Export { id } => cmd_export(&mut repo, branch_id, id),
         Command::Diff { id, from, to } => cmd_diff(&mut repo, branch_id, id, from, to),
@@ -3627,10 +3621,16 @@ fn main() -> Result<()> {
         Command::Check { compile } => cmd_check(&mut repo, branch_id, compile),
         Command::Batch { action } => match action {
             BatchAction::Export { dir } => cmd_export_all(&mut repo, branch_id, dir),
-            BatchAction::Import { dir } => cmd_import_all(&mut repo, branch_id, dir),
+            BatchAction::Import { dir } => {
+                cmd_import_all(&mut repo, branch_id, dir, files_space.as_ref())
+            }
         },
-        Command::FixTruncated { input } => cmd_fix_truncated(&mut repo, branch_id, input),
-        Command::Lint { fix, check } => cmd_lint(&mut repo, branch_id, fix, check),
+        Command::FixTruncated { input } => {
+            cmd_fix_truncated(&mut repo, branch_id, input, files_space.as_ref())
+        }
+        Command::Lint { fix, check } => {
+            cmd_lint(&mut repo, branch_id, fix, check, files_space.as_ref())
+        }
     };
 
     repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;

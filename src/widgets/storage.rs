@@ -2,10 +2,10 @@
 //!
 //! A single `StorageState` holds an open `Repository<Pile>` and
 //! renders the top-bar pile-path selector / error banner. Widgets pull a
-//! fresh [`Workspace`] each frame via [`StorageState::workspace`]; if the
-//! callsite mutates the workspace, it pushes back with
-//! [`StorageState::push`]. Nothing is cached across frames — the storage
-//! itself (pile + repo) is the only shared state.
+//! fresh legacy [`Workspace`] each frame via [`StorageState::workspace`]; if
+//! the callsite mutates the workspace, it pushes back with
+//! [`StorageState::push`]. The native Files collection is materialized once
+//! per pile open and exposed as an immutable [`FilesView`].
 //!
 //! ```ignore
 //! let storage = nb.state(
@@ -28,7 +28,7 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, PinStore, Repository, Workspace};
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
@@ -36,13 +36,47 @@ use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::View;
 use GORBIE::prelude::CardCtx;
 
+use crate::collection_cutover::load_signer;
+
 type TextHandle = Inline<Handle<LongString>>;
+
+/// Opaque cache identity for one materialized Files snapshot.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FilesRevision(u64);
+
+/// Borrowed immutable native Files collection used by read-only widgets.
+#[derive(Clone, Copy, Debug)]
+pub struct FilesView<'a> {
+    pub facts: &'a TribleSet,
+    pub reader: &'a PileReader,
+    pub revision: FilesRevision,
+}
+
+struct LoadedFiles {
+    facts: TribleSet,
+    reader: PileReader,
+    revision: FilesRevision,
+}
+
+impl LoadedFiles {
+    fn view(&self) -> FilesView<'_> {
+        FilesView {
+            facts: &self.facts,
+            reader: &self.reader,
+            revision: self.revision,
+        }
+    }
+}
 
 /// Shared open pile + repository. Workspaces are pulled fresh per call.
 pub struct StorageState {
     /// Open repository. `None` when the last open attempt failed; see
     /// [`StorageState::error`] for the message.
     repo: Option<Repository<Pile>>,
+    /// Native Files collection materialized from the same open pile.
+    files: Option<LoadedFiles>,
+    /// Local cache generation advanced whenever the pile is reopened.
+    next_files_revision: u64,
     /// Canonical path the pile was opened from.
     pile_path: PathBuf,
     /// Editable text buffer for the top-bar path field.
@@ -68,6 +102,8 @@ impl StorageState {
         let pile_path_text = pile_path.to_string_lossy().into_owned();
         Self {
             repo: None,
+            files: None,
+            next_files_revision: 0,
             pile_path,
             pile_path_text,
             error: None,
@@ -104,7 +140,13 @@ impl StorageState {
         if let Some(repo) = self.repo.take() {
             let _ = repo.close();
         }
+        self.files = None;
         self.error = None;
+        self.toast = None;
+        // Files is an optional secondary dataset for the generic viewer. Its
+        // signer is still resolved before the pile opens, but a missing or
+        // invalid Files view must not hide unrelated legacy faculty branches.
+        let files_signer = load_signer(&self.pile_path, None);
         let mut pile = match Pile::open(&self.pile_path) {
             Ok(p) => p,
             Err(e) => {
@@ -130,10 +172,32 @@ impl StorageState {
             }
         };
         if let Err(e) = repo.storage_mut().refresh() {
+            let _ = repo.close();
             self.error = Some(format!("refresh: {e:?}"));
             return;
         }
+        match files_signer
+            .and_then(|signer| crate::files::materialize_collection(repo.storage_mut(), &signer))
+        {
+            Ok((facts, reader)) => {
+                self.next_files_revision = self.next_files_revision.wrapping_add(1);
+                self.files = Some(LoadedFiles {
+                    facts,
+                    reader,
+                    revision: FilesRevision(self.next_files_revision),
+                });
+            }
+            Err(error) => {
+                self.toast = Some(format!("Files collection unavailable: {error:#}"));
+            }
+        }
         self.repo = Some(repo);
+    }
+
+    /// Borrow the current native Files snapshot.
+    pub fn files_view(&mut self) -> Option<FilesView<'_>> {
+        self.ensure_open();
+        self.files.as_ref().map(LoadedFiles::view)
     }
 
     /// Pull a fresh workspace for `branch`. `None` if no repo is open or
@@ -303,6 +367,7 @@ impl StorageState {
     /// Cleanly close the underlying pile. Called automatically on drop
     /// but exposed so callers can surface close failures.
     pub fn close(&mut self) -> Result<(), String> {
+        self.files = None;
         if let Some(repo) = self.repo.take() {
             repo.close().map_err(|e| format!("close pile: {e:?}"))?;
         }

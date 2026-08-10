@@ -35,10 +35,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("files", FilesViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(mut ws) = st.workspace("files") else {
+        let Some(files) = st.files_view() else {
             return;
         };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        panel.render(ctx, files);
     });
 }
