@@ -34,6 +34,7 @@ pub fn model_dir() -> std::path::PathBuf {
 
 pub mod collection_cutover;
 pub mod files;
+pub mod files_cutover;
 pub mod memory_cover;
 #[cfg(feature = "local-embed")]
 pub mod nomic;

@@ -11,13 +11,18 @@
 //! immutable [`PileReader`] snapshot. Those coordinates never become target
 //! authority and no operation on a frozen source can update them.
 
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 
+use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::blob::{Blob, IntoBlob, MemoryBlobStore};
 use triblespace::core::collection::simplearchive_union;
 use triblespace::core::collection::{
     discover_collection_records, Collection, CollectionCommit, CollectionDefinition,
@@ -25,11 +30,13 @@ use triblespace::core::collection::{
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
+use triblespace::core::inline::{Inline, InlineEncoding};
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader, ReadError};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, PinStore};
+use triblespace::core::repo::{self, reachable, BlobStore, BlobStoreGet, CommitHandle, PinStore};
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
+use triblespace::macros::{entity, find, pattern};
 
 /// Canonical records currently known for one scoped target collection.
 ///
@@ -184,12 +191,39 @@ pub fn publish_fragment(
     scope: Id,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
+    let mut commits = publish_fragments(pile_path, key_path, scope, [fragment])?;
+    Ok(commits
+        .pop()
+        .expect("one input fragment produces one collection commit"))
+}
+
+/// Publish a deterministic sequence of complete fragments into one collection.
+///
+/// This is the authored-leaf migration path: the target pile is opened once,
+/// each input crosses the same narrow [`Collection::commit`] boundary, and the
+/// pile is closed even if a later publication fails. Replaying a prefix or the
+/// whole sequence is idempotent because both blobs and collection records are
+/// content addressed.
+pub fn publish_fragments(
+    pile_path: &Path,
+    key_path: Option<&Path>,
+    scope: Id,
+    fragments: impl IntoIterator<Item = Fragment>,
+) -> Result<Vec<CollectionCommit>> {
     let signer = load_signer(pile_path, key_path)?;
     let pile = open_pile_strict(pile_path)?;
     let mut collection = Collection::new(pile, scope, signer);
-    let result = collection
-        .commit(fragment)
-        .context("publish native collection fragment");
+    let result = (|| {
+        let mut commits = Vec::new();
+        for fragment in fragments {
+            commits.push(
+                collection
+                    .commit(fragment)
+                    .context("publish native collection fragment")?,
+            );
+        }
+        Ok(commits)
+    })();
     finish_pile(collection.into_storage(), result)
 }
 
@@ -215,10 +249,72 @@ pub struct LegacyPinCoordinate {
     pub value: Inline<Handle<SimpleArchive>>,
 }
 
+/// Exact frozen-source coordinate of one verified legacy authored commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct LegacyCommitCoordinate {
+    pub branch: Id,
+    pub pin: Inline<Handle<SimpleArchive>>,
+    pub commit: CommitHandle,
+}
+
+/// One verified legacy commit in a frozen branch DAG.
+///
+/// `content == None` identifies a canonical contentless merge. An authored
+/// commit whose archive is the empty set still has `content == Some(_)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenLegacyDelta {
+    pub commit: CommitHandle,
+    pub parents: Vec<CommitHandle>,
+    pub subject: Id,
+    pub facts: TribleSet,
+    commit_metadata: TribleSet,
+    content: Option<Inline<Handle<SimpleArchive>>>,
+}
+
+impl FrozenLegacyDelta {
+    pub fn commit_metadata(&self) -> &TribleSet {
+        &self.commit_metadata
+    }
+
+    pub const fn content_handle(&self) -> Option<Inline<Handle<SimpleArchive>>> {
+        self.content
+    }
+
+    pub const fn is_authored(&self) -> bool {
+        self.content.is_some()
+    }
+}
+
+/// Exact named legacy branch observed in one frozen source snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenLegacyBranch {
+    pub branch: Id,
+    pub pin: Inline<Handle<SimpleArchive>>,
+    pub head: Option<CommitHandle>,
+    /// Verified commits in deterministic parent-before-child order.
+    pub deltas: Vec<FrozenLegacyDelta>,
+}
+
+impl FrozenLegacyBranch {
+    pub const fn pin_coordinate(&self) -> LegacyPinCoordinate {
+        LegacyPinCoordinate {
+            id: self.branch,
+            value: self.pin,
+        }
+    }
+}
+
+/// One self-contained authored commit projected from a frozen legacy branch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedLegacyCommit {
+    pub source: LegacyCommitCoordinate,
+    pub content: Fragment,
+    pub metadata: Fragment,
+}
+
 /// Read-only stopped-world input for deterministic migration transforms.
 #[derive(Debug)]
 pub struct FrozenSource {
-    path: PathBuf,
     fingerprint: SourceFingerprint,
     legacy_pins: Vec<LegacyPinCoordinate>,
     reader: PileReader,
@@ -240,27 +336,379 @@ impl FrozenSource {
         &self.reader
     }
 
-    /// Fail unless the source still exposes the captured legacy coordinates.
-    pub fn verify_unchanged(&self) -> Result<()> {
-        let initial_length = fs::metadata(&self.path)?.len();
-        let mut pile = open_pile_strict(&self.path)?;
-        let result = legacy_pin_coordinates(&mut pile);
-        let coordinates = finish_pile(pile, result)?;
-        let final_length = fs::metadata(&self.path)?.len();
-        if final_length != initial_length {
-            bail!(
-                "source pile changed while checking frozen coordinates ({initial_length} -> {final_length} bytes); retry"
-            );
+    /// Resolve and verify one exact-name legacy branch from this snapshot.
+    ///
+    /// Duplicate names are rejected. The branch-head signature, every
+    /// authored commit signature, and every contentless canonical merge are
+    /// checked before a value is returned. This method never reopens or
+    /// mutates the source pile.
+    pub fn legacy_branch(&self, name: &str) -> Result<Option<FrozenLegacyBranch>> {
+        let wanted: Inline<Handle<triblespace::core::blob::encodings::longstring::LongString>> =
+            name.to_owned().to_blob().get_handle();
+        let mut matches = Vec::new();
+        for pin in &self.legacy_pins {
+            let facts: TribleSet = self
+                .reader
+                .get(pin.value)
+                .with_context(|| format!("read frozen legacy pin {:X}", pin.id))?;
+            let Ok(entity) = repo::branch::branch_entity(&facts, pin.id) else {
+                continue;
+            };
+            let branch_name = one_legacy_value(&facts, entity, &metadata::name, "branch name")?;
+            if branch_name == Some(wanted) {
+                matches.push((*pin, facts, entity));
+            }
         }
-        let current = fingerprint_legacy_pins(&coordinates);
-        if current != self.fingerprint {
-            bail!(
-                "legacy coordinates in source pile {} changed after it was frozen",
-                self.path.display()
-            );
+
+        let (pin, branch_facts, branch_entity) = match matches.len() {
+            0 => return Ok(None),
+            1 => matches.pop().expect("one legacy branch match"),
+            count => bail!("frozen source contains {count} legacy branches named {name}"),
+        };
+        let head = one_legacy_value(&branch_facts, branch_entity, &repo::head, "branch head")?;
+        if let Some(head) = head {
+            let blob: Blob<SimpleArchive> = self
+                .reader
+                .get(head)
+                .with_context(|| format!("read frozen legacy {name} branch head"))?;
+            repo::branch::verify(pin.id, blob, branch_facts.clone())
+                .map_err(|_| anyhow!("frozen legacy {name} branch-head signature is invalid"))?;
         }
-        Ok(())
+
+        let mut deltas = Vec::new();
+        if let Some(head) = head {
+            for commit in legacy_topological(&self.reader, head)? {
+                let commit_metadata = legacy_commit_metadata(&self.reader, commit)?;
+                let subject = legacy_commit_subject(&commit_metadata, commit)?;
+                let parents = legacy_parents(&commit_metadata, subject);
+                let content =
+                    one_legacy_value(&commit_metadata, subject, &repo::content, "content")?;
+                let facts = match content {
+                    Some(content) => {
+                        let blob: Blob<SimpleArchive> =
+                            self.reader.get(content).with_context(|| {
+                                format!(
+                                    "read frozen legacy {name} content {}",
+                                    hex::encode_upper(content.raw)
+                                )
+                            })?;
+                        repo::commit::verify(blob, commit_metadata.clone()).map_err(|_| {
+                            anyhow!(
+                                "frozen legacy authored commit {} has an invalid content signature",
+                                hex::encode_upper(commit.raw)
+                            )
+                        })?;
+                        self.reader.get(content).with_context(|| {
+                            format!(
+                                "decode frozen legacy {name} content {}",
+                                hex::encode_upper(content.raw)
+                            )
+                        })?
+                    }
+                    None => {
+                        validate_contentless_merge(&commit_metadata, subject, commit)?;
+                        TribleSet::new()
+                    }
+                };
+                deltas.push(FrozenLegacyDelta {
+                    commit,
+                    parents,
+                    subject,
+                    facts,
+                    commit_metadata,
+                    content,
+                });
+            }
+        }
+
+        Ok(Some(FrozenLegacyBranch {
+            branch: pin.id,
+            pin: pin.value,
+            head,
+            deltas,
+        }))
     }
+}
+
+/// Project every authored legacy delta into self-contained content and
+/// metadata fragments.
+///
+/// Contentless merge nodes remain verified ancestry but produce no collection
+/// authority. Authored empty archives do produce an empty content fragment.
+/// The payload validator must strictly load every schema-known direct handle;
+/// conservative closure hydration then carries every resident attachment.
+pub fn project_legacy_authored_commits<V>(
+    source: &FrozenSource,
+    branch: &FrozenLegacyBranch,
+    validate_payloads: V,
+) -> Result<Vec<ProjectedLegacyCommit>>
+where
+    V: Fn(&PileReader, &TribleSet) -> Result<()>,
+{
+    if !source.legacy_pins.contains(&branch.pin_coordinate()) {
+        bail!(
+            "frozen legacy branch {:X} pin is not part of this source snapshot",
+            branch.branch
+        );
+    }
+    if branch.head != branch.deltas.last().map(|delta| delta.commit) {
+        bail!(
+            "frozen legacy branch {:X} deltas do not end at its captured head",
+            branch.branch
+        );
+    }
+
+    let mut projected = Vec::new();
+    for delta in &branch.deltas {
+        let Some(content_handle) = delta.content_handle() else {
+            continue;
+        };
+        let content_blob: Blob<SimpleArchive> =
+            source.reader.get(content_handle).with_context(|| {
+                format!(
+                    "read frozen legacy content {}",
+                    hex::encode_upper(content_handle.raw)
+                )
+            })?;
+        repo::commit::verify(content_blob, delta.commit_metadata.clone()).map_err(|_| {
+            anyhow!(
+                "frozen legacy authored commit {} has an invalid content signature",
+                hex::encode_upper(delta.commit.raw)
+            )
+        })?;
+        let facts: TribleSet = source.reader.get(content_handle).with_context(|| {
+            format!(
+                "decode frozen legacy content {}",
+                hex::encode_upper(content_handle.raw)
+            )
+        })?;
+        if facts != delta.facts {
+            bail!(
+                "frozen legacy commit {} content differs from its verified delta",
+                hex::encode_upper(delta.commit.raw)
+            );
+        }
+        validate_payloads(&source.reader, &facts).with_context(|| {
+            format!(
+                "validate frozen legacy content payloads in commit {}",
+                hex::encode_upper(delta.commit.raw)
+            )
+        })?;
+        let content = Fragment::from_facts_and_blobs(
+            facts,
+            hydrate_resident_closure(&source.reader, [content_handle.transmute()])?,
+        );
+        let metadata = project_legacy_metadata(&source.reader, delta, &validate_payloads)?;
+        projected.push(ProjectedLegacyCommit {
+            source: LegacyCommitCoordinate {
+                branch: branch.branch,
+                pin: branch.pin,
+                commit: delta.commit,
+            },
+            content,
+            metadata,
+        });
+    }
+    Ok(projected)
+}
+
+fn one_legacy_value<V: InlineEncoding>(
+    facts: &TribleSet,
+    subject: Id,
+    attribute: &Attribute<V>,
+    field: &str,
+) -> Result<Option<Inline<V>>> {
+    let mut values = facts
+        .iter()
+        .filter(|fact| fact.e() == &subject && fact.a() == &attribute.id())
+        .map(|fact| *fact.v::<V>());
+    let first = values.next();
+    if values.next().is_some() {
+        bail!("frozen legacy commit or branch has repeated {field}");
+    }
+    Ok(first)
+}
+
+fn legacy_commit_subject(facts: &TribleSet, handle: CommitHandle) -> Result<Id> {
+    let entities: BTreeSet<Id> = facts.iter().map(|fact| *fact.e()).collect();
+    if entities.len() != 1 {
+        bail!(
+            "frozen legacy commit {} must contain exactly one metadata entity, found {}",
+            hex::encode_upper(handle.raw),
+            entities.len()
+        );
+    }
+    Ok(*entities.iter().next().expect("one legacy commit entity"))
+}
+
+fn legacy_parents(facts: &TribleSet, subject: Id) -> Vec<CommitHandle> {
+    let mut parents: Vec<_> = find!(
+        (parent: CommitHandle),
+        pattern!(facts, [{ subject @ repo::parent: ?parent }])
+    )
+    .map(|(parent,)| parent)
+    .collect();
+    parents.sort_unstable_by_key(|parent| parent.raw);
+    parents.dedup();
+    parents
+}
+
+fn legacy_commit_metadata(reader: &PileReader, handle: CommitHandle) -> Result<TribleSet> {
+    reader.get(handle).with_context(|| {
+        format!(
+            "read frozen legacy commit {}",
+            hex::encode_upper(handle.raw)
+        )
+    })
+}
+
+fn legacy_topological(reader: &PileReader, head: CommitHandle) -> Result<Vec<CommitHandle>> {
+    let mut ordered = Vec::new();
+    let mut emitted = HashSet::new();
+    let mut active = HashSet::new();
+    let mut stack = vec![(head, false)];
+    while let Some((commit, expanded)) = stack.pop() {
+        if emitted.contains(&commit) {
+            continue;
+        }
+        if expanded {
+            active.remove(&commit);
+            emitted.insert(commit);
+            ordered.push(commit);
+            continue;
+        }
+        if !active.insert(commit) {
+            bail!(
+                "cycle in frozen legacy commit ancestry at {}",
+                hex::encode_upper(commit.raw)
+            );
+        }
+        let facts = legacy_commit_metadata(reader, commit)?;
+        let subject = legacy_commit_subject(&facts, commit)?;
+        let parents = legacy_parents(&facts, subject);
+        stack.push((commit, true));
+        for parent in parents.into_iter().rev() {
+            if active.contains(&parent) {
+                bail!(
+                    "cycle in frozen legacy commit ancestry at {}",
+                    hex::encode_upper(parent.raw)
+                );
+            }
+            if !emitted.contains(&parent) {
+                stack.push((parent, false));
+            }
+        }
+    }
+    Ok(ordered)
+}
+
+fn validate_contentless_merge(facts: &TribleSet, subject: Id, commit: CommitHandle) -> Result<()> {
+    let parents = legacy_parents(facts, subject);
+    let only_parents = facts
+        .iter()
+        .all(|fact| fact.e() == &subject && fact.a() == &repo::parent.id());
+    let current = entity! { repo::parent*: parents.clone() }.root();
+    let historical = triblespace::core::trible::intrinsic_entity_id_v1(
+        parents
+            .iter()
+            .map(|parent| (repo::parent.id(), parent.raw))
+            .collect(),
+    );
+    if parents.len() < 2 || !only_parents || (current != Some(subject) && historical != subject) {
+        bail!(
+            "frozen contentless legacy commit {} is not a canonical merge",
+            hex::encode_upper(commit.raw)
+        );
+    }
+    Ok(())
+}
+
+fn project_legacy_metadata<V>(
+    reader: &PileReader,
+    delta: &FrozenLegacyDelta,
+    validate_payloads: &V,
+) -> Result<Fragment>
+where
+    V: Fn(&PileReader, &TribleSet) -> Result<()> + ?Sized,
+{
+    let commit = delta.commit_metadata();
+    let attached = one_legacy_value(
+        commit,
+        delta.subject,
+        &metadata::archive,
+        "metadata archive",
+    )?;
+    let message = one_legacy_value(commit, delta.subject, &repo::message, "message")?;
+    let created = one_legacy_value(commit, delta.subject, &metadata::created_at, "created_at")?;
+
+    let (mut facts, mut blobs) = if let Some(handle) = attached {
+        let _: Blob<SimpleArchive> = reader.get(handle).with_context(|| {
+            format!(
+                "strictly read attached frozen legacy metadata {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+        let facts: TribleSet = reader.get(handle).with_context(|| {
+            format!(
+                "decode attached frozen legacy metadata {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+        validate_payloads(reader, &facts).with_context(|| {
+            format!(
+                "validate attached frozen legacy semantic metadata in commit {}",
+                hex::encode_upper(delta.commit.raw)
+            )
+        })?;
+        (
+            facts,
+            hydrate_resident_closure(reader, [handle.transmute()])?,
+        )
+    } else {
+        (TribleSet::new(), MemoryBlobStore::new())
+    };
+
+    if let Some(handle) = message {
+        let _: View<str> = reader.get(handle).with_context(|| {
+            format!(
+                "strictly read frozen legacy commit message {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+        blobs.union(hydrate_resident_closure(reader, [handle.transmute()])?);
+    }
+
+    let projected = match (created, message) {
+        (Some(created), Some(message)) => entity! {
+            metadata::created_at: created,
+            metadata::description: message,
+        },
+        (Some(created), None) => entity! { metadata::created_at: created },
+        (None, Some(message)) => entity! { metadata::description: message },
+        (None, None) => Fragment::empty(),
+    };
+    let (_, projected_facts, projected_metafacts, projected_blobs) = projected.into_parts();
+    facts += projected_facts;
+    facts += projected_metafacts;
+    blobs.union(projected_blobs);
+    Ok(Fragment::from_facts_and_blobs(facts, blobs))
+}
+
+fn hydrate_resident_closure(
+    reader: &PileReader,
+    roots: impl IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
+) -> Result<MemoryBlobStore> {
+    let mut blobs = MemoryBlobStore::new();
+    for handle in reachable(reader, roots) {
+        let blob: Blob<UnknownBlob> = reader.get(handle).with_context(|| {
+            format!(
+                "load reachable frozen legacy attachment {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+        blobs.insert(blob);
+    }
+    Ok(blobs)
 }
 
 /// Capture an immutable reader plus read-only legacy pin coordinates.
@@ -305,7 +753,6 @@ pub fn freeze_source(path: &Path) -> Result<FrozenSource> {
     let fingerprint = fingerprint_legacy_pins(&legacy_pins);
 
     Ok(FrozenSource {
-        path: path.to_owned(),
         fingerprint,
         legacy_pins,
         reader,
@@ -486,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_source_is_read_only_and_detects_semantic_pin_changes() {
+    fn frozen_source_is_read_only_and_captures_semantic_coordinates() {
         let files = TestFiles::new();
         let pin_id = id(7);
         let pin_facts = entity! { _ @ metadata::tag: &id(8) }.into_facts();
@@ -507,27 +954,6 @@ mod tests {
         );
         let from_snapshot: TribleSet = frozen.reader().get(value).unwrap();
         assert_eq!(from_snapshot, pin_facts);
-        frozen.verify_unchanged().unwrap();
-
-        // Physical append history is not source identity. A blob that changes
-        // no legacy coordinate must not invalidate a deterministic transform.
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        pile.put::<SimpleArchive, _>(entity! { _ @ metadata::tag: &id(11) }.into_facts())
-            .unwrap();
-        pile.close().unwrap();
-        frozen.verify_unchanged().unwrap();
-
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        let later_value = pile
-            .put::<SimpleArchive, _>(entity! { _ @ metadata::tag: &id(9) }.into_facts())
-            .unwrap();
-        assert!(matches!(
-            pile.update(id(10), None, Some(later_value)).unwrap(),
-            PushResult::Success()
-        ));
-        pile.close().unwrap();
-        let error = frozen.verify_unchanged().unwrap_err();
-        assert!(format!("{error:#}").contains("changed after it was frozen"));
     }
 
     #[test]

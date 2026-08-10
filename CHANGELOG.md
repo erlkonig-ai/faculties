@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Files has a strictly additive native-collection migration.** The
+  stopped-world planner preserves every legacy fact and entity ID, derives
+  only missing canonical media-type facts, and publishes authored leaves
+  through collection commits without target pins or compare-and-swap state.
 - **Native collection publication has a central, pinless seam.** Faculties can
   discover scoped targets through `CollectionStore` and publish complete
   `Fragment` values through `Collection<Pile>::commit`, preserving facts,

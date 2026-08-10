@@ -10,6 +10,17 @@ use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
 
 // ── branch name ──────────────────────────────────────────────────────────
+/// Stable extrinsic scope of the Files `SimpleArchive`-union collection.
+///
+/// Minted with `trible genid` on 2026-08-07 and recovered from the reviewed
+/// collection-cutover lineage:
+/// `56002AB0A2A7D56753EE20C61900BFB0`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("56002AB0A2A7D56753EE20C61900BFB0");
+
+/// Exact name of the pre-collection repository branch.
+///
+/// New collection operations address [`DEFAULT_SCOPE_ID`]; this name is input
+/// vocabulary for the one-way stopped-world migration only.
 pub const FILES_BRANCH_NAME: &str = "files";
 
 // ── kinds ────────────────────────────────────────────────────────────────
