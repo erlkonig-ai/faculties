@@ -70,7 +70,7 @@ mod common {
     use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
     use triblespace::prelude::*;
     use triblespace_search::index_bm25::Bm25Rollup;
-    use triblespace_search::succinct::SuccinctBM25Blob;
+    use triblespace_search::portable_bm25::PortableBM25Blob;
 
     #[cfg(feature = "gpu-succinct")]
     use triblespace::core::repo::index_home::AcceleratedSuccinctRollup;
@@ -266,7 +266,7 @@ mod common {
     pub(super) struct PreparedArchiveCommit {
         pub(super) commit: CommitHandle,
         pub(super) succinct: Option<Vec<PreparedSuccinctArtifact>>,
-        pub(super) bm25: Option<Vec<Blob<SuccinctBM25Blob>>>,
+        pub(super) bm25: Option<Vec<Blob<PortableBM25Blob>>>,
         pub(super) physical_shards: usize,
         pub(super) tribles: usize,
         pub(super) elapsed: std::time::Duration,
@@ -2115,7 +2115,8 @@ fn run_search_standalone(
 
         // 2. Rank across the segment union (per-segment BM25; best score wins).
         let bm25_start = Instant::now();
-        let ranked = query_across(&segments, &hash_tokens(&text));
+        let ranked = query_across(&segments, &hash_tokens(&text))
+            .map_err(|error| anyhow!("query BM25 segment cover: {error}"))?;
         let total_docs: usize = segments.iter().map(|s| s.doc_count()).sum();
         tracing::info!(
             segment_documents = total_docs,

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
+use triblespace_paths::{PathExpr, PathIndex, Step};
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
@@ -383,17 +384,22 @@ fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
         .collect()
 }
 
+fn parent_paths(space: &TribleSet) -> Result<PathIndex> {
+    let parent_plus = PathExpr::from(Step::Forward(board::parent.id().into()))
+        .plus()
+        .compile();
+    PathIndex::from_tribles(parent_plus, space.iter())
+        .map_err(|error| anyhow::anyhow!("materialize goal-parent ancestry: {error}"))
+}
+
 /// Check if `to` is an ancestor of `from` (or `from` itself) in the parent tree.
-fn is_ancestor(space: &TribleSet, from: Id, to: Id) -> bool {
-    from == to
-        || exists!(
-            (_start: Id, _end: Id),
-            and!(
-                _start.is(from.to_inline()),
-                _end.is(to.to_inline()),
-                path!(space, _start board::parent+ _end)
-            )
-        )
+fn is_ancestor(paths: &PathIndex, from: Id, to: Id) -> bool {
+    if from == to {
+        return true;
+    }
+    let from: Inline<inlineencodings::GenId> = from.to_inline();
+    let to: Inline<inlineencodings::GenId> = to.to_inline();
+    paths.contains(&from.raw, &to.raw)
 }
 
 /// Count notes for a task.
@@ -1225,7 +1231,8 @@ fn cmd_prioritize(
         }
 
         if would_create_cycle(&edges, higher_id, lower_id) {
-            if is_ancestor(&space, higher_id, lower_id) || is_ancestor(&space, lower_id, higher_id)
+            let paths = parent_paths(&space)?;
+            if is_ancestor(&paths, higher_id, lower_id) || is_ancestor(&paths, lower_id, higher_id)
             {
                 bail!("children are implicitly prioritized over their parents");
             }
@@ -1407,6 +1414,24 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_paths_preserve_reflexive_and_transitive_ancestry() {
+        let root = Id::new([1; 16]).unwrap();
+        let child = Id::new([2; 16]).unwrap();
+        let grandchild = Id::new([3; 16]).unwrap();
+        let unrelated = Id::new([4; 16]).unwrap();
+        let mut space = TribleSet::new();
+        space += entity! { ExclusiveId::force_ref(&child) @ board::parent: &root };
+        space += entity! { ExclusiveId::force_ref(&grandchild) @ board::parent: &child };
+
+        let paths = parent_paths(&space).unwrap();
+        assert!(is_ancestor(&paths, grandchild, root));
+        assert!(is_ancestor(&paths, child, root));
+        assert!(is_ancestor(&paths, root, root));
+        assert!(!is_ancestor(&paths, root, grandchild));
+        assert!(!is_ancestor(&paths, grandchild, unrelated));
+    }
 
     #[test]
     fn inline_references_are_exact_sorted_and_deduplicated() {

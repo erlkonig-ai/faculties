@@ -146,6 +146,7 @@ ed25519-dalek = "2.1.1"
 hifitime = "4.2.3"
 rand_core = "0.6.4"
 triblespace = { version = "0.47", path = "../triblespace-rs" }
+triblespace-paths = { version = "0.47.0", path = "../triblespace-rs/triblespace-paths" }
 triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
 faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
 triblespace-gpu = { version = "0.47.0", path = "../triblespace-rs/triblespace-gpu", optional = true, default-features = false }

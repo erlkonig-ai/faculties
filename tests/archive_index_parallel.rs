@@ -19,7 +19,7 @@ use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 use triblespace_search::index_bm25::Bm25Rollup;
-use triblespace_search::succinct::SuccinctBM25Blob;
+use triblespace_search::portable_bm25::PortableBM25Blob;
 
 type CommitHandle = Inline<Handle<SimpleArchive>>;
 
@@ -213,7 +213,7 @@ fn snapshot(path: &Path, branch_id: Id) -> IndexSnapshot {
                 .artifacts()
                 .iter()
                 .map(|handle| {
-                    let blob: Blob<SuccinctBM25Blob> = reader.get(*handle).expect("BM25 artifact");
+                    let blob: Blob<PortableBM25Blob> = reader.get(*handle).expect("BM25 artifact");
                     vec![(handle.raw, blob.bytes.to_vec())]
                 })
                 .collect(),
