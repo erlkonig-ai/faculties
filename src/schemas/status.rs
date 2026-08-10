@@ -17,8 +17,8 @@ pub mod status {
     use super::*;
     attributes! {
         // The window (relations persona id) this status is about.
-        "51D3C4DEDA7BCFCCA4C3D85FFB7CCFAC" as window: inlineencodings::GenId;
+        "51D3C4DEDA7BCFCCA4C3D85FFB7CCFAC" unsafe as window: inlineencodings::GenId;
         // The status text ("currently …").
-        "0DB5E52B99D75A09E666718147C45208" as text: inlineencodings::Handle<blobencodings::LongString>;
+        "0DB5E52B99D75A09E666718147C45208" unsafe as text: inlineencodings::Handle<blobencodings::LongString>;
     }
 }

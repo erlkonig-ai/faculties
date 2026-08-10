@@ -34,24 +34,24 @@ pub mod board {
     use super::*;
 
     attributes! {
-        "EE18CEC15C18438A2FAB670E2E46E00C" as title: inlineencodings::Handle<blobencodings::LongString>;
+        "EE18CEC15C18438A2FAB670E2E46E00C" unsafe as title: inlineencodings::Handle<blobencodings::LongString>;
         // TODO: migrate to metadata::tag (GenId) — tags should be entities with
         // their own ID + metadata::name, not inline strings. See wiki.rs TagIndex
         // for the correct pattern. This ShortString tag is a legacy design mistake.
-        "5FF4941DCC3F6C35E9B3FD57216F69ED" as tag: inlineencodings::ShortString;
-        "9D2B6EBDA67E9BB6BE6215959D182041" as parent: inlineencodings::GenId;
+        "5FF4941DCC3F6C35E9B3FD57216F69ED" unsafe as tag: inlineencodings::ShortString;
+        "9D2B6EBDA67E9BB6BE6215959D182041" unsafe as parent: inlineencodings::GenId;
 
-        "C1EAAA039DA7F486E4A54CC87D42E72C" as task: inlineencodings::GenId;
-        "61C44E0F8A73443ED592A713151E99A4" as status: inlineencodings::ShortString;
+        "C1EAAA039DA7F486E4A54CC87D42E72C" unsafe as task: inlineencodings::GenId;
+        "61C44E0F8A73443ED592A713151E99A4" unsafe as status: inlineencodings::ShortString;
         // Optional acting persona (relations person id) on status and note
         // events. This is attribution only; it has no workflow semantics.
-        "34718CDC13D0E3D8750DB58105390AB3" as by: inlineencodings::GenId;
-        "47351DF00B3DDA96CB305157CD53D781" as note: inlineencodings::Handle<blobencodings::LongString>;
+        "34718CDC13D0E3D8750DB58105390AB3" unsafe as by: inlineencodings::GenId;
+        "47351DF00B3DDA96CB305157CD53D781" unsafe as note: inlineencodings::Handle<blobencodings::LongString>;
         // Opaque, exact references attached to a note. Repeated handles keep
         // the ledger queryable without assigning any interpretation here.
-        "FD59B704D0F1D06AF14102ADCB5F6FF0" as reference: inlineencodings::Handle<blobencodings::LongString>;
-        "B88842D9D00361A0F2728C478C79D75C" as higher: inlineencodings::GenId;
-        "18F3446C9E9281A248D370A56395A3F0" as lower: inlineencodings::GenId;
+        "FD59B704D0F1D06AF14102ADCB5F6FF0" unsafe as reference: inlineencodings::Handle<blobencodings::LongString>;
+        "B88842D9D00361A0F2728C478C79D75C" unsafe as higher: inlineencodings::GenId;
+        "18F3446C9E9281A248D370A56395A3F0" unsafe as lower: inlineencodings::GenId;
     }
 }
 

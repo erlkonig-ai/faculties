@@ -20,8 +20,8 @@ pub mod search_index {
     use super::*;
     use triblespace_search::succinct::SuccinctBM25Blob;
     attributes! {
-        "97F01976040A842A4B88B4ABAAFFD6D0" as index: Handle<SuccinctBM25Blob>;
-        "DCEC5F15A91F89F95A2A5E1D3C1C34DB" as indexed_at: NsTAIInterval;
+        "97F01976040A842A4B88B4ABAAFFD6D0" unsafe as index: Handle<SuccinctBM25Blob>;
+        "DCEC5F15A91F89F95A2A5E1D3C1C34DB" unsafe as indexed_at: NsTAIInterval;
     }
 }
 
@@ -35,34 +35,34 @@ pub mod archive {
 
     attributes! {
 
-        "0D9195A7B1B20DE312A08ECE39168079" as pub reply_to: GenId;
-        "838CC157FFDD37C6AC7CC5A472E43ADB" as pub author: GenId;
+        "0D9195A7B1B20DE312A08ECE39168079" unsafe as pub reply_to: GenId;
+        "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as pub author: GenId;
         /// Wall-clock interval at which the message was last
         /// edited. Absent on unedited messages. Protocol-agnostic
         /// — every messaging faculty (teams, discord, any future
         /// Slack / Matrix / etc.) writes the same attribute.
-        "76ED22B5BBB68EC6418DE2B6234EA5FB" as pub edited_at: NsTAIInterval;
-        "E63EE961ABDB1D1BEC0789FDAFFB9501" as pub author_name: Handle<LongString>;
-        "2D15150501ACCD9DFD96CB4BF19D1883" as pub author_role: Handle<LongString>;
-        "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<LongString>;
-        "1F127324384335D12ECFE0CB84840925" as pub author_provider: Handle<LongString>;
-        "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<LongString>;
-        "D8A469EAC2518D1A85692E0BEBF20D6C" as pub content_type: ShortString;
-        "8334E282F24A4C7779C8899191B29E00" as pub attachment: GenId;
+        "76ED22B5BBB68EC6418DE2B6234EA5FB" unsafe as pub edited_at: NsTAIInterval;
+        "E63EE961ABDB1D1BEC0789FDAFFB9501" unsafe as pub author_name: Handle<LongString>;
+        "2D15150501ACCD9DFD96CB4BF19D1883" unsafe as pub author_role: Handle<LongString>;
+        "4FE6A8A43658BC2F61FEDF5CFB29EEFC" unsafe as pub author_model: Handle<LongString>;
+        "1F127324384335D12ECFE0CB84840925" unsafe as pub author_provider: Handle<LongString>;
+        "ACF09FF3D62B73983A222313FF0C52D2" unsafe as pub content: Handle<LongString>;
+        "D8A469EAC2518D1A85692E0BEBF20D6C" unsafe as pub content_type: ShortString;
+        "8334E282F24A4C7779C8899191B29E00" unsafe as pub attachment: GenId;
 
-        "C9132D7400892F65B637BCBE92E230FB" as pub attachment_source_id: Handle<LongString>;
+        "C9132D7400892F65B637BCBE92E230FB" unsafe as pub attachment_source_id: Handle<LongString>;
         /// Content artifact represented by this source-specific attachment
         /// occurrence. The target is a `files::KIND_FILE` entity; keeping the
         /// occurrence and artifact separate lets identical bytes deduplicate
         /// without conflating their message-local provenance.
-        "983BE64C7663D4DFBF7F227BA6D32634" as pub attachment_file: GenId;
-        "A8F6CF04A9B2391A26F04BC84B77217D" as pub attachment_source_pointer: Handle<LongString>;
-        "9ADD88D3FFD9E4F91E0DC08126D9180A" as pub attachment_name: Handle<LongString>;
-        "EEFDB32D37B7B2834D99ACCF159B6507" as pub attachment_mime: ShortString;
-        "D233E7BE0E973B09BD51E768E528ACA5" as pub attachment_size_bytes: U256BE;
-        "5937E1072AF2F8E493321811B483C57B" as pub attachment_width_px: U256BE;
-        "B252F4F77929E54FF8472027B7603EE9" as pub attachment_height_px: U256BE;
-        "B0D18159D6035C576AE6B5D871AB4D63" as pub attachment_data: Handle<RawBytes>;
+        "983BE64C7663D4DFBF7F227BA6D32634" unsafe as pub attachment_file: GenId;
+        "A8F6CF04A9B2391A26F04BC84B77217D" unsafe as pub attachment_source_pointer: Handle<LongString>;
+        "9ADD88D3FFD9E4F91E0DC08126D9180A" unsafe as pub attachment_name: Handle<LongString>;
+        "EEFDB32D37B7B2834D99ACCF159B6507" unsafe as pub attachment_mime: ShortString;
+        "D233E7BE0E973B09BD51E768E528ACA5" unsafe as pub attachment_size_bytes: U256BE;
+        "5937E1072AF2F8E493321811B483C57B" unsafe as pub attachment_width_px: U256BE;
+        "B252F4F77929E54FF8472027B7603EE9" unsafe as pub attachment_height_px: U256BE;
+        "B0D18159D6035C576AE6B5D871AB4D63" unsafe as pub attachment_data: Handle<RawBytes>;
     }
 
     /// Tag for message payloads.
@@ -80,21 +80,21 @@ pub mod import_schema {
     use super::*;
 
     attributes! {
-        "891508CAD6E1430B221ADA937EFBD982" as pub conversation: GenId;
-        "E997DCAAF43BAA04790FCB0FA0FBFE3A" as pub source_format: ShortString;
-        "973FB59D3452D3A8276172F8E3272324" as pub source_raw_root: GenId;
-        "87B587A3906056038FD767F4225274F9" as pub source_conversation_id: Handle<LongString>;
-        "1B2A09FF44D2A5736FA320AB255026C1" as pub source_message_id: Handle<LongString>;
-        "AA3CF220F15CCF724276F1251AFE053B" as pub source_author: Handle<LongString>;
-        "B4C084B61FB46A932BFCA75B8BC621FA" as pub source_role: Handle<LongString>;
-        "220DA5084D6261B5420922EADC064A5A" as pub source_parent_id: Handle<LongString>;
-        "D59247F3AADD3DE8E23B01E8B7406020" as pub source_created_at: NsTAIInterval;
+        "891508CAD6E1430B221ADA937EFBD982" unsafe as pub conversation: GenId;
+        "E997DCAAF43BAA04790FCB0FA0FBFE3A" unsafe as pub source_format: ShortString;
+        "973FB59D3452D3A8276172F8E3272324" unsafe as pub source_raw_root: GenId;
+        "87B587A3906056038FD767F4225274F9" unsafe as pub source_conversation_id: Handle<LongString>;
+        "1B2A09FF44D2A5736FA320AB255026C1" unsafe as pub source_message_id: Handle<LongString>;
+        "AA3CF220F15CCF724276F1251AFE053B" unsafe as pub source_author: Handle<LongString>;
+        "B4C084B61FB46A932BFCA75B8BC621FA" unsafe as pub source_role: Handle<LongString>;
+        "220DA5084D6261B5420922EADC064A5A" unsafe as pub source_parent_id: Handle<LongString>;
+        "D59247F3AADD3DE8E23B01E8B7406020" unsafe as pub source_created_at: NsTAIInterval;
         /// Conversation → message edge (repeated).
-        "06DB96427C8EA6FC982D44E018AB0831" as pub message: GenId;
+        "06DB96427C8EA6FC982D44E018AB0831" unsafe as pub message: GenId;
         /// Source-assigned conversation title (e.g. claude.ai `name`).
-        "BCFFFF156EB6D8694D263DCFDAA39CF6" as pub source_conversation_title: Handle<LongString>;
+        "BCFFFF156EB6D8694D263DCFDAA39CF6" unsafe as pub source_conversation_title: Handle<LongString>;
         /// Source-assigned conversation summary (e.g. claude.ai `summary`).
-        "F23BD37982802B051A261561A694DA0C" as pub source_conversation_summary: Handle<LongString>;
+        "F23BD37982802B051A261561A694DA0C" unsafe as pub source_conversation_summary: Handle<LongString>;
     }
 
     /// Root id for describing the import metadata protocol.

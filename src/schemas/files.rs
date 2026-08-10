@@ -46,28 +46,28 @@ pub mod file {
     use super::*;
     attributes! {
         // file leaf: content blob
-        "C1E3A12230595280F22ABEB8733D082C" as content: inlineencodings::Handle<blobencodings::RawBytes>;
+        "C1E3A12230595280F22ABEB8733D082C" unsafe as content: inlineencodings::Handle<blobencodings::RawBytes>;
         // file/directory: name (filename or dirname)
-        "AA6AB6F5E68F3A9D95681251C2B9DAFA" as name: inlineencodings::Handle<blobencodings::LongString>;
+        "AA6AB6F5E68F3A9D95681251C2B9DAFA" unsafe as name: inlineencodings::Handle<blobencodings::LongString>;
         // file leaf: canonical media-type entity
-        "B300DAE46621BF56D11621BAD9C66BA5" as media_type: inlineencodings::GenId;
+        "B300DAE46621BF56D11621BAD9C66BA5" unsafe as media_type: inlineencodings::GenId;
         // import: timestamp
-        "3765160CC1A96BE38302B344718E4C49" as imported_at: inlineencodings::NsTAIInterval;
+        "3765160CC1A96BE38302B344718E4C49" unsafe as imported_at: inlineencodings::NsTAIInterval;
         // TODO: migrate to metadata::tag (GenId) — should use canonical tag
         // entities with metadata::name, not inline ShortString. See wiki.rs TagIndex.
-        "CDA941A27F86A7551779CF9524DE1D0F" as tag: inlineencodings::ShortString;
+        "CDA941A27F86A7551779CF9524DE1D0F" unsafe as tag: inlineencodings::ShortString;
         // directory: children (multi-valued, files or subdirectories)
-        "0AC1D962B6E8170FDD73AE3743E16578" as children: inlineencodings::GenId;
+        "0AC1D962B6E8170FDD73AE3743E16578" unsafe as children: inlineencodings::GenId;
         // import: root directory or file entity
-        "7B36A7A304C26C5504EA54F5723FA135" as root: inlineencodings::GenId;
+        "7B36A7A304C26C5504EA54F5723FA135" unsafe as root: inlineencodings::GenId;
         // import: original filesystem path
-        "E4B24BB9F469CEC6FD12926C56514E9F" as source_path: inlineencodings::Handle<blobencodings::LongString>;
+        "E4B24BB9F469CEC6FD12926C56514E9F" unsafe as source_path: inlineencodings::Handle<blobencodings::LongString>;
         // file leaf: CLIP-512 embedding handle (v0, untyped Embedding) —
         // semantic-search exhaust, set on `add` for image/* files. Being
         // superseded by the shared 768-d nomic space (`schemas::embeddings`,
         // dim-typed `Embedding768`); kept live until the nomic vision tower
         // lands, then a clean break (new attribute, no dimension clash).
-        "433BE3AC7F95405872385898AD52FB73" as embedding: inlineencodings::Handle<Embedding>;
+        "433BE3AC7F95405872385898AD52FB73" unsafe as embedding: inlineencodings::Handle<Embedding>;
     }
 }
 
@@ -78,8 +78,8 @@ pub mod page {
     use super::*;
     attributes! {
         // page: the file entity this page was rasterized from
-        "2CA50D520D6784D9340851C36EDED209" as parent: inlineencodings::GenId;
+        "2CA50D520D6784D9340851C36EDED209" unsafe as parent: inlineencodings::GenId;
         // page: 1-based page number, decimal text (a display/identity label)
-        "1AACF2C318E912C3B74283FB127D3CFE" as index: inlineencodings::ShortString;
+        "1AACF2C318E912C3B74283FB127D3CFE" unsafe as index: inlineencodings::ShortString;
     }
 }

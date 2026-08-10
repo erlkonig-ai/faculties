@@ -19,25 +19,25 @@ pub mod teams {
     use super::*;
 
     attributes! {
-        "1E525B603A0060D9FA132B3D4EE9538A" as pub chat: GenId;
-        "B6089037C04529F55D2A2D1A668DBE95" as pub chat_id: Handle<LongString>;
-        "02D2C105E35BD5DD6CF7A1F1B74BA686" as pub message_id: Handle<LongString>;
-        "1DE123824D5BDA58F92CD002FCFB2BFF" as pub message_raw: Handle<LongString>;
+        "1E525B603A0060D9FA132B3D4EE9538A" unsafe as pub chat: GenId;
+        "B6089037C04529F55D2A2D1A668DBE95" unsafe as pub chat_id: Handle<LongString>;
+        "02D2C105E35BD5DD6CF7A1F1B74BA686" unsafe as pub message_id: Handle<LongString>;
+        "1DE123824D5BDA58F92CD002FCFB2BFF" unsafe as pub message_raw: Handle<LongString>;
         /// Logical Teams message that owns an attachment. Together with the
         /// attachment kind and source-local id, this forms its intrinsic key.
-        "617A66047DCBBDDED1BC5167336FADE0" as pub attachment_message: GenId;
+        "617A66047DCBBDDED1BC5167336FADE0" unsafe as pub attachment_message: GenId;
         /// Graph collection that supplied an attachment id (`attachment` or
         /// `hosted-content`). The two collections have independent id scopes.
-        "E0FC3B5C541A7DA9C56158D41B322623" as pub attachment_kind: ShortString;
-        "5820C49A7A8B4ADBCA4637E3AE2499EB" as pub user_id: Handle<LongString>;
-        "57AABA4FBA3A5EC6EF28DC80CD6E0919" as pub delta_link: Handle<LongString>;
-        "438A29922F91F873A69C3856AA7A553F" as pub access_token: Handle<LongString>;
-        "60C85DD37D09D3D27BC6BFA0E8040EA9" as pub refresh_token: Handle<LongString>;
-        "0F7784BBDA2EE5B9009DE688472D6F24" as pub token_type: Handle<LongString>;
-        "139B46989D7F56C7DFE6259FD74479AC" as pub scope: Handle<LongString>;
-        "34ACCCECE281E1A0E191EEEBE7E47A23" as pub tenant: Handle<LongString>;
-        "8C6CA6A45DCA9F78420BC216A83F4C22" as pub client_id: Handle<LongString>;
-        "0E734F66EBBA45ED022D1EE539B11EBE" as pub client_secret: Handle<LongString>;
+        "E0FC3B5C541A7DA9C56158D41B322623" unsafe as pub attachment_kind: ShortString;
+        "5820C49A7A8B4ADBCA4637E3AE2499EB" unsafe as pub user_id: Handle<LongString>;
+        "57AABA4FBA3A5EC6EF28DC80CD6E0919" unsafe as pub delta_link: Handle<LongString>;
+        "438A29922F91F873A69C3856AA7A553F" unsafe as pub access_token: Handle<LongString>;
+        "60C85DD37D09D3D27BC6BFA0E8040EA9" unsafe as pub refresh_token: Handle<LongString>;
+        "0F7784BBDA2EE5B9009DE688472D6F24" unsafe as pub token_type: Handle<LongString>;
+        "139B46989D7F56C7DFE6259FD74479AC" unsafe as pub scope: Handle<LongString>;
+        "34ACCCECE281E1A0E191EEEBE7E47A23" unsafe as pub tenant: Handle<LongString>;
+        "8C6CA6A45DCA9F78420BC216A83F4C22" unsafe as pub client_id: Handle<LongString>;
+        "0E734F66EBBA45ED022D1EE539B11EBE" unsafe as pub client_secret: Handle<LongString>;
     }
 
     /// Root id for describing the Teams protocol.

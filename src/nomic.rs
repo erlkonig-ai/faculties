@@ -58,7 +58,7 @@ pub mod attr {
         /// The model's `tokenizer.json` (HF tokenizers format), stored beside
         /// the weight graph in the SAME model pile. Attached to an entity that
         /// also carries mary's `model_name` for provenance. Minted 2026-07-18.
-        "7B8D68E86EEC09D7096D40D65FBA7026" as tokenizer_json: inlineencodings::Handle<blobencodings::LongString>;
+        "7B8D68E86EEC09D7096D40D65FBA7026" unsafe as tokenizer_json: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 

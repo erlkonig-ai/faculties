@@ -50,7 +50,7 @@ mod legacy {
     attributes! {
         // Historical Files inline MIME field. The id is source vocabulary,
         // not a newly minted schema id.
-        "BFE2C88ECD13D56F80967C343FC072EE" as mime: ShortString;
+        "BFE2C88ECD13D56F80967C343FC072EE" unsafe as mime: ShortString;
     }
 }
 

@@ -47,7 +47,7 @@ pub mod intent {
         /// The language instruction gemma emits and the VLA acts on
         /// ("someone's stroking your head — lean in, perk the antennas").
         /// The time coordinate is the canonical `metadata::created_at`.
-        "C81A15C5C436CABC9328599858FA1B33" as pub text: Handle<LongString>;
+        "C81A15C5C436CABC9328599858FA1B33" unsafe as pub text: Handle<LongString>;
     }
 }
 
@@ -56,20 +56,20 @@ pub mod capture {
     attributes! {
         /// The raw payload, content-addressed (PNG frame, WAV clip, …).
         /// Absent on touch captures (the signature lives in `pose`).
-        "FC033C3E4E74105D83E8C44004AD8EB7" as pub frame: Handle<RawBytes>;
+        "FC033C3E4E74105D83E8C44004AD8EB7" unsafe as pub frame: Handle<RawBytes>;
         /// MIME type of the payload (e.g. "image/png", "audio/wav").
-        "ACB762F023B9AF391D914A4F00163192" as pub mime: ShortString;
+        "ACB762F023B9AF391D914A4F00163192" unsafe as pub mime: ShortString;
         /// Pixel width (vision captures).
-        "C5251A43428C595C36A276828ECDD232" as pub width: U256BE;
+        "C5251A43428C595C36A276828ECDD232" unsafe as pub width: U256BE;
         /// Pixel height (vision captures).
-        "D2CE800163450CE0A34AA164AE66E8FF" as pub height: U256BE;
+        "D2CE800163450CE0A34AA164AE66E8FF" unsafe as pub height: U256BE;
         /// "vision" | "audio" | "touch" — the sense that produced this capture.
-        "11487C7943FB2ED6A675A0E35477A966" as pub modality: ShortString;
+        "11487C7943FB2ED6A675A0E35477A966" unsafe as pub modality: ShortString;
         /// Optional deliberate note: why this moment was kept.
-        "4E12AEBAB07830F8EEEF997957EA27D4" as pub note: Handle<LongString>;
+        "4E12AEBAB07830F8EEEF997957EA27D4" unsafe as pub note: Handle<LongString>;
         /// Proprioceptive context at capture (JSON: head pose / joints, or the
         /// touch signature), so a moment can be grounded in the body state
         /// that produced it.
-        "509530F784B438714D7A6F2A236F2CFB" as pub pose: Handle<LongString>;
+        "509530F784B438714D7A6F2A236F2CFB" unsafe as pub pose: Handle<LongString>;
     }
 }

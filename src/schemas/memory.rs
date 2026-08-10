@@ -37,24 +37,24 @@ pub mod search_index {
     use super::*;
     use triblespace_search::succinct::SuccinctBM25Blob;
     attributes! {
-        "3BAF1837E1A1128042A0582CF6D71CE0" as index: Handle<SuccinctBM25Blob>;
-        "FD8C086B68F20AD04B2C70B9CE3C2BCC" as indexed_at: NsTAIInterval;
+        "3BAF1837E1A1128042A0582CF6D71CE0" unsafe as index: Handle<SuccinctBM25Blob>;
+        "FD8C086B68F20AD04B2C70B9CE3C2BCC" unsafe as indexed_at: NsTAIInterval;
     }
 }
 
 pub mod archive_schema {
     use super::*;
     attributes! {
-        "838CC157FFDD37C6AC7CC5A472E43ADB" as author: GenId;
-        "E63EE961ABDB1D1BEC0789FDAFFB9501" as author_name: Handle<LongString>;
+        "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as author: GenId;
+        "E63EE961ABDB1D1BEC0789FDAFFB9501" unsafe as author_name: Handle<LongString>;
     }
 }
 
 pub mod archive_import_schema {
     use super::*;
     attributes! {
-        "E997DCAAF43BAA04790FCB0FA0FBFE3A" as source_format: ShortString;
-        "87B587A3906056038FD767F4225274F9" as source_conversation_id: Handle<LongString>;
+        "E997DCAAF43BAA04790FCB0FA0FBFE3A" unsafe as source_format: ShortString;
+        "87B587A3906056038FD767F4225274F9" unsafe as source_conversation_id: Handle<LongString>;
     }
 }
 
@@ -79,15 +79,15 @@ pub mod comb {
     attributes! {
         /// Which practice stream this cursor belongs to:
         /// "archive-replay", "memory-replay", or "consolidate-edge".
-        "E095C3752346D4FC73841BC8A975368F" as cursor_stream: ShortString;
+        "E095C3752346D4FC73841BC8A975368F" unsafe as cursor_stream: ShortString;
         /// Persona label owning this cursor (from $PERSONA; never defaulted).
-        "E5BB54261818A75DB8DA622450EAC97E" as cursor_persona: ShortString;
+        "E5BB54261818A75DB8DA622450EAC97E" unsafe as cursor_persona: ShortString;
         /// Position: the timestamp up to which this stream has been consumed
         /// (exclusive); for the consolidation edge, where the next chunk opens.
-        "79F4E916807654A5A8DDFAE5F402D21D" as cursor_position: NsTAIInterval;
+        "79F4E916807654A5A8DDFAE5F402D21D" unsafe as cursor_position: NsTAIInterval;
         /// Replay granularity as typed (e.g. "2h", "1d", "30d") — stored on
         /// memory-replay cursors so a bare `memory replay` knows its zoom.
-        "AEF10362CC939FA43CBED29D84CCAC13" as cursor_grain: ShortString;
+        "AEF10362CC939FA43CBED29D84CCAC13" unsafe as cursor_grain: ShortString;
     }
 
     use triblespace::core::id::ufoid;
@@ -169,9 +169,9 @@ pub mod comb {
 pub mod ctx {
     use super::*;
     attributes! {
-        "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: Handle<LongString>;
-        "502F7D33822A90366F0F0ADA0556177F" as start_at: NsTAIInterval;
-        "DF84E872EB68FBFCA63D760F27FD8A6F" as end_at: NsTAIInterval;
+        "3292CF0B3B6077991D8ECE6E2973D4B6" unsafe as summary: Handle<LongString>;
+        "502F7D33822A90366F0F0ADA0556177F" unsafe as start_at: NsTAIInterval;
+        "DF84E872EB68FBFCA63D760F27FD8A6F" unsafe as end_at: NsTAIInterval;
         /// Contextualised cross-reference to another chunk, extracted from
         /// `[why this matters here](memory:<hex>)` at create. Annotation, not
         /// structure: no span effect, no tree role — hierarchy is temporal
@@ -184,17 +184,17 @@ pub mod ctx {
         /// children-union spans). The structural role is retired; legacy
         /// edges in any pile reinterpret as what they always semantically
         /// were — contextualised references.
-        "9B83D68AECD6888AA9CE95E754494768" as reference: GenId;
-        "CB97C36A32DEC70E0D1149E7C5D88588" as left: GenId;
-        "087D07E3D9D94F0C4E96813C7BC5E74C" as right: GenId;
-        "316834CC6B0EA6F073BF5362D67AC530" as about_exec_result: GenId;
-        "A4E2B712CA28AB1EED76C34DE72AFA39" as about_archive_message: GenId;
+        "9B83D68AECD6888AA9CE95E754494768" unsafe as reference: GenId;
+        "CB97C36A32DEC70E0D1149E7C5D88588" unsafe as left: GenId;
+        "087D07E3D9D94F0C4E96813C7BC5E74C" unsafe as right: GenId;
+        "316834CC6B0EA6F073BF5362D67AC530" unsafe as about_exec_result: GenId;
+        "A4E2B712CA28AB1EED76C34DE72AFA39" unsafe as about_archive_message: GenId;
         /// This chunk replaces another (wrong span, superseded retelling).
         /// Monotonic correction: the fact is appended, never removed; readers
         /// exclude any chunk that something else supersedes (read-side policy,
         /// periphery principle). Mis-created chunks stay in history but leave
         /// every view.
-        "0381735B64BFE71EA0341B95EA42C984" as supersedes: GenId;
+        "0381735B64BFE71EA0341B95EA42C984" unsafe as supersedes: GenId;
         /// Marks this chunk as a thematic LENS rather than part of the
         /// chronological spine; the value is the theme name. Lens chunks are
         /// excluded from the temporal containment tree, so a wide lens (e.g. a
@@ -202,13 +202,13 @@ pub mod ctx {
         /// the eras it overlaps. They are read on their own axis via
         /// `memory lens <theme>`. This is what lets memory be a many-threaded
         /// weave — overlapping views over the same time — instead of one tree.
-        "B53D37A3BE552B0F47E279D69AB7ECD3" as lens: Handle<LongString>;
+        "B53D37A3BE552B0F47E279D69AB7ECD3" unsafe as lens: Handle<LongString>;
         /// The raw image bytes of a WORDLESS image memory chunk. A chunk with
         /// this attribute is a memory whose content is a picture, not prose —
         /// no `ctx::summary` is required. It shares the same time-coordinate
         /// (`start_at`/`end_at`) and the same shared-space `embeddings::embedding`
         /// (via nomic-VISION-768, co-embedded with nomic-text) as text memories,
         /// so `memory similar` ranks text and image memories together by meaning.
-        "1490E76164F3B523E32EDB15D949BD1C" as image: Handle<RawBytes>;
+        "1490E76164F3B523E32EDB15D949BD1C" unsafe as image: Handle<RawBytes>;
     }
 }

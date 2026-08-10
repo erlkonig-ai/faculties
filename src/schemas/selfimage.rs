@@ -19,8 +19,8 @@ use triblespace::prelude::*;
 attributes! {
     /// The visual/aesthetic style label of a self-image sample (e.g.
     /// "portrait", "watercolour", "line-art"). Minted 2026-06-30 (trible genid).
-    "C60D8DCFD7ECA4B0A975C8656327A17F" as style: ShortString;
+    "C60D8DCFD7ECA4B0A975C8656327A17F" unsafe as style: ShortString;
     /// The emotional expression label of a self-image sample (e.g. "joyful",
     /// "pensive", "serene"). Minted 2026-06-30 (trible genid).
-    "813627529BC29E76938ADC06ACD4F9F8" as expression: ShortString;
+    "813627529BC29E76938ADC06ACD4F9F8" unsafe as expression: ShortString;
 }

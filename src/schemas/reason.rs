@@ -12,9 +12,9 @@ pub mod reason_schema {
     use super::*;
 
     attributes! {
-        "B10329D5D1087D15A3DAFF7A7CC50696" as text: inlineencodings::Handle<blobencodings::LongString>;
-        "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: inlineencodings::GenId;
-        "721DED6DA776F2CF4FB91C54D9F82358" as worker: inlineencodings::GenId;
-        "514F4FE9F560FB155450462C8CF50749" as command_text: inlineencodings::Handle<blobencodings::LongString>;
+        "B10329D5D1087D15A3DAFF7A7CC50696" unsafe as text: inlineencodings::Handle<blobencodings::LongString>;
+        "E6B1C728F1AE9F46CAB4DBB60D1A9528" unsafe as about_turn: inlineencodings::GenId;
+        "721DED6DA776F2CF4FB91C54D9F82358" unsafe as worker: inlineencodings::GenId;
+        "514F4FE9F560FB155450462C8CF50749" unsafe as command_text: inlineencodings::Handle<blobencodings::LongString>;
     }
 }

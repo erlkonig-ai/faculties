@@ -124,7 +124,7 @@ where
 pub mod attr {
     use super::*;
     attributes! {
-        "BCDCA79081A84E7428A2D06A7F222313" as embedding: inlineencodings::Handle<super::Embedding768>;
+        "BCDCA79081A84E7428A2D06A7F222313" unsafe as embedding: inlineencodings::Handle<super::Embedding768>;
     }
 }
 
@@ -192,7 +192,7 @@ where
 pub mod attr_mm7b {
     use super::*;
     attributes! {
-        "1BFC43C63FE8A38BC09DB3144859F3FC" as embedding: inlineencodings::Handle<super::Embedding3584>;
+        "1BFC43C63FE8A38BC09DB3144859F3FC" unsafe as embedding: inlineencodings::Handle<super::Embedding3584>;
     }
 }
 

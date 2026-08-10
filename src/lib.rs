@@ -41,6 +41,9 @@ pub mod nomic;
 pub mod schemas;
 pub mod tokens;
 
+#[cfg(test)]
+mod attribute_id_preservation_tests;
+
 /// Resolve a free-text argument that may reference a file or stdin, so every
 /// faculty that takes prose content (`memory create`, `message send`,
 /// `wiki create/edit`, `compass note`, `status set`, …) shares one convention:
