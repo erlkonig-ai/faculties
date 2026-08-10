@@ -4,12 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-- **Files now runs directly on its native collection.** Each invocation loads
-  the durable signer, materializes the complete signer-owned collection once,
-  reads attachments through an immutable pile reader, and publishes mutations
-  as self-contained `Fragment` commits. Runtime branch/head/CAS vocabulary is
-  gone. The shared file constructor now owns all three referenced blobs inside
-  its returned fragment, including for legacy Mail, Teams, and Discord callers.
+- **Files now runs directly on its native collection.** Read commands load the
+  durable signer and materialize one immutable signer-owned view; append-only
+  commands publish self-contained `Fragment` commits without reconstructing
+  existing history, and dry runs touch no persistence. Runtime branch/head/CAS
+  vocabulary is gone. The shared file constructor owns all three referenced
+  blobs inside its returned fragment, including for Mail, Teams, and Discord
+  callers.
 - **Files has a strictly additive native-collection migration.** The
   stopped-world planner preserves every legacy fact and entity ID, derives
   only missing canonical media-type facts, and publishes authored leaves
