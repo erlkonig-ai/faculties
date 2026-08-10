@@ -651,25 +651,20 @@ fn pull_once_with_cache(
             fetch_delta_with_cursor_recovery(&token, &start_url, &base_url, using_saved_cursor)?;
         let index = CatalogIndex::build(&catalog);
         let incoming = parse_messages(messages)?;
-        let (mut change, files_change) = build_ingest_change(
-            &mut ws,
-            &mut files_ws,
-            &catalog,
-            &index,
-            &existing_files,
-            incoming,
-            &token,
-        )?;
+        let (mut change, mut files_change) =
+            build_ingest_change(&mut ws, &catalog, &index, &existing_files, incoming, &token)?;
         if let Some(cursor_change) =
             build_cursor_change(&mut ws, &catalog, cursor_state.as_ref(), new_cursor)?
         {
             change += cursor_change;
         }
 
-        // File blobs are staged in the files workspace. Publish them before
-        // advancing Teams facts and the delta cursor: a later Teams failure is
-        // safely replayable against an already-present content-addressed file.
-        let files_change = files_change.difference(&files_catalog);
+        // The self-contained file fragments are published to the files
+        // workspace before advancing Teams facts and the delta cursor: a later
+        // Teams failure is safely replayable against already-present content-
+        // addressed files.
+        let files_delta = files_change.facts().difference(&files_catalog);
+        *files_change.facts_mut() = files_delta;
         if !files_change.is_empty() {
             files_ws.commit(files_change, "teams attachment files");
             map_err_debug(repo.push(&mut files_ws), "push files workspace")?;
@@ -2590,7 +2585,7 @@ fn backfill_attachments(
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
-        let mut files_change = TribleSet::new();
+        let mut files_change = Fragment::empty();
 
         let chat_filter_ids = match options.chat_id.as_ref().map(|value| value.trim()) {
             Some(value) if !value.is_empty() => {
@@ -2751,7 +2746,6 @@ fn backfill_attachments(
             let before = change.len() + files_change.len();
             ensure_attachments(
                 &mut ws,
-                &mut files_ws,
                 &mut change,
                 &mut files_change,
                 &index,
@@ -2768,7 +2762,8 @@ fn backfill_attachments(
         }
 
         let change = change.difference(&catalog);
-        let files_change = files_change.difference(&files_catalog);
+        let files_delta = files_change.facts().difference(&files_catalog);
+        *files_change.facts_mut() = files_delta;
         if change.is_empty() && files_change.is_empty() {
             println!("No attachments to backfill.");
             return Ok(());
@@ -3468,13 +3463,12 @@ fn validate_message_identity_lineage(catalog: &TribleSet) -> Result<()> {
 
 fn build_ingest_change(
     ws: &mut Workspace<Pile>,
-    files_ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     index: &CatalogIndex,
     existing_files: &HashSet<Id>,
     incoming: Vec<IncomingMessage>,
     token: &str,
-) -> Result<(TribleSet, TribleSet)> {
+) -> Result<(TribleSet, Fragment)> {
     let mut by_chat: HashMap<String, Vec<IncomingMessage>> = HashMap::new();
     for message in incoming {
         by_chat
@@ -3484,7 +3478,7 @@ fn build_ingest_change(
     }
 
     let mut change = TribleSet::new();
-    let mut files_change = TribleSet::new();
+    let mut files_change = Fragment::empty();
     let mut added_attachments = HashSet::new();
     for (chat_external_id, mut messages) in by_chat {
         // Derive chat_id intrinsically from the external id.
@@ -3544,7 +3538,6 @@ fn build_ingest_change(
 
             ensure_attachments(
                 ws,
-                files_ws,
                 &mut change,
                 &mut files_change,
                 index,
@@ -3634,9 +3627,8 @@ fn ensure_author(
 
 fn ensure_attachments(
     ws: &mut Workspace<Pile>,
-    files_ws: &mut Workspace<Pile>,
     change: &mut TribleSet,
-    files_change: &mut TribleSet,
+    files_change: &mut Fragment,
     index: &CatalogIndex,
     existing_files: &HashSet<Id>,
     message_id: Id,
@@ -3748,8 +3740,7 @@ fn ensure_attachments(
             .as_deref()
             .unwrap_or("application/octet-stream");
         let media_type = file_capability::normalize_media_type_or_default(mime);
-        let file_fragment =
-            file_capability::stage(files_ws, bytes, name_str.to_owned(), &media_type)?;
+        let file_fragment = file_capability::stage(bytes, name_str.to_owned(), &media_type)?;
         let file_id = file_fragment
             .root()
             .expect("canonical file fragment has one root");
@@ -4135,16 +4126,16 @@ mod tests {
             let existing_files = file_entity_ids(&files_catalog);
             let index = CatalogIndex::build(&catalog);
             let incoming = parse_messages(messages)?;
-            let (change, files_change) = build_ingest_change(
+            let (change, mut files_change) = build_ingest_change(
                 &mut ws,
-                &mut files_ws,
                 &catalog,
                 &index,
                 &existing_files,
                 incoming,
                 "test-token",
             )?;
-            let files_change = files_change.difference(&files_catalog);
+            let files_delta = files_change.facts().difference(&files_catalog);
+            *files_change.facts_mut() = files_delta;
             let counts = (change.len(), files_change.len());
 
             if commit_files && !files_change.is_empty() {

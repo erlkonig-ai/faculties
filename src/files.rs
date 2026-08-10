@@ -16,7 +16,6 @@ use anyhow::{anyhow, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 use triblespace::core::metadata;
-use triblespace::core::repo::{BlobStore, Workspace};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
@@ -307,25 +306,22 @@ pub fn media_type_name_handle(space: &TribleSet, file_id: Id) -> Option<NameHand
     .map(|(name,)| name)
 }
 
-/// Stage a file's blobs in `workspace` and return its canonical fragment.
+/// Build one self-contained canonical file fragment.
 ///
 /// `name` is a leaf name supplied by the caller, not a filesystem path. The
-/// workspace remains responsible for commit composition and push ordering, so
-/// faculties can include this fragment in larger cross-branch operations.
-pub fn stage<Blobs, T>(
-    workspace: &mut Workspace<Blobs>,
-    bytes: T,
-    name: impl Into<String>,
-    media_type: &str,
-) -> Result<Fragment>
+/// returned [`Fragment`] owns the content, name, and media-type-name blobs, so
+/// callers can safely compose it into a larger fragment and publish that one
+/// ownership unit through either the native collection API or a legacy
+/// [`Workspace`](triblespace::core::repo::Workspace).
+pub fn stage<T>(bytes: T, name: impl Into<String>, media_type: &str) -> Result<Fragment>
 where
-    Blobs: BlobStore,
     T: triblespace::core::blob::IntoBlob<RawBytes>,
 {
     let media_type = normalize_media_type(media_type)?;
-    let content = workspace.put::<RawBytes, _>(bytes);
-    let name = workspace.put::<LongString, _>(leaf_name(&name.into()));
-    let media_type_name = workspace.put::<LongString, _>(media_type);
+    let mut fragment = Fragment::empty();
+    let content = fragment.put::<RawBytes, _>(bytes);
+    let name = fragment.put::<LongString, _>(leaf_name(&name.into()));
+    let media_type_name = fragment.put::<LongString, _>(media_type);
     let media_type = entity! {
         metadata::tag: &KIND_MEDIA_TYPE,
         metadata::name: media_type_name,
@@ -334,12 +330,13 @@ where
     // Spreading the child fragment consumes its exported id into the relation
     // while folding its facts into the returned fragment. The file remains the
     // fragment's sole exported root.
-    Ok(entity! {
+    fragment += entity! {
         metadata::tag: &KIND_FILE,
         file::content: content,
         file::name: name,
         file::media_type*: media_type,
-    })
+    };
+    Ok(fragment)
 }
 
 #[cfg(test)]
@@ -348,18 +345,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::Repository;
-
-    fn workspace() -> Workspace<MemoryRepo> {
-        let mut repo = Repository::new(
-            MemoryRepo::default(),
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        )
-        .expect("repository");
-        let branch = repo.create_branch("files", None).expect("branch");
-        repo.pull(*branch).expect("workspace")
-    }
+    use triblespace::core::repo::{BlobStore, BlobStoreGet, Repository};
 
     fn content_of(fragment: &Fragment) -> ContentHandle {
         find!(
@@ -404,14 +390,7 @@ mod tests {
 
     #[test]
     fn entity_and_content_prefixes_resolve_without_a_minimum_length() {
-        let mut workspace = workspace();
-        let file = stage(
-            &mut workspace,
-            b"selector bytes".to_vec(),
-            "selector.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let file = stage(b"selector bytes".to_vec(), "selector.txt", "text/plain").unwrap();
         let file_id = file.root().unwrap();
         let content = content_of(&file);
         let hash = content_hash_hex(content);
@@ -458,21 +437,8 @@ mod tests {
 
     #[test]
     fn duplicate_content_is_ambiguous_by_entity_even_for_a_complete_hash() {
-        let mut workspace = workspace();
-        let first = stage(
-            &mut workspace,
-            b"shared bytes".to_vec(),
-            "first.txt",
-            "text/plain",
-        )
-        .unwrap();
-        let second = stage(
-            &mut workspace,
-            b"shared bytes".to_vec(),
-            "second.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let first = stage(b"shared bytes".to_vec(), "first.txt", "text/plain").unwrap();
+        let second = stage(b"shared bytes".to_vec(), "second.txt", "text/plain").unwrap();
         let content = content_of(&first);
         let hash = content_hash_hex(content);
         let mut expected = vec![first.root().unwrap(), second.root().unwrap()];
@@ -527,21 +493,8 @@ mod tests {
 
     #[test]
     fn identical_file_records_have_identical_intrinsic_ids() {
-        let mut workspace = workspace();
-        let left = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "report.txt",
-            "text/plain",
-        )
-        .unwrap();
-        let right = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "report.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let left = stage(b"same bytes".to_vec(), "report.txt", "text/plain").unwrap();
+        let right = stage(b"same bytes".to_vec(), "report.txt", "text/plain").unwrap();
 
         assert_eq!(left.root(), right.root());
         assert_eq!(left, right);
@@ -549,23 +502,9 @@ mod tests {
 
     #[test]
     fn name_and_media_type_are_identity_but_bytes_still_deduplicate() {
-        let mut workspace = workspace();
-        let text = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "report.txt",
-            "text/plain",
-        )
-        .unwrap();
-        let renamed = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "renamed.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let text = stage(b"same bytes".to_vec(), "report.txt", "text/plain").unwrap();
+        let renamed = stage(b"same bytes".to_vec(), "renamed.txt", "text/plain").unwrap();
         let retyped = stage(
-            &mut workspace,
             b"same bytes".to_vec(),
             "report.txt",
             "application/octet-stream",
@@ -582,28 +521,19 @@ mod tests {
 
     #[test]
     fn containing_paths_never_enter_file_identity() {
-        let mut workspace = workspace();
         let unix = stage(
-            &mut workspace,
             b"same bytes".to_vec(),
             "/tmp/archive/report.txt",
             "text/plain",
         )
         .unwrap();
         let windows = stage(
-            &mut workspace,
             b"same bytes".to_vec(),
             r"C:\archive\report.txt",
             "text/plain",
         )
         .unwrap();
-        let bare = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "report.txt",
-            "text/plain",
-        )
-        .unwrap();
+        let bare = stage(b"same bytes".to_vec(), "report.txt", "text/plain").unwrap();
 
         assert_eq!(unix.root(), bare.root());
         assert_eq!(windows.root(), bare.root());
@@ -611,9 +541,7 @@ mod tests {
 
     #[test]
     fn invalid_media_type_is_reported_instead_of_panicking() {
-        let mut workspace = workspace();
         let error = stage(
-            &mut workspace,
             Vec::<u8>::new(),
             "document.bin",
             "application/invalid\0mime",
@@ -649,16 +577,8 @@ mod tests {
 
     #[test]
     fn normalized_variants_converge_and_long_suffixes_remain_identity() {
-        let mut workspace = workspace();
-        let plain = stage(
-            &mut workspace,
-            b"same bytes".to_vec(),
-            "document.bin",
-            "text/plain",
-        )
-        .unwrap();
+        let plain = stage(b"same bytes".to_vec(), "document.bin", "text/plain").unwrap();
         let decorated = stage(
-            &mut workspace,
             b"same bytes".to_vec(),
             "document.bin",
             " TEXT/PLAIN; charset=UTF-8",
@@ -668,14 +588,12 @@ mod tests {
         assert_eq!(media_type_of(&plain), media_type_of(&decorated));
 
         let document = stage(
-            &mut workspace,
             b"same bytes".to_vec(),
             "document.bin",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
         .unwrap();
         let sheet = stage(
-            &mut workspace,
             b"same bytes".to_vec(),
             "document.bin",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -686,16 +604,21 @@ mod tests {
     }
 
     #[test]
-    fn media_type_is_a_joinable_intrinsic_entity() {
-        let mut workspace = workspace();
+    fn staged_fragment_owns_content_name_and_joinable_media_type_name() {
         let file = stage(
-            &mut workspace,
             b"slides".to_vec(),
             "deck.pptx",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         )
         .unwrap();
         let file_id = file.root().expect("file root");
+        let content = content_of(&file);
+        let file_name = find!(
+            name: NameHandle,
+            pattern!(&file, [{ file_id @ file::name: ?name }])
+        )
+        .next()
+        .expect("file name");
         let media_type_id = find!(
             (media_type: Id),
             pattern!(&file, [{ file_id @ file::media_type: ?media_type }])
@@ -718,17 +641,23 @@ mod tests {
             .next()
             .map(|(name,)| name)
         );
-        let name: anybytes::View<str> = workspace
+        let mut blobs = file.blobs().clone();
+        let reader = blobs.reader().expect("fragment blob reader");
+        let name: anybytes::View<str> = reader
             .get::<anybytes::View<str>, LongString>(name_handle)
             .expect("staged media type name");
         assert_eq!(
             name.as_ref(),
             "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         );
+        let content: anybytes::Bytes = reader.get(content).expect("staged content");
+        assert_eq!(content.as_ref(), b"slides");
+        let file_name: anybytes::View<str> = reader.get(file_name).expect("staged name");
+        assert_eq!(file_name.as_ref(), "deck.pptx");
     }
 
     #[test]
-    fn media_type_name_survives_tribleset_commit_and_checkout() {
+    fn complete_fragment_survives_legacy_workspace_commit_and_checkout() {
         let mut repo = Repository::new(
             MemoryRepo::default(),
             SigningKey::generate(&mut OsRng),
@@ -738,7 +667,6 @@ mod tests {
         let branch = *repo.create_branch("files", None).expect("branch");
         let mut workspace = repo.pull(branch).expect("workspace");
         let file = stage(
-            &mut workspace,
             b"slides".to_vec(),
             "deck.pptx",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -746,16 +674,26 @@ mod tests {
         .unwrap();
         let file_id = file.root().expect("file root");
 
-        // Mail, Teams, and Discord currently accumulate facts in a TribleSet.
-        // The constructor therefore stages blobs in the Workspace rather than
-        // relying on Fragment-local blob propagation alone.
-        let mut facts = TribleSet::new();
-        facts += file;
-        workspace.commit(facts, "store canonical file");
+        // Legacy Repository callers must preserve the returned Fragment as the
+        // ownership unit: collapsing it into a TribleSet would discard its
+        // attachment store before Workspace::commit can persist the closure.
+        workspace.commit(file, "store canonical file");
         repo.push(&mut workspace).expect("push");
 
         let mut reopened = repo.pull(branch).expect("reopen");
         let catalog = reopened.checkout(..).expect("checkout").into_facts();
+        let content_handle = find!(
+            content: ContentHandle,
+            pattern!(&catalog, [{ file_id @ file::content: ?content }])
+        )
+        .next()
+        .expect("persisted content handle");
+        let file_name_handle = find!(
+            name: NameHandle,
+            pattern!(&catalog, [{ file_id @ file::name: ?name }])
+        )
+        .next()
+        .expect("persisted file name handle");
         let name_handle = media_type_name_handle(&catalog, file_id).expect("canonical media type");
         let name: anybytes::View<str> = reopened
             .get::<anybytes::View<str>, LongString>(name_handle)
@@ -764,5 +702,10 @@ mod tests {
             name.as_ref(),
             "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         );
+        let content: anybytes::Bytes = reopened.get(content_handle).expect("persisted content");
+        assert_eq!(content.as_ref(), b"slides");
+        let file_name: anybytes::View<str> =
+            reopened.get(file_name_handle).expect("persisted file name");
+        assert_eq!(file_name.as_ref(), "deck.pptx");
     }
 }

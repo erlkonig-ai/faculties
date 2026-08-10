@@ -972,15 +972,11 @@ fn persist_message(
             .pull(files_branch_id)
             .map_err(|e| anyhow::anyhow!("pull files: {e:?}"))?;
 
-        let mut change = TribleSet::new();
+        let mut change = Fragment::empty();
         for att in &parsed.attachments {
             let media_type = file_capability::normalize_media_type_or_default(&att.mime);
-            let file_fragment = file_capability::stage(
-                &mut ws,
-                att.bytes.clone(),
-                att.filename.clone(),
-                &media_type,
-            )?;
+            let file_fragment =
+                file_capability::stage(att.bytes.clone(), att.filename.clone(), &media_type)?;
             let file_ref = file_fragment
                 .root()
                 .expect("canonical file fragment has one root");

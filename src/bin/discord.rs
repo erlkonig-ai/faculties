@@ -519,14 +519,13 @@ fn pull_channel(
             .checkout(..)
             .map_err(|e| anyhow!("checkout files: {e:?}"))?
             .into_facts();
+        let (change, mut files_change) = build_ingest_change(&mut ws, &catalog, incoming, config)?;
+        let files_delta = files_change.facts().difference(&files_catalog);
+        *files_change.facts_mut() = files_delta;
 
-        let (change, files_change) =
-            build_ingest_change(&mut ws, &mut files_ws, &catalog, incoming, config)?;
-
-        let files_delta = files_change.difference(&files_catalog);
-        if !files_delta.is_empty() {
+        if !files_change.is_empty() {
             files_ws.commit(
-                files_delta,
+                files_change,
                 &format!("discord: attachments from channel {channel_id}"),
             );
             repo.push(&mut files_ws)
@@ -894,13 +893,12 @@ fn parse_messages(
 
 fn build_ingest_change(
     ws: &mut Workspace<Pile>,
-    files_ws: &mut Workspace<Pile>,
     _catalog: &TribleSet,
     messages: Vec<IncomingMessage>,
     config: &DiscordConfig,
-) -> Result<(TribleSet, TribleSet)> {
+) -> Result<(TribleSet, Fragment)> {
     let mut change = TribleSet::new();
-    let mut files_change = TribleSet::new();
+    let mut files_change = Fragment::empty();
     let mut added_attachment_files: std::collections::HashSet<Id> =
         std::collections::HashSet::new();
 
@@ -1029,7 +1027,7 @@ fn build_ingest_change(
                 .unwrap_or_else(|| "application/octet-stream".to_string());
             let media_type = file_capability::normalize_media_type_or_default(&mime);
             let file_fragment =
-                file_capability::stage(files_ws, bytes, source.filename.clone(), &media_type)?;
+                file_capability::stage(bytes, source.filename.clone(), &media_type)?;
             let file_id = file_fragment
                 .root()
                 .expect("canonical file fragment has one root");
