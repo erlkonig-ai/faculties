@@ -49,6 +49,7 @@ use faculties::schemas::posture::{
 use faculties::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
 use hifitime::Epoch;
 use lopdf::{Dictionary, Document, Object};
+use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -173,7 +174,9 @@ enum Command {
     /// review by the normal mechanism — and it is written in the register you
     /// use for your own notes, moments after the work, to a reader you imagine
     /// as yourself. That combination is how internal vocabulary reaches a public
-    /// remote.
+    /// remote. It also checks added and removed Rust lines for changes to
+    /// literal-pinned `unsafe as` attribute declarations, independently of
+    /// channel vocabulary.
     Git {
         /// Commit range, e.g. origin/main..HEAD
         range: String,
@@ -2210,8 +2213,13 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
         bail!("Posture scan collection contains unrecognized entities");
     }
 
+    let coverage_modalities = modality::ALL
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
     let known_modalities = modality::ALL
         .iter()
+        .chain(modality::GIT_ONLY)
         .map(|(id, _)| *id)
         .collect::<BTreeSet<_>>();
     for scan in &scans {
@@ -2295,14 +2303,21 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
                 fmt_id(*scan)
             );
         }
-        let covered = checked.union(&unchecked).copied().collect::<BTreeSet<_>>();
+        let checked_coverage = checked
+            .intersection(&coverage_modalities)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let covered = checked_coverage
+            .union(&unchecked)
+            .copied()
+            .collect::<BTreeSet<_>>();
         if !checked.is_disjoint(&unchecked)
             || !checked.is_subset(&known_modalities)
-            || !unchecked.is_subset(&known_modalities)
-            || covered != known_modalities
+            || !unchecked.is_subset(&coverage_modalities)
+            || covered != coverage_modalities
         {
             bail!(
-                "scan {} does not partition every known modality into checked or unchecked",
+                "scan {} does not partition every file-scan coverage modality into checked or unchecked",
                 fmt_id(*scan)
             );
         }
@@ -2857,7 +2872,13 @@ const BENIGN_DECISION_OUTCOME: &str = "benign";
 #[derive(Default)]
 struct OccurrenceDecisionState {
     benign: bool,
+    justified_benign: bool,
     disputed: bool,
+}
+
+struct BenignOccurrenceSets {
+    ordinary: BTreeSet<Id>,
+    justified: BTreeSet<Id>,
 }
 
 /// Occurrences classified benign by the native Decide collection.
@@ -2868,7 +2889,7 @@ struct OccurrenceDecisionState {
 /// nothing. A fork or a second resolved decision with another outcome keeps
 /// the occurrence visible; set union therefore exposes disagreement instead of
 /// choosing a winner by time or iteration order.
-fn benign_occurrences(reader: &PileReader, facts: &TribleSet) -> Result<BTreeSet<Id>> {
+fn benign_occurrence_sets(reader: &PileReader, facts: &TribleSet) -> Result<BenignOccurrenceSets> {
     let mut states = BTreeMap::<Id, OccurrenceDecisionState>::new();
     for decision in decide::decision_anchors(facts) {
         let genesis = decide::genesis_for_decision(facts, decision)?
@@ -2893,14 +2914,45 @@ fn benign_occurrences(reader: &PileReader, facts: &TribleSet) -> Result<BTreeSet
         };
         if decide::read_text(reader, snapshot.outcome)? == BENIGN_DECISION_OUTCOME {
             state.benign = true;
+            if let Some(context) = genesis.context {
+                // Decide validates proposal context as canonical required text;
+                // read it anyway so missing/corrupt justification cannot grant
+                // clearance merely because a handle is present.
+                if !decide::read_text(reader, context)?.trim().is_empty() {
+                    state.justified_benign = true;
+                }
+            }
         } else {
             state.disputed = true;
         }
     }
-    Ok(states
+    let ordinary = states
+        .iter()
+        .filter_map(|(occurrence, state)| (state.benign && !state.disputed).then_some(*occurrence))
+        .collect();
+    let justified = states
         .into_iter()
-        .filter_map(|(occurrence, state)| (state.benign && !state.disputed).then_some(occurrence))
-        .collect())
+        .filter_map(|(occurrence, state)| {
+            (state.justified_benign && !state.disputed).then_some(occurrence)
+        })
+        .collect();
+    Ok(BenignOccurrenceSets {
+        ordinary,
+        justified,
+    })
+}
+
+#[cfg(test)]
+fn benign_occurrences(reader: &PileReader, facts: &TribleSet) -> Result<BTreeSet<Id>> {
+    Ok(benign_occurrence_sets(reader, facts)?.ordinary)
+}
+
+fn occurrence_is_hidden(modality: Id, occurrence: Id, benign: &BenignOccurrenceSets) -> bool {
+    if modality == modality::UNSAFE_ATTRIBUTE_ID {
+        benign.justified.contains(&occurrence)
+    } else {
+        benign.ordinary.contains(&occurrence)
+    }
 }
 
 fn cmd_list(
@@ -2921,7 +2973,7 @@ fn cmd_list(
             );
         }
     }
-    let benign = benign_occurrences(&decisions.reader, &decisions.facts)?;
+    let benign = benign_occurrence_sets(&decisions.reader, &decisions.facts)?;
     let all_rows = find!(
         (finding: Id, scan: Id, occurrence: Id, locator: TextHandle, value: TextHandle),
         pattern!(&view.facts, [{
@@ -2936,24 +2988,35 @@ fn cmd_list(
     )
     .filter(|(_, scan, _, _, _)| want.is_none_or(|wanted| *scan == wanted))
     .collect::<Vec<_>>();
+    let all_rows = all_rows
+        .into_iter()
+        .map(|(finding, scan, occurrence, locator, value)| {
+            let modality = find!(
+                tag: Id,
+                pattern!(&view.facts, [{ (finding) @ metadata::tag: ?tag }])
+            )
+            .find(|tag| modality::is_known(*tag))
+            .expect("validated finding has one known modality");
+            (finding, scan, occurrence, locator, value, modality)
+        })
+        .collect::<Vec<_>>();
     let hidden = all_rows
         .iter()
-        .filter(|(_, _, occurrence, _, _)| benign.contains(occurrence))
+        .filter(|(_, _, occurrence, _, _, modality)| {
+            occurrence_is_hidden(*modality, *occurrence, &benign)
+        })
         .count();
     let rows = all_rows
         .into_iter()
-        .filter(|(_, _, occurrence, _, _)| all || !benign.contains(occurrence))
+        .filter(|(_, _, occurrence, _, _, modality)| {
+            all || !occurrence_is_hidden(*modality, *occurrence, &benign)
+        })
         .collect::<Vec<_>>();
 
     let mut groups: BTreeMap<&str, Vec<(Id, TextHandle, TextHandle)>> = BTreeMap::new();
-    for (finding, _, occurrence, locator, value) in &rows {
-        let modality = find!(
-            tag: Id,
-            pattern!(&view.facts, [{ (*finding) @ metadata::tag: ?tag }])
-        )
-        .find(|tag| modality::ALL.iter().any(|(known, _)| known == tag));
+    for (_, _, occurrence, locator, value, modality) in &rows {
         groups
-            .entry(modality.map(modality::name).unwrap_or("unclassified"))
+            .entry(modality::name(*modality))
             .or_default()
             .push((*occurrence, *locator, *value));
     }
@@ -3535,9 +3598,14 @@ struct GitAudit {
     /// of how the caller spelled `--repo`.
     repo_root: PathBuf,
     hits: BTreeMap<String, Vec<GitHit>>,
+    unsafe_attribute_hits: Vec<GitHit>,
     commits: usize,
     added_lines: usize,
+    removed_lines: usize,
 }
+
+const UNSAFE_ATTRIBUTE_FINDING: &str =
+    "literal-pinned attribute identity (`unsafe as`) change requires justification";
 
 fn abbreviated_object_id(object_id: &str) -> &str {
     &object_id[..object_id.len().min(8)]
@@ -3569,11 +3637,454 @@ fn git_occurrence_id(repo_root: &Path, hit: &GitHit, term: &str) -> Id {
     occurrence_id(modality::PROTECTED_TERM, path, locator, value)
 }
 
+fn unsafe_attribute_occurrence_id(repo_root: &Path, hit: &GitHit) -> Id {
+    let path: TextHandle = repo_root.display().to_string().to_blob().get_handle();
+    let locator: TextHandle = hit.locator.clone().to_blob().get_handle();
+    let value: TextHandle = UNSAFE_ATTRIBUTE_FINDING.to_owned().to_blob().get_handle();
+    occurrence_id(modality::UNSAFE_ATTRIBUTE_ID, path, locator, value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnsafeAttributeChange {
+    Added,
+    Removed,
+}
+
+impl UnsafeAttributeChange {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+/// Unlike a protected-text hit, the policy judgement here belongs to the
+/// source declaration, not to one spelling of the commit that introduced it.
+/// A rebase or amend therefore changes only the display evidence. Moving the
+/// declaration to another source path or changing its text is a new occurrence
+/// and needs its own justification.
+fn unsafe_attribute_hit(
+    object_id: &str,
+    position: &str,
+    source_path: &str,
+    change: UnsafeAttributeChange,
+    declaration: &UnsafeAttributeDeclaration,
+) -> GitHit {
+    let kind = format!("unsafe-attribute-{}", change.label());
+    let exact = git_hit(&kind, object_id, position, &declaration.text);
+    GitHit {
+        locator: format!(
+            "rust-attribute-{} {source_path}#{}  {}",
+            change.label(),
+            declaration.same_text_ordinal,
+            declaration.text
+        ),
+        display: exact.display,
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct UnsafeAttributeDeclaration {
+    /// One-based inclusive source-line span.
+    start_line: u64,
+    end_line: u64,
+    /// Whitespace-normalized complete declaration through its semicolon. The
+    /// encoding remains part of this text when rustfmt wraps it.
+    text: String,
+    /// Distinguish repeated identical declarations without making ordinary
+    /// source-line movement part of identity.
+    same_text_ordinal: usize,
+}
+
+fn unsafe_attribute_declarations(source: &str) -> Vec<UnsafeAttributeDeclaration> {
+    // Token-tree whitespace and comments may separate every part of the macro
+    // arm, including the id literal from `unsafe as`. Match through the first
+    // semicolon so the complete name and encoding participate in identity.
+    let comments = r"(?:(?://[^\n]*\n)|(?:/\*.*?\*/)|\s)*";
+    let pattern = format!(r#"(?ms)^[ \t]*"[0-9A-Fa-f]{{32}}"{comments}unsafe{comments}as\b"#);
+    let declaration_start =
+        Regex::new(&pattern).expect("unsafe attribute declaration regex is valid");
+    let mut declarations = Vec::new();
+    let mut text_counts = BTreeMap::<String, usize>::new();
+    for matched in declaration_start.find_iter(source) {
+        let Some(end) = rust_declaration_end(source, matched.end()) else {
+            continue;
+        };
+        let matched_text = &source[matched.start()..end];
+        let text = matched_text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let same_text_ordinal = *text_counts
+            .entry(text.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        declarations.push(UnsafeAttributeDeclaration {
+            start_line: source[..matched.start()]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as u64
+                + 1,
+            end_line: source[..end].bytes().filter(|byte| *byte == b'\n').count() as u64 + 1,
+            text,
+            same_text_ordinal,
+        });
+    }
+    declarations
+}
+
+/// Find the arm-terminating semicolon while ignoring semicolons inside Rust
+/// comments and literals. This is intentionally a small lexer rather than
+/// `[^;]*`: compatibility comments quite reasonably contain prose punctuation,
+/// and truncating there would omit the encoding from the reviewed claim.
+fn rust_declaration_end(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = start;
+    let mut block_depth = 0usize;
+    let mut line_comment = false;
+    let mut string = false;
+    let mut character = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_depth > 0 {
+            if byte == b'/' && next == Some(b'*') {
+                block_depth += 1;
+                index += 2;
+            } else if byte == b'*' && next == Some(b'/') {
+                block_depth -= 1;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if string || character {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if (string && byte == b'"') || (character && byte == b'\'') {
+                string = false;
+                character = false;
+            }
+            index += 1;
+            continue;
+        }
+        match (byte, next) {
+            (b'/', Some(b'/')) => {
+                line_comment = true;
+                index += 2;
+            }
+            (b'/', Some(b'*')) => {
+                block_depth = 1;
+                index += 2;
+            }
+            (b'"', _) => {
+                string = true;
+                index += 1;
+            }
+            // Treat only a visibly closed short character literal as such;
+            // ordinary Rust lifetimes should remain normal tokens.
+            (b'\'', _) if bytes[index + 1..bytes.len().min(index + 8)].contains(&b'\'') => {
+                character = true;
+                index += 1;
+            }
+            (b';', _) => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn hunk_start(line: &str, prefix: char) -> Option<u64> {
+    line.split_whitespace().find_map(|field| {
+        field
+            .strip_prefix(prefix)
+            .and_then(|range| range.split(',').next())
+            .and_then(|start| start.parse::<u64>().ok())
+    })
+}
+
+fn append_changed_unsafe_attributes(
+    repo_root: &Path,
+    display_commit: &str,
+    treeish: &str,
+    change: UnsafeAttributeChange,
+    changed_lines: BTreeMap<String, BTreeSet<u64>>,
+    hits: &mut Vec<GitHit>,
+) -> Result<()> {
+    for (patch_path, changed_lines) in changed_lines {
+        if patch_path == "/dev/null" {
+            continue;
+        }
+        let source_path = patch_path
+            .strip_prefix("a/")
+            .or_else(|| patch_path.strip_prefix("b/"))
+            .unwrap_or(&patch_path);
+        let object = format!("{treeish}:{source_path}");
+        let source = git_required(repo_root, &["show", &object])?;
+        for declaration in unsafe_attribute_declarations(&source) {
+            if !(declaration.start_line..=declaration.end_line)
+                .any(|line| changed_lines.contains(&line))
+            {
+                continue;
+            }
+            let position = if declaration.start_line == declaration.end_line {
+                format!("{source_path}:{}", declaration.start_line)
+            } else {
+                format!(
+                    "{source_path}:{}-{}",
+                    declaration.start_line, declaration.end_line
+                )
+            };
+            hits.push(unsafe_attribute_hit(
+                display_commit,
+                &position,
+                source_path,
+                change,
+                &declaration,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unsafe_attribute_claim_key(hit: &GitHit) -> Option<&str> {
+    hit.locator
+        .strip_prefix("rust-attribute-added ")
+        .or_else(|| hit.locator.strip_prefix("rust-attribute-removed "))
+}
+
+fn cancel_unchanged_unsafe_attributes(hits: &mut Vec<GitHit>) {
+    let added = hits
+        .iter()
+        .filter(|hit| hit.locator.starts_with("rust-attribute-added "))
+        .filter_map(unsafe_attribute_claim_key)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let removed = hits
+        .iter()
+        .filter(|hit| hit.locator.starts_with("rust-attribute-removed "))
+        .filter_map(unsafe_attribute_claim_key)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let unchanged = added
+        .intersection(&removed)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    hits.retain(|hit| unsafe_attribute_claim_key(hit).is_none_or(|key| !unchanged.contains(key)));
+}
+
+/// Audit one ordinary two-way commit edge. Merge commits are deliberately
+/// expanded into one edge per parent: combined-diff syntax has one old
+/// coordinate and prefix column per parent and cannot be parsed as a unified
+/// diff without silently losing parent-specific removals.
+fn collect_parent_unsafe_hits(
+    repo_root: &Path,
+    sha: &str,
+    parent: Option<&str>,
+    unsafe_attribute_hits: &mut Vec<GitHit>,
+) -> Result<usize> {
+    let patch = match parent {
+        Some(parent) => git_required(
+            repo_root,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--diff-algorithm=myers",
+                "--unified=0",
+                parent,
+                sha,
+            ],
+        )?,
+        None => git_required(
+            repo_root,
+            &[
+                "show",
+                "--format=",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--diff-algorithm=myers",
+                "--unified=0",
+                sha,
+            ],
+        )?,
+    };
+
+    let mut added_rust_lines = BTreeMap::<String, BTreeSet<u64>>::new();
+    let mut removed_rust_lines = BTreeMap::<String, BTreeSet<u64>>::new();
+    let mut old_patch_path = "?";
+    let mut new_patch_path = "?";
+    let mut next_old_line = None;
+    let mut next_new_line = None;
+    let mut n_removed = 0usize;
+    for line in patch.lines() {
+        if line.starts_with("diff --git ") {
+            old_patch_path = "?";
+            new_patch_path = "?";
+            next_old_line = None;
+            next_new_line = None;
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("--- ") {
+            old_patch_path = path;
+            next_old_line = None;
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("+++ ") {
+            new_patch_path = path;
+            next_new_line = None;
+            continue;
+        }
+        if line.starts_with("@@") {
+            next_old_line = hunk_start(line, '-');
+            next_new_line = hunk_start(line, '+');
+            continue;
+        }
+        if line.starts_with('-') && !line.starts_with("---") {
+            n_removed += 1;
+            if old_patch_path.ends_with(".rs") {
+                if let Some(source_line) = next_old_line {
+                    removed_rust_lines
+                        .entry(old_patch_path.to_owned())
+                        .or_default()
+                        .insert(source_line);
+                }
+            }
+            next_old_line = next_old_line.map(|line| line + 1);
+            continue;
+        }
+        if !line.starts_with('+') || line.starts_with("+++") {
+            if !line.starts_with('\\') {
+                next_old_line = next_old_line.map(|line| line + 1);
+                next_new_line = next_new_line.map(|line| line + 1);
+            }
+            continue;
+        }
+        let added_line = next_new_line;
+        next_new_line = next_new_line.map(|line| line + 1);
+        if new_patch_path.ends_with(".rs") {
+            if let Some(line) = added_line {
+                added_rust_lines
+                    .entry(new_patch_path.to_owned())
+                    .or_default()
+                    .insert(line);
+            }
+        }
+    }
+
+    let mut edge_unsafe_hits = Vec::new();
+    append_changed_unsafe_attributes(
+        repo_root,
+        sha,
+        sha,
+        UnsafeAttributeChange::Added,
+        added_rust_lines,
+        &mut edge_unsafe_hits,
+    )?;
+    if !removed_rust_lines.is_empty() {
+        let parent =
+            parent.ok_or_else(|| anyhow!("root commit {sha} unexpectedly removes source lines"))?;
+        append_changed_unsafe_attributes(
+            repo_root,
+            sha,
+            parent,
+            UnsafeAttributeChange::Removed,
+            removed_rust_lines,
+            &mut edge_unsafe_hits,
+        )?;
+    }
+    // A formatter may remove and add differently-spaced source lines while
+    // leaving the normalized path/name/encoding claim unchanged. That is not a
+    // pin lifecycle event and must retain its existing justification.
+    cancel_unchanged_unsafe_attributes(&mut edge_unsafe_hits);
+    unsafe_attribute_hits.extend(edge_unsafe_hits);
+    Ok(n_removed)
+}
+
+/// Preserve the original protected-term semantics: one combined patch per
+/// commit catches conflict-resolution text introduced relative to every parent
+/// without treating ordinary content inherited from one side as newly
+/// published again at the merge commit.
+fn collect_commit_patch_term_hits(
+    repo_root: &Path,
+    sha: &str,
+    terms: &[(String, String)],
+    hits: &mut BTreeMap<String, Vec<GitHit>>,
+) -> Result<usize> {
+    let patch = git_required(
+        repo_root,
+        &[
+            "show",
+            "--format=",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--diff-algorithm=myers",
+            "--unified=0",
+            sha,
+        ],
+    )?;
+    let mut patch_path = "?";
+    let mut next_new_line = None;
+    let mut n_added = 0usize;
+    for (diff_line_index, line) in patch.lines().enumerate() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            patch_path = path;
+            next_new_line = None;
+            continue;
+        }
+        if line.starts_with("@@") {
+            next_new_line = hunk_start(line, '+');
+            continue;
+        }
+        if !line.starts_with('+') || line.starts_with("+++") {
+            if next_new_line.is_some() && !line.starts_with('-') && !line.starts_with('\\') {
+                next_new_line = next_new_line.map(|line| line + 1);
+            }
+            continue;
+        }
+        n_added += 1;
+        let position = match next_new_line {
+            Some(new_line) => format!("{patch_path}:{new_line}:diff-{}", diff_line_index + 1),
+            None => format!("{patch_path}:diff-{}", diff_line_index + 1),
+        };
+        next_new_line = next_new_line.map(|line| line + 1);
+        let lower = line.to_lowercase();
+        for (term, _) in terms {
+            if lower.contains(&term.to_lowercase()) {
+                hits.entry(term.clone())
+                    .or_default()
+                    .push(git_hit("patch", sha, &position, line));
+            }
+        }
+    }
+    Ok(n_added)
+}
+
 fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Result<GitAudit> {
     let repo_root = canonical_git_root(repo_path)?;
     let mut hits: BTreeMap<String, Vec<GitHit>> = BTreeMap::new();
+    let mut unsafe_attribute_hits = Vec::new();
     let mut n_commits = 0usize;
     let mut n_added = 0usize;
+    let mut n_removed = 0usize;
 
     // Commit messages, one record per commit so a hit can name its commit.
     // %x1e separates sha from body, %x1f terminates the record — control
@@ -3633,75 +4144,38 @@ fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Re
                 }
             }
         }
-        // PER-COMMIT patches, not the range's net diff: a file added in one
-        // commit and deleted in the next contributes nothing to `git diff A..B`
-        // while both commits still push and `git show` recovers it forever.
-        //
-        // And `git show` per commit rather than one `git log -p`: log -p omits
-        // merge diffs by default, so an "evil merge" whose conflict resolution
-        // introduces content present in neither parent is invisible to it.
-        // Measured: log -p found 0, show found 1. Do not "simplify" this.
-        let patch = git_required(
-            &repo_root,
-            &[
-                "show",
-                "--format=",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                "--diff-algorithm=myers",
-                "--unified=0",
-                sha,
-            ],
-        )?;
-        let mut patch_path = "?";
-        let mut next_new_line = None;
-        for (diff_line_index, line) in patch.lines().enumerate() {
-            if let Some(path) = line.strip_prefix("+++ ") {
-                patch_path = path;
-                next_new_line = None;
-                continue;
-            }
-            if line.starts_with("@@") {
-                next_new_line = line.split_whitespace().find_map(|field| {
-                    field
-                        .strip_prefix('+')
-                        .and_then(|range| range.split(',').next())
-                        .and_then(|start| start.parse::<u64>().ok())
-                });
-                continue;
-            }
-            if !line.starts_with('+') || line.starts_with("+++") {
-                if next_new_line.is_some() && !line.starts_with('-') && !line.starts_with('\\') {
-                    next_new_line = next_new_line.map(|line| line + 1);
-                }
-                continue;
-            }
-            n_added += 1;
-            // The diff-output ordinal is retained even when a normal hunk line
-            // number is available. It keeps repeated combined-diff emissions
-            // distinct without making identity depend on abbreviated hashes.
-            let position = match next_new_line {
-                Some(new_line) => format!("{patch_path}:{new_line}:diff-{}", diff_line_index + 1),
-                None => format!("{patch_path}:diff-{}", diff_line_index + 1),
-            };
-            next_new_line = next_new_line.map(|line| line + 1);
-            let lower = line.to_lowercase();
-            for (t, _) in terms {
-                if lower.contains(&t.to_lowercase()) {
-                    hits.entry(t.clone())
-                        .or_default()
-                        .push(git_hit("patch", sha, &position, line));
-                }
+        let lineage = git_required(&repo_root, &["rev-list", "--parents", "-n", "1", sha])?;
+        let parents = lineage.split_whitespace().skip(1).collect::<Vec<_>>();
+        if parents.is_empty() {
+            let removed =
+                collect_parent_unsafe_hits(&repo_root, sha, None, &mut unsafe_attribute_hits)?;
+            n_removed += removed;
+        } else {
+            for parent in parents {
+                let removed = collect_parent_unsafe_hits(
+                    &repo_root,
+                    sha,
+                    Some(parent),
+                    &mut unsafe_attribute_hits,
+                )?;
+                n_removed += removed;
             }
         }
+        n_added += collect_commit_patch_term_hits(&repo_root, sha, terms, &mut hits)?;
     }
+    for term_hits in hits.values_mut() {
+        term_hits.sort_by(|left, right| left.locator.cmp(&right.locator));
+        term_hits.dedup_by(|left, right| left.locator == right.locator);
+    }
+    unsafe_attribute_hits.sort_by(|left, right| left.locator.cmp(&right.locator));
+    unsafe_attribute_hits.dedup_by(|left, right| left.locator == right.locator);
     Ok(GitAudit {
         repo_root,
         hits,
+        unsafe_attribute_hits,
         commits: n_commits,
         added_lines: n_added,
+        removed_lines: n_removed,
     })
 }
 
@@ -3751,42 +4225,41 @@ fn load_terms(storage: PostureStorage<'_>, channel: &str) -> Result<Vec<(String,
         .unwrap_or_default())
 }
 
+fn git_audit_must_fail(
+    lexical_checked: bool,
+    protected_hits: usize,
+    unsafe_attribute_hits: usize,
+) -> bool {
+    !lexical_checked || protected_hits > 0 || unsafe_attribute_hits > 0
+}
+
 fn cmd_git(
     storage: PostureStorage<'_>,
     range: &str,
     channel: &str,
     repo_path: &Path,
 ) -> Result<()> {
-    let Some((channel_id, terms)) = load_channel_terms(storage, channel)? else {
-        bail!(
-            "channel {channel:?} has no protected terms — an audit against an empty \
-             vocabulary would report clean while checking nothing. Add terms with \
-             `posture vocab add <term> --channel {channel}`"
-        );
+    let policy = load_channel_terms(storage, channel)?;
+    let (channel_id, terms) = match policy {
+        Some((channel_id, terms)) => (Some(channel_id), terms),
+        None => (None, Vec::new()),
     };
-
-    if terms.is_empty() {
-        // Refusing to pass silently: an empty vocabulary would otherwise print a
-        // clean result, which is the single failure this tool must never have.
-        anyhow::bail!(
-            "channel {channel:?} has no protected terms — an audit against an empty \
-             vocabulary would report clean while checking nothing. Add terms with \
-             `posture vocab add <term> --channel {channel}`"
-        );
-    }
+    let lexical_checked = !terms.is_empty();
 
     let GitAudit {
         repo_root,
         hits,
+        unsafe_attribute_hits,
         commits: n_commits,
         added_lines: n_added,
+        removed_lines: n_removed,
     } = collect_hits(repo_path, range, &terms)?;
 
     // Persist the complete audit before rendering or deciding the exit code.
     // This gives Decide a stable semantic occurrence to name and records a
     // genuinely empty audit differently from an audit never run.
     let decisions = storage.decide_view()?;
-    let benign = benign_occurrences(&decisions.reader, &decisions.facts)?;
+    let benign = benign_occurrence_sets(&decisions.reader, &decisions.facts)?;
     let findings = hits
         .iter()
         .flat_map(|(term, term_hits)| {
@@ -3796,6 +4269,11 @@ fn cmd_git(
                 value: term.clone(),
             })
         })
+        .chain(unsafe_attribute_hits.iter().map(|hit| Found {
+            modality: modality::UNSAFE_ATTRIBUTE_ID,
+            locator: hit.locator.clone(),
+            value: UNSAFE_ATTRIBUTE_FINDING.to_owned(),
+        }))
         .collect::<Vec<_>>();
     let files = [ScannedFile {
         path: repo_root.clone(),
@@ -3808,8 +4286,12 @@ fn cmd_git(
         &files,
         &[],
         point_interval(now_epoch()?),
-        Some(channel_id),
-        BTreeSet::from([modality::PROTECTED_TERM]),
+        channel_id,
+        if lexical_checked {
+            BTreeSet::from([modality::PROTECTED_TERM, modality::UNSAFE_ATTRIBUTE_ID])
+        } else {
+            BTreeSet::from([modality::UNSAFE_ATTRIBUTE_ID])
+        },
     );
     storage.publish_scan(fragment, "posture git audit")?;
 
@@ -3819,17 +4301,34 @@ fn cmd_git(
         .filter_map(|(term, term_hits)| {
             let kept = term_hits
                 .into_iter()
-                .filter(|hit| !benign.contains(&git_occurrence_id(&repo_root, hit, &term)))
+                .filter(|hit| {
+                    !benign
+                        .ordinary
+                        .contains(&git_occurrence_id(&repo_root, hit, &term))
+                })
                 .collect::<Vec<_>>();
             (!kept.is_empty()).then_some((term, kept))
         })
         .collect::<BTreeMap<_, _>>();
     let remaining = hits.values().map(Vec::len).sum::<usize>();
-    let hidden = found - remaining;
+    let unsafe_found = unsafe_attribute_hits.len();
+    let unsafe_attribute_hits = unsafe_attribute_hits
+        .into_iter()
+        .filter(|hit| {
+            !benign
+                .justified
+                .contains(&unsafe_attribute_occurrence_id(&repo_root, hit))
+        })
+        .collect::<Vec<_>>();
+    let unsafe_remaining = unsafe_attribute_hits.len();
+    let hidden = (found - remaining) + (unsafe_found - unsafe_remaining);
 
     println!("channel  : {channel} ({} protected term(s))", terms.len());
+    if !lexical_checked {
+        println!("lexical  : NOT CHECKED — channel has no protected-term vocabulary");
+    }
     println!("range    : {range}");
-    println!("examined : {n_commits} commit message(s), {n_added} added line(s) across {n_commits} commit patch(es)\n");
+    println!("examined : {n_commits} commit message(s), {n_added} added and {n_removed} removed line(s) across {n_commits} commit patch(es)\n");
 
     if hidden > 0 {
         println!(
@@ -3837,9 +4336,7 @@ fn cmd_git(
              {BENIGN_DECISION_OUTCOME:?}."
         );
     }
-    if hits.is_empty() {
-        println!("no unresolved protected-term occurrence remains in this range.");
-    } else {
+    if !hits.is_empty() {
         let total: usize = hits.values().map(|v| v.len()).sum();
         println!("{total} hit(s) across {} term(s):\n", hits.len());
         for (term, term_hits) in &hits {
@@ -3852,23 +4349,53 @@ fn cmd_git(
                 println!("    … {} more", term_hits.len() - 4);
             }
         }
+    }
+    if !unsafe_attribute_hits.is_empty() {
+        println!(
+            "{} literal-pinned Rust attribute declaration change(s) require justification:\n",
+            unsafe_attribute_hits.len()
+        );
+        for hit in &unsafe_attribute_hits {
+            println!(
+                "    {}  {}",
+                fmt_id(unsafe_attribute_occurrence_id(&repo_root, hit)),
+                hit.display
+            );
+        }
+    }
+    if hits.is_empty() && unsafe_attribute_hits.is_empty() {
+        println!("no unresolved Posture occurrence remains in this range.");
+    } else {
         println!(
             "\nA finding stops blocking only after a Decide decision about its exact id resolves \
-             to outcome {BENIGN_DECISION_OUTCOME:?}."
+             to outcome {BENIGN_DECISION_OUTCOME:?}. An unsafe-attribute change additionally \
+             requires a nonempty `decide propose --context` justification."
         );
     }
 
     // Never a clean bill of health.
     println!("\nNOT CHECKED — this audit is narrow by construction:");
     println!("  - file contents outside this range's added lines");
-    println!("  - lines this range REMOVES, and anything already on the remote");
+    println!(
+        "  - removed-line protected terms (literal-pinned attribute declarations ARE checked)"
+    );
     println!("  - author names, emails and commit dates");
     println!("  - binary files, and anything a term does not literally spell");
     println!(
         "  - thematic material carrying no protected term (the 2026-07-22 leak was exactly this)"
     );
 
-    if !hits.is_empty() {
+    if !lexical_checked {
+        eprintln!(
+            "posture: refusing a clean result because channel {channel:?} has no \
+             protected-term vocabulary; the unsafe-attribute invariant was still checked."
+        );
+    }
+    if git_audit_must_fail(
+        lexical_checked,
+        hits.values().map(Vec::len).sum(),
+        unsafe_attribute_hits.len(),
+    ) {
         std::process::exit(1);
     }
     Ok(())
@@ -4455,14 +4982,9 @@ fn git_probe(repo_path: &Path, args: &[&str], absent_statuses: &[i32]) -> Result
 
 fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool) -> Result<()> {
     let terms = load_terms(storage, channel)?;
-    if terms.is_empty() {
-        bail!(
-            "channel {channel:?} has no protected terms — a sweep against an empty \
-            vocabulary would report every repository clean while checking nothing"
-        );
-    }
+    let lexical_checked = !terms.is_empty();
     let decisions = storage.decide_view()?;
-    let benign = benign_occurrences(&decisions.reader, &decisions.facts)?;
+    let benign = benign_occurrence_sets(&decisions.reader, &decisions.facts)?;
 
     let mut repos = Vec::new();
     for entry in
@@ -4484,6 +5006,9 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
         .unwrap_or(false);
 
     println!("channel  : {channel} ({} protected term(s))", terms.len());
+    if !lexical_checked {
+        println!("lexical  : NOT CHECKED — channel has no protected-term vocabulary");
+    }
     println!("root     : {}", root.display());
     println!("repos    : {}\n", repos.len());
     if !have_gh && !all {
@@ -4569,32 +5094,53 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
             continue;
         }
         let GitAudit {
-            repo_root, hits, ..
+            repo_root,
+            hits,
+            unsafe_attribute_hits,
+            ..
         } = collect_hits(repo, &range, &terms)?;
         let hits = hits
             .into_iter()
             .filter_map(|(term, term_hits)| {
                 let kept = term_hits
                     .into_iter()
-                    .filter(|hit| !benign.contains(&git_occurrence_id(&repo_root, hit, &term)))
+                    .filter(|hit| {
+                        !benign
+                            .ordinary
+                            .contains(&git_occurrence_id(&repo_root, hit, &term))
+                    })
                     .collect::<Vec<_>>();
                 (!kept.is_empty()).then_some((term, kept))
             })
             .collect::<BTreeMap<_, _>>();
-        let count: usize = hits.values().map(Vec::len).sum();
+        let unsafe_attribute_hits = unsafe_attribute_hits
+            .into_iter()
+            .filter(|hit| {
+                !benign
+                    .justified
+                    .contains(&unsafe_attribute_occurrence_id(&repo_root, hit))
+            })
+            .collect::<Vec<_>>();
+        let count: usize = hits.values().map(Vec::len).sum::<usize>() + unsafe_attribute_hits.len();
         if count > 0 {
             flagged += 1;
+            let classes = hits.len() + usize::from(!unsafe_attribute_hits.is_empty());
             println!(
-                "  {:<24} {:<28} {visibility:<8} ahead={ahead:<5} {count} hit(s) across {} term(s)",
+                "  {:<24} {:<28} {visibility:<8} ahead={ahead:<5} {count} finding(s) across {classes} class(es)",
                 repo.file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("?"),
                 slug,
-                hits.len()
             );
             println!("      (range {range})");
             for (term, lines) in &hits {
                 println!("      {term}  ({} hit(s))", lines.len());
+            }
+            if !unsafe_attribute_hits.is_empty() {
+                println!(
+                    "      unsafe-attribute-id  ({} finding(s))",
+                    unsafe_attribute_hits.len()
+                );
             }
         } else {
             println!(
@@ -4607,7 +5153,9 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
         }
     }
 
-    println!("\n{flagged} repositor(y/ies) carry protected material ahead of their remote.");
+    println!(
+        "\n{flagged} repositor(y/ies) carry unresolved Posture findings ahead of their remote."
+    );
     println!("\nNOT CHECKED:");
     println!("  - {skipped_private} repo(s) whose remote gh reports PRIVATE (re-run with --all)");
     println!("  - {no_remote} repo(s) with no origin remote");
@@ -4616,7 +5164,13 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
     println!("  - uncommitted work, which cannot be pushed but can be committed later");
     println!("  - everything posture git does not check (see its own coverage note)");
 
-    if flagged > 0 {
+    if !lexical_checked {
+        eprintln!(
+            "posture: sweep cannot issue a clean result because channel {channel:?} has no \
+             protected-term vocabulary; unsafe-attribute invariants were still checked."
+        );
+    }
+    if flagged > 0 || !lexical_checked {
         std::process::exit(1);
     }
     Ok(())
@@ -4772,6 +5326,51 @@ mod tests {
                 "-m",
                 "project-sunrise\nproject-sunrise",
             ],
+        );
+        directory
+    }
+
+    fn git_unsafe_attribute_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        git_fixture(directory.path(), &["init", "--quiet"]);
+        std::fs::write(
+            directory.path().join("schema.rs"),
+            concat!(
+                "attributes! {\n",
+                "    \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\" unsafe as legacy: ShortString;\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        git_fixture(directory.path(), &["add", "schema.rs"]);
+        git_fixture(
+            directory.path(),
+            &["commit", "--quiet", "-m", "legacy fixture"],
+        );
+
+        std::fs::write(
+            directory.path().join("schema.rs"),
+            concat!(
+                "attributes! {\n",
+                "    \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\" unsafe as legacy: ShortString;\n",
+                "    \"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" as safe: ShortString;\n",
+                "    \"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\" unsafe as pub migrated:\n",
+                "        ShortString;\n",
+                "    // \"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\" unsafe as prose: ShortString;\n",
+                "}\n",
+                "const EXPLANATION: &str = \"unsafe as is exceptional\";\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("notes.txt"),
+            "\"EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE\" unsafe as not_rust: ShortString;\n",
+        )
+        .unwrap();
+        git_fixture(directory.path(), &["add", "schema.rs", "notes.txt"]);
+        git_fixture(
+            directory.path(),
+            &["commit", "--quiet", "-m", "new declarations"],
         );
         directory
     }
@@ -5162,6 +5761,52 @@ mod tests {
     }
 
     #[test]
+    fn git_only_modality_preserves_historical_file_scan_coverage() {
+        let created_at = point_interval(Epoch::from_unix_seconds(1_500.0));
+        let (files, omissions) = sample_scan_inputs();
+        let (historical, historical_scan) = build_scan_fragment(
+            Path::new("historical-file-scan"),
+            &files,
+            &omissions,
+            created_at,
+            None,
+            IMPLEMENTED.iter().copied().collect(),
+        );
+        assert_eq!(
+            validate_scan_commit_fragment(historical.facts()).unwrap(),
+            historical_scan
+        );
+        assert!(!exists!(pattern!(historical.facts(), [{
+            (historical_scan) @ posture::unchecked: (&modality::UNSAFE_ATTRIBUTE_ID)
+        }])));
+
+        let files = [ScannedFile {
+            path: PathBuf::from("repository"),
+            outcome: FileOutcome::Examined,
+            findings: vec![f(
+                modality::UNSAFE_ATTRIBUTE_ID,
+                "rust-attribute-added src/schema.rs#1",
+                UNSAFE_ATTRIBUTE_FINDING,
+            )],
+        }];
+        let (git, git_scan) = build_scan_fragment(
+            Path::new("git:repository HEAD"),
+            &files,
+            &[],
+            point_interval(Epoch::from_unix_seconds(1_501.0)),
+            None,
+            BTreeSet::from([modality::PROTECTED_TERM, modality::UNSAFE_ATTRIBUTE_ID]),
+        );
+        assert_eq!(
+            validate_scan_commit_fragment(git.facts()).unwrap(),
+            git_scan
+        );
+        assert!(exists!(pattern!(git.facts(), [{
+            _?finding @ metadata::tag: (&KIND_FINDING), metadata::tag: (&modality::UNSAFE_ATTRIBUTE_ID)
+        }])));
+    }
+
+    #[test]
     fn scan_structure_rejects_incomplete_and_semantically_inconsistent_records() {
         let target = Path::new("fixture-corpus");
         let created_at = point_interval(Epoch::from_unix_seconds(2_345.0));
@@ -5179,7 +5824,7 @@ mod tests {
         assert!(validate_scan_commit_fragment(missing_coverage.facts())
             .unwrap_err()
             .to_string()
-            .contains("partition every known modality"));
+            .contains("partition every file-scan coverage modality"));
 
         let mut missing_document = Fragment::empty();
         let target_handle: TextHandle = missing_document.put(target.display().to_string());
@@ -5564,6 +6209,433 @@ mod tests {
             .map(|hit| git_occurrence_id(&from_absolute.repo_root, hit, "project-sunrise"))
             .collect::<Vec<_>>();
         assert_eq!(relative_ids, absolute_ids);
+    }
+
+    #[test]
+    fn git_unsafe_attribute_rule_checks_only_new_literal_pins_in_rust() {
+        let directory = git_unsafe_attribute_fixture();
+        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+
+        assert!(audit.hits.is_empty());
+        assert_eq!(audit.unsafe_attribute_hits.len(), 1);
+        let hit = &audit.unsafe_attribute_hits[0];
+        assert!(hit.locator.contains("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"));
+        assert!(hit.locator.contains("ShortString;"));
+        assert!(hit.locator.contains("schema.rs"));
+
+        let whole_history = collect_hits(directory.path(), "HEAD", &[]).unwrap();
+        assert_eq!(
+            whole_history.unsafe_attribute_hits.len(),
+            2,
+            "the old literal pin is visible only when its introducing commit is in range"
+        );
+    }
+
+    #[test]
+    fn git_unsafe_attribute_invariant_runs_but_a_missing_lexical_channel_fails_closed() {
+        let store = TestStore::new();
+        assert!(load_channel_terms(store.storage(), "undefined-channel")
+            .unwrap()
+            .is_none());
+
+        let directory = git_unsafe_attribute_fixture();
+        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        assert!(audit.hits.is_empty());
+        assert_eq!(audit.unsafe_attribute_hits.len(), 1);
+        assert!(git_audit_must_fail(
+            false,
+            0,
+            audit.unsafe_attribute_hits.len()
+        ));
+        assert!(
+            git_audit_must_fail(false, 0, 0),
+            "a quiet invariant scan must not disguise missing lexical coverage"
+        );
+    }
+
+    #[test]
+    fn unsafe_attribute_parser_accepts_token_tree_header_wrapping_and_comments() {
+        let declarations = unsafe_attribute_declarations(concat!(
+            "attributes! {\n",
+            "    \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
+            "    /* compatibility arm */ unsafe\n",
+            "    // macro keyword follows\n",
+            "    as legacy:\n",
+            "        inlineencodings::GenId;\n",
+            "}\n",
+        ));
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].start_line, 2);
+        assert_eq!(declarations[0].end_line, 6);
+        assert!(declarations[0].text.contains("inlineencodings::GenId;"));
+
+        let after_as_comment = unsafe_attribute_declarations(concat!(
+            "attributes! {\n",
+            "    \"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\" unsafe as value:\n",
+            "        /* preserved for compatibility; do not change */\n",
+            "        inlineencodings::GenId;\n",
+            "}\n",
+        ));
+        assert_eq!(after_as_comment.len(), 1);
+        assert!(after_as_comment[0]
+            .text
+            .contains("compatibility; do not change"));
+        assert!(after_as_comment[0].text.contains("inlineencodings::GenId;"));
+    }
+
+    #[test]
+    fn multiline_encoding_only_change_is_a_new_unsafe_attribute_occurrence() {
+        let directory = git_unsafe_attribute_fixture();
+        let before = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        assert_eq!(before.unsafe_attribute_hits.len(), 1);
+        let before_id =
+            unsafe_attribute_occurrence_id(&before.repo_root, &before.unsafe_attribute_hits[0]);
+
+        let path = directory.path().join("schema.rs");
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            source.replace("        ShortString;", "        inlineencodings::GenId;"),
+        )
+        .unwrap();
+        git_fixture(directory.path(), &["add", "schema.rs"]);
+        git_fixture(
+            directory.path(),
+            &["commit", "--quiet", "-m", "change pinned encoding"],
+        );
+
+        let after = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        assert_eq!(after.unsafe_attribute_hits.len(), 2);
+        let added = after
+            .unsafe_attribute_hits
+            .iter()
+            .find(|hit| hit.locator.starts_with("rust-attribute-added"))
+            .unwrap();
+        let removed = after
+            .unsafe_attribute_hits
+            .iter()
+            .find(|hit| hit.locator.starts_with("rust-attribute-removed"))
+            .unwrap();
+        assert!(added.locator.contains("inlineencodings::GenId;"));
+        assert!(removed.locator.contains("ShortString;"));
+        assert_ne!(
+            before_id,
+            unsafe_attribute_occurrence_id(&after.repo_root, added),
+            "the encoding is part of the exact compatibility claim"
+        );
+    }
+
+    #[test]
+    fn unsafe_attribute_removal_unpinning_and_renaming_are_reviewed() {
+        let unpinned = git_unsafe_attribute_fixture();
+        let path = unpinned.path().join("schema.rs");
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            source.replace("unsafe as pub migrated", "as pub migrated"),
+        )
+        .unwrap();
+        git_fixture(unpinned.path(), &["add", "schema.rs"]);
+        git_fixture(
+            unpinned.path(),
+            &["commit", "--quiet", "-m", "use safe attribute anchor"],
+        );
+        let audit = collect_hits(unpinned.path(), "HEAD^..HEAD", &[]).unwrap();
+        assert_eq!(audit.unsafe_attribute_hits.len(), 1);
+        assert!(audit.unsafe_attribute_hits[0]
+            .locator
+            .starts_with("rust-attribute-removed"));
+        assert!(audit.unsafe_attribute_hits[0]
+            .locator
+            .contains("pub migrated"));
+
+        let renamed = git_unsafe_attribute_fixture();
+        let path = renamed.path().join("schema.rs");
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, source.replace("pub migrated", "pub renamed")).unwrap();
+        git_fixture(renamed.path(), &["add", "schema.rs"]);
+        git_fixture(
+            renamed.path(),
+            &["commit", "--quiet", "-m", "rename pinned attribute"],
+        );
+        let audit = collect_hits(renamed.path(), "HEAD^..HEAD", &[]).unwrap();
+        assert_eq!(audit.unsafe_attribute_hits.len(), 2);
+        assert!(audit
+            .unsafe_attribute_hits
+            .iter()
+            .any(|hit| hit.locator.starts_with("rust-attribute-added")
+                && hit.locator.contains("pub renamed")));
+        assert!(audit
+            .unsafe_attribute_hits
+            .iter()
+            .any(|hit| hit.locator.starts_with("rust-attribute-removed")
+                && hit.locator.contains("pub migrated")));
+    }
+
+    #[test]
+    fn whitespace_only_unsafe_attribute_rewrite_reuses_justification() {
+        let directory = git_unsafe_attribute_fixture();
+        let path = directory.path().join("schema.rs");
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            source.replace(
+                "\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\" unsafe as pub migrated:\n        ShortString;",
+                "\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\" unsafe as pub migrated: ShortString;",
+            ),
+        )
+        .unwrap();
+        git_fixture(directory.path(), &["add", "schema.rs"]);
+        git_fixture(
+            directory.path(),
+            &["commit", "--quiet", "-m", "format schema"],
+        );
+        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        assert!(
+            audit.unsafe_attribute_hits.is_empty(),
+            "a source-only rewrite of the same path/name/encoding claim keeps its decision"
+        );
+    }
+
+    #[test]
+    fn merge_audits_removal_relative_only_to_non_first_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        git_fixture(directory.path(), &["init", "--quiet"]);
+        std::fs::write(directory.path().join("schema.rs"), "attributes! {}\n").unwrap();
+        git_fixture(directory.path(), &["add", "schema.rs"]);
+        git_fixture(directory.path(), &["commit", "--quiet", "-m", "base"]);
+        let main_branch = git_fixture(directory.path(), &["branch", "--show-current"]);
+
+        git_fixture(directory.path(), &["checkout", "--quiet", "-b", "side"]);
+        std::fs::write(
+            directory.path().join("schema.rs"),
+            concat!(
+                "attributes! {\n",
+                "    \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\" unsafe as side_pin: ShortString;\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        git_fixture(directory.path(), &["add", "schema.rs"]);
+        git_fixture(
+            directory.path(),
+            &["commit", "--quiet", "-m", "side adds pin"],
+        );
+
+        git_fixture(directory.path(), &["checkout", "--quiet", &main_branch]);
+        std::fs::write(directory.path().join("main.txt"), "main work\n").unwrap();
+        git_fixture(directory.path(), &["add", "main.txt"]);
+        git_fixture(directory.path(), &["commit", "--quiet", "-m", "main work"]);
+        git_fixture(
+            directory.path(),
+            &[
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "-s",
+                "ours",
+                "side",
+                "-m",
+                "merge without side pin",
+            ],
+        );
+
+        let merge = git_fixture(directory.path(), &["rev-parse", "HEAD"]);
+        let lineage = git_fixture(
+            directory.path(),
+            &["rev-list", "--parents", "-n", "1", &merge],
+        );
+        let parents = lineage.split_whitespace().skip(1).collect::<Vec<_>>();
+        assert_eq!(parents.len(), 2);
+        let mut unsafe_hits = Vec::new();
+        collect_parent_unsafe_hits(directory.path(), &merge, Some(parents[1]), &mut unsafe_hits)
+            .unwrap();
+        assert_eq!(unsafe_hits.len(), 1);
+        let hit = &unsafe_hits[0];
+        assert!(hit.locator.starts_with("rust-attribute-removed"));
+        assert!(hit.locator.contains("side_pin: ShortString;"));
+    }
+
+    #[test]
+    fn merge_deduplicates_one_new_claim_seen_against_both_parents() {
+        let directory = tempfile::tempdir().unwrap();
+        git_fixture(directory.path(), &["init", "--quiet"]);
+        std::fs::write(directory.path().join("schema.rs"), "attributes! {}\n").unwrap();
+        git_fixture(directory.path(), &["add", "schema.rs"]);
+        git_fixture(directory.path(), &["commit", "--quiet", "-m", "base"]);
+        let main_branch = git_fixture(directory.path(), &["branch", "--show-current"]);
+
+        git_fixture(directory.path(), &["checkout", "--quiet", "-b", "side"]);
+        std::fs::write(directory.path().join("side.txt"), "side\n").unwrap();
+        git_fixture(directory.path(), &["add", "side.txt"]);
+        git_fixture(directory.path(), &["commit", "--quiet", "-m", "side"]);
+        git_fixture(directory.path(), &["checkout", "--quiet", &main_branch]);
+        std::fs::write(directory.path().join("main.txt"), "main\n").unwrap();
+        git_fixture(directory.path(), &["add", "main.txt"]);
+        git_fixture(directory.path(), &["commit", "--quiet", "-m", "main"]);
+        git_fixture(
+            directory.path(),
+            &["merge", "--quiet", "--no-ff", "--no-commit", "side"],
+        );
+        std::fs::write(
+            directory.path().join("schema.rs"),
+            concat!(
+                "attributes! {\n",
+                "    \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\" unsafe as merge_pin: ShortString;\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        git_fixture(directory.path(), &["add", "schema.rs"]);
+        git_fixture(
+            directory.path(),
+            &["commit", "--quiet", "-m", "merge adds pin"],
+        );
+
+        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        assert_eq!(
+            audit.unsafe_attribute_hits.len(),
+            1,
+            "one semantic claim compared with two parents is one review occurrence"
+        );
+        assert!(audit.unsafe_attribute_hits[0]
+            .locator
+            .starts_with("rust-attribute-added"));
+    }
+
+    #[test]
+    fn unsafe_attribute_findings_have_exact_decide_occurrences() {
+        let directory = git_unsafe_attribute_fixture();
+        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        let hit = &audit.unsafe_attribute_hits[0];
+        let occurrence = unsafe_attribute_occurrence_id(&audit.repo_root, hit);
+
+        let rebased = GitHit {
+            locator: hit.locator.clone(),
+            display: "unsafe-attribute deadbeef:b/schema.rs:99  rewritten commit".to_owned(),
+        };
+        assert_eq!(
+            occurrence,
+            unsafe_attribute_occurrence_id(&audit.repo_root, &rebased),
+            "rewriting the introducing commit must not discard its declaration justification"
+        );
+
+        let changed = GitHit {
+            locator: hit.locator.replace("schema.rs", "other.rs"),
+            display: hit.display.clone(),
+        };
+        let changed_occurrence = unsafe_attribute_occurrence_id(&audit.repo_root, &changed);
+        assert_ne!(
+            occurrence, changed_occurrence,
+            "moving or changing the declaration is a new occurrence"
+        );
+
+        let store = TestStore::new();
+        let decision = genid().id;
+        let proposed = decide::decision_fragment(
+            decision,
+            "Justify this literal-pinned attribute identity",
+            Some("It preserves rows written under this already-published byte id".to_owned()),
+            Some(occurrence),
+            point_interval(Epoch::from_unix_seconds(6_000.0)),
+        )
+        .unwrap()
+        .0;
+        store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposed, "attribute justification");
+        let resolved = decide::resolution_fragment(
+            decision,
+            BENIGN_DECISION_OUTCOME,
+            true,
+            &[],
+            &[],
+            point_interval(Epoch::from_unix_seconds(6_001.0)),
+        )
+        .unwrap()
+        .0;
+        store.publish_raw(
+            DEFAULT_DECIDE_SCOPE_ID,
+            resolved,
+            "attribute classification",
+        );
+        let view = store.storage().decide_view().unwrap();
+        let benign = benign_occurrence_sets(&view.reader, &view.facts).unwrap();
+        assert!(benign.justified.contains(&occurrence));
+        assert!(!benign.justified.contains(&changed_occurrence));
+    }
+
+    #[test]
+    fn unsafe_attribute_clearance_requires_decide_proposal_context() {
+        let store = TestStore::new();
+        let occurrence = genid().id;
+
+        let decision = genid().id;
+        let proposal = decide::decision_fragment(
+            decision,
+            "Classify literal-pinned attribute",
+            None,
+            Some(occurrence),
+            point_interval(Epoch::from_unix_seconds(6_100.0)),
+        )
+        .unwrap()
+        .0;
+        store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposal, "unexplained proposal");
+        let resolution = decide::resolution_fragment(
+            decision,
+            BENIGN_DECISION_OUTCOME,
+            true,
+            &[],
+            &[],
+            point_interval(Epoch::from_unix_seconds(6_101.0)),
+        )
+        .unwrap()
+        .0;
+        store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, resolution, "unexplained benign");
+
+        let view = store.storage().decide_view().unwrap();
+        let benign = benign_occurrence_sets(&view.reader, &view.facts).unwrap();
+        assert!(benign.ordinary.contains(&occurrence));
+        assert!(!benign.justified.contains(&occurrence));
+        assert!(occurrence_is_hidden(
+            modality::PROTECTED_TERM,
+            occurrence,
+            &benign
+        ));
+        assert!(!occurrence_is_hidden(
+            modality::UNSAFE_ATTRIBUTE_ID,
+            occurrence,
+            &benign
+        ));
+        drop(view);
+
+        let explained = genid().id;
+        let proposal = decide::decision_fragment(
+            explained,
+            "Classify literal-pinned attribute",
+            Some("This exact byte id and encoding preserve already-published rows".to_owned()),
+            Some(occurrence),
+            point_interval(Epoch::from_unix_seconds(6_102.0)),
+        )
+        .unwrap()
+        .0;
+        store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposal, "explained proposal");
+        let resolution = decide::resolution_fragment(
+            explained,
+            BENIGN_DECISION_OUTCOME,
+            true,
+            &[],
+            &[],
+            point_interval(Epoch::from_unix_seconds(6_103.0)),
+        )
+        .unwrap()
+        .0;
+        store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, resolution, "explained benign");
+        let view = store.storage().decide_view().unwrap();
+        let benign = benign_occurrence_sets(&view.reader, &view.facts).unwrap();
+        assert!(occurrence_is_hidden(
+            modality::UNSAFE_ATTRIBUTE_ID,
+            occurrence,
+            &benign
+        ));
     }
 
     #[test]

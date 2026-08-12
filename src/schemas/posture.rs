@@ -101,6 +101,13 @@ pub mod modality {
     pub const AUDIO_TRANSCRIPT: Id = id_hex!("66775E7BA0A9CAD07111028E5AA1CB82");
     /// A protected term found in a git commit message, path, or added line.
     pub const PROTECTED_TERM: Id = id_hex!("433BEC19196D856273D739B023A1085E");
+    /// A Rust attribute declaration that pins an already-published byte id with
+    /// `unsafe as`. Safe anchored `as` declarations are the default; every new
+    /// literal-pinned declaration needs an occurrence-specific justification.
+    ///
+    /// Minted with `trible genid` on 2026-08-12:
+    /// `8EC83CD4107A1BDF9F3C5245AF9C4EE6`.
+    pub const UNSAFE_ATTRIBUTE_ID: Id = id_hex!("8EC83CD4107A1BDF9F3C5245AF9C4EE6");
     /// Term matching against a protected-entity vocabulary. Implemented, but by
     /// `posture git`, not by `posture scan` — so a file scan still declares it
     /// unchecked, which is accurate rather than pedantic: scanning a directory
@@ -112,10 +119,12 @@ pub mod modality {
     /// Image regions cropped in the viewer but still embedded in the file.
     pub const EMBEDDED_CROP: Id = id_hex!("E6117E71FB35A0A0D0E1CE2D695F468D");
 
-    /// Every modality this schema knows, implemented or not. A scan diffs its
-    /// applied set against this to derive what it must declare unchecked —
-    /// which means adding a modality here automatically makes every scan that
-    /// does not implement it admit the gap.
+    /// The immutable file-scan coverage universe. A file scan diffs its applied
+    /// set against this to derive what it must declare unchecked.
+    ///
+    /// This set is part of the meaning of already-published scan records: adding
+    /// a modality here would retroactively make every older coverage partition
+    /// incomplete. New command-specific modalities belong in a separate set.
     pub const ALL: &[(Id, &str)] = &[
         (OOXML_CORE_PROPS, "ooxml-core-props"),
         (OOXML_COMMENTS, "ooxml-comments"),
@@ -133,9 +142,20 @@ pub mod modality {
         (EMBEDDED_CROP, "embedded-crop"),
     ];
 
+    /// Modalities emitted and checked by `posture git` but not obligations in a
+    /// historical file scan's checked/unchecked coverage partition.
+    pub const GIT_ONLY: &[(Id, &str)] = &[(UNSAFE_ATTRIBUTE_ID, "unsafe-attribute-id")];
+
+    pub fn is_known(id: Id) -> bool {
+        ALL.iter()
+            .chain(GIT_ONLY)
+            .any(|(candidate, _)| *candidate == id)
+    }
+
     /// Human-readable name for a modality id.
     pub fn name(id: Id) -> &'static str {
         ALL.iter()
+            .chain(GIT_ONLY)
             .find(|(i, _)| *i == id)
             .map(|(_, n)| *n)
             .unwrap_or("unknown")
