@@ -16,7 +16,10 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
-use crate::schemas::orient::{checkpoint, KIND_CHECKPOINT_EVENT};
+use crate::schemas::compass::KIND_NOTE_ID;
+use crate::schemas::orient::{
+    checkpoint, observation, KIND_CHECKPOINT_EVENT, KIND_SEEN, KIND_SEEN_FRONTIER,
+};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
@@ -134,6 +137,58 @@ fn checkpoint_record(persona: Id, view: TextHandle, at: IntervalValue) -> Fragme
     }
 }
 
+fn seen_record(persona: Id, kind: Id, item: Id) -> Fragment {
+    entity! {
+        metadata::tag: &KIND_SEEN,
+        observation::persona: &persona,
+        observation::source_kind: &kind,
+        observation::source_item: &item,
+    }
+}
+
+fn seen_frontier_record(persona: Id, kind: Id) -> Fragment {
+    entity! {
+        metadata::tag: &KIND_SEEN_FRONTIER,
+        observation::persona: &persona,
+        observation::source_kind: &kind,
+    }
+}
+
+/// Build the grow-only atoms that initialize one person's seen-note frontier
+/// and prove every note identity observed in the same publication.
+pub fn seen_notes_fragment(persona: Id, notes: impl IntoIterator<Item = Id>) -> Fragment {
+    let mut fragment = seen_frontier_record(persona, KIND_NOTE_ID);
+    for note in notes {
+        fragment += seen_record(persona, KIND_NOTE_ID, note);
+    }
+    fragment
+}
+
+/// Every note observed by one exact persona anchor.
+pub fn seen_notes(facts: &TribleSet, persona: Id) -> BTreeSet<Id> {
+    find!(
+        item: Id,
+        pattern!(facts, [{
+            _?seen @
+            metadata::tag: &KIND_SEEN,
+            observation::persona: &persona,
+            observation::source_kind: &KIND_NOTE_ID,
+            observation::source_item: ?item,
+        }])
+    )
+    .collect()
+}
+
+/// Whether one exact persona anchor has initialized its Seen-note frontier.
+pub fn has_seen_notes_frontier(facts: &TribleSet, persona: Id) -> bool {
+    triblespace::macros::exists!(pattern!(facts, [{
+        _?frontier @
+        metadata::tag: &KIND_SEEN_FRONTIER,
+        observation::persona: &persona,
+        observation::source_kind: &KIND_NOTE_ID,
+    }]))
+}
+
 /// Build one intrinsic immutable checkpoint with its serialized view payload.
 pub fn checkpoint_fragment(
     persona: Id,
@@ -235,6 +290,70 @@ where
             at,
         });
     }
+    let seen_ids: BTreeSet<Id> = find!(
+        event: Id,
+        pattern!(facts, [{ ?event @ metadata::tag: &KIND_SEEN }])
+    )
+    .collect();
+    for event in seen_ids {
+        let persona = exactly_one(
+            event,
+            "observation::persona",
+            find!(persona: Id, pattern!(facts, [{ event @ observation::persona: ?persona }]))
+                .collect(),
+        )?;
+        let kind = exactly_one(
+            event,
+            "observation::source_kind",
+            find!(kind: Id, pattern!(facts, [{ event @ observation::source_kind: ?kind }]))
+                .collect(),
+        )?;
+        let item = exactly_one(
+            event,
+            "observation::source_item",
+            find!(item: Id, pattern!(facts, [{ event @ observation::source_item: ?item }]))
+                .collect(),
+        )?;
+        if kind != KIND_NOTE_ID {
+            bail!("Orient Seen event {event:x} has unsupported kind {kind:x}");
+        }
+        let record = seen_record(persona, kind, item);
+        let canonical = record.root().expect("canonical Seen atom has one root");
+        if event != canonical {
+            bail!(
+                "Orient Seen event {event:x} is not intrinsic; canonical identity is {canonical:x}"
+            );
+        }
+        expected += record.facts().clone();
+    }
+    let frontier_ids: BTreeSet<Id> = find!(
+        event: Id,
+        pattern!(facts, [{ ?event @ metadata::tag: &KIND_SEEN_FRONTIER }])
+    )
+    .collect();
+    for event in frontier_ids {
+        let persona = exactly_one(
+            event,
+            "observation::persona",
+            find!(persona: Id, pattern!(facts, [{ event @ observation::persona: ?persona }]))
+                .collect(),
+        )?;
+        let kind = exactly_one(
+            event,
+            "observation::source_kind",
+            find!(kind: Id, pattern!(facts, [{ event @ observation::source_kind: ?kind }]))
+                .collect(),
+        )?;
+        if kind != KIND_NOTE_ID {
+            bail!("Orient Seen frontier {event:x} has unsupported kind {kind:x}");
+        }
+        let record = seen_frontier_record(persona, kind);
+        let canonical = record.root().expect("canonical Seen frontier has one root");
+        if event != canonical {
+            bail!("Orient Seen frontier {event:x} is not intrinsic; canonical identity is {canonical:x}");
+        }
+        expected += record.facts().clone();
+    }
     if expected != *facts {
         bail!(
             "Orient checkpoint collection is not an exact canonical ontology ({} missing, {} unexpected facts)",
@@ -245,7 +364,10 @@ where
     Ok(events)
 }
 
-/// Latest checkpoint for one persona under a deterministic total order.
+/// Latest checkpoint for one exact persona anchor under a deterministic total
+/// order. Observation history deliberately does not follow mutable identity
+/// equivalence: an exact anchor's grow-only ledger must never shrink if a
+/// same-person verdict is later corrected.
 pub fn latest_checkpoint(
     events: impl IntoIterator<Item = CheckpointEvent>,
     persona: Id,
@@ -260,16 +382,41 @@ pub fn latest_checkpoint(
     Ok(latest.map(|(_, event)| event))
 }
 
-pub fn validate_catalog<Store>(reader: &Store, facts: &TribleSet) -> Result<()>
+pub fn validate_catalog<Store>(reader: &Store, facts: &TribleSet, compass: &TribleSet) -> Result<()>
 where
     Store: BlobStoreGet + ?Sized,
 {
-    load_checkpoint_events(reader, facts).map(|_| ())
+    load_checkpoint_events(reader, facts)?;
+    let notes: BTreeSet<Id> = find!(
+        note: Id,
+        pattern!(compass, [{
+            ?note @
+            metadata::tag: &KIND_NOTE_ID,
+            crate::schemas::compass::board::task: _?goal,
+            crate::schemas::compass::board::note: _?body,
+        }])
+    )
+    .collect();
+    for item in find!(
+        item: Id,
+        pattern!(facts, [{
+            _?event @
+            metadata::tag: &KIND_SEEN,
+            observation::source_kind: &KIND_NOTE_ID,
+            observation::source_item: ?item,
+        }])
+    ) {
+        if !notes.contains(&item) {
+            bail!("Orient Seen marker names missing Compass note {item:x}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compass;
     use hifitime::Epoch;
     use triblespace::core::repo::BlobStore;
 
@@ -348,5 +495,70 @@ mod tests {
                 right_view
             }
         );
+    }
+
+    fn validated_compass(persona: Id, note: Id) -> Fragment {
+        let goal = Id::new([5; 16]).unwrap();
+        let mut compass = compass::goal_fragment(goal, "goal", Vec::new(), None, at(1.0)).unwrap();
+        compass += compass::note_fragment(
+            note,
+            goal,
+            "note",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(persona),
+            at(2.0),
+        )
+        .unwrap();
+        compass
+    }
+
+    fn validate_fragments(orient: &Fragment, compass: &Fragment) -> Result<()> {
+        let mut blobs = orient.clone();
+        blobs.blobs_mut().union(compass.blobs().clone());
+        let reader = blobs.blobs_mut().reader().unwrap();
+        validate_catalog(&reader, orient.facts(), compass.facts())
+    }
+
+    #[test]
+    fn seen_atoms_and_frontier_are_intrinsic_and_deduplicate() {
+        let persona = Id::new([4; 16]).unwrap();
+        let note = Id::new([6; 16]).unwrap();
+        let once = seen_notes_fragment(persona, [note]);
+        let mut twice = once.clone();
+        twice += seen_notes_fragment(persona, [note, note]);
+        assert_eq!(once.facts(), twice.facts());
+        assert!(has_seen_notes_frontier(once.facts(), persona));
+        assert_eq!(seen_notes(once.facts(), persona), BTreeSet::from([note]));
+        let compass = validated_compass(persona, note);
+        validate_fragments(&once, &compass).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_missing_seen_note() {
+        let persona = Id::new([4; 16]).unwrap();
+        let note = Id::new([6; 16]).unwrap();
+        let missing = Id::new([7; 16]).unwrap();
+        let orient = seen_notes_fragment(persona, [missing]);
+        let compass = validated_compass(persona, note);
+        assert!(validate_fragments(&orient, &compass)
+            .unwrap_err()
+            .to_string()
+            .contains("missing Compass note"));
+    }
+
+    #[test]
+    fn validation_accepts_preprofile_seen_and_checkpoint_personas() {
+        let persona = Id::new([4; 16]).unwrap();
+        let preprofile = Id::new([7; 16]).unwrap();
+        let note = Id::new([6; 16]).unwrap();
+        let compass = validated_compass(persona, note);
+        let seen = seen_notes_fragment(preprofile, [note]);
+        validate_fragments(&seen, &compass).unwrap();
+
+        let (checkpoint, _) =
+            checkpoint_fragment(preprofile, &WatchedView::default(), at(3.0)).unwrap();
+        validate_fragments(&checkpoint, &compass).unwrap();
     }
 }

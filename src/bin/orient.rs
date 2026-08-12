@@ -140,6 +140,11 @@ enum Command {
         #[arg(long)]
         peek: bool,
     },
+    /// Establish an explicit seen-note frontier for an observer written by the
+    /// earlier checkpoint-only implementation. Run stopped-world: every note
+    /// in the coherent Compass snapshot is marked seen, while messages and
+    /// other pending news remain untouched.
+    MigrateNoteFrontier,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -281,7 +286,7 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
         .map_err(|error| anyhow!("validate Status collection: {error:#}"))?;
     let habits = habits::load_catalog(&reader, &habit_facts)
         .map_err(|error| anyhow!("validate Habit collection: {error:#}"))?;
-    orient_model::validate_catalog(&reader, &checkpoint_facts)
+    orient_model::validate_catalog(&reader, &checkpoint_facts, &compass_facts)
         .map_err(|error| anyhow!("validate Orient checkpoint collection: {error:#}"))?;
 
     Ok(NativeCatalogs {
@@ -324,19 +329,21 @@ fn render_native_messages(
         return Ok(out);
     };
 
-    let identities = relations::IdentityComponents::from_facts(&catalogs.relations)?;
-    let reads = message::load_read_rows(&catalogs.messages)?;
-    let mut rows = message::load_message_rows(&catalogs.messages)?;
-    rows.sort_by_key(|row| std::cmp::Reverse(interval_key(row.created_at)));
     let mut unread = Vec::new();
-    for row in rows {
-        if message::is_inbox_message(&row, persona, &catalogs.relations, &identities)?
-            && !message::is_read_by(&reads, row.id, persona, &identities)?
-        {
-            if unread.len() >= limit {
-                break;
+    if relations::person_anchors(&catalogs.relations).contains(&persona) {
+        let identities = relations::IdentityComponents::from_facts(&catalogs.relations)?;
+        let reads = message::load_read_rows(&catalogs.messages)?;
+        let mut rows = message::load_message_rows(&catalogs.messages)?;
+        rows.sort_by_key(|row| std::cmp::Reverse(interval_key(row.created_at)));
+        for row in rows {
+            if message::is_inbox_message(&row, persona, &catalogs.relations, &identities)?
+                && !message::is_read_by(&reads, row.id, persona, &identities)?
+            {
+                if unread.len() >= limit {
+                    break;
+                }
+                unread.push(row);
             }
-            unread.push(row);
         }
     }
 
@@ -385,6 +392,12 @@ struct MailSummary {
 /// the same wire through another source is idempotent when its presentation
 /// agrees; conflicting parser projections are not silently arbitrated.
 fn native_unread_mail(catalogs: &NativeCatalogs, persona: Id) -> Result<BTreeMap<Id, MailSummary>> {
+    // A raw exact anchor is a valid observer before its Relations profile
+    // arrives. Until then it has no identity component and therefore no
+    // Relations-dependent Mail inbox projection.
+    if !relations::person_anchors(&catalogs.relations).contains(&persona) {
+        return Ok(BTreeMap::new());
+    }
     let mut by_wire = BTreeMap::new();
     for row in mail_model::inbox_projection(&catalogs.mail, &catalogs.relations, persona)? {
         if !row.unread {
@@ -832,18 +845,48 @@ fn insert_note_goal(notes: &mut BTreeMap<Id, Id>, note_id: Id, goal_id: Id) {
         })
         .or_insert(goal_id);
 }
+
+fn all_note_ids(compass: &TribleSet) -> BTreeSet<Id> {
+    find!(
+        note_id: Id,
+        pattern!(compass, [{
+            ?note_id @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: _?goal_id,
+            board::note: _?body,
+        }])
+    )
+    .collect()
+}
+
+fn observed_notes(catalogs: &NativeCatalogs, persona: Id) -> Result<(BTreeSet<Id>, bool)> {
+    let initialized = orient_model::has_seen_notes_frontier(&catalogs.checkpoints, persona);
+    let mut observed = orient_model::seen_notes(&catalogs.checkpoints, persona);
+    if !initialized {
+        let events = orient_model::load_checkpoint_events(&catalogs.reader, &catalogs.checkpoints)?;
+        observed.extend(
+            events
+                .into_iter()
+                .filter(|event| event.persona == persona)
+                .flat_map(|event| event.view.notes.into_keys()),
+        );
+    }
+    Ok((observed, initialized))
+}
 fn load_watched_view(
     catalogs: &NativeCatalogs,
     persona_id: Id,
 ) -> Result<orient_model::WatchedView> {
-    let identities = relations::IdentityComponents::from_facts(&catalogs.relations)?;
-    let reads = message::load_read_rows(&catalogs.messages)?;
     let mut unread = BTreeSet::new();
-    for row in message::load_message_rows(&catalogs.messages)? {
-        if message::is_inbox_message(&row, persona_id, &catalogs.relations, &identities)?
-            && !message::is_read_by(&reads, row.id, persona_id, &identities)?
-        {
-            unread.insert(row.id);
+    if relations::person_anchors(&catalogs.relations).contains(&persona_id) {
+        let identities = relations::IdentityComponents::from_facts(&catalogs.relations)?;
+        let reads = message::load_read_rows(&catalogs.messages)?;
+        for row in message::load_message_rows(&catalogs.messages)? {
+            if message::is_inbox_message(&row, persona_id, &catalogs.relations, &identities)?
+                && !message::is_read_by(&reads, row.id, persona_id, &identities)?
+            {
+                unread.insert(row.id);
+            }
         }
     }
     let mail_unread = native_unread_mail(catalogs, persona_id)?
@@ -935,6 +978,7 @@ fn view_news(
     old: &orient_model::WatchedView,
     new: &orient_model::WatchedView,
     persona_id: Id,
+    observed_notes: &BTreeSet<Id>,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
     for msg in new.unread.difference(&old.unread) {
@@ -984,7 +1028,7 @@ fn view_news(
         }
     }
     for (note_id, goal_id) in &new.notes {
-        if !old.notes.contains_key(note_id) {
+        if !observed_notes.contains(note_id) {
             reasons.push(format!(
                 "new note [{}] on goal [{}]",
                 fmt_id(*note_id),
@@ -1008,9 +1052,11 @@ fn save_checkpoint(
     signer: &SigningKey,
     persona: Id,
     view: &orient_model::WatchedView,
+    newly_observed: impl IntoIterator<Item = Id>,
 ) -> Result<()> {
-    let (fragment, _) =
+    let (mut fragment, _) =
         orient_model::checkpoint_fragment(persona, view, epoch_interval(now_epoch()))?;
+    fragment += orient_model::seen_notes_fragment(persona, newly_observed);
     Collection::new(
         pile,
         faculties::schemas::orient::DEFAULT_SCOPE_ID,
@@ -1019,6 +1065,72 @@ fn save_checkpoint(
     .commit(fragment)
     .map_err(|error| anyhow!("commit Orient semantic checkpoint: {error}"))?;
     Ok(())
+}
+
+fn require_seen_frontier(
+    catalogs: &NativeCatalogs,
+    persona: Id,
+) -> Result<(BTreeSet<Id>, BTreeSet<Id>)> {
+    let universe = all_note_ids(&catalogs.compass);
+    let (observed, initialized) = observed_notes(catalogs, persona)?;
+    if !initialized {
+        bail!(
+            "Orient's note frontier is not initialized for this persona: {} current notes exist, {} occur in legacy checkpoints, and {} have no legacy observation record. Stop Compass writers, then run `orient --persona <persona> migrate-note-frontier` once to baseline one coherent current Compass snapshot",
+            universe.len(),
+            observed.len(),
+            universe.difference(&observed).count(),
+        );
+    }
+    Ok((universe, observed))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MigrationOutcome {
+    checkpoint: Id,
+    observed: usize,
+}
+
+fn migrate_note_frontier(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    catalogs: &NativeCatalogs,
+    persona: Id,
+) -> Result<MigrationOutcome> {
+    let (legacy_observed, initialized) = observed_notes(catalogs, persona)?;
+    if initialized {
+        bail!("note frontier is already initialized for {persona:x}");
+    }
+    let universe = all_note_ids(&catalogs.compass);
+    let stale: Vec<_> = legacy_observed.difference(&universe).copied().collect();
+    if !stale.is_empty() {
+        bail!(
+            "legacy Orient checkpoint for {persona:x} references {} missing Compass note(s), beginning with {}",
+            stale.len(),
+            fmt_id(stale[0]),
+        );
+    }
+    let events = orient_model::load_checkpoint_events(&catalogs.reader, &catalogs.checkpoints)?;
+    let checkpoint = orient_model::latest_checkpoint(events, persona)?.ok_or_else(|| {
+        anyhow!("cannot migrate note frontier for {persona:x}: no checkpoint exists")
+    })?;
+    // `created_at` is authored event time, not publication order: a delayed or
+    // backdated note may enter the pile after this checkpoint. A stopped-world
+    // migration therefore baselines the one coherent current Compass snapshot
+    // rather than pretending timestamps prove historical observation. Notes
+    // appended after this commit are absent from Seen and wake normally.
+    let selected = universe;
+    let fragment = orient_model::seen_notes_fragment(persona, selected.iter().copied());
+    Collection::new(
+        pile,
+        faculties::schemas::orient::DEFAULT_SCOPE_ID,
+        signer.clone(),
+    )
+    .commit(fragment)
+    .map_err(|error| anyhow!("commit Orient note-frontier migration: {error}"))?;
+    Ok(MigrationOutcome {
+        checkpoint: checkpoint.event,
+        observed: selected.len(),
+    })
 }
 
 fn cmd_show(
@@ -1048,8 +1160,26 @@ fn cmd_show(
         let window_status = render_window_status(&catalogs)?;
         if let Some(persona_id) = persona_id {
             let view = load_watched_view(&catalogs, persona_id)?;
-            if latest_checkpoint_view(&catalogs, persona_id)?.as_ref() != Some(&view) {
-                save_checkpoint(&mut pile, &signer, persona_id, &view)?;
+            match latest_checkpoint_view(&catalogs, persona_id)? {
+                None => save_checkpoint(
+                    &mut pile,
+                    &signer,
+                    persona_id,
+                    &view,
+                    all_note_ids(&catalogs.compass),
+                )?,
+                Some(checkpoint) => {
+                    let (universe, observed) = require_seen_frontier(&catalogs, persona_id)?;
+                    if checkpoint != view || universe != observed {
+                        save_checkpoint(
+                            &mut pile,
+                            &signer,
+                            persona_id,
+                            &view,
+                            universe.difference(&observed).copied(),
+                        )?;
+                    }
+                }
             }
         }
         Ok((messages, mail, goals, window_status))
@@ -1260,10 +1390,17 @@ fn check_news_once(
     let Some(seen) = latest_checkpoint_view(catalogs, persona_id)? else {
         return Ok(NewsCheck::NoCheckpoint(view));
     };
-    let reasons = view_news(&seen, &view, persona_id);
+    let (universe, observed) = require_seen_frontier(catalogs, persona_id)?;
+    let reasons = view_news(&seen, &view, persona_id, &observed);
     if reasons.is_empty() {
-        if !peek && view != seen {
-            save_checkpoint(pile, signer, persona_id, &view)?;
+        if !peek && (view != seen || universe != observed) {
+            save_checkpoint(
+                pile,
+                signer,
+                persona_id,
+                &view,
+                universe.difference(&observed).copied(),
+            )?;
         }
         return Ok(NewsCheck::Quiet);
     }
@@ -1277,7 +1414,13 @@ fn check_news_once(
     // Peek mode skips the save: report without consuming, for hooks that
     // can't tell whose turn they fire on (root vs subagent).
     if !peek {
-        save_checkpoint(pile, signer, persona_id, &view)?;
+        save_checkpoint(
+            pile,
+            signer,
+            persona_id,
+            &view,
+            universe.difference(&observed).copied(),
+        )?;
     }
     Ok(NewsCheck::Fired)
 }
@@ -1320,10 +1463,41 @@ fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: b
             // root persona's checkpoint).
             NewsCheck::NoCheckpoint(view) => {
                 if !peek {
-                    save_checkpoint(&mut pile, &signer, persona_id, &view)?;
+                    save_checkpoint(
+                        &mut pile,
+                        &signer,
+                        persona_id,
+                        &view,
+                        all_note_ids(&catalogs.compass),
+                    )?;
                 }
             }
         }
+        Ok(())
+    })();
+    close_pile(pile, result)
+}
+
+fn cmd_migrate_note_frontier(
+    pile_path: &Path,
+    key: Option<&Path>,
+    persona: Option<&str>,
+) -> Result<()> {
+    let Some(input) = persona else {
+        bail!("migrate-note-frontier requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
+    };
+    let signer = load_signer(pile_path, key)?;
+    let mut pile = open_pile_strict(pile_path)?;
+    let result = (|| {
+        let catalogs = load_native_catalogs(&mut pile, &signer)?;
+        let persona_id = resolve_native_persona(&catalogs, input)?;
+        let outcome = migrate_note_frontier(&mut pile, &signer, &catalogs, persona_id)?;
+        println!(
+            "Initialized note frontier for {} from legacy checkpoint {}: {} notes in the coherent Compass snapshot marked observed",
+            input,
+            fmt_id(outcome.checkpoint),
+            outcome.observed,
+        );
         Ok(())
     })();
     close_pile(pile, result)
@@ -1366,7 +1540,13 @@ fn cmd_wait(
             NewsCheck::Fired => return Ok((true, true)),
             NewsCheck::Quiet => {}
             NewsCheck::NoCheckpoint(view) => {
-                save_checkpoint(&mut pile, &signer, persona_id, &view)?;
+                save_checkpoint(
+                    &mut pile,
+                    &signer,
+                    persona_id,
+                    &view,
+                    all_note_ids(&catalogs.compass),
+                )?;
             }
         }
 
@@ -1415,7 +1595,13 @@ fn cmd_wait(
                         // This can only happen if an external rewrite removed
                         // the append-only checkpoint collection. Retain total
                         // behavior without inventing a partial baseline.
-                        save_checkpoint(&mut pile, &signer, persona_id, &view)?;
+                        save_checkpoint(
+                            &mut pile,
+                            &signer,
+                            persona_id,
+                            &view,
+                            all_note_ids(&catalogs.compass),
+                        )?;
                         false
                     }
                 }
@@ -1590,6 +1776,9 @@ fn main() -> Result<()> {
         Command::Poll { peek } => {
             cmd_poll(&cli.pile, cli.key.as_deref(), cli.persona.as_deref(), peek)
         }
+        Command::MigrateNoteFrontier => {
+            cmd_migrate_note_frontier(&cli.pile, cli.key.as_deref(), cli.persona.as_deref())
+        }
     }
 }
 
@@ -1658,7 +1847,12 @@ mod tests {
     fn addressed_new_goal_wakes() {
         let me = ufoid().id;
         let goal = ufoid().id;
-        let news = view_news(&view(""), &view(format!("{goal:x}:todo::a")), me);
+        let news = view_news(
+            &view(""),
+            &view(format!("{goal:x}:todo::a")),
+            me,
+            &BTreeSet::new(),
+        );
         assert_eq!(news, [format!("new goal [{goal:x}] (todo)")]);
     }
 
@@ -1666,7 +1860,13 @@ mod tests {
     fn unaddressed_new_goal_is_quiet() {
         let me = ufoid().id;
         let goal = ufoid().id;
-        assert!(view_news(&view(""), &view(format!("{goal:x}:todo::")), me).is_empty());
+        assert!(view_news(
+            &view(""),
+            &view(format!("{goal:x}:todo::")),
+            me,
+            &BTreeSet::new()
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1675,7 +1875,7 @@ mod tests {
         let goal = ufoid().id;
         let old = view(format!("{goal:x}:todo:{me:x}:ia"));
         let new = view(format!("{goal:x}:doing:{me:x}:ia"));
-        assert!(view_news(&old, &new, me).is_empty());
+        assert!(view_news(&old, &new, me, &BTreeSet::new()).is_empty());
     }
 
     #[test]
@@ -1686,7 +1886,7 @@ mod tests {
         let old = view(format!("{goal:x}:todo:{peer:x}:a"));
         let new = view(format!("{goal:x}:doing:{peer:x}:a"));
         assert_eq!(
-            view_news(&old, &new, me),
+            view_news(&old, &new, me, &BTreeSet::new()),
             [format!("goal [{goal:x}]: todo → doing")]
         );
     }
@@ -1700,7 +1900,7 @@ mod tests {
         let mut new = view("");
         new.unread.insert(message);
         new.roster.insert(person);
-        let news = view_news(&old, &new, me);
+        let news = view_news(&old, &new, me, &BTreeSet::new());
         assert_eq!(
             news,
             [
@@ -1718,10 +1918,10 @@ mod tests {
         let mut unread = old.clone();
         unread.mail_unread.insert(wire);
         assert_eq!(
-            view_news(&old, &unread, me),
+            view_news(&old, &unread, me, &BTreeSet::new()),
             [format!("new mail [{wire:x}]")]
         );
-        assert!(view_news(&unread, &old, me).is_empty());
+        assert!(view_news(&unread, &old, me, &BTreeSet::new()).is_empty());
     }
 
     #[test]
@@ -1733,7 +1933,7 @@ mod tests {
         let mut new = view("");
         new.notes.insert(note, goal);
         assert_eq!(
-            view_news(&old, &new, me),
+            view_news(&old, &new, me, &BTreeSet::new()),
             [format!("new note [{note:x}] on goal [{goal:x}]")]
         );
     }
@@ -1755,7 +1955,7 @@ mod tests {
 
         let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
         let baseline = load_watched_view(&catalogs, persona).unwrap();
-        save_checkpoint(&mut pile, &signer, persona, &baseline).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
 
         // A second authored leaf has distinct metadata/history but contributes
         // exactly the same Relations set value.
@@ -1772,6 +1972,342 @@ mod tests {
         ));
         let after = fs::metadata(&fixture.path).unwrap().len();
         assert_eq!(before, after, "equal semantic views must not checkpoint");
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn seen_frontier_blocks_relevance_replay_but_wakes_for_a_later_note() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let persona = ufoid().id;
+        let peer = ufoid().id;
+        let goal = ufoid().id;
+        let old_note = ufoid().id;
+        let own_note = ufoid().id;
+        let new_note = ufoid().id;
+        let mut relations_fragment = relations::person_fragment(persona, profile("persona"))
+            .unwrap()
+            .0;
+        relations_fragment += relations::person_fragment(peer, profile("peer")).unwrap().0;
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+
+        let mut history = compass::goal_fragment(
+            goal,
+            "unrelated history",
+            Vec::new(),
+            None,
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+        )
+        .unwrap();
+        history += compass::note_fragment(
+            old_note,
+            goal,
+            "old invisible note",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(peer),
+            epoch_interval(Epoch::from_unix_seconds(2.0)),
+        )
+        .unwrap();
+        commit_scope(&mut pile, &signer, COMPASS_SCOPE_ID, history);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        assert!(!baseline.notes.contains_key(&old_note));
+        save_checkpoint(&mut pile, &signer, persona, &baseline, [old_note]).unwrap();
+
+        let participation = compass::note_fragment(
+            own_note,
+            goal,
+            "joining",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(persona),
+            epoch_interval(Epoch::from_unix_seconds(3.0)),
+        )
+        .unwrap();
+        commit_scope(&mut pile, &signer, COMPASS_SCOPE_ID, participation);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+
+        let response = compass::note_fragment(
+            new_note,
+            goal,
+            "new response",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(peer),
+            epoch_interval(Epoch::from_unix_seconds(4.0)),
+        )
+        .unwrap();
+        commit_scope(&mut pile, &signer, COMPASS_SCOPE_ID, response);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let current = load_watched_view(&catalogs, persona).unwrap();
+        let (_, observed) = require_seen_frontier(&catalogs, persona).unwrap();
+        assert_eq!(
+            view_news(&baseline, &current, persona, &observed),
+            [format!("new note [{new_note:x}] on goal [{goal:x}]")]
+        );
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Fired
+        ));
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn old_checkpoint_requires_explicit_note_baseline() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let persona = ufoid().id;
+        let (relations_fragment, _, _) =
+            relations::person_fragment(persona, profile("persona")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        let (legacy_checkpoint, _) = orient_model::checkpoint_fragment(
+            persona,
+            &baseline,
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+        )
+        .unwrap();
+        commit_scope(
+            &mut pile,
+            &signer,
+            faculties::schemas::orient::DEFAULT_SCOPE_ID,
+            legacy_checkpoint,
+        );
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let error = match check_news_once(&mut pile, &signer, &catalogs, persona, false) {
+            Err(error) => error,
+            Ok(_) => panic!("legacy checkpoint must require explicit note baseline"),
+        };
+        assert!(error.to_string().contains("migrate-note-frontier"));
+
+        let frontier = orient_model::seen_notes_fragment(persona, std::iter::empty());
+        commit_scope(
+            &mut pile,
+            &signer,
+            faculties::schemas::orient::DEFAULT_SCOPE_ID,
+            frontier,
+        );
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn frontier_migration_rejects_stale_checkpoint_notes_without_appending() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let persona = ufoid().id;
+        let missing_note = ufoid().id;
+        let missing_goal = ufoid().id;
+        let (relations_fragment, _, _) =
+            relations::person_fragment(persona, profile("persona")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+
+        let mut stale_view = view("");
+        stale_view.notes.insert(missing_note, missing_goal);
+        let (checkpoint, _) = orient_model::checkpoint_fragment(
+            persona,
+            &stale_view,
+            epoch_interval(Epoch::from_unix_seconds(10.0)),
+        )
+        .unwrap();
+        commit_scope(
+            &mut pile,
+            &signer,
+            faculties::schemas::orient::DEFAULT_SCOPE_ID,
+            checkpoint,
+        );
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        let error = migrate_note_frontier(&mut pile, &signer, &catalogs, persona).unwrap_err();
+        let after = fs::metadata(&fixture.path).unwrap().len();
+        assert!(format!("{error:#}").contains("references 1 missing Compass note"));
+        assert_eq!(before, after, "a rejected migration must append nothing");
+        assert!(!observed_notes(&catalogs, persona).unwrap().1);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn first_persona_baseline_is_silent_and_initializes_frontier() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let persona = ufoid().id;
+        let (relations_fragment, _, _) =
+            relations::person_fragment(persona, profile("persona")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let view = match check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap() {
+            NewsCheck::NoCheckpoint(view) => view,
+            _ => panic!("first persona must have no checkpoint"),
+        };
+        save_checkpoint(
+            &mut pile,
+            &signer,
+            persona,
+            &view,
+            all_note_ids(&catalogs.compass),
+        )
+        .unwrap();
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        assert!(require_seen_frontier(&catalogs, persona)
+            .unwrap()
+            .1
+            .is_empty());
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn raw_persona_first_poll_survives_reload_without_a_relations_profile() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let persona = ufoid().id;
+        let input = format!("{persona:x}");
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let resolved = resolve_native_persona(&catalogs, &input).unwrap();
+        assert_eq!(resolved, persona);
+        let baseline =
+            match check_news_once(&mut pile, &signer, &catalogs, resolved, false).unwrap() {
+                NewsCheck::NoCheckpoint(view) => view,
+                _ => panic!("an undeclared raw persona must begin without a checkpoint"),
+            };
+        save_checkpoint(
+            &mut pile,
+            &signer,
+            resolved,
+            &baseline,
+            all_note_ids(&catalogs.compass),
+        )
+        .unwrap();
+
+        // Reloading all catalogs performs the same validation as the next
+        // command invocation. The exact raw anchor remains valid even though
+        // no Relations profile has arrived yet.
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        assert!(relations::person_anchors(&catalogs.relations).is_empty());
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, resolved, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn frontier_migration_baselines_the_snapshot_but_preserves_pending_messages() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let persona = ufoid().id;
+        let sender = ufoid().id;
+        let goal = ufoid().id;
+        let existing_note = ufoid().id;
+        let later_note = ufoid().id;
+        let mut relations_fragment = relations::person_fragment(persona, profile("persona"))
+            .unwrap()
+            .0;
+        relations_fragment += relations::person_fragment(sender, profile("sender"))
+            .unwrap()
+            .0;
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let baseline = view("");
+        let (checkpoint, _) = orient_model::checkpoint_fragment(
+            persona,
+            &baseline,
+            epoch_interval(Epoch::from_unix_seconds(10.0)),
+        )
+        .unwrap();
+        commit_scope(
+            &mut pile,
+            &signer,
+            faculties::schemas::orient::DEFAULT_SCOPE_ID,
+            checkpoint,
+        );
+        let mut notes = compass::goal_fragment(
+            goal,
+            "goal",
+            vec!["persona".to_owned()],
+            None,
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+        )
+        .unwrap();
+        notes += compass::note_fragment(
+            existing_note,
+            goal,
+            "existing note",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(sender),
+            epoch_interval(Epoch::from_unix_seconds(99.0)),
+        )
+        .unwrap();
+        commit_scope(&mut pile, &signer, COMPASS_SCOPE_ID, notes);
+        let (message_fragment, message_id) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(persona),
+            "pending",
+            epoch_interval(Epoch::from_unix_seconds(13.0)),
+        );
+        commit_scope(&mut pile, &signer, MESSAGE_SCOPE_ID, message_fragment);
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let outcome = migrate_note_frontier(&mut pile, &signer, &catalogs, persona).unwrap();
+        assert_eq!(outcome.observed, 1);
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let (_, observed) = require_seen_frontier(&catalogs, persona).unwrap();
+        assert!(observed.contains(&existing_note));
+        let current = load_watched_view(&catalogs, persona).unwrap();
+        let news = view_news(&baseline, &current, persona, &observed);
+        assert!(news.contains(&format!("new message [{message_id:x}]")));
+        // Publication order—not authored time—defines what was in the
+        // migration snapshot. A deliberately backdated note appended now must
+        // remain unseen and therefore wake.
+        let later = compass::note_fragment(
+            later_note,
+            goal,
+            "later backdated note",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(sender),
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+        )
+        .unwrap();
+        commit_scope(&mut pile, &signer, COMPASS_SCOPE_ID, later);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let (_, observed) = require_seen_frontier(&catalogs, persona).unwrap();
+        assert!(!observed.contains(&later_note));
+        let current = load_watched_view(&catalogs, persona).unwrap();
+        let news = view_news(&baseline, &current, persona, &observed);
+        assert!(news.contains(&format!("new note [{later_note:x}] on goal [{goal:x}]")));
         pile.close().unwrap();
     }
 
@@ -1813,7 +2349,7 @@ mod tests {
         let mut new = view("");
         new.roster.insert(me);
 
-        assert!(view_news(&old, &new, me).is_empty());
+        assert!(view_news(&old, &new, me, &BTreeSet::new()).is_empty());
     }
 
     #[test]
@@ -1944,7 +2480,7 @@ mod tests {
         commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
         let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
         let baseline = load_watched_view(&catalogs, persona).unwrap();
-        save_checkpoint(&mut pile, &signer, persona, &baseline).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
 
         let (message_fragment, message_id) = message::message_fragment(
             sender,
@@ -1956,7 +2492,7 @@ mod tests {
         let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
         let current = load_watched_view(&catalogs, persona).unwrap();
         assert_eq!(
-            view_news(&baseline, &current, persona),
+            view_news(&baseline, &current, persona, &BTreeSet::new()),
             [format!("new message [{message_id:x}]")]
         );
         assert!(matches!(
@@ -1977,7 +2513,7 @@ mod tests {
         commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
         let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
         let baseline = load_watched_view(&catalogs, persona).unwrap();
-        save_checkpoint(&mut pile, &signer, persona, &baseline).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
 
         let account = ufoid().id;
         let (account_fragment, config) = mail_model::account_config_fragment(
@@ -2004,7 +2540,7 @@ mod tests {
         let incoming = load_watched_view(&catalogs, persona).unwrap();
         assert_eq!(incoming.mail_unread, BTreeSet::from([wire]));
         assert_eq!(
-            view_news(&baseline, &incoming, persona),
+            view_news(&baseline, &incoming, persona, &BTreeSet::new()),
             [format!("new mail [{wire:x}]")]
         );
         let rendered = render_native_mail(&catalogs, Some(persona), 10).unwrap();
@@ -2051,7 +2587,7 @@ mod tests {
         let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
         let read = load_watched_view(&catalogs, persona).unwrap();
         assert!(read.mail_unread.is_empty());
-        assert!(view_news(&incoming, &read, persona).is_empty());
+        assert!(view_news(&incoming, &read, persona, &BTreeSet::new()).is_empty());
         let rendered = render_native_mail(&catalogs, Some(persona), 10).unwrap();
         assert!(rendered.contains("- None"));
         pile.close().unwrap();
