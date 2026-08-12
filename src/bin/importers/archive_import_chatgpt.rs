@@ -417,6 +417,7 @@ fn collect_conversation_files(path: &Path, out: &mut Vec<std::path::PathBuf>) ->
 
 fn index_export_files(root: &Path) -> Result<HashMap<String, PathBuf>> {
     let mut files = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).with_context(|| format!("read dir {}", dir.display()))? {
@@ -434,10 +435,25 @@ fn index_export_files(root: &Path) -> Result<HashMap<String, PathBuf>> {
                 continue;
             };
             let Some(file_id) = chatgpt_file_id_from_filename(name) else {
+                // FAIL LOUDLY: a filename that looks like an asset but does not
+                // key is exactly how 15,738 sediment files were silently lost
+                // before 2026-07-26. Anything else is genuinely not an asset.
+                if name.starts_with("file-") || name.starts_with("file_") {
+                    skipped.push(name.to_string());
+                }
                 continue;
             };
             files.push((file_id, entry_path));
         }
+    }
+
+    if !skipped.is_empty() {
+        eprintln!(
+            "chatgpt WARN: {} asset-shaped file(s) in the export could not be keyed and were NOT indexed \
+             (e.g. {}). If these are real attachments, extend chatgpt_file_id_from_filename.",
+            skipped.len(),
+            skipped.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+        );
     }
 
     files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -449,21 +465,30 @@ fn index_export_files(root: &Path) -> Result<HashMap<String, PathBuf>> {
 }
 
 fn chatgpt_file_id_from_filename(filename: &str) -> Option<String> {
-    // ChatGPT exports commonly store attachments as:
-    // - file-<id>-image.png
-    // - file-<id>-Screenshot ... .png
-    // - file-<id>-<uuid>.jpeg
-    // We key by the "file-<id>" prefix.
-    if !filename.starts_with("file-") {
-        return None;
+    // Two on-disk naming conventions, matching the two pointer schemes in
+    // `file_id_from_asset_pointer` — and the derived key MUST agree with it:
+    //   file-service (dash):  file-<id>-image.png / file-<id>-<uuid>.jpeg
+    //                         -> key "file-<id>"  (first two dash segments)
+    //   sediment (underscore): file_<id>.dat / file_<id>.wav / file_<id>.mp4
+    //                         -> key "file_<id>"  (stem, before the extension)
+    if let Some(rest) = filename.strip_prefix("file_") {
+        // sediment: the whole stem is the id; strip only the extension.
+        let id = rest.split('.').next().unwrap_or(rest);
+        if id.is_empty() {
+            return None;
+        }
+        return Some(format!("file_{id}"));
     }
-    let mut it = filename.splitn(3, '-');
-    let first = it.next()?;
-    let second = it.next()?;
-    if first != "file" || second.is_empty() {
-        return None;
+    if filename.starts_with("file-") {
+        let mut it = filename.splitn(3, '-');
+        let first = it.next()?;
+        let second = it.next()?;
+        if first != "file" || second.is_empty() {
+            return None;
+        }
+        return Some(format!("{first}-{second}"));
     }
-    Some(format!("{first}-{second}"))
+    None
 }
 
 fn message_content_type(message: &serde_json::Map<String, JsonValue>) -> Option<&str> {
@@ -522,15 +547,19 @@ fn has_message_attachments(message: &serde_json::Map<String, JsonValue>) -> bool
 }
 
 fn file_id_from_asset_pointer(pointer: &str) -> Option<&str> {
-    // Typical pointer: "file-service://file-<id>"
-    let prefix = "file-service://";
-    if pointer.starts_with(prefix) {
-        let rest = &pointer[prefix.len()..];
-        if rest.starts_with("file-") {
-            return Some(rest);
-        }
+    // Pointers name their storage backend by scheme, then the file id:
+    //   "file-service://file-<id>"   — original backend, dash-named
+    //   "sediment://file_<id>"       — newer backend (voice audio, DALLE,
+    //                                   image-gen-in-chat), UNDERSCORE-named
+    // We key on the file id (the part after the scheme), whichever backend it
+    // came from. Until 2026-07-26 this only matched file-service, so EVERY
+    // sediment asset — all voice audio and newer images — was silently dropped.
+    let rest = pointer.split_once("://").map(|(_, r)| r)?;
+    if rest.starts_with("file-") || rest.starts_with("file_") {
+        Some(rest)
+    } else {
+        None
     }
-    None
 }
 
 fn collect_attachments(message: &serde_json::Map<String, JsonValue>) -> Vec<AttachmentFields> {

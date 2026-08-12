@@ -1,116 +1,46 @@
-//! secrets — an encrypted secret-store faculty (a 1Password replacement, owned,
-//! pile-native). Admins distribute company secrets by sealing them to
-//! recipients' keys; the pile gives storage, sync, and a signed audit trail for
-//! free; authorization is signed relationship-tuples queried with the engine.
-//! Design captured in the `authz`-tagged wiki (hub 4448d5fc).
+//! `secrets` — collection-native encrypted secret storage.
 //!
-//! This binary is a thin clap wrapper over the `faculties-secrets` crate: each `cmd_*`
-//! parses args, resolves ids/names, calls the library, and prints. All of the
-//! capability + envelope-encryption logic — schema, crypto, the effective-admin
-//! fixpoint, and the seal/open paths — lives in `faculties_secrets` so other
-//! faculties can reuse it without the mary/GORBIE/egui stack.
-//!
-//! The envelope (KEM-DEM): a fresh data key (DEK) encrypts a secret body once
-//! via secretbox; the DEK is sealed-boxed to each recipient's X25519 key (the
-//! key is *derived* from their Ed25519 identity key). Removal = rotate. The
-//! current recipient set is enumerated from the grant tuples with the query
-//! engine — never stored, "work as its own ledger".
-//!
-//! Status: `identity init/list`, `scope create/list`, `grant` (issuer-required),
-//! `revoke`, `secret add/get/list/share`. Scopes are content-derived and rooted
-//! at their creator (`scope_id = Blake3(creator_pk, name)`); a grant is
-//! *effective* only if its issuer chains, through admin-grants, back to that
-//! root (the `effective_admins` fixpoint). Strong/transitive removal therefore
-//! falls out for free — retracting an admin drops everything that depended on
-//! it. Transitive group membership is a materialized regular-path relation over
-//! *effective* grants.
-//! Secrets are `(scope, name)` addressed, latest-wins (`secret add` of an
-//! existing name is a new version, sealed to the *current* recipients).
-//!
-//! Removal is *operational, not cryptographic*: a removed user keeps the wrap
-//! (= the value) they already held — the append-only pile cannot delete it, and
-//! re-encrypting the same value protects nothing. So `secret rotate` is not a
-//! crypto op; it is an *advisory* that lists every credential still readable by
-//! a removed user, so you can change it at its source and `secret add` the new
-//! value (which seals only to current recipients). The two-admin harness (in
-//! `faculties-secrets`) shows the effective-admin fixpoint over the merged union
-//! already defeats the duelling-admin / backdating / headless-group attacks (the
-//! verdict is order-independent), so no epoch-finality layer is needed.
+//! Every mutation publishes one independently signed fragment into the stable
+//! Secrets union collection. The rooted grant fixpoint, OR-set grant identity,
+//! strict record validation, crypto envelopes, and attachment validation live
+//! in [`faculties::secrets`]; this binary owns only command workflow and I/O.
 
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashSet};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-
-use dryoc::dryocbox::{DryocBox, KeyPair as BoxKeyPair};
-use dryoc::dryocsecretbox::{DryocSecretBox, Key, Nonce};
-use dryoc::types::*;
-
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::secrets::schema::DEFAULT_SCOPE_ID;
+use faculties::secrets::{
+    self as secrets_model, entity_name, grant_fragment, open_version, prepare_identity, read_text,
+    resolve_identity, resolve_principal, resolve_scope, retraction_fragment,
+    scope_by_creator_and_name, scope_fragment, seal_version, share_version, validate_candidate,
+    SecretsCatalog,
+};
+use faculties::secrets_cutover;
+use hifitime::Epoch;
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Workspace;
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::Handle;
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
-use faculties_secrets::schema::{KIND_IDENTITY, KIND_SCOPE};
-use faculties_secrets::{fmt_id, MemberRole, SecretsRepo, DEFAULT_BRANCH};
-
-type TextHandle = Inline<Handle<LongString>>;
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h)
-        .ok()
-        .map(|v| v.to_string())
-}
-
-/// Resolve an entity id of a given KIND, accepting a full hex or a prefix.
-fn resolve_kind_id(space: &TribleSet, kind: Id, input: &str) -> Result<Id> {
-    let candidates = find!(e: Id, pattern!(space, [{ ?e @ metadata::tag: kind }]));
-    faculties::resolve_id_prefix(input, candidates)
-}
-
-/// Resolve an entity of `kind` from an id (full hex or prefix) or, failing
-/// that, its name (`metadata::name` — a scope's name, an identity's nickname).
-/// Name resolution requires the name to be unambiguous.
-fn resolve_named(ws: &mut Workspace<Pile>, space: &TribleSet, kind: Id, input: &str) -> Result<Id> {
-    if let Ok(id) = resolve_kind_id(space, kind, input) {
-        return Ok(id);
-    }
-    let named: Vec<Id> = find!(
-        (e: Id, n: TextHandle),
-        pattern!(space, [{ ?e @ metadata::tag: kind, metadata::name: ?n }])
-    )
-    .filter(|(_, n)| read_text(ws, *n).as_deref() == Some(input))
-    .map(|(e, _)| e)
-    .collect();
-    match named.as_slice() {
-        [one] => Ok(*one),
-        [] => anyhow::bail!("no match for '{input}' (by id or name)"),
-        many => anyhow::bail!(
-            "name '{input}' is ambiguous ({} matches — use the id)",
-            many.len()
-        ),
-    }
-}
-
-fn password() -> Result<Vec<u8>> {
-    std::env::var("FACULTIES_SECRETS_PW")
-        .map(|s| s.into_bytes())
-        .map_err(|_| anyhow::anyhow!("set FACULTIES_SECRETS_PW to the identity password"))
-}
-
-// ── commands ──────────────────────────────────────────────────────────────────
-
 #[derive(Parser)]
-#[command(version = faculties::GIT_VERSION, name = "secrets", about = "Encrypted secret store (pile-native 1Password replacement)")]
+#[command(
+    version = faculties::GIT_VERSION,
+    name = "secrets",
+    about = "Encrypted secret store (collection-native 1Password replacement)"
+)]
 struct Cli {
-    /// Pile path (defaults to $PILE).
+    /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name.
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
+    /// Existing durable collection signing-key file. Reads and writes never
+    /// create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -124,27 +54,26 @@ enum Command {
         #[command(subcommand)]
         cmd: IdentityCmd,
     },
-    /// Scope management. A scope is content-derived from its creator+name;
-    /// the creator is its implicit root admin.
+    /// Scope management. A scope is intrinsic in creator+name; its creator is
+    /// the implicit root admin.
     Scope {
         #[command(subcommand)]
         cmd: ScopeCmd,
     },
-    /// Grant a relation: (object, relation, subject), issued by an admin.
-    /// The issuer (--as) must be an effective admin of the object; for a
-    /// fresh scope that means its creator.
+    /// Add one independent relation grant, issued by an effective admin.
     Grant {
         #[arg(long)]
         object: String,
         #[arg(long, default_value = "member")]
         relation: String,
+        /// Identity or nested scope receiving the grant.
         #[arg(long)]
         subject: String,
         #[arg(long)]
         r#as: String,
     },
-    /// Revoke a subject's grants on a scope (sets the retraction cursor).
-    /// Non-concurrent only; rotate affected secrets to exclude the subject.
+    /// Monotonically retract every currently live grant for a subject on a
+    /// scope. Rotate affected source credentials afterwards.
     Revoke {
         #[arg(long)]
         object: String,
@@ -156,11 +85,13 @@ enum Command {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
+    /// Migrate the stopped legacy `secrets` Repository branch additively.
+    MigrateLegacy,
 }
 
 #[derive(Subcommand)]
 enum IdentityCmd {
-    /// Create an identity (Ed25519 key, password-locked private key in the pile).
+    /// Create an identity (Ed25519 key, password-locked private key).
     Init {
         #[arg(long)]
         nickname: String,
@@ -171,16 +102,16 @@ enum IdentityCmd {
 
 #[derive(Subcommand)]
 enum ScopeCmd {
-    /// Create a scope rooted at an identity (the creator becomes root admin).
+    /// Create the intrinsic `(creator, name)` scope.
     Create {
         #[arg(long)]
         name: String,
         #[arg(long)]
         r#as: String,
     },
-    /// List scopes (with root-derivation check).
+    /// List rooted scopes.
     List,
-    /// Show who can currently access a scope (the audit view).
+    /// Show effective recipients of a scope.
     Members {
         #[arg(long)]
         scope: String,
@@ -189,17 +120,16 @@ enum ScopeCmd {
 
 #[derive(Subcommand)]
 enum SecretCmd {
-    /// Add a secret to a scope, sealed to every live recipient.
+    /// Add an immutable version, sealed to every current recipient.
     Add {
         #[arg(long)]
         scope: String,
         #[arg(long)]
         name: String,
-        /// The secret value (or @file / @- for stdin).
+        /// Literal value, @file, or @- for stdin.
         value: String,
     },
-    /// Get the latest version of a named secret, as a given identity
-    /// (needs FACULTIES_SECRETS_PW).
+    /// Decrypt the latest unambiguous version as one identity.
     Get {
         #[arg(long)]
         scope: String,
@@ -208,17 +138,13 @@ enum SecretCmd {
         #[arg(long)]
         r#as: String,
     },
-    /// Show which secrets are still readable by a removed user — the operational
-    /// rotate worklist. Re-encrypting a stored value protects nothing (the
-    /// removed user keeps their old wrap = the value), so the real fix is to
-    /// change the credential at its source and `secret add` the new value. Bare
-    /// `secret rotate` scans everything; `--scope` narrows it.
+    /// List credentials whose current version is still wrapped to a removed
+    /// user. This is an operational rotation worklist, not re-encryption.
     Rotate {
         #[arg(long)]
         scope: Option<String>,
     },
-    /// Re-wrap a named secret's DEK to recipients added after it was created.
-    /// Run as an existing recipient (needs FACULTIES_SECRETS_PW to unlock the DEK).
+    /// Add wraps for recipients who joined after a version was created.
     Share {
         #[arg(long)]
         scope: String,
@@ -227,19 +153,128 @@ enum SecretCmd {
         #[arg(long)]
         r#as: String,
     },
-    /// List secrets (grouped by scope+name, newest version).
+    /// List credentials grouped by `(scope, name)`.
     List,
+}
+
+#[derive(Clone, Copy)]
+struct SecretsStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+}
+
+struct CollectionView {
+    facts: TribleSet,
+    reader: PileReader,
+}
+
+struct LoadedSecrets {
+    view: CollectionView,
+    catalog: SecretsCatalog,
+}
+
+impl SecretsStorage<'_> {
+    fn materialized_facts(&self) -> Result<TribleSet> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let result = collection
+            .materialize()
+            .context("materialize raw Secrets collection");
+        finish_pile(collection.into_storage(), result)
+    }
+
+    fn with_collection<T>(
+        &self,
+        operation: impl FnOnce(&mut Collection<Pile>, &LoadedSecrets) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let result = (|| {
+            let facts = collection
+                .materialize()
+                .context("materialize Secrets collection")?;
+            let reader = collection
+                .storage_mut()
+                .reader()
+                .context("open Secrets attachment reader")?;
+            let catalog = secrets_model::validate_catalog(&reader, &facts)
+                .context("validate Secrets collection")?;
+            operation(
+                &mut collection,
+                &LoadedSecrets {
+                    view: CollectionView { facts, reader },
+                    catalog,
+                },
+            )
+        })();
+        finish_pile(collection.into_storage(), result)
+    }
+
+    fn with_view<T>(&self, operation: impl FnOnce(&LoadedSecrets) -> Result<T>) -> Result<T> {
+        self.with_collection(|_, loaded| operation(loaded))
+    }
+
+    fn update<T>(
+        &self,
+        description: &'static str,
+        operation: impl FnOnce(&LoadedSecrets) -> Result<(Option<Fragment>, T)>,
+    ) -> Result<T> {
+        self.with_collection(|collection, loaded| {
+            let (fragment, value) = operation(loaded)?;
+            let Some(mut fragment) = fragment else {
+                return Ok(value);
+            };
+            validate_candidate(&loaded.view.reader, &loaded.view.facts, &fragment)
+                .context("validate Secrets mutation")?;
+            fragment.describe_with(entity! { metadata::description: description });
+            collection
+                .commit(fragment)
+                .context("commit Secrets fragment")?;
+            Ok(value)
+        })
+    }
+}
+
+fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context("close Secrets pile")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing Secrets pile also failed: {close_error}")))
+        }
+    }
+}
+
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
+}
+
+fn now_epoch() -> Result<Epoch> {
+    Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))
+}
+
+fn point_interval(at: Epoch) -> secrets_model::IntervalValue {
+    (at, at)
+        .try_to_inline()
+        .expect("a clock point is a valid interval")
+}
+
+fn password() -> Result<Vec<u8>> {
+    faculties::secrets::password::read("the identity password")
 }
 
 fn load_value(raw: &str) -> Result<Vec<u8>> {
     if let Some(rest) = raw.strip_prefix('@') {
         if rest == "-" {
-            use std::io::Read;
-            let mut buf = Vec::new();
+            let mut value = Vec::new();
             std::io::stdin()
-                .read_to_end(&mut buf)
-                .context("read stdin")?;
-            Ok(buf)
+                .read_to_end(&mut value)
+                .context("read secret value from stdin")?;
+            Ok(value)
         } else {
             std::fs::read(rest).with_context(|| format!("read {rest}"))
         }
@@ -248,278 +283,427 @@ fn load_value(raw: &str) -> Result<Vec<u8>> {
     }
 }
 
-fn cmd_selftest() -> Result<()> {
-    let alice = BoxKeyPair::gen_with_defaults();
-    let bob = BoxKeyPair::gen_with_defaults();
-    let secret = b"the prod database password is hunter2";
-    let dek = Key::gen();
-    let nonce = Nonce::gen();
-    let body = DryocSecretBox::encrypt_to_vecbox(secret, &nonce, &dek).to_vec();
-    let wrap_a = DryocBox::seal_to_vecbox(&dek, &alice.public_key)?.to_vec();
+// ── commands ───────────────────────────────────────────────────────────────
 
-    let dek_bytes = DryocBox::from_sealed_bytes(&wrap_a)
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?
-        .unseal_to_vec(&alice)
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let dek2 = Key::try_from(&dek_bytes[..]).unwrap();
-    let opened = DryocSecretBox::from_bytes(&body)
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?
-        .decrypt_to_vec(&nonce, &dek2)
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    assert_eq!(opened.as_slice(), secret);
-    assert!(
-        DryocBox::from_sealed_bytes(&wrap_a)
-            .unwrap()
-            .unseal_to_vec(&bob)
-            .is_err(),
-        "cross-open must fail"
-    );
+fn cmd_selftest() -> Result<()> {
+    secrets_model::envelope_selftest()?;
     println!("✓ envelope round-trip: alice opened, bob refused");
     Ok(())
 }
 
-fn cmd_identity_init(repo: &SecretsRepo, nickname: String) -> Result<()> {
-    let pw = password()?;
-    let out = repo.identity_init(&pw, &nickname)?;
-    println!("identity {} ({})", fmt_id(out.id), out.nickname);
-    println!("  sign_pk {}", hex(&out.sign_pk));
+fn cmd_identity_init(storage: SecretsStorage<'_>, nickname: String) -> Result<()> {
+    let password = password()?;
+    let (identity, public_key) = storage.update("secrets: identity init", |_| {
+        let prepared = prepare_identity(&nickname, &password, point_interval(now_epoch()?))?;
+        Ok((Some(prepared.fragment), (prepared.id, prepared.public_key)))
+    })?;
+    println!("identity {} ({nickname})", fmt_id(identity));
+    println!("  sign_pk {}", hex(&public_key));
     Ok(())
 }
 
-fn cmd_identity_list(repo: &SecretsRepo) -> Result<()> {
-    let rows = repo.identity_list()?;
-    if rows.is_empty() {
-        println!("(no identities)");
-    }
-    for r in rows {
-        println!("{}  {}", fmt_id(r.id), r.nickname);
-    }
-    Ok(())
+fn cmd_identity_list(storage: SecretsStorage<'_>) -> Result<()> {
+    storage.with_view(|loaded| {
+        if loaded.catalog.identities.is_empty() {
+            println!("(no identities)");
+            return Ok(());
+        }
+        for row in loaded.catalog.identities.values() {
+            println!(
+                "{}  {}",
+                fmt_id(row.id),
+                read_text(&loaded.view.reader, row.name)?
+            );
+        }
+        Ok(())
+    })
 }
 
-fn cmd_scope_create(repo: &SecretsRepo, name: String, as_id: String) -> Result<()> {
-    let creator = repo.read(|ws, space| resolve_named(ws, space, KIND_IDENTITY, &as_id))?;
-    let out = repo.scope_create(&name, creator)?;
-    println!(
-        "scope {} ({})  root admin: {}",
-        fmt_id(out.id),
-        out.name,
-        fmt_id(out.creator)
-    );
-    Ok(())
-}
-
-fn cmd_scope_list(repo: &SecretsRepo) -> Result<()> {
-    let rows = repo.scope_list()?;
-    if rows.is_empty() {
-        println!("(no scopes)");
-    }
-    for s in rows {
-        let mark = if s.rooted {
-            "✓ rooted"
-        } else {
-            "✗ MISMATCH"
-        };
+fn cmd_scope_create(storage: SecretsStorage<'_>, name: String, as_identity: String) -> Result<()> {
+    let (scope, creator, existed) = storage.update("secrets: scope create", |loaded| {
+        let creator = resolve_identity(&loaded.view.reader, &loaded.catalog, &as_identity)?;
+        if let Some(scope) =
+            scope_by_creator_and_name(&loaded.view.reader, &loaded.catalog, creator, &name)?
+        {
+            return Ok((None, (scope, creator, true)));
+        }
+        let fragment = scope_fragment(creator, &name, point_interval(now_epoch()?))?;
+        let scope = fragment.root().expect("scope fragment has one root");
+        Ok((Some(fragment), (scope, creator, false)))
+    })?;
+    if existed {
         println!(
-            "{}  {}  root {}  [{}]",
-            fmt_id(s.id),
-            s.name,
-            fmt_id(s.creator),
-            mark
+            "scope {} ({name}) already exists; root admin {}",
+            fmt_id(scope),
+            fmt_id(creator)
         );
-    }
-    Ok(())
-}
-
-fn cmd_scope_members(repo: &SecretsRepo, scope: String) -> Result<()> {
-    let members = repo.read(|ws, space| {
-        let scope_id = resolve_named(ws, space, KIND_SCOPE, &scope)?;
-        repo.scope_members(space, ws, scope_id)
-    })?;
-    if members.is_empty() {
-        println!("(no members)");
-    }
-    for m in members {
-        let role = match m.role {
-            MemberRole::RootAdmin => "root admin",
-            MemberRole::Admin => "admin",
-            MemberRole::Member => "member",
-        };
-        println!("{}  {}  [{}]", m.name, fmt_id(m.id), role);
-    }
-    Ok(())
-}
-
-fn cmd_grant(
-    repo: &SecretsRepo,
-    object: String,
-    relation: String,
-    subject: String,
-    as_id: String,
-) -> Result<()> {
-    let (object_id, subject_id, issuer_id) = repo.read(|ws, space| {
-        let object_id = resolve_named(ws, space, KIND_SCOPE, &object)?;
-        let subject_id = resolve_named(ws, space, KIND_IDENTITY, &subject)?;
-        let issuer_id = resolve_named(ws, space, KIND_IDENTITY, &as_id)?;
-        Ok((object_id, subject_id, issuer_id))
-    })?;
-    let out = repo.grant(object_id, &relation, subject_id, issuer_id)?;
-    println!(
-        "grant {}  {} --{}--> {}  (by {})",
-        fmt_id(out.grant_id),
-        fmt_id(out.object),
-        out.relation,
-        fmt_id(out.subject),
-        fmt_id(out.issuer)
-    );
-    Ok(())
-}
-
-fn cmd_revoke(repo: &SecretsRepo, object: String, subject: String) -> Result<()> {
-    let (object_id, subject_id) = repo.read(|ws, space| {
-        let object_id = resolve_named(ws, space, KIND_SCOPE, &object)?;
-        let subject_id = resolve_named(ws, space, KIND_IDENTITY, &subject)?;
-        Ok((object_id, subject_id))
-    })?;
-    let n = repo.revoke(object_id, subject_id)?;
-    println!(
-        "revoked {} grant(s) for {} on {}",
-        n,
-        fmt_id(subject_id),
-        fmt_id(object_id)
-    );
-    Ok(())
-}
-
-fn cmd_secret_add(repo: &SecretsRepo, scope: String, name: String, value: String) -> Result<()> {
-    let plaintext = load_value(&value)?;
-    let scope_id = repo.read(|ws, space| resolve_named(ws, space, KIND_SCOPE, &scope))?;
-    let out = repo.secret_add(scope_id, &name, &plaintext)?;
-    println!(
-        "secret {} ({}) sealed to {} recipient(s)",
-        fmt_id(out.secret_id),
-        out.name,
-        out.recipients
-    );
-    Ok(())
-}
-
-fn cmd_secret_rotate(repo: &SecretsRepo, scope: Option<String>) -> Result<()> {
-    let filter = match scope {
-        Some(s) => Some(repo.read(|ws, space| resolve_named(ws, space, KIND_SCOPE, &s))?),
-        None => None,
-    };
-    let findings = repo.rotate_worklist(filter)?;
-    if findings.is_empty() {
-        println!("✓ no secrets are exposed to removed users — nothing to rotate");
         return Ok(());
     }
     println!(
-        "{} secret(s) still readable by a removed user. Re-encrypting them here\n\
-         would change nothing (they keep their old wrap = the value). Change each\n\
-         credential at its source, then `secret add` the new value:\n",
-        findings.len()
+        "scope {} ({name})  root admin: {}",
+        fmt_id(scope),
+        fmt_id(creator)
     );
-    // Resolve exposed-identity names for display.
-    let named = repo.read(|ws, space| {
-        Ok(findings
-            .iter()
-            .map(|f| {
-                f.exposed
-                    .iter()
-                    .map(|e| faculties_secrets::entity_name(ws, space, *e))
-                    .collect::<Vec<_>>()
+    Ok(())
+}
+
+fn cmd_scope_list(storage: SecretsStorage<'_>) -> Result<()> {
+    storage.with_view(|loaded| {
+        if loaded.catalog.scopes.is_empty() {
+            println!("(no scopes)");
+            return Ok(());
+        }
+        for row in loaded.catalog.scopes.values() {
+            let name = read_text(&loaded.view.reader, row.name)?;
+            println!(
+                "{}  {}  root {}  [✓ intrinsic]",
+                fmt_id(row.id),
+                name,
+                fmt_id(row.creator)
+            );
+        }
+        Ok(())
+    })
+}
+
+fn cmd_scope_members(storage: SecretsStorage<'_>, scope: String) -> Result<()> {
+    storage.with_view(|loaded| {
+        let scope = resolve_scope(&loaded.view.reader, &loaded.catalog, &scope)?;
+        let creator = loaded.catalog.scope_creator(scope);
+        let admins = loaded.catalog.effective_admins(scope);
+        let recipients = loaded.catalog.recipients_of(scope);
+        if recipients.is_empty() {
+            println!("(no members)");
+            return Ok(());
+        }
+        for recipient in recipients {
+            let name = entity_name(&loaded.view.reader, &loaded.catalog, recipient)?;
+            let role = if creator == Some(recipient) {
+                "root admin"
+            } else if admins.contains(&recipient) {
+                "admin"
+            } else {
+                "member"
+            };
+            println!("{}  {}  [{role}]", name, fmt_id(recipient));
+        }
+        Ok(())
+    })
+}
+
+fn cmd_grant(
+    storage: SecretsStorage<'_>,
+    object: String,
+    relation: String,
+    subject: String,
+    as_identity: String,
+) -> Result<()> {
+    let grant = genid().id;
+    let (object, subject, issuer) = storage.update("secrets: grant", |loaded| {
+        let object = resolve_scope(&loaded.view.reader, &loaded.catalog, &object)?;
+        let subject = resolve_principal(&loaded.view.reader, &loaded.catalog, &subject)?;
+        let issuer = resolve_identity(&loaded.view.reader, &loaded.catalog, &as_identity)?;
+        if !loaded.catalog.effective_admins(object).contains(&issuer) {
+            bail!(
+                "{} is not an effective admin of {}; only an admin can grant",
+                fmt_id(issuer),
+                fmt_id(object)
+            );
+        }
+        let fragment = grant_fragment(
+            grant,
+            object,
+            &relation,
+            subject,
+            issuer,
+            point_interval(now_epoch()?),
+        )?;
+        Ok((Some(fragment), (object, subject, issuer)))
+    })?;
+    println!(
+        "grant {}  {} --{}--> {}  (by {})",
+        fmt_id(grant),
+        fmt_id(object),
+        relation,
+        fmt_id(subject),
+        fmt_id(issuer)
+    );
+    Ok(())
+}
+
+fn cmd_revoke(storage: SecretsStorage<'_>, object: String, subject: String) -> Result<()> {
+    let (object, subject, count) = storage.update("secrets: revoke", |loaded| {
+        let object = resolve_scope(&loaded.view.reader, &loaded.catalog, &object)?;
+        let subject = resolve_principal(&loaded.view.reader, &loaded.catalog, &subject)?;
+        let grants: BTreeSet<Id> = loaded
+            .catalog
+            .grants
+            .values()
+            .filter(|grant| {
+                grant.object == object && grant.subject == subject && grant.retracted_at.is_empty()
             })
-            .collect::<Vec<_>>())
+            .map(|grant| grant.id)
+            .collect();
+        if grants.is_empty() {
+            bail!(
+                "no live grant for {} on {}",
+                fmt_id(subject),
+                fmt_id(object)
+            );
+        }
+        let count = grants.len();
+        let fragment = retraction_fragment(grants, point_interval(now_epoch()?))?;
+        Ok((Some(fragment), (object, subject, count)))
     })?;
-    for (f, who) in findings.iter().zip(named) {
+    println!(
+        "revoked {count} grant(s) for {} on {}",
+        fmt_id(subject),
+        fmt_id(object)
+    );
+    Ok(())
+}
+
+fn cmd_secret_add(
+    storage: SecretsStorage<'_>,
+    scope: String,
+    name: String,
+    value: String,
+) -> Result<()> {
+    let plaintext = load_value(&value)?;
+    let (secret, recipient_count) = storage.update("secrets: secret add", |loaded| {
+        let scope = resolve_scope(&loaded.view.reader, &loaded.catalog, &scope)?;
+        let sealed = seal_version(
+            &loaded.view.reader,
+            &loaded.catalog,
+            scope,
+            &name,
+            &plaintext,
+            point_interval(now_epoch()?),
+        )?;
+        Ok((
+            Some(sealed.fragment),
+            (sealed.secret, sealed.recipient_count),
+        ))
+    })?;
+    println!(
+        "secret {} ({name}) sealed to {} recipient(s)",
+        fmt_id(secret),
+        recipient_count
+    );
+    Ok(())
+}
+
+fn cmd_secret_get(
+    storage: SecretsStorage<'_>,
+    scope: String,
+    name: String,
+    as_identity: String,
+) -> Result<()> {
+    let password = password()?;
+    let plaintext = storage.with_view(|loaded| {
+        let scope = resolve_scope(&loaded.view.reader, &loaded.catalog, &scope)?;
+        let secret = loaded
+            .catalog
+            .latest_secret(scope, &name)?
+            .ok_or_else(|| anyhow!("no secret named '{name}' in that scope"))?;
+        let identity = resolve_identity(&loaded.view.reader, &loaded.catalog, &as_identity)?;
+        open_version(
+            &loaded.view.reader,
+            &loaded.catalog,
+            secret,
+            identity,
+            &password,
+        )
+    })?;
+    std::io::stdout().write_all(&plaintext)?;
+    Ok(())
+}
+
+fn cmd_secret_rotate(storage: SecretsStorage<'_>, scope: Option<String>) -> Result<()> {
+    storage.with_view(|loaded| {
+        let scope_filter = scope
+            .as_deref()
+            .map(|value| resolve_scope(&loaded.view.reader, &loaded.catalog, value))
+            .transpose()?;
+        let credentials: BTreeSet<(Id, String)> = loaded
+            .catalog
+            .secrets
+            .values()
+            .filter(|row| scope_filter.is_none_or(|scope| row.scope == scope))
+            .map(|row| (row.scope, row.name.clone()))
+            .collect();
+
+        let mut findings = Vec::new();
+        for (scope, name) in credentials {
+            let Some(latest) = loaded.catalog.latest_secret(scope, &name)? else {
+                continue;
+            };
+            let current: HashSet<Id> = loaded.catalog.recipients_of(scope).into_iter().collect();
+            let exposed: Vec<Id> = loaded
+                .catalog
+                .wrap_holders(latest)
+                .into_iter()
+                .filter(|holder| !current.contains(holder))
+                .collect();
+            if !exposed.is_empty() {
+                findings.push((scope, name, exposed));
+            }
+        }
+        if findings.is_empty() {
+            println!("✓ no secrets are exposed to removed users — nothing to rotate");
+            return Ok(());
+        }
         println!(
-            "  {}/{}  →  exposed to: {}",
-            f.scope_name,
-            f.name,
-            who.join(", ")
+            "{} secret(s) remain readable by a removed user. Change each credential\n\
+             at its source, then add the new value as another version:\n",
+            findings.len()
         );
-    }
-    Ok(())
+        for (scope, name, exposed) in findings {
+            let scope_name = entity_name(&loaded.view.reader, &loaded.catalog, scope)?;
+            let exposed = exposed
+                .into_iter()
+                .map(|id| entity_name(&loaded.view.reader, &loaded.catalog, id))
+                .collect::<Result<Vec<_>>>()?;
+            println!(
+                "  {scope_name}/{name}  →  exposed to: {}",
+                exposed.join(", ")
+            );
+        }
+        Ok(())
+    })
 }
 
-fn cmd_secret_get(repo: &SecretsRepo, scope: String, name: String, as_id: String) -> Result<()> {
-    let pw = password()?;
-    let (scope_id, me) = repo.read(|ws, space| {
-        let scope_id = resolve_named(ws, space, KIND_SCOPE, &scope)?;
-        let me = resolve_named(ws, space, KIND_IDENTITY, &as_id)?;
-        Ok((scope_id, me))
+fn cmd_secret_share(
+    storage: SecretsStorage<'_>,
+    scope: String,
+    name: String,
+    as_identity: String,
+) -> Result<()> {
+    let password = password()?;
+    let new_recipient_count = storage.update("secrets: secret share", |loaded| {
+        let scope = resolve_scope(&loaded.view.reader, &loaded.catalog, &scope)?;
+        let secret = loaded
+            .catalog
+            .latest_secret(scope, &name)?
+            .ok_or_else(|| anyhow!("no secret named '{name}' in that scope"))?;
+        let identity = resolve_identity(&loaded.view.reader, &loaded.catalog, &as_identity)?;
+        let shared = share_version(
+            &loaded.view.reader,
+            &loaded.catalog,
+            secret,
+            identity,
+            &password,
+            point_interval(now_epoch()?),
+        )?;
+        let fragment = (shared.new_recipient_count != 0).then_some(shared.fragment);
+        Ok((fragment, shared.new_recipient_count))
     })?;
-    let out = repo.secret_get(&pw, scope_id, &name, me)?;
-    use std::io::Write;
-    std::io::stdout().write_all(&out)?;
-    Ok(())
-}
-
-fn cmd_secret_share(repo: &SecretsRepo, scope: String, name: String, as_id: String) -> Result<()> {
-    let pw = password()?;
-    let (scope_id, me) = repo.read(|ws, space| {
-        let scope_id = resolve_named(ws, space, KIND_SCOPE, &scope)?;
-        let me = resolve_named(ws, space, KIND_IDENTITY, &as_id)?;
-        Ok((scope_id, me))
-    })?;
-    let n = repo.secret_share(&pw, scope_id, &name, me)?;
-    if n == 0 {
+    if new_recipient_count == 0 {
         println!("already shared to all current recipients");
-    } else {
-        println!("shared to {} new recipient(s)", n);
+        return Ok(());
     }
+    println!("shared to {new_recipient_count} new recipient(s)");
     Ok(())
 }
 
-fn cmd_secret_list(repo: &SecretsRepo) -> Result<()> {
-    let rows = repo.secret_list()?;
-    if rows.is_empty() {
-        println!("(no secrets)");
-    }
-    for s in rows {
-        println!(
-            "{}  scope {}  (v{}, {} recipient(s))",
-            s.name,
-            fmt_id(s.scope),
-            s.versions,
-            s.recipients
+fn cmd_secret_list(storage: SecretsStorage<'_>) -> Result<()> {
+    storage.with_view(|loaded| {
+        let credentials: BTreeSet<_> = loaded
+            .catalog
+            .secrets
+            .values()
+            .map(|row| (row.scope, row.name.clone()))
+            .collect();
+        if credentials.is_empty() {
+            println!("(no secrets)");
+            return Ok(());
+        }
+        for (scope, name) in credentials {
+            let versions = loaded.catalog.secret_versions(scope, &name);
+            let recipients = loaded.catalog.recipients_of(scope).len();
+            println!(
+                "{name}  scope {}  (v{versions}, {recipients} recipient(s))",
+                fmt_id(scope)
+            );
+        }
+        Ok(())
+    })
+}
+
+fn cmd_migrate_legacy(storage: SecretsStorage<'_>) -> Result<()> {
+    // Fail before inspecting legacy state if durable native authority was not
+    // initialized explicitly for this pile.
+    load_signer(storage.pile, storage.key)?;
+    // Read the raw collection value without requiring domain validity. This
+    // lets an idempotent rerun finish after a process died between commits.
+    let existing = storage.materialized_facts()?;
+    let source = freeze_source(storage.pile).context("freeze legacy Secrets source")?;
+    let plan = secrets_cutover::plan(&source)?;
+    let mut expected = existing;
+    expected += plan.materialized_facts();
+
+    let commits = secrets_cutover::publish(&source, &plan, storage.pile, storage.key)?;
+    let actual = storage.with_view(|loaded| Ok(loaded.view.facts.clone()))?;
+    if actual != expected {
+        bail!(
+            "Secrets migration result is not prior native value union planned canonical Secrets facts"
         );
     }
+
+    println!(
+        "migrated {} authored Secrets commit{} ({} retained facts, {} retired historical Mail facts, {} retired-only commit{}, {} authored-empty) into scope {:X}",
+        commits.len(),
+        if commits.len() == 1 { "" } else { "s" },
+        plan.report().facts,
+        plan.report().retired_facts,
+        plan.report().retired_only_commits,
+        if plan.report().retired_only_commits == 1 {
+            ""
+        } else {
+            "s"
+        },
+        plan.report().authored_empty_commits,
+        DEFAULT_SCOPE_ID,
+    );
+    println!("legacy branch retained; native commands no longer consult it");
     Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let repo = SecretsRepo::open(&cli.pile, &cli.branch);
+    let storage = SecretsStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+    };
     match cli.command {
         Command::Selftest => cmd_selftest(),
         Command::Identity { cmd } => match cmd {
-            IdentityCmd::Init { nickname } => cmd_identity_init(&repo, nickname),
-            IdentityCmd::List => cmd_identity_list(&repo),
+            IdentityCmd::Init { nickname } => cmd_identity_init(storage, nickname),
+            IdentityCmd::List => cmd_identity_list(storage),
         },
         Command::Scope { cmd } => match cmd {
-            ScopeCmd::Create { name, r#as } => cmd_scope_create(&repo, name, r#as),
-            ScopeCmd::List => cmd_scope_list(&repo),
-            ScopeCmd::Members { scope } => cmd_scope_members(&repo, scope),
+            ScopeCmd::Create { name, r#as } => cmd_scope_create(storage, name, r#as),
+            ScopeCmd::List => cmd_scope_list(storage),
+            ScopeCmd::Members { scope } => cmd_scope_members(storage, scope),
         },
         Command::Grant {
             object,
             relation,
             subject,
             r#as,
-        } => cmd_grant(&repo, object, relation, subject, r#as),
-        Command::Revoke { object, subject } => cmd_revoke(&repo, object, subject),
+        } => cmd_grant(storage, object, relation, subject, r#as),
+        Command::Revoke { object, subject } => cmd_revoke(storage, object, subject),
         Command::Secret { cmd } => match cmd {
-            SecretCmd::Add { scope, name, value } => cmd_secret_add(&repo, scope, name, value),
-            SecretCmd::Get { scope, name, r#as } => cmd_secret_get(&repo, scope, name, r#as),
-            SecretCmd::Rotate { scope } => cmd_secret_rotate(&repo, scope),
-            SecretCmd::Share { scope, name, r#as } => cmd_secret_share(&repo, scope, name, r#as),
-            SecretCmd::List => cmd_secret_list(&repo),
+            SecretCmd::Add { scope, name, value } => cmd_secret_add(storage, scope, name, value),
+            SecretCmd::Get { scope, name, r#as } => cmd_secret_get(storage, scope, name, r#as),
+            SecretCmd::Rotate { scope } => cmd_secret_rotate(storage, scope),
+            SecretCmd::Share { scope, name, r#as } => cmd_secret_share(storage, scope, name, r#as),
+            SecretCmd::List => cmd_secret_list(storage),
         },
+        Command::MigrateLegacy => cmd_migrate_legacy(storage),
     }
 }

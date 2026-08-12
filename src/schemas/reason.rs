@@ -5,7 +5,6 @@
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
-pub const DEFAULT_BRANCH: &str = "cognition";
 pub const KIND_REASON_ID: Id = id_hex!("9D43BB36D8B4A6275CAF38A1D5DACF36");
 
 pub mod reason_schema {

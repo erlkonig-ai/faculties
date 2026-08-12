@@ -1,8 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration as StdDuration;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,60 +9,51 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use ed25519_dalek::SigningKey;
-use hifitime::{Epoch, TimeScale};
-use rand_core::OsRng;
-use reqwest::blocking::Client;
-use reqwest::header::CONTENT_TYPE;
-use serde::Deserialize;
-use serde_json::{json, Value as JsonValue};
-use triblespace::core::blob::Bytes;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStoreGet, Repository, Workspace};
-use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString, U256BE};
-use triblespace::prelude::*;
-
-/// Fallback author id used when Teams delivers a message with no `from.user.id`.
-/// Mapping anonymous messages to one explicit subject keeps missing identity
-/// distinct from any source-assigned user. Later correction belongs in the
-/// message-revision model rather than additive mutation of the first snapshot.
-const TEAMS_UNKNOWN_AUTHOR_ID: Id = id_hex!("04217F0E5F75F57B8A7CBFD824D5FF31");
-
 #[cfg(test)]
 use faculties::collection_cutover::initialize_signer;
-use faculties::collection_cutover::load_signer;
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use hifitime::{Epoch, TimeScale};
+use reqwest::blocking::Client;
+use reqwest::header::CONTENT_TYPE;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value as JsonValue};
+use triblespace::core::blob::Bytes;
+use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::metadata;
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStoreGet;
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::*;
+
 use faculties::files as file_capability;
 use faculties::schemas::archive::{archive, RawBytes};
-use faculties::schemas::files::{file, KIND_FILE, KIND_MEDIA_TYPE};
-use faculties::schemas::teams::{teams, DEFAULT_BRANCH, DEFAULT_DELTA_URL};
+use faculties::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
+use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
+use faculties::teams as teams_core;
+use faculties::teams_cutover;
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
 struct Cli {
-    /// Path to the pile file to write into.
+    /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name to write into (created if missing).
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
-    /// Branch id to write into (hex). Overrides config/env branch id.
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it;
+    /// initialize explicitly with `trible pile signing-key init <pile>`.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Concrete Microsoft Entra tenant used to select a collection auth
+    /// profile. It may be omitted only when exactly one profile source exists.
+    #[arg(long, env = "TEAMS_TENANT")]
+    tenant: Option<String>,
+    /// Secrets identity used to open the exact encrypted credential versions.
+    /// This is independent of the Teams presentation identity.
+    #[arg(long, env = "SECRETS_IDENTITY")]
+    secrets_identity: Option<String>,
     /// Microsoft Graph delta endpoint.
     #[arg(long, default_value = DEFAULT_DELTA_URL)]
     delta_url: String,
-    /// OAuth bearer token (optional; otherwise use token command). Use @path for file input or @- for stdin.
-    #[arg(long)]
-    token: Option<String>,
-    /// Command that outputs a bearer token. Use @path for file input or @- for stdin.
-    #[arg(
-        long,
-        default_value = "az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv"
-    )]
-    token_command: String,
     /// Explicit external presentation identity for Teams mutations.
     #[arg(long = "as", global = true)]
     present_as: Option<String>,
@@ -123,7 +113,7 @@ enum CommandMode {
         #[command(subcommand)]
         command: AuthCommand,
     },
-    /// Interactive device-code login to cache a delegated token.
+    /// Interactive device-code login that publishes encrypted credential versions.
     Login {
         /// Tenant id or domain (default: common).
         #[arg(long, default_value = "common")]
@@ -131,12 +121,23 @@ enum CommandMode {
         /// Azure app client id.
         #[arg(long)]
         client_id: String,
-        /// Azure app client secret (stored in the pile).
+        /// Non-argv source for an Azure app client secret to encrypt as a new
+        /// Secrets version. Use `@path` or `@-`; alternatively set
+        /// `TEAMS_CLIENT_SECRET`.
         #[arg(
-            long,
-            help = "Azure app client secret (stored in the pile). Use @path for file input or @- for stdin."
+            long = "client-secret",
+            value_name = "@PATH|@-",
+            conflicts_with = "client_secret_version",
+            help = "Read the Azure app client secret from @path or @- and encrypt it into shared Secrets. TEAMS_CLIENT_SECRET is the environment alternative."
         )]
-        client_secret: Option<String>,
+        client_secret_source: Option<String>,
+        /// Exact existing Secrets version for the app client secret.
+        #[arg(long, conflicts_with = "client_secret_source")]
+        client_secret_version: Option<String>,
+        /// Secrets scope receiving newly encrypted credential versions. An
+        /// existing unique profile defaults to its referenced secret scope.
+        #[arg(long)]
+        secret_scope: Option<String>,
         /// Space-delimited scopes (defaults to chat + presence + user read + offline_access).
         #[arg(
             long,
@@ -144,6 +145,8 @@ enum CommandMode {
         )]
         scopes: Option<String>,
     },
+    /// Migrate the stopped legacy `teams` branch while retiring plaintext OAuth rows.
+    MigrateLegacy,
 }
 
 #[derive(Subcommand)]
@@ -162,8 +165,24 @@ enum ContextCommand {
 
 #[derive(Subcommand)]
 enum AuthCommand {
-    /// Show safe authentication metadata and token liveness (never secrets/tokens).
+    /// Show safe profile metadata and exact secret-version references.
     Status,
+    /// Publish a complete profile from exact existing Secrets versions. This
+    /// is also the repair/reconciliation path after an interrupted login.
+    Set {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        client_id: String,
+        #[arg(long)]
+        user_id: String,
+        #[arg(long)]
+        scopes: String,
+        #[arg(long)]
+        client_secret_version: Option<String>,
+        #[arg(long)]
+        delegated_token_version: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -308,21 +327,6 @@ enum AttachmentsCommand {
         #[arg(long)]
         descending: bool,
     },
-    /// Backfill attachments for existing messages.
-    Backfill {
-        /// Filter by Teams chat id (external id).
-        #[arg(long)]
-        chat_id: Option<String>,
-        /// Filter by Teams message id (external id).
-        #[arg(long)]
-        message_id: Option<String>,
-        /// Maximum number of messages to scan (0 = no limit).
-        #[arg(long, default_value_t = 0)]
-        limit: usize,
-        /// Scan newest messages first.
-        #[arg(long)]
-        descending: bool,
-    },
     /// Export a stored attachment to a local file.
     Export {
         /// Attachment source id (as shown in attachments list).
@@ -345,14 +349,196 @@ enum AttachmentsCommand {
 }
 
 #[derive(Clone, Debug)]
-struct TeamsBridgeConfig {
+struct TeamsCommandConfig {
     pile_path: PathBuf,
-    branch: String,
-    branch_id: Id,
-    presentation_context: TeamsPresentationContext,
+    key_path: Option<PathBuf>,
+    tenant_selector: Option<String>,
     delta_url: String,
-    token: Option<String>,
-    token_command: String,
+    secrets_identity: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TeamsBridgeConfig {
+    source_id: Id,
+    tenant: String,
+    client_id: String,
+    user_id: String,
+    scopes: String,
+    profile: Id,
+    client_secret_version: Option<Id>,
+    delegated_token_version: Option<Id>,
+    delta_url: String,
+    secrets_identity: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DelegatedTokenBundle {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at_unix: i64,
+    token_type: Option<String>,
+    scope: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct TeamsStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+}
+
+#[derive(Clone)]
+struct CollectionView {
+    facts: TribleSet,
+    reader: PileReader,
+}
+
+struct TeamsSession<'a> {
+    collection: &'a mut Collection<Pile>,
+    facts: TribleSet,
+    reader: PileReader,
+    signer: ed25519_dalek::SigningKey,
+    secrets_facts: TribleSet,
+    secrets_reader: PileReader,
+    secrets_catalog: SecretsCatalog,
+}
+
+impl TeamsSession<'_> {
+    fn view(&self) -> CollectionView {
+        CollectionView {
+            facts: self.facts.clone(),
+            reader: self.reader.clone(),
+        }
+    }
+
+    fn commit(
+        &mut self,
+        mut fragment: Fragment,
+        description: &'static str,
+    ) -> Result<Option<CollectionCommit>> {
+        validate_candidate(&self.reader, &self.facts, &fragment)?;
+        let mut candidate = self.facts.clone();
+        candidate += fragment.facts().clone();
+        teams_core::validate_auth_secret_references(&candidate, &self.secrets_catalog)?;
+        if fragment.facts().difference(&self.facts).is_empty() {
+            return Ok(None);
+        }
+        let added = fragment.facts().clone();
+        fragment.describe_with(entity! { metadata::description: description });
+        let commit = self
+            .collection
+            .commit(fragment)
+            .context("commit Teams fragment")?;
+        self.facts += added;
+        self.reader = self
+            .collection
+            .storage_mut()
+            .reader()
+            .context("refresh Teams attachment snapshot")?;
+        Ok(Some(commit))
+    }
+
+    fn commit_secret(
+        &mut self,
+        mut fragment: Fragment,
+        description: &'static str,
+    ) -> Result<Option<CollectionCommit>> {
+        let candidate =
+            secrets_model::validate_candidate(&self.secrets_reader, &self.secrets_facts, &fragment)
+                .context("validate Teams credential version")?;
+        if fragment.facts().difference(&self.secrets_facts).is_empty() {
+            return Ok(None);
+        }
+        let added = fragment.facts().clone();
+        fragment.describe_with(entity! { metadata::description: description });
+        let commit = Collection::new(
+            self.collection.storage_mut(),
+            secrets_schema::DEFAULT_SCOPE_ID,
+            self.signer.clone(),
+        )
+        .commit(fragment)
+        .context("commit Teams credential to Secrets collection")?;
+        self.secrets_facts += added;
+        self.secrets_reader = self
+            .collection
+            .storage_mut()
+            .reader()
+            .context("refresh Secrets payload snapshot")?;
+        self.secrets_catalog = candidate;
+        Ok(Some(commit))
+    }
+}
+
+impl TeamsStorage<'_> {
+    fn with_session<T>(
+        &self,
+        operation: impl FnOnce(&mut TeamsSession<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let (secrets_facts, secrets_reader, secrets_catalog) = {
+            let mut secrets_collection =
+                Collection::new(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone());
+            let facts = secrets_collection
+                .materialize()
+                .context("materialize Secrets collection for Teams")?;
+            let reader = secrets_collection
+                .storage_mut()
+                .reader()
+                .context("open Secrets payload reader for Teams")?;
+            let catalog = secrets_model::validate_catalog(&reader, &facts)
+                .context("validate Secrets collection for Teams")?;
+            (facts, reader, catalog)
+        };
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer.clone());
+        let result = (|| {
+            let facts = collection
+                .materialize()
+                .context("materialize Teams collection")?;
+            let reader = collection
+                .storage_mut()
+                .reader()
+                .context("open Teams attachment reader")?;
+            validate_catalog(&reader, &facts).context("validate Teams collection")?;
+            teams_core::validate_auth_secret_references(&facts, &secrets_catalog)
+                .context("validate Teams auth-profile Secrets references")?;
+            operation(&mut TeamsSession {
+                collection: &mut collection,
+                facts,
+                reader,
+                signer,
+                secrets_facts,
+                secrets_reader,
+                secrets_catalog,
+            })
+        })();
+        finish_pile(collection.into_storage(), result)
+    }
+
+    #[cfg(test)]
+    fn view(&self) -> Result<CollectionView> {
+        self.with_session(|session| Ok(session.view()))
+    }
+
+    #[cfg(test)]
+    fn publish(
+        &self,
+        fragment: Fragment,
+        message: &'static str,
+    ) -> Result<Option<CollectionCommit>> {
+        self.with_session(|session| session.commit(fragment, message))
+    }
+}
+
+fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context("close Teams pile")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing Teams pile also failed: {close_error}")))
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -373,31 +559,46 @@ fn main() -> Result<()> {
             descending,
         } => {
             let config = build_config(&cli)?;
-            prepare_teams_context(&config, requested_as.as_deref(), false)?;
-            read_messages(
-                config,
-                ReadOptions {
-                    chat_id,
-                    since,
-                    limit,
-                    descending,
+            with_teams_context(
+                &config,
+                requested_as.as_deref(),
+                false,
+                |runtime, session, _| {
+                    read_messages(
+                        runtime,
+                        session,
+                        ReadOptions {
+                            chat_id,
+                            since,
+                            limit,
+                            descending,
+                        },
+                    )
                 },
             )
         }
         CommandMode::Send { chat_id, text } => {
             let config = build_config(&cli)?;
-            prepare_teams_context(&config, requested_as.as_deref(), true)?;
             let text = faculties::text_arg(&text, "message text")?;
-            send_message(config, &chat_id, &text)
+            with_teams_context(
+                &config,
+                requested_as.as_deref(),
+                true,
+                |runtime, session, _| send_message(runtime, session, &chat_id, &text),
+            )
         }
         CommandMode::Users { command } => {
             let config = build_config(&cli)?;
-            prepare_teams_context(&config, requested_as.as_deref(), false)?;
-            match command {
-                UsersCommand::List { prefix, limit } => {
-                    list_users(config, prefix.as_deref(), limit)
-                }
-            }
+            with_teams_context(
+                &config,
+                requested_as.as_deref(),
+                false,
+                |runtime, session, _| match command {
+                    UsersCommand::List { prefix, limit } => {
+                        list_users(runtime, session, prefix.as_deref(), limit)
+                    }
+                },
+            )
         }
         CommandMode::Presence { command } => {
             let config = build_config(&cli)?;
@@ -407,14 +608,27 @@ fn main() -> Result<()> {
                     activity,
                     duration_mins,
                     session_id,
-                } => {
-                    prepare_teams_context(&config, requested_as.as_deref(), true)?;
-                    set_presence_status(config, availability, activity, duration_mins, session_id)
-                }
-                PresenceCommand::Get { user_ids } => {
-                    prepare_teams_context(&config, requested_as.as_deref(), false)?;
-                    get_presence(config, user_ids)
-                }
+                } => with_teams_context(
+                    &config,
+                    requested_as.as_deref(),
+                    true,
+                    |runtime, session, _| {
+                        set_presence_status(
+                            runtime,
+                            session,
+                            availability,
+                            activity,
+                            duration_mins,
+                            session_id,
+                        )
+                    },
+                ),
+                PresenceCommand::Get { user_ids } => with_teams_context(
+                    &config,
+                    requested_as.as_deref(),
+                    false,
+                    |runtime, session, _| get_presence(runtime, session, user_ids),
+                ),
             }
         }
         CommandMode::Chat { command } => {
@@ -424,78 +638,78 @@ fn main() -> Result<()> {
                     chat_id,
                     user_id,
                     owner,
-                } => {
-                    prepare_teams_context(&config, requested_as.as_deref(), true)?;
-                    invite_to_chat(config, &chat_id, &user_id, owner)
-                }
+                } => with_teams_context(
+                    &config,
+                    requested_as.as_deref(),
+                    true,
+                    |runtime, session, _| {
+                        invite_to_chat(runtime, session, &chat_id, &user_id, owner)
+                    },
+                ),
                 ChatCommand::Create {
                     user_ids,
                     group,
                     topic,
                 } => {
-                    prepare_teams_context(&config, requested_as.as_deref(), true)?;
                     let topic = topic
                         .as_deref()
                         .map(|value| load_value_or_file(value, "chat topic"))
                         .transpose()?;
-                    create_chat(config, user_ids, group, topic)
+                    with_teams_context(
+                        &config,
+                        requested_as.as_deref(),
+                        true,
+                        |runtime, session, _| create_chat(runtime, session, user_ids, group, topic),
+                    )
                 }
             }
         }
         CommandMode::Attachments { command } => {
             let config = build_config(&cli)?;
-            prepare_teams_context(&config, requested_as.as_deref(), false)?;
-            match command {
-                AttachmentsCommand::List {
-                    chat_id,
-                    message_id,
-                    limit,
-                    descending,
-                } => list_attachments(
-                    config,
-                    AttachmentListOptions {
+            with_teams_context(
+                &config,
+                requested_as.as_deref(),
+                false,
+                |runtime, session, _| match command {
+                    AttachmentsCommand::List {
                         chat_id,
                         message_id,
                         limit,
                         descending,
-                    },
-                ),
-                AttachmentsCommand::Backfill {
-                    chat_id,
-                    message_id,
-                    limit,
-                    descending,
-                } => backfill_attachments(
-                    config,
-                    AttachmentBackfillOptions {
-                        chat_id,
-                        message_id,
-                        limit,
-                        descending,
-                    },
-                ),
-                AttachmentsCommand::Export {
-                    source_id,
-                    chat_id,
-                    message_id,
-                    out_dir,
-                    filename,
-                    overwrite,
-                } => {
-                    let out_dir = out_dir.unwrap_or_else(|| PathBuf::from("./attachments"));
-                    export_attachment(
-                        config,
-                        AttachmentExportOptions {
-                            source_id,
+                    } => list_attachments(
+                        runtime,
+                        session,
+                        AttachmentListOptions {
                             chat_id,
                             message_id,
-                            out_dir,
-                            filename,
-                            overwrite,
+                            limit,
+                            descending,
                         },
-                    )
-                }
-            }
+                    ),
+                    AttachmentsCommand::Export {
+                        source_id,
+                        chat_id,
+                        message_id,
+                        out_dir,
+                        filename,
+                        overwrite,
+                    } => {
+                        let out_dir = out_dir.unwrap_or_else(|| PathBuf::from("./attachments"));
+                        export_attachment(
+                            runtime,
+                            session,
+                            AttachmentExportOptions {
+                                source_id,
+                                chat_id,
+                                message_id,
+                                out_dir,
+                                filename,
+                                overwrite,
+                            },
+                        )
+                    }
+                },
+            )
         }
         CommandMode::Context { command } => {
             let config = build_config(&cli)?;
@@ -503,96 +717,268 @@ fn main() -> Result<()> {
                 ContextCommand::Set {
                     present_as,
                     boundary,
-                } => {
-                    let context = store_context_in_pile(&config, &present_as, &boundary)?;
+                } => storage(&config).with_session(|session| {
+                    let source = selected_source(session, config.tenant_selector.as_deref())?;
+                    let tenant = config.tenant_selector.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`teams context set` requires --tenant for an explicit source identity"
+                        )
+                    })?;
+                    let context = store_context(session, source, tenant, &present_as, &boundary)?;
                     show_context(&context)
-                }
-                ContextCommand::Show => show_context(&config.presentation_context),
+                }),
+                ContextCommand::Show => storage(&config).with_session(|session| {
+                    let source = selected_source(session, config.tenant_selector.as_deref())?;
+                    let context = load_context(&session.reader, &session.facts, source)?;
+                    show_context(&context)
+                }),
             }
         }
         CommandMode::Auth { command } => {
             let config = build_config(&cli)?;
-            prepare_teams_context(&config, requested_as.as_deref(), false)?;
-            match command {
-                AuthCommand::Status => show_auth_status(&config),
-            }
+            storage(&config).with_session(|session| match command {
+                AuthCommand::Status => {
+                    let banner_source = match config.tenant_selector.as_deref() {
+                        Some(tenant) => Some(source_id_for_tenant(tenant)?),
+                        None => {
+                            let sources = teams_core::auth_profile_sources(&session.facts);
+                            (sources.len() == 1).then(|| *sources.first().unwrap())
+                        }
+                    };
+                    if let Some(source) = banner_source {
+                        let context = load_context(&session.reader, &session.facts, source)?;
+                        prepare_teams_context(&context, requested_as.as_deref(), false)?;
+                    }
+                    show_auth_status(session, config.tenant_selector.as_deref())
+                }
+                AuthCommand::Set {
+                    tenant,
+                    client_id,
+                    user_id,
+                    scopes,
+                    client_secret_version,
+                    delegated_token_version,
+                } => set_auth_profile(
+                    session,
+                    &tenant,
+                    &client_id,
+                    &user_id,
+                    &scopes,
+                    client_secret_version.as_deref(),
+                    delegated_token_version.as_deref(),
+                ),
+            })
         }
         CommandMode::Login {
             tenant,
             client_id,
-            client_secret,
+            client_secret_source,
+            client_secret_version,
+            secret_scope,
             scopes,
         } => {
             let config = build_config(&cli)?;
-            prepare_teams_context(&config, requested_as.as_deref(), false)?;
+            prepare_teams_context(
+                &TeamsPresentationContext::default(),
+                requested_as.as_deref(),
+                false,
+            )?;
             let scopes = scopes
                 .as_deref()
                 .map(|value| load_value_or_file(value, "scopes"))
                 .transpose()?
                 .unwrap_or_else(default_scopes);
-            let client_secret = client_secret
-                .as_deref()
-                .map(|value| load_value_or_file_trimmed(value, "client secret"))
-                .transpose()?;
-            login_device_code(
-                &config,
-                &tenant,
-                &client_id,
-                client_secret.as_deref(),
-                &scopes,
-            )
+            let client_secret = load_client_secret(
+                client_secret_source.as_deref(),
+                client_secret_version.as_deref(),
+            )?;
+            storage(&config).with_session(|session| {
+                login_device_code_collection(
+                    session,
+                    &tenant,
+                    &client_id,
+                    client_secret.as_deref(),
+                    client_secret_version.as_deref(),
+                    secret_scope.as_deref(),
+                    &scopes,
+                )
+            })
         }
+        CommandMode::MigrateLegacy => migrate_legacy(&cli),
     }
 }
 
-fn with_repo<T>(
-    pile_path: &PathBuf,
-    f: impl FnOnce(&mut Repository<Pile>) -> Result<T>,
-) -> Result<T> {
-    let pile = open_pile(pile_path)?;
-    let repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))?;
-    with_repo_close(repo, f)
-}
-
-fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
-    let pile_path = cli.pile.clone();
-    let branch = std::env::var("TRIBLESPACE_BRANCH")
-        .ok()
-        .unwrap_or_else(|| cli.branch.clone());
-    let (branch_id, presentation_context) = with_repo(&pile_path, |repo| {
-        let branch_id = if let Some(hex) = cli.branch_id.as_deref() {
-            Id::from_hex(hex.trim()).ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"))?
-        } else {
-            repo.ensure_branch(&branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure teams branch: {e:?}"))?
-        };
-        let presentation_context = load_context_from_repo(repo, branch_id)?;
-        Ok((branch_id, presentation_context))
-    })?;
+fn build_config(cli: &Cli) -> Result<TeamsCommandConfig> {
     let delta_url = std::env::var("TEAMS_DELTA_URL")
         .ok()
         .unwrap_or_else(|| cli.delta_url.clone());
-    let token = cli
-        .token
-        .clone()
-        .or_else(|| std::env::var("TEAMS_TOKEN").ok());
-    let token_command = std::env::var("TEAMS_TOKEN_COMMAND")
-        .ok()
-        .unwrap_or_else(|| cli.token_command.clone());
-    Ok(TeamsBridgeConfig {
-        pile_path,
-        branch,
-        branch_id,
-        presentation_context,
+    Ok(TeamsCommandConfig {
+        pile_path: cli.pile.clone(),
+        key_path: cli.key.clone(),
+        tenant_selector: cli.tenant.clone(),
         delta_url,
-        token,
-        token_command,
+        secrets_identity: cli.secrets_identity.clone(),
     })
+}
+
+fn source_fragment(tenant: &str) -> Fragment {
+    teams_core::source_fragment(tenant)
+}
+
+fn source_id_for_tenant(tenant: &str) -> Result<Id> {
+    let tenant = tenant.trim();
+    if tenant.is_empty() || is_generic_tenant(tenant) {
+        bail!("Teams collection state requires one concrete tenant, got {tenant:?}");
+    }
+    Ok(source_fragment(tenant)
+        .root()
+        .expect("Teams source fragment has one root"))
+}
+
+fn selected_source(session: &TeamsSession<'_>, tenant_selector: Option<&str>) -> Result<Id> {
+    if let Some(tenant) = tenant_selector {
+        return source_id_for_tenant(tenant);
+    }
+    one_required(
+        teams_core::auth_profile_sources(&session.facts),
+        "Teams auth-profile source (set --tenant when more than one exists)",
+    )
+}
+
+fn resolve_auth_config(
+    session: &TeamsSession<'_>,
+    config: &TeamsCommandConfig,
+    source_id: Id,
+) -> Result<TeamsBridgeConfig> {
+    let profile = match teams_core::auth_profile_head(&session.facts, source_id) {
+        teams_core::AuthProfileHead::Missing => {
+            bail!("Teams source {source_id:x} has no auth profile; run `teams login`")
+        }
+        teams_core::AuthProfileHead::Unique(profile) => profile,
+        teams_core::AuthProfileHead::Forked(heads) => bail!(
+            "Teams source {source_id:x} has forked auth-profile heads {heads:?}; reconcile with `teams auth set`"
+        ),
+    };
+    let record = teams_core::auth_profile(&session.facts, profile)?;
+    let tenant = teams_core::source_label(&session.reader, &session.facts, source_id)?;
+    Ok(TeamsBridgeConfig {
+        source_id,
+        tenant,
+        client_id: read_longstring(&session.reader, record.client_id, "Teams auth client id")?,
+        user_id: read_longstring(&session.reader, record.user_id, "Teams auth user id")?,
+        scopes: read_longstring(&session.reader, record.scopes, "Teams auth scopes")?,
+        profile,
+        client_secret_version: record.client_secret_version,
+        delegated_token_version: record.delegated_token_version,
+        delta_url: config.delta_url.clone(),
+        secrets_identity: config.secrets_identity.clone(),
+    })
+}
+
+fn exact_secret_id(catalog: &SecretsCatalog, value: &str, label: &str) -> Result<Id> {
+    let id = Id::from_hex(value.trim())
+        .ok_or_else(|| anyhow::anyhow!("{label} requires one exact 32-hex Secrets id"))?;
+    if !catalog.secrets.contains_key(&id) {
+        bail!("unknown {label} {id:x}");
+    }
+    Ok(id)
+}
+
+fn secrets_identity(session: &TeamsSession<'_>, explicit: Option<&str>) -> Result<Id> {
+    let selector = match explicit {
+        Some(selector) => selector.to_owned(),
+        None => std::env::var("PERSONA").context(
+            "set --secrets-identity/SECRETS_IDENTITY when the Secrets identity differs from PERSONA",
+        )?,
+    };
+    secrets_model::resolve_identity(&session.secrets_reader, &session.secrets_catalog, &selector)
+        .with_context(|| format!("resolve Secrets identity {selector:?}"))
+}
+
+fn identity_password() -> Result<Vec<u8>> {
+    faculties::secrets::password::read("unlock the selected Secrets identity")
+}
+
+fn open_exact_secret(
+    session: &TeamsSession<'_>,
+    identity_selector: Option<&str>,
+    secret: Id,
+) -> Result<Vec<u8>> {
+    let identity = secrets_identity(session, identity_selector)?;
+    let password = identity_password()?;
+    secrets_model::open_version(
+        &session.secrets_reader,
+        &session.secrets_catalog,
+        secret,
+        identity,
+        &password,
+    )
+    .with_context(|| format!("open exact Teams Secrets version {secret:x}"))
+}
+
+fn teams_secret_name(source: Id, kind: &str) -> String {
+    format!(
+        "teams/{kind}/{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(source.raw())
+    )
+}
+
+fn storage(config: &TeamsCommandConfig) -> TeamsStorage<'_> {
+    TeamsStorage {
+        pile: &config.pile_path,
+        key: config.key_path.as_deref(),
+    }
+}
+
+fn with_teams_context<T>(
+    config: &TeamsCommandConfig,
+    requested_as: Option<&str>,
+    require_explicit_identity: bool,
+    operation: impl FnOnce(
+        &TeamsBridgeConfig,
+        &mut TeamsSession<'_>,
+        &TeamsPresentationContext,
+    ) -> Result<T>,
+) -> Result<T> {
+    storage(config).with_session(|session| {
+        let source_id = selected_source(session, config.tenant_selector.as_deref())?;
+        let context = load_context(&session.reader, &session.facts, source_id)?;
+        let context = prepare_teams_context(&context, requested_as, require_explicit_identity)?;
+        // The presentation gate deliberately precedes auth-profile resolution.
+        // Outward mutations must fail on a missing/mismatched `--as` before
+        // inspecting credentials or attempting any network operation.
+        let runtime = resolve_auth_config(session, config, source_id)?;
+        operation(&runtime, session, &context)
+    })
+}
+
+fn migrate_legacy(cli: &Cli) -> Result<()> {
+    let frozen = freeze_source(&cli.pile)?;
+    let plan = teams_cutover::plan(&frozen)?;
+    let report = plan.report().clone();
+    let commits = teams_cutover::publish(&frozen, &plan, &cli.pile, cli.key.as_deref())?;
+    println!(
+        "Migrated {} authored Teams commits ({} source-empty, {} OAuth-only retired; {} contentless merges remained ancestry), publishing {} of {} source facts and retiring {} plaintext OAuth facts in {} native commits.",
+        report.authored_commits,
+        report.authored_empty_commits,
+        report.retired_only_commits,
+        report.contentless_merges,
+        report.facts,
+        report.source_facts,
+        report.retired_facts,
+        commits.len(),
+    );
+    if report.retired_facts > 0 {
+        eprintln!(
+            "SECURITY: the native Teams collection omits the retired OAuth rows, but this in-place append leaves their old plaintext bytes in the legacy pile prefix. Rotate the Microsoft client secret and delegated grants, then repack the validated native collections into a fresh pile before sharing or archiving it."
+        );
+    }
+    Ok(())
 }
 
 fn default_scopes() -> String {
     [
+        "openid",
         "offline_access",
         "User.Read.All",
         "Presence.ReadWrite",
@@ -605,67 +991,122 @@ fn default_scopes() -> String {
     .join(" ")
 }
 
-fn with_repo_close<T, F>(repo: Repository<Pile>, f: F) -> Result<T>
-where
-    F: FnOnce(&mut Repository<Pile>) -> Result<T>,
-{
-    let mut repo = repo;
-    let result = f(&mut repo);
-    let pile = repo.into_storage();
-    let close_res = pile
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
+fn is_generic_tenant(tenant: &str) -> bool {
+    teams_core::is_generic_tenant(tenant)
+}
+
+fn canonical_tenant(tenant: &str) -> String {
+    teams_core::canonical_tenant(tenant)
+}
+
+fn jwt_tenant(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let claims: JsonValue = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("tid")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|tenant| !tenant.is_empty() && !is_generic_tenant(tenant))
+        .map(str::to_owned)
+}
+
+fn resolve_source_tenant(
+    requested_authority: &str,
+    id_token: Option<&str>,
+    access_token: Option<&str>,
+) -> Result<String> {
+    if let Some(tenant) = id_token
+        .and_then(jwt_tenant)
+        .or_else(|| access_token.and_then(jwt_tenant))
+    {
+        return Ok(canonical_tenant(&tenant));
     }
-    result
+    let requested = requested_authority.trim();
+    if !requested.is_empty() && !is_generic_tenant(requested) {
+        return Ok(canonical_tenant(requested));
+    }
+    bail!(
+        "Microsoft did not return a concrete tenant identity for authority {requested_authority:?}; include `openid` in login scopes or login against the actual tenant id"
+    )
 }
 
 fn pull_once_with_cache(
     config: &TeamsBridgeConfig,
     app_token_cache: &mut Option<AppTokenCache>,
+    session: &mut TeamsSession<'_>,
 ) -> Result<()> {
-    let (token, app_config) = get_app_token(config, app_token_cache)?;
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-        validate_message_identity_lineage(&catalog)?;
-        let cursor_state = load_cursor_from_space(&mut ws, &catalog)?;
-        let base_url = resolve_delta_url(&config.delta_url, &app_config.user_id)?;
-        let (start_url, using_saved_cursor) = match cursor_state.as_ref() {
-            Some(cursor) if cursor.url.contains("/me/") => (base_url.clone(), false),
-            Some(cursor) => (cursor.url.clone(), true),
-            None => (base_url.clone(), false),
+    let (token, app_config) = get_app_token(config, app_token_cache, session)?;
+    let mut known_messages =
+        load_known_messages(&session.reader, &session.facts, config.source_id)?;
+    let mut coverage = coverage_head(&session.reader, &session.facts, config.source_id)?;
+    let base_url = resolve_delta_url(&config.delta_url, &app_config.user_id)?;
+    let mut request_url = coverage
+        .as_ref()
+        .and_then(|coverage| coverage.cursor.clone())
+        .unwrap_or_else(|| base_url.clone());
+    let mut reset_expired = coverage
+        .as_ref()
+        .is_some_and(|coverage| coverage.cursor.is_some());
+    loop {
+        let page = match fetch_delta_page(&Client::new(), &token, &request_url) {
+            Ok(page) => page,
+            Err(error) if reset_expired && error.downcast_ref::<DeltaCursorExpired>().is_some() => {
+                eprintln!(
+                        "Teams delta cursor expired; beginning a new covered round from the base endpoint."
+                    );
+                request_url = base_url.clone();
+                reset_expired = false;
+                continue;
+            }
+            Err(error) => return Err(error),
         };
+        reset_expired = false;
 
-        let (messages, new_cursor) =
-            fetch_delta_with_cursor_recovery(&token, &start_url, &base_url, using_saved_cursor)?;
-        let index = CatalogIndex::build(&catalog);
-        let incoming = parse_messages(messages)?;
-        let (mut change, files_plan) =
-            build_ingest_change(&mut ws, &catalog, &index, incoming, &token)?;
-        if let Some(cursor_change) =
-            build_cursor_change(&mut ws, &catalog, cursor_state.as_ref(), new_cursor)?
-        {
-            change += cursor_change;
+        let (cursor_kind, cursor) = match (page.next_link, page.delta_link) {
+            (Some(next), None) => ("next", next),
+            (None, Some(delta)) => ("delta", delta),
+            _ => bail!("Teams delta page must contain exactly one nextLink or deltaLink"),
+        };
+        let incoming = parse_messages(page.messages)?;
+        let generation = coverage
+            .as_ref()
+            .map(|coverage| coverage.generation + 1)
+            .unwrap_or(1);
+        let (mut fragment, observations, next_known_messages) = build_page_fragment(
+            &app_config.tenant,
+            config.source_id,
+            incoming,
+            &token,
+            &known_messages,
+        )?;
+        let receipt = coverage_fragment(
+            config.source_id,
+            generation,
+            coverage.as_ref().map(|coverage| coverage.id).into_iter(),
+            &request_url,
+            &cursor,
+            cursor_kind,
+            observations.iter().copied(),
+        )?;
+        let receipt_id = receipt.root().expect("coverage receipt has one root");
+        fragment += receipt;
+        session.commit(fragment, "teams delta page")?;
+        known_messages = next_known_messages;
+
+        coverage = Some(CoverageHead {
+            id: receipt_id,
+            generation,
+            cursor: Some(cursor.clone()),
+        });
+        if cursor_kind == "delta" {
+            return Ok(());
         }
-
-        // Publish complete per-file commits before advancing Teams facts and
-        // the delta cursor. Deterministic commit identity makes replay a no-op.
-        publish_files_plan(repo, &config.pile_path, files_plan)?;
-
-        if !change.is_empty() {
-            ws.commit(change, "teams ingest");
-            map_err_debug(repo.push(&mut ws), "push workspace")?;
-        }
-
-        Ok(())
-    })
+        request_url = cursor;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -682,14 +1123,6 @@ struct AppConfig {
     user_id: String,
 }
 
-#[derive(Debug, Clone, Default)]
-struct TeamsConfigData {
-    tenant: Option<String>,
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    user_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TeamsPresentationContext {
     name: Option<String>,
@@ -699,8 +1132,9 @@ struct TeamsPresentationContext {
 fn get_app_token(
     config: &TeamsBridgeConfig,
     app_token_cache: &mut Option<AppTokenCache>,
+    session: &TeamsSession<'_>,
 ) -> Result<(String, AppConfig)> {
-    let app_config = load_app_config_from_pile(config)?;
+    let app_config = app_config(config, session)?;
     let now_key = interval_key(epoch_interval(now_epoch()));
 
     if let Some(cache) = app_token_cache {
@@ -724,33 +1158,25 @@ fn get_app_token(
     Ok((access_token, app_config))
 }
 
-fn load_app_config_from_pile(config: &TeamsBridgeConfig) -> Result<AppConfig> {
-    let Some(config_data) = load_config_from_pile(config)? else {
-        bail!(
-            "missing Teams app config; run teams.rs login --client-id <app-id> --tenant <tenant-id> --client-secret <secret>"
-        );
-    };
-
-    let tenant = config_data
-        .tenant
-        .ok_or_else(|| anyhow::anyhow!("missing tenant in Teams config; re-run teams.rs login"))?;
-    let client_id = config_data.client_id.ok_or_else(|| {
-        anyhow::anyhow!("missing client id in Teams config; re-run teams.rs login")
-    })?;
-    let client_secret = config_data.client_secret.ok_or_else(|| {
+fn app_config(config: &TeamsBridgeConfig, session: &TeamsSession<'_>) -> Result<AppConfig> {
+    let secret = config.client_secret_version.ok_or_else(|| {
         anyhow::anyhow!(
-            "missing client secret in Teams config; re-run teams.rs login with --client-secret"
+            "Teams auth profile {} has no app client-secret version; rotate with `teams login --client-secret ...` or `teams auth set`",
+            config.profile
         )
     })?;
-    let user_id = config_data
-        .user_id
-        .ok_or_else(|| anyhow::anyhow!("missing user id in Teams config; re-run teams.rs login"))?;
+    let client_secret = String::from_utf8(open_exact_secret(
+        session,
+        config.secrets_identity.as_deref(),
+        secret,
+    )?)
+    .context("Teams client secret is not UTF-8")?;
 
     Ok(AppConfig {
-        tenant,
-        client_id,
+        tenant: config.tenant.clone(),
+        client_id: config.client_id.clone(),
         client_secret,
-        user_id,
+        user_id: config.user_id.clone(),
     })
 }
 
@@ -764,50 +1190,79 @@ fn resolve_delta_url(template: &str, user_id: &str) -> Result<String> {
     Ok(template.to_owned())
 }
 
-fn get_delegated_token(config: &TeamsBridgeConfig) -> Result<String> {
-    if let Some(token) = config
-        .token
-        .as_deref()
-        .map(|value| load_value_or_file_trimmed(value, "token"))
-        .transpose()?
-    {
-        let token = token.trim();
-        if !token.is_empty() {
-            return Ok(token.to_owned());
-        }
+fn get_delegated_token(
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
+) -> Result<String> {
+    let secret = config.delegated_token_version.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Teams auth profile {} has no delegated-token version; run `teams login`",
+            config.profile
+        )
+    })?;
+    let plaintext = open_exact_secret(session, config.secrets_identity.as_deref(), secret)?;
+    let bundle: DelegatedTokenBundle =
+        serde_json::from_slice(&plaintext).context("decode Teams delegated-token bundle")?;
+    if bundle.expires_at_unix > now_epoch_secs() + 30 {
+        return Ok(bundle.access_token);
     }
-
-    if let Some(token) = load_cached_token_from_pile(config)? {
-        return Ok(token);
-    }
-
-    let token_command = load_value_or_file_trimmed(&config.token_command, "token command")?;
-    let cmd = token_command
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if cmd.is_empty() {
-        bail!("token command is empty");
-    }
-
-    let mut command = Command::new(&cmd[0]);
-    if cmd.len() > 1 {
-        command.args(&cmd[1..]);
-    }
-    let output = command.output().context("run token command")?;
-    if !output.status.success() {
-        bail!(
-            "token command failed: exit={} stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let stdout = String::from_utf8(output.stdout).context("token command stdout not utf8")?;
-    let token = stdout.trim();
-    if token.is_empty() {
-        bail!("token command returned empty token");
-    }
-    Ok(token.to_owned())
+    let refresh = bundle.refresh_token.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("delegated token expired without a refresh token; run `teams login`")
+    })?;
+    let refreshed = refresh_token(
+        &config.tenant,
+        &config.client_id,
+        refresh,
+        bundle.scope.as_deref().or(Some(&config.scopes)),
+    )?;
+    let next_bundle = DelegatedTokenBundle {
+        access_token: refreshed.access_token.clone(),
+        refresh_token: refreshed
+            .refresh_token
+            .or_else(|| bundle.refresh_token.clone()),
+        expires_at_unix: now_epoch_secs() + refreshed.expires_in,
+        token_type: refreshed.token_type.or(bundle.token_type),
+        scope: refreshed
+            .scope
+            .or(bundle.scope)
+            .or_else(|| Some(config.scopes.clone())),
+    };
+    let row = session
+        .secrets_catalog
+        .secrets
+        .get(&secret)
+        .ok_or_else(|| anyhow::anyhow!("exact delegated-token Secrets version disappeared"))?;
+    let sealed = secrets_model::seal_version(
+        &session.secrets_reader,
+        &session.secrets_catalog,
+        row.scope,
+        &row.name,
+        &serde_json::to_vec(&next_bundle).context("encode refreshed Teams token bundle")?,
+        epoch_interval(now_epoch()),
+    )?;
+    let next_secret = sealed.secret;
+    session.commit_secret(sealed.fragment, "teams delegated token refresh")?;
+    let client_repair = config
+        .client_secret_version
+        .map(|id| format!(" --client-secret-version {id:x}"))
+        .unwrap_or_default();
+    eprintln!(
+        "Published refreshed delegated-token version {next_secret:x}; if auth-profile publication is interrupted, repair with `teams auth set --tenant {} --client-id {} --user-id {} --scopes @SCOPES{client_repair} --delegated-token-version {next_secret:x}`.",
+        config.tenant, config.client_id, config.user_id,
+    );
+    let mut fragment = source_fragment(&config.tenant);
+    let (profile, _) = teams_core::auth_profile_fragment(
+        config.source_id,
+        &config.client_id,
+        &config.user_id,
+        next_bundle.scope.as_deref().unwrap_or(&config.scopes),
+        config.client_secret_version,
+        Some(next_secret),
+        [config.profile],
+    )?;
+    fragment += profile;
+    session.commit(fragment, "teams auth profile after token refresh")?;
+    Ok(refreshed.access_token)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -825,6 +1280,7 @@ struct DeviceCodeResponse {
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
+    id_token: Option<String>,
     expires_in: i64,
     scope: Option<String>,
     token_type: Option<String>,
@@ -833,46 +1289,20 @@ struct TokenResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct ErrorResponse {
     error: String,
-    error_description: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct TokenState {
-    token_id: Id,
-    created_at_key: i128,
-    expires_at_key: i128,
-    access_token: Inline<Handle<LongString>>,
-    refresh_token: Option<Inline<Handle<LongString>>>,
-    scope: Option<Inline<Handle<LongString>>>,
-    tenant: Option<Inline<Handle<LongString>>>,
-    client_id: Option<Inline<Handle<LongString>>>,
-}
-
-#[derive(Debug, Clone)]
-struct ConfigState {
-    config_id: Id,
-    created_at_key: i128,
-    tenant: Option<Inline<Handle<LongString>>>,
-    client_id: Option<Inline<Handle<LongString>>>,
-    client_secret: Option<Inline<Handle<LongString>>>,
-    user_id: Option<Inline<Handle<LongString>>>,
-}
-
-#[derive(Debug, Clone)]
-struct ContextState {
-    presentation_name: Option<Inline<Handle<LongString>>>,
-    presentation_boundary: Option<Inline<Handle<LongString>>>,
-}
-
-#[derive(Debug, Clone)]
-struct TokenData {
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_at: Inline<NsTAIInterval>,
-    token_type: Option<String>,
-    scope: Option<String>,
-    tenant: String,
-    client_id: String,
+fn oauth_error_kind(body: &str) -> String {
+    serde_json::from_str::<ErrorResponse>(body)
+        .ok()
+        .map(|error| error.error)
+        .filter(|kind| {
+            !kind.is_empty()
+                && kind.len() <= 64
+                && kind
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn now_epoch_secs() -> i64 {
@@ -882,117 +1312,42 @@ fn now_epoch_secs() -> i64 {
         .as_secs() as i64
 }
 
-fn load_cached_token_from_pile(config: &TeamsBridgeConfig) -> Result<Option<String>> {
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-        let Some(state) = latest_token_state(&catalog) else {
-            return Ok(None);
-        };
-
-        let now_key = interval_key(epoch_interval(now_epoch()));
-        if state.expires_at_key > now_key + 30 * 1_000_000_000 {
-            let token = load_longstring(&mut ws, state.access_token)?;
-            return Ok(Some(token));
-        }
-
-        let refresh_handle = state.refresh_token.clone();
-        let tenant_handle = state.tenant.clone();
-        let client_handle = state.client_id.clone();
-        let Some(refresh_handle) = refresh_handle else {
-            return Ok(None);
-        };
-        let Some(tenant_handle) = tenant_handle else {
-            return Ok(None);
-        };
-        let Some(client_handle) = client_handle else {
-            return Ok(None);
-        };
-
-        let refresh = load_longstring(&mut ws, refresh_handle)?;
-        let tenant = load_longstring(&mut ws, tenant_handle)?;
-        let client_id = load_longstring(&mut ws, client_handle)?;
-        let scope = match state.scope.clone() {
-            Some(scope) => Some(load_longstring(&mut ws, scope)?),
-            None => None,
-        };
-
-        let refreshed = refresh_token(&tenant, &client_id, &refresh, scope.as_deref())?;
-        let expires_at = epoch_interval(epoch_after_seconds(now_epoch(), refreshed.expires_in));
-        let token = TokenData {
-            access_token: refreshed.access_token.clone(),
-            refresh_token: refreshed.refresh_token.or(Some(refresh)),
-            expires_at,
-            token_type: refreshed.token_type,
-            scope: refreshed.scope.or(scope),
-            tenant,
-            client_id,
-        };
-        store_token_in_repo(repo, branch_id, &token)?;
-        Ok(Some(token.access_token))
-    })
-}
-
-fn load_config_from_pile(config: &TeamsBridgeConfig) -> Result<Option<TeamsConfigData>> {
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-        let Some(state) = latest_config_state(&catalog) else {
-            return Ok(None);
-        };
-
-        let tenant = match state.tenant {
-            Some(handle) => Some(load_longstring(&mut ws, handle)?),
-            None => None,
-        };
-        let client_id = match state.client_id {
-            Some(handle) => Some(load_longstring(&mut ws, handle)?),
-            None => None,
-        };
-        let client_secret = match state.client_secret {
-            Some(handle) => Some(load_longstring(&mut ws, handle)?),
-            None => None,
-        };
-        let user_id = match state.user_id {
-            Some(handle) => Some(load_longstring(&mut ws, handle)?),
-            None => None,
-        };
-        Ok(Some(TeamsConfigData {
-            tenant,
-            client_id,
-            client_secret,
-            user_id,
-        }))
-    })
-}
-
-fn load_context_from_repo(
-    repo: &mut Repository<Pile>,
-    branch_id: Id,
+fn load_context(
+    reader: &PileReader,
+    catalog: &TribleSet,
+    source_id: Id,
 ) -> Result<TeamsPresentationContext> {
-    let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-    let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-    let Some(state) = latest_context_state(&catalog) else {
+    let heads = current_context_head_ids(catalog, source_id);
+    let Some(context_id) = one_optional(heads, "Teams presentation-context head")? else {
         return Ok(TeamsPresentationContext::default());
     };
-
-    let name = state
-        .presentation_name
-        .map(|handle| load_longstring(&mut ws, handle))
-        .transpose()?;
-    let boundary = state
-        .presentation_boundary
-        .map(|handle| load_longstring(&mut ws, handle))
-        .transpose()?;
+    let name = one_optional(
+        find!(
+            name: Inline<Handle<LongString>>,
+            pattern!(catalog, [{ context_id @ metadata::name: ?name }])
+        )
+        .collect(),
+        "Teams presentation name",
+    )?
+    .map(|handle| read_longstring(reader, handle, "Teams presentation name"))
+    .transpose()?;
+    let boundary = one_optional(
+        find!(
+            boundary: Inline<Handle<LongString>>,
+            pattern!(catalog, [{ context_id @ metadata::description: ?boundary }])
+        )
+        .collect(),
+        "Teams presentation boundary",
+    )?
+    .map(|handle| read_longstring(reader, handle, "Teams presentation boundary"))
+    .transpose()?;
     Ok(TeamsPresentationContext { name, boundary })
 }
 
-fn store_context_in_pile(
-    config: &TeamsBridgeConfig,
+fn store_context(
+    session: &mut TeamsSession<'_>,
+    source_id: Id,
+    tenant: &str,
     presentation_name: &str,
     presentation_boundary: &str,
 ) -> Result<TeamsPresentationContext> {
@@ -1005,31 +1360,22 @@ fn store_context_in_pile(
         bail!("Teams presentation boundary must not be empty");
     }
 
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-        let supersedes = current_context_head_ids(&catalog);
-        let context_id = ufoid();
-        let created_at = epoch_interval(now_epoch());
-        let name_handle = ws.put(presentation_name.to_owned());
-        let boundary_handle = ws.put(presentation_boundary.to_owned());
-        let mut change = TribleSet::new();
-        change += entity! { &context_id @
-            metadata::tag: teams::kind_context,
-            metadata::created_at: created_at,
-            metadata::supersedes*: supersedes,
-            metadata::name: name_handle,
-            metadata::description: boundary_handle,
-        };
-
-        ws.commit(change.difference(&catalog), "teams professional context");
-        map_err_debug(repo.push(&mut ws), "push workspace")?;
-        Ok(TeamsPresentationContext {
-            name: Some(presentation_name.to_owned()),
-            boundary: Some(presentation_boundary.to_owned()),
-        })
+    let supersedes = current_context_head_ids(&session.facts, source_id);
+    let mut fragment = source_fragment(tenant);
+    if fragment.root() != Some(source_id) {
+        bail!("Teams context tenant/source identity mismatch");
+    }
+    fragment += teams_core::context_fragment(
+        source_id,
+        epoch_interval(now_epoch()),
+        supersedes,
+        presentation_name,
+        presentation_boundary,
+    )?;
+    session.commit(fragment, "teams professional context")?;
+    Ok(TeamsPresentationContext {
+        name: Some(presentation_name.to_owned()),
+        boundary: Some(presentation_boundary.to_owned()),
     })
 }
 
@@ -1055,11 +1401,11 @@ fn print_context_banner(context: &TeamsPresentationContext) {
 }
 
 fn prepare_teams_context(
-    config: &TeamsBridgeConfig,
+    context: &TeamsPresentationContext,
     requested_as: Option<&str>,
     require_explicit_identity: bool,
 ) -> Result<TeamsPresentationContext> {
-    let context = config.presentation_context.clone();
+    let context = context.clone();
     print_context_banner(&context);
     if !require_explicit_identity {
         return Ok(context);
@@ -1106,396 +1452,194 @@ fn show_context(context: &TeamsPresentationContext) -> Result<()> {
     Ok(())
 }
 
-fn show_auth_status(config: &TeamsBridgeConfig) -> Result<()> {
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-
-        if let Some(state) = latest_config_state(&catalog) {
-            let tenant = state
-                .tenant
-                .map(|handle| load_longstring(&mut ws, handle))
-                .transpose()?;
-            let client_id = state
-                .client_id
-                .map(|handle| load_longstring(&mut ws, handle))
-                .transpose()?;
-            println!("tenant: {}", tenant.as_deref().unwrap_or("(unset)"));
-            println!("client_id: {}", client_id.as_deref().unwrap_or("(unset)"));
-            println!(
-                "app_client_secret: {}",
-                if state.client_secret.is_some() {
-                    "configured (validity not checked)"
-                } else {
-                    "not configured"
-                }
-            );
-            println!(
-                "user_identity: {}",
-                if state.user_id.is_some() {
-                    "configured"
-                } else {
-                    "not configured"
-                }
-            );
-        } else {
-            println!("tenant: (unset)");
-            println!("client_id: (unset)");
-            println!("app_client_secret: not configured");
-            println!("user_identity: not configured");
-        }
-
-        if let Some(token) = latest_token_state(&catalog) {
-            let now_key = interval_key(epoch_interval(now_epoch()));
-            let access_state = if token.expires_at_key > now_key + 30 * 1_000_000_000 {
-                "locally unexpired"
-            } else {
-                "locally expired"
-            };
-            println!("delegated_access_token: {access_state}");
-            println!(
-                "delegated_refresh_token: {}",
-                if token.refresh_token.is_some() {
-                    "configured (validity not checked)"
-                } else {
-                    "not configured"
-                }
-            );
-        } else {
-            println!("delegated_access_token: not configured");
-            println!("delegated_refresh_token: not configured");
-        }
-        Ok(())
-    })
-}
-
-fn latest_token_state(catalog: &TribleSet) -> Option<TokenState> {
-    let mut best: Option<TokenState> = None;
-    for (token_id, access_token, expires_at, created_at) in find!(
-        (
-            token: Id,
-            access: Inline<Handle<LongString>>,
-            expires_at: Inline<NsTAIInterval>,
-            created_at: Inline<NsTAIInterval>
-        ),
-        pattern!(catalog, [{
-            ?token @
-            metadata::tag: teams::kind_token,
-            teams::access_token: ?access,
-            metadata::expires_at: ?expires_at,
-            metadata::created_at: ?created_at,
-        }])
-    ) {
-        let created_key = interval_key(created_at);
-        let expires_key = interval_key(expires_at);
-        let replace = match &best {
-            None => true,
-            Some(current) => {
-                created_key > current.created_at_key
-                    || (created_key == current.created_at_key && token_id > current.token_id)
+fn show_auth_status(session: &TeamsSession<'_>, tenant: Option<&str>) -> Result<()> {
+    let sources = match tenant {
+        Some(tenant) => BTreeSet::from([source_id_for_tenant(tenant)?]),
+        None => teams_core::auth_profile_sources(&session.facts),
+    };
+    if sources.is_empty() {
+        println!("auth_profile: (unset)");
+        return Ok(());
+    }
+    for source in sources {
+        let tenant = teams_core::source_label(&session.reader, &session.facts, source)
+            .unwrap_or_else(|_| format!("unknown-source-{source:x}"));
+        println!("tenant: {tenant}");
+        match teams_core::auth_profile_head(&session.facts, source) {
+            teams_core::AuthProfileHead::Missing => println!("auth_profile: (unset)"),
+            teams_core::AuthProfileHead::Forked(heads) => {
+                println!("auth_profile: FORKED {heads:?}")
             }
-        };
-        if replace {
-            best = Some(TokenState {
-                token_id,
-                created_at_key: created_key,
-                expires_at_key: expires_key,
-                access_token,
-                refresh_token: find_optional_handle(catalog, token_id, &teams::refresh_token),
-                scope: find_optional_handle(catalog, token_id, &teams::scope),
-                tenant: find_optional_handle(catalog, token_id, &teams::tenant),
-                client_id: find_optional_handle(catalog, token_id, &teams::client_id),
-            });
-        }
-    }
-    best
-}
-
-fn latest_config_state(catalog: &TribleSet) -> Option<ConfigState> {
-    let mut best: Option<ConfigState> = None;
-    for (config_id, created_at) in find!(
-        (config: Id, created_at: Inline<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?config @
-            metadata::tag: teams::kind_config,
-            metadata::created_at: ?created_at,
-        }])
-    ) {
-        let created_key = interval_key(created_at);
-        let replace = match &best {
-            None => true,
-            Some(current) => {
-                created_key > current.created_at_key
-                    || (created_key == current.created_at_key && config_id > current.config_id)
+            teams_core::AuthProfileHead::Unique(profile) => {
+                let record = teams_core::auth_profile(&session.facts, profile)?;
+                println!("auth_profile: {profile:x}");
+                println!(
+                    "client_id: {}",
+                    read_longstring(&session.reader, record.client_id, "Teams client id")?
+                );
+                println!(
+                    "user_id: {}",
+                    read_longstring(&session.reader, record.user_id, "Teams user id")?
+                );
+                println!(
+                    "scopes: {}",
+                    read_longstring(&session.reader, record.scopes, "Teams scopes")?
+                );
+                println!(
+                    "client_secret_version: {}",
+                    record
+                        .client_secret_version
+                        .map(|id| format!("{id:x}"))
+                        .unwrap_or_else(|| "(unset)".to_owned())
+                );
+                println!(
+                    "delegated_token_version: {}",
+                    record
+                        .delegated_token_version
+                        .map(|id| format!("{id:x}"))
+                        .unwrap_or_else(|| "(unset)".to_owned())
+                );
             }
-        };
-        if replace {
-            best = Some(ConfigState {
-                config_id,
-                created_at_key: created_key,
-                tenant: find_optional_handle(catalog, config_id, &teams::tenant),
-                client_id: find_optional_handle(catalog, config_id, &teams::client_id),
-                client_secret: find_optional_handle(catalog, config_id, &teams::client_secret),
-                user_id: find_optional_handle(catalog, config_id, &teams::user_id),
-            });
         }
     }
-    best
+    Ok(())
 }
 
-fn latest_context_state(catalog: &TribleSet) -> Option<ContextState> {
-    let context_id = current_context_head_ids(catalog).into_iter().max()?;
-    Some(ContextState {
-        presentation_name: find_optional_handle(catalog, context_id, &metadata::name),
-        presentation_boundary: find_optional_handle(catalog, context_id, &metadata::description),
-    })
+#[allow(clippy::too_many_arguments)]
+fn set_auth_profile(
+    session: &mut TeamsSession<'_>,
+    tenant: &str,
+    client_id: &str,
+    user_id: &str,
+    scopes: &str,
+    client_secret_version: Option<&str>,
+    delegated_token_version: Option<&str>,
+) -> Result<()> {
+    let source = source_id_for_tenant(tenant)?;
+    let client_secret_version = client_secret_version
+        .map(|value| exact_secret_id(&session.secrets_catalog, value, "client-secret version"))
+        .transpose()?;
+    let delegated_token_version = delegated_token_version
+        .map(|value| exact_secret_id(&session.secrets_catalog, value, "delegated-token version"))
+        .transpose()?;
+    let predecessors = teams_core::auth_profile_head_ids(&session.facts, source);
+    let scopes = load_value_or_file(scopes, "Teams scopes")?;
+    let mut fragment = source_fragment(tenant);
+    let (profile, profile_id) = teams_core::auth_profile_fragment(
+        source,
+        client_id,
+        user_id,
+        &scopes,
+        client_secret_version,
+        delegated_token_version,
+        predecessors,
+    )?;
+    fragment += profile;
+    session.commit(fragment, "teams auth profile")?;
+    println!("auth_profile: {profile_id:x}");
+    Ok(())
 }
 
-fn current_context_head_ids(catalog: &TribleSet) -> Vec<Id> {
-    let mut context_ids = find!(
-        (context: Id),
-        pattern!(catalog, [{ ?context @ metadata::tag: teams::kind_context }])
-    )
-    .into_iter()
-    .map(|(context_id,)| context_id)
-    .collect::<Vec<_>>();
-    context_ids.sort_unstable();
-    context_ids.dedup();
-
-    let superseded = find!(
-        (predecessor: Id),
-        pattern!(catalog, [{
-            _?successor @
-            metadata::tag: teams::kind_context,
-            metadata::supersedes: ?predecessor,
-        }])
-    )
-    .into_iter()
-    .map(|(predecessor,)| predecessor)
-    .collect::<HashSet<_>>();
-    let heads = context_ids
-        .iter()
-        .copied()
-        .filter(|context_id| !superseded.contains(context_id))
-        .collect::<Vec<_>>();
-
-    // A malformed cyclic history should not make the safety context disappear.
-    // Deterministically fall back to the maximal known context id.
-    if heads.is_empty() && !context_ids.is_empty() {
-        context_ids.into_iter().max().into_iter().collect()
-    } else {
-        heads
-    }
+fn current_context_head_ids(catalog: &TribleSet, source_id: Id) -> BTreeSet<Id> {
+    teams_core::context_head_ids(catalog, source_id)
 }
 
-fn find_optional_handle(
+fn load_chat_map(
+    reader: &PileReader,
     catalog: &TribleSet,
-    entity: Id,
-    attribute: &Attribute<Handle<LongString>>,
-) -> Option<Inline<Handle<LongString>>> {
-    find!(
-        (handle: Inline<Handle<LongString>>),
-        pattern!(catalog, [{ entity @ attribute: ?handle }])
-    )
-    .into_iter()
-    .next()
-    .map(|(handle,)| handle)
-}
-
-fn find_optional_value<S: InlineEncoding>(
-    catalog: &TribleSet,
-    entity: Id,
-    attribute: &Attribute<S>,
-) -> Option<Inline<S>> {
-    find!(
-        (value: Inline<S>),
-        pattern!(catalog, [{ entity @ attribute: ?value }])
-    )
-    .into_iter()
-    .next()
-    .map(|(value,)| value)
-}
-
-fn find_optional_id(catalog: &TribleSet, entity: Id, attribute: &Attribute<GenId>) -> Option<Id> {
-    find!(
-        (value: Id),
-        pattern!(catalog, [{ entity @ attribute: ?value }])
-    )
-    .into_iter()
-    .next()
-    .map(|(value,)| value)
-}
-
-fn load_chat_map(ws: &mut Workspace<Pile>, catalog: &TribleSet) -> Result<HashMap<Id, String>> {
+    source_id: Id,
+) -> Result<HashMap<Id, String>> {
     let mut map = HashMap::new();
     for (chat_id, handle) in find!(
         (chat: Id, chat_id: Inline<Handle<LongString>>),
         pattern!(catalog, [{
-            ?chat @ teams::chat_id: ?chat_id,
+            ?chat @
+            metadata::tag: teams::kind_chat,
+            teams::source: source_id,
+            teams::chat_id: ?chat_id,
         }])
     ) {
-        let value = load_longstring(ws, handle)?;
+        let value = read_longstring(reader, handle, "Teams chat id")?;
         map.insert(chat_id, value);
     }
     Ok(map)
 }
 
 fn load_message_external_map(
-    ws: &mut Workspace<Pile>,
+    reader: &PileReader,
     catalog: &TribleSet,
+    source_id: Id,
 ) -> Result<HashMap<Id, String>> {
     let mut map = HashMap::new();
     for (message_id, handle) in find!(
-        (message: Id, message_id: Inline<Handle<LongString>>),
-        pattern!(catalog, [{
-            ?message @ teams::message_id: ?message_id,
-        }])
+        (message: Id, external: Inline<Handle<LongString>>),
+        pattern!(catalog, [
+            {
+                ?message @
+                metadata::tag: archive::kind_message,
+                teams::chat: _?chat,
+                teams::message_id: ?external,
+            },
+            {
+                _?chat @
+                metadata::tag: teams::kind_chat,
+                teams::source: source_id,
+            }
+        ])
     ) {
-        let value = load_longstring(ws, handle)?;
+        let value = read_longstring(reader, handle, "Teams message id")?;
         map.insert(message_id, value);
     }
     Ok(map)
 }
 
-fn load_author_map(ws: &mut Workspace<Pile>, catalog: &TribleSet) -> Result<HashMap<Id, String>> {
-    let mut map = HashMap::new();
-    for (author_id, handle) in find!(
-        (author: Id, name: Inline<Handle<LongString>>),
-        pattern!(catalog, [{
-            ?author @ archive::author_name: ?name,
-        }])
+fn load_known_messages(
+    reader: &PileReader,
+    catalog: &TribleSet,
+    source_id: Id,
+) -> Result<Vec<KnownMessage>> {
+    let mut known = BTreeSet::new();
+    for (message_id, message_external, chat_id, chat_external) in find!(
+        (
+            message: Id,
+            message_external: Inline<Handle<LongString>>,
+            chat: Id,
+            chat_external: Inline<Handle<LongString>>
+        ),
+        pattern!(catalog, [
+            {
+                ?message @
+                metadata::tag: archive::kind_message,
+                teams::chat: ?chat,
+                teams::message_id: ?message_external,
+            },
+            {
+                ?chat @
+                metadata::tag: teams::kind_chat,
+                teams::source: source_id,
+                teams::chat_id: ?chat_external,
+            }
+        ])
     ) {
-        let value = load_longstring(ws, handle)?;
-        map.insert(author_id, value);
+        known.insert(KnownMessage {
+            message_id,
+            message_external_id: read_longstring(reader, message_external, "Teams message id")?,
+            chat_id,
+            chat_external_id: read_longstring(reader, chat_external, "Teams chat id")?,
+        });
     }
-    Ok(map)
+    Ok(known.into_iter().collect())
 }
 
-fn store_token_in_repo(
-    repo: &mut Repository<Pile>,
-    branch_id: Id,
-    token: &TokenData,
-) -> Result<()> {
-    let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-    let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-    let change = build_token_change(&mut ws, &catalog, token)?;
-    if change.is_empty() {
-        return Ok(());
-    }
-    ws.commit(change, "teams token cache");
-    map_err_debug(repo.push(&mut ws), "push workspace")?;
-    Ok(())
-}
-
-fn store_token_in_pile(config: &TeamsBridgeConfig, token: &TokenData) -> Result<()> {
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| store_token_in_repo(repo, branch_id, token))
-}
-
-fn store_config_in_pile(config: &TeamsBridgeConfig, data: &TeamsConfigData) -> Result<()> {
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| store_config_in_repo(repo, branch_id, data))
-}
-
-fn build_token_change(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    token: &TokenData,
-) -> Result<TribleSet> {
-    let mut change = TribleSet::new();
-    let token_id = ufoid();
-    let access_handle = ws.put(token.access_token.clone());
-    let expires_at = token.expires_at;
-    let created_at = epoch_interval(now_epoch());
-    let tenant_handle = ws.put(token.tenant.clone());
-    let client_handle = ws.put(token.client_id.clone());
-    let refresh_handle = token
-        .refresh_token
-        .as_ref()
-        .map(|refresh| ws.put(refresh.to_owned()));
-    let token_type_handle = token
-        .token_type
-        .as_ref()
-        .map(|token_type| ws.put(token_type.to_owned()));
-    let scope_handle = token.scope.as_ref().map(|scope| ws.put(scope.to_owned()));
-
-    change += entity! { &token_id @
-        metadata::tag: teams::kind_token,
-        metadata::created_at: created_at,
-        teams::access_token: access_handle,
-        metadata::expires_at: expires_at,
-        teams::tenant: tenant_handle,
-        teams::client_id: client_handle,
-        teams::refresh_token?: refresh_handle,
-        teams::token_type?: token_type_handle,
-        teams::scope?: scope_handle,
-    };
-
-    Ok(change.difference(catalog))
-}
-
-fn store_config_in_repo(
-    repo: &mut Repository<Pile>,
-    branch_id: Id,
-    data: &TeamsConfigData,
-) -> Result<()> {
-    let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-    let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-    let change = build_config_change(&mut ws, &catalog, data)?;
-    if change.is_empty() {
-        return Ok(());
-    }
-    ws.commit(change, "teams config cache");
-    map_err_debug(repo.push(&mut ws), "push workspace")?;
-    Ok(())
-}
-
-fn build_config_change(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    data: &TeamsConfigData,
-) -> Result<TribleSet> {
-    let mut change = TribleSet::new();
-    let config_id = ufoid();
-    let created_at = epoch_interval(now_epoch());
-    let tenant_handle = data.tenant.as_ref().map(|value| ws.put(value.to_owned()));
-    let client_id_handle = data
-        .client_id
-        .as_ref()
-        .map(|value| ws.put(value.to_owned()));
-    let client_secret_handle = data
-        .client_secret
-        .as_ref()
-        .map(|value| ws.put(value.to_owned()));
-    let user_id_handle = data.user_id.as_ref().map(|value| ws.put(value.to_owned()));
-
-    change += entity! { &config_id @
-        metadata::tag: teams::kind_config,
-        metadata::created_at: created_at,
-        teams::tenant?: tenant_handle,
-        teams::client_id?: client_id_handle,
-        teams::client_secret?: client_secret_handle,
-        teams::user_id?: user_id_handle,
-    };
-
-    Ok(change.difference(catalog))
-}
-
-fn load_longstring(ws: &mut Workspace<Pile>, handle: Inline<Handle<LongString>>) -> Result<String> {
-    let view: View<str> = map_err_debug(ws.get(handle), "load longstring")?;
-    Ok(view.to_string())
-}
-
-fn load_files_longstring(
+fn read_longstring(
     reader: &PileReader,
     handle: Inline<Handle<LongString>>,
+    field: &str,
 ) -> Result<String> {
-    let view: View<str> = map_err_debug(reader.get(handle), "load Files longstring")?;
-    Ok(view.to_string())
+    let view: anybytes::View<str> = reader
+        .get(handle)
+        .with_context(|| format!("read {field} payload {}", hex::encode_upper(handle.raw)))?;
+    Ok(view.as_ref().to_owned())
 }
 
 fn epoch_after_seconds(base: Epoch, seconds: i64) -> Epoch {
@@ -1503,14 +1647,44 @@ fn epoch_after_seconds(base: Epoch, seconds: i64) -> Epoch {
     base + HifiDuration::from_seconds(seconds as f64)
 }
 
-fn login_device_code(
-    config: &TeamsBridgeConfig,
+fn login_device_code_collection(
+    session: &mut TeamsSession<'_>,
     tenant: &str,
     client_id: &str,
     client_secret: Option<&str>,
+    client_secret_version: Option<&str>,
+    secret_scope: Option<&str>,
     scopes: &str,
 ) -> Result<()> {
-    let device = request_device_code(tenant, client_id, scopes)?;
+    let tenant = tenant.trim();
+    if tenant.is_empty() {
+        bail!("Teams login tenant must not be empty");
+    }
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        bail!("Teams login client id must not be empty");
+    }
+    if client_secret.is_some_and(str::is_empty) {
+        bail!("Teams client secret must not be empty");
+    }
+    let scopes = teams_core::canonical_auth_scopes(scopes)?;
+    // Validate every caller-supplied collection coordinate before starting an
+    // interactive OAuth flow. Source-derived inheritance still has to wait
+    // until Microsoft identifies the concrete tenant.
+    let explicit_client_version = client_secret_version
+        .map(|value| exact_secret_id(&session.secrets_catalog, value, "client-secret version"))
+        .transpose()?;
+    let explicit_secret_scope = secret_scope
+        .map(|selector| {
+            secrets_model::resolve_scope(
+                &session.secrets_reader,
+                &session.secrets_catalog,
+                selector,
+            )
+        })
+        .transpose()?;
+
+    let device = request_device_code(tenant, client_id, &scopes)?;
     if let Some(message) = &device.message {
         println!("{message}");
     } else if let Some(url) = &device.verification_uri_complete {
@@ -1526,36 +1700,106 @@ fn login_device_code(
     let deadline = now_epoch_secs() + device.expires_in;
     let token = poll_device_token(tenant, client_id, &device.device_code, interval, deadline)?;
     let user_id = fetch_me_id(&token.access_token)?;
-    let expires_at = epoch_interval(epoch_after_seconds(now_epoch(), token.expires_in));
-    let token = TokenData {
+    let source_tenant =
+        resolve_source_tenant(tenant, token.id_token.as_deref(), Some(&token.access_token))?;
+    let source = source_id_for_tenant(&source_tenant)?;
+    let predecessors = teams_core::auth_profile_head_ids(&session.facts, source);
+    let previous = match teams_core::auth_profile_head(&session.facts, source) {
+        teams_core::AuthProfileHead::Unique(profile) => {
+            Some(teams_core::auth_profile(&session.facts, profile)?)
+        }
+        teams_core::AuthProfileHead::Missing | teams_core::AuthProfileHead::Forked(_) => None,
+    };
+    let inherited_client_version = match previous.as_ref() {
+        Some(profile)
+            if read_longstring(
+                &session.reader,
+                profile.client_id,
+                "predecessor Teams auth client id",
+            )? == client_id =>
+        {
+            profile.client_secret_version
+        }
+        Some(_) | None => None,
+    };
+    let client_scope_hint = explicit_client_version
+        .or(inherited_client_version)
+        .and_then(|id| session.secrets_catalog.secrets.get(&id))
+        .map(|secret| secret.scope);
+    let token_scope_hint = previous
+        .as_ref()
+        .and_then(|profile| profile.delegated_token_version)
+        .and_then(|id| session.secrets_catalog.secrets.get(&id))
+        .map(|secret| secret.scope);
+    let secret_scope = match explicit_secret_scope {
+        Some(scope) => scope,
+        None => token_scope_hint.or(client_scope_hint).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--secret-scope is required when no unique predecessor credential supplies one"
+            )
+        })?,
+    };
+
+    let canonical_scopes =
+        teams_core::canonical_auth_scopes(token.scope.as_deref().unwrap_or(&scopes))?;
+    let bundle = DelegatedTokenBundle {
         access_token: token.access_token,
         refresh_token: token.refresh_token,
-        expires_at,
+        expires_at_unix: now_epoch_secs() + token.expires_in,
         token_type: token.token_type,
-        scope: token.scope.or_else(|| Some(scopes.to_owned())),
-        tenant: tenant.to_owned(),
-        client_id: client_id.to_owned(),
+        scope: Some(canonical_scopes.clone()),
     };
-    store_token_in_pile(config, &token)?;
-    let existing = load_config_from_pile(config)?.unwrap_or_default();
-    let merged_secret = client_secret.map(str::to_owned).or(existing.client_secret);
-    let config_data = TeamsConfigData {
-        tenant: Some(tenant.to_owned()),
-        client_id: Some(client_id.to_owned()),
-        client_secret: merged_secret,
-        user_id: Some(user_id),
+    let sealed_token = secrets_model::seal_version(
+        &session.secrets_reader,
+        &session.secrets_catalog,
+        secret_scope,
+        &teams_secret_name(source, "delegated-token"),
+        &serde_json::to_vec(&bundle).context("encode Teams delegated-token bundle")?,
+        epoch_interval(now_epoch()),
+    )?;
+    let token_version = sealed_token.secret;
+    let mut secrets_fragment = sealed_token.fragment;
+
+    let client_version = if let Some(client_secret) = client_secret {
+        let sealed = secrets_model::seal_version(
+            &session.secrets_reader,
+            &session.secrets_catalog,
+            secret_scope,
+            &teams_secret_name(source, "client-secret"),
+            client_secret.as_bytes(),
+            epoch_interval(now_epoch()),
+        )?;
+        let id = sealed.secret;
+        secrets_fragment += sealed.fragment;
+        Some(id)
+    } else {
+        explicit_client_version.or(inherited_client_version)
     };
-    store_config_in_pile(config, &config_data)?;
-    println!(
-        "Stored token cache in {} (branch {})",
-        config.pile_path.display(),
-        config.branch
+
+    session.commit_secret(secrets_fragment, "teams login credential versions")?;
+    let client_repair = client_version
+        .map(|id| format!(" --client-secret-version {id:x}"))
+        .unwrap_or_default();
+    eprintln!(
+        "Published delegated-token version {token_version:x}; if Teams profile publication is interrupted, repair with `teams auth set --tenant {source_tenant} --client-id {client_id} --user-id {user_id} --scopes @SCOPES{client_repair} --delegated-token-version {token_version:x}`."
     );
-    println!(
-        "Stored Teams config in {} (branch {})",
-        config.pile_path.display(),
-        config.branch
-    );
+    let mut fragment = source_fragment(&source_tenant);
+    let (profile, profile_id) = teams_core::auth_profile_fragment(
+        source,
+        client_id,
+        &user_id,
+        &canonical_scopes,
+        client_version,
+        Some(token_version),
+        predecessors,
+    )?;
+    fragment += profile;
+    session.commit(fragment, "teams login auth profile")?;
+    println!("auth_profile: {profile_id:x}");
+    println!("delegated_token_version: {token_version:x}");
+    if let Some(client_version) = client_version {
+        println!("client_secret_version: {client_version:x}");
+    }
     Ok(())
 }
 
@@ -1571,7 +1815,10 @@ fn request_device_code(tenant: &str, client_id: &str, scopes: &str) -> Result<De
     let status = resp.status();
     let body = resp.text().unwrap_or_default();
     if !status.is_success() {
-        bail!("device code request failed: status={status} body={body}");
+        bail!(
+            "device code request failed: status={status} error={}",
+            oauth_error_kind(&body)
+        );
     }
     let parsed: DeviceCodeResponse =
         serde_json::from_str(&body).context("parse device code response")?;
@@ -1631,12 +1878,8 @@ fn poll_device_token(
             return Ok(token);
         }
 
-        let err: ErrorResponse = serde_json::from_str(&body).unwrap_or(ErrorResponse {
-            error: "unknown".to_owned(),
-            error_description: Some(body.clone()),
-        });
-
-        match err.error.as_str() {
+        let error = oauth_error_kind(&body);
+        match error.as_str() {
             "authorization_pending" => {
                 thread::sleep(StdDuration::from_secs(interval));
             }
@@ -1645,10 +1888,9 @@ fn poll_device_token(
                 thread::sleep(StdDuration::from_secs(interval));
             }
             "expired_token" => bail!("device code expired"),
-            other => bail!(
-                "device code authorization failed: {other} {}",
-                err.error_description.unwrap_or_default()
-            ),
+            other => {
+                bail!("device code authorization failed: status={status} error={other}")
+            }
         }
     }
 }
@@ -1677,7 +1919,10 @@ fn refresh_token(
     let status = resp.status();
     let body = resp.text().unwrap_or_default();
     if !status.is_success() {
-        bail!("refresh token failed: status={status} body={body}");
+        bail!(
+            "refresh token failed: status={status} error={}",
+            oauth_error_kind(&body)
+        );
     }
     let token: TokenResponse = serde_json::from_str(&body).context("parse refresh response")?;
     Ok(token)
@@ -1704,33 +1949,14 @@ fn request_client_credentials_token(
     let status = resp.status();
     let body = resp.text().unwrap_or_default();
     if !status.is_success() {
-        bail!("client credentials token failed: status={status} body={body}");
+        bail!(
+            "client credentials token failed: status={status} error={}",
+            oauth_error_kind(&body)
+        );
     }
     let token: TokenResponse =
         serde_json::from_str(&body).context("parse client credentials response")?;
     Ok(token)
-}
-
-fn fetch_delta_messages(token: &str, start_url: &str) -> Result<(Vec<JsonValue>, Option<String>)> {
-    let client = Client::new();
-    let mut url = start_url.to_owned();
-
-    let mut messages = Vec::new();
-    let cursor = loop {
-        let delta = fetch_delta_page(&client, token, &url)?;
-        messages.extend(delta.messages);
-
-        if let Some(next) = delta.next_link {
-            url = next;
-            continue;
-        }
-
-        break delta.delta_link.ok_or_else(|| {
-            anyhow::anyhow!("Teams delta response ended without @odata.deltaLink")
-        })?;
-    };
-
-    Ok((messages, Some(cursor)))
 }
 
 struct DeltaPage {
@@ -1749,22 +1975,6 @@ impl std::fmt::Display for DeltaCursorExpired {
 }
 
 impl std::error::Error for DeltaCursorExpired {}
-
-fn fetch_delta_with_cursor_recovery(
-    token: &str,
-    start_url: &str,
-    base_url: &str,
-    using_saved_cursor: bool,
-) -> Result<(Vec<JsonValue>, Option<String>)> {
-    match fetch_delta_messages(token, start_url) {
-        Ok(result) => Ok(result),
-        Err(err) if using_saved_cursor && err.downcast_ref::<DeltaCursorExpired>().is_some() => {
-            eprintln!("Teams delta cursor expired; restarting sync from the base endpoint.");
-            fetch_delta_messages(token, base_url)
-        }
-        Err(err) => Err(err),
-    }
-}
 
 fn fetch_delta_page(client: &Client, token: &str, url: &str) -> Result<DeltaPage> {
     let safe_url = url_without_query(url);
@@ -1802,7 +2012,7 @@ fn fetch_delta_page(client: &Client, token: &str, url: &str) -> Result<DeltaPage
         .get("value")
         .and_then(JsonValue::as_array)
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| anyhow::anyhow!("Teams delta response is missing its value array"))?;
     let next_link = json
         .get("@odata.nextLink")
         .and_then(JsonValue::as_str)
@@ -1823,8 +2033,13 @@ fn url_without_query(url: &str) -> &str {
     url.split_once('?').map_or(url, |(base, _)| base)
 }
 
-fn send_message(config: TeamsBridgeConfig, chat_id: &str, text: &str) -> Result<()> {
-    let token = get_delegated_token(&config)?;
+fn send_message(
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
+    chat_id: &str,
+    text: &str,
+) -> Result<()> {
+    let token = get_delegated_token(config, session)?;
     let url = format!("https://graph.microsoft.com/v1.0/chats/{chat_id}/messages");
     let body = json!({
         "body": {
@@ -1848,8 +2063,13 @@ fn send_message(config: TeamsBridgeConfig, chat_id: &str, text: &str) -> Result<
     Ok(())
 }
 
-fn list_users(config: TeamsBridgeConfig, prefix: Option<&str>, limit: usize) -> Result<()> {
-    let token = get_delegated_token(&config)?;
+fn list_users(
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
+    prefix: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let token = get_delegated_token(config, session)?;
     let mut url =
         reqwest::Url::parse("https://graph.microsoft.com/v1.0/users").context("parse users url")?;
     {
@@ -1903,7 +2123,8 @@ fn list_users(config: TeamsBridgeConfig, prefix: Option<&str>, limit: usize) -> 
 }
 
 fn set_presence_status(
-    config: TeamsBridgeConfig,
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
     availability: PresenceAvailability,
     activity: Option<PresenceActivity>,
     duration_mins: u32,
@@ -1917,18 +2138,11 @@ fn set_presence_status(
     if !(5..=240).contains(&duration_mins) {
         bail!("duration-mins must be between 5 and 240");
     }
-    let config_data = load_config_from_pile(&config)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "missing Teams config; run teams.rs login --client-id <app-id> --tenant <tenant-id>"
-        )
-    })?;
-    let user_id = config_data
-        .user_id
-        .ok_or_else(|| anyhow::anyhow!("missing user id; re-run teams.rs login"))?;
-    let default_session = config_data.client_id.unwrap_or_else(|| user_id.clone());
+    let user_id = config.user_id.clone();
+    let default_session = config.client_id.clone();
     let session_id = session_id.unwrap_or(default_session);
 
-    let token = get_delegated_token(&config)?;
+    let token = get_delegated_token(config, session)?;
     let url = format!("https://graph.microsoft.com/v1.0/users/{user_id}/presence/setPresence");
     let expiration = format!("PT{}M", duration_mins);
     let body = json!({
@@ -1953,11 +2167,15 @@ fn set_presence_status(
     Ok(())
 }
 
-fn get_presence(config: TeamsBridgeConfig, user_ids: Vec<String>) -> Result<()> {
+fn get_presence(
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
+    user_ids: Vec<String>,
+) -> Result<()> {
     if user_ids.is_empty() {
         bail!("presence-get requires at least one user id");
     }
-    let token = get_delegated_token(&config)?;
+    let token = get_delegated_token(config, session)?;
     let url = "https://graph.microsoft.com/v1.0/communications/getPresencesByUserId";
     let body = json!({
         "ids": user_ids,
@@ -2030,12 +2248,13 @@ fn ensure_presence_combo(availability: &str, activity: &str) -> Result<()> {
 }
 
 fn invite_to_chat(
-    config: TeamsBridgeConfig,
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
     chat_id: &str,
     user_id: &str,
     owner: bool,
 ) -> Result<()> {
-    let token = get_delegated_token(&config)?;
+    let token = get_delegated_token(config, session)?;
     let url = format!("https://graph.microsoft.com/v1.0/chats/{chat_id}/members");
     let roles = if owner { vec!["owner"] } else { Vec::new() };
     let body = json!({
@@ -2060,7 +2279,8 @@ fn invite_to_chat(
 }
 
 fn create_chat(
-    config: TeamsBridgeConfig,
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
     mut user_ids: Vec<String>,
     force_group: bool,
     topic: Option<String>,
@@ -2068,14 +2288,7 @@ fn create_chat(
     if user_ids.is_empty() {
         bail!("chat-create requires at least one user id");
     }
-    let config_data = load_config_from_pile(&config)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "missing Teams config; run teams.rs login --client-id <app-id> --tenant <tenant-id>"
-        )
-    })?;
-    let self_id = config_data
-        .user_id
-        .ok_or_else(|| anyhow::anyhow!("missing user id; re-run teams.rs login"))?;
+    let self_id = config.user_id.clone();
     if !user_ids.iter().any(|id| id == &self_id) {
         user_ids.push(self_id.clone());
     }
@@ -2117,7 +2330,7 @@ fn create_chat(
             }
         }
     }
-    let token = get_delegated_token(&config)?;
+    let token = get_delegated_token(config, session)?;
     let client = Client::new();
     let resp = client
         .post("https://graph.microsoft.com/v1.0/chats")
@@ -2156,22 +2369,16 @@ struct ReadOptions {
 struct ReadMessage {
     message_id: Id,
     chat_id: Id,
-    author_id: Id,
+    author_names: BTreeSet<Inline<Handle<LongString>>>,
+    deleted: bool,
     created_at: Inline<NsTAIInterval>,
     created_at_key: i128,
-    content: Inline<Handle<LongString>>,
+    content: Option<Inline<Handle<LongString>>>,
+    attachments: BTreeSet<Id>,
 }
 
 #[derive(Debug, Clone)]
 struct AttachmentListOptions {
-    chat_id: Option<String>,
-    message_id: Option<String>,
-    limit: usize,
-    descending: bool,
-}
-
-#[derive(Debug, Clone)]
-struct AttachmentBackfillOptions {
     chat_id: Option<String>,
     message_id: Option<String>,
     limit: usize,
@@ -2208,7 +2415,7 @@ struct AttachmentRow {
     created_at_key: i128,
     source_id: Option<Inline<Handle<LongString>>>,
     source_kind: Option<Inline<ShortString>>,
-    source_pointer: Option<Inline<Handle<LongString>>>,
+    source_pointers: BTreeSet<Inline<Handle<LongString>>>,
     name: Option<Inline<Handle<LongString>>>,
     media_type: Option<Inline<Handle<LongString>>>,
     size: Option<Inline<U256BE>>,
@@ -2233,120 +2440,211 @@ fn parse_attachment_reference(reference: &str) -> (Option<&str>, &str) {
     (None, reference)
 }
 
-fn read_messages(config: TeamsBridgeConfig, options: ReadOptions) -> Result<()> {
-    let mut app_token_cache = None;
-    pull_once_with_cache(&config, &mut app_token_cache)?;
-
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-
-        let chat_map = load_chat_map(&mut ws, &catalog)?;
-        let author_map = load_author_map(&mut ws, &catalog)?;
-        let chat_filter_ids = match options.chat_id.as_ref().map(|value| value.trim()) {
-            Some(value) if !value.is_empty() => {
-                let mut ids = HashSet::new();
-                for (chat_id, external) in &chat_map {
-                    if external == value {
-                        ids.insert(*chat_id);
-                    }
-                }
-                if ids.is_empty() {
-                    println!("No chat found for id {}", value);
-                    return Ok(());
-                }
-                Some(ids)
-            }
-            _ => None,
-        };
-
-        let since_key = parse_since_key(options.since.as_deref())?;
-        let mut messages = Vec::new();
-        for (message_id, content, author_id, created_at, chat_id) in find!(
-            (
-                message: Id,
-                content: Inline<Handle<LongString>>,
-                author: Id,
-                created_at: Inline<NsTAIInterval>,
-                chat: Id
-            ),
-            pattern!(&catalog, [{
+fn current_messages(catalog: &TribleSet, source_id: Id) -> Result<Vec<ReadMessage>> {
+    let message_chats = find!(
+        (message: Id, chat: Id),
+        pattern!(catalog, [
+            {
                 ?message @
                 metadata::tag: archive::kind_message,
-                archive::content: ?content,
-                archive::author: ?author,
-                metadata::created_at: ?created_at,
                 teams::chat: ?chat,
-            }])
-        ) {
-            if let Some(filter) = &chat_filter_ids {
-                if !filter.contains(&chat_id) {
-                    continue;
-                }
+                teams::message_id: _?external,
+            },
+            {
+                ?chat @
+                metadata::tag: teams::kind_chat,
+                teams::source: source_id,
             }
-            let created_key = interval_key(created_at);
-            if let Some(since_key) = since_key {
-                if created_key < since_key {
-                    continue;
-                }
-            }
-            messages.push(ReadMessage {
-                message_id,
-                chat_id,
-                author_id,
-                created_at,
-                created_at_key: created_key,
-                content,
-            });
+        ])
+    )
+    .collect::<BTreeMap<_, _>>();
+    let mut result = Vec::new();
+    for (message, state) in teams_core::current_message_states(catalog, source_id)? {
+        let chat = message_chats.get(&message).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Teams causal state names message {message:x} outside source {source_id:x}"
+            )
+        })?;
+        match state {
+            teams_core::CurrentMessageState::Present(observation) => result.push(
+                read_message_observation(catalog, message, chat, observation, false)?,
+            ),
+            teams_core::CurrentMessageState::Deleted(Some(observation)) => result.push(
+                read_message_observation(catalog, message, chat, observation, true)?,
+            ),
+            teams_core::CurrentMessageState::Deleted(None) => {}
         }
+    }
+    Ok(result)
+}
 
-        messages.sort_by(|left, right| {
-            left.created_at_key
-                .cmp(&right.created_at_key)
-                .then_with(|| left.message_id.cmp(&right.message_id))
-        });
-
-        if options.limit > 0 && messages.len() > options.limit {
-            let start = messages.len() - options.limit;
-            messages = messages.split_off(start);
-        }
-
-        if options.descending {
-            messages.reverse();
-        }
-
-        for message in messages {
-            let content = load_longstring(&mut ws, message.content)?;
-            let author = author_map
-                .get(&message.author_id)
-                .cloned()
-                .unwrap_or_else(|| format!("{}", message.author_id));
-            let chat = chat_map
-                .get(&message.chat_id)
-                .cloned()
-                .unwrap_or_else(|| format!("{}", message.chat_id));
-            let timestamp = format_interval(message.created_at);
-
-            println!("[{}] ({}) {}: {}", timestamp, chat, author, content);
-        }
-
-        Ok(())
+fn read_message_observation(
+    catalog: &TribleSet,
+    message_id: Id,
+    chat_id: Id,
+    observation_id: Id,
+    deleted: bool,
+) -> Result<ReadMessage> {
+    let created_at = one_optional(
+        find!(
+            created: Inline<NsTAIInterval>,
+            pattern!(catalog, [{ observation_id @ metadata::created_at: ?created }])
+        )
+        .collect(),
+        "Teams message created time",
+    )?;
+    let content = one_optional(
+        find!(
+            content: Inline<Handle<LongString>>,
+            pattern!(catalog, [{ observation_id @ archive::content: ?content }])
+        )
+        .collect(),
+        "Teams message content",
+    )?;
+    let author_names = find!(
+        name: Inline<Handle<LongString>>,
+        pattern!(catalog, [{ observation_id @ teams::author_name: ?name }])
+    )
+    .collect::<BTreeSet<_>>();
+    if !deleted && (created_at.is_none() || content.is_none()) {
+        bail!("present Teams observation {observation_id:x} lacks created time or content");
+    }
+    let modified_at = one_required(
+        find!(
+            modified: Inline<NsTAIInterval>,
+            pattern!(catalog, [{ observation_id @ teams::modified_at: ?modified }])
+        )
+        .collect(),
+        "Teams message modified time",
+    )?;
+    let created_at = created_at.unwrap_or(modified_at);
+    let attachments = find!(
+        attachment: Id,
+        pattern!(catalog, [{ observation_id @ archive::attachment: ?attachment }])
+    )
+    .collect::<BTreeSet<_>>();
+    Ok(ReadMessage {
+        message_id,
+        chat_id,
+        author_names,
+        deleted,
+        created_at,
+        created_at_key: interval_key(created_at),
+        content,
+        attachments,
     })
+}
+
+fn read_messages(
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
+    options: ReadOptions,
+) -> Result<()> {
+    let mut app_token_cache = None;
+    pull_once_with_cache(config, &mut app_token_cache, session)?;
+    let view = session.view();
+    let chat_map = load_chat_map(&view.reader, &view.facts, config.source_id)?;
+    let chat_filter_ids = filter_external_ids(options.chat_id.as_deref(), &chat_map, "chat")?;
+    let since_key = parse_since_key(options.since.as_deref())?;
+    let mut messages = current_messages(&view.facts, config.source_id)?
+        .into_iter()
+        .filter(|message| !message.deleted)
+        .filter(|message| {
+            chat_filter_ids
+                .as_ref()
+                .is_none_or(|filter| filter.contains(&message.chat_id))
+        })
+        .filter(|message| since_key.is_none_or(|since| message.created_at_key >= since))
+        .collect::<Vec<_>>();
+    messages.sort_by(|left, right| {
+        left.created_at_key
+            .cmp(&right.created_at_key)
+            .then_with(|| left.message_id.cmp(&right.message_id))
+    });
+    if options.limit > 0 && messages.len() > options.limit {
+        messages = messages.split_off(messages.len() - options.limit);
+    }
+    if options.descending {
+        messages.reverse();
+    }
+    for message in messages {
+        let content = read_longstring(
+            &view.reader,
+            message.content.expect("present observation has content"),
+            "Teams message content",
+        )?;
+        let mut author_names = message
+            .author_names
+            .into_iter()
+            .map(|handle| read_longstring(&view.reader, handle, "Teams author display name"))
+            .collect::<Result<Vec<_>>>()?;
+        author_names.sort();
+        author_names.dedup();
+        let author = if author_names.is_empty() {
+            "unknown".to_owned()
+        } else {
+            author_names.join(" / ")
+        };
+        let chat = chat_map
+            .get(&message.chat_id)
+            .cloned()
+            .unwrap_or_else(|| format!("{}", message.chat_id));
+        println!(
+            "[{}] ({}) {}: {}",
+            format_interval(message.created_at),
+            chat,
+            author,
+            content
+        );
+    }
+    Ok(())
+}
+
+fn filter_external_ids(
+    requested: Option<&str>,
+    map: &HashMap<Id, String>,
+    kind: &str,
+) -> Result<Option<HashSet<Id>>> {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let ids = map
+        .iter()
+        .filter_map(|(id, external)| (external == requested).then_some(*id))
+        .collect::<HashSet<_>>();
+    if ids.is_empty() {
+        bail!("No {kind} found for id {requested}");
+    }
+    Ok(Some(ids))
 }
 
 #[derive(Debug, Clone)]
 struct IncomingMessage {
-    chat_external_id: String,
+    chat_external_id: Option<String>,
     message_external_id: String,
     raw_json: String,
     author_external_id: Option<String>,
     author_display_name: Option<String>,
-    content: String,
-    created_at: Inline<NsTAIInterval>,
-    created_at_key: i128,
+    content: Option<String>,
+    created_at: Option<Inline<NsTAIInterval>>,
+    modified_at: Option<Inline<NsTAIInterval>>,
+    source_removed: bool,
+    deleted: bool,
+    deleted_at: Option<Inline<NsTAIInterval>>,
+    etag: Option<String>,
     attachments: Vec<AttachmentSource>,
+}
+
+/// A source-local logical message identity already established by a previous
+/// admitted page (or by a fully identified message in the page being built).
+/// Graph's minimal `@removed` records contain only the source-local message id,
+/// so they may be resolved only when that id names exactly one such record.
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct KnownMessage {
+    message_id: Id,
+    message_external_id: String,
+    chat_id: Id,
+    chat_external_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2354,735 +2652,415 @@ struct AttachmentSource {
     source_kind: &'static str,
     source_id: String,
     source_url: Option<String>,
+    fetch_required: bool,
     name: Option<String>,
     content_type: Option<String>,
     content_bytes: Option<Vec<u8>>,
 }
 
-fn open_pile(path: &PathBuf) -> Result<Pile> {
-    let mut pile = Pile::open(path).with_context(|| format!("open pile {}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        // Avoid Drop warnings on early errors.
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    Ok(pile)
-}
-
-fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -> Result<()> {
-    let mut app_token_cache = None;
-    pull_once_with_cache(&config, &mut app_token_cache)?;
-    let files_signer = load_signer(&config.pile_path, None)?;
-
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-        let (files_catalog, files_reader) =
-            file_capability::materialize_collection(repo.storage_mut(), &files_signer)?;
-
-        let chat_map = load_chat_map(&mut ws, &catalog)?;
-        let message_map = load_message_external_map(&mut ws, &catalog)?;
-
-        let chat_filter_ids = match options.chat_id.as_ref().map(|value| value.trim()) {
-            Some(value) if !value.is_empty() => {
-                let mut ids = HashSet::new();
-                for (chat_id, external) in &chat_map {
-                    if external == value {
-                        ids.insert(*chat_id);
-                    }
-                }
-                if ids.is_empty() {
-                    println!("No chat found for id {}", value);
-                    return Ok(());
-                }
-                Some(ids)
-            }
-            _ => None,
-        };
-
-        let message_filter_ids = match options.message_id.as_ref().map(|value| value.trim()) {
-            Some(value) if !value.is_empty() => {
-                let mut ids = HashSet::new();
-                for (message_id, external) in &message_map {
-                    if external == value {
-                        ids.insert(*message_id);
-                    }
-                }
-                if ids.is_empty() {
-                    println!("No message found for id {}", value);
-                    return Ok(());
-                }
-                Some(ids)
-            }
-            _ => None,
-        };
-
-        let mut rows = Vec::new();
-        for (message_id, attachment_id, created_at, chat_id) in find!(
-            (
-                message: Id,
-                attachment: Id,
-                created_at: Inline<NsTAIInterval>,
-                chat: Id
-            ),
-            pattern!(&catalog, [{
-                ?message @
-                archive::attachment: ?attachment,
-                metadata::created_at: ?created_at,
-                teams::chat: ?chat,
-            }])
-        ) {
-            if let Some(filter) = &chat_filter_ids {
-                if !filter.contains(&chat_id) {
-                    continue;
-                }
-            }
-            if let Some(filter) = &message_filter_ids {
-                if !filter.contains(&message_id) {
-                    continue;
-                }
-            }
-            let file_id = find_optional_id(&catalog, attachment_id, &archive::attachment_file);
-            rows.push(AttachmentRow {
-                attachment_id,
-                message_id,
-                chat_id,
-                created_at,
-                created_at_key: interval_key(created_at),
-                source_id: find_optional_handle(
-                    &catalog,
-                    attachment_id,
-                    &archive::attachment_source_id,
-                ),
-                source_kind: find_optional_value(&catalog, attachment_id, &teams::attachment_kind),
-                source_pointer: find_optional_handle(
-                    &catalog,
-                    attachment_id,
-                    &archive::attachment_source_pointer,
-                ),
-                name: find_optional_handle(&catalog, attachment_id, &archive::attachment_name)
-                    .or_else(|| {
-                        file_id.and_then(|file_id| {
-                            find_optional_handle(&files_catalog, file_id, &file::name)
-                        })
-                    }),
-                media_type: file_id.and_then(|file_id| {
-                    file_capability::media_type_name_handle(&files_catalog, file_id)
-                }),
-                size: find_optional_value(&catalog, attachment_id, &archive::attachment_size_bytes),
-            });
-        }
-
-        rows.sort_by(|left, right| {
-            left.created_at_key
-                .cmp(&right.created_at_key)
-                .then_with(|| left.attachment_id.cmp(&right.attachment_id))
-        });
-
-        if options.limit > 0 && rows.len() > options.limit {
-            let start = rows.len() - options.limit;
-            rows = rows.split_off(start);
-        }
-
-        if options.descending {
-            rows.reverse();
-        }
-
-        for row in rows {
-            let chat = chat_map
-                .get(&row.chat_id)
-                .cloned()
-                .unwrap_or_else(|| format!("{}", row.chat_id));
-            let message = message_map
-                .get(&row.message_id)
-                .cloned()
-                .unwrap_or_else(|| format!("{}", row.message_id));
-            let source_id = row
-                .source_id
-                .map(|handle| load_longstring(&mut ws, handle))
-                .transpose()?
-                .unwrap_or_default();
-            let source_kind = row
-                .source_kind
-                .map(|value| String::try_from_inline(&value).unwrap());
-            let source_reference = attachment_reference(source_kind.as_deref(), source_id.as_str());
-            let source_pointer = row
-                .source_pointer
-                .map(|handle| load_longstring(&mut ws, handle))
-                .transpose()?;
-            let name = row
-                .name
-                .map(|handle| load_longstring(&mut ws, handle))
-                .transpose()?;
-            let media_type = row
-                .media_type
-                .map(|handle| load_files_longstring(&files_reader, handle))
-                .transpose()?;
-            let size = row
-                .size
-                .and_then(u256_to_u128)
-                .map(|value| value.to_string());
-            let timestamp = format_interval(row.created_at);
-
-            let size_display = size.unwrap_or_else(|| "-".to_string());
-            let name_display = name.unwrap_or_else(|| "-".to_string());
-            let mime_display = media_type.unwrap_or_else(|| "-".to_string());
-            let pointer_display = source_pointer.unwrap_or_else(|| "-".to_string());
-            println!(
-                "[{}] ({}) msg={} attachment={} name={} mime={} size={} source={}",
-                timestamp,
-                chat,
-                message,
-                source_reference,
-                name_display,
-                mime_display,
-                size_display,
-                pointer_display
-            );
-        }
-
-        Ok(())
-    })
-}
-
-fn backfill_attachments(
-    config: TeamsBridgeConfig,
-    options: AttachmentBackfillOptions,
+fn list_attachments(
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
+    options: AttachmentListOptions,
 ) -> Result<()> {
     let mut app_token_cache = None;
-    let (token, _app_config) = get_app_token(&config, &mut app_token_cache)?;
-    pull_once_with_cache(&config, &mut app_token_cache)?;
-
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-        validate_message_identity_lineage(&catalog)?;
-        let index = CatalogIndex::build(&catalog);
-
-        let chat_map = load_chat_map(&mut ws, &catalog)?;
-        let message_map = load_message_external_map(&mut ws, &catalog)?;
-        let mut files_plan = FilesPlan::default();
-
-        let chat_filter_ids = match options.chat_id.as_ref().map(|value| value.trim()) {
-            Some(value) if !value.is_empty() => {
-                let mut ids = HashSet::new();
-                for (chat_id, external) in &chat_map {
-                    if external == value {
-                        ids.insert(*chat_id);
-                    }
-                }
-                if ids.is_empty() {
-                    println!("No chat found for id {}", value);
-                    return Ok(());
-                }
-                Some(ids)
-            }
-            _ => None,
-        };
-
-        let message_filter_ids = match options.message_id.as_ref().map(|value| value.trim()) {
-            Some(value) if !value.is_empty() => {
-                let mut ids = HashSet::new();
-                for (message_id, external) in &message_map {
-                    if external == value {
-                        ids.insert(*message_id);
-                    }
-                }
-                if ids.is_empty() {
-                    println!("No message found for id {}", value);
-                    return Ok(());
-                }
-                Some(ids)
-            }
-            _ => None,
-        };
-
-        let mut content_map = HashMap::new();
-        let mut chat_by_message = HashMap::new();
-        let mut created_by_message = HashMap::new();
-        for (message_id, chat_id, created_at, content) in find!(
-            (
-                message: Id,
-                chat: Id,
-                created_at: Inline<NsTAIInterval>,
-                content: Inline<Handle<LongString>>
-            ),
-            pattern!(&catalog, [{
-                ?message @
-                metadata::tag: archive::kind_message,
-                teams::chat: ?chat,
-                metadata::created_at: ?created_at,
-                archive::content: ?content,
-            }])
-        ) {
-            content_map.insert(message_id, content);
-            chat_by_message.insert(message_id, chat_id);
-            created_by_message.insert(message_id, created_at);
-        }
-
-        let mut raw_map = HashMap::new();
-        for (message_id, raw) in find!(
-            (message: Id, raw: Inline<Handle<LongString>>),
-            pattern!(&catalog, [{ ?message @ teams::message_raw: ?raw }])
-        ) {
-            raw_map.insert(message_id, raw);
-        }
-
-        let mut message_rows = Vec::new();
-        for (message_id, content_handle) in &content_map {
-            let chat_id = match chat_by_message.get(message_id) {
-                Some(chat_id) => *chat_id,
-                None => continue,
-            };
-            if let Some(filter) = &chat_filter_ids {
-                if !filter.contains(&chat_id) {
-                    continue;
-                }
-            }
-            if let Some(filter) = &message_filter_ids {
-                if !filter.contains(message_id) {
-                    continue;
-                }
-            }
-            let created_at = match created_by_message.get(message_id) {
-                Some(created_at) => *created_at,
-                None => continue,
-            };
-            message_rows.push((
-                *message_id,
-                chat_id,
-                created_at,
-                interval_key(created_at),
-                *content_handle,
-            ));
-        }
-
-        message_rows.sort_by(|left, right| left.3.cmp(&right.3).then_with(|| left.0.cmp(&right.0)));
-        if options.descending {
-            message_rows.reverse();
-        }
-        if options.limit > 0 && message_rows.len() > options.limit {
-            message_rows.truncate(options.limit);
-        }
-
-        let mut change = TribleSet::new();
-        let mut added_attachments = HashSet::new();
-        let mut scanned = 0usize;
-        let mut created = 0usize;
-        for (message_id, chat_id, created_at, _created_key, content_handle) in message_rows {
-            let chat_external_id = match chat_map.get(&chat_id) {
-                Some(value) => value.clone(),
-                None => continue,
-            };
-            let message_external_id = match message_map.get(&message_id) {
-                Some(value) => value.clone(),
-                None => continue,
-            };
-
-            let content = load_longstring(&mut ws, content_handle)?;
-            let raw_json = raw_map
-                .get(&message_id)
-                .map(|handle| load_longstring(&mut ws, *handle))
-                .transpose()?;
-
-            let mut seen = HashSet::new();
-            let mut attachments = Vec::new();
-            if let Some(raw_str) = raw_json.as_deref() {
-                if let Ok(parsed) = serde_json::from_str::<JsonValue>(raw_str) {
-                    attachments.extend(parse_json_attachments(
-                        &parsed,
-                        &chat_external_id,
-                        &message_external_id,
-                        &mut seen,
-                    ));
-                }
-            }
-            attachments.extend(parse_hosted_content_attachments(
-                &content,
-                &chat_external_id,
-                &message_external_id,
-                &mut seen,
-            ));
-
-            if attachments.is_empty() {
-                continue;
-            }
-
-            // `created_at`, `content`, `chat_external_id`, `message_external_id`,
-            // and `raw_json` are not used by the new `ensure_attachments` —
-            // they were kept in the stub only to satisfy the old IncomingMessage
-            // shape. The backfill only needs `message_id` + the attachments list.
-            let _ = (
-                created_at,
-                &content,
-                &chat_external_id,
-                &message_external_id,
-                &raw_json,
-            );
-            let before = change.len() + files_plan.facts_len();
-            ensure_attachments(
-                &mut ws,
-                &mut change,
-                &mut files_plan,
-                &index,
-                message_id,
-                &attachments,
-                &token,
-                &mut added_attachments,
-            )?;
-            if change.len() + files_plan.facts_len() > before {
-                created += 1;
-            }
-            scanned += 1;
-        }
-
-        let change = change.difference(&catalog);
-        if change.is_empty() && !files_plan.has_work() {
-            println!("No attachments to backfill.");
-            return Ok(());
-        }
-
-        publish_files_plan(repo, &config.pile_path, files_plan)?;
-        if !change.is_empty() {
-            ws.commit(change, "teams attachments backfill");
-            map_err_debug(repo.push(&mut ws), "push workspace")?;
-        }
-        println!("Backfilled attachments for {created} messages (scanned {scanned}).");
-        Ok(())
-    })
+    pull_once_with_cache(config, &mut app_token_cache, session)?;
+    let view = session.view();
+    let chat_map = load_chat_map(&view.reader, &view.facts, config.source_id)?;
+    let message_map = load_message_external_map(&view.reader, &view.facts, config.source_id)?;
+    let chat_filter = filter_external_ids(options.chat_id.as_deref(), &chat_map, "chat")?;
+    let message_filter =
+        filter_external_ids(options.message_id.as_deref(), &message_map, "message")?;
+    let mut rows = attachment_rows(
+        &view.reader,
+        &view.facts,
+        config.source_id,
+        chat_filter.as_ref(),
+        message_filter.as_ref(),
+    )?;
+    rows.sort_by(|left, right| {
+        left.created_at_key
+            .cmp(&right.created_at_key)
+            .then_with(|| left.attachment_id.cmp(&right.attachment_id))
+    });
+    if options.limit > 0 && rows.len() > options.limit {
+        rows = rows.split_off(rows.len() - options.limit);
+    }
+    if options.descending {
+        rows.reverse();
+    }
+    for row in rows {
+        let chat = chat_map
+            .get(&row.chat_id)
+            .cloned()
+            .unwrap_or_else(|| format!("{}", row.chat_id));
+        let message = message_map
+            .get(&row.message_id)
+            .cloned()
+            .unwrap_or_else(|| format!("{}", row.message_id));
+        let source_id = row
+            .source_id
+            .map(|handle| read_longstring(&view.reader, handle, "Teams attachment source id"))
+            .transpose()?
+            .unwrap_or_default();
+        let source_kind = row
+            .source_kind
+            .map(|value| String::try_from_inline(&value))
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("decode attachment kind: {error:?}"))?;
+        let mut source_pointers = row
+            .source_pointers
+            .into_iter()
+            .map(|handle| read_longstring(&view.reader, handle, "Teams attachment pointer"))
+            .collect::<Result<Vec<_>>>()?;
+        source_pointers.sort();
+        source_pointers.dedup();
+        let name = row
+            .name
+            .map(|handle| read_longstring(&view.reader, handle, "Teams attachment name"))
+            .transpose()?;
+        let media_type = row
+            .media_type
+            .map(|handle| read_longstring(&view.reader, handle, "Teams attachment media type"))
+            .transpose()?;
+        let size = row.size.map(inline_u256_to_u128).transpose()?;
+        println!(
+            "[{}] ({}) msg={} attachment={} name={} mime={} size={} source={}",
+            format_interval(row.created_at),
+            chat,
+            message,
+            attachment_reference(source_kind.as_deref(), &source_id),
+            name.as_deref().unwrap_or("-"),
+            media_type.as_deref().unwrap_or("-"),
+            size.map(|size| size.to_string()).as_deref().unwrap_or("-"),
+            if source_pointers.is_empty() {
+                "-".to_owned()
+            } else {
+                source_pointers.join(" | ")
+            },
+        );
+    }
+    Ok(())
 }
 
-fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions) -> Result<()> {
-    let mut app_token_cache = None;
-    pull_once_with_cache(&config, &mut app_token_cache)?;
-    let files_signer = load_signer(&config.pile_path, None)?;
-
-    let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
-    with_repo_close(repo, |repo| {
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
-        let (files_catalog, files_reader) =
-            file_capability::materialize_collection(repo.storage_mut(), &files_signer)?;
-
-        let chat_map = load_chat_map(&mut ws, &catalog)?;
-        let message_map = load_message_external_map(&mut ws, &catalog)?;
-
-        let chat_filter_ids = match options.chat_id.as_ref().map(|value| value.trim()) {
-            Some(value) if !value.is_empty() => {
-                let mut ids = HashSet::new();
-                for (chat_id, external) in &chat_map {
-                    if external == value {
-                        ids.insert(*chat_id);
-                    }
-                }
-                if ids.is_empty() {
-                    println!("No chat found for id {}", value);
-                    return Ok(());
-                }
-                Some(ids)
-            }
-            _ => None,
-        };
-
-        let message_filter_ids = match options.message_id.as_ref().map(|value| value.trim()) {
-            Some(value) if !value.is_empty() => {
-                let mut ids = HashSet::new();
-                for (message_id, external) in &message_map {
-                    if external == value {
-                        ids.insert(*message_id);
-                    }
-                }
-                if ids.is_empty() {
-                    println!("No message found for id {}", value);
-                    return Ok(());
-                }
-                Some(ids)
-            }
-            _ => None,
-        };
-
-        let wanted_reference = options.source_id.trim();
-        let (wanted_kind, wanted_source) = parse_attachment_reference(wanted_reference);
-        if wanted_source.is_empty() {
-            bail!("attachment source id is empty");
+fn attachment_rows(
+    _reader: &PileReader,
+    catalog: &TribleSet,
+    source_id: Id,
+    chat_filter: Option<&HashSet<Id>>,
+    message_filter: Option<&HashSet<Id>>,
+) -> Result<Vec<AttachmentRow>> {
+    let mut rows = Vec::new();
+    for message in current_messages(catalog, source_id)?
+        .into_iter()
+        .filter(|message| !message.deleted)
+    {
+        if chat_filter.is_some_and(|filter| !filter.contains(&message.chat_id))
+            || message_filter.is_some_and(|filter| !filter.contains(&message.message_id))
+        {
+            continue;
         }
-
-        let mut candidates = Vec::new();
-        for (message_id, attachment_id, chat_id, source_id_handle) in find!(
-            (
-                message: Id,
-                attachment: Id,
-                chat: Id,
-                source_id: Inline<Handle<LongString>>
-            ),
-            pattern!(&catalog, [
-                { ?message @ archive::attachment: ?attachment, teams::chat: ?chat },
-                { ?attachment @ archive::attachment_source_id: ?source_id }
-            ])
-        ) {
-            if let Some(filter) = &chat_filter_ids {
-                if !filter.contains(&chat_id) {
-                    continue;
-                }
-            }
-            if let Some(filter) = &message_filter_ids {
-                if !filter.contains(&message_id) {
-                    continue;
-                }
-            }
-            let source_id = load_longstring(&mut ws, source_id_handle)?;
-            if source_id != wanted_source {
-                continue;
-            }
-            let source_kind = find_optional_value(&catalog, attachment_id, &teams::attachment_kind)
-                .map(|value| String::try_from_inline(&value).unwrap());
-            if wanted_kind.is_some_and(|wanted| source_kind.as_deref() != Some(wanted)) {
-                continue;
-            }
-            let Some(file_id) =
-                find_optional_id(&catalog, attachment_id, &archive::attachment_file)
-            else {
-                continue;
-            };
-            let Some(data_handle) = find_optional_value(&files_catalog, file_id, &file::content)
-            else {
-                continue;
-            };
-
-            candidates.push(AttachmentExportCandidate {
-                message_id,
-                chat_id,
-                source_id,
-                source_kind,
-                data_handle,
-                name: find_optional_handle(&catalog, attachment_id, &archive::attachment_name)
-                    .or_else(|| find_optional_handle(&files_catalog, file_id, &file::name)),
-                media_type: file_capability::media_type_name_handle(&files_catalog, file_id),
+        for attachment_id in message.attachments {
+            let source_id = one_required(
+                find!(
+                    value: Inline<Handle<LongString>>,
+                    pattern!(catalog, [{ attachment_id @ archive::attachment_source_id: ?value }])
+                )
+                .collect(),
+                "Teams attachment source id",
+            )?;
+            let source_kind = one_required(
+                find!(
+                    value: Inline<ShortString>,
+                    pattern!(catalog, [{ attachment_id @ teams::attachment_kind: ?value }])
+                )
+                .collect(),
+                "Teams attachment kind",
+            )?;
+            let source_pointers = find!(
+                value: Inline<Handle<LongString>>,
+                pattern!(catalog, [{ attachment_id @ archive::attachment_source_pointer: ?value }])
+            )
+            .collect::<BTreeSet<_>>();
+            let file_id = one_optional(
+                find!(
+                    value: Id,
+                    pattern!(catalog, [{ attachment_id @ archive::attachment_file: ?value }])
+                )
+                .collect(),
+                "Teams attachment file",
+            )?;
+            let occurrence_name = one_optional(
+                find!(
+                    value: Inline<Handle<LongString>>,
+                    pattern!(catalog, [{ attachment_id @ archive::attachment_name: ?value }])
+                )
+                .collect(),
+                "Teams attachment occurrence name",
+            )?;
+            let file_name = file_id
+                .map(|id| file_capability::name_handle(catalog, id))
+                .transpose()?
+                .flatten();
+            let media_type = file_id
+                .map(|id| file_capability::media_type_name_handle_strict(catalog, id))
+                .transpose()?
+                .flatten();
+            let size = one_optional(
+                find!(
+                    value: Inline<U256BE>,
+                    pattern!(catalog, [{ attachment_id @ archive::attachment_size_bytes: ?value }])
+                )
+                .collect(),
+                "Teams attachment size",
+            )?;
+            rows.push(AttachmentRow {
+                attachment_id,
+                message_id: message.message_id,
+                chat_id: message.chat_id,
+                created_at: message.created_at,
+                created_at_key: message.created_at_key,
+                source_id: Some(source_id),
+                source_kind: Some(source_kind),
+                source_pointers,
+                name: occurrence_name.or(file_name),
+                media_type,
+                size,
             });
         }
-
-        if candidates.is_empty() {
-            println!("No attachment found for {wanted_reference}.");
-            return Ok(());
-        }
-
-        if candidates.len() > 1 {
-            println!(
-                "Multiple attachments matched. Use the qualified attachment reference shown below, or --chat-id/--message-id, to disambiguate:"
-            );
-            for candidate in &candidates {
-                let chat = chat_map
-                    .get(&candidate.chat_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{}", candidate.chat_id));
-                let message = message_map
-                    .get(&candidate.message_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{}", candidate.message_id));
-                println!(
-                    "- chat={chat} message={message} attachment={}",
-                    attachment_reference(candidate.source_kind.as_deref(), &candidate.source_id)
-                );
-            }
-            return Ok(());
-        }
-
-        let candidate = candidates.remove(0);
-        let media_type = candidate
-            .media_type
-            .map(|handle| load_files_longstring(&files_reader, handle))
-            .transpose()?;
-        let mut filename = options
-            .filename
-            .clone()
-            .or_else(|| {
-                candidate
-                    .name
-                    .map(|handle| load_files_longstring(&files_reader, handle))
-                    .transpose()
-                    .ok()
-                    .flatten()
-            })
-            .unwrap_or_else(|| candidate.source_id.clone());
-
-        filename = sanitize_filename(&filename);
-        if !filename.contains('.') {
-            if let Some(ext) = infer_extension(media_type.as_deref()) {
-                filename.push('.');
-                filename.push_str(ext);
-            }
-        }
-
-        let out_dir = options.out_dir.clone();
-        fs::create_dir_all(&out_dir)
-            .with_context(|| format!("create output dir {}", out_dir.display()))?;
-        let path = out_dir.join(&filename);
-        if path.exists() && !options.overwrite {
-            bail!("output file exists: {} (use --overwrite)", path.display());
-        }
-
-        let bytes: Bytes = map_err_debug(
-            files_reader.get::<Bytes, RawBytes>(candidate.data_handle),
-            "load attachment bytes",
-        )?;
-        fs::write(&path, bytes.as_ref())
-            .with_context(|| format!("write attachment {}", path.display()))?;
-        println!("{}", path.display());
-        Ok(())
-    })
-}
-
-fn open_repo_for_branch_id(
-    path: &PathBuf,
-    branch_id: Id,
-    branch_name: &str,
-) -> Result<(Repository<Pile>, Id)> {
-    let mut pile = open_pile(path)?;
-    if pile
-        .head(branch_id)
-        .map_err(|err| anyhow::anyhow!("branch head {branch_name}: {err:?}"))?
-        .is_none()
-    {
-        let _ = pile.close();
-        return Err(anyhow::anyhow!(
-            "unknown branch {branch_name} ({branch_id:x})"
-        ));
     }
-    let repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))?;
-    Ok((repo, branch_id))
+    Ok(rows)
 }
 
-#[derive(Debug, Clone)]
-struct CursorState {
-    url: String,
-}
-
-fn load_cursor_from_space(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-) -> Result<Option<CursorState>> {
-    let mut best: Option<(i128, Id, Inline<Handle<LongString>>)> = None;
-    for (cursor_id, delta_link, created_at) in find!(
-        (cursor: Id, delta_link: Inline<Handle<LongString>>, created_at: Inline<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?cursor @
-            metadata::tag: teams::kind_cursor,
-            teams::delta_link: ?delta_link,
-            metadata::created_at: ?created_at,
-        }])
-    ) {
-        let key = interval_key(created_at);
-        let replace = match &best {
-            None => true,
-            Some((best_key, best_id, _)) => {
-                key > *best_key || (key == *best_key && cursor_id > *best_id)
-            }
-        };
-        if replace {
-            best = Some((key, cursor_id, delta_link));
-        }
+fn export_attachment(
+    config: &TeamsBridgeConfig,
+    session: &mut TeamsSession<'_>,
+    options: AttachmentExportOptions,
+) -> Result<()> {
+    let mut app_token_cache = None;
+    pull_once_with_cache(config, &mut app_token_cache, session)?;
+    let view = session.view();
+    let chat_map = load_chat_map(&view.reader, &view.facts, config.source_id)?;
+    let message_map = load_message_external_map(&view.reader, &view.facts, config.source_id)?;
+    let chat_filter = filter_external_ids(options.chat_id.as_deref(), &chat_map, "chat")?;
+    let message_filter =
+        filter_external_ids(options.message_id.as_deref(), &message_map, "message")?;
+    let wanted = options.source_id.trim();
+    let (wanted_kind, wanted_source) = parse_attachment_reference(wanted);
+    if wanted_source.is_empty() {
+        bail!("attachment source id is empty");
     }
-
-    let Some((_key, _cursor_id, handle)) = best else {
-        return Ok(None);
-    };
-
-    let view: View<str> = map_err_debug(
-        ws.get::<View<str>, LongString>(handle),
-        "load teams delta cursor",
+    let rows = attachment_rows(
+        &view.reader,
+        &view.facts,
+        config.source_id,
+        chat_filter.as_ref(),
+        message_filter.as_ref(),
     )?;
-    Ok(Some(CursorState {
-        url: view.to_string(),
-    }))
-}
-
-fn build_cursor_change(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    current: Option<&CursorState>,
-    new_cursor: Option<String>,
-) -> Result<Option<TribleSet>> {
-    let Some(cursor) = new_cursor else {
-        return Ok(None);
-    };
-    let cursor = cursor.trim().to_owned();
-    if cursor.is_empty() {
-        return Ok(None);
+    let mut candidates = Vec::new();
+    for row in rows {
+        let source = read_longstring(
+            &view.reader,
+            row.source_id.expect("attachment row has source id"),
+            "Teams attachment source id",
+        )?;
+        let kind_inline = row.source_kind.expect("attachment row has source kind");
+        let kind = String::try_from_inline(&kind_inline)
+            .map_err(|error| anyhow::anyhow!("decode attachment kind: {error:?}"))?;
+        if source != wanted_source || wanted_kind.is_some_and(|wanted| wanted != kind) {
+            continue;
+        }
+        let file_id = one_optional(
+            find!(
+                file: Id,
+                pattern!(&view.facts, [{ row.attachment_id @ archive::attachment_file: ?file }])
+            )
+            .collect(),
+            "Teams attachment file",
+        )?;
+        let Some(file_id) = file_id else {
+            continue;
+        };
+        let data_handle = file_capability::content_handle(&view.facts, file_id)?
+            .ok_or_else(|| anyhow::anyhow!("attachment file {file_id:x} has no content"))?;
+        candidates.push(AttachmentExportCandidate {
+            message_id: row.message_id,
+            chat_id: row.chat_id,
+            source_id: source,
+            source_kind: Some(kind),
+            data_handle,
+            name: row.name,
+            media_type: row.media_type,
+        });
     }
-    if current.is_some_and(|state| state.url == cursor) {
-        return Ok(None);
+    if candidates.is_empty() {
+        println!("No stored attachment bytes found for {wanted}.");
+        return Ok(());
     }
-
-    let handle = ws.put(cursor);
-    let now = epoch_interval(now_epoch());
-    let cursor_id = ufoid();
-    let mut change = TribleSet::new();
-    change += entity! { &cursor_id @
-        metadata::tag: teams::kind_cursor,
-        teams::delta_link: handle,
-        metadata::created_at: now,
-    };
-    Ok(Some(change.difference(catalog)))
+    if candidates.len() > 1 {
+        println!("Multiple attachments matched; add --chat-id/--message-id:");
+        for candidate in &candidates {
+            println!(
+                "- chat={} message={} attachment={}",
+                chat_map
+                    .get(&candidate.chat_id)
+                    .map(String::as_str)
+                    .unwrap_or("?"),
+                message_map
+                    .get(&candidate.message_id)
+                    .map(String::as_str)
+                    .unwrap_or("?"),
+                attachment_reference(candidate.source_kind.as_deref(), &candidate.source_id),
+            );
+        }
+        return Ok(());
+    }
+    let candidate = candidates.remove(0);
+    let media_type = candidate
+        .media_type
+        .map(|handle| read_longstring(&view.reader, handle, "attachment media type"))
+        .transpose()?;
+    let mut filename = options
+        .filename
+        .or_else(|| {
+            candidate
+                .name
+                .map(|handle| read_longstring(&view.reader, handle, "attachment name"))
+                .transpose()
+                .ok()
+                .flatten()
+        })
+        .unwrap_or(candidate.source_id);
+    filename = sanitize_filename(&filename);
+    if !filename.contains('.') {
+        if let Some(extension) = infer_extension(media_type.as_deref()) {
+            filename.push('.');
+            filename.push_str(extension);
+        }
+    }
+    fs::create_dir_all(&options.out_dir)
+        .with_context(|| format!("create output dir {}", options.out_dir.display()))?;
+    let path = options.out_dir.join(filename);
+    if path.exists() && !options.overwrite {
+        bail!("output file exists: {} (use --overwrite)", path.display());
+    }
+    let bytes: Bytes = view
+        .reader
+        .get(candidate.data_handle)
+        .context("load attachment bytes")?;
+    fs::write(&path, bytes.as_ref())
+        .with_context(|| format!("write attachment {}", path.display()))?;
+    println!("{}", path.display());
+    Ok(())
 }
 
 fn parse_messages(messages: Vec<JsonValue>) -> Result<Vec<IncomingMessage>> {
-    // Graph delta responses may repeat one logical entity, including multiple
-    // versions in one response sequence. Coalesce before constructing facts so
-    // page boundaries and replay order cannot create conflicting first-write
-    // values on a new logical message.
-    let mut parsed: HashMap<(String, String), (i128, String, String, IncomingMessage)> =
-        HashMap::new();
+    // Preserve every distinct immutable source version. Full versions are
+    // ordered only by Graph's lastModifiedDateTime and etag; neither field is
+    // synthesized from another timestamp. Minimal @removed records carry no
+    // usable version clock and are ordered causally by their page receipt.
+    let mut parsed = BTreeMap::new();
     for message in messages {
-        if message.get("@removed").is_some() {
+        let message_external_id = message
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Teams delta message is missing id"))?;
+        let chat_external_id = message
+            .get("chatId")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let source_removed = message.get("@removed").is_some();
+        let raw_json = serde_json::to_string(&message).context("serialize teams message json")?;
+
+        if source_removed {
+            let incoming = IncomingMessage {
+                chat_external_id,
+                message_external_id: message_external_id.to_owned(),
+                raw_json: raw_json.clone(),
+                author_external_id: None,
+                author_display_name: None,
+                content: None,
+                created_at: None,
+                modified_at: None,
+                source_removed: true,
+                deleted: true,
+                deleted_at: None,
+                etag: None,
+                attachments: Vec::new(),
+            };
+            parsed.insert(
+                (
+                    incoming.chat_external_id.clone(),
+                    incoming.message_external_id.clone(),
+                    None,
+                    None,
+                    raw_json,
+                ),
+                incoming,
+            );
             continue;
         }
 
-        let Some(chat_external_id) = message.get("chatId").and_then(JsonValue::as_str) else {
-            continue;
-        };
-        let Some(message_external_id) = message.get("id").and_then(JsonValue::as_str) else {
-            continue;
-        };
-        let Some(created_at_str) = message.get("createdDateTime").and_then(JsonValue::as_str)
-        else {
-            continue;
-        };
-        let Some(content) = message
+        let chat_external_id = chat_external_id.ok_or_else(|| {
+            anyhow::anyhow!("Teams delta message {message_external_id} is missing chatId")
+        })?;
+        let content = message
             .get("body")
             .and_then(|body| body.get("content"))
             .and_then(JsonValue::as_str)
-        else {
-            continue;
-        };
+            .map(str::to_owned);
 
-        let epoch = parse_graph_datetime(created_at_str).unwrap_or_else(now_epoch);
-        let created_at = epoch_interval(epoch);
-        let created_at_key = interval_key(created_at);
-        let modified_at_key = message
+        let created_at = message
+            .get("createdDateTime")
+            .and_then(JsonValue::as_str)
+            .map(|value| {
+                teams_core::parse_graph_datetime(value)
+                    .map(epoch_interval)
+                    .ok_or_else(|| anyhow::anyhow!("invalid Teams createdDateTime {value:?}"))
+            })
+            .transpose()?;
+        let deleted_at = message
+            .get("deletedDateTime")
+            .and_then(JsonValue::as_str)
+            .map(|value| {
+                teams_core::parse_graph_datetime(value)
+                    .map(epoch_interval)
+                    .ok_or_else(|| anyhow::anyhow!("invalid Teams deletedDateTime {value:?}"))
+            })
+            .transpose()?;
+        let deleted = deleted_at.is_some();
+        if !deleted && content.is_none() {
+            bail!("Teams delta message {message_external_id} is missing body.content");
+        }
+        let modified_at = message
             .get("lastModifiedDateTime")
             .and_then(JsonValue::as_str)
-            .and_then(parse_graph_datetime)
-            .map(epoch_interval)
-            .map(interval_key)
-            .unwrap_or(created_at_key);
+            .map(|value| {
+                teams_core::parse_graph_datetime(value)
+                    .map(epoch_interval)
+                    .ok_or_else(|| anyhow::anyhow!("invalid Teams lastModifiedDateTime {value:?}"))
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Teams delta message {message_external_id} has no Graph lastModifiedDateTime; refusing to manufacture a source version"
+                )
+            })?;
+        let modified_at_key = interval_key(modified_at);
         let etag = message
             .get("etag")
             .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .to_owned();
+            .map(str::trim)
+            .filter(|etag| !etag.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Teams delta message {message_external_id} has no Graph etag; refusing to manufacture a source version"
+                )
+            })?;
 
         let from = message.get("from");
         let author_external_id = from
@@ -3096,57 +3074,51 @@ fn parse_messages(messages: Vec<JsonValue>) -> Result<Vec<IncomingMessage>> {
             .and_then(JsonValue::as_str)
             .map(str::to_owned);
 
-        let raw_json = serde_json::to_string(&message).context("serialize teams message json")?;
-
         let mut attachments = Vec::new();
         let mut seen_sources = HashSet::new();
         attachments.extend(parse_json_attachments(
             &message,
-            chat_external_id,
+            &chat_external_id,
             message_external_id,
             &mut seen_sources,
-        ));
-        attachments.extend(parse_hosted_content_attachments(
-            &content,
-            chat_external_id,
-            message_external_id,
-            &mut seen_sources,
-        ));
+        )?);
+        if let Some(content) = content.as_deref() {
+            attachments.extend(parse_hosted_content_attachments(
+                content,
+                &chat_external_id,
+                message_external_id,
+                &mut seen_sources,
+            ));
+        }
 
-        let raw_order_key = raw_json.clone();
         let incoming = IncomingMessage {
-            chat_external_id: chat_external_id.to_owned(),
+            chat_external_id: Some(chat_external_id.clone()),
             message_external_id: message_external_id.to_owned(),
-            raw_json,
+            raw_json: raw_json.clone(),
             author_external_id,
             author_display_name,
-            content: content.to_owned(),
+            content,
             created_at,
-            created_at_key,
+            modified_at: Some(modified_at),
+            source_removed: false,
+            deleted,
+            deleted_at,
+            etag: Some(etag.clone()),
             attachments,
         };
-        let logical_key = (
-            incoming.chat_external_id.clone(),
-            incoming.message_external_id.clone(),
+        parsed.insert(
+            (
+                incoming.chat_external_id.clone(),
+                incoming.message_external_id.clone(),
+                Some(modified_at_key),
+                Some(etag),
+                raw_json,
+            ),
+            incoming,
         );
-        let version_key = (modified_at_key, etag.clone(), raw_order_key.clone());
-        let replace = parsed
-            .get(&logical_key)
-            .is_none_or(|(modified, old_etag, old_raw, _)| {
-                version_key > (*modified, old_etag.clone(), old_raw.clone())
-            });
-        if replace {
-            parsed.insert(
-                logical_key,
-                (modified_at_key, etag, raw_order_key, incoming),
-            );
-        }
     }
 
-    Ok(parsed
-        .into_values()
-        .map(|(_, _, _, message)| message)
-        .collect())
+    Ok(parsed.into_values().collect())
 }
 
 fn parse_json_attachments(
@@ -3154,28 +3126,38 @@ fn parse_json_attachments(
     chat_external_id: &str,
     message_external_id: &str,
     seen: &mut HashSet<String>,
-) -> Vec<AttachmentSource> {
+) -> Result<Vec<AttachmentSource>> {
     let mut attachments = Vec::new();
-    let Some(list) = message.get("attachments").and_then(JsonValue::as_array) else {
-        return attachments;
+    let Some(value) = message.get("attachments") else {
+        return Ok(attachments);
     };
+    if value.is_null() {
+        return Ok(attachments);
+    }
+    let list = value.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Teams delta message {message_external_id} has a non-array attachments field"
+        )
+    })?;
     for attachment in list {
-        let Some(source_id) = attachment.get("id").and_then(JsonValue::as_str) else {
-            continue;
-        };
+        let source_id = attachment
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|source_id| !source_id.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Teams delta message {message_external_id} has an attachment without an id"
+                )
+            })?;
         if !seen.insert(format!("attachment:{source_id}")) {
-            continue;
+            bail!("Teams delta message {message_external_id} repeats attachment id {source_id:?}");
         }
 
-        let mut source_url = attachment
+        let source_url = attachment
             .get("contentUrl")
             .and_then(JsonValue::as_str)
             .map(str::to_owned);
-        if source_url.is_none() {
-            source_url = Some(format!(
-                "https://graph.microsoft.com/v1.0/chats/{chat_external_id}/messages/{message_external_id}/attachments/{source_id}/$value"
-            ));
-        }
         let name = attachment
             .get("name")
             .and_then(JsonValue::as_str)
@@ -3187,19 +3169,22 @@ fn parse_json_attachments(
         let content_bytes = attachment
             .get("contentBytes")
             .and_then(JsonValue::as_str)
-            .and_then(|value| decode_base64(value).ok());
+            .map(decode_base64)
+            .transpose()?;
 
         attachments.push(AttachmentSource {
             source_kind: "attachment",
             source_id: source_id.to_owned(),
             source_url,
+            fetch_required: false,
             name,
             content_type,
             content_bytes,
         });
     }
 
-    attachments
+    let _ = (chat_external_id, message_external_id);
+    Ok(attachments)
 }
 
 fn parse_hosted_content_attachments(
@@ -3209,7 +3194,7 @@ fn parse_hosted_content_attachments(
     seen: &mut HashSet<String>,
 ) -> Vec<AttachmentSource> {
     let mut attachments = Vec::new();
-    for hosted_id in extract_hosted_content_ids(content) {
+    for hosted_id in teams_core::extract_hosted_content_ids(content) {
         if !seen.insert(format!("hosted-content:{hosted_id}")) {
             continue;
         }
@@ -3220,30 +3205,13 @@ fn parse_hosted_content_attachments(
             source_kind: "hosted-content",
             source_id: hosted_id,
             source_url: Some(url),
+            fetch_required: true,
             name: None,
             content_type: None,
             content_bytes: None,
         });
     }
     attachments
-}
-
-fn extract_hosted_content_ids(content: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    let needle = "/hostedContents/";
-    let mut pos = 0;
-    while let Some(idx) = content[pos..].find(needle) {
-        let start = pos + idx + needle.len();
-        let rest = &content[start..];
-        let end = rest.find('/').unwrap_or(rest.len());
-        let id = rest[..end].trim();
-        if !id.is_empty() && seen.insert(id.to_string()) {
-            ids.push(id.to_string());
-        }
-        pos = start + end;
-    }
-    ids
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>> {
@@ -3256,533 +3224,384 @@ fn decode_base64(value: &str) -> Result<Vec<u8>> {
         .map_err(|err| anyhow::anyhow!("base64 decode failed: {err:?}"))
 }
 
-struct CatalogIndex {
-    messages: HashSet<Id>,
-    authors: HashSet<Id>,
-    chats: HashSet<Id>,
-    attachments: HashSet<Id>,
-    message_attachment_set: HashSet<(Id, Id)>,
-    attachment_files: HashMap<Id, HashSet<Id>>,
-    author_name_set: HashSet<Id>,
-    message_raw_set: HashSet<Id>,
-    message_content_set: HashSet<Id>,
-    message_created_at_set: HashSet<Id>,
-}
+type CoverageHead = teams_core::CoverageHead;
 
-impl CatalogIndex {
-    fn build(catalog: &TribleSet) -> Self {
-        let messages = find!(
-            (message: Id),
-            pattern!(catalog, [{
-                ?message @
-                metadata::tag: archive::kind_message,
-            }])
-        )
-        .into_iter()
-        .map(|(message,)| message)
-        .collect::<HashSet<_>>();
-
-        let authors = find!(
-            (author: Id),
-            pattern!(catalog, [{
-                ?author @
-                metadata::tag: archive::kind_author,
-            }])
-        )
-        .into_iter()
-        .map(|(author,)| author)
-        .collect::<HashSet<_>>();
-
-        let chats = find!(
-            (chat: Id),
-            pattern!(catalog, [{ ?chat @ metadata::tag: teams::kind_chat }])
-        )
-        .into_iter()
-        .map(|(chat,)| chat)
-        .collect::<HashSet<_>>();
-
-        let attachments = find!(
-            (attachment: Id),
-            pattern!(catalog, [{
-                ?attachment @
-                metadata::tag: archive::kind_attachment,
-            }])
-        )
-        .into_iter()
-        .map(|(attachment,)| attachment)
-        .collect::<HashSet<_>>();
-
-        let message_attachment_set = find!(
-            (message: Id, attachment: Id),
-            pattern!(catalog, [{ ?message @ archive::attachment: ?attachment }])
-        )
-        .into_iter()
-        .collect::<HashSet<_>>();
-
-        let mut attachment_files: HashMap<Id, HashSet<Id>> = HashMap::new();
-        for (attachment, file_id) in find!(
-            (attachment: Id, file_id: Id),
-            pattern!(catalog, [{ ?attachment @ archive::attachment_file: ?file_id }])
-        ) {
-            attachment_files
-                .entry(attachment)
-                .or_default()
-                .insert(file_id);
-        }
-
-        let author_name_set = find!(
-            (author: Id, name: Inline<Handle<LongString>>),
-            pattern!(catalog, [{ ?author @ archive::author_name: ?name }])
-        )
-        .into_iter()
-        .map(|(author, _)| author)
-        .collect::<HashSet<_>>();
-
-        let message_raw_set = find!(
-            (message: Id, raw: Inline<Handle<LongString>>),
-            pattern!(catalog, [{ ?message @ teams::message_raw: ?raw }])
-        )
-        .into_iter()
-        .map(|(message, _)| message)
-        .collect::<HashSet<_>>();
-
-        let message_content_set = find!(
-            (message: Id, content: Inline<Handle<LongString>>),
-            pattern!(catalog, [{ ?message @ archive::content: ?content }])
-        )
-        .into_iter()
-        .map(|(message, _)| message)
-        .collect::<HashSet<_>>();
-
-        let message_created_at_set = find!(
-            (message: Id, created_at: Inline<NsTAIInterval>),
-            pattern!(catalog, [{ ?message @ metadata::created_at: ?created_at }])
-        )
-        .into_iter()
-        .map(|(message, _)| message)
-        .collect::<HashSet<_>>();
-
-        Self {
-            messages,
-            authors,
-            chats,
-            attachments,
-            message_attachment_set,
-            attachment_files,
-            author_name_set,
-            message_raw_set,
-            message_content_set,
-            message_created_at_set,
-        }
+fn one_optional<T: Ord>(values: BTreeSet<T>, field: &str) -> Result<Option<T>> {
+    match values.len() {
+        0 => Ok(None),
+        1 => Ok(values.into_iter().next()),
+        count => bail!("{field} has {count} values; refusing arbitrary selection"),
     }
 }
 
-fn file_entity_ids(catalog: &TribleSet) -> HashSet<Id> {
-    find!(
-        (file_id: Id),
-        pattern!(catalog, [
-            {
-                ?file_id @
-                metadata::tag: &KIND_FILE,
-                file::content: _?content,
-                file::name: _?name,
-                file::media_type: _?media_type,
-            },
-            {
-                _?media_type @
-                metadata::tag: &KIND_MEDIA_TYPE,
-                metadata::name: _?media_type_name,
-            }
-        ])
-    )
-    .into_iter()
-    .map(|(file_id,)| file_id)
-    .collect()
+fn one_required<T: Ord>(values: BTreeSet<T>, field: &str) -> Result<T> {
+    one_optional(values, field)?.ok_or_else(|| anyhow::anyhow!("{field} is missing"))
 }
 
-#[derive(Default)]
-struct FilesPlan {
-    fragments: Vec<Fragment>,
-    staged_file_ids: HashSet<Id>,
-    existing_links: HashSet<(Id, Id)>,
+fn inline_u256_to_u128(value: Inline<U256BE>) -> Result<u128> {
+    let raw = value.raw;
+    if raw[..16].iter().any(|byte| *byte != 0) {
+        bail!("Teams coverage generation exceeds u128");
+    }
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&raw[16..]);
+    Ok(u128::from_be_bytes(bytes))
 }
 
-impl FilesPlan {
-    fn stage(&mut self, fragment: Fragment) -> Id {
-        let file_id = fragment
-            .root()
-            .expect("canonical file fragment has one root");
-        if self.staged_file_ids.insert(file_id) {
-            self.fragments.push(fragment);
-        }
-        file_id
-    }
-
-    fn validate_existing(&mut self, attachment_id: Id, file_id: Id) {
-        self.existing_links.insert((attachment_id, file_id));
-    }
-
-    fn facts_len(&self) -> usize {
-        self.fragments
-            .iter()
-            .map(|fragment| fragment.facts().len())
-            .sum()
-    }
-
-    fn has_work(&self) -> bool {
-        !self.fragments.is_empty() || !self.existing_links.is_empty()
-    }
-}
-
-/// Validate only source occurrences that already name a canonical file, then
-/// publish each newly staged file as its own deterministic collection commit.
-/// Attachment-free pulls never load the Files signer or enumerate Files.
-fn publish_files_plan(
-    repo: &mut Repository<Pile>,
-    pile_path: &PathBuf,
-    plan: FilesPlan,
-) -> Result<()> {
-    if !plan.has_work() {
-        return Ok(());
-    }
-
-    let signer = load_signer(pile_path, None)?;
-    if !plan.existing_links.is_empty() {
-        let (catalog, _) = file_capability::materialize_collection(repo.storage_mut(), &signer)?;
-        let existing_files = file_entity_ids(&catalog);
-        for (attachment_id, file_id) in &plan.existing_links {
-            if !existing_files.contains(file_id) {
-                bail!(
-                    "Teams attachment occurrence {attachment_id:x} links to incomplete file record {file_id:x}; repair the Files collection before retrying"
-                );
-            }
-        }
-    }
-
-    for fragment in plan.fragments {
-        file_capability::commit_collection(repo.storage_mut(), &signer, fragment)?;
-    }
-    Ok(())
-}
-
-fn validate_message_identity_lineage(catalog: &TribleSet) -> Result<()> {
-    for (message_id,) in find!(
-        (message: Id),
-        pattern!(catalog, [{ ?message @ metadata::tag: archive::kind_message }])
-    ) {
-        let chats = find!(
-            (chat: Id),
-            pattern!(catalog, [{ message_id @ teams::chat: ?chat }])
-        )
-        .map(|(chat,)| chat)
-        .collect::<HashSet<_>>();
-        let external_ids = find!(
-            (external: Inline<Handle<LongString>>),
-            pattern!(catalog, [{ message_id @ teams::message_id: ?external }])
-        )
-        .map(|(external,)| external)
-        .collect::<HashSet<_>>();
-        if chats.len() != 1 || external_ids.len() != 1 {
-            bail!(
-                "Teams branch contains a legacy or malformed message identity ({message_id:x}); refusing to sync because replay could merge or duplicate logical messages. Rebuild the Teams branch with the composite identity schema first."
-            );
-        }
-        let chat_id = *chats.iter().next().expect("checked singleton");
-        let external_id = *external_ids.iter().next().expect("checked singleton");
-        let expected = entity! { _ @
-            teams::message_id: external_id,
-            teams::chat: chat_id,
-        }
-        .root()
-        .expect("identity fragment is non-empty");
-        if expected != message_id {
-            bail!(
-                "Teams branch uses the legacy message identity lineage ({message_id:x}); refusing to sync because a full replay would create duplicate subjects. Rebuild the Teams branch with the composite identity schema first."
-            );
-        }
-    }
-    Ok(())
-}
-
-fn build_ingest_change(
-    ws: &mut Workspace<Pile>,
+fn coverage_head(
+    reader: &PileReader,
     catalog: &TribleSet,
-    index: &CatalogIndex,
+    source_id: Id,
+) -> Result<Option<CoverageHead>> {
+    teams_core::coverage_head(reader, catalog, source_id)
+}
+
+fn coverage_fragment(
+    source_id: Id,
+    generation: u128,
+    predecessors: impl IntoIterator<Item = Id>,
+    request: &str,
+    cursor: &str,
+    kind: &str,
+    observations: impl IntoIterator<Item = Id>,
+) -> Result<Fragment> {
+    teams_core::coverage_fragment(
+        source_id,
+        generation,
+        predecessors,
+        request,
+        cursor,
+        kind,
+        observations,
+    )
+}
+
+fn build_page_fragment(
+    tenant: &str,
+    source_id: Id,
     incoming: Vec<IncomingMessage>,
     token: &str,
-) -> Result<(TribleSet, FilesPlan)> {
-    let mut by_chat: HashMap<String, Vec<IncomingMessage>> = HashMap::new();
-    for message in incoming {
-        by_chat
-            .entry(message.chat_external_id.clone())
-            .or_default()
-            .push(message);
+    known: &[KnownMessage],
+) -> Result<(Fragment, BTreeSet<Id>, Vec<KnownMessage>)> {
+    let mut fragment = source_fragment(tenant);
+    if fragment.root() != Some(source_id) {
+        bail!("Teams tenant/source identity changed during one sync");
     }
+    let mut events = BTreeSet::new();
+    let mut identities = known.iter().cloned().collect::<BTreeSet<_>>();
 
-    let mut change = TribleSet::new();
-    let mut files_plan = FilesPlan::default();
-    let mut added_attachments = HashSet::new();
-    for (chat_external_id, mut messages) in by_chat {
-        // Derive chat_id intrinsically from the external id.
-        let chat_external_handle = ws.put(chat_external_id.clone());
-        let chat_id_frag = entity! { _ @
-            teams::chat_id: chat_external_handle,
+    // Establish every fully identified logical message first. This lets a
+    // minimal tombstone later in the same page resolve without depending on
+    // Graph's response order.
+    for message in &incoming {
+        let Some(chat_external_id) = message.chat_external_id.as_deref() else {
+            continue;
         };
-        let chat_id = chat_id_frag
-            .root()
-            .ok_or_else(|| anyhow::anyhow!("chat id rooted"))?;
-        change += chat_id_frag;
-
-        let missing_chat_kind = !index.chats.contains(&chat_id);
-        if missing_chat_kind {
-            change += entity! { ExclusiveId::force_ref(&chat_id) @
-                metadata::tag: teams::kind_chat,
-            };
-        }
-
-        // Stable ordering keeps ingestion traces deterministic. Chronology is
-        // represented by `created_at`, never by synthetic reply edges: delta
-        // delivery is replayed and out of order, so adjacency would require
-        // non-monotonic replacement when an older message arrives late.
-        messages.sort_by(|left, right| {
-            left.created_at_key
-                .cmp(&right.created_at_key)
-                .then_with(|| left.message_external_id.cmp(&right.message_external_id))
-        });
-
-        for message in messages {
-            // Derive author_id intrinsically from the author's external id,
-            // or fall back to the unknown-author singleton if Teams did not
-            // provide one.
-            let author_id = match message.author_external_id.as_deref() {
-                Some(ext) if !ext.trim().is_empty() => ensure_author(
-                    ws,
-                    &mut change,
-                    index,
-                    ext,
-                    message.author_display_name.as_deref(),
-                )?,
-                _ => TEAMS_UNKNOWN_AUTHOR_ID,
-            };
-
-            // Graph message ids are unique only within a chat/channel/thread.
-            // The logical message identity is therefore the composite
-            // (chat, external message id), matching Graph's resource scope.
-            let message_external_handle = ws.put(message.message_external_id.clone());
-            let message_id_frag = entity! { _ @
-                teams::message_id: message_external_handle,
-                teams::chat: chat_id,
-            };
-            let message_id = message_id_frag
-                .root()
-                .ok_or_else(|| anyhow::anyhow!("message id rooted"))?;
-            change += message_id_frag;
-
-            ensure_attachments(
-                ws,
-                &mut change,
-                &mut files_plan,
-                index,
-                message_id,
-                &message.attachments,
-                token,
-                &mut added_attachments,
-            )?;
-
-            if !index.messages.contains(&message_id) {
-                // New message entity.
-                let content_handle = ws.put(message.content);
-                let raw_handle = ws.put(message.raw_json);
-                change += entity! { ExclusiveId::force_ref(&message_id) @
-                    metadata::tag: archive::kind_message,
-                    archive::author: author_id,
-                    metadata::created_at: message.created_at,
-                    archive::content: content_handle,
-                    teams::message_raw: raw_handle,
-                };
-            } else {
-                // Logical messages are stable subjects. This path repairs
-                // absent first-snapshot fields only; edited/deleted versions
-                // require explicit immutable revision entities rather than
-                // ambiguous additive replacement facts.
-                let message_raw = (!index.message_raw_set.contains(&message_id))
-                    .then(|| ws.put(message.raw_json.clone()));
-                let message_created_at = (!index.message_created_at_set.contains(&message_id))
-                    .then_some(message.created_at);
-                let message_content = (!index.message_content_set.contains(&message_id))
-                    .then(|| ws.put(message.content.clone()));
-
-                if message_raw.is_some()
-                    || message_created_at.is_some()
-                    || message_content.is_some()
-                {
-                    change += entity! { ExclusiveId::force_ref(&message_id) @
-                        teams::message_raw?: message_raw,
-                        metadata::created_at?: message_created_at,
-                        archive::content?: message_content,
-                    };
-                }
-            }
-        }
+        identities.insert(stage_message_identity(
+            &mut fragment,
+            source_id,
+            chat_external_id,
+            &message.message_external_id,
+        ));
     }
 
-    Ok((change.difference(catalog), files_plan))
-}
+    let mut by_external = BTreeMap::<String, BTreeSet<KnownMessage>>::new();
+    for identity in &identities {
+        by_external
+            .entry(identity.message_external_id.clone())
+            .or_default()
+            .insert(identity.clone());
+    }
 
-fn ensure_author(
-    ws: &mut Workspace<Pile>,
-    change: &mut TribleSet,
-    index: &CatalogIndex,
-    author_external_id: &str,
-    author_display_name: Option<&str>,
-) -> Result<Id> {
-    // Derive author_id intrinsically from the external id via the
-    // identity-only-fragment idiom.
-    let external_handle = ws.put(author_external_id.to_owned());
-    let id_frag = entity! { _ @
-        teams::user_id: external_handle,
-    };
-    let author_id = id_frag
-        .root()
-        .ok_or_else(|| anyhow::anyhow!("author id rooted"))?;
-    *change += id_frag;
+    let mut page_kinds = BTreeMap::<Id, (bool, bool)>::new();
+    for message in &incoming {
+        let identity = resolve_message_identity(message, &identities, &by_external)?;
+        let kinds = page_kinds.entry(identity.message_id).or_default();
+        if message.source_removed {
+            kinds.0 = true;
+        } else {
+            kinds.1 = true;
+        }
+    }
+    if let Some((message, _)) = page_kinds
+        .iter()
+        .find(|(_, (removed, full))| *removed && *full)
+    {
+        bail!(
+            "Teams delta page carries both an unversioned @removed marker and a full source version for message {message:x}; refusing to invent their order"
+        );
+    }
 
-    let missing_author_kind = !index.authors.contains(&author_id);
-    let author_name = (!index.author_name_set.contains(&author_id)).then(|| {
-        let name = author_display_name
+    for message in incoming {
+        let identity = resolve_message_identity(&message, &identities, &by_external)?;
+        // Every page COMMIT is independently inspectable: even a minimal
+        // tombstone repeats the complete source/chat/message identity closure.
+        let staged = stage_message_identity(
+            &mut fragment,
+            source_id,
+            &identity.chat_external_id,
+            &identity.message_external_id,
+        );
+        if staged.message_id != identity.message_id || staged.chat_id != identity.chat_id {
+            bail!("Teams logical message identity changed while staging a page");
+        }
+        let message_id = identity.message_id;
+
+        if message.source_removed {
+            let tombstone = entity! {
+                metadata::tag: teams::kind_message_tombstone,
+                teams::message: message_id,
+            };
+            let tombstone_id = tombstone
+                .root()
+                .expect("Teams message tombstone has one root");
+            fragment += tombstone;
+            let raw = fragment.put::<LongString, _>(message.raw_json);
+            fragment += entity! { ExclusiveId::force_ref(&tombstone_id) @
+                teams::message_state: "deleted",
+                teams::message_raw: raw,
+            };
+            events.insert(tombstone_id);
+            continue;
+        }
+
+        let author_id = message
+            .author_external_id
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or(author_external_id);
-        ws.put(name.to_string())
-    });
+            .map(|external| {
+                let external = fragment.put::<LongString, _>(external.to_owned());
+                let author = entity! {
+                    metadata::tag: archive::kind_author,
+                    teams::source: source_id,
+                    teams::user_id: external,
+                };
+                let id = author.root().expect("Teams user fragment has one root");
+                fragment += author;
+                id
+            });
 
-    if missing_author_kind || author_name.is_some() {
-        *change += entity! { ExclusiveId::force_ref(&author_id) @
-            metadata::tag?: missing_author_kind.then_some(&archive::kind_author),
-            archive::author_name?: author_name,
+        let mut attachment_ids = BTreeSet::new();
+        for attachment in &message.attachments {
+            let attachment = build_attachment_fragment(message_id, attachment, token)?;
+            let id = attachment
+                .root()
+                .expect("Teams attachment fragment has one root");
+            attachment_ids.insert(id);
+            fragment += attachment;
+        }
+
+        let content = message
+            .content
+            .as_ref()
+            .map(|content| fragment.put::<LongString, _>(content.to_owned()));
+        let etag = fragment.put::<LongString, _>(
+            message
+                .etag
+                .as_ref()
+                .expect("full Teams source version has an etag")
+                .to_owned(),
+        );
+        let author_name = message
+            .author_display_name
+            .as_ref()
+            .map(|name| fragment.put::<LongString, _>(name.to_owned()));
+        let state = if message.deleted {
+            "deleted"
+        } else {
+            "present"
         };
+        let observation = entity! {
+            metadata::tag: teams::kind_message_observation,
+            teams::message: message_id,
+            teams::modified_at: message.modified_at.expect("full Teams source version has a timestamp"),
+            teams::etag: etag,
+        };
+        let observation_id = observation
+            .root()
+            .expect("Teams message observation has one root");
+        fragment += observation;
+        let raw = fragment.put::<LongString, _>(message.raw_json);
+        fragment += entity! { ExclusiveId::force_ref(&observation_id) @
+            teams::message_state: state,
+            metadata::created_at?: message.created_at,
+            teams::deleted_at?: message.deleted_at,
+            archive::author?: author_id,
+            teams::author_name?: author_name,
+            archive::content?: content,
+            archive::attachment*: attachment_ids,
+            teams::message_raw: raw,
+        };
+        events.insert(observation_id);
     }
 
-    Ok(author_id)
+    Ok((fragment, events, identities.into_iter().collect()))
 }
 
-fn ensure_attachments(
-    ws: &mut Workspace<Pile>,
-    change: &mut TribleSet,
-    files_plan: &mut FilesPlan,
-    index: &CatalogIndex,
+fn stage_message_identity(
+    fragment: &mut Fragment,
+    source_id: Id,
+    chat_external_id: &str,
+    message_external_id: &str,
+) -> KnownMessage {
+    let chat_external = fragment.put::<LongString, _>(chat_external_id.to_owned());
+    let chat = entity! {
+        metadata::tag: teams::kind_chat,
+        teams::source: source_id,
+        teams::chat_id: chat_external,
+    };
+    let chat_id = chat.root().expect("Teams chat fragment has one root");
+    *fragment += chat;
+
+    let message_external = fragment.put::<LongString, _>(message_external_id.to_owned());
+    let logical = entity! {
+        metadata::tag: archive::kind_message,
+        teams::chat: chat_id,
+        teams::message_id: message_external,
+    };
+    let message_id = logical.root().expect("Teams message fragment has one root");
+    *fragment += logical;
+
+    KnownMessage {
+        message_id,
+        message_external_id: message_external_id.to_owned(),
+        chat_id,
+        chat_external_id: chat_external_id.to_owned(),
+    }
+}
+
+fn resolve_message_identity(
+    message: &IncomingMessage,
+    identities: &BTreeSet<KnownMessage>,
+    by_external: &BTreeMap<String, BTreeSet<KnownMessage>>,
+) -> Result<KnownMessage> {
+    if let Some(chat_external_id) = message.chat_external_id.as_deref() {
+        return one_required(
+            identities
+                .iter()
+                .filter(|known| {
+                    known.chat_external_id == chat_external_id
+                        && known.message_external_id == message.message_external_id
+                })
+                .cloned()
+                .collect(),
+            &format!(
+                "Teams logical message identity for chat {chat_external_id:?}, message {:?}",
+                message.message_external_id
+            ),
+        );
+    }
+
+    one_required(
+        by_external
+            .get(&message.message_external_id)
+            .cloned()
+            .unwrap_or_default(),
+        &format!(
+            "source-local Teams message id {:?} needed by minimal @removed record",
+            message.message_external_id
+        ),
+    )
+}
+
+fn build_attachment_fragment(
     message_id: Id,
-    attachments: &[AttachmentSource],
+    source: &AttachmentSource,
     token: &str,
-    added: &mut HashSet<Id>,
-) -> Result<()> {
-    for source in attachments {
-        let source_id = source.source_id.trim();
-        if source_id.is_empty() {
-            continue;
-        }
-        // Graph attachment ids are scoped to their containing message, and
-        // ordinary attachments and hosted content are distinct collections.
-        // Preserve the raw source id while deriving identity from the complete
-        // resource scope.
-        let source_handle = ws.put(source_id.to_owned());
-        let att_id_frag = entity! { _ @
-            archive::attachment_source_id: source_handle,
-            teams::attachment_message: message_id,
-            teams::attachment_kind: source.source_kind,
-        };
-        let attachment_id = att_id_frag
-            .root()
-            .ok_or_else(|| anyhow::anyhow!("attachment id rooted"))?;
+) -> Result<Fragment> {
+    let source_id = source.source_id.trim();
+    if source_id.is_empty() {
+        bail!("Teams attachment has an empty source id");
+    }
+    let mut fragment = Fragment::empty();
+    let source_handle = fragment.put::<LongString, _>(source_id.to_owned());
+    let name = source
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| fragment.put::<LongString, _>(name.to_owned()));
+    let source_pointer = source
+        .source_url
+        .as_ref()
+        .map(|url| fragment.put::<LongString, _>(url.to_owned()));
 
-        if !index
-            .message_attachment_set
-            .contains(&(message_id, attachment_id))
-        {
-            *change += entity! { ExclusiveId::force_ref(&message_id) @
-                archive::attachment: attachment_id,
-            };
-        }
-        *change += att_id_frag;
-        if let Some(linked_files) = index.attachment_files.get(&attachment_id) {
-            if linked_files.len() != 1 {
-                bail!(
-                    "Teams attachment occurrence {attachment_id:x} links to {} file records; refusing to add another append-only value",
-                    linked_files.len()
-                );
+    let mut content_type = source.content_type.clone();
+    let bytes = match source.content_bytes.clone() {
+        Some(bytes) => Some(bytes),
+        None if source.fetch_required => {
+            let url = source.source_url.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("required Teams attachment {source_id} has no fetch URL")
+            })?;
+            let (bytes, fetched_type) = fetch_attachment_bytes(token, url)?;
+            if content_type.is_none() {
+                content_type = fetched_type;
             }
-            let file_id = *linked_files.iter().next().expect("checked singleton");
-            files_plan.validate_existing(attachment_id, file_id);
-            continue;
+            Some(bytes)
         }
-
-        if !added.insert(attachment_id) {
-            continue;
-        }
-
-        // Occurrence metadata is the immutable first snapshot. Source-side
-        // edits belong in explicit revision entities; appending a changed name
-        // here would make readers choose arbitrarily between simultaneous
-        // values.
-        if !index.attachments.contains(&attachment_id) {
-            *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                metadata::tag: archive::kind_attachment,
-            };
-            if let Some(name) = source
-                .name
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-            {
-                let name = ws.put(name.to_owned());
-                *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                    archive::attachment_name: name,
-                };
-            }
-        }
-
-        let mut content_type = source.content_type.clone();
-        let bytes = match &source.content_bytes {
-            Some(bytes) => bytes.clone(),
-            None => {
-                let Some(url) = source.source_url.as_deref() else {
-                    continue;
-                };
-                match fetch_attachment_bytes(token, url) {
-                    Ok((bytes, fetched_type)) => {
-                        if content_type.is_none() {
-                            content_type = fetched_type;
-                        }
-                        bytes
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "Teams attachment fetch failed ({}): {err:#}; metadata was retained for backfill.",
-                            url_without_query(url),
-                        );
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let name_str = source
+        None => None,
+    };
+    let (file_id, size) = if let Some(bytes) = bytes {
+        let size: Inline<U256BE> = (bytes.len() as u128).to_inline();
+        let file_name = source
             .name
             .as_deref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("attachment");
-        let mime = content_type
-            .as_deref()
-            .unwrap_or("application/octet-stream");
-        let media_type = file_capability::normalize_media_type_or_default(mime);
-        let file_fragment = file_capability::stage(bytes, name_str.to_owned(), &media_type)?;
-        let file_id = files_plan.stage(file_fragment);
-        *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-            archive::attachment_file: file_id,
-        };
-    }
-    Ok(())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(source_id);
+        let media_type = file_capability::normalize_media_type_or_default(
+            content_type
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
+        );
+        let file = file_capability::stage(bytes, file_name, &media_type)?;
+        let file_id = file.root().expect("canonical file fragment has one root");
+        let (_, file_facts, file_metafacts, file_blobs) = file.into_parts();
+        fragment += Fragment::from_parts(file_facts, file_metafacts, file_blobs);
+        (Some(file_id), Some(size))
+    } else {
+        (None, None)
+    };
+
+    // The source occurrence is stable evidence. Materialized bytes are an
+    // additive DERIVE of that evidence, not part of its identity: ordinary
+    // Graph attachments often arrive pointer-only and may be fetched by a
+    // separate process later without minting a second occurrence entity.
+    let attachment = entity! {
+        metadata::tag: archive::kind_attachment,
+        archive::attachment_source_id: source_handle,
+        teams::attachment_message: message_id,
+        teams::attachment_kind: source.source_kind,
+        archive::attachment_name?: name,
+    };
+    let attachment_id = attachment
+        .root()
+        .expect("Teams attachment fragment has one root");
+    fragment += attachment;
+    fragment += entity! { ExclusiveId::force_ref(&attachment_id) @
+        archive::attachment_source_pointer?: source_pointer,
+        archive::attachment_file?: file_id,
+        archive::attachment_size_bytes?: size,
+    };
+    Ok(fragment)
+}
+
+/// Validate a page against the state it would create before any dependency or
+/// signed COMMIT byte reaches the pile. This is deliberately stronger than
+/// validating the isolated fragment: append-only storage cannot repair a
+/// singular-field conflict or stale coverage fork after it has been signed.
+fn validate_candidate(reader: &PileReader, catalog: &TribleSet, fragment: &Fragment) -> Result<()> {
+    teams_core::validate_candidate(reader, catalog, fragment)
+}
+
+#[cfg(test)]
+fn validate_commit_fragment(facts: &TribleSet) -> Result<()> {
+    teams_core::validate_commit_fragment(facts)
+}
+
+fn validate_catalog(reader: &PileReader, catalog: &TribleSet) -> Result<()> {
+    teams_core::validate_catalog(reader, catalog)
 }
 
 fn fetch_attachment_bytes(token: &str, url: &str) -> Result<(Vec<u8>, Option<String>)> {
@@ -3889,138 +3708,9 @@ fn parse_since_key(value: Option<&str>) -> Result<Option<i128>> {
     }
     let epoch = Epoch::from_gregorian_str(value)
         .ok()
-        .or_else(|| parse_graph_datetime(value))
+        .or_else(|| teams_core::parse_graph_datetime(value))
         .ok_or_else(|| anyhow::anyhow!("invalid timestamp: {}", value))?;
     Ok(Some(interval_key(epoch_interval(epoch))))
-}
-
-fn parse_graph_datetime(value: &str) -> Option<Epoch> {
-    // Accept common Graph formats:
-    // - 2025-01-01T12:34:56Z
-    // - 2025-01-01T12:34:56.1234567Z
-    // - 2025-01-01T12:34:56+00:00
-    let value = value.trim();
-    let (date, time) = value.split_once('T')?;
-    let (year, month, day) = {
-        let mut parts = date.splitn(3, '-');
-        let year = parts.next()?.parse::<i32>().ok()?;
-        let month = parts.next()?.parse::<u8>().ok()?;
-        let day = parts.next()?.parse::<u8>().ok()?;
-        (year, month, day)
-    };
-
-    let (time, offset_secs) = parse_time_and_offset(time)?;
-    let (hour, minute, second, nanos) = time;
-
-    let mut epoch = Epoch::from_gregorian_utc(
-        year,
-        month as u8,
-        day as u8,
-        hour as u8,
-        minute as u8,
-        second as u8,
-        nanos as u32,
-    );
-    if offset_secs != 0 {
-        use hifitime::Duration as HifiDuration;
-        epoch -= HifiDuration::from_seconds(offset_secs as f64);
-    }
-    Some(epoch)
-}
-
-fn parse_time_and_offset(value: &str) -> Option<((u8, u8, u8, u32), i32)> {
-    // Returns ((hour, min, sec, nanos), offset_secs)
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    if let Some(stripped) = value.strip_suffix('Z') {
-        let time = parse_hms_fraction(stripped)?;
-        return Some((time, 0));
-    }
-
-    if let Some((time, offset)) = split_timezone_offset(value) {
-        let time = parse_hms_fraction(time)?;
-        let offset_secs = parse_offset_seconds(offset)?;
-        return Some((time, offset_secs));
-    }
-
-    let time = parse_hms_fraction(value)?;
-    Some((time, 0))
-}
-
-fn split_timezone_offset(value: &str) -> Option<(&str, &str)> {
-    // Find the last '+' or '-' which starts the offset (after HH:MM:SS(.nanos)).
-    // This handles negative offsets without confusing the date part (already split).
-    let bytes = value.as_bytes();
-    for idx in (0..bytes.len()).rev() {
-        let b = bytes[idx];
-        if b == b'+' || b == b'-' {
-            let (time, offset) = value.split_at(idx);
-            if offset.len() >= 3 {
-                return Some((time, offset));
-            }
-            return None;
-        }
-    }
-    None
-}
-
-fn parse_offset_seconds(offset: &str) -> Option<i32> {
-    let offset = offset.trim();
-    let sign = if offset.starts_with('+') {
-        1i32
-    } else if offset.starts_with('-') {
-        -1i32
-    } else {
-        return None;
-    };
-    let rest = &offset[1..];
-    let (hh, mm) = rest.split_once(':')?;
-    let hours = hh.parse::<i32>().ok()?;
-    let mins = mm.parse::<i32>().ok()?;
-    Some(sign * (hours * 3600 + mins * 60))
-}
-
-fn parse_hms_fraction(value: &str) -> Option<(u8, u8, u8, u32)> {
-    let value = value.trim();
-    let (hms, frac) = value.split_once('.').unwrap_or((value, ""));
-    let mut parts = hms.splitn(3, ':');
-    let hour = parts.next()?.parse::<u8>().ok()?;
-    let minute = parts.next()?.parse::<u8>().ok()?;
-    let second = parts.next()?.parse::<u8>().ok()?;
-
-    let nanos = if frac.is_empty() {
-        0
-    } else {
-        // Pad/truncate to nanoseconds.
-        let mut digits = frac
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        if digits.is_empty() {
-            0
-        } else {
-            if digits.len() > 9 {
-                digits.truncate(9);
-            } else {
-                while digits.len() < 9 {
-                    digits.push('0');
-                }
-            }
-            digits.parse::<u32>().ok()?
-        }
-    };
-
-    Some((hour, minute, second, nanos))
-}
-
-fn map_err_debug<T, E: std::fmt::Debug>(
-    result: std::result::Result<T, E>,
-    context: &str,
-) -> Result<T> {
-    result.map_err(|err| anyhow::anyhow!("{context}: {err:?}"))
 }
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
@@ -4041,606 +3731,855 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
     Ok(load_value_or_file(raw, label)?.trim().to_string())
 }
 
-fn u256_to_u128(value: Inline<U256BE>) -> Option<u128> {
-    let raw = value.raw;
-    if raw[..16].iter().any(|&b| b != 0) {
-        return None;
+fn load_client_secret(
+    source: Option<&str>,
+    existing_version: Option<&str>,
+) -> Result<Option<String>> {
+    let sourced = source
+        .map(|source| {
+            if !source.starts_with('@') {
+                bail!(
+                    "--client-secret accepts only @path or @-; use TEAMS_CLIENT_SECRET for environment input"
+                );
+            }
+            load_value_or_file_trimmed(source, "client secret")
+        })
+        .transpose()?;
+    let environment = match std::env::var("TEAMS_CLIENT_SECRET") {
+        Ok(value) => Some(value.trim().to_owned()),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("TEAMS_CLIENT_SECRET is not valid Unicode")
+        }
+    };
+
+    if sourced.is_some() && environment.is_some() {
+        bail!("provide the client secret through only one non-argv source");
     }
-    let mut buf = [0u8; 16];
-    buf.copy_from_slice(&raw[16..]);
-    Some(u128::from_be_bytes(buf))
+    let secret = sourced.or(environment);
+    if existing_version.is_some() && secret.is_some() {
+        bail!("an existing client-secret version conflicts with a new client secret");
+    }
+    if secret.as_deref().is_some_and(str::is_empty) {
+        bail!("Teams client secret must not be empty");
+    }
+    Ok(secret)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-    use std::net::TcpListener;
-    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
-    struct TestPile {
-        dir: PathBuf,
-        path: PathBuf,
+    #[test]
+    fn oauth_error_kind_exposes_only_a_bounded_machine_kind() {
+        let described = r#"{"error":"invalid_grant","error_description":"contains-secret"}"#;
+        assert_eq!(oauth_error_kind(described), "invalid_grant");
+        assert!(!oauth_error_kind(described).contains("contains-secret"));
+        assert_eq!(
+            oauth_error_kind(r#"{"error":"secret value with spaces"}"#),
+            "unknown"
+        );
+        assert_eq!(oauth_error_kind("contains-secret"), "unknown");
     }
 
-    impl TestPile {
+    struct Fixture {
+        dir: PathBuf,
+        pile: PathBuf,
+        key: PathBuf,
+    }
+
+    impl Fixture {
         fn new() -> Self {
-            Self::with_files_signer(true)
-        }
-
-        fn without_files_signer() -> Self {
-            Self::with_files_signer(false)
-        }
-
-        fn with_files_signer(initialize_files: bool) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let sequence = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "faculties-teams-context-{}-{nonce}-{sequence}",
+                "faculties-teams-collection-{}-{sequence}",
                 std::process::id()
             ));
+            let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("test.pile");
-            fs::File::create(&path).unwrap();
-            if initialize_files {
-                initialize_signer(&path, None).unwrap();
-            }
-            Self { dir, path }
+            let pile = dir.join("test.pile");
+            fs::File::create(&pile).unwrap();
+            let key = dir.join("test.key");
+            initialize_signer(&pile, Some(&key)).unwrap();
+            Self { dir, pile, key }
         }
 
-        fn config(&self) -> TeamsBridgeConfig {
-            let branch_id = ensure_test_branch(&self.path, DEFAULT_BRANCH);
-            TeamsBridgeConfig {
-                pile_path: self.path.clone(),
-                branch: DEFAULT_BRANCH.to_string(),
-                branch_id,
-                presentation_context: TeamsPresentationContext::default(),
-                delta_url: DEFAULT_DELTA_URL.to_string(),
-                token: None,
-                token_command: "unused".to_string(),
+        fn storage(&self) -> TeamsStorage<'_> {
+            TeamsStorage {
+                pile: &self.pile,
+                key: Some(&self.key),
             }
+        }
+
+        fn publish(&self, fragment: Fragment) {
+            self.storage().publish(fragment, "test Teams page").unwrap();
         }
     }
 
-    impl Drop for TestPile {
+    impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
 
-    fn ensure_test_branch(path: &Path, name: &str) -> Id {
-        with_repo(&path.to_path_buf(), |repo| {
-            repo.ensure_branch(name, None)
-                .map_err(|err| anyhow::anyhow!("ensure test branch: {err:?}"))
-        })
-        .unwrap()
-    }
-
     fn graph_message(
-        chat_id: &str,
-        message_id: &str,
-        created_at: &str,
+        chat: &str,
+        message: &str,
+        created: &str,
+        modified: &str,
         content: &str,
-        attachments: Vec<JsonValue>,
     ) -> JsonValue {
         json!({
-            "chatId": chat_id,
-            "id": message_id,
-            "createdDateTime": created_at,
-            "lastModifiedDateTime": created_at,
-            "etag": format!("{message_id}:{content}"),
+            "chatId": chat,
+            "id": message,
+            "createdDateTime": created,
+            "lastModifiedDateTime": modified,
+            "etag": format!("{message}:{modified}:{content}"),
             "from": { "user": { "id": "user-1", "displayName": "Tester" } },
             "body": { "content": content },
-            "attachments": attachments,
+            "attachments": [],
         })
     }
 
-    fn inline_attachment(id: &str, name: &str, bytes: &[u8]) -> JsonValue {
-        json!({
-            "id": id,
-            "name": name,
-            "contentType": "application/octet-stream",
-            "contentBytes": base64::engine::general_purpose::STANDARD.encode(bytes),
-        })
-    }
-
-    fn ingest_test_batch(
-        config: &TeamsBridgeConfig,
+    fn page_fragment(
+        tenant: &str,
         messages: Vec<JsonValue>,
-        commit_files: bool,
-        commit_teams: bool,
-    ) -> (usize, usize) {
-        with_repo(&config.pile_path, |repo| {
-            let mut ws = map_err_debug(repo.pull(config.branch_id), "pull test workspace")?;
-            let catalog = map_err_debug(ws.checkout(..), "checkout test workspace")?.into_facts();
-            validate_message_identity_lineage(&catalog)?;
-            let index = CatalogIndex::build(&catalog);
-            let incoming = parse_messages(messages)?;
-            let (change, files_plan) =
-                build_ingest_change(&mut ws, &catalog, &index, incoming, "test-token")?;
-            let counts = (change.len(), files_plan.facts_len());
-
-            if commit_files {
-                publish_files_plan(repo, &config.pile_path, files_plan)?;
-            }
-            if commit_teams && !change.is_empty() {
-                ws.commit(change, "test teams ingest");
-                map_err_debug(repo.push(&mut ws), "push test teams workspace")?;
-            }
-            Ok(counts)
-        })
-        .unwrap()
+        generation: u128,
+        predecessors: impl IntoIterator<Item = Id>,
+        cursor: &str,
+    ) -> (Fragment, Id) {
+        page_fragment_with_known(tenant, messages, generation, predecessors, cursor, &[])
     }
 
-    fn test_branch_catalog(path: &Path, branch: &str) -> TribleSet {
-        with_repo(&path.to_path_buf(), |repo| {
-            let branch_id = repo
-                .ensure_branch(branch, None)
-                .map_err(|err| anyhow::anyhow!("ensure test branch: {err:?}"))?;
-            let mut ws = map_err_debug(repo.pull(branch_id), "pull test branch")?;
-            Ok(map_err_debug(ws.checkout(..), "checkout test branch")?.into_facts())
-        })
-        .unwrap()
-    }
-
-    fn test_files_catalog(path: &Path) -> TribleSet {
-        let signer = load_signer(path, None).unwrap();
-        with_repo(&path.to_path_buf(), |repo| {
-            file_capability::materialize_collection(repo.storage_mut(), &signer)
-                .map(|(facts, _)| facts)
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn context_update_preserves_authentication_snapshot() {
-        let pile = TestPile::new();
-        let config = pile.config();
-        let initial = TeamsConfigData {
-            tenant: Some("tenant.example".to_string()),
-            client_id: Some("client-id".to_string()),
-            client_secret: Some("secret-value".to_string()),
-            user_id: Some("user-id".to_string()),
-        };
-        store_config_in_pile(&config, &initial).unwrap();
-
-        store_context_in_pile(&config, "Bulti", "Work-only boundary").unwrap();
-
-        let loaded = load_config_from_pile(&config).unwrap().unwrap();
-        assert_eq!(loaded.tenant, initial.tenant);
-        assert_eq!(loaded.client_id, initial.client_id);
-        assert_eq!(loaded.client_secret, initial.client_secret);
-        assert_eq!(loaded.user_id, initial.user_id);
-        let context = with_repo(&config.pile_path, |repo| {
-            load_context_from_repo(repo, config.branch_id)
-        })
-        .unwrap();
-        assert_eq!(context.name.as_deref(), Some("Bulti"));
-        assert_eq!(context.boundary.as_deref(), Some("Work-only boundary"));
-    }
-
-    #[test]
-    fn context_supersession_ignores_future_wall_clock_values() {
-        let pile = TestPile::new();
-        let config = pile.config();
-        with_repo(&config.pile_path, |repo| {
-            let mut ws = map_err_debug(repo.pull(config.branch_id), "pull test workspace")?;
-            let catalog = map_err_debug(ws.checkout(..), "checkout test workspace")?.into_facts();
-            let context_id = ufoid();
-            let name = ws.put("Future identity".to_string());
-            let boundary = ws.put("Future boundary".to_string());
-            let future = epoch_interval(Epoch::from_gregorian_utc(2099, 1, 1, 0, 0, 0, 0));
-            let change = entity! { &context_id @
-                metadata::tag: teams::kind_context,
-                metadata::created_at: future,
-                metadata::name: name,
-                metadata::description: boundary,
-            };
-            ws.commit(change.difference(&catalog), "future-dated test context");
-            map_err_debug(repo.push(&mut ws), "push test workspace")?;
-            Ok(())
-        })
-        .unwrap();
-
-        store_context_in_pile(&config, "Bulti", "Current boundary").unwrap();
-        let context = with_repo(&config.pile_path, |repo| {
-            load_context_from_repo(repo, config.branch_id)
-        })
-        .unwrap();
-        assert_eq!(context.name.as_deref(), Some("Bulti"));
-        assert_eq!(context.boundary.as_deref(), Some("Current boundary"));
-    }
-
-    #[test]
-    fn outward_mutations_require_the_configured_identity() {
-        let pile = TestPile::new();
-        let mut config = pile.config();
-        store_context_in_pile(&config, "Bulti", "Work-only boundary").unwrap();
-        config.presentation_context = TeamsPresentationContext {
-            name: Some("Bulti".to_string()),
-            boundary: Some("Work-only boundary".to_string()),
-        };
-
-        let missing = prepare_teams_context(&config, None, true).unwrap_err();
-        assert!(missing.to_string().contains("--as Bulti"));
-
-        let mismatch = prepare_teams_context(&config, Some("Liora"), true).unwrap_err();
-        assert!(mismatch.to_string().contains("presentation mismatch"));
-
-        prepare_teams_context(&config, Some("Bulti"), true).unwrap();
-    }
-
-    #[test]
-    fn context_command_accepts_global_identity_argument_after_subcommand() {
-        let cli = Cli::try_parse_from([
-            "teams",
-            "--pile",
-            "test.pile",
-            "send",
-            "--as",
-            "Bulti",
-            "chat-id",
-            "hello",
-        ])
-        .unwrap();
-        assert_eq!(cli.present_as.as_deref(), Some("Bulti"));
-        assert!(matches!(cli.command, Some(CommandMode::Send { .. })));
-    }
-
-    #[test]
-    fn expired_delta_cursor_restarts_from_base_endpoint() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let fresh_cursor = format!("http://{address}/delta?$deltatoken=fresh-secret");
-        let fresh_cursor_for_server = fresh_cursor.clone();
-        let server = thread::spawn(move || {
-            for (status, body) in [
-                ("410 Gone", String::new()),
-                (
-                    "200 OK",
-                    json!({
-                        "value": [],
-                        "@odata.deltaLink": fresh_cursor_for_server,
-                    })
-                    .to_string(),
-                ),
-            ] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 4096];
-                let _ = stream.read(&mut request).unwrap();
-                write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
-
-        let stale = format!("http://{address}/stale?$deltatoken=expired-secret");
-        let base = format!("http://{address}/base");
-        let (messages, cursor) =
-            fetch_delta_with_cursor_recovery("token", &stale, &base, true).unwrap();
-        server.join().unwrap();
-        assert!(messages.is_empty());
-        assert_eq!(cursor.as_deref(), Some(fresh_cursor.as_str()));
-    }
-
-    #[test]
-    fn delta_errors_never_print_query_tokens() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
-            let body = r#"{"error":{"code":"testError","message":"must-not-leak-body"}}"#;
-            write!(
-                stream,
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        });
-
-        let url = format!("http://{address}/delta?$deltatoken=must-not-leak");
-        let err = fetch_delta_messages("token", &url).unwrap_err();
-        server.join().unwrap();
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains(&format!("http://{address}/delta")));
-        assert!(!rendered.contains("must-not-leak"));
-        assert!(!rendered.contains("$deltatoken"));
-        assert!(!rendered.contains("must-not-leak-body"));
-    }
-
-    #[test]
-    fn delta_transport_errors_strip_query_tokens_from_the_full_chain() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-
-        let url = format!("http://{address}/delta?$deltatoken=transport-secret");
-        let err = fetch_delta_messages("token", &url).unwrap_err();
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains(&format!("http://{address}/delta")));
-        assert!(!rendered.contains("transport-secret"));
-        assert!(!rendered.contains("$deltatoken"));
-    }
-
-    #[test]
-    fn identical_and_prefix_delta_replays_are_noops() {
-        let pile = TestPile::new();
-        let config = pile.config();
-        let a = graph_message("chat-a", "1", "2026-07-29T10:00:00Z", "A", vec![]);
-        let b = graph_message("chat-a", "2", "2026-07-29T10:01:00Z", "B", vec![]);
-
-        let first = ingest_test_batch(&config, vec![a.clone(), b.clone()], true, true);
-        assert!(first.0 > 0);
-        assert_eq!(first.1, 0);
-        assert_eq!(
-            ingest_test_batch(&config, vec![a.clone(), b], true, true),
-            (0, 0)
-        );
-        assert_eq!(ingest_test_batch(&config, vec![a], true, true), (0, 0));
-
-        let catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
-        let reply_edges = find!(
-            (message: Id, parent: Id),
-            pattern!(&catalog, [{ ?message @ archive::reply_to: ?parent }])
+    fn page_fragment_with_known(
+        tenant: &str,
+        messages: Vec<JsonValue>,
+        generation: u128,
+        predecessors: impl IntoIterator<Item = Id>,
+        cursor: &str,
+        known: &[KnownMessage],
+    ) -> (Fragment, Id) {
+        let source = source_fragment(tenant);
+        let source_id = source.root().unwrap();
+        let incoming = parse_messages(messages).unwrap();
+        let (mut fragment, observations, _) =
+            build_page_fragment(tenant, source_id, incoming, "test-token", known).unwrap();
+        let receipt = coverage_fragment(
+            source_id,
+            generation,
+            predecessors,
+            "https://graph.example/request",
+            cursor,
+            "delta",
+            observations,
         )
-        .count();
-        assert_eq!(reply_edges, 0);
+        .unwrap();
+        let receipt_id = receipt.root().unwrap();
+        fragment += receipt;
+        (fragment, receipt_id)
+    }
+
+    fn load_view(fixture: &Fixture) -> CollectionView {
+        fixture.storage().view().unwrap()
+    }
+
+    fn initialize_test_secrets(fixture: &Fixture) -> (Id, Id, Id, Id) {
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let identity = secrets_model::prepare_identity(
+            "teams-vault",
+            b"test identity password",
+            epoch_interval(now_epoch()),
+        )
+        .unwrap();
+        let identity_id = identity.id;
+        let scope_fragment =
+            secrets_model::scope_fragment(identity_id, "teams-test", epoch_interval(now_epoch()))
+                .unwrap();
+        let scope = scope_fragment.root().unwrap();
+        let mut initialization = identity.fragment;
+        initialization += scope_fragment;
+        Collection::new(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
+            .commit(initialization)
+            .unwrap();
+
+        let facts = Collection::new(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
+            .materialize()
+            .unwrap();
+        let reader = pile.reader().unwrap();
+        let catalog = secrets_model::validate_catalog(&reader, &facts).unwrap();
+        let client = secrets_model::seal_version(
+            &reader,
+            &catalog,
+            scope,
+            "teams/client-secret/test",
+            b"distinct-test-client-secret",
+            epoch_interval(now_epoch()),
+        )
+        .unwrap();
+        let token_bundle = DelegatedTokenBundle {
+            access_token: "distinct-test-access-token".to_owned(),
+            refresh_token: Some("distinct-test-refresh-token".to_owned()),
+            expires_at_unix: now_epoch_secs() + 3600,
+            token_type: Some("Bearer".to_owned()),
+            scope: Some("Chat.ReadWrite offline_access".to_owned()),
+        };
+        let token = secrets_model::seal_version(
+            &reader,
+            &catalog,
+            scope,
+            "teams/delegated-token/test",
+            &serde_json::to_vec(&token_bundle).unwrap(),
+            epoch_interval(now_epoch()),
+        )
+        .unwrap();
+        let client_id = client.secret;
+        let token_id = token.secret;
+        let mut credentials = client.fragment;
+        credentials += token.fragment;
+        Collection::new(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer)
+            .commit(credentials)
+            .unwrap();
+        pile.close().unwrap();
+        (identity_id, scope, client_id, token_id)
     }
 
     #[test]
-    fn attachment_free_ingest_needs_no_files_signer_or_materialization() {
-        let pile = TestPile::without_files_signer();
-        let config = pile.config();
-        let message = graph_message(
-            "chat-a",
-            "1",
-            "2026-07-29T10:00:00Z",
-            "no attachments",
-            vec![],
-        );
+    fn auth_profile_persists_only_exact_encrypted_secrets_references() {
+        let fixture = Fixture::new();
+        let (identity, _scope, client_secret, delegated_token) = initialize_test_secrets(&fixture);
+        let tenant = "tenant.example";
+        let source = source_fragment(tenant).root().unwrap();
+        fixture
+            .storage()
+            .with_session(|session| {
+                let mut fragment = source_fragment(tenant);
+                let (profile, profile_id) = teams_core::auth_profile_fragment(
+                    source,
+                    "client-id",
+                    "user-id",
+                    "offline_access Chat.ReadWrite",
+                    Some(client_secret),
+                    Some(delegated_token),
+                    [],
+                )?;
+                fragment += profile;
+                session.commit(fragment, "test Teams auth profile")?;
+                assert_eq!(
+                    teams_core::auth_profile_head(&session.facts, source),
+                    teams_core::AuthProfileHead::Unique(profile_id)
+                );
+                let opened_client = secrets_model::open_version(
+                    &session.secrets_reader,
+                    &session.secrets_catalog,
+                    client_secret,
+                    identity,
+                    b"test identity password",
+                )?;
+                assert_eq!(opened_client, b"distinct-test-client-secret");
+                Ok(())
+            })
+            .unwrap();
 
-        let first = ingest_test_batch(&config, vec![message.clone()], true, true);
-        assert!(first.0 > 0);
-        assert_eq!(first.1, 0);
+        let bytes = fs::read(&fixture.pile).unwrap();
+        for plaintext in [
+            b"distinct-test-client-secret".as_slice(),
+            b"distinct-test-access-token".as_slice(),
+            b"distinct-test-refresh-token".as_slice(),
+        ] {
+            assert!(!bytes
+                .windows(plaintext.len())
+                .any(|window| window == plaintext));
+        }
+    }
+
+    #[test]
+    fn unknown_auth_secret_reference_is_rejected_before_append() {
+        let fixture = Fixture::new();
+        let source_identity = source_fragment("tenant.example");
+        let source = source_identity.root().unwrap();
+        let (profile, _) = teams_core::auth_profile_fragment(
+            source,
+            "client-id",
+            "user-id",
+            "offline_access",
+            None,
+            Some(Id::new([0xD7; 16]).unwrap()),
+            [],
+        )
+        .unwrap();
+        let mut fragment = source_identity;
+        fragment += profile;
+        let before = fs::read(&fixture.pile).unwrap();
+        let error = fixture
+            .storage()
+            .publish(fragment, "dangling auth ref")
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown delegated token bundle"));
+        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn source_chat_user_and_message_ids_are_tenant_scoped() {
+        let a_source = source_fragment("tenant-a").root().unwrap();
+        let b_source = source_fragment("tenant-b").root().unwrap();
+        assert_eq!(a_source, source_fragment(" TENANT-A ").root().unwrap());
+        assert_ne!(a_source, b_source);
+
+        let a = build_page_fragment(
+            "tenant-a",
+            a_source,
+            parse_messages(vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T10:00:00Z",
+                "A",
+            )])
+            .unwrap(),
+            "token",
+            &[],
+        )
+        .unwrap()
+        .0;
+        let b = build_page_fragment(
+            "tenant-b",
+            b_source,
+            parse_messages(vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T10:00:00Z",
+                "A",
+            )])
+            .unwrap(),
+            "token",
+            &[],
+        )
+        .unwrap()
+        .0;
+        let a_chat = find!(
+            chat: Id,
+            pattern!(&a, [{ ?chat @ metadata::tag: teams::kind_chat }])
+        )
+        .collect::<BTreeSet<_>>();
+        let b_chat = find!(
+            chat: Id,
+            pattern!(&b, [{ ?chat @ metadata::tag: teams::kind_chat }])
+        )
+        .collect::<BTreeSet<_>>();
+        assert!(a_chat.is_disjoint(&b_chat));
+        let a_messages = find!(
+            message: Id,
+            pattern!(&a, [{ ?message @ metadata::tag: archive::kind_message }])
+        )
+        .collect::<BTreeSet<_>>();
+        let b_messages = find!(
+            message: Id,
+            pattern!(&b, [{ ?message @ metadata::tag: archive::kind_message }])
+        )
+        .collect::<BTreeSet<_>>();
+        assert!(a_messages.is_disjoint(&b_messages));
+    }
+
+    #[test]
+    fn edits_and_deletes_are_immutable_max_time_observations() {
+        let fixture = Fixture::new();
+        let (first, first_receipt) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T10:00:00Z",
+                "first",
+            )],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        fixture.publish(first);
+        let (edited, edited_receipt) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T11:00:00Z",
+                "edited",
+            )],
+            2,
+            [first_receipt],
+            "https://graph.example/delta-2",
+        );
+        fixture.publish(edited);
+        let view = load_view(&fixture);
+        let source = source_fragment("tenant-a").root().unwrap();
+        let current = current_messages(&view.facts, source).unwrap();
+        assert_eq!(current.len(), 1);
+        assert!(!current[0].deleted);
         assert_eq!(
-            ingest_test_batch(&config, vec![message], true, true),
-            (0, 0)
+            read_longstring(&view.reader, current[0].content.unwrap(), "test content").unwrap(),
+            "edited"
+        );
+        assert_eq!(
+            coverage_head(&view.reader, &view.facts, source)
+                .unwrap()
+                .unwrap()
+                .id,
+            edited_receipt
+        );
+
+        let mut deleted = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T12:00:00Z",
+            "",
+        );
+        deleted["deletedDateTime"] = json!("2026-08-01T12:00:00Z");
+        deleted["body"] = JsonValue::Null;
+        let (tombstone, _) = page_fragment(
+            "tenant-a",
+            vec![deleted],
+            3,
+            [edited_receipt],
+            "https://graph.example/delta-3",
+        );
+        fixture.publish(tombstone);
+        let view = load_view(&fixture);
+        let current = current_messages(&view.facts, source).unwrap();
+        assert_eq!(current.len(), 1);
+        assert!(current[0].deleted);
+    }
+
+    #[test]
+    fn minimal_removed_is_causal_reversible_and_old_replay_cannot_restore() {
+        let fixture = Fixture::new();
+        let original = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "original",
+        );
+        let (first, first_receipt) = page_fragment(
+            "tenant-a",
+            vec![original.clone()],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        fixture.publish(first);
+        let first_view = load_view(&fixture);
+        let source = source_fragment("tenant-a").root().unwrap();
+        let known = load_known_messages(&first_view.reader, &first_view.facts, source).unwrap();
+
+        let removed = json!({
+            "id": "message",
+            "@removed": { "reason": "deleted" }
+        });
+        let (tombstone, tombstone_receipt) = page_fragment_with_known(
+            "tenant-a",
+            vec![removed],
+            2,
+            [first_receipt],
+            "https://graph.example/delta-2",
+            &known,
+        );
+        fixture.publish(tombstone);
+        let deleted_view = load_view(&fixture);
+        assert!(current_messages(&deleted_view.facts, source)
+            .unwrap()
+            .is_empty());
+
+        // A cursor reset can replay the exact pre-deletion source version in
+        // a descendant receipt. Receipt recency alone must not resurrect it.
+        let (replay, replay_receipt) = page_fragment(
+            "tenant-a",
+            vec![original],
+            3,
+            [tombstone_receipt],
+            "https://graph.example/delta-3",
+        );
+        fixture.publish(replay);
+        let replay_view = load_view(&fixture);
+        assert!(current_messages(&replay_view.facts, source)
+            .unwrap()
+            .is_empty());
+
+        let (restore, _) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T11:00:00Z",
+                "restored",
+            )],
+            4,
+            [replay_receipt],
+            "https://graph.example/delta-4",
+        );
+        fixture.publish(restore);
+        let restored_view = load_view(&fixture);
+        let current = current_messages(&restored_view.facts, source).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(
+            read_longstring(
+                &restored_view.reader,
+                current[0].content.unwrap(),
+                "restored content",
+            )
+            .unwrap(),
+            "restored"
         );
     }
 
     #[test]
-    fn message_identity_is_scoped_to_chat() {
-        let pile = TestPile::new();
-        let config = pile.config();
-        let x = graph_message("chat-x", "42", "2026-07-29T10:00:00Z", "X", vec![]);
-        let y = graph_message("chat-y", "42", "2026-07-29T10:00:00Z", "Y", vec![]);
+    fn minimal_removed_requires_unique_source_local_message_resolution() {
+        let source = source_fragment("tenant-a").root().unwrap();
+        let removed = parse_messages(vec![json!({
+            "id": "message",
+            "@removed": { "reason": "deleted" }
+        })])
+        .unwrap();
+        assert!(
+            build_page_fragment("tenant-a", source, removed.clone(), "token", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("is missing")
+        );
 
-        ingest_test_batch(&config, vec![x.clone(), y.clone()], true, true);
-        let catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
-        let rows = find!(
-            (message: Id, chat: Id),
-            pattern!(&catalog, [{
-                ?message @
-                metadata::tag: archive::kind_message,
-                teams::chat: ?chat,
+        let mut scratch = source_fragment("tenant-a");
+        let left = stage_message_identity(&mut scratch, source, "chat-left", "message");
+        let right = stage_message_identity(&mut scratch, source, "chat-right", "message");
+        let error =
+            build_page_fragment("tenant-a", source, removed, "token", &[left, right]).unwrap_err();
+        assert!(error.to_string().contains("has 2 values"));
+    }
+
+    #[test]
+    fn graph_source_versions_require_modified_time_and_etag() {
+        let mut missing_modified = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "content",
+        );
+        missing_modified
+            .as_object_mut()
+            .unwrap()
+            .remove("lastModifiedDateTime");
+        assert!(parse_messages(vec![missing_modified])
+            .unwrap_err()
+            .to_string()
+            .contains("lastModifiedDateTime"));
+
+        let mut missing_etag = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "content",
+        );
+        missing_etag.as_object_mut().unwrap().remove("etag");
+        assert!(parse_messages(vec![missing_etag])
+            .unwrap_err()
+            .to_string()
+            .contains("etag"));
+    }
+    #[test]
+    fn repeated_partial_payload_for_one_source_version_converges() {
+        let fixture = Fixture::new();
+        let mut first = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "content",
+        );
+        first["etag"] = json!("stable-etag");
+        first["attachments"] = json!([{
+            "id": "attachment-1",
+            "name": "note.txt",
+            "contentUrl": "https://graph.example/first",
+        }]);
+        let (first_page, first_receipt) = page_fragment(
+            "tenant-a",
+            vec![first],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        fixture.publish(first_page);
+
+        let mut second = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "content",
+        );
+        second["etag"] = json!("stable-etag");
+        second["from"]["user"]["displayName"] = json!("Renamed Tester");
+        second["attachments"] = json!([{
+            "id": "attachment-1",
+            "name": "note.txt",
+            "contentUrl": "https://graph.example/second",
+            "contentType": "text/plain",
+            "contentBytes": base64::engine::general_purpose::STANDARD.encode(b"hello"),
+        }]);
+        let (second_page, _) = page_fragment(
+            "tenant-a",
+            vec![second],
+            2,
+            [first_receipt],
+            "https://graph.example/delta-2",
+        );
+        fixture.publish(second_page);
+
+        let view = load_view(&fixture);
+        let observations = find!(
+            value: Id,
+            pattern!(&view.facts, [{
+                ?value @ metadata::tag: teams::kind_message_observation
             }])
         )
-        .collect::<HashSet<_>>();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows.iter()
-                .map(|(message, _)| *message)
-                .collect::<HashSet<_>>()
-                .len(),
-            2
-        );
-        assert_eq!(
-            rows.iter()
-                .map(|(_, chat)| *chat)
-                .collect::<HashSet<_>>()
-                .len(),
-            2
-        );
-        assert_eq!(ingest_test_batch(&config, vec![y, x], true, true), (0, 0));
-    }
-
-    #[test]
-    fn out_of_order_message_delivery_converges() {
-        let one_shot = TestPile::new();
-        let staged = TestPile::new();
-        let one_shot_config = one_shot.config();
-        let staged_config = staged.config();
-        let a = graph_message("chat-a", "1", "2026-07-29T10:00:00Z", "A", vec![]);
-        let b = graph_message("chat-a", "2", "2026-07-29T10:01:00Z", "B", vec![]);
-        let c = graph_message("chat-a", "3", "2026-07-29T10:02:00Z", "C", vec![]);
-
-        ingest_test_batch(
-            &one_shot_config,
-            vec![a.clone(), b.clone(), c.clone()],
-            true,
-            true,
-        );
-        ingest_test_batch(&staged_config, vec![b.clone(), c.clone()], true, true);
-        ingest_test_batch(&staged_config, vec![a.clone()], true, true);
-
-        assert_eq!(
-            test_branch_catalog(&one_shot.path, DEFAULT_BRANCH),
-            test_branch_catalog(&staged.path, DEFAULT_BRANCH)
-        );
-        assert_eq!(
-            ingest_test_batch(&staged_config, vec![c, a, b], true, true),
-            (0, 0)
-        );
-    }
-
-    #[test]
-    fn attachment_identity_and_files_are_replay_safe() {
-        let pile = TestPile::new();
-        let config = pile.config();
-        let a = graph_message(
-            "chat-a",
-            "1",
-            "2026-07-29T10:00:00Z",
-            "A",
-            vec![inline_attachment("same-local-id", "a.bin", b"a")],
-        );
-        let b = graph_message(
-            "chat-a",
-            "2",
-            "2026-07-29T10:01:00Z",
-            "B",
-            vec![inline_attachment("same-local-id", "b.bin", b"b")],
-        );
-
-        let first = ingest_test_batch(&config, vec![a.clone(), b.clone()], true, true);
-        assert!(first.0 > 0);
-        assert!(first.1 > 0);
-        let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
-        let attachment_edges = find!(
-            (message: Id, attachment: Id),
-            pattern!(&teams_catalog, [{ ?message @ archive::attachment: ?attachment }])
-        )
-        .collect::<HashSet<_>>();
-        assert_eq!(attachment_edges.len(), 2);
-        assert_eq!(
-            attachment_edges
-                .iter()
-                .map(|(_, attachment)| *attachment)
-                .collect::<HashSet<_>>()
-                .len(),
-            2
-        );
-        let files_catalog = test_files_catalog(&pile.path);
-        assert_eq!(file_entity_ids(&files_catalog).len(), 2);
-        let occurrence_files = find!(
-            (attachment: Id, file_id: Id),
-            pattern!(&teams_catalog, [{ ?attachment @ archive::attachment_file: ?file_id }])
-        )
-        .collect::<HashSet<_>>();
-        assert_eq!(occurrence_files.len(), 2);
-        assert_eq!(
-            occurrence_files
-                .iter()
-                .map(|(_, file_id)| *file_id)
-                .collect::<HashSet<_>>()
-                .len(),
-            2
-        );
-        assert_eq!(ingest_test_batch(&config, vec![b, a], true, true), (0, 0));
-    }
-
-    #[test]
-    fn identical_file_records_converge_across_attachment_occurrences() {
-        let pile = TestPile::new();
-        let config = pile.config();
-        let a = graph_message(
-            "chat-a",
-            "1",
-            "2026-07-29T10:00:00Z",
-            "A",
-            vec![inline_attachment("source-a", "shared.bin", b"same")],
-        );
-        let b = graph_message(
-            "chat-a",
-            "2",
-            "2026-07-29T10:01:00Z",
-            "B",
-            vec![inline_attachment("source-b", "shared.bin", b"same")],
-        );
-
-        ingest_test_batch(&config, vec![a, b], true, true);
-        let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
-        let occurrence_files = find!(
-            (attachment: Id, file_id: Id),
-            pattern!(&teams_catalog, [{ ?attachment @ archive::attachment_file: ?file_id }])
-        )
-        .collect::<HashSet<_>>();
-        assert_eq!(occurrence_files.len(), 2);
-        assert_eq!(
-            occurrence_files
-                .iter()
-                .map(|(_, file_id)| *file_id)
-                .collect::<HashSet<_>>()
-                .len(),
-            1
-        );
-        let files_catalog = test_files_catalog(&pile.path);
-        assert_eq!(file_entity_ids(&files_catalog).len(), 1);
-    }
-
-    #[test]
-    fn attachment_occurrence_name_is_an_immutable_first_snapshot() {
-        let pile = TestPile::new();
-        let config = pile.config();
-        let first = graph_message(
-            "chat-a",
-            "1",
-            "2026-07-29T10:00:00Z",
-            "A",
-            vec![inline_attachment("attachment-1", "first.bin", b"same")],
-        );
-        let renamed = graph_message(
-            "chat-a",
-            "1",
-            "2026-07-29T10:00:00Z",
-            "A",
-            vec![inline_attachment("attachment-1", "renamed.bin", b"same")],
-        );
-
-        ingest_test_batch(&config, vec![first], true, true);
-        assert_eq!(
-            ingest_test_batch(&config, vec![renamed], true, true),
-            (0, 0)
-        );
-        let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
-        let names = find!(
-            (attachment: Id, name: Inline<Handle<LongString>>),
-            pattern!(&teams_catalog, [{ ?attachment @ archive::attachment_name: ?name }])
-        )
-        .collect::<Vec<_>>();
-        assert_eq!(names.len(), 1);
-    }
-
-    #[test]
-    fn files_first_partial_commit_recovers_without_duplicate_file_facts() {
-        let pile = TestPile::new();
-        let config = pile.config();
-        let message = graph_message(
-            "chat-a",
-            "1",
-            "2026-07-29T10:00:00Z",
-            "A",
-            vec![inline_attachment("attachment-1", "a.bin", b"a")],
-        );
-
-        let first = ingest_test_batch(&config, vec![message.clone()], true, false);
-        assert!(first.0 > 0);
-        assert!(first.1 > 0);
-        let retry = ingest_test_batch(&config, vec![message.clone()], true, true);
-        assert!(retry.0 > 0);
-        assert!(retry.1 > 0, "retry restages the canonical per-file leaf");
-        assert_eq!(
-            ingest_test_batch(&config, vec![message], true, true),
-            (0, 0)
-        );
-        let files_catalog = test_files_catalog(&pile.path);
-        assert_eq!(file_entity_ids(&files_catalog).len(), 1);
-        let teams_catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
+        .collect::<BTreeSet<_>>();
+        assert_eq!(observations.len(), 1);
+        let observation = *observations.first().unwrap();
         assert_eq!(
             find!(
-                (attachment: Id, file_id: Id),
-                pattern!(&teams_catalog, [{ ?attachment @ archive::attachment_file: ?file_id }])
+                value: Inline<Handle<LongString>>,
+                pattern!(&view.facts, [{ observation @ teams::author_name: ?value }])
+            )
+            .collect::<BTreeSet<_>>()
+            .len(),
+            2
+        );
+        let attachment = one_required(
+            find!(
+                value: Id,
+                pattern!(&view.facts, [{ observation @ archive::attachment: ?value }])
+            )
+            .collect(),
+            "test attachment",
+        )
+        .unwrap();
+        assert_eq!(
+            find!(
+                value: Inline<Handle<LongString>>,
+                pattern!(&view.facts, [{ attachment @ archive::attachment_source_pointer: ?value }])
+            )
+            .collect::<BTreeSet<_>>()
+            .len(),
+            2
+        );
+        assert_eq!(
+            find!(
+                value: Id,
+                pattern!(&view.facts, [{ attachment @ archive::attachment_file: ?value }])
+            )
+            .collect::<BTreeSet<_>>()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn pointer_only_attachment_accepts_later_file_materialization() {
+        let fixture = Fixture::new();
+        let mut message = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "content",
+        );
+        message["attachments"] = json!([{
+            "id": "attachment-1",
+            "name": "note.txt",
+            "contentUrl": "https://graph.example/content",
+        }]);
+        let (page, _) = page_fragment(
+            "tenant-a",
+            vec![message],
+            1,
+            [],
+            "https://graph.example/delta",
+        );
+        fixture.publish(page);
+        let view = load_view(&fixture);
+        let attachment = one_required(
+            find!(
+                value: Id,
+                pattern!(&view.facts, [{
+                    ?value @ metadata::tag: archive::kind_attachment
+                }])
+            )
+            .collect(),
+            "test attachment",
+        )
+        .unwrap();
+
+        let mut derived =
+            file_capability::stage(b"hello".to_vec(), "note.txt", "text/plain").unwrap();
+        let file_id = derived.root().unwrap();
+        let size: Inline<U256BE> = 5_u128.to_inline();
+        derived += entity! { ExclusiveId::force_ref(&attachment) @
+            archive::attachment_file: file_id,
+            archive::attachment_size_bytes: size,
+        };
+        fixture
+            .storage()
+            .publish(derived, "materialize attachment")
+            .unwrap();
+
+        let materialized = load_view(&fixture);
+        assert_eq!(
+            one_required(
+                find!(
+                    value: Id,
+                    pattern!(&materialized.facts, [{ attachment @ archive::attachment_file: ?value }])
+                )
+                .collect(),
+                "materialized attachment file",
+            )
+            .unwrap(),
+            file_id
+        );
+    }
+
+    #[test]
+    fn divergent_latest_message_ties_fail_closed() {
+        let fixture = Fixture::new();
+        let (first, first_receipt) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T11:00:00Z",
+                "left",
+            )],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        fixture.publish(first);
+        let (tie, _) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T11:00:00Z",
+                "right",
+            )],
+            2,
+            [first_receipt],
+            "https://graph.example/delta-2",
+        );
+        let before = fs::read(&fixture.pile).unwrap();
+        let error = fixture.storage().publish(tie, "tie").unwrap_err();
+        assert!(
+            error.to_string().contains("causally ambiguous"),
+            "unexpected rejection: {error:#}"
+        );
+        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+        let view = load_view(&fixture);
+        let source = source_fragment("tenant-a").root().unwrap();
+        let current = current_messages(&view.facts, source).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(
+            read_longstring(&view.reader, current[0].content.unwrap(), "test content").unwrap(),
+            "left"
+        );
+    }
+
+    #[test]
+    fn causal_coverage_never_hides_a_stale_fork_behind_generation() {
+        let fixture = Fixture::new();
+        let (root, root_id) =
+            page_fragment("tenant-a", vec![], 1, [], "https://graph.example/root");
+        fixture.publish(root);
+        let (main, main_id) = page_fragment(
+            "tenant-a",
+            vec![],
+            2,
+            [root_id],
+            "https://graph.example/main",
+        );
+        fixture.publish(main);
+        let (advanced, _) = page_fragment(
+            "tenant-a",
+            vec![],
+            3,
+            [main_id],
+            "https://graph.example/advanced",
+        );
+        fixture.publish(advanced);
+        let (stale_fork, _) = page_fragment(
+            "tenant-a",
+            vec![],
+            2,
+            [root_id],
+            "https://graph.example/stale-fork",
+        );
+        let before = fs::read(&fixture.pile).unwrap();
+        let error = fixture
+            .storage()
+            .publish(stale_fork, "stale fork")
+            .unwrap_err();
+        assert!(error.to_string().contains("coverage head has 2 values"));
+        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn inline_attachment_bytes_live_in_the_same_page_fragment() {
+        let source = source_fragment("tenant-a").root().unwrap();
+        let mut message = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "file",
+        );
+        message["attachments"] = json!([{
+            "id": "attachment-1",
+            "name": "note.txt",
+            "contentType": "text/plain; charset=utf-8",
+            "contentBytes": base64::engine::general_purpose::STANDARD.encode(b"hello"),
+        }]);
+        let (fragment, _, _) = build_page_fragment(
+            "tenant-a",
+            source,
+            parse_messages(vec![message]).unwrap(),
+            "token",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            find!(
+                file: Id,
+                pattern!(&fragment, [{ ?file @ metadata::tag: faculties::schemas::files::KIND_FILE }])
+            )
+            .count(),
+            1
+        );
+        assert_eq!(
+            find!(
+                attachment: Id,
+                pattern!(&fragment, [{
+                    ?attachment @
+                    metadata::tag: archive::kind_attachment,
+                    archive::attachment_file: _?file,
+                }])
             )
             .count(),
             1
@@ -4648,33 +4587,156 @@ mod tests {
     }
 
     #[test]
-    fn legacy_message_identity_lineage_is_rejected_before_replay() {
-        let pile = TestPile::new();
-        let config = pile.config();
-        with_repo(&config.pile_path, |repo| {
-            let mut ws = map_err_debug(repo.pull(config.branch_id), "pull test workspace")?;
-            let chat_external = ws.put("legacy-chat".to_string());
-            let chat_fragment = entity! { _ @ teams::chat_id: chat_external };
-            let chat_id = chat_fragment.root().expect("chat root");
-            let message_external = ws.put("legacy-message".to_string());
-            let legacy_message = ufoid();
-            let mut change = chat_fragment;
-            change += entity! { &legacy_message @
-                metadata::tag: archive::kind_message,
-                teams::chat: chat_id,
-                teams::message_id: message_external,
-            };
-            ws.commit(change, "legacy Teams identity fixture");
-            map_err_debug(repo.push(&mut ws), "push test workspace")?;
-            Ok(())
-        })
+    fn observations_without_their_page_receipt_are_rejected() {
+        let source = source_fragment("tenant-a").root().unwrap();
+        let (mut fragment, observations, _) = build_page_fragment(
+            "tenant-a",
+            source,
+            parse_messages(vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T10:00:00Z",
+                "atomic",
+            )])
+            .unwrap(),
+            "token",
+            &[],
+        )
         .unwrap();
+        assert!(validate_commit_fragment(fragment.facts()).is_err());
 
-        let catalog = test_branch_catalog(&pile.path, DEFAULT_BRANCH);
-        let error = validate_message_identity_lineage(&catalog).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("legacy message identity lineage"));
+        fragment += coverage_fragment(
+            source,
+            1,
+            [],
+            "https://graph.example/request",
+            "https://graph.example/delta",
+            "delta",
+            observations,
+        )
+        .unwrap();
+        validate_commit_fragment(fragment.facts()).unwrap();
+    }
+
+    #[test]
+    fn page_commit_cannot_borrow_identity_facts_from_the_catalog() {
+        let fixture = Fixture::new();
+        let (first, first_receipt) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T10:00:00Z",
+                "first",
+            )],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        fixture.publish(first);
+
+        let (second, _) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T11:00:00Z",
+                "second",
+            )],
+            2,
+            [first_receipt],
+            "https://graph.example/delta-2",
+        );
+        let chat = one_required(
+            find!(
+                value: Id,
+                pattern!(&second, [{ ?value @ metadata::tag: teams::kind_chat }])
+            )
+            .collect(),
+            "test chat",
+        )
+        .unwrap();
+        let (_, facts, metafacts, blobs) = second.into_parts();
+        let incomplete = facts
+            .iter()
+            .filter(|fact| fact.e() != &chat)
+            .copied()
+            .collect::<TribleSet>();
+        let incomplete = Fragment::from_parts(incomplete, metafacts, blobs);
+        let before = fs::read(&fixture.pile).unwrap();
+        let error = fixture
+            .storage()
+            .publish(incomplete, "incomplete page")
+            .unwrap_err();
+        assert!(error.to_string().contains("names an unknown chat"));
+        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn malformed_inline_attachment_blocks_page_construction() {
+        let mut message = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "file",
+        );
+        message["attachments"] = json!([{
+            "id": "attachment-1",
+            "contentBytes": "not base64!",
+        }]);
+        assert!(parse_messages(vec![message]).is_err());
+
+        let mut missing_id = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "file",
+        );
+        missing_id["attachments"] = json!([{ "name": "orphan.bin" }]);
+        assert!(parse_messages(vec![missing_id]).is_err());
+    }
+
+    #[test]
+    fn exact_page_replay_is_idempotent() {
+        let fixture = Fixture::new();
+        let (page, _) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T10:00:00Z",
+                "same",
+            )],
+            1,
+            [],
+            "https://graph.example/delta",
+        );
+        fixture.publish(page.clone());
+        let after_first = fs::metadata(&fixture.pile).unwrap().len();
+        fixture.publish(page);
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
+    }
+
+    #[test]
+    fn login_resolves_generic_authority_to_token_tenant() {
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"tid":"tenant-guid"}"#);
+        let token = format!("e30.{payload}.signature");
+        assert_eq!(
+            resolve_source_tenant("common", Some(&token), None).unwrap(),
+            "tenant-guid"
+        );
+        assert!(resolve_source_tenant("common", None, None).is_err());
+        assert_eq!(
+            resolve_source_tenant("tenant.example", None, None).unwrap(),
+            "tenant.example"
+        );
     }
 
     #[test]
@@ -4688,21 +4750,5 @@ mod tests {
             (Some("attachment"), "42")
         );
         assert_eq!(parse_attachment_reference("42"), (None, "42"));
-    }
-
-    #[test]
-    fn duplicate_delta_versions_are_coalesced_deterministically() {
-        let older = graph_message("chat-a", "1", "2026-07-29T10:00:00Z", "older", vec![]);
-        let mut newer = graph_message("chat-a", "1", "2026-07-29T10:00:00Z", "newer", vec![]);
-        newer["lastModifiedDateTime"] = json!("2026-07-29T10:01:00Z");
-
-        for input in [
-            vec![older.clone(), newer.clone()],
-            vec![newer.clone(), older],
-        ] {
-            let parsed = parse_messages(input).unwrap();
-            assert_eq!(parsed.len(), 1);
-            assert_eq!(parsed[0].content, "newer");
-        }
     }
 }

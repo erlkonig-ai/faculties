@@ -1,7 +1,7 @@
 = Substrate 2/4: The Pile
 
-A pile is one file holding everything an agent knows: every
-trible, every blob, every branch head. It is *append-only* —
+A pile is one file holding everything an agent knows: every trible, every blob,
+and the grow-only collection calculus that authorizes them. It is *append-only* —
 bytes are added at the end, never rewritten.
 
 == The shape
@@ -9,32 +9,37 @@ bytes are added at the end, never rewritten.
 ```
 self.pile
 ┌────────────────────────────────────────────────┐
-│ blob │ blob │ commit │ blob │ commit │ commit │ ──▶ append
+│ blob │ blob │ COMMIT │ blob │ MERGE │ COMMIT │ ──▶ append
 └────────────────────────────────────────────────┘
    ▲                       ▲
-   content-addressed       Ed25519-signed,
-   (hash = identity)       form branch histories
+   content-addressed       signed membership and
+   (hash = identity)       reproducible equations
 ```
 
   - *Blobs* carry the data: trible sets, documents, files.
     Each is addressed by its hash — the pile is a
     content-addressed store in a single file.
-  - *Commits* are signed pointers: "branch `wiki` now
-    includes this set of facts". Each faculty owns its
-    branch (`compass`, `wiki`, `files`, …) and they merge
-    independently.
+  - A signed *COMMIT* says "this canonical fact archive is a member of this
+    exact collection". The collection is named by a self-describing descriptor
+    containing its scope, representation, and recipe—not by a mutable pointer.
+  - Unsigned *MERGE* and *DERIVE* records describe reproducible algebraic work:
+    moving within a collection by union, or across collections by a canonical
+    homomorphism. They accelerate reads but grant no publication authority.
 
-== Nothing is ever deleted
+== Published facts are never overwritten in place
 
-Changing your mind appends a *new* fact rather than editing
-an old one. Readers pick the latest fact per key by its
-time coordinate (the coordinate-and-cursor pattern); the old
-fact stays — history is exhaust from the workflow, never a
-separate bookkeeping step.
+Changing your mind publishes a new immutable state or event rather than editing
+an old one. When a domain needs change, it represents the relationship
+explicitly—for example Wiki revisions form a supersession DAG whose complete
+frontier remains visible. There is no substrate-wide last-writer-wins rule. The
+old fact remains in the append-only source pile: history is exhaust from the
+workflow, never separate bookkeeping.
 
-This is what makes the audit trail of `compass` /
-`wiki` / `decide` trustworthy: there is no API to
-falsify the past, by construction.
+Valid signer-owned COMMITs are strong retention roots for their resident data
+and attachment closure. Local storage is still manageable: conservative GC can
+rewrite retained state into a new pile, and explicit destructive repair can
+amputate a torn tail. Those are storage-policy operations, not silent mutation
+of a published fact.
 
 == Consequences of append-only + content-addressing
 
@@ -42,12 +47,17 @@ falsify the past, by construction.
     reported loudly; everything before it is intact. Cutting
     the torn tail off is a separate, explicit, destructive
     step (`trible pile amputate`), never part of opening.
-  - *Trivially mergeable*: `cat a.pile >> b.pile` is a
-    legitimate first step of merging two piles — duplicate
-    blobs collapse because identical content has identical
-    hashes.
-  - *Syncable*: a peer needs only the blobs it's missing —
-    which both sides can compute from hashes alone.
+  - *Trivially mergeable*: concatenation unions the immutable blob and native
+    collection-record sets; duplicate content collapses by identity. Retired
+    mutable pin logs are not part of this native convergence claim. Physical
+    presence is not admission: current faculties materialize only the COMMITs
+    made by their configured durable signer.
+  - *Transport-capable algebra*: core defines signed, irrevocable
+    *collection-gossip grants* for redistributing one author's COMMITs in one
+    exact collection and their missing blobs. This is distinct from team
+    capability auth. Faculties do not yet publish these grants, and
+    `pile net sync` has not wired the record transport; it still speaks the
+    legacy head/blob protocol.
 
 == Further reading
 

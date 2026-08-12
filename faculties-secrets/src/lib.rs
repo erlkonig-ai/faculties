@@ -1,43 +1,27 @@
-//! faculties-secrets — the capability + envelope-encryption core of the `secrets`
-//! faculty, extracted from the monolithic `src/bin/secrets.rs` so the CLI and
-//! other faculties can share one implementation without pulling all of
-//! faculties (no mary/GORBIE/egui). This crate is the shared data layout (the 5
-//! KIND ids + attributes), the crypto primitives, the capability queries (the
-//! effective-admin fixpoint), and the mutating operations — everything the
-//! `secrets` bin does MINUS the clap parsing and the `println!` output.
+//! Canonical Secrets records and strict collection semantics.
 //!
-//! Design captured in the `authz`-tagged wiki (hub 4448d5fc).
+//! The collection is a monotone union of immutable identities, rooted
+//! intrinsic scopes, independent grant occurrences, grant-retraction facts,
+//! immutable secret versions, and recipient wraps.  Authorization is the
+//! least rooted grant fixpoint; no read path chooses an arbitrary scalar from
+//! competing values.
 //!
-//! The envelope (KEM-DEM): a fresh data key (DEK) encrypts a secret body once
-//! via secretbox; the DEK is sealed-boxed to each recipient's X25519 key (the
-//! key is *derived* from their Ed25519 identity key). Removal = rotate. The
-//! current recipient set is enumerated from the grant tuples with the query
-//! engine — never stored, "work as its own ledger".
+//! A fresh DEK secretboxes each secret version once and is sealed-boxed to the
+//! X25519 key derived from every recipient's Ed25519 identity. A grant is
+//! effective only when its issuer belongs to the effective-admin fixpoint of
+//! its object. Retracting one admin grant therefore transitively invalidates
+//! authority derived solely through it, while another independent live grant
+//! preserves OR-set membership.
 //!
-//! Scopes are content-derived and rooted at their creator
-//! (`scope_id = Blake3(creator_pk, name)`); a grant is *effective* only if its
-//! issuer chains, through admin-grants, back to that root (the
-//! `effective_admins` fixpoint). Strong/transitive removal therefore falls out
-//! for free — retracting an admin drops everything that depended on it.
-//! Transitive group membership is a materialized regular-path relation over
-//! *effective* grants.
-//! Secrets are `(scope, name)` addressed, latest-wins (`secret_add` of an
-//! existing name is a new version, sealed to the *current* recipients).
-//!
-//! Removal is *operational, not cryptographic*: a removed user keeps the wrap
-//! (= the value) they already held — the append-only pile cannot delete it, and
-//! re-encrypting the same value protects nothing. So `rotate_worklist` is not a
-//! crypto op; it lists every credential still readable by a removed user, so you
-//! can change it at its source and `secret_add` the new value.
+//! Removal is operational rather than retroactively cryptographic: append-only
+//! storage cannot make a recipient forget an old wrap. The rotation view thus
+//! reports source credentials that must be changed and published as a fresh
+//! version; it never pretends that re-encrypting the same value revokes past
+//! knowledge.
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use anyhow::{bail, Context, Result};
-use ed25519_dalek::SigningKey;
-use hifitime::Epoch;
-use rand_core::{OsRng, RngCore};
-
+use anyhow::{anyhow, bail, Context, Result};
 use dryoc::classic::crypto_pwhash::{crypto_pwhash, PasswordHashAlgorithm};
 use dryoc::classic::crypto_sign_ed25519::{
     crypto_sign_ed25519_pk_to_curve25519, crypto_sign_ed25519_sk_to_curve25519,
@@ -49,78 +33,244 @@ use dryoc::dryocbox::{DryocBox, KeyPair as BoxKeyPair, PublicKey as BoxPublicKey
 use dryoc::dryocsecretbox::{DryocSecretBox, Key, Nonce};
 use dryoc::sign::SigningKeyPair;
 use dryoc::types::*;
-
+use rand_core::{OsRng, RngCore};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
-use triblespace::prelude::inlineencodings::Handle;
+use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
-use triblespace_paths::{PathExpr, PathIndex, Step};
 
-// ── schema ──────────────────────────────────────────────────────────────────
-// Minted with `trible genid` 2026-06-19. Reserved-but-unused (for the
-// correctness/governance layers): grant_sig 74521A9057EBC9B75C957F25D504B5FA,
-// grant_issued_at 7411C2DDB81DC5C1B1AC85F4449B2EB9 (we use metadata::created_at),
-// secret_created_at 6A0708F6F48490661F55240ED5D1C279 (idem),
-// identity_nickname FF6BE7814DFCA5401E48DBDF0429C3EB (we use metadata::name),
-// secrets_metadata B906AE45B1F40AE47C9924A18E7CE2B9.
-pub mod schema {
-    use triblespace::macros::id_hex;
-    use triblespace::prelude::blobencodings::RawBytes;
-    use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
-    use triblespace::prelude::*;
+pub mod password;
+pub mod schema;
 
-    attributes! {
-        "FD0897D627CF18F4E49A93968A8D6301" unsafe as pub identity_sign_pk: Handle<RawBytes>;
-        "1E4279231655D8C67835865C3AFB629F" unsafe as pub identity_lockbox: Handle<RawBytes>;
-        "B3F0E5A5FFACC159B651BFDA19EAE18C" unsafe as pub grant_object: GenId;
-        "22F807F93FADFE092C8CE0698044680B" unsafe as pub grant_relation: ShortString;
-        "B44AF03BA7AF04ED81096D7900D70A12" unsafe as pub grant_subject: GenId;
-        "B177568BEE389D76D9D71110E9067EF1" unsafe as pub grant_issuer: GenId;
-        "73CE206E6B9B81CB2BD2388ECC5D3AA8" unsafe as pub grant_retracted_at: NsTAIInterval;
-        "A66C795299212D16BA6BA25BD1D9F983" unsafe as pub secret_scope: GenId;
-        "8FD8C43D3490ACD6AFAD6D691B748CA3" unsafe as pub secret_name: ShortString;
-        "7FC38805FDC9FA4D8449497B298B51BB" unsafe as pub secret_body: Handle<RawBytes>;
-        "D17EC6F6A9F9D6B7A3B9A329A9CFC4CC" unsafe as pub wrap_secret: GenId;
-        "CAD2A79E7F5B1A870F5814BDEE5C90F8" unsafe as pub wrap_recipient: GenId;
-        "B30CE37D4DC3CAACC34D946B3D71E37C" unsafe as pub wrap_dek: Handle<RawBytes>;
-        // Ephemeral edge, only ever asserted into an in-memory TribleSet for a
-        // materialized regular-path closure — never persisted. (minted 2026-06-19)
-        "ABAF427C4F1CB01AA7091A9C38F0DA3A" unsafe as pub reaches: GenId;
-        // A scope is a content-derived entity: id = Blake3(creator_pk, name).
-        // The creator is the implicit root admin. (minted 2026-06-19)
-        "CE866212934742FF5B27DEF25E366E07" unsafe as pub scope_creator: GenId;
-    }
-
-    pub const KIND_IDENTITY: Id = id_hex!("0B870F06D1B502EBE1259C90234E8BA2");
-    pub const KIND_GRANT: Id = id_hex!("BB95E8D2D7DC644B39396A1B6C10ECC6");
-    pub const KIND_SECRET: Id = id_hex!("72B64C9F3644B8016B64820D7F3F23C1");
-    pub const KIND_WRAP: Id = id_hex!("EB8549BAF679C5D11ECEDB416AAD76E3");
-    pub const KIND_SCOPE: Id = id_hex!("B2920B23494B9DBD4500158D84432325");
-}
-
-use schema::{
+use crate::schema::{
     grant_issuer, grant_object, grant_relation, grant_retracted_at, grant_subject,
-    identity_lockbox, identity_sign_pk, reaches, scope_creator, secret_body, secret_name,
-    secret_scope, wrap_dek, wrap_recipient, wrap_secret, KIND_GRANT, KIND_IDENTITY, KIND_SCOPE,
-    KIND_SECRET, KIND_WRAP,
+    identity_lockbox, identity_sign_pk, scope_creator, secret_body, secret_name, secret_scope,
+    wrap_dek, wrap_recipient, wrap_secret, KIND_GRANT, KIND_IDENTITY, KIND_SCOPE, KIND_SECRET,
+    KIND_WRAP,
 };
 
-/// The default branch the `secrets` faculty stores its data on.
-pub const DEFAULT_BRANCH: &str = "secrets";
+pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 
-type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-type TextHandle = Inline<Handle<LongString>>;
-type BytesHandle = Inline<Handle<RawBytes>>;
+const ED25519_PUBLIC_KEY_BYTES: usize = 32;
+const LOCKBOX_BYTES: usize = 16 + 24 + 16 + 64;
+const SECRET_BODY_MIN_BYTES: usize = 24 + 16;
+const SEALED_DEK_BYTES: usize = 48 + 32;
 
-// ── crypto ──────────────────────────────────────────────────────────────────
+/// A freshly prepared identity and the public material callers may display.
+/// The password-protected signing key remains embedded in `fragment`.
+pub struct PreparedIdentity {
+    pub fragment: Fragment,
+    pub id: Id,
+    pub public_key: Vec<u8>,
+}
 
-/// Derive a 32-byte secretbox key from a password and salt via Argon2id.
+/// One immutable encrypted secret version and all of its initial wraps.
+pub struct SealedVersion {
+    pub fragment: Fragment,
+    pub secret: Id,
+    pub recipient_count: usize,
+}
+
+/// Additional recipient wraps for an existing immutable secret version.
+pub struct SharedVersion {
+    pub fragment: Fragment,
+    pub new_recipient_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdentityRow {
+    pub id: Id,
+    pub created_at: IntervalValue,
+    pub name: TextHandle,
+    pub sign_pk: BytesHandle,
+    pub lockbox: BytesHandle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeRow {
+    pub id: Id,
+    pub creator: Id,
+    /// Independent observations that this intrinsic scope was created.
+    /// Repeating the same `(creator, name)` operation is therefore monotone
+    /// and never creates a competing scalar.
+    pub created_at: BTreeSet<IntervalValue>,
+    pub name: TextHandle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantRow {
+    pub id: Id,
+    pub created_at: IntervalValue,
+    pub object: Id,
+    pub relation: String,
+    pub subject: Id,
+    pub issuer: Id,
+    /// Retractions are an unordered set of monotone observations. Their
+    /// existence, not an arbitrated timestamp, makes the grant non-live.
+    pub retracted_at: BTreeSet<IntervalValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretRow {
+    pub id: Id,
+    pub created_at: IntervalValue,
+    pub scope: Id,
+    pub name: String,
+    pub display_name: TextHandle,
+    pub body: BytesHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WrapRow {
+    pub id: Id,
+    pub created_at: IntervalValue,
+    pub secret: Id,
+    pub recipient: Id,
+    pub sealed_dek: BytesHandle,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SecretsCatalog {
+    pub identities: BTreeMap<Id, IdentityRow>,
+    pub scopes: BTreeMap<Id, ScopeRow>,
+    pub grants: BTreeMap<Id, GrantRow>,
+    pub secrets: BTreeMap<Id, SecretRow>,
+    pub wraps: BTreeMap<Id, WrapRow>,
+}
+
+impl SecretsCatalog {
+    pub fn grant_is_live(&self, grant: Id) -> bool {
+        self.grants
+            .get(&grant)
+            .is_some_and(|row| row.retracted_at.is_empty())
+    }
+
+    pub fn scope_creator(&self, scope: Id) -> Option<Id> {
+        self.scopes.get(&scope).map(|row| row.creator)
+    }
+
+    /// Least fixpoint rooted at the intrinsic scope creator.
+    pub fn effective_admins(&self, scope: Id) -> HashSet<Id> {
+        let mut admins = HashSet::new();
+        let Some(creator) = self.scope_creator(scope) else {
+            return admins;
+        };
+        admins.insert(creator);
+        loop {
+            let mut grew = false;
+            for grant in self.grants.values() {
+                if grant.object == scope
+                    && grant.relation == "admin"
+                    && grant.retracted_at.is_empty()
+                    && admins.contains(&grant.issuer)
+                    && admins.insert(grant.subject)
+                {
+                    grew = true;
+                }
+            }
+            if !grew {
+                return admins;
+            }
+        }
+    }
+
+    /// Identity leaves reachable through effective grants, plus the root
+    /// creator. Nested scopes are traversed as groups without becoming
+    /// recipients unless they are also identity records.
+    pub fn recipients_of(&self, scope: Id) -> Vec<Id> {
+        let mut admin_cache: HashMap<Id, HashSet<Id>> = HashMap::new();
+        let mut edges: BTreeMap<Id, BTreeSet<Id>> = BTreeMap::new();
+        for grant in self.grants.values() {
+            if !grant.retracted_at.is_empty() {
+                continue;
+            }
+            let admins = admin_cache
+                .entry(grant.object)
+                .or_insert_with(|| self.effective_admins(grant.object));
+            if admins.contains(&grant.issuer) {
+                edges.entry(grant.object).or_default().insert(grant.subject);
+            }
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::from([scope]);
+        while let Some(object) = queue.pop_front() {
+            if !visited.insert(object) {
+                continue;
+            }
+            if let Some(subjects) = edges.get(&object) {
+                queue.extend(subjects.iter().copied());
+            }
+        }
+
+        let mut recipients: BTreeSet<Id> = visited
+            .into_iter()
+            .filter(|id| self.identities.contains_key(id))
+            .collect();
+        if let Some(creator) = self.scope_creator(scope) {
+            recipients.insert(creator);
+        }
+        recipients.into_iter().collect()
+    }
+
+    pub fn wrap_holders(&self, secret: Id) -> Vec<Id> {
+        self.wraps
+            .values()
+            .filter(|row| row.secret == secret)
+            .map(|row| row.recipient)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn secret_versions(&self, scope: Id, name: &str) -> usize {
+        self.secrets
+            .values()
+            .filter(|row| row.scope == scope && row.name == name)
+            .count()
+    }
+
+    /// Resolve latest-wins addressing without hiding a concurrent timestamp
+    /// tie. A tie between distinct versions is visible ambiguity.
+    pub fn latest_secret(&self, scope: Id, name: &str) -> Result<Option<Id>> {
+        let mut candidates: Vec<&SecretRow> = self
+            .secrets
+            .values()
+            .filter(|row| row.scope == scope && row.name == name)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        candidates.sort_by_key(|row| interval_start(row.created_at));
+        let latest_time = interval_start(candidates.last().expect("non-empty").created_at);
+        let latest: Vec<_> = candidates
+            .into_iter()
+            .filter(|row| interval_start(row.created_at) == latest_time)
+            .collect();
+        match latest.as_slice() {
+            [row] => Ok(Some(row.id)),
+            rows => bail!(
+                "{} secret versions named '{name}' in scope {} share the latest timestamp; address is ambiguous",
+                rows.len(),
+                fmt_id(scope)
+            ),
+        }
+    }
+
+    pub fn wraps_for(&self, secret: Id, recipient: Id) -> Vec<&WrapRow> {
+        self.wraps
+            .values()
+            .filter(|row| row.secret == secret && row.recipient == recipient)
+            .collect()
+    }
+}
+
 fn derive_key(password: &[u8], salt: &[u8]) -> Key {
-    let mut out = [0u8; 32];
+    let mut output = [0u8; 32];
     crypto_pwhash(
-        &mut out,
+        &mut output,
         password,
         salt,
         CRYPTO_PWHASH_OPSLIMIT_MODERATE,
@@ -128,1366 +278,1655 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Key {
         PasswordHashAlgorithm::Argon2id13,
     )
     .expect("argon2id");
-    Key::try_from(&out[..]).expect("32-byte key")
+    Key::try_from(&output[..]).expect("32-byte secretbox key")
 }
 
-/// Password-lock an Ed25519 secret key: `salt(16) ‖ nonce(24) ‖ secretbox(sk)`.
-pub fn lock_secret_key(password: &[u8], sk: &[u8]) -> Vec<u8> {
+/// `salt(16) || nonce(24) || secretbox(ed25519 secret key)`.
+fn lock_secret_key(password: &[u8], secret_key: &[u8]) -> Vec<u8> {
     let mut salt = [0u8; CRYPTO_PWHASH_SALTBYTES];
     OsRng.fill_bytes(&mut salt);
     let key = derive_key(password, &salt);
     let nonce = Nonce::gen();
-    let ct = DryocSecretBox::encrypt_to_vecbox(sk, &nonce, &key).to_vec();
-    let mut out = Vec::with_capacity(salt.len() + nonce.len() + ct.len());
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ct);
-    out
+    let ciphertext = DryocSecretBox::encrypt_to_vecbox(secret_key, &nonce, &key).to_vec();
+    let mut output = Vec::with_capacity(salt.len() + nonce.len() + ciphertext.len());
+    output.extend_from_slice(&salt);
+    output.extend_from_slice(&nonce);
+    output.extend_from_slice(&ciphertext);
+    output
 }
 
-/// Recover the Ed25519 secret key from a lockbox.
-pub fn unlock_secret_key(password: &[u8], lockbox: &[u8]) -> Result<Vec<u8>> {
+fn unlock_secret_key(password: &[u8], lockbox: &[u8]) -> Result<Vec<u8>> {
     if lockbox.len() < CRYPTO_PWHASH_SALTBYTES + 24 {
         bail!("malformed lockbox");
     }
     let salt = &lockbox[..CRYPTO_PWHASH_SALTBYTES];
-    let nonce = Nonce::try_from(&lockbox[CRYPTO_PWHASH_SALTBYTES..CRYPTO_PWHASH_SALTBYTES + 24])
-        .context("nonce")?;
-    let ct = &lockbox[CRYPTO_PWHASH_SALTBYTES + 24..];
+    let nonce = Nonce::try_from(&lockbox[CRYPTO_PWHASH_SALTBYTES..][..24]).context("nonce")?;
+    let ciphertext = &lockbox[CRYPTO_PWHASH_SALTBYTES + 24..];
     let key = derive_key(password, salt);
-    DryocSecretBox::from_bytes(ct)
-        .map_err(|e| anyhow::anyhow!("parse lockbox: {e:?}"))?
+    DryocSecretBox::from_bytes(ciphertext)
+        .map_err(|error| anyhow!("parse lockbox: {error:?}"))?
         .decrypt_to_vec(&nonce, &key)
-        .map_err(|_| anyhow::anyhow!("wrong password"))
+        .map_err(|_| anyhow!("wrong password"))
 }
 
-/// A scope's identity *is* its `(creator, name)`: build the intrinsic fragment
-/// whose entity id `entity!` derives from exactly those two facts. Creating
-/// "the same scope" twice converges to one entity (idempotent), and the id can
-/// never drift from what it commits to — the derivation is the macro's job, not
-/// a hand-rolled hash. Non-identifying facts (tag, created_at) are added by the
-/// caller under `fragment.root()`.
-pub fn scope_fragment(creator: Id, name_handle: TextHandle) -> Fragment {
-    entity! { _ @
-        scope_creator: &creator,
-        metadata::name: name_handle,
+fn box_pk_from_ed25519(ed_pk: &[u8]) -> Result<BoxPublicKey> {
+    let public: &[u8; 32] = ed_pk.try_into().context("Ed25519 public key length")?;
+    let mut x25519 = [0u8; 32];
+    crypto_sign_ed25519_pk_to_curve25519(&mut x25519, public)
+        .map_err(|error| anyhow!("public-key conversion: {error:?}"))?;
+    BoxPublicKey::try_from(&x25519[..]).map_err(|error| anyhow!("X25519 public key: {error:?}"))
+}
+
+fn box_keypair_from_ed25519(ed_sk: &[u8], ed_pk: &[u8]) -> Result<BoxKeyPair> {
+    let secret: &[u8; 64] = ed_sk.try_into().context("Ed25519 secret key length")?;
+    let public: &[u8; 32] = ed_pk.try_into().context("Ed25519 public key length")?;
+    let mut x_public = [0u8; 32];
+    let mut x_secret = [0u8; 32];
+    crypto_sign_ed25519_pk_to_curve25519(&mut x_public, public)
+        .map_err(|error| anyhow!("public-key conversion: {error:?}"))?;
+    crypto_sign_ed25519_sk_to_curve25519(&mut x_secret, secret);
+    BoxKeyPair::from_slices(&x_public, &x_secret)
+        .map_err(|error| anyhow!("X25519 keypair: {error:?}"))
+}
+
+fn identity_box_keypair(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    identity: Id,
+    password: &[u8],
+) -> Result<BoxKeyPair> {
+    let row = catalog
+        .identities
+        .get(&identity)
+        .ok_or_else(|| anyhow!("identity {} not found", fmt_id(identity)))?;
+    let lockbox = read_bytes(reader, row.lockbox).context("read identity lockbox")?;
+    let public = read_bytes(reader, row.sign_pk).context("read identity public key")?;
+    let secret = unlock_secret_key(password, &lockbox)?;
+    box_keypair_from_ed25519(&secret, &public)
+}
+
+/// Recover the unique DEK assertion without selecting an arbitrary wrap.
+/// Independent duplicate wraps are valid iff they all open to the same key.
+fn recover_dek(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    secret: Id,
+    identity: Id,
+    password: &[u8],
+) -> Result<Key> {
+    let keypair = identity_box_keypair(reader, catalog, identity, password)?;
+    let wraps = catalog.wraps_for(secret, identity);
+    if wraps.is_empty() {
+        bail!("no wrap for {} on this secret", fmt_id(identity));
     }
-}
-
-/// Derive the X25519 public key (for sealing) from an Ed25519 public key.
-pub fn box_pk_from_ed25519(ed_pk: &[u8]) -> Result<BoxPublicKey> {
-    let arr: &[u8; 32] = ed_pk.try_into().context("ed25519 public key length")?;
-    let mut xpk = [0u8; 32];
-    crypto_sign_ed25519_pk_to_curve25519(&mut xpk, arr)
-        .map_err(|e| anyhow::anyhow!("pk convert: {e:?}"))?;
-    BoxPublicKey::try_from(&xpk[..]).map_err(|e| anyhow::anyhow!("x25519 pk: {e:?}"))
-}
-
-/// Build the X25519 keypair (for unsealing) from an Ed25519 keypair.
-pub fn box_keypair_from_ed25519(ed_sk: &[u8], ed_pk: &[u8]) -> Result<BoxKeyPair> {
-    let sk_arr: &[u8; 64] = ed_sk.try_into().context("ed25519 secret key length")?;
-    let pk_arr: &[u8; 32] = ed_pk.try_into().context("ed25519 public key length")?;
-    let mut xpk = [0u8; 32];
-    let mut xsk = [0u8; 32];
-    crypto_sign_ed25519_pk_to_curve25519(&mut xpk, pk_arr)
-        .map_err(|e| anyhow::anyhow!("pk convert: {e:?}"))?;
-    crypto_sign_ed25519_sk_to_curve25519(&mut xsk, sk_arr);
-    BoxKeyPair::from_slices(&xpk, &xsk).map_err(|e| anyhow::anyhow!("x25519 keypair: {e:?}"))
-}
-
-// ── pile plumbing (mirrors decide.rs) ─────────────────────────────────────────
-
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
-}
-
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-/// Wrap an instant as a zero-width `[at, at]` interval value.
-pub fn instant_interval(at: Epoch) -> IntervalValue {
-    (at, at).try_to_inline().unwrap()
-}
-
-/// Format an [`Id`] as its lowercase hex string.
-pub fn fmt_id(id: Id) -> String {
-    format!("{id:x}")
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h)
-        .ok()
-        .map(|v| v.to_string())
-}
-
-fn read_bytes(ws: &mut Workspace<Pile>, h: BytesHandle) -> Option<Vec<u8>> {
-    ws.get::<anybytes::Bytes, _>(h)
-        .ok()
-        .map(|b| b.as_ref().to_vec())
-}
-
-fn put_bytes(ws: &mut Workspace<Pile>, bytes: Vec<u8>) -> BytesHandle {
-    ws.put::<RawBytes, _>(bytes)
-}
-
-// ── enumerate (the engine does the work) ──────────────────────────────────────
-
-/// A grant is *live* at `now` if it carries no retraction coordinate (the
-/// non-concurrent cursor; the concurrency-safe rules are the next layer).
-pub fn grant_is_live(space: &TribleSet, grant: Id) -> bool {
-    !exists!(pattern!(space, [{ grant @ grant_retracted_at: _?r }]))
-}
-
-fn interval_start(iv: IntervalValue) -> Epoch {
-    let (start, _end): (Epoch, Epoch) = iv.try_from_inline().unwrap();
-    start
-}
-
-/// The latest version of a secret named `name` within `scope` — `secret add`
-/// with an existing (scope, name) makes a new version; this picks the newest by
-/// creation time (latest-wins addressing = rotation).
-pub fn latest_secret(space: &TribleSet, scope: Id, name: &str) -> Option<Id> {
-    find!(
-        (s: Id, t: IntervalValue),
-        pattern!(space, [{ ?s @ metadata::tag: KIND_SECRET, secret_scope: scope, secret_name: name, metadata::created_at: ?t }])
-    )
-    .max_by_key(|(_, t)| interval_start(*t))
-    .map(|(s, _)| s)
-}
-
-/// Count versions of a (scope, name) secret.
-pub fn secret_versions(space: &TribleSet, scope: Id, name: &str) -> usize {
-    find!(
-        s: Id,
-        pattern!(space, [{ ?s @ metadata::tag: KIND_SECRET, secret_scope: scope, secret_name: name }])
-    )
-    .count()
-}
-
-/// The identities currently holding a wrap on a given secret version.
-pub fn wrap_holders(space: &TribleSet, secret_id: Id) -> Vec<Id> {
-    let mut v: Vec<Id> = find!(
-        (w: Id, r: Id),
-        pattern!(space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: ?r }])
-    )
-    .map(|(_, r)| r)
-    .collect();
-    v.sort();
-    v.dedup();
-    v
-}
-
-/// The creator (implicit root admin) of a rooted scope, if any.
-pub fn scope_creator_of(space: &TribleSet, scope: Id) -> Option<Id> {
-    find!(
-        c: Id,
-        pattern!(space, [{ scope @ metadata::tag: KIND_SCOPE, scope_creator: ?c }])
-    )
-    .next()
-}
-
-/// Effective admins of a scope: the least fixpoint seeded by the scope's
-/// creator and grown through non-retracted admin-grants whose issuer is
-/// *already* an effective admin. An unrooted scope (no creator) has none —
-/// so none of its grants can be effective. This is the predecessor-only
-/// validity rule made constructive (wiki D02D6767 / 65a1835b).
-pub fn effective_admins(space: &TribleSet, scope: Id) -> HashSet<Id> {
-    let mut admins = HashSet::new();
-    match scope_creator_of(space, scope) {
-        Some(creator) => {
-            admins.insert(creator);
+    let mut keys = BTreeSet::new();
+    for wrap in wraps {
+        let sealed = read_bytes(reader, wrap.sealed_dek)
+            .with_context(|| format!("read wrap {}", fmt_id(wrap.id)))?;
+        let bytes = DryocBox::from_sealed_bytes(&sealed)
+            .map_err(|error| anyhow!("parse wrap {}: {error:?}", fmt_id(wrap.id)))?
+            .unseal_to_vec(&keypair)
+            .map_err(|_| anyhow!("unseal wrap {} failed", fmt_id(wrap.id)))?;
+        if bytes.len() != 32 {
+            bail!("wrap {} opened to a malformed DEK", fmt_id(wrap.id));
         }
-        None => return admins,
+        keys.insert(bytes);
     }
-    let admin_grants: Vec<(Id, Id)> = find!(
-        (g: Id, iss: Id, subj: Id),
-        pattern!(space, [{ ?g @ metadata::tag: KIND_GRANT, grant_object: scope, grant_relation: "admin", grant_issuer: ?iss, grant_subject: ?subj }])
-    )
-    .filter(|(g, _, _)| grant_is_live(space, *g))
-    .map(|(_, iss, subj)| (iss, subj))
-    .collect();
-    loop {
-        let mut grew = false;
-        for (iss, subj) in &admin_grants {
-            if admins.contains(iss) && admins.insert(*subj) {
-                grew = true;
-            }
-        }
-        if !grew {
-            break;
-        }
+    if keys.len() != 1 {
+        bail!(
+            "{} independent wraps for secret {} and identity {} open to competing DEKs",
+            keys.len(),
+            fmt_id(secret),
+            fmt_id(identity)
+        );
     }
-    admins
+    let bytes = keys.into_iter().next().expect("one DEK checked above");
+    Key::try_from(&bytes[..]).context("decode DEK")
 }
 
-/// A grant is *effective* iff it is not retracted AND its issuer is an
-/// effective admin of its object. (Issuerless grants never match the
-/// pattern, so they are inert.)
-///
-/// Recipients of a scope = identities transitively reachable through its live,
-/// *effective* grants. A "group" is just a scope that is itself a grant subject
-/// elsewhere; any id can be both object and subject, so membership nests with no
-/// extra entity kind. We project effective grants into an ephemeral
-/// object->subject edge set and materialize its `reaches+` endpoint relation.
-/// The edge set and path index are never persisted (work as its own ledger:
-/// recipients are a derived view).
-pub fn recipients_of(space: &TribleSet, scope: Id) -> Result<Vec<Id>> {
-    let mut admin_cache: HashMap<Id, HashSet<Id>> = HashMap::new();
-    let mut edges = TribleSet::new();
-    for (g, obj, subj, iss) in find!(
-        (g: Id, o: Id, s: Id, i: Id),
-        pattern!(space, [{ ?g @ metadata::tag: KIND_GRANT, grant_object: ?o, grant_subject: ?s, grant_issuer: ?i }])
-    ) {
-        if !grant_is_live(space, g) {
-            continue;
-        }
-        let admins = admin_cache
-            .entry(obj)
-            .or_insert_with(|| effective_admins(space, obj));
-        if admins.contains(&iss) {
-            edges += entity! { ExclusiveId::force_ref(&obj) @ reaches: &subj };
-        }
-    }
-    let reaches_plus = PathExpr::from(Step::Forward(reaches.id().into()))
-        .plus()
-        .compile();
-    let paths = PathIndex::from_tribles(reaches_plus, edges.iter())
-        .context("materialize effective grant reachability")?;
-    let start: Inline<inlineencodings::GenId> = scope.to_inline();
-    let mut out: Vec<Id> = paths
-        .reachable_from(&start.raw)
-        .filter_map(|raw| {
-            Inline::<inlineencodings::GenId>::new(raw)
-                .try_from_inline::<Id>()
-                .ok()
-        })
-        // keep only identity leaves (intermediate groups carry no signing key)
-        .filter(|l| {
-            let lid = *l;
-            exists!(pattern!(space, [{ lid @ identity_sign_pk: _?p }]))
-        })
-        .collect();
-    // The root admin (creator) is always a recipient of her own scope, even
-    // though she is never a grant *subject*.
-    if let Some(creator) = scope_creator_of(space, scope) {
-        out.push(creator);
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
-}
-
-/// An entity's `metadata::name` (an identity's nickname, a scope's name), or
-/// its short id if unnamed.
-pub fn entity_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
-    find!(n: TextHandle, pattern!(space, [{ id @ metadata::name: ?n }]))
-        .next()
-        .and_then(|n| read_text(ws, n))
-        .unwrap_or_else(|| fmt_id(id))
-}
-
-// ── open / seal (shared by get/rotate and add/rotate) ─────────────────────────
-
-/// Decrypt the latest-resolved secret `secret_id` as identity `me`: unlock me,
-/// unseal my wrap to the DEK, open the body. The single read/decrypt path
-/// shared by `get` and `rotate`.
-fn open_secret_value(
-    pw: &[u8],
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    secret_id: Id,
-    me: Id,
+fn decrypt_secret_body(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    secret: Id,
+    dek: &Key,
 ) -> Result<Vec<u8>> {
-    let (lock_h, my_pk_h): (BytesHandle, BytesHandle) = find!(
-        (l: BytesHandle, p: BytesHandle),
-        pattern!(space, [{ me @ identity_lockbox: ?l, identity_sign_pk: ?p }])
-    )
-    .next()
-    .ok_or_else(|| anyhow::anyhow!("identity {} not found", fmt_id(me)))?;
-    let lockbox = read_bytes(ws, lock_h).context("read lockbox")?;
-    let my_pk = read_bytes(ws, my_pk_h).context("read pk")?;
-    let my_sk = unlock_secret_key(pw, &lockbox)?;
-    let box_kp = box_keypair_from_ed25519(&my_sk, &my_pk)?;
-
-    let dek_h: BytesHandle = find!(
-        (w: Id, d: BytesHandle),
-        pattern!(space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: me, wrap_dek: ?d }])
-    )
-    .next()
-    .map(|(_, d)| d)
-    .ok_or_else(|| anyhow::anyhow!("no wrap for {} on this secret", fmt_id(me)))?;
-    let sealed = read_bytes(ws, dek_h).context("read wrap")?;
-    let dek_bytes = DryocBox::from_sealed_bytes(&sealed)
-        .map_err(|e| anyhow::anyhow!("parse wrap: {e:?}"))?
-        .unseal_to_vec(&box_kp)
-        .map_err(|_| anyhow::anyhow!("unseal failed (wrong key?)"))?;
-    let dek = Key::try_from(&dek_bytes[..]).context("dek")?;
-
-    let body_h: BytesHandle = find!(
-        h: BytesHandle,
-        pattern!(space, [{ secret_id @ secret_body: ?h }])
-    )
-    .next()
-    .ok_or_else(|| anyhow::anyhow!("secret body missing"))?;
-    let body_blob = read_bytes(ws, body_h).context("read body")?;
-    if body_blob.len() < 24 {
-        bail!("malformed body");
+    let row = catalog
+        .secrets
+        .get(&secret)
+        .ok_or_else(|| anyhow!("secret {} not found", fmt_id(secret)))?;
+    let body = read_bytes(reader, row.body).context("read encrypted secret body")?;
+    if body.len() < SECRET_BODY_MIN_BYTES {
+        bail!(
+            "secret {} body is too short: expected at least {SECRET_BODY_MIN_BYTES} bytes, got {}",
+            fmt_id(secret),
+            body.len(),
+        );
     }
-    let nonce = Nonce::try_from(&body_blob[..24]).context("nonce")?;
-    DryocSecretBox::from_bytes(&body_blob[24..])
-        .map_err(|e| anyhow::anyhow!("parse body: {e:?}"))?
-        .decrypt_to_vec(&nonce, &dek)
-        .map_err(|_| anyhow::anyhow!("decrypt failed"))
+    let nonce = Nonce::try_from(&body[..24]).context("secret nonce")?;
+    DryocSecretBox::from_bytes(&body[24..])
+        .map_err(|error| anyhow!("parse secret body: {error:?}"))?
+        .decrypt_to_vec(&nonce, dek)
+        .map_err(|_| anyhow!("decrypt secret body failed"))
 }
 
-/// Build the trible change for a fresh secret version of `(scope, name)`:
-/// a new DEK secretboxes the body, and the DEK is sealed to *every current*
-/// recipient (so a member removed since the last version is excluded). Returns
-/// (change, new secret id, recipient count). The single seal path shared by
-/// `add` and `rotate`; the caller commits.
-fn build_seal_change(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    scope_id: Id,
-    name: &str,
-    plaintext: &[u8],
-) -> Result<(TribleSet, Id, usize)> {
-    let recipients = recipients_of(space, scope_id)?;
+fn recipient_public_keys(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    scope: Id,
+) -> Result<Vec<(Id, BoxPublicKey)>> {
+    let recipients = catalog.recipients_of(scope);
     if recipients.is_empty() {
         bail!(
             "scope {} has no live recipients; grant access first",
-            fmt_id(scope_id)
+            fmt_id(scope)
         );
     }
-    let mut recipient_keys: Vec<(Id, BoxPublicKey)> = Vec::new();
-    for r in &recipients {
-        let rid = *r;
-        let pk_h: BytesHandle =
-            find!(h: BytesHandle, pattern!(space, [{ rid @ identity_sign_pk: ?h }]))
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("recipient {} has no signing key", fmt_id(*r)))?;
-        let pk =
-            read_bytes(ws, pk_h).ok_or_else(|| anyhow::anyhow!("read pk for {}", fmt_id(*r)))?;
-        recipient_keys.push((*r, box_pk_from_ed25519(&pk)?));
-    }
+    recipients
+        .into_iter()
+        .map(|recipient| {
+            let row = catalog
+                .identities
+                .get(&recipient)
+                .ok_or_else(|| anyhow!("recipient {} has no identity record", fmt_id(recipient)))?;
+            let public = read_bytes(reader, row.sign_pk)
+                .with_context(|| format!("read key for {}", fmt_id(recipient)))?;
+            Ok((recipient, box_pk_from_ed25519(&public)?))
+        })
+        .collect()
+}
 
+/// Prepare an Ed25519 identity whose private key is password-locked in the
+/// canonical Secrets wire format.
+pub fn prepare_identity(
+    nickname: &str,
+    password: &[u8],
+    created_at: IntervalValue,
+) -> Result<PreparedIdentity> {
+    let keypair = SigningKeyPair::gen_with_defaults();
+    let public_key = keypair.public_key.to_vec();
+    let lockbox = lock_secret_key(password, &keypair.secret_key);
+    let id = genid().id;
+    let fragment = identity_fragment(id, nickname, public_key.clone(), lockbox, created_at)?;
+    Ok(PreparedIdentity {
+        fragment,
+        id,
+        public_key,
+    })
+}
+
+/// Encrypt one immutable version and seal its DEK to every current recipient.
+pub fn seal_version(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    scope: Id,
+    name: &str,
+    plaintext: &[u8],
+    created_at: IntervalValue,
+) -> Result<SealedVersion> {
+    let recipients = recipient_public_keys(reader, catalog, scope)?;
+    let dek = Key::gen();
+    let nonce = Nonce::gen();
+    let ciphertext = DryocSecretBox::encrypt_to_vecbox(plaintext, &nonce, &dek).to_vec();
+    let mut body = Vec::with_capacity(nonce.len() + ciphertext.len());
+    body.extend_from_slice(&nonce);
+    body.extend_from_slice(&ciphertext);
+
+    let wraps: Result<Vec<_>> = recipients
+        .iter()
+        .map(|(recipient, public)| {
+            let sealed_dek = DryocBox::seal_to_vecbox(&dek, public)
+                .map_err(|error| anyhow!("seal to {}: {error:?}", fmt_id(*recipient)))?
+                .to_vec();
+            Ok(SealedWrap {
+                id: genid().id,
+                recipient: *recipient,
+                sealed_dek,
+            })
+        })
+        .collect();
+    let secret = genid().id;
+    let fragment = secret_version_fragment(secret, scope, name, body, wraps?, created_at)?;
+    Ok(SealedVersion {
+        fragment,
+        secret,
+        recipient_count: recipients.len(),
+    })
+}
+
+/// Open one exact immutable secret version as one identity.
+pub fn open_version(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    secret: Id,
+    identity: Id,
+    password: &[u8],
+) -> Result<Vec<u8>> {
+    let dek = recover_dek(reader, catalog, secret, identity, password)?;
+    decrypt_secret_body(reader, catalog, secret, &dek)
+}
+
+/// Add wraps for current recipients who cannot yet open an existing version.
+/// An empty fragment and zero count mean that the version is already shared
+/// to the complete current recipient set.
+pub fn share_version(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    secret: Id,
+    acting_identity: Id,
+    password: &[u8],
+    created_at: IntervalValue,
+) -> Result<SharedVersion> {
+    let scope = catalog
+        .secrets
+        .get(&secret)
+        .ok_or_else(|| anyhow!("secret {} not found", fmt_id(secret)))?
+        .scope;
+    let dek = recover_dek(reader, catalog, secret, acting_identity, password)?;
+    let existing: BTreeSet<Id> = catalog.wrap_holders(secret).into_iter().collect();
+    let missing: Vec<_> = recipient_public_keys(reader, catalog, scope)?
+        .into_iter()
+        .filter(|(recipient, _)| !existing.contains(recipient))
+        .collect();
+
+    let mut fragment = Fragment::empty();
+    for (recipient, public) in &missing {
+        let sealed_dek = DryocBox::seal_to_vecbox(&dek, public)
+            .map_err(|error| anyhow!("seal to {}: {error:?}", fmt_id(*recipient)))?
+            .to_vec();
+        fragment += wrap_fragment(genid().id, secret, *recipient, sealed_dek, created_at)?;
+    }
+    Ok(SharedVersion {
+        fragment,
+        new_recipient_count: missing.len(),
+    })
+}
+
+/// Exercise the crypto envelope without touching a pile.
+pub fn envelope_selftest() -> Result<()> {
+    let alice = BoxKeyPair::gen_with_defaults();
+    let outsider = BoxKeyPair::gen_with_defaults();
+    let plaintext = b"the prod database password is hunter2";
     let dek = Key::gen();
     let nonce = Nonce::gen();
     let body = DryocSecretBox::encrypt_to_vecbox(plaintext, &nonce, &dek).to_vec();
-    let mut body_blob = Vec::with_capacity(nonce.len() + body.len());
-    body_blob.extend_from_slice(&nonce);
-    body_blob.extend_from_slice(&body);
+    let wrap = DryocBox::seal_to_vecbox(&dek, &alice.public_key)?.to_vec();
 
-    let secret_id = ufoid();
-    let now = instant_interval(now_epoch());
-    let body_h = put_bytes(ws, body_blob);
-    let name_h = ws.put(name.to_string());
-    let mut change = TribleSet::new();
-    change += entity! { &secret_id @
-        metadata::tag: &KIND_SECRET,
-        metadata::created_at: now,
-        metadata::name: name_h,
-        secret_scope: &scope_id,
-        secret_name: name,
-        secret_body: body_h,
+    let recovered = DryocBox::from_sealed_bytes(&wrap)
+        .map_err(|error| anyhow!("{error:?}"))?
+        .unseal_to_vec(&alice)
+        .map_err(|error| anyhow!("{error:?}"))?;
+    let recovered = Key::try_from(&recovered[..])?;
+    let opened = DryocSecretBox::from_bytes(&body)
+        .map_err(|error| anyhow!("{error:?}"))?
+        .decrypt_to_vec(&nonce, &recovered)
+        .map_err(|error| anyhow!("{error:?}"))?;
+    if opened != plaintext {
+        bail!("envelope round-trip changed the plaintext");
+    }
+    if DryocBox::from_sealed_bytes(&wrap)
+        .expect("the same valid sealed box")
+        .unseal_to_vec(&outsider)
+        .is_ok()
+    {
+        bail!("an unrelated identity opened the envelope");
+    }
+    Ok(())
+}
+
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
+}
+
+fn exactly_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<T> {
+    if values.len() != 1 {
+        bail!(
+            "Secrets entity {} has {} values for {field}; expected exactly one",
+            fmt_id(entity),
+            values.len()
+        );
+    }
+    Ok(values.pop().expect("length checked above"))
+}
+
+fn point_interval(entity: Id, field: &str, value: IntervalValue) -> Result<()> {
+    let (lower, upper): (i128, i128) = value
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode {field} on Secrets entity {entity:x}: {error:?}"))?;
+    if lower != upper {
+        bail!("{field} on Secrets entity {entity:x} must be a point interval");
+    }
+    Ok(())
+}
+
+fn point_value(field: &str, value: IntervalValue) -> Result<()> {
+    let (lower, upper): (i128, i128) = value
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode {field}: {error:?}"))?;
+    if lower != upper {
+        bail!("{field} must be a point interval");
+    }
+    Ok(())
+}
+
+pub fn interval_start(value: IntervalValue) -> i128 {
+    let (start, _): (i128, i128) = value
+        .try_from_inline()
+        .expect("validated Secrets point interval");
+    start
+}
+
+fn validate_short(field: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.trim() != value {
+        bail!("{field} must be non-empty and have no surrounding whitespace");
+    }
+    if value.len() > 32 {
+        bail!("{field} exceeds 32 UTF-8 bytes");
+    }
+    if value.as_bytes().contains(&0) {
+        bail!("{field} contains a NUL byte");
+    }
+    Ok(())
+}
+
+fn validate_name(field: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.trim() != value {
+        bail!("{field} must be non-empty and have no surrounding whitespace");
+    }
+    if value.as_bytes().contains(&0) {
+        bail!("{field} contains a NUL byte");
+    }
+    Ok(())
+}
+
+fn identity_record(
+    id: Id,
+    created_at: IntervalValue,
+    name: TextHandle,
+    sign_pk: BytesHandle,
+    lockbox: BytesHandle,
+) -> Fragment {
+    entity! { ExclusiveId::force_ref(&id) @
+        metadata::tag: &KIND_IDENTITY,
+        metadata::created_at: created_at,
+        metadata::name: name,
+        identity_sign_pk: sign_pk,
+        identity_lockbox: lockbox,
+    }
+}
+
+fn scope_identity(creator: Id, name: TextHandle) -> Fragment {
+    entity! { _ @
+        scope_creator: creator,
+        metadata::name: name,
+    }
+}
+
+fn scope_identity_epochs(creator: Id, name: TextHandle) -> (Id, Id) {
+    let current = scope_identity(creator, name)
+        .root()
+        .expect("scope identity has one intrinsic root");
+    let creator: Inline<inlineencodings::GenId> = creator.to_inline();
+    let legacy = triblespace::core::trible::intrinsic_entity_id_v1(vec![
+        (scope_creator.id(), creator.raw),
+        (metadata::name.id(), name.raw),
+    ]);
+    (current, legacy)
+}
+
+fn scope_record_at(
+    id: Id,
+    creator: Id,
+    name: TextHandle,
+    created_at: &BTreeSet<IntervalValue>,
+) -> Fragment {
+    let mut fragment = entity! { ExclusiveId::force_ref(&id) @
+        scope_creator: creator,
+        metadata::name: name,
+        metadata::tag: &KIND_SCOPE,
     };
-    for (r, rx_pk) in &recipient_keys {
-        let sealed = DryocBox::seal_to_vecbox(&dek, rx_pk)
-            .map_err(|e| anyhow::anyhow!("seal to {}: {e:?}", fmt_id(*r)))?
-            .to_vec();
-        let dek_h = put_bytes(ws, sealed);
-        let w = ufoid();
-        change += entity! { &w @
-            metadata::tag: &KIND_WRAP,
-            metadata::created_at: now,
-            wrap_secret: &secret_id.id,
-            wrap_recipient: r,
-            wrap_dek: dek_h,
-        };
+    for at in created_at {
+        fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::created_at: at };
     }
-    Ok((change, secret_id.id, recipient_keys.len()))
+    fragment
 }
 
-// ── the repo handle ───────────────────────────────────────────────────────────
-
-/// Outcome of `identity_init`.
-pub struct IdentityInit {
-    pub id: Id,
-    pub nickname: String,
-    /// The Ed25519 signing public key.
-    pub sign_pk: Vec<u8>,
+fn scope_record(creator: Id, name: TextHandle, created_at: &BTreeSet<IntervalValue>) -> Fragment {
+    let mut fragment = scope_identity(creator, name);
+    let id = fragment
+        .root()
+        .expect("scope identity has one intrinsic root");
+    fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::tag: &KIND_SCOPE };
+    for at in created_at {
+        fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::created_at: at };
+    }
+    fragment
 }
 
-/// A resolved identity row (`identity_list`).
-pub struct IdentityRow {
-    pub id: Id,
-    pub nickname: String,
+fn grant_record(
+    id: Id,
+    created_at: IntervalValue,
+    object: Id,
+    relation: &str,
+    subject: Id,
+    issuer: Id,
+    retractions: &BTreeSet<IntervalValue>,
+) -> Fragment {
+    let mut fragment = entity! { ExclusiveId::force_ref(&id) @
+        metadata::tag: &KIND_GRANT,
+        metadata::created_at: created_at,
+        grant_object: object,
+        grant_relation: relation,
+        grant_subject: subject,
+        grant_issuer: issuer,
+    };
+    for at in retractions {
+        fragment += entity! { ExclusiveId::force_ref(&id) @ grant_retracted_at: at };
+    }
+    fragment
 }
 
-/// Outcome of `scope_create`.
-pub struct ScopeCreated {
-    pub id: Id,
-    pub name: String,
-    pub creator: Id,
+fn secret_record(
+    id: Id,
+    created_at: IntervalValue,
+    scope: Id,
+    name: &str,
+    display_name: TextHandle,
+    body: BytesHandle,
+) -> Fragment {
+    entity! { ExclusiveId::force_ref(&id) @
+        metadata::tag: &KIND_SECRET,
+        metadata::created_at: created_at,
+        metadata::name: display_name,
+        secret_scope: scope,
+        secret_name: name,
+        secret_body: body,
+    }
 }
 
-/// A resolved scope row (`scope_list`), with a self-derivation check.
-pub struct ScopeRow {
-    pub id: Id,
-    pub name: String,
-    pub creator: Id,
-    /// True iff the scope's id re-derives from its own `(creator, name)` facts.
-    pub rooted: bool,
+fn wrap_record(
+    id: Id,
+    created_at: IntervalValue,
+    secret: Id,
+    recipient: Id,
+    sealed_dek: BytesHandle,
+) -> Fragment {
+    entity! { ExclusiveId::force_ref(&id) @
+        metadata::tag: &KIND_WRAP,
+        metadata::created_at: created_at,
+        wrap_secret: secret,
+        wrap_recipient: recipient,
+        wrap_dek: sealed_dek,
+    }
 }
 
-/// A resolved member of a scope (`scope_members`).
-pub struct Member {
-    pub id: Id,
-    pub name: String,
-    pub role: MemberRole,
+fn identity_fragment(
+    id: Id,
+    nickname: &str,
+    sign_pk: Vec<u8>,
+    lockbox: Vec<u8>,
+    created_at: IntervalValue,
+) -> Result<Fragment> {
+    validate_name("identity nickname", nickname)?;
+    point_value("identity creation time", created_at)?;
+    if sign_pk.len() != ED25519_PUBLIC_KEY_BYTES {
+        bail!("Ed25519 public key must be {ED25519_PUBLIC_KEY_BYTES} bytes");
+    }
+    if lockbox.len() != LOCKBOX_BYTES {
+        bail!("identity lockbox must be {LOCKBOX_BYTES} bytes");
+    }
+    let mut fragment = Fragment::empty();
+    let name = fragment.put(nickname.to_owned());
+    let sign_pk = fragment.put::<blobencodings::RawBytes, _>(sign_pk);
+    let lockbox = fragment.put::<blobencodings::RawBytes, _>(lockbox);
+    fragment += identity_record(id, created_at, name, sign_pk, lockbox);
+    Ok(fragment)
 }
 
-/// The role a member holds within a scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemberRole {
-    RootAdmin,
-    Admin,
-    Member,
+pub fn scope_fragment(creator: Id, name: &str, created_at: IntervalValue) -> Result<Fragment> {
+    validate_name("scope name", name)?;
+    point_value("scope creation time", created_at)?;
+    let mut fragment = Fragment::empty();
+    let name = fragment.put(name.to_owned());
+    fragment += scope_record(creator, name, &BTreeSet::from([created_at]));
+    Ok(fragment)
 }
 
-/// Outcome of `grant`.
-pub struct GrantResult {
-    pub grant_id: Id,
-    pub object: Id,
-    pub relation: String,
-    pub subject: Id,
-    pub issuer: Id,
+pub fn grant_fragment(
+    id: Id,
+    object: Id,
+    relation: &str,
+    subject: Id,
+    issuer: Id,
+    created_at: IntervalValue,
+) -> Result<Fragment> {
+    validate_short("grant relation", relation)?;
+    point_value("grant creation time", created_at)?;
+    Ok(grant_record(
+        id,
+        created_at,
+        object,
+        relation,
+        subject,
+        issuer,
+        &BTreeSet::new(),
+    ))
 }
 
-/// Outcome of `secret_add`.
-pub struct SecretAdded {
-    pub secret_id: Id,
-    pub name: String,
-    pub recipients: usize,
+pub fn retraction_fragment(
+    grants: impl IntoIterator<Item = Id>,
+    at: IntervalValue,
+) -> Result<Fragment> {
+    point_value("grant retraction time", at)?;
+    let mut fragment = Fragment::empty();
+    for grant in grants.into_iter().collect::<BTreeSet<_>>() {
+        fragment += entity! { ExclusiveId::force_ref(&grant) @ grant_retracted_at: at };
+    }
+    Ok(fragment)
 }
 
-/// A summary row for `secret_list` (grouped by scope+name, newest version).
-pub struct SecretSummary {
-    pub name: String,
-    pub scope: Id,
-    pub versions: usize,
-    pub recipients: usize,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SealedWrap {
+    id: Id,
+    recipient: Id,
+    sealed_dek: Vec<u8>,
 }
 
-/// A credential still readable by a removed user (`rotate_worklist`).
-pub struct Exposure {
-    pub scope: Id,
-    pub scope_name: String,
-    pub name: String,
-    /// Identity ids still holding a wrap on the current version but no longer
-    /// current recipients.
-    pub exposed: Vec<Id>,
-}
-
-/// A handle over a pile branch that performs the secrets capability operations.
-///
-/// Each mutating method is a full transaction: it opens the pile, ensures the
-/// branch, pulls, checks out, mutates, commits, pushes, and closes — exactly
-/// what the old `cmd_*` handlers did, minus the `println!`. Read queries take a
-/// checked-out [`TribleSet`] the caller obtains via [`SecretsRepo::read`].
-pub struct SecretsRepo {
-    pile: std::path::PathBuf,
-    branch: String,
-}
-
-impl SecretsRepo {
-    /// Open a handle on `pile`'s `branch`. Does no I/O until a method runs.
-    pub fn open(pile: impl Into<std::path::PathBuf>, branch: impl Into<String>) -> Self {
-        Self {
-            pile: pile.into(),
-            branch: branch.into(),
+fn secret_version_fragment(
+    id: Id,
+    scope: Id,
+    name: &str,
+    encrypted_body: Vec<u8>,
+    wraps: Vec<SealedWrap>,
+    created_at: IntervalValue,
+) -> Result<Fragment> {
+    validate_short("secret name", name)?;
+    point_value("secret creation time", created_at)?;
+    if encrypted_body.len() < SECRET_BODY_MIN_BYTES {
+        bail!("encrypted secret body is too short");
+    }
+    if wraps.is_empty() {
+        bail!("a secret version must have at least one recipient wrap");
+    }
+    let mut recipients = BTreeSet::new();
+    let mut wrap_ids = BTreeSet::new();
+    for wrap in &wraps {
+        if !recipients.insert(wrap.recipient) {
+            bail!("a newly sealed version contains duplicate recipient wraps");
+        }
+        if !wrap_ids.insert(wrap.id) {
+            bail!("a newly sealed version contains duplicate wrap ids");
+        }
+        if wrap.sealed_dek.len() != SEALED_DEK_BYTES {
+            bail!("sealed DEK must be {SEALED_DEK_BYTES} bytes");
         }
     }
 
-    /// Open a handle on `pile`'s default `secrets` branch.
-    pub fn open_default(pile: impl Into<std::path::PathBuf>) -> Self {
-        Self::open(pile, DEFAULT_BRANCH)
+    let mut fragment = Fragment::empty();
+    let display_name = fragment.put(name.to_owned());
+    let body = fragment.put::<blobencodings::RawBytes, _>(encrypted_body);
+    fragment += secret_record(id, created_at, scope, name, display_name, body);
+    for wrap in wraps {
+        let sealed_dek = fragment.put::<blobencodings::RawBytes, _>(wrap.sealed_dek);
+        fragment += wrap_record(wrap.id, created_at, id, wrap.recipient, sealed_dek);
     }
+    Ok(fragment)
+}
 
-    /// Run `f` against an open repository, closing the pile afterwards.
-    fn with_repo<T>(&self, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-        let mut repo = open_repo(&self.pile)?;
-        let result = f(&mut repo);
-        let close_res = repo
-            .close()
-            .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-        if let Err(err) = close_res {
-            if result.is_ok() {
-                return Err(err);
-            }
-            eprintln!("warning: failed to close pile cleanly: {err:#}");
-        }
-        result
+fn wrap_fragment(
+    id: Id,
+    secret: Id,
+    recipient: Id,
+    sealed_dek: Vec<u8>,
+    created_at: IntervalValue,
+) -> Result<Fragment> {
+    point_value("wrap creation time", created_at)?;
+    if sealed_dek.len() != SEALED_DEK_BYTES {
+        bail!("sealed DEK must be {SEALED_DEK_BYTES} bytes");
     }
+    let mut fragment = Fragment::empty();
+    let handle = fragment.put::<blobencodings::RawBytes, _>(sealed_dek);
+    fragment += wrap_record(id, created_at, secret, recipient, handle);
+    Ok(fragment)
+}
 
-    /// Checkout the branch's current space and run a read-only query against it.
-    /// The closure also receives the workspace (needed to read blob handles for
-    /// names/keys). This is the read counterpart to the mutating methods.
-    pub fn read<T>(
-        &self,
-        f: impl FnOnce(&mut Workspace<Pile>, &TribleSet) -> Result<T>,
-    ) -> Result<T> {
-        self.with_repo(|repo| {
-            let branch_id = repo
-                .ensure_branch(&self.branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-            let mut ws = repo
-                .pull(branch_id)
-                .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            f(&mut ws, &space)
-        })
+fn entity_facts(space: &TribleSet, entity: Id) -> TribleSet {
+    let mut facts = TribleSet::new();
+    for fact in space.iter().filter(|fact| fact.e() == &entity) {
+        facts.insert(fact);
     }
+    facts
+}
 
-    /// Create an identity: Ed25519 keypair, password-locked private key in the
-    /// pile.
-    pub fn identity_init(&self, pw: &[u8], nickname: &str) -> Result<IdentityInit> {
-        let kp = SigningKeyPair::gen_with_defaults();
-        let sign_pk = kp.public_key.to_vec();
-        let lockbox = lock_secret_key(pw, &kp.secret_key);
+fn tagged_entities(space: &TribleSet, kind: Id) -> BTreeSet<Id> {
+    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: kind }])).collect()
+}
 
-        let id = self.with_repo(|repo| {
-            let branch_id = repo
-                .ensure_branch(&self.branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-            let mut ws = repo
-                .pull(branch_id)
-                .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            let id = ufoid();
-            let now = instant_interval(now_epoch());
-            let nick_h = ws.put(nickname.to_string());
-            let pk_h = put_bytes(&mut ws, sign_pk.clone());
-            let lock_h = put_bytes(&mut ws, lockbox.clone());
-            let mut change = TribleSet::new();
-            change += entity! { &id @
-                metadata::tag: &KIND_IDENTITY,
-                metadata::created_at: now,
-                metadata::name: nick_h,
-                identity_sign_pk: pk_h,
-                identity_lockbox: lock_h,
-            };
-            ws.commit(change, "secrets: identity init");
-            repo.push(&mut ws)
-                .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-            Ok(id.id)
-        })?;
-        Ok(IdentityInit {
+fn load_identity(space: &TribleSet, id: Id) -> Result<IdentityRow> {
+    let row = IdentityRow {
+        id,
+        created_at: exactly_one(
             id,
-            nickname: nickname.to_string(),
-            sign_pk,
-        })
+            "metadata::created_at",
+            find!(value: IntervalValue, pattern!(space, [{ id @ metadata::created_at: ?value }]))
+                .collect(),
+        )?,
+        name: exactly_one(
+            id,
+            "metadata::name",
+            find!(value: TextHandle, pattern!(space, [{ id @ metadata::name: ?value }])).collect(),
+        )?,
+        sign_pk: exactly_one(
+            id,
+            "identity_sign_pk",
+            find!(value: BytesHandle, pattern!(space, [{ id @ identity_sign_pk: ?value }]))
+                .collect(),
+        )?,
+        lockbox: exactly_one(
+            id,
+            "identity_lockbox",
+            find!(value: BytesHandle, pattern!(space, [{ id @ identity_lockbox: ?value }]))
+                .collect(),
+        )?,
+    };
+    point_interval(id, "identity creation time", row.created_at)?;
+    if entity_facts(space, id)
+        != *identity_record(id, row.created_at, row.name, row.sign_pk, row.lockbox).facts()
+    {
+        bail!(
+            "Secrets identity {} is not one canonical immutable record",
+            fmt_id(id)
+        );
+    }
+    Ok(row)
+}
+
+fn load_scope(space: &TribleSet, id: Id) -> Result<ScopeRow> {
+    let row = ScopeRow {
+        id,
+        creator: exactly_one(
+            id,
+            "scope_creator",
+            find!(value: Id, pattern!(space, [{ id @ scope_creator: ?value }])).collect(),
+        )?,
+        created_at: find!(
+            value: IntervalValue,
+            pattern!(space, [{ id @ metadata::created_at: ?value }])
+        )
+        .collect(),
+        name: exactly_one(
+            id,
+            "metadata::name",
+            find!(value: TextHandle, pattern!(space, [{ id @ metadata::name: ?value }])).collect(),
+        )?,
+    };
+    if row.created_at.is_empty() {
+        bail!("Secrets scope {} has no creation observation", fmt_id(id));
+    }
+    for value in &row.created_at {
+        point_interval(id, "scope creation time", *value)?;
+    }
+    let (current, legacy) = scope_identity_epochs(row.creator, row.name);
+    if id != current && id != legacy {
+        bail!(
+            "Secrets scope {} is neither the current {} nor legacy {} intrinsic creator/name identity",
+            fmt_id(id),
+            fmt_id(current),
+            fmt_id(legacy),
+        );
+    }
+    let expected = scope_record_at(id, row.creator, row.name, &row.created_at);
+    if entity_facts(space, id) != *expected.facts() {
+        bail!(
+            "Secrets scope {} is not one canonical immutable record",
+            fmt_id(id)
+        );
+    }
+    Ok(row)
+}
+
+fn load_grant(space: &TribleSet, id: Id) -> Result<GrantRow> {
+    let row = GrantRow {
+        id,
+        created_at: exactly_one(
+            id,
+            "metadata::created_at",
+            find!(value: IntervalValue, pattern!(space, [{ id @ metadata::created_at: ?value }]))
+                .collect(),
+        )?,
+        object: exactly_one(
+            id,
+            "grant_object",
+            find!(value: Id, pattern!(space, [{ id @ grant_object: ?value }])).collect(),
+        )?,
+        relation: exactly_one(
+            id,
+            "grant_relation",
+            find!(value: String, pattern!(space, [{ id @ grant_relation: ?value }])).collect(),
+        )?,
+        subject: exactly_one(
+            id,
+            "grant_subject",
+            find!(value: Id, pattern!(space, [{ id @ grant_subject: ?value }])).collect(),
+        )?,
+        issuer: exactly_one(
+            id,
+            "grant_issuer",
+            find!(value: Id, pattern!(space, [{ id @ grant_issuer: ?value }])).collect(),
+        )?,
+        retracted_at: find!(
+            value: IntervalValue,
+            pattern!(space, [{ id @ grant_retracted_at: ?value }])
+        )
+        .collect(),
+    };
+    point_interval(id, "grant creation time", row.created_at)?;
+    validate_short("grant relation", &row.relation)?;
+    for value in &row.retracted_at {
+        point_interval(id, "grant retraction time", *value)?;
+    }
+    let expected = grant_record(
+        id,
+        row.created_at,
+        row.object,
+        &row.relation,
+        row.subject,
+        row.issuer,
+        &row.retracted_at,
+    );
+    if entity_facts(space, id) != *expected.facts() {
+        bail!(
+            "Secrets grant {} is not one canonical grant record",
+            fmt_id(id)
+        );
+    }
+    Ok(row)
+}
+
+fn load_secret(space: &TribleSet, id: Id) -> Result<SecretRow> {
+    let row = SecretRow {
+        id,
+        created_at: exactly_one(
+            id,
+            "metadata::created_at",
+            find!(value: IntervalValue, pattern!(space, [{ id @ metadata::created_at: ?value }]))
+                .collect(),
+        )?,
+        scope: exactly_one(
+            id,
+            "secret_scope",
+            find!(value: Id, pattern!(space, [{ id @ secret_scope: ?value }])).collect(),
+        )?,
+        name: exactly_one(
+            id,
+            "secret_name",
+            find!(value: String, pattern!(space, [{ id @ secret_name: ?value }])).collect(),
+        )?,
+        display_name: exactly_one(
+            id,
+            "metadata::name",
+            find!(value: TextHandle, pattern!(space, [{ id @ metadata::name: ?value }])).collect(),
+        )?,
+        body: exactly_one(
+            id,
+            "secret_body",
+            find!(value: BytesHandle, pattern!(space, [{ id @ secret_body: ?value }])).collect(),
+        )?,
+    };
+    point_interval(id, "secret creation time", row.created_at)?;
+    validate_short("secret name", &row.name)?;
+    let expected = secret_record(
+        id,
+        row.created_at,
+        row.scope,
+        &row.name,
+        row.display_name,
+        row.body,
+    );
+    if entity_facts(space, id) != *expected.facts() {
+        bail!(
+            "Secrets version {} is not one canonical immutable record",
+            fmt_id(id)
+        );
+    }
+    Ok(row)
+}
+
+fn load_wrap(space: &TribleSet, id: Id) -> Result<WrapRow> {
+    let row = WrapRow {
+        id,
+        created_at: exactly_one(
+            id,
+            "metadata::created_at",
+            find!(value: IntervalValue, pattern!(space, [{ id @ metadata::created_at: ?value }]))
+                .collect(),
+        )?,
+        secret: exactly_one(
+            id,
+            "wrap_secret",
+            find!(value: Id, pattern!(space, [{ id @ wrap_secret: ?value }])).collect(),
+        )?,
+        recipient: exactly_one(
+            id,
+            "wrap_recipient",
+            find!(value: Id, pattern!(space, [{ id @ wrap_recipient: ?value }])).collect(),
+        )?,
+        sealed_dek: exactly_one(
+            id,
+            "wrap_dek",
+            find!(value: BytesHandle, pattern!(space, [{ id @ wrap_dek: ?value }])).collect(),
+        )?,
+    };
+    point_interval(id, "wrap creation time", row.created_at)?;
+    if entity_facts(space, id)
+        != *wrap_record(
+            id,
+            row.created_at,
+            row.secret,
+            row.recipient,
+            row.sealed_dek,
+        )
+        .facts()
+    {
+        bail!(
+            "Secrets wrap {} is not one canonical immutable record",
+            fmt_id(id)
+        );
+    }
+    Ok(row)
+}
+
+/// Strictly project the complete collection without dereferencing attachments.
+pub fn load_catalog(space: &TribleSet) -> Result<SecretsCatalog> {
+    let identity_ids = tagged_entities(space, KIND_IDENTITY);
+    let scope_ids = tagged_entities(space, KIND_SCOPE);
+    let grant_ids = tagged_entities(space, KIND_GRANT);
+    let secret_ids = tagged_entities(space, KIND_SECRET);
+    let wrap_ids = tagged_entities(space, KIND_WRAP);
+
+    let mut catalog = SecretsCatalog::default();
+    for id in &identity_ids {
+        catalog.identities.insert(*id, load_identity(space, *id)?);
+    }
+    for id in &scope_ids {
+        catalog.scopes.insert(*id, load_scope(space, *id)?);
+    }
+    let mut logical_scopes = BTreeMap::new();
+    for scope in catalog.scopes.values() {
+        if let Some(previous) = logical_scopes.insert((scope.creator, scope.name), scope.id) {
+            bail!(
+                "Secrets scopes {} and {} claim the same intrinsic creator/name identity",
+                fmt_id(previous),
+                fmt_id(scope.id),
+            );
+        }
+    }
+    for id in &grant_ids {
+        catalog.grants.insert(*id, load_grant(space, *id)?);
+    }
+    for id in &secret_ids {
+        catalog.secrets.insert(*id, load_secret(space, *id)?);
+    }
+    for id in &wrap_ids {
+        catalog.wraps.insert(*id, load_wrap(space, *id)?);
     }
 
-    /// List identities `(id, nickname)`.
-    pub fn identity_list(&self) -> Result<Vec<IdentityRow>> {
-        self.read(|ws, space| {
-            let rows: Vec<(Id, TextHandle)> = find!(
-                (e: Id, n: TextHandle),
-                pattern!(space, [{ ?e @ metadata::tag: KIND_IDENTITY, metadata::name: ?n }])
-            )
-            .collect();
-            let mut out = Vec::new();
-            for (e, n) in rows {
-                out.push(IdentityRow {
-                    id: e,
-                    nickname: read_text(ws, n).unwrap_or_default(),
-                });
-            }
-            Ok(out)
-        })
+    for scope in catalog.scopes.values() {
+        if !catalog.identities.contains_key(&scope.creator) {
+            bail!(
+                "Secrets scope {} refers to missing creator identity {}",
+                fmt_id(scope.id),
+                fmt_id(scope.creator)
+            );
+        }
+    }
+    for grant in catalog.grants.values() {
+        if !catalog.scopes.contains_key(&grant.object) {
+            bail!(
+                "Secrets grant {} refers to missing scope {}",
+                fmt_id(grant.id),
+                fmt_id(grant.object)
+            );
+        }
+        if !catalog.identities.contains_key(&grant.issuer) {
+            bail!(
+                "Secrets grant {} refers to missing issuer identity {}",
+                fmt_id(grant.id),
+                fmt_id(grant.issuer)
+            );
+        }
+        if !catalog.identities.contains_key(&grant.subject)
+            && !catalog.scopes.contains_key(&grant.subject)
+        {
+            bail!(
+                "Secrets grant {} refers to missing identity or scope subject {}",
+                fmt_id(grant.id),
+                fmt_id(grant.subject)
+            );
+        }
+    }
+    for secret in catalog.secrets.values() {
+        if !catalog.scopes.contains_key(&secret.scope) {
+            bail!(
+                "Secrets version {} refers to missing scope {}",
+                fmt_id(secret.id),
+                fmt_id(secret.scope)
+            );
+        }
+        if !catalog.wraps.values().any(|wrap| wrap.secret == secret.id) {
+            bail!(
+                "Secrets version {} has no recipient wrap",
+                fmt_id(secret.id)
+            );
+        }
+    }
+    for wrap in catalog.wraps.values() {
+        if !catalog.secrets.contains_key(&wrap.secret) {
+            bail!(
+                "Secrets wrap {} refers to missing secret version {}",
+                fmt_id(wrap.id),
+                fmt_id(wrap.secret)
+            );
+        }
+        if !catalog.identities.contains_key(&wrap.recipient) {
+            bail!(
+                "Secrets wrap {} refers to missing recipient identity {}",
+                fmt_id(wrap.id),
+                fmt_id(wrap.recipient)
+            );
+        }
     }
 
-    /// Create a scope rooted at identity `creator` (its implicit root admin).
-    /// The scope id is content-derived from `(creator, name)`.
-    pub fn scope_create(&self, name: &str, creator: Id) -> Result<ScopeCreated> {
-        self.with_repo(|repo| {
-            let branch_id = repo
-                .ensure_branch(&self.branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-            let mut ws = repo
-                .pull(branch_id)
-                .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            let now = instant_interval(now_epoch());
-            let name_h = ws.put(name.to_string());
-
-            // Intrinsic id from (creator, name); extra facts go under it.
-            let mut change = scope_fragment(creator, name_h);
-            let scope_id = change.root().expect("entity! derives a root id");
-            change += entity! { ExclusiveId::force_ref(&scope_id) @
-                metadata::tag: &KIND_SCOPE,
-                metadata::created_at: now,
-            };
-            ws.commit(change, "secrets: scope create");
-            repo.push(&mut ws)
-                .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-            Ok(ScopeCreated {
-                id: scope_id,
-                name: name.to_string(),
-                creator,
-            })
-        })
+    let all_ids: BTreeSet<Id> = identity_ids
+        .into_iter()
+        .chain(scope_ids)
+        .chain(grant_ids)
+        .chain(secret_ids)
+        .chain(wrap_ids)
+        .collect();
+    let accounted: usize = all_ids
+        .iter()
+        .map(|id| entity_facts(space, *id).len())
+        .sum();
+    if accounted != space.len() {
+        bail!(
+            "Secrets collection has {} facts outside canonical identity, scope, grant, secret, and wrap records",
+            space.len() - accounted.min(space.len())
+        );
     }
+    Ok(catalog)
+}
 
-    /// List scopes with a self-derivation (`rooted`) check.
-    pub fn scope_list(&self) -> Result<Vec<ScopeRow>> {
-        self.read(|ws, space| {
-            let rows: Vec<(Id, Id, TextHandle)> = find!(
-                (s: Id, c: Id, n: TextHandle),
-                pattern!(space, [{ ?s @ metadata::tag: KIND_SCOPE, scope_creator: ?c, metadata::name: ?n }])
-            )
-            .collect();
-            let mut out = Vec::new();
-            for (s, c, n) in rows {
-                let name = read_text(ws, n).unwrap_or_default();
-                // Self-validation: the id must derive from the scope's own
-                // (creator, name) facts — the same intrinsic derivation used at
-                // create time, so a forged id-vs-facts pairing shows as a mismatch.
-                let rooted = scope_fragment(c, n).root() == Some(s);
-                out.push(ScopeRow { id: s, name, creator: c, rooted });
-            }
-            Ok(out)
-        })
+fn read_text_overlay<Overlay>(
+    reader: &PileReader,
+    overlay: Option<&Overlay>,
+    handle: TextHandle,
+) -> Result<String>
+where
+    Overlay: BlobStoreGet + BlobStoreMeta,
+{
+    if let Some(overlay) = overlay {
+        if overlay.metadata(handle)?.is_some() {
+            let value: anybytes::View<str> = overlay.get(handle)?;
+            return Ok(value.to_string());
+        }
     }
+    let value: anybytes::View<str> = reader.get(handle)?;
+    Ok(value.to_string())
+}
 
-    /// The current members (recipients) of a scope, with their roles — the audit
-    /// view. Uses a checked-out `space` and the workspace for names.
-    pub fn scope_members(
-        &self,
-        space: &TribleSet,
-        ws: &mut Workspace<Pile>,
-        scope: Id,
-    ) -> Result<Vec<Member>> {
-        let creator = scope_creator_of(space, scope);
-        let admins = effective_admins(space, scope);
-        Ok(recipients_of(space, scope)?
-            .into_iter()
-            .map(|r| {
-                let name = entity_name(ws, space, r);
-                let role = if creator == Some(r) {
-                    MemberRole::RootAdmin
-                } else if admins.contains(&r) {
-                    MemberRole::Admin
-                } else {
-                    MemberRole::Member
-                };
-                Member { id: r, name, role }
-            })
-            .collect())
+fn read_bytes_overlay<Overlay>(
+    reader: &PileReader,
+    overlay: Option<&Overlay>,
+    handle: BytesHandle,
+) -> Result<Vec<u8>>
+where
+    Overlay: BlobStoreGet + BlobStoreMeta,
+{
+    if let Some(overlay) = overlay {
+        if overlay.metadata(handle)?.is_some() {
+            let value: anybytes::Bytes = overlay.get(handle)?;
+            return Ok(value.as_ref().to_vec());
+        }
     }
+    let value: anybytes::Bytes = reader.get(handle)?;
+    Ok(value.as_ref().to_vec())
+}
 
-    /// Grant a relation `(object, relation, subject)` issued by `issuer`. The
-    /// issuer must be an effective admin of the object (for a fresh scope, its
-    /// creator).
-    pub fn grant(
-        &self,
-        object: Id,
-        relation: &str,
-        subject: Id,
-        issuer: Id,
-    ) -> Result<GrantResult> {
-        self.with_repo(|repo| {
-            let branch_id = repo
-                .ensure_branch(&self.branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-            let mut ws = repo
-                .pull(branch_id)
-                .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-
-            // The issuer must be an effective admin of the object — otherwise this
-            // grant could never chain to the scope root and would be inert anyway.
-            let admins = effective_admins(&space, object);
-            if !admins.contains(&issuer) {
-                if scope_creator_of(&space, object).is_none() {
-                    bail!(
-                        "scope {} is not rooted — run `scope create` first",
-                        fmt_id(object)
-                    );
-                }
-                bail!(
-                    "{} is not an effective admin of {}; only an admin can grant",
-                    fmt_id(issuer),
-                    fmt_id(object)
-                );
-            }
-
-            let g = ufoid();
-            let now = instant_interval(now_epoch());
-            let mut change = TribleSet::new();
-            change += entity! { &g @
-                metadata::tag: &KIND_GRANT,
-                metadata::created_at: now,
-                grant_object: &object,
-                grant_relation: relation,
-                grant_subject: &subject,
-                grant_issuer: &issuer,
-            };
-            ws.commit(change, "secrets: grant");
-            repo.push(&mut ws)
-                .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-            Ok(GrantResult {
-                grant_id: g.id,
-                object,
-                relation: relation.to_string(),
-                subject,
-                issuer,
-            })
-        })
+fn validate_payloads<Overlay>(
+    reader: &PileReader,
+    overlay: Option<&Overlay>,
+    catalog: &SecretsCatalog,
+) -> Result<()>
+where
+    Overlay: BlobStoreGet + BlobStoreMeta,
+{
+    for identity in catalog.identities.values() {
+        let name = read_text_overlay(reader, overlay, identity.name)
+            .with_context(|| format!("read identity {} nickname", fmt_id(identity.id)))?;
+        validate_name("identity nickname", &name)?;
+        let pk = read_bytes_overlay(reader, overlay, identity.sign_pk)
+            .with_context(|| format!("read identity {} public key", fmt_id(identity.id)))?;
+        if pk.len() != ED25519_PUBLIC_KEY_BYTES {
+            bail!(
+                "identity {} has a malformed Ed25519 public key",
+                fmt_id(identity.id)
+            );
+        }
+        let lockbox = read_bytes_overlay(reader, overlay, identity.lockbox)
+            .with_context(|| format!("read identity {} lockbox", fmt_id(identity.id)))?;
+        if lockbox.len() != LOCKBOX_BYTES {
+            bail!("identity {} has a malformed lockbox", fmt_id(identity.id));
+        }
     }
-
-    /// Revoke a subject's live grants on a scope (sets the retraction cursor).
-    /// Returns the number of grants revoked. Errors if none are live.
-    pub fn revoke(&self, object: Id, subject: Id) -> Result<usize> {
-        self.with_repo(|repo| {
-            let branch_id = repo
-                .ensure_branch(&self.branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-            let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            let grants: Vec<Id> = find!(
-                g: Id,
-                pattern!(&space, [{ ?g @ metadata::tag: KIND_GRANT, grant_object: object, grant_subject: subject }])
-            )
-            .filter(|g| grant_is_live(&space, *g))
-            .collect();
-            if grants.is_empty() {
-                bail!("no live grant for {} on {}", fmt_id(subject), fmt_id(object));
-            }
-            let now = instant_interval(now_epoch());
-            let mut change = TribleSet::new();
-            for g in &grants {
-                change += entity! { ExclusiveId::force_ref(g) @ grant_retracted_at: now };
-            }
-            ws.commit(change, "secrets: revoke");
-            repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-            Ok(grants.len())
-        })
+    for scope in catalog.scopes.values() {
+        let name = read_text_overlay(reader, overlay, scope.name)
+            .with_context(|| format!("read scope {} name", fmt_id(scope.id)))?;
+        validate_name("scope name", &name)?;
     }
-
-    /// Add a secret to a scope, sealed to every live recipient. An add of an
-    /// existing `(scope, name)` makes a new version.
-    pub fn secret_add(&self, scope: Id, name: &str, plaintext: &[u8]) -> Result<SecretAdded> {
-        self.with_repo(|repo| {
-            let branch_id = repo
-                .ensure_branch(&self.branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-            let mut ws = repo
-                .pull(branch_id)
-                .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            let (change, secret_id, n) =
-                build_seal_change(&mut ws, &space, scope, name, plaintext)?;
-            ws.commit(change, "secrets: secret add");
-            repo.push(&mut ws)
-                .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-            Ok(SecretAdded {
-                secret_id,
-                name: name.to_string(),
-                recipients: n,
-            })
-        })
+    for secret in catalog.secrets.values() {
+        let display_name = read_text_overlay(reader, overlay, secret.display_name)
+            .with_context(|| format!("read secret {} display name", fmt_id(secret.id)))?;
+        if display_name != secret.name {
+            bail!(
+                "secret {} has disagreeing metadata::name and secret_name values",
+                fmt_id(secret.id)
+            );
+        }
+        let body = read_bytes_overlay(reader, overlay, secret.body)
+            .with_context(|| format!("read secret {} body", fmt_id(secret.id)))?;
+        if body.len() < SECRET_BODY_MIN_BYTES {
+            bail!(
+                "secret {} has a malformed encrypted body",
+                fmt_id(secret.id)
+            );
+        }
     }
-
-    /// Get the latest version of a named secret, decrypted as identity `me`
-    /// (needs the identity password).
-    pub fn secret_get(&self, pw: &[u8], scope: Id, name: &str, me: Id) -> Result<Vec<u8>> {
-        self.with_repo(|repo| {
-            let branch_id = repo
-                .ensure_branch(&self.branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-            let mut ws = repo
-                .pull(branch_id)
-                .map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            let secret_id = latest_secret(&space, scope, name)
-                .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
-            open_secret_value(pw, &mut ws, &space, secret_id, me)
-        })
+    for wrap in catalog.wraps.values() {
+        let sealed = read_bytes_overlay(reader, overlay, wrap.sealed_dek)
+            .with_context(|| format!("read wrap {} sealed DEK", fmt_id(wrap.id)))?;
+        if sealed.len() != SEALED_DEK_BYTES {
+            bail!("wrap {} has a malformed sealed DEK", fmt_id(wrap.id));
+        }
     }
+    Ok(())
+}
 
-    /// Re-wrap a named secret's DEK to recipients added after it was created.
-    /// Run as an existing recipient `me` (needs the password to unlock the DEK).
-    /// Returns the number of newly-shared recipients (0 if already complete).
-    pub fn secret_share(&self, pw: &[u8], scope: Id, name: &str, me: Id) -> Result<usize> {
-        self.with_repo(|repo| {
-            let branch_id = repo
-                .ensure_branch(&self.branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
-            let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-            let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            let secret_id = latest_secret(&space, scope, name)
-                .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
+/// Validate one complete authorized Secrets collection and every attachment.
+pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<SecretsCatalog> {
+    let catalog = load_catalog(facts)?;
+    validate_payloads(reader, None::<&PileReader>, &catalog)?;
+    Ok(catalog)
+}
 
-            // Unlock my key and recover the DEK from my own wrap.
-            let (lock_h, my_pk_h): (BytesHandle, BytesHandle) = find!(
-                (l: BytesHandle, p: BytesHandle),
-                pattern!(&space, [{ me @ identity_lockbox: ?l, identity_sign_pk: ?p }])
-            )
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("identity {} not found", fmt_id(me)))?;
-            let lockbox = read_bytes(&mut ws, lock_h).context("read lockbox")?;
-            let my_pk = read_bytes(&mut ws, my_pk_h).context("read pk")?;
-            let my_sk = unlock_secret_key(pw, &lockbox)?;
-            let box_kp = box_keypair_from_ed25519(&my_sk, &my_pk)?;
+/// Validate the exact union a proposed publication would create, including
+/// attachments staged only inside `fragment`, before any pile bytes are
+/// written or signed root is published.
+pub fn validate_candidate(
+    reader: &PileReader,
+    current: &TribleSet,
+    fragment: &Fragment,
+) -> Result<SecretsCatalog> {
+    let mut union = current.clone();
+    union += fragment.facts().clone();
+    let catalog = load_catalog(&union)?;
+    let mut staged = fragment.clone();
+    let overlay = staged
+        .blobs_mut()
+        .reader()
+        .context("snapshot staged Secrets attachments")?;
+    validate_payloads(reader, Some(&overlay), &catalog)?;
+    Ok(catalog)
+}
 
-            let my_wrap_h: BytesHandle = find!(
-                (w: Id, d: BytesHandle),
-                pattern!(&space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: me, wrap_dek: ?d }])
-            )
-            .next()
-            .map(|(_, d)| d)
-            .ok_or_else(|| anyhow::anyhow!("you ({}) are not a recipient of this secret", fmt_id(me)))?;
-            let sealed = read_bytes(&mut ws, my_wrap_h).context("read wrap")?;
-            let dek_bytes = DryocBox::from_sealed_bytes(&sealed)
-                .map_err(|e| anyhow::anyhow!("parse wrap: {e:?}"))?
-                .unseal_to_vec(&box_kp)
-                .map_err(|_| anyhow::anyhow!("unseal failed (wrong key?)"))?;
-            let dek = Key::try_from(&dek_bytes[..]).context("dek")?;
+pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+    read_text_overlay(reader, None::<&PileReader>, handle)
+}
 
-            // Current recipients minus those who already hold a wrap.
-            let recipients = recipients_of(&space, scope)?;
-            let existing: HashSet<Id> = find!(
-                (w: Id, r: Id),
-                pattern!(&space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: ?r }])
-            )
-            .map(|(_, r)| r)
-            .collect();
-            let missing: Vec<Id> = recipients.into_iter().filter(|r| !existing.contains(r)).collect();
-            if missing.is_empty() {
-                return Ok(0);
-            }
+pub fn read_bytes(reader: &PileReader, handle: BytesHandle) -> Result<Vec<u8>> {
+    read_bytes_overlay(reader, None::<&PileReader>, handle)
+}
 
-            let now = instant_interval(now_epoch());
-            let mut change = TribleSet::new();
-            for r in &missing {
-                let rid = *r;
-                let pk_h: BytesHandle = find!(h: BytesHandle, pattern!(&space, [{ rid @ identity_sign_pk: ?h }]))
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("recipient {} has no signing key", fmt_id(*r)))?;
-                let pk = read_bytes(&mut ws, pk_h).ok_or_else(|| anyhow::anyhow!("read pk"))?;
-                let rx_pk = box_pk_from_ed25519(&pk)?;
-                let sealed = DryocBox::seal_to_vecbox(&dek, &rx_pk)
-                    .map_err(|e| anyhow::anyhow!("seal to {}: {e:?}", fmt_id(*r)))?
-                    .to_vec();
-                let dek_h = put_bytes(&mut ws, sealed);
-                let w = ufoid();
-                change += entity! { &w @
-                    metadata::tag: &KIND_WRAP,
-                    metadata::created_at: now,
-                    wrap_secret: &secret_id,
-                    wrap_recipient: r,
-                    wrap_dek: dek_h,
-                };
-            }
-            ws.commit(change, "secrets: secret share");
-            repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-            Ok(missing.len())
-        })
+fn named_candidates(
+    reader: &PileReader,
+    rows: impl IntoIterator<Item = (Id, TextHandle)>,
+    input: &str,
+) -> Result<Vec<Id>> {
+    let mut matches = Vec::new();
+    for (id, handle) in rows {
+        if read_text(reader, handle)? == input {
+            matches.push(id);
+        }
     }
+    matches.sort_unstable();
+    matches.dedup();
+    Ok(matches)
+}
 
-    /// The rotate worklist: credentials whose current version is still wrapped to
-    /// someone no longer a recipient. `filter` narrows to a single scope.
-    /// Re-encrypting them here changes nothing (they keep their old wrap = the
-    /// value); the fix is to change each credential at its source and
-    /// `secret_add` the new value.
-    pub fn rotate_worklist(&self, filter: Option<Id>) -> Result<Vec<Exposure>> {
-        self.read(|ws, space| {
-            // Unique (scope, name) credentials.
-            let rows: Vec<(Id, TextHandle)> = find!(
-                (sc: Id, n: TextHandle),
-                pattern!(space, [{ _?s @ metadata::tag: KIND_SECRET, secret_scope: ?sc, metadata::name: ?n }])
-            )
-            .collect();
-            let mut seen: HashSet<(Id, String)> = HashSet::new();
-            let mut findings: Vec<Exposure> = Vec::new();
-            for (sc, nh) in rows {
-                if let Some(f) = filter {
-                    if sc != f {
-                        continue;
-                    }
-                }
-                let name = match read_text(ws, nh) {
-                    Some(n) => n,
-                    None => continue,
-                };
-                if !seen.insert((sc, name.clone())) {
-                    continue;
-                }
-                let latest = match latest_secret(space, sc, &name) {
-                    Some(l) => l,
-                    None => continue,
-                };
-                let current: HashSet<Id> = recipients_of(space, sc)?.into_iter().collect();
-                let exposed: Vec<Id> = wrap_holders(space, latest)
-                    .into_iter()
-                    .filter(|h| !current.contains(h))
-                    .collect();
-                if !exposed.is_empty() {
-                    let scope_name = entity_name(ws, space, sc);
-                    findings.push(Exposure { scope: sc, scope_name, name, exposed });
-                }
-            }
-            Ok(findings)
-        })
+fn resolve_rows(
+    reader: &PileReader,
+    rows: Vec<(Id, TextHandle)>,
+    input: &str,
+    kind: &str,
+) -> Result<Id> {
+    if let Ok(id) = resolve_id_prefix(input, rows.iter().map(|(id, _)| *id)) {
+        return Ok(id);
     }
+    let named = named_candidates(reader, rows, input)?;
+    match named.as_slice() {
+        [id] => Ok(*id),
+        [] => bail!("no {kind} matches '{input}' by id or name"),
+        ids => bail!("{kind} name '{input}' is ambiguous ({} matches)", ids.len()),
+    }
+}
 
-    /// List secrets grouped by (scope, name), newest version, with version count
-    /// and current recipient count.
-    pub fn secret_list(&self) -> Result<Vec<SecretSummary>> {
-        self.read(|ws, space| {
-            // Group versions by (scope, name); show the newest of each.
-            let rows: Vec<(Id, Id, TextHandle)> = find!(
-                (s: Id, sc: Id, n: TextHandle),
-                pattern!(space, [{ ?s @ metadata::tag: KIND_SECRET, secret_scope: ?sc, metadata::name: ?n }])
-            )
-            .collect();
-            let mut seen: HashSet<(Id, String)> = HashSet::new();
-            let mut out = Vec::new();
-            for (_s, sc, n) in rows {
-                let name = read_text(ws, n).unwrap_or_default();
-                if !seen.insert((sc, name.clone())) {
-                    continue;
-                }
-                let versions = secret_versions(space, sc, &name);
-                let recipients = recipients_of(space, sc)?.len();
-                out.push(SecretSummary { name, scope: sc, versions, recipients });
-            }
-            Ok(out)
-        })
+fn resolve_id_prefix(input: &str, candidates: impl IntoIterator<Item = Id>) -> Result<Id> {
+    let input = input.trim();
+    if input.len() == 32 {
+        return Id::from_hex(input).ok_or_else(|| anyhow!("invalid entity id '{input}'"));
     }
+    if input.is_empty() || input.len() > 32 || !input.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid entity id prefix '{input}'");
+    }
+    let input = input.to_ascii_lowercase();
+    let mut matches: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| format!("{candidate:x}").starts_with(&input))
+        .collect();
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.as_slice() {
+        [id] => Ok(*id),
+        [] => bail!("no entity matches id prefix '{input}'"),
+        many => bail!(
+            "entity id prefix '{input}' is ambiguous ({} matches)",
+            many.len()
+        ),
+    }
+}
+
+pub fn resolve_identity(reader: &PileReader, catalog: &SecretsCatalog, input: &str) -> Result<Id> {
+    resolve_rows(
+        reader,
+        catalog
+            .identities
+            .values()
+            .map(|row| (row.id, row.name))
+            .collect(),
+        input,
+        "identity",
+    )
+}
+
+pub fn resolve_scope(reader: &PileReader, catalog: &SecretsCatalog, input: &str) -> Result<Id> {
+    resolve_rows(
+        reader,
+        catalog
+            .scopes
+            .values()
+            .map(|row| (row.id, row.name))
+            .collect(),
+        input,
+        "scope",
+    )
+}
+
+/// Find the one scope with an exact logical `(creator, name)` identity across
+/// both intrinsic-identity epochs. New scopes use the current epoch, while an
+/// exact legacy scope is reused rather than duplicated under a new id.
+pub fn scope_by_creator_and_name(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    creator: Id,
+    name: &str,
+) -> Result<Option<Id>> {
+    let mut matches = Vec::new();
+    for scope in catalog
+        .scopes
+        .values()
+        .filter(|scope| scope.creator == creator)
+    {
+        if read_text(reader, scope.name)? == name {
+            matches.push(scope.id);
+        }
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [scope] => Ok(Some(*scope)),
+        many => bail!(
+            "creator {} has {} scopes named '{name}'",
+            fmt_id(creator),
+            many.len(),
+        ),
+    }
+}
+
+/// Resolve a grant subject across identities and nested scopes. A label shared
+/// by both kinds is explicitly ambiguous.
+pub fn resolve_principal(reader: &PileReader, catalog: &SecretsCatalog, input: &str) -> Result<Id> {
+    let rows: Vec<_> = catalog
+        .identities
+        .values()
+        .map(|row| (row.id, row.name))
+        .chain(catalog.scopes.values().map(|row| (row.id, row.name)))
+        .collect();
+    resolve_rows(reader, rows, input, "identity or scope")
+}
+
+pub fn entity_name(reader: &PileReader, catalog: &SecretsCatalog, id: Id) -> Result<String> {
+    if let Some(row) = catalog.identities.get(&id) {
+        return read_text(reader, row.name);
+    }
+    if let Some(row) = catalog.scopes.get(&id) {
+        return read_text(reader, row.name);
+    }
+    Ok(fmt_id(id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use triblespace::core::blob::IntoBlob;
+    use std::fs::File;
+    use std::path::Path;
 
-    #[test]
-    fn historical_schema_ids_are_preserved() {
-        macro_rules! assert_id {
-            ($actual:expr, $expected:literal) => {
-                assert_eq!(format!("{:X}", $actual), $expected);
-            };
-        }
+    use crate::schema::DEFAULT_SCOPE_ID;
+    use ed25519_dalek::SigningKey;
+    use triblespace::core::collection::{discover_collection_records, Collection};
+    use triblespace::core::repo::pile::{Pile, PileReader};
+    use triblespace::core::repo::BlobStore;
 
-        assert_id!(identity_sign_pk.id(), "FD0897D627CF18F4E49A93968A8D6301");
-        assert_id!(identity_lockbox.id(), "1E4279231655D8C67835865C3AFB629F");
-        assert_id!(grant_object.id(), "B3F0E5A5FFACC159B651BFDA19EAE18C");
-        assert_id!(grant_relation.id(), "22F807F93FADFE092C8CE0698044680B");
-        assert_id!(grant_subject.id(), "B44AF03BA7AF04ED81096D7900D70A12");
-        assert_id!(grant_issuer.id(), "B177568BEE389D76D9D71110E9067EF1");
-        assert_id!(grant_retracted_at.id(), "73CE206E6B9B81CB2BD2388ECC5D3AA8");
-        assert_id!(secret_scope.id(), "A66C795299212D16BA6BA25BD1D9F983");
-        assert_id!(secret_name.id(), "8FD8C43D3490ACD6AFAD6D691B748CA3");
-        assert_id!(secret_body.id(), "7FC38805FDC9FA4D8449497B298B51BB");
-        assert_id!(wrap_secret.id(), "D17EC6F6A9F9D6B7A3B9A329A9CFC4CC");
-        assert_id!(wrap_recipient.id(), "CAD2A79E7F5B1A870F5814BDEE5C90F8");
-        assert_id!(wrap_dek.id(), "B30CE37D4DC3CAACC34D946B3D71E37C");
-        assert_id!(reaches.id(), "ABAF427C4F1CB01AA7091A9C38F0DA3A");
-        assert_id!(scope_creator.id(), "CE866212934742FF5B27DEF25E366E07");
+    struct TestView {
+        facts: TribleSet,
+        reader: PileReader,
+    }
 
-        assert_id!(KIND_IDENTITY, "0B870F06D1B502EBE1259C90234E8BA2");
-        assert_id!(KIND_GRANT, "BB95E8D2D7DC644B39396A1B6C10ECC6");
-        assert_id!(KIND_SECRET, "72B64C9F3644B8016B64820D7F3F23C1");
-        assert_id!(KIND_WRAP, "EB8549BAF679C5D11ECEDB416AAD76E3");
-        assert_id!(KIND_SCOPE, "B2920B23494B9DBD4500158D84432325");
+    fn test_collection(path: &Path) -> Collection<Pile> {
+        File::create(path).unwrap();
+        let mut pile = Pile::open(path).unwrap();
+        pile.refresh().unwrap();
+        Collection::new(pile, DEFAULT_SCOPE_ID, SigningKey::generate(&mut OsRng))
+    }
+
+    fn test_view(collection: &mut Collection<Pile>) -> TestView {
+        let facts = collection.materialize().unwrap();
+        let reader = collection.storage_mut().reader().unwrap();
+        TestView { facts, reader }
+    }
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn at(second: i64) -> IntervalValue {
+        let epoch = hifitime::Epoch::from_unix_seconds(second as f64);
+        (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    fn fixture() -> (Fragment, Id, Id, Id) {
+        let alice = id(1);
+        let bob = id(2);
+        let mut fragment = identity_fragment(
+            alice,
+            "alice",
+            vec![1; ED25519_PUBLIC_KEY_BYTES],
+            vec![2; LOCKBOX_BYTES],
+            at(1),
+        )
+        .unwrap();
+        fragment += identity_fragment(
+            bob,
+            "bob",
+            vec![3; ED25519_PUBLIC_KEY_BYTES],
+            vec![4; LOCKBOX_BYTES],
+            at(2),
+        )
+        .unwrap();
+        let scope = scope_fragment(alice, "prod", at(3)).unwrap();
+        let scope_id = scope.root().unwrap();
+        fragment += scope;
+        (fragment, alice, bob, scope_id)
     }
 
     #[test]
-    fn repo_roundtrips_a_secret_across_reopens() {
-        let dir = tempfile::tempdir().unwrap();
-        let pile = dir.path().join("secrets.pile");
-        std::fs::File::create(&pile).unwrap();
-        let password = b"test-only password";
+    fn high_level_envelope_roundtrip_share_and_competing_wrap_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("secrets.pile");
+        let mut collection = test_collection(&pile);
 
-        let repo = SecretsRepo::open_default(&pile);
-        let alice = repo.identity_init(password, "alice").unwrap();
-        let scope = repo.scope_create("production", alice.id).unwrap();
-        let added = repo
-            .secret_add(scope.id, "database", b"correct horse")
-            .unwrap();
-        assert_eq!(added.recipients, 1);
+        let alice_password = b"alice correct horse";
+        let bob_password = b"bob battery staple";
+        let alice = prepare_identity("alice", alice_password, at(1)).unwrap();
+        let bob = prepare_identity("bob", bob_password, at(2)).unwrap();
+        let alice_id = alice.id;
+        let bob_id = bob.id;
+        let mut foundation = alice.fragment;
+        foundation += bob.fragment;
+        let scope_fragment = scope_fragment(alice_id, "prod", at(3)).unwrap();
+        let scope = scope_fragment.root().unwrap();
+        foundation += scope_fragment;
+        collection.commit(foundation).unwrap();
 
-        let reopened = SecretsRepo::open_default(&pile);
-        assert_eq!(reopened.identity_list().unwrap().len(), 1);
-        assert_eq!(reopened.scope_list().unwrap().len(), 1);
-        assert_eq!(reopened.secret_list().unwrap().len(), 1);
+        let base = test_view(&mut collection);
+        let base_catalog = validate_catalog(&base.reader, &base.facts).unwrap();
+        let sealed = seal_version(
+            &base.reader,
+            &base_catalog,
+            scope,
+            "database",
+            b"hunter2",
+            at(4),
+        )
+        .unwrap();
+        let secret = sealed.secret;
+        assert_eq!(sealed.recipient_count, 1);
+        collection.commit(sealed.fragment).unwrap();
+
+        let sealed_view = test_view(&mut collection);
+        let sealed_catalog = validate_catalog(&sealed_view.reader, &sealed_view.facts).unwrap();
         assert_eq!(
-            reopened
-                .secret_get(password, scope.id, "database", alice.id)
-                .unwrap(),
-            b"correct horse"
+            open_version(
+                &sealed_view.reader,
+                &sealed_catalog,
+                secret,
+                alice_id,
+                alice_password,
+            )
+            .unwrap(),
+            b"hunter2"
         );
-    }
+        assert!(open_version(
+            &sealed_view.reader,
+            &sealed_catalog,
+            secret,
+            alice_id,
+            b"wrong password",
+        )
+        .is_err());
 
-    #[test]
-    fn lockbox_roundtrips_and_rejects_wrong_password() {
-        let kp = SigningKeyPair::gen_with_defaults();
-        let sk = kp.secret_key.to_vec();
-        let lb = lock_secret_key(b"correct horse", &sk);
-        assert_eq!(unlock_secret_key(b"correct horse", &lb).unwrap(), sk);
-        assert!(unlock_secret_key(b"wrong horse", &lb).is_err());
-        // distinct salts => distinct lockboxes for the same key+password
-        let lb2 = lock_secret_key(b"correct horse", &sk);
-        assert_ne!(lb, lb2);
-    }
+        let grant = grant_fragment(id(90), scope, "member", bob_id, alice_id, at(5)).unwrap();
+        collection.commit(grant).unwrap();
+        let granted_view = test_view(&mut collection);
+        let granted_catalog = validate_catalog(&granted_view.reader, &granted_view.facts).unwrap();
+        let shared = share_version(
+            &granted_view.reader,
+            &granted_catalog,
+            secret,
+            alice_id,
+            alice_password,
+            at(6),
+        )
+        .unwrap();
+        assert_eq!(shared.new_recipient_count, 1);
+        collection.commit(shared.fragment).unwrap();
 
-    #[test]
-    fn derived_x25519_pub_and_secret_agree() {
-        // The subtlest bit: the X25519 public key derived from the Ed25519
-        // *public* key must pair with the X25519 secret derived from the
-        // Ed25519 *secret* key. Seal to the former, open with the latter.
-        let kp = SigningKeyPair::gen_with_defaults();
-        let pk = kp.public_key.to_vec();
-        let sk = kp.secret_key.to_vec();
-        let box_pk = box_pk_from_ed25519(&pk).unwrap();
-        let box_kp = box_keypair_from_ed25519(&sk, &pk).unwrap();
-        let msg = b"a 32-byte data key would go here";
-        let sealed = DryocBox::seal_to_vecbox(&msg[..], &box_pk)
-            .unwrap()
-            .to_vec();
-        let opened = DryocBox::from_sealed_bytes(&sealed)
-            .unwrap()
-            .unseal_to_vec(&box_kp)
-            .unwrap();
-        assert_eq!(opened.as_slice(), msg);
-    }
-
-    #[test]
-    fn latest_secret_picks_newest_version() {
-        let scope = ufoid().id;
-        let mut space = TribleSet::new();
-        let add_version = |space: &mut TribleSet, year: i32| -> Id {
-            let s = ufoid().id;
-            let t = instant_interval(Epoch::from_gregorian_utc(year, 1, 1, 0, 0, 0, 0));
-            *space += entity! { ExclusiveId::force_ref(&s) @
-                metadata::tag: &KIND_SECRET,
-                secret_scope: &scope,
-                secret_name: "db",
-                metadata::created_at: t,
-            };
-            s
-        };
-        let _v1 = add_version(&mut space, 2020);
-        let v2 = add_version(&mut space, 2025);
-        let v3_older = add_version(&mut space, 2023);
+        let shared_view = test_view(&mut collection);
+        let shared_catalog = validate_catalog(&shared_view.reader, &shared_view.facts).unwrap();
         assert_eq!(
-            latest_secret(&space, scope, "db"),
-            Some(v2),
-            "2025 is newest"
+            open_version(
+                &shared_view.reader,
+                &shared_catalog,
+                secret,
+                bob_id,
+                bob_password,
+            )
+            .unwrap(),
+            b"hunter2"
         );
-        assert_eq!(secret_versions(&space, scope, "db"), 3);
-        assert_eq!(latest_secret(&space, scope, "absent"), None);
-        let _ = v3_older;
-    }
 
-    // ── concurrent two-admin harness ─────────────────────────────────────────
-    // triblespace merge is set-union, so a merged pile of two admins' diverged
-    // branches is exactly the union of their tribles. We model "concurrent
-    // branches, then merge" by building one TribleSet that contains BOTH
-    // admins' ops, and ask the CURRENT model for its verdict. These reproduce
-    // the cluster-G duelling-admin / backdating scenarios (wiki 65a1835b) to
-    // show what the effective-admin fixpoint already defends against.
-    fn mk_scope(space: &mut TribleSet, creator: &Id) -> Id {
-        let s = ufoid().id;
-        *space += entity! { ExclusiveId::force_ref(&s) @
-        metadata::tag: &KIND_SCOPE, scope_creator: creator };
-        s
-    }
-    fn mk_grant(space: &mut TribleSet, scope: &Id, iss: &Id, rel: &str, subj: &Id) -> Id {
-        let g = ufoid().id;
-        *space += entity! { ExclusiveId::force_ref(&g) @
-            metadata::tag: &KIND_GRANT,
-            grant_object: scope,
-            grant_relation: rel,
-            grant_issuer: iss,
-            grant_subject: subj,
-        };
-        g
-    }
-    fn retract(space: &mut TribleSet, g: &Id) {
-        *space += entity! { ExclusiveId::force_ref(g) @
-        grant_retracted_at: instant_interval(now_epoch()) };
-    }
-
-    #[test]
-    fn concurrent_confederate_add_is_defeated() {
-        // alice (root) -> admin -> bob. Then, concurrently: alice REMOVES bob,
-        // while bob (not yet seeing the removal) makes mallory an admin. After
-        // merge, both ops are present. The removal must win: mallory's grant was
-        // issued by bob, who is no longer an effective admin.
-        let (alice, bob, mallory) = (ufoid().id, ufoid().id, ufoid().id);
-        let mut space = TribleSet::new();
-        let s = mk_scope(&mut space, &alice);
-        let g_bob = mk_grant(&mut space, &s, &alice, "admin", &bob);
-        // branch A: alice removes bob.  branch B: bob adds mallory.  (union)
-        retract(&mut space, &g_bob);
-        mk_grant(&mut space, &s, &bob, "admin", &mallory);
-
-        let admins = effective_admins(&space, s);
-        assert_eq!(admins.len(), 1);
-        assert!(admins.contains(&alice));
-        assert!(!admins.contains(&bob), "bob was removed");
-        assert!(
-            !admins.contains(&mallory),
-            "confederate-add by a removed admin is inert"
-        );
-    }
-
-    #[test]
-    fn concurrent_removal_cascades_through_delegated_admin() {
-        // alice -> admin -> bob -> admin -> carol. Concurrently: alice removes
-        // bob, while carol (whose admin came via bob) makes dave an admin. The
-        // removal of bob must transitively void carol AND dave.
-        let (alice, bob, carol, dave) = (ufoid().id, ufoid().id, ufoid().id, ufoid().id);
-        let mut space = TribleSet::new();
-        let s = mk_scope(&mut space, &alice);
-        let g_bob = mk_grant(&mut space, &s, &alice, "admin", &bob);
-        mk_grant(&mut space, &s, &bob, "admin", &carol);
-        retract(&mut space, &g_bob); // alice removes bob
-        mk_grant(&mut space, &s, &carol, "admin", &dave); // concurrent, by carol
-
-        let admins = effective_admins(&space, s);
-        assert_eq!(admins, HashSet::from([alice]));
-    }
-
-    #[test]
-    fn root_is_unremovable_no_headless_group() {
-        // Even if every admin grant is retracted, the content-derived creator
-        // remains — there is no grant to retract for the root, so the group can
-        // never become headless.
-        let (alice, bob) = (ufoid().id, ufoid().id);
-        let mut space = TribleSet::new();
-        let s = mk_scope(&mut space, &alice);
-        let g = mk_grant(&mut space, &s, &alice, "admin", &bob);
-        retract(&mut space, &g);
-        assert_eq!(effective_admins(&space, s), HashSet::from([alice]));
-    }
-
-    #[test]
-    fn concurrent_independent_grants_both_apply() {
-        // Two non-conflicting concurrent ops by the same effective admin both
-        // survive the merge (convergence, no spurious loss).
-        let (alice, bob, carol, dave) = (ufoid().id, ufoid().id, ufoid().id, ufoid().id);
-        let mut space = TribleSet::new();
-        let s = mk_scope(&mut space, &alice);
-        mk_grant(&mut space, &s, &alice, "admin", &bob);
-        mk_grant(&mut space, &s, &bob, "admin", &carol); // branch A
-        mk_grant(&mut space, &s, &bob, "admin", &dave); // branch B
-        assert_eq!(
-            effective_admins(&space, s),
-            HashSet::from([alice, bob, carol, dave])
-        );
-    }
-
-    #[test]
-    fn materialized_path_preserves_transitive_recipient_semantics() {
-        let (root_creator, group_creator, recipient) = (ufoid().id, ufoid().id, ufoid().id);
-        let mut space = TribleSet::new();
-        let root = mk_scope(&mut space, &root_creator);
-        let group = mk_scope(&mut space, &group_creator);
-        mk_grant(&mut space, &root, &root_creator, "member", &group);
-        mk_grant(&mut space, &group, &group_creator, "member", &recipient);
-
-        for (identity, byte) in [(root_creator, 1), (recipient, 2)] {
-            let key = Inline::<Handle<RawBytes>>::new([byte; 32]);
-            space += entity! { ExclusiveId::force_ref(&identity) @ identity_sign_pk: key };
-        }
-
-        let mut expected = vec![root_creator, recipient];
-        expected.sort();
-        assert_eq!(recipients_of(&space, root).unwrap(), expected);
-    }
-
-    #[test]
-    fn exposure_is_wrap_holders_minus_current_recipients() {
-        // A secret version wrapped to {alice, bob}; bob later revoked. The
-        // exposure set (what `secret rotate` reports) = wrap-holders not in the
-        // current recipient set = {bob}. Adding a newer version wrapped only to
-        // {alice} clears it (latest-version check).
-        let (alice, bob) = (ufoid().id, ufoid().id);
-        let secret_v1 = ufoid().id;
-        let mut space = TribleSet::new();
-        // wraps on v1 to both
-        for r in [alice, bob] {
-            let w = ufoid().id;
-            space += entity! { ExclusiveId::force_ref(&w) @
-            metadata::tag: &KIND_WRAP, wrap_secret: &secret_v1, wrap_recipient: &r };
-        }
-        let holders = wrap_holders(&space, secret_v1);
-        assert_eq!(holders, {
-            let mut v = vec![alice, bob];
-            v.sort();
-            v
-        });
-        // current recipients after bob's revocation = {alice}
-        let current: HashSet<Id> = HashSet::from([alice]);
-        let exposed: Vec<Id> = holders
-            .into_iter()
-            .filter(|h| !current.contains(h))
-            .collect();
-        assert_eq!(exposed, vec![bob]);
-    }
-
-    #[test]
-    fn or_set_redundant_grant_survives_one_retraction() {
-        // bob is made admin by two independent grants; retracting one must not
-        // remove him (OR-set semantics — authority survives on any live path).
-        let (alice, bob) = (ufoid().id, ufoid().id);
-        let mut space = TribleSet::new();
-        let s = mk_scope(&mut space, &alice);
-        let g1 = mk_grant(&mut space, &s, &alice, "admin", &bob);
-        let _g2 = mk_grant(&mut space, &s, &alice, "admin", &bob);
-        retract(&mut space, &g1);
-        assert_eq!(effective_admins(&space, s), HashSet::from([alice, bob]));
-    }
-
-    #[test]
-    fn effective_admins_fixpoint_and_transitive_removal() {
-        // Pure TribleSet (no pile/blobs): exercises the validity fixpoint.
-        let sid = ufoid().id;
-        let (aid, bid, cid, did, eid) =
-            (ufoid().id, ufoid().id, ufoid().id, ufoid().id, ufoid().id);
-        let mut space = TribleSet::new();
-        // scope rooted at alice
-        space += entity! { ExclusiveId::force_ref(&sid) @
-        metadata::tag: &KIND_SCOPE, scope_creator: &aid };
-        let grant = |space: &mut TribleSet, iss: &Id, rel: &str, subj: &Id| -> Id {
-            let g = ufoid().id;
-            *space += entity! { ExclusiveId::force_ref(&g) @
-                metadata::tag: &KIND_GRANT,
-                grant_object: &sid,
-                grant_relation: rel,
-                grant_issuer: iss,
-                grant_subject: subj,
-            };
-            g
-        };
-        let g_bob = grant(&mut space, &aid, "admin", &bid); // alice -> admin -> bob
-        grant(&mut space, &bid, "admin", &cid); // bob -> admin -> carol (transitive)
-        grant(&mut space, &did, "admin", &eid); // dave (not admin) -> eve (inert)
-
-        let admins = effective_admins(&space, sid);
-        assert!(admins.contains(&aid) && admins.contains(&bid) && admins.contains(&cid));
-        assert!(
-            !admins.contains(&eid),
-            "dave isn't an admin, so eve must not be"
-        );
-        assert!(!admins.contains(&did));
-
-        // Transitive strong removal: retract bob's admin -> bob AND carol drop.
-        space += entity! { ExclusiveId::force_ref(&g_bob) @
-        grant_retracted_at: instant_interval(now_epoch()) };
-        let admins2 = effective_admins(&space, sid);
-        assert!(admins2.contains(&aid));
-        assert!(!admins2.contains(&bid), "bob's admin was retracted");
-        assert!(
-            !admins2.contains(&cid),
-            "carol's admin chained through bob -> gone"
-        );
-        assert_eq!(admins2.len(), 1);
-    }
-
-    #[test]
-    fn scope_id_derives_from_creator_and_name() {
-        // The scope id is `entity!`'s intrinsic derivation over (creator, name):
-        // idempotent in those facts, and changes when either changes.
-        let a = ufoid().id;
-        let b = ufoid().id;
-        let id = |c: Id, name: &'static str| {
-            scope_fragment(c, name.to_blob().get_handle())
-                .root()
+        let bob_public = read_bytes(
+            &shared_view.reader,
+            shared_catalog.identities[&bob_id].sign_pk,
+        )
+        .unwrap();
+        let competing_dek = Key::gen();
+        let competing_wrap =
+            DryocBox::seal_to_vecbox(&competing_dek, &box_pk_from_ed25519(&bob_public).unwrap())
                 .unwrap()
-        };
-        assert_eq!(id(a, "prod"), id(a, "prod")); // idempotent creation
-        assert_ne!(id(a, "prod"), id(b, "prod")); // creator-bound
-        assert_ne!(id(a, "prod"), id(a, "staging")); // name-bound
+                .to_vec();
+        let competing = wrap_fragment(id(91), secret, bob_id, competing_wrap, at(7)).unwrap();
+        collection.commit(competing).unwrap();
+        let conflicting_view = test_view(&mut collection);
+        let conflicting_catalog =
+            validate_catalog(&conflicting_view.reader, &conflicting_view.facts).unwrap();
+        let error = open_version(
+            &conflicting_view.reader,
+            &conflicting_catalog,
+            secret,
+            bob_id,
+            bob_password,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("competing DEKs"));
+        collection.into_storage().close().unwrap();
     }
 
     #[test]
-    fn envelope_seals_to_many_and_refuses_outsiders() {
-        let alice = SigningKeyPair::gen_with_defaults();
-        let bob = SigningKeyPair::gen_with_defaults();
-        let carol = SigningKeyPair::gen_with_defaults();
-        let recipients: Vec<BoxPublicKey> = [&alice, &bob]
-            .iter()
-            .map(|kp| box_pk_from_ed25519(&kp.public_key.to_vec()).unwrap())
-            .collect();
+    fn opening_a_short_unvalidated_body_fails_instead_of_panicking() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("secrets.pile");
+        let mut collection = test_collection(&pile);
+        let mut resident = Fragment::empty();
+        let body = resident.put::<blobencodings::RawBytes, _>(vec![0; 23]);
+        let display_name = resident.put("broken".to_owned());
+        collection.commit(resident).unwrap();
 
-        let secret = b"prod db password";
-        let dek = Key::gen();
-        let nonce = Nonce::gen();
-        let body = DryocSecretBox::encrypt_to_vecbox(&secret[..], &nonce, &dek).to_vec();
-        let wraps: Vec<Vec<u8>> = recipients
-            .iter()
-            .map(|pk| DryocBox::seal_to_vecbox(&dek, pk).unwrap().to_vec())
-            .collect();
+        let view = test_view(&mut collection);
+        let secret = id(92);
+        let mut catalog = SecretsCatalog::default();
+        catalog.secrets.insert(
+            secret,
+            SecretRow {
+                id: secret,
+                created_at: at(1),
+                scope: id(93),
+                name: "broken".to_owned(),
+                display_name,
+                body,
+            },
+        );
 
-        // each intended recipient opens to the same plaintext
-        for kp in [&alice, &bob] {
-            let box_kp =
-                box_keypair_from_ed25519(&kp.secret_key.to_vec(), &kp.public_key.to_vec()).unwrap();
-            let dek_bytes = DryocBox::from_sealed_bytes(&wraps[0])
-                .unwrap()
-                .unseal_to_vec(&box_kp);
-            // alice's keypair opens wraps[0]; bob's does not — verify per-wrap below
-            let _ = dek_bytes;
+        let error = decrypt_secret_body(&view.reader, &catalog, secret, &Key::gen()).unwrap_err();
+        assert!(format!("{error:#}").contains("body is too short"));
+        collection.into_storage().close().unwrap();
+    }
+
+    #[test]
+    fn rooted_admin_fixpoint_and_or_set_retraction_survive_port() {
+        let (mut fragment, alice, bob, scope) = fixture();
+        let first = id(10);
+        let second = id(11);
+        fragment += grant_fragment(first, scope, "admin", bob, alice, at(4)).unwrap();
+        fragment += grant_fragment(second, scope, "admin", bob, alice, at(5)).unwrap();
+        fragment += retraction_fragment([first], at(6)).unwrap();
+
+        let catalog = load_catalog(fragment.facts()).unwrap();
+        assert_eq!(catalog.effective_admins(scope), HashSet::from([alice, bob]));
+        assert!(!catalog.grant_is_live(first));
+        assert!(catalog.grant_is_live(second));
+    }
+
+    #[test]
+    fn removal_cascades_through_delegated_admins() {
+        let (mut fragment, alice, bob, scope) = fixture();
+        let carol = id(3);
+        let dave = id(4);
+        fragment += identity_fragment(
+            carol,
+            "carol",
+            vec![5; ED25519_PUBLIC_KEY_BYTES],
+            vec![6; LOCKBOX_BYTES],
+            at(3),
+        )
+        .unwrap();
+        fragment += identity_fragment(
+            dave,
+            "dave",
+            vec![7; ED25519_PUBLIC_KEY_BYTES],
+            vec![8; LOCKBOX_BYTES],
+            at(4),
+        )
+        .unwrap();
+        let bob_grant = id(10);
+        fragment += grant_fragment(bob_grant, scope, "admin", bob, alice, at(5)).unwrap();
+        fragment += grant_fragment(id(11), scope, "admin", carol, bob, at(6)).unwrap();
+        fragment += retraction_fragment([bob_grant], at(7)).unwrap();
+        fragment += grant_fragment(id(12), scope, "admin", dave, carol, at(8)).unwrap();
+
+        let catalog = load_catalog(fragment.facts()).unwrap();
+        assert_eq!(catalog.effective_admins(scope), HashSet::from([alice]));
+    }
+
+    #[test]
+    fn concurrent_confederate_grant_by_removed_admin_is_inert() {
+        let (mut fragment, alice, bob, scope) = fixture();
+        let mallory = id(3);
+        fragment += identity_fragment(
+            mallory,
+            "mallory",
+            vec![5; ED25519_PUBLIC_KEY_BYTES],
+            vec![6; LOCKBOX_BYTES],
+            at(3),
+        )
+        .unwrap();
+        let bob_grant = id(10);
+        fragment += grant_fragment(bob_grant, scope, "admin", bob, alice, at(4)).unwrap();
+        fragment += retraction_fragment([bob_grant], at(5)).unwrap();
+        fragment += grant_fragment(id(11), scope, "admin", mallory, bob, at(6)).unwrap();
+
+        let catalog = load_catalog(fragment.facts()).unwrap();
+        assert_eq!(catalog.effective_admins(scope), HashSet::from([alice]));
+    }
+
+    #[test]
+    fn root_admin_has_no_retractable_grant() {
+        let (mut fragment, alice, bob, scope) = fixture();
+        let grant = id(10);
+        fragment += grant_fragment(grant, scope, "admin", bob, alice, at(4)).unwrap();
+        fragment += retraction_fragment([grant], at(5)).unwrap();
+        let catalog = load_catalog(fragment.facts()).unwrap();
+        assert_eq!(catalog.effective_admins(scope), HashSet::from([alice]));
+    }
+
+    #[test]
+    fn competing_scalar_values_are_rejected() {
+        let (mut fragment, alice, bob, scope) = fixture();
+        let grant = id(10);
+        fragment += grant_fragment(grant, scope, "member", bob, alice, at(4)).unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&grant) @ grant_relation: "admin" };
+        let error = load_catalog(fragment.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("2 values for grant_relation"));
+    }
+
+    #[test]
+    fn retractions_are_a_set_not_a_scalar_conflict() {
+        let (mut fragment, alice, bob, scope) = fixture();
+        let grant = id(10);
+        fragment += grant_fragment(grant, scope, "member", bob, alice, at(4)).unwrap();
+        fragment += retraction_fragment([grant], at(5)).unwrap();
+        fragment += retraction_fragment([grant], at(6)).unwrap();
+        let catalog = load_catalog(fragment.facts()).unwrap();
+        assert_eq!(catalog.grants[&grant].retracted_at.len(), 2);
+        assert!(!catalog.grant_is_live(grant));
+    }
+
+    #[test]
+    fn scope_identity_is_intrinsic_and_creator_bound() {
+        let first = scope_fragment(id(1), "prod", at(1)).unwrap();
+        let same = scope_fragment(id(1), "prod", at(1)).unwrap();
+        let other = scope_fragment(id(2), "prod", at(1)).unwrap();
+        assert_eq!(first.root(), same.root());
+        assert_ne!(first.root(), other.root());
+    }
+
+    #[test]
+    fn repeated_intrinsic_scope_creation_is_a_set_of_observations() {
+        let (mut fragment, alice, _bob, scope) = fixture();
+        fragment += scope_fragment(alice, "prod", at(9)).unwrap();
+        let catalog = load_catalog(fragment.facts()).unwrap();
+        assert_eq!(
+            catalog.scopes[&scope].created_at,
+            BTreeSet::from([at(3), at(9)])
+        );
+    }
+
+    #[test]
+    fn legacy_intrinsic_scope_epoch_is_admitted_and_reused_logically() {
+        let (mut fragment, alice, _bob, _current_scope) = fixture();
+        let mut legacy_scope = Fragment::empty();
+        let name = legacy_scope.put("legacy-prod".to_owned());
+        let (current, legacy) = scope_identity_epochs(alice, name);
+        assert_ne!(current, legacy);
+        legacy_scope += scope_record_at(legacy, alice, name, &BTreeSet::from([at(8)]));
+        fragment += legacy_scope;
+
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("secrets.pile");
+        let mut collection = test_collection(&pile);
+        collection.commit(fragment).unwrap();
+        let view = test_view(&mut collection);
+        let catalog = validate_catalog(&view.reader, &view.facts).unwrap();
+        assert_eq!(
+            scope_by_creator_and_name(&view.reader, &catalog, alice, "legacy-prod").unwrap(),
+            Some(legacy)
+        );
+        collection.into_storage().close().unwrap();
+    }
+
+    #[test]
+    fn latest_timestamp_tie_is_visible_not_arbitrated() {
+        let (mut fragment, alice, _bob, scope) = fixture();
+        for (secret, wrap) in [(id(20), id(30)), (id(21), id(31))] {
+            let mut record = Fragment::empty();
+            let name = record.put("db".to_owned());
+            let body = record.put::<blobencodings::RawBytes, _>(vec![0; SECRET_BODY_MIN_BYTES]);
+            record += secret_record(secret, at(9), scope, "db", name, body);
+            let sealed = record.put::<blobencodings::RawBytes, _>(vec![0; SEALED_DEK_BYTES]);
+            record += wrap_record(wrap, at(9), secret, alice, sealed);
+            fragment += record;
         }
-        let alice_kp =
-            box_keypair_from_ed25519(&alice.secret_key.to_vec(), &alice.public_key.to_vec())
-                .unwrap();
-        let dek_bytes = DryocBox::from_sealed_bytes(&wraps[0])
-            .unwrap()
-            .unseal_to_vec(&alice_kp)
-            .unwrap();
-        let dek2 = Key::try_from(&dek_bytes[..]).unwrap();
-        let opened = DryocSecretBox::from_bytes(&body)
-            .unwrap()
-            .decrypt_to_vec(&nonce, &dek2)
-            .unwrap();
-        assert_eq!(opened.as_slice(), secret);
+        let catalog = load_catalog(fragment.facts()).unwrap();
+        assert!(catalog.latest_secret(scope, "db").is_err());
+    }
 
-        // carol (not a recipient) cannot open alice's wrap
-        let carol_kp =
-            box_keypair_from_ed25519(&carol.secret_key.to_vec(), &carol.public_key.to_vec())
-                .unwrap();
-        assert!(DryocBox::from_sealed_bytes(&wraps[0])
-            .unwrap()
-            .unseal_to_vec(&carol_kp)
-            .is_err());
+    #[test]
+    fn nested_scope_membership_reaches_identity_leaves() {
+        let (mut fragment, alice, bob, root) = fixture();
+        let group = scope_fragment(bob, "group", at(4)).unwrap();
+        let group_id = group.root().unwrap();
+        fragment += group;
+        fragment += grant_fragment(id(10), root, "member", group_id, alice, at(5)).unwrap();
+        fragment += grant_fragment(id(11), group_id, "member", bob, bob, at(6)).unwrap();
+
+        let catalog = load_catalog(fragment.facts()).unwrap();
+        assert_eq!(catalog.recipients_of(root), vec![alice, bob]);
+    }
+
+    #[test]
+    fn orphan_references_are_rejected_before_publication() {
+        let (mut fragment, alice, bob, _scope) = fixture();
+        fragment += grant_fragment(id(10), id(99), "member", bob, alice, at(4)).unwrap();
+        let error = load_catalog(fragment.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("refers to missing scope"));
+    }
+
+    #[test]
+    fn staged_attachments_validate_and_roundtrip_one_signed_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("secrets.pile");
+        let mut collection = test_collection(&pile);
+
+        let before = test_view(&mut collection);
+        let (fragment, alice, _bob, scope) = fixture();
+        let candidate = validate_candidate(&before.reader, &before.facts, &fragment).unwrap();
+        assert_eq!(candidate.scope_creator(scope), Some(alice));
+
+        collection.commit(fragment).unwrap();
+        let after = test_view(&mut collection);
+        let catalog = validate_catalog(&after.reader, &after.facts).unwrap();
+        assert_eq!(catalog.scope_creator(scope), Some(alice));
+        let records = discover_collection_records(collection.storage_mut()).unwrap();
+        assert_eq!(records.commits().len(), 1);
+        collection.into_storage().close().unwrap();
     }
 }

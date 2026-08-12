@@ -7,34 +7,26 @@
 //! Drafts show a DRAFT badge in the header.
 //!
 //! Threading via `in_reply_to` / `references` is rendered as a small
-//! "RE" badge when the message has any parent reference; a full
-//! tree-of-replies view is a follow-on.
+//! "RE" badge and, when one parent wire resolves to exactly one visible
+//! projection, as a nested reply. Ambiguous parents stay unnested and visible.
 //!
 //! ```ignore
 //! let mut panel = MailViewer::default();
-//! panel.render(ctx, mail_ws, Some(relations_ws));
+//! panel.render(ctx, mail_view, Some(relations_view));
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::pile::PileReader;
 use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 
-use crate::schemas::mail::{mail as mail_attrs, KIND_DRAFT, KIND_MESSAGE, KIND_SPAM};
-use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
-
-type TextHandle = Inline<Handle<LongString>>;
+use crate::mail::{self, ProjectionDirection};
+use crate::relations::{self, ProfileInput, ProfileView};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 // ── Color palette ────────────────────────────────────────────────────
 
@@ -78,22 +70,22 @@ fn person_color(id: Id) -> egui::Color32 {
 #[derive(Clone, Debug)]
 struct MailRow {
     id: Id,
-    from: Option<Id>,
-    to: Vec<Id>,
-    cc: Vec<Id>,
+    wire: Option<Id>,
+    from: Option<String>,
+    to: Vec<String>,
+    cc: Vec<String>,
     subject: String,
     body: String,
     sent_at: Option<i128>,
     attachments: usize,
     is_draft: bool,
     is_spam: bool,
-    /// Immediate parent entity id, if that parent is also a mail in
-    /// pile. Chosen from `in_reply_to` first, falling back to the last
-    /// `references` entry (RFC 5322 convention: References lists the
-    /// thread ancestry in order, with the immediate parent last).
-    /// Mails whose declared parent isn't in the pile are treated as
-    /// thread roots.
+    /// Exact projection/draft row used for visual nesting when the canonical
+    /// parent wire resolves to one and only one in-pile row.
     parent_in_pile: Option<Id>,
+    /// Wire identities named by the canonical projection. Multiple possible
+    /// in-pile parents remain diagnostic rather than becoming a chosen edge.
+    parent_candidates: Vec<Id>,
     /// True when the message has any `in_reply_to` or `references`
     /// link at all — used for the `RE` badge even when the parent
     /// isn't itself in the pile.
@@ -112,297 +104,184 @@ impl MailRow {
 }
 
 /// Friendly display info for an address.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct Person {
-    alias: Option<String>,
-    first_name: Option<String>,
-    last_name: Option<String>,
-    display_name: Option<String>,
-    email: Option<String>,
+    id: Id,
+    display: String,
 }
 
 impl Person {
-    fn display(&self, id: Id) -> String {
-        if let Some(a) = self.alias.as_ref() {
-            if !a.is_empty() {
-                return a.clone();
-            }
-        }
-        match (self.first_name.as_ref(), self.last_name.as_ref()) {
-            (Some(f), Some(l)) if !f.is_empty() && !l.is_empty() => {
-                return format!("{f} {l}");
-            }
-            (Some(f), _) if !f.is_empty() => return f.clone(),
-            (_, Some(l)) if !l.is_empty() => return l.clone(),
-            _ => {}
-        }
-        if let Some(d) = self.display_name.as_ref() {
-            if !d.is_empty() {
-                return d.clone();
-            }
-        }
-        if let Some(e) = self.email.as_ref() {
-            if !e.is_empty() {
-                return e.clone();
-            }
-        }
-        id_hex(id)
+    fn from_profile(id: Id, profile: &ProfileInput) -> Self {
+        let display = profile
+            .display_name
+            .clone()
+            .or_else(|| match (&profile.first_name, &profile.last_name) {
+                (Some(first), Some(last)) => Some(format!("{first} {last}")),
+                (Some(first), None) => Some(first.clone()),
+                (None, Some(last)) => Some(last.clone()),
+                (None, None) => None,
+            })
+            .unwrap_or_else(|| profile.label.clone());
+        Self { id, display }
     }
-}
-
-fn id_hex(id: Id) -> String {
-    format!("{id:x}")
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 struct MailLive {
-    cached_head: Option<CommitHandle>,
-    relations_cached_head: Option<CommitHandle>,
-    people: HashMap<Id, Person>,
+    cached_revision: DatasetRevision,
+    relations_cached_revision: Option<DatasetRevision>,
+    people: HashMap<String, Person>,
     mails: Vec<MailRow>,
+    diagnostics: Vec<String>,
 }
 
 impl MailLive {
-    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[mail] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-
-        let (relations_cached_head, people) = match relations_ws {
-            Some(rws) => {
-                let head = rws.head();
-                let rspace = rws
-                    .checkout(..)
-                    .map(|co| co.into_facts())
-                    .unwrap_or_else(|e| {
-                        eprintln!("[mail] relations checkout: {e:?}");
-                        TribleSet::new()
-                    });
-                (head, build_people(&rspace, rws))
+    fn refresh(view: DatasetView<'_>, relations: Option<DatasetView<'_>>) -> Self {
+        let (relations_cached_revision, people, mut diagnostics) = match relations {
+            Some(relations) => {
+                let (people, diagnostics) = build_people(relations.facts, relations.reader);
+                (Some(relations.revision), people, diagnostics)
             }
-            None => (None, HashMap::new()),
+            None => (None, HashMap::new(), Vec::new()),
         };
 
-        let mails = collect_mails(ws, &space);
+        let (mails, mail_diagnostics) = collect_mails(view.reader, view.facts);
+        diagnostics.extend(mail_diagnostics);
 
         MailLive {
-            cached_head,
-            relations_cached_head,
+            cached_revision: view.revision,
+            relations_cached_revision,
             people,
             mails,
+            diagnostics,
         }
     }
 
-    fn display(&self, id: Id) -> String {
+    fn display(&self, address: &str) -> String {
         self.people
-            .get(&id)
-            .map(|p| p.display(id))
-            .unwrap_or_else(|| id_hex(id))
+            .get(&mailbox_key(address))
+            .map(|person| person.display.clone())
+            .unwrap_or_else(|| address.to_owned())
+    }
+
+    fn color(&self, address: &str) -> egui::Color32 {
+        self.people
+            .get(&mailbox_key(address))
+            .map(|person| person_color(person.id))
+            .unwrap_or_else(|| colorhash::ral_categorical(mailbox_key(address).as_bytes()))
     }
 }
 
-fn collect_mails(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<MailRow> {
-    // All KIND_MESSAGE ids.
-    let mut by_id: HashMap<Id, MailRow> = HashMap::new();
-    for (id,) in find!(
-        (m: Id,),
-        pattern!(space, [{ ?m @ metadata::tag: KIND_MESSAGE }])
-    ) {
-        by_id.insert(
-            id,
-            MailRow {
-                id,
-                from: None,
-                to: Vec::new(),
-                cc: Vec::new(),
-                subject: String::new(),
-                body: String::new(),
-                sent_at: None,
-                attachments: 0,
-                is_draft: false,
-                is_spam: false,
-                parent_in_pile: None,
-                has_parent_reference: false,
-            },
-        );
-    }
-
-    // Draft / spam status — same id may carry both KIND_DRAFT (was a
-    // draft) and KIND_MESSAGE (now sent), per schema docs.
-    for (id,) in find!(
-        (m: Id,),
-        pattern!(space, [{ ?m @ metadata::tag: KIND_DRAFT }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.is_draft = true;
-        } else {
-            // A pure draft (never sent) has KIND_DRAFT but no
-            // KIND_MESSAGE. Surface those too.
-            by_id.insert(
-                id,
-                MailRow {
-                    id,
-                    from: None,
-                    to: Vec::new(),
-                    cc: Vec::new(),
-                    subject: String::new(),
-                    body: String::new(),
-                    sent_at: None,
-                    attachments: 0,
-                    is_draft: true,
-                    is_spam: false,
-                    parent_in_pile: None,
-                    has_parent_reference: false,
-                },
-            );
+fn collect_mails(reader: &PileReader, space: &TribleSet) -> (Vec<MailRow>, Vec<String>) {
+    let mut mails = Vec::new();
+    let mut diagnostics = Vec::new();
+    for id in mail::projection_ids(space) {
+        match projection_row(reader, space, id) {
+            Ok(row) => mails.push(row),
+            Err(error) => diagnostics.push(format!("Mail projection {id:x} is invalid: {error:#}")),
         }
     }
-    for (id,) in find!(
-        (m: Id,),
-        pattern!(space, [{ ?m @ metadata::tag: KIND_SPAM }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.is_spam = true;
+    for id in mail::draft_ids(space) {
+        match draft_row(reader, space, id) {
+            Ok(row) => mails.push(row),
+            Err(error) => diagnostics.push(format!("Mail draft {id:x} is invalid: {error:#}")),
         }
     }
-
-    // From.
-    for (id, from) in find!(
-        (m: Id, f: Id),
-        pattern!(space, [{ ?m @ mail_attrs::from: ?f }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.from = Some(from);
-        }
-    }
-
-    // Recipients (TO / CC). Each is repeated, hence the per-row Vec.
-    for (id, to) in find!(
-        (m: Id, t: Id),
-        pattern!(space, [{ ?m @ mail_attrs::to: ?t }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.to.push(to);
-        }
-    }
-    for (id, cc) in find!(
-        (m: Id, c: Id),
-        pattern!(space, [{ ?m @ mail_attrs::cc: ?c }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.cc.push(cc);
-        }
-    }
-
-    // Subject / body — Handle<LongString>, resolved via `ws.get`.
-    let subject_rows: Vec<(Id, TextHandle)> = find!(
-        (m: Id, h: TextHandle),
-        pattern!(space, [{ ?m @ mail_attrs::subject: ?h }])
-    )
-    .collect();
-    for (id, h) in subject_rows {
-        if let Some(row) = by_id.get_mut(&id) {
-            if let Some(text) = read_text(ws, h) {
-                row.subject = text;
-            }
-        }
-    }
-    let body_rows: Vec<(Id, TextHandle)> = find!(
-        (m: Id, h: TextHandle),
-        pattern!(space, [{ ?m @ mail_attrs::body: ?h }])
-    )
-    .collect();
-    for (id, h) in body_rows {
-        if let Some(row) = by_id.get_mut(&id) {
-            if let Some(text) = read_text(ws, h) {
-                row.body = text;
-            }
-        }
-    }
-
-    // Sent-at — interval, take start ns.
-    for (id, ts) in find!(
-        (m: Id, ts: (i128, i128)),
-        pattern!(space, [{ ?m @ mail_attrs::sent_at: ?ts }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.sent_at = Some(ts.0);
-        }
-    }
-
-    // Attachments — repeated GenIds, just count for now.
-    for (id, _att) in find!(
-        (m: Id, a: Id),
-        pattern!(space, [{ ?m @ mail_attrs::attachment: ?a }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.attachments += 1;
-        }
-    }
-
-    // Thread parentage. The schema lets a mail carry multiple
-    // `in_reply_to` GenIds (RFC 5322 allows multiple parents — rare,
-    // but happens on merged threads) and an ordered `references`
-    // chain. We pick `in_reply_to` first; if that parent isn't in
-    // pile, fall back to the most recent `references` entry that
-    // IS in pile. Mails whose declared parents are all out-of-pile
-    // are treated as roots.
-    let mut in_reply_to_pairs: HashMap<Id, Vec<Id>> = HashMap::new();
-    for (id, parent) in find!(
-        (m: Id, p: Id),
-        pattern!(space, [{ ?m @ mail_attrs::in_reply_to: ?p }])
-    ) {
-        in_reply_to_pairs.entry(id).or_default().push(parent);
-        if let Some(row) = by_id.get_mut(&id) {
-            row.has_parent_reference = true;
-        }
-    }
-    let mut references_pairs: HashMap<Id, Vec<Id>> = HashMap::new();
-    for (id, parent) in find!(
-        (m: Id, p: Id),
-        pattern!(space, [{ ?m @ mail_attrs::references: ?p }])
-    ) {
-        references_pairs.entry(id).or_default().push(parent);
-        if let Some(row) = by_id.get_mut(&id) {
-            row.has_parent_reference = true;
-        }
-    }
-    let known_ids: std::collections::HashSet<Id> = by_id.keys().copied().collect();
-    for (id, parents) in in_reply_to_pairs.iter() {
-        if let Some(parent) = parents.iter().copied().find(|p| known_ids.contains(p)) {
-            if let Some(row) = by_id.get_mut(id) {
-                row.parent_in_pile = Some(parent);
-            }
-        }
-    }
-    // If in_reply_to didn't give an in-pile parent, scan references
-    // backwards (last entry is the immediate parent per the RFC).
-    for (id, parents) in references_pairs.iter() {
-        if let Some(row) = by_id.get_mut(id) {
-            if row.parent_in_pile.is_some() {
-                continue;
-            }
-            if let Some(parent) = parents
-                .iter()
-                .rev()
-                .copied()
-                .find(|p| known_ids.contains(p))
-            {
-                row.parent_in_pile = Some(parent);
-            }
-        }
-    }
-
-    let mut mails: Vec<MailRow> = by_id.into_values().collect();
-    // Newest first; missing dates (MIN key) sink to the bottom.
+    resolve_thread_parents(&mut mails, &mut diagnostics);
     mails.sort_by_key(|m| std::cmp::Reverse(m.sort_key()));
-    mails
+    (mails, diagnostics)
+}
+
+fn projection_row(reader: &PileReader, space: &TribleSet, id: Id) -> anyhow::Result<MailRow> {
+    let projection = mail::projection_view(reader, space, id)?;
+    let direction = mail::projection_direction(space, projection.source)?;
+    let parent_candidates = if projection.in_reply_to.is_empty() {
+        projection.references.clone()
+    } else {
+        projection.in_reply_to.clone()
+    };
+    Ok(MailRow {
+        id,
+        wire: Some(projection.wire),
+        from: projection.from,
+        to: projection.to,
+        cc: projection.cc,
+        subject: projection.subject,
+        body: projection.body,
+        sent_at: projection.claimed_date.map(interval_ns).transpose()?,
+        attachments: projection.attachments.len(),
+        is_draft: direction == ProjectionDirection::Draft,
+        is_spam: projection.spam,
+        parent_in_pile: None,
+        has_parent_reference: !parent_candidates.is_empty(),
+        parent_candidates,
+    })
+}
+
+fn draft_row(reader: &PileReader, space: &TribleSet, id: Id) -> anyhow::Result<MailRow> {
+    let draft = mail::draft_value(space, id)?;
+    let read_all = |handles: &[mail::TextHandle]| -> anyhow::Result<Vec<String>> {
+        handles
+            .iter()
+            .map(|&handle| mail::read_text(reader, handle))
+            .collect()
+    };
+    let parent_candidates = if draft.in_reply_to.is_empty() {
+        draft.references.clone()
+    } else {
+        draft.in_reply_to.clone()
+    };
+    Ok(MailRow {
+        id,
+        wire: None,
+        from: Some(mail::read_text(reader, draft.envelope_from)?),
+        to: read_all(&draft.to)?,
+        cc: read_all(&draft.cc)?,
+        subject: mail::read_text(reader, draft.subject)?,
+        body: mail::read_text(reader, draft.body)?,
+        sent_at: Some(interval_ns(draft.created_at)?),
+        attachments: draft.attachments.len(),
+        is_draft: true,
+        is_spam: false,
+        parent_in_pile: None,
+        has_parent_reference: !parent_candidates.is_empty(),
+        parent_candidates,
+    })
+}
+
+fn interval_ns(value: mail::IntervalValue) -> anyhow::Result<i128> {
+    let (lower, _upper): (i128, i128) = value
+        .try_from_inline()
+        .map_err(|error| anyhow::anyhow!("decode Mail timestamp: {error:?}"))?;
+    Ok(lower)
+}
+
+fn resolve_thread_parents(mails: &mut [MailRow], diagnostics: &mut Vec<String>) {
+    let mut rows_by_wire = BTreeMap::<Id, Vec<usize>>::new();
+    for (index, row) in mails.iter().enumerate() {
+        if let Some(wire) = row.wire {
+            rows_by_wire.entry(wire).or_default().push(index);
+        }
+    }
+    for index in 0..mails.len() {
+        let candidates = mails[index]
+            .parent_candidates
+            .iter()
+            .filter_map(|wire| rows_by_wire.get(wire).map(|rows| (*wire, rows)))
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [] => {}
+            [(_wire, rows)] if rows.len() == 1 => {
+                mails[index].parent_in_pile = Some(mails[rows[0]].id);
+            }
+            _ => diagnostics.push(format!(
+                "Mail projection {} has {} possible in-pile parent projections; thread nesting was left unresolved",
+                mails[index].id,
+                candidates.iter().map(|(_, rows)| rows.len()).sum::<usize>()
+            )),
+        }
+    }
 }
 
 /// Flatten the mail forest into DFS order with depth per row.
@@ -431,7 +310,11 @@ fn flatten_threaded(mails: &[MailRow]) -> Vec<(usize, &MailRow)> {
 
     let mut out: Vec<(usize, &MailRow)> = Vec::with_capacity(mails.len());
     let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&i| (i, 0usize)).collect();
+    let mut visited = HashSet::new();
     while let Some((idx, depth)) = stack.pop() {
+        if !visited.insert(idx) {
+            continue;
+        }
         out.push((depth, &mails[idx]));
         if let Some(kids) = children.get(&mails[idx].id) {
             let child_depth = (depth + 1).min(MAX_DEPTH);
@@ -440,81 +323,73 @@ fn flatten_threaded(mails: &[MailRow]) -> Vec<(usize, &MailRow)> {
             }
         }
     }
+    // Malformed or cyclic source thread claims must not make messages vanish.
+    // Surface every remaining row at root depth; the canonical projection
+    // remains visible even when nesting cannot be represented as a forest.
+    for idx in 0..mails.len() {
+        if visited.insert(idx) {
+            out.push((0, &mails[idx]));
+        }
+    }
     out
 }
 
-fn build_people(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, Person> {
-    let person_ids: Vec<Id> = find!(
-        (pid: Id,),
-        pattern!(rspace, [{ ?pid @ metadata::tag: KIND_PERSON_ID }])
-    )
-    .map(|(pid,)| pid)
-    .collect();
-
-    let mut people: HashMap<Id, Person> = person_ids
-        .into_iter()
-        .map(|pid| (pid, Person::default()))
-        .collect();
-
-    let alias_rows: Vec<(Id, String)> = find!(
-        (pid: Id, alias: String),
-        pattern!(rspace, [{ ?pid @ rel::alias: ?alias }])
-    )
-    .collect();
-    for (pid, alias) in alias_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.alias = Some(alias);
-        }
-    }
-    let first_rows: Vec<(Id, TextHandle)> = find!(
-        (pid: Id, h: TextHandle),
-        pattern!(rspace, [{ ?pid @ rel::first_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in first_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.first_name = read_text(rws, h);
-        }
-    }
-    let last_rows: Vec<(Id, TextHandle)> = find!(
-        (pid: Id, h: TextHandle),
-        pattern!(rspace, [{ ?pid @ rel::last_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in last_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.last_name = read_text(rws, h);
-        }
-    }
-    let display_rows: Vec<(Id, TextHandle)> = find!(
-        (pid: Id, h: TextHandle),
-        pattern!(rspace, [{ ?pid @ rel::display_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in display_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.display_name = read_text(rws, h);
-        }
-    }
-    let email_rows: Vec<(Id, String)> = find!(
-        (pid: Id, e: String),
-        pattern!(rspace, [{ ?pid @ rel::email: ?e }])
-    )
-    .collect();
-    for (pid, e) in email_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.email = Some(e);
+fn build_people(rspace: &TribleSet, reader: &PileReader) -> (HashMap<String, Person>, Vec<String>) {
+    let mut candidates = BTreeMap::<String, Vec<Person>>::new();
+    let mut diagnostics = Vec::new();
+    for (person, view) in relations::person_profile_views(reader, rspace) {
+        match view {
+            ProfileView::Current { value, .. } => {
+                let display = Person::from_profile(person, &value);
+                for email in &value.emails {
+                    candidates
+                        .entry(mailbox_key(email))
+                        .or_default()
+                        .push(display.clone());
+                }
+            }
+            ProfileView::Forked(heads) => diagnostics.push(format!(
+                "Relations person {person:x} has {} profile heads; Mail address labels remain unresolved",
+                heads.len()
+            )),
+            ProfileView::Invalid(error) => diagnostics.push(format!(
+                "Relations person {person:x} profile is invalid: {error}"
+            )),
         }
     }
 
-    people
+    let mut people = HashMap::new();
+    for (email, mut values) in candidates {
+        values.sort_by_key(|person| person.id);
+        values.dedup_by_key(|person| person.id);
+        if values.len() == 1 {
+            people.insert(email, values.pop().expect("one person"));
+        } else {
+            diagnostics.push(format!(
+                "Mail address {email} belongs to {} Relations anchors; no display identity was selected",
+                values.len()
+            ));
+        }
+    }
+    (people, diagnostics)
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn mailbox_key(value: &str) -> String {
+    let value = value.trim();
+    let address = value
+        .rfind('<')
+        .and_then(|start| {
+            value[start + 1..]
+                .find('>')
+                .map(|end| &value[start + 1..start + 1 + end])
+        })
+        .unwrap_or(value)
+        .trim();
+    let address = address.to_ascii_lowercase();
+    address
+        .strip_prefix("mailto:")
+        .unwrap_or(&address)
+        .to_owned()
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -548,20 +423,19 @@ impl MailViewer {
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-        mut relations_ws: Option<&mut Workspace<Pile>>,
+        view: DatasetView<'_>,
+        relations: Option<DatasetView<'_>>,
     ) {
-        let head = ws.head();
-        let rhead = relations_ws.as_ref().and_then(|w| w.head());
+        let revision = view.revision;
+        let relations_revision = relations.map(|view| view.revision);
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head || l.relations_cached_head != rhead,
+            Some(l) => {
+                l.cached_revision != revision || l.relations_cached_revision != relations_revision
+            }
         };
         if need_refresh {
-            self.live = Some(MailLive::refresh(
-                ws,
-                relations_ws.as_mut().map(|w| &mut **w),
-            ));
+            self.live = Some(MailLive::refresh(view, relations));
         }
 
         ctx.section("Mail", |ctx| {
@@ -584,6 +458,9 @@ impl MailViewer {
             let search_active = !needle.is_empty();
 
             ctx.grid(|g| {
+                for diagnostic in &live.diagnostics {
+                    g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
+                }
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
                     ui.horizontal(|ui| {
@@ -692,13 +569,13 @@ fn mail_matches_search(mail: &MailRow, live: &MailLive, needle: &str) -> bool {
     if mail.body.to_lowercase().contains(needle) {
         return true;
     }
-    if let Some(from) = mail.from {
+    if let Some(from) = &mail.from {
         if live.display(from).to_lowercase().contains(needle) {
             return true;
         }
     }
-    for id in mail.to.iter().chain(mail.cc.iter()) {
-        if live.display(*id).to_lowercase().contains(needle) {
+    for address in mail.to.iter().chain(mail.cc.iter()) {
+        if live.display(address).to_lowercase().contains(needle) {
             return true;
         }
     }
@@ -721,15 +598,12 @@ fn render_mail(
     let bubble_fill = ui.visuals().window_fill;
     let from_color = mail
         .from
-        .map(person_color)
+        .as_deref()
+        .map(|address| live.color(address))
         .unwrap_or_else(|| color_muted(ui));
-    let primary_recipient = mail
-        .to
-        .first()
-        .copied()
-        .or_else(|| mail.cc.first().copied());
+    let primary_recipient = mail.to.first().or_else(|| mail.cc.first());
     let to_color = primary_recipient
-        .map(person_color)
+        .map(|address| live.color(address))
         .unwrap_or_else(|| color_muted(ui));
 
     let inner_margin = egui::Margin {
@@ -825,13 +699,29 @@ fn render_mail(
                     body_format(ui, ui.visuals().text_color()),
                     focused,
                 );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {}",
+                        if mail.wire.is_some() {
+                            "projection"
+                        } else {
+                            "draft"
+                        },
+                        format_args!("{:x}", mail.id)
+                    ))
+                    .monospace()
+                    .small()
+                    .color(color_muted(ui)),
+                );
             });
 
         // Left / right stripes — sender + first recipient, compass idiom.
         let outer = frame_resp.response.rect;
         let from_label = mail
             .from
-            .map(|id| live.display(id))
+            .as_deref()
+            .map(|address| live.display(address))
             .unwrap_or_else(|| "(no sender)".into());
         paint_party_stripe(
             ui.painter(),
@@ -841,7 +731,7 @@ fn render_mail(
             &from_label.to_uppercase(),
         );
         let to_label = primary_recipient
-            .map(|id| live.display(id))
+            .map(|address| live.display(address))
             .unwrap_or_else(|| "(no recipient)".into());
         paint_party_stripe(
             ui.painter(),
@@ -867,6 +757,22 @@ fn render_badge(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
                     .strong()
                     .color(text),
             );
+        });
+}
+
+fn render_diagnostic(ui: &mut egui::Ui, diagnostic: &str) {
+    egui::Frame::NONE
+        .fill(color_frame(ui))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("MAIL PROJECTION DIAGNOSTIC")
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color_spam()),
+            );
+            ui.label(egui::RichText::new(diagnostic).monospace().small());
         });
 }
 
@@ -970,4 +876,61 @@ fn now_tai_ns() -> i128 {
     use hifitime::Epoch;
     let now = Epoch::now().unwrap_or_else(|_| Epoch::from_tai_seconds(0.0));
     now.to_tai_duration().total_nanoseconds()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn row(id_byte: u8, wire: Option<Id>, parents: Vec<Id>) -> MailRow {
+        MailRow {
+            id: id(id_byte),
+            wire,
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            subject: String::new(),
+            body: String::new(),
+            sent_at: None,
+            attachments: 0,
+            is_draft: false,
+            is_spam: false,
+            parent_in_pile: None,
+            has_parent_reference: !parents.is_empty(),
+            parent_candidates: parents,
+        }
+    }
+
+    #[test]
+    fn address_lookup_normalizes_display_mailboxes_without_guessing_names() {
+        assert_eq!(
+            mailbox_key("Alice Example <Alice@Example.TEST>"),
+            "alice@example.test"
+        );
+        assert_eq!(mailbox_key("MAILTO:Me@Example.TEST"), "me@example.test");
+    }
+
+    #[test]
+    fn ambiguous_parent_projection_is_diagnostic_not_arbitrated() {
+        let wire = id(9);
+        let mut rows = vec![
+            row(1, Some(wire), Vec::new()),
+            row(2, Some(wire), Vec::new()),
+            row(3, None, vec![wire]),
+        ];
+        let mut diagnostics = Vec::new();
+        resolve_thread_parents(&mut rows, &mut diagnostics);
+        assert_eq!(rows[2].parent_in_pile, None);
+        assert_eq!(diagnostics.len(), 1);
+
+        let mut unique = vec![row(1, Some(wire), Vec::new()), row(3, None, vec![wire])];
+        diagnostics.clear();
+        resolve_thread_parents(&mut unique, &mut diagnostics);
+        assert_eq!(unique[1].parent_in_pile, Some(unique[0].id));
+        assert!(diagnostics.is_empty());
+    }
 }

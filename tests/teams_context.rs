@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,6 +9,7 @@ static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 struct TestPile {
     dir: PathBuf,
     path: PathBuf,
+    key: PathBuf,
 }
 
 impl TestPile {
@@ -24,8 +25,10 @@ impl TestPile {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.pile");
+        let key = dir.join("test.key");
         fs::File::create(&path).unwrap();
-        Self { dir, path }
+        faculties::collection_cutover::initialize_signer(&path, Some(&key)).unwrap();
+        Self { dir, path, key }
     }
 }
 
@@ -35,10 +38,15 @@ impl Drop for TestPile {
     }
 }
 
-fn run(pile: &Path, args: &[&str]) -> Output {
+fn run(pile: &TestPile, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_teams"))
+        .env_remove("TEAMS_CLIENT_SECRET")
         .arg("--pile")
-        .arg(pile)
+        .arg(&pile.path)
+        .arg("--key")
+        .arg(&pile.key)
+        .arg("--tenant")
+        .arg("tenant.example")
         .args(args)
         .output()
         .unwrap()
@@ -61,29 +69,29 @@ fn context_roundtrips_and_auth_status_stays_credential_safe() {
     let pile = TestPile::new();
     let boundary = "Work-only context; keep private conversation out of workplace communication.";
     let (set_stdout, _) = success(run(
-        &pile.path,
+        &pile,
         &["context", "set", "Bulti", "--boundary", boundary],
     ));
     assert!(set_stdout.contains("present_as: Bulti"));
     assert!(set_stdout.contains(boundary));
 
-    let (show_stdout, _) = success(run(&pile.path, &["context", "show"]));
+    let (show_stdout, _) = success(run(&pile, &["context", "show"]));
     assert!(show_stdout.contains("present_as: Bulti"));
     assert!(show_stdout.contains("context: professional/work-only"));
     assert!(show_stdout.contains(boundary));
 
-    let (status_stdout, status_stderr) = success(run(&pile.path, &["auth", "status"]));
+    let (status_stdout, status_stderr) = success(run(&pile, &["auth", "status"]));
     assert!(status_stderr.contains("PRESENT AS Bulti"));
     assert!(status_stderr.contains(boundary));
-    assert!(status_stdout.contains("tenant: (unset)"));
-    assert!(status_stdout.contains("app_client_secret: not configured"));
+    assert!(status_stdout.contains("tenant: tenant.example"));
+    assert!(status_stdout.contains("auth_profile: (unset)"));
 }
 
 #[test]
 fn outward_mutation_identity_gate_runs_before_auth_or_network() {
     let pile = TestPile::new();
     success(run(
-        &pile.path,
+        &pile,
         &[
             "context",
             "set",
@@ -93,14 +101,14 @@ fn outward_mutation_identity_gate_runs_before_auth_or_network() {
         ],
     ));
 
-    let missing = run(&pile.path, &["send", "chat-id", "hello"]);
+    let missing = run(&pile, &["send", "chat-id", "hello"]);
     assert!(!missing.status.success());
     let missing_stderr = String::from_utf8_lossy(&missing.stderr);
     assert!(missing_stderr.contains("--as Bulti"));
     assert!(!missing_stderr.contains("token command"));
     assert!(!missing_stderr.contains("graph.microsoft.com"));
 
-    let mismatch = run(&pile.path, &["send", "--as", "Liora", "chat-id", "hello"]);
+    let mismatch = run(&pile, &["send", "--as", "OtherPersona", "chat-id", "hello"]);
     assert!(!mismatch.status.success());
     let mismatch_stderr = String::from_utf8_lossy(&mismatch.stderr);
     assert!(mismatch_stderr.contains("presentation mismatch"));
@@ -108,11 +116,18 @@ fn outward_mutation_identity_gate_runs_before_auth_or_network() {
     assert!(!mismatch_stderr.contains("graph.microsoft.com"));
 
     for args in [
-        vec!["presence", "set", "--as", "Liora", "Available"],
-        vec!["chat", "invite", "--as", "Liora", "chat-id", "user-id"],
-        vec!["chat", "create", "--as", "Liora", "user-id"],
+        vec!["presence", "set", "--as", "OtherPersona", "Available"],
+        vec![
+            "chat",
+            "invite",
+            "--as",
+            "OtherPersona",
+            "chat-id",
+            "user-id",
+        ],
+        vec!["chat", "create", "--as", "OtherPersona", "user-id"],
     ] {
-        let output = run(&pile.path, &args);
+        let output = run(&pile, &args);
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("presentation mismatch"), "stderr: {stderr}");
@@ -121,40 +136,45 @@ fn outward_mutation_identity_gate_runs_before_auth_or_network() {
 }
 
 #[test]
-fn irrelevant_token_files_are_not_resolved_before_the_identity_gate() {
+fn plaintext_oauth_sidecar_flags_are_not_cli_surface() {
     let pile = TestPile::new();
-    success(run(
-        &pile.path,
-        &[
-            "context",
-            "set",
-            "Bulti",
-            "--boundary",
-            "Work-only boundary",
-        ],
-    ));
+    for removed in ["--token", "--token-command", "--auth-file"] {
+        let rejected = run(
+            &pile,
+            &[
+                removed,
+                "@/definitely/missing/teams-oauth",
+                "auth",
+                "status",
+            ],
+        );
+        assert!(!rejected.status.success());
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(stderr.contains("unexpected argument"), "stderr: {stderr}");
+        assert!(!stderr.contains("read token from"));
+    }
+}
 
-    let missing_token = "@/definitely/missing/teams-token";
-    let (show_stdout, _) = success(run(
-        &pile.path,
-        &["--token", missing_token, "context", "show"],
-    ));
-    assert!(show_stdout.contains("present_as: Bulti"));
-
+#[test]
+fn literal_client_secret_is_rejected_without_echoing_it() {
+    let pile = TestPile::new();
     let rejected = run(
-        &pile.path,
+        &pile,
         &[
-            "--token",
-            missing_token,
-            "send",
-            "--as",
-            "Liora",
-            "chat-id",
-            "hello",
+            "login",
+            "--tenant",
+            "tenant.example",
+            "--client-id",
+            "client-id",
+            "--client-secret",
+            "do-not-echo-this-secret",
         ],
     );
     assert!(!rejected.status.success());
     let stderr = String::from_utf8_lossy(&rejected.stderr);
-    assert!(stderr.contains("presentation mismatch"));
-    assert!(!stderr.contains("read token from"));
+    assert!(
+        stderr.contains("accepts only @path or @-"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("do-not-echo-this-secret"));
 }

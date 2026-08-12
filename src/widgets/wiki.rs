@@ -1,29 +1,29 @@
 //! Full-featured GORBIE-embeddable wiki viewer.
 //!
-//! Renders wiki fragments from a triblespace pile. The widget holds only
-//! UI state plus cached query results; the host is responsible for
-//! pulling the wiki branch and borrowing the native Files collection view at
-//! render time:
+//! Renders the canonical Wiki revision collection from a triblespace pile. The widget holds only
+//! UI state plus cached query results; the host passes a wiki dataset
+//! (and optionally a files dataset) at render time:
 //!
 //! ```ignore
 //! let mut viewer = WikiViewer::default();
-//! // Inside a GORBIE card, with `wiki_ws` and optional native `files_view`:
-//! viewer.render(ctx, wiki_ws, files_view);
+//! // Inside a GORBIE card, with `wiki_view` and optional `files_view`:
+//! viewer.render(ctx, wiki_view, files_view);
 //! ```
 //!
 //! Features:
 //! - Search bar at the top
-//! - A force-directed graph of fragments + their `links_to` edges (GPU,
+//! - A force-directed graph of current entry-frontier revisions + links
+//!   derived from immutable content (GPU,
 //!   with optional FDEB edge bundling)
 //! - Floating wiki-page cards that open when the user clicks a node, a
 //!   `wiki:<hex>` link in typst content, or a file entry
-//! - Version navigation (prev/next/latest) on fragments with history
+//! - Fork-visible revision cards without inventing a scalar latest state
 //! - `files:` link handling — resolves the shared file selector language to a
-//!   file blob (against the optional native Files view),
+//!   file blob (against the optional files dataset),
 //!   writes it to `$TMPDIR/faculties-files/`, and opens it via the platform
 //!   `open` command.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use cubecl::prelude::*;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
@@ -31,279 +31,263 @@ use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStoreGet, CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
+use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
-use triblespace::prelude::View;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use crate::schemas::files::{file, KIND_FILE};
-use crate::schemas::wiki::{attrs as wiki, KIND_VERSION_ID, TAG_ARCHIVED_ID};
-use crate::widgets::storage::{FilesRevision, FilesView};
+use crate::schemas::wiki::{extract_link_targets, TAG_ARCHIVED_ID};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
+use crate::wiki::{EntryRecord, RevisionRecord, WikiCatalog};
 
 /// Handle to a long-string blob living in a pile.
 type TextHandle = Inline<Handle<LongString>>;
 
 /// Handle to a file-bytes blob living in a pile.
-type FileHandle = Inline<Handle<RawBytes>>;
+type FileHandle = crate::files::ContentHandle;
 
 /// Format an Id as a lowercase hex string.
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-/// Deterministic per-fragment color via GORBIE's colorhash palette.
-/// Gives each wiki fragment a stable identity color so the same
-/// fragment shows up consistently across open pages.
+fn resolved_file_name(resolved: &crate::files::ResolvedFile) -> String {
+    resolved
+        .unique_name()
+        .map(crate::files::leaf_name)
+        .unwrap_or_else(|| crate::files::content_hash_hex(resolved.content))
+}
+
+/// Deterministic per-entry color via GORBIE's colorhash palette.
+/// The caller passes the entry's canonical root-set representative strictly as
+/// a UI key; storage identity remains the complete root set.
 fn frag_color(id: Id) -> egui::Color32 {
     colorhash::ral_categorical(id.as_ref())
 }
 
 // ── cached wiki query state ──────────────────────────────────────────
 
-/// Cached fact spaces + head marker. Rebuilt when the wiki workspace's
-/// head advances past `cached_head` (i.e. we pushed something, or the
-/// host re-pulled after an external write).
+/// One visible revision head in a logical Wiki entry.
+///
+/// `entry_key` is only a deterministic UI/color key (a legacy fragment
+/// selector when present, otherwise the first root). The entry's real identity
+/// remains its complete component in the revision read model; no scalar anchor
+/// is smuggled back into storage semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VisibleHead {
+    entry_key: Id,
+    revision_id: Id,
+    archived: bool,
+    fork_width: usize,
+}
+
+/// Cached canonical Wiki projection + file facts and revision markers.
+/// Rebuilt when either input dataset changes.
 struct WikiLive {
-    wiki_space: TribleSet,
-    files_space: TribleSet,
-    cached_head: Option<CommitHandle>,
-    files_cached_revision: Option<FilesRevision>,
+    catalog: WikiCatalog,
+    files_catalog: Option<crate::files::FilesCatalog>,
+    cached_revision: DatasetRevision,
+    files_cached_revision: Option<DatasetRevision>,
 }
 
 impl WikiLive {
-    /// Refresh cached fact spaces from the provided workspaces. Pulls
-    /// fresh `TribleSet`s via `checkout(..)`.
-    fn refresh(wiki_ws: &mut Workspace<Pile>, files_view: Option<FilesView<'_>>) -> Self {
-        let wiki_space = wiki_ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[wiki] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = wiki_ws.head();
-
-        let (files_space, files_cached_revision) = match files_view {
-            Some(view) => (view.facts.clone(), Some(view.revision)),
-            None => (TribleSet::new(), None),
+    /// Refresh cached fact spaces from the provided immutable dataset views.
+    fn refresh(wiki: DatasetView<'_>, files: Option<DatasetView<'_>>) -> Result<Self, String> {
+        let (files_catalog, files_cached_revision) = match files {
+            Some(files) => {
+                let catalog = crate::files::load_catalog(files.reader, files.facts)
+                    .map_err(|error| format!("validate Files collection for Wiki: {error:#}"))?;
+                (Some(catalog), Some(files.revision))
+            }
+            None => (None, None),
         };
 
-        WikiLive {
-            wiki_space,
-            files_space,
-            cached_head,
+        Ok(WikiLive {
+            // Storage normally admits this exact snapshot first, but the
+            // widget remains a safe embedding boundary on its own: structural
+            // corruption and missing text blobs become visible diagnostics.
+            catalog: crate::wiki::validate_catalog(wiki.reader, wiki.facts)
+                .map_err(|error| format!("validate Wiki collection: {error:#}"))?,
+            files_catalog,
+            cached_revision: wiki.revision,
             files_cached_revision,
-        }
+        })
     }
 
-    fn text(&self, ws: &mut Workspace<Pile>, h: TextHandle) -> String {
-        ws.get::<View<str>, LongString>(h)
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
+    fn text(&self, reader: &PileReader, h: TextHandle) -> String {
+        crate::wiki::read_text(reader, h).unwrap_or_default()
+    }
+
+    // ── canonical revision/entry projection ──────────────────────────
+
+    fn entry_key(entry: &EntryRecord) -> Id {
+        *entry
+            .legacy_fragments
+            .first()
+            .or_else(|| entry.roots.first())
+            .expect("validated Wiki entries always have a selector")
+    }
+
+    fn revision(&self, revision: Id) -> Option<&RevisionRecord> {
+        self.catalog.revisions.revision(revision)
+    }
+
+    fn title(&self, wiki_reader: &PileReader, revision: Id) -> String {
+        self.revision(revision)
+            .map(|row| self.text(wiki_reader, row.title))
             .unwrap_or_default()
     }
 
-    fn file_text(&self, files_reader: Option<&PileReader>, h: TextHandle) -> String {
-        files_reader
-            .and_then(|reader| reader.get::<View<str>, LongString>(h).ok())
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
+    fn content(&self, wiki_reader: &PileReader, revision: Id) -> String {
+        self.revision(revision)
+            .map(|row| self.text(wiki_reader, row.content))
             .unwrap_or_default()
     }
 
-    // ── queries (all on-demand via find!) ─────────────────────────────
-
-    /// Resolve a hex prefix to a fragment ID. Matches both version and
-    /// fragment IDs. Returns None if no match or ambiguous.
-    fn resolve_prefix(&self, prefix: &str) -> Option<Id> {
-        let needle = prefix.trim().to_lowercase();
-        let mut matches = Vec::new();
-        let mut seen_frags = HashSet::new();
-        for (vid, frag) in find!(
-            (vid: Id, frag: Id),
-            pattern!(&self.wiki_space, [{
-                ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag
-            }])
-        ) {
-            if format!("{vid:x}").starts_with(&needle) {
-                matches.push(frag); // resolve version to its fragment
+    /// Complete frontiers of every entry which has at least one live head.
+    ///
+    /// An archived/live fork keeps both heads visible: hiding the archived
+    /// side would falsely present a resolved state. Entries whose complete
+    /// frontier is archived are absent from the default graph.
+    fn projected_heads(catalog: &WikiCatalog) -> Vec<VisibleHead> {
+        let mut heads = Vec::new();
+        for entry in catalog.revisions.list_entries() {
+            let entry_key = Self::entry_key(&entry);
+            let fork_width = entry.frontier.len();
+            for revision in entry.frontier {
+                heads.push(VisibleHead {
+                    entry_key,
+                    revision_id: revision.id,
+                    archived: revision.tags.contains(&TAG_ARCHIVED_ID),
+                    fork_width,
+                });
             }
-            if seen_frags.insert(frag) && format!("{frag:x}").starts_with(&needle) {
-                matches.push(frag);
-            }
         }
-        matches.sort();
-        matches.dedup();
-        if matches.len() == 1 {
-            Some(matches[0])
-        } else {
-            None
-        }
+        heads
     }
 
-    /// Resolve an ID that might be a version or a fragment to its fragment.
-    fn to_fragment(&self, id: Id) -> Option<Id> {
-        if self.latest_version(id).is_some() {
-            return Some(id);
-        }
-        find!(frag: Id, pattern!(&self.wiki_space, [{ id @ wiki::fragment: ?frag }])).next()
+    fn visible_heads(&self, wiki_reader: &PileReader) -> Vec<VisibleHead> {
+        let mut heads = Self::projected_heads(&self.catalog);
+        heads.sort_by(|left, right| {
+            self.title(wiki_reader, left.revision_id)
+                .to_lowercase()
+                .cmp(&self.title(wiki_reader, right.revision_id).to_lowercase())
+                .then_with(|| left.entry_key.cmp(&right.entry_key))
+                .then_with(|| left.revision_id.cmp(&right.revision_id))
+        });
+        heads
     }
 
-    /// All versions of a fragment, sorted newest-first.
-    fn version_history(&self, fragment_id: Id) -> Vec<Id> {
-        let mut versions: Vec<(Id, i128)> = find!(
-            (vid: Id, ts: (i128, i128)),
-            pattern!(&self.wiki_space, [{
-                ?vid @
-                metadata::tag: &KIND_VERSION_ID,
-                wiki::fragment: &fragment_id,
-                metadata::created_at: ?ts,
-            }])
-        )
-        .map(|(vid, ts)| (vid, ts.0))
-        .collect();
-        versions.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
-        versions.into_iter().map(|(vid, _)| vid).collect()
-    }
-
-    /// Find the latest version id for a given fragment id.
-    fn latest_version(&self, fragment_id: Id) -> Option<Id> {
-        find!(
-            (vid: Id, ts: (i128, i128)),
-            pattern!(&self.wiki_space, [{
-                ?vid @
-                metadata::tag: &KIND_VERSION_ID,
-                wiki::fragment: &fragment_id,
-                metadata::created_at: ?ts,
-            }])
-        )
-        .max_by_key(|(_, ts)| ts.0)
-        .map(|(vid, _)| vid)
-    }
-
-    fn title(&self, wiki_ws: &mut Workspace<Pile>, vid: Id) -> String {
-        find!(h: TextHandle, pattern!(&self.wiki_space, [{ vid @ wiki::title: ?h }]))
-            .next()
-            .map(|h| self.text(wiki_ws, h))
-            .unwrap_or_default()
-    }
-
-    fn content(&self, wiki_ws: &mut Workspace<Pile>, vid: Id) -> String {
-        find!(h: TextHandle, pattern!(&self.wiki_space, [{ vid @ wiki::content: ?h }]))
-            .next()
-            .map(|h| self.text(wiki_ws, h))
-            .unwrap_or_default()
-    }
-
-    fn tags(&self, vid: Id) -> Vec<Id> {
-        find!(tag: Id, pattern!(&self.wiki_space, [{ vid @ metadata::tag: ?tag }]))
-            .filter(|t| *t != KIND_VERSION_ID)
+    fn all_selectors(&self) -> BTreeSet<Id> {
+        self.catalog
+            .revisions
+            .revision_records()
+            .map(|revision| revision.id)
+            .chain(
+                self.catalog
+                    .revisions
+                    .all_entries()
+                    .into_iter()
+                    .flat_map(|entry| entry.legacy_fragments),
+            )
             .collect()
     }
 
-    fn is_archived(&self, vid: Id) -> bool {
-        self.tags(vid).contains(&TAG_ARCHIVED_ID)
+    /// Resolve one full selector without collapsing its legitimate frontier.
+    fn resolve_catalog_selector(catalog: &WikiCatalog, selector: Id) -> Vec<Id> {
+        if catalog.revisions.revision(selector).is_some() {
+            vec![selector]
+        } else if let Some(revisions) = catalog.revisions.legacy_fragment_frontier(selector) {
+            revisions.to_vec()
+        } else {
+            Vec::new()
+        }
     }
 
-    fn links(&self, vid: Id) -> Vec<Id> {
-        find!(
-            target: Id,
-            pattern!(&self.wiki_space, [{ vid @ wiki::links_to: ?target }])
-        )
-        .collect()
+    fn resolve_selector(&self, selector: Id) -> Vec<Id> {
+        Self::resolve_catalog_selector(&self.catalog, selector)
     }
 
-    /// Latest non-archived (fragment_id, version_id) pairs sorted by title.
-    fn fragments_sorted(&self, wiki_ws: &mut Workspace<Pile>) -> Vec<(Id, Id)> {
-        let mut latest: BTreeMap<Id, (Id, i128)> = BTreeMap::new();
-        for (vid, frag, ts) in find!(
-            (vid: Id, frag: Id, ts: (i128, i128)),
-            pattern!(&self.wiki_space, [{
-                ?vid @
-                metadata::tag: &KIND_VERSION_ID,
-                wiki::fragment: ?frag,
-                metadata::created_at: ?ts,
-            }])
-        ) {
-            let replace = match latest.get(&frag) {
-                None => true,
-                Some((_, prev_key)) => ts.0 > *prev_key,
-            };
-            if replace {
-                latest.insert(frag, (vid, ts.0));
+    /// Resolve a selector as a live entry reference. Unlike an immutable
+    /// revision link, this deliberately follows the selected revision's
+    /// connected component to its complete current frontier.
+    fn resolve_catalog_entry_selector(catalog: &WikiCatalog, selector: Id) -> Vec<Id> {
+        let mut heads = BTreeSet::new();
+        for revision in Self::resolve_catalog_selector(catalog, selector) {
+            if let Some(entry) = catalog.revisions.entry_containing(revision) {
+                heads.extend(entry.frontier.iter().map(|head| head.id));
             }
         }
-        let mut entries: Vec<(Id, Id)> = latest
+        heads.into_iter().collect()
+    }
+
+    fn resolve_entry_selector(&self, selector: Id) -> Vec<Id> {
+        Self::resolve_catalog_entry_selector(&self.catalog, selector)
+    }
+
+    /// Resolve a hex prefix to the set-valued result of its unique selector.
+    /// No timestamp, fact order, or lowest-id winner resolves ambiguity.
+    fn resolve_prefix(&self, prefix: &str) -> Option<Vec<Id>> {
+        let needle = prefix.trim().to_lowercase();
+        if needle.is_empty()
+            || needle.len() > 32
+            || !needle.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let mut matches = self
+            .all_selectors()
             .into_iter()
-            .map(|(frag, (vid, _))| (frag, vid))
-            .filter(|(_, vid)| !self.is_archived(*vid))
-            .collect();
-        entries.sort_by(|a, b| {
-            self.title(wiki_ws, a.1)
-                .to_lowercase()
-                .cmp(&self.title(wiki_ws, b.1).to_lowercase())
-        });
-        entries
+            .filter(|id| format!("{id:x}").starts_with(&needle));
+        let selector = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        let resolved = self.resolve_selector(selector);
+        (!resolved.is_empty()).then_some(resolved)
+    }
+
+    /// Resolve links parsed from immutable revision content.
+    fn links(&self, wiki_reader: &PileReader, revision: Id) -> Vec<Id> {
+        let mut links = BTreeSet::new();
+        for raw in extract_link_targets(&self.content(wiki_reader, revision)) {
+            if let Some(selector) = Id::from_hex(&raw) {
+                links.extend(self.resolve_selector(selector));
+            }
+        }
+        links.into_iter().collect()
+    }
+
+    /// Convert a link's exact revision targets into the current entry
+    /// frontiers used by the graph. This changes only graph topology; opening
+    /// the link still shows every exact set-valued target.
+    fn graph_link_targets(&self, wiki_reader: &PileReader, revision: Id) -> Vec<Id> {
+        let mut heads = BTreeSet::new();
+        for target in self.links(wiki_reader, revision) {
+            if let Some(entry) = self.catalog.revisions.entry_containing(target) {
+                heads.extend(entry.frontier.iter().map(|head| head.id));
+            }
+        }
+        heads.into_iter().collect()
     }
 
     // ── file resolution ──────────────────────────────────────────────
 
     /// Resolve a `files:<selector>` URL fragment through the canonical file
-    /// selector semantics. Returns the blob handle and a file name (or "file"
-    /// if none is known).
-    fn resolve_file(
-        &self,
-        files_reader: Option<&PileReader>,
-        hex: &str,
-    ) -> Option<(FileHandle, String)> {
-        let (entity_id, handle) =
-            match crate::files::resolve_reference(&self.files_space, hex).ok()? {
-                crate::files::FileReference::Entity(entity_id) => {
-                    let handle = find!(
-                        handle: FileHandle,
-                        pattern!(&self.files_space, [{
-                            entity_id @ metadata::tag: &KIND_FILE, file::content: ?handle,
-                        }])
-                    )
-                    .next()?;
-                    (Some(entity_id), handle)
-                }
-                crate::files::FileReference::Content(handle) => {
-                    // The hash names bytes, not metadata. Duplicate named records
-                    // therefore remain one valid reference; the lowest entity id
-                    // is used only as an optional, deterministic display-name hint.
-                    let entity_id = find!(
-                        entity_id: Id,
-                        pattern!(&self.files_space, [{
-                            ?entity_id @ metadata::tag: &KIND_FILE, file::content: &handle,
-                        }])
-                    )
-                    .min();
-                    (entity_id, handle)
-                }
-            };
-
-        let name = entity_id
-            .and_then(|entity_id| {
-                find!(
-                    h: TextHandle,
-                    pattern!(&self.files_space, [{ entity_id @ file::name: ?h }])
-                )
-                .next()
-            })
-            .map(|h| self.file_text(files_reader, h))
-            .unwrap_or_else(|| "file".to_string());
-
-        Some((handle, name))
+    /// selector semantics. Shared bytes keep every filename variant in the
+    /// catalog; when there is no unique name, the content digest itself is the
+    /// neutral output name.
+    fn resolve_file(&self, hex: &str) -> Result<(FileHandle, String), String> {
+        let catalog = self
+            .files_catalog
+            .as_ref()
+            .ok_or_else(|| "no Files dataset available".to_owned())?;
+        let resolved = catalog
+            .resolve_file(hex)
+            .map_err(|error| format!("resolve files:{hex}: {error:#}"))?;
+        let name = resolved_file_name(&resolved);
+        Ok((resolved.content, name))
     }
 
     /// Resolve `files:<selector>`, write the blob to `$TMPDIR/faculties-files/<name>`,
@@ -311,12 +295,15 @@ impl WikiLive {
     /// them through the UI (this is a best-effort side channel).
     fn open_file(&self, files_reader: Option<&PileReader>, hex: &str) {
         let Some(reader) = files_reader else {
-            eprintln!("[files] no Files collection available");
+            eprintln!("[files] no files dataset available");
             return;
         };
-        let Some((handle, name)) = self.resolve_file(Some(reader), hex) else {
-            eprintln!("[files] could not resolve files:{hex}");
-            return;
+        let (handle, name) = match self.resolve_file(hex) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                eprintln!("[files] {error}");
+                return;
+            }
         };
 
         let result = (|| -> Result<std::path::PathBuf, String> {
@@ -591,33 +578,44 @@ struct GpuForceState {
 }
 
 struct GraphNode {
-    frag_id: Id,
+    revision_id: Id,
+    entry_key: Id,
+    archived: bool,
     label: String,
     pos: egui::Vec2,
     /// Total incident edges (in + out). Used to scale the node
-    /// radius so hub fragments visually dominate.
+    /// radius so hub revisions visually dominate.
     degree: u32,
 }
 
 impl WikiGraph {
-    fn from_wiki(live: &WikiLive, wiki_ws: &mut Workspace<Pile>) -> Self {
-        let fragments = live.fragments_sorted(wiki_ws);
-        let mut frag_to_idx = BTreeMap::new();
+    fn from_wiki(live: &WikiLive, wiki_reader: &PileReader) -> Self {
+        let heads = live.visible_heads(wiki_reader);
+        let mut revision_to_idx = BTreeMap::new();
         let mut nodes = Vec::new();
 
-        let n = fragments.len().max(1) as f32;
-        for (i, &(frag_id, vid)) in fragments.iter().enumerate() {
+        let n = heads.len().max(1) as f32;
+        for (i, head) in heads.iter().enumerate() {
             let angle = (i as f32 / n) * std::f32::consts::TAU;
             let radius = 200.0 + n * 5.0;
-            let title = live.title(wiki_ws, vid);
-            frag_to_idx.insert(frag_id, i);
+            let title = live.title(wiki_reader, head.revision_id);
+            revision_to_idx.insert(head.revision_id, i);
+            let mut label = if title.is_empty() {
+                fmt_id(head.revision_id)
+            } else {
+                title
+            };
+            if head.fork_width > 1 {
+                label.push_str(" [fork]");
+            }
+            if head.archived {
+                label.push_str(" [archived]");
+            }
             nodes.push(GraphNode {
-                frag_id,
-                label: if title.is_empty() {
-                    fmt_id(frag_id)
-                } else {
-                    title
-                },
+                revision_id: head.revision_id,
+                entry_key: head.entry_key,
+                archived: head.archived,
+                label,
                 pos: egui::vec2(angle.cos() * radius, angle.sin() * radius),
                 degree: 0,
             });
@@ -626,25 +624,12 @@ impl WikiGraph {
         let mut seen = HashSet::new();
         let mut edges = Vec::new();
         let mut unresolved = 0usize;
-        for &(frag_id, vid) in &fragments {
-            let from = frag_to_idx[&frag_id];
-            for target in live.links(vid) {
-                let frag_target = if frag_to_idx.contains_key(&target) {
-                    Some(target)
-                } else {
-                    find!(
-                        frag: Id,
-                        pattern!(&live.wiki_space, [{ target @ wiki::fragment: ?frag }])
-                    )
-                    .next()
-                };
-                if let Some(frag) = frag_target {
-                    if let Some(&to) = frag_to_idx.get(&frag) {
-                        if from != to && seen.insert((from, to)) {
-                            edges.push((from, to));
-                        }
-                    } else {
-                        unresolved += 1;
+        for head in &heads {
+            let from = revision_to_idx[&head.revision_id];
+            for target in live.graph_link_targets(wiki_reader, head.revision_id) {
+                if let Some(&to) = revision_to_idx.get(&target) {
+                    if from != to && seen.insert((from, to)) {
+                        edges.push((from, to));
                     }
                 } else {
                     unresolved += 1;
@@ -652,7 +637,7 @@ impl WikiGraph {
             }
         }
         if unresolved > 0 {
-            eprintln!("[wiki] graph: {unresolved} link targets could not be resolved to fragments");
+            eprintln!("[wiki] graph: {unresolved} link targets are outside the visible frontier");
         }
 
         // Compute per-node degree for size scaling in the render pass.
@@ -1051,7 +1036,6 @@ impl WikiGraph {
 
         let node_radius = 6.0 * zoom.max(0.3);
         let edge_color = ui.visuals().weak_text_color();
-        let node_fill = GORBIE::themes::ral(5005);
         let node_match_fill = GORBIE::themes::ral(1003);
         let needle_lower = search.query().to_lowercase();
         let node_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
@@ -1091,14 +1075,14 @@ impl WikiGraph {
             // Search-active and the node's title matches? Report to
             // the search session BEFORE the visibility check, so
             // off-screen matches still bump the global `n / total`
-            // counter. We use `frag_id.with("graph_node")` as the
+            // counter. We use the revision id as the graph-node match id
             // match id to avoid colliding with text-level matches for
             // the same fragment (e.g. wiki:id in a meta row).
             let is_match =
                 !needle_lower.is_empty() && node.label.to_lowercase().contains(&needle_lower);
             let _match_info = if is_match {
-                let frag_bytes: &[u8] = node.frag_id.as_ref();
-                let id = egui::Id::new(("wiki_graph_node", frag_bytes));
+                let revision_bytes: &[u8] = node.revision_id.as_ref();
+                let id = egui::Id::new(("wiki_graph_node", revision_bytes));
                 Some(search.report(id))
             } else {
                 None
@@ -1110,13 +1094,19 @@ impl WikiGraph {
             }
 
             // Scale node radius by degree: isolated nodes at the base
-            // size, hub fragments grow logarithmically. Caps at 3×.
+            // size, hub revisions grow logarithmically. Caps at 3×.
             let deg_scale = (1.0 + (node.degree as f32 + 1.0).ln() * 0.4).min(3.0);
             let r = node_radius * deg_scale;
             // Matching nodes paint in RAL 1003 (signal yellow) — same
             // color GORBIE uses for word-level search underlines, so
             // the graph and the floats highlight in lock-step.
-            let fill = if is_match { node_match_fill } else { node_fill };
+            let fill = if is_match {
+                node_match_fill
+            } else if node.archived {
+                egui::Color32::from_rgb(0x66, 0x66, 0x66)
+            } else {
+                frag_color(node.entry_key)
+            };
             painter.circle(pos, r, fill, node_stroke);
             if show_labels {
                 // Measure the label first so we know whether it fits
@@ -1149,7 +1139,7 @@ impl WikiGraph {
                 if (hp - pos).length() < r + 8.0 {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     if response.clicked() {
-                        clicked = Some(node.frag_id);
+                        clicked = Some(node.revision_id);
                     }
                 }
             }
@@ -1186,15 +1176,29 @@ impl WikiGraph {
 
 // ── link interception ────────────────────────────────────────────────
 
-/// A clicked URL in a rendered typst fragment that the viewer should
+/// A clicked URL in rendered Typst content that the viewer should
 /// handle internally (rather than letting egui open it in a browser).
 /// `pub(crate)` so sibling widgets can reuse the same
 /// typst-render-and-intercept path instead of reimplementing it.
 pub(crate) enum LinkClick {
-    /// `wiki:<hex>` link — `Id` is either a fragment or a version id.
+    /// `wiki:<hex>` link — `Id` is a revision or a set-valued legacy fragment.
     Wiki(Id),
+    /// `wiki:entry:<hex>` link — follow the selected entry to its complete
+    /// current frontier without imposing a last-writer-wins head.
+    WikiEntry(Id),
     /// `files:<selector>` link — `String` is the hex selector payload.
     File(String),
+}
+
+fn parse_wiki_link_target(target: &str) -> Option<(Id, bool)> {
+    let (kind, hex) = target
+        .rsplit_once(':')
+        .map_or((None, target), |(kind, hex)| (Some(kind), hex));
+    let id = Id::from_hex(hex)?;
+    Some((
+        id,
+        kind.is_some_and(|kind| kind.eq_ignore_ascii_case("entry")),
+    ))
 }
 
 /// Render typst `content` into `ctx` and intercept any `wiki:` / `files:`
@@ -1215,13 +1219,20 @@ pub(crate) fn render_wiki_content(ctx: &mut CardCtx<'_>, content: &str) -> Optio
         for cmd in new_commands {
             match &cmd {
                 egui::OutputCommand::OpenUrl(open_url) => {
-                    if let Some(hex) = open_url.url.strip_prefix("wiki:") {
-                        if let Some(id) = Id::from_hex(hex) {
-                            clicked = Some(LinkClick::Wiki(id));
+                    if let Some(target) = open_url.url.strip_prefix("wiki:") {
+                        if let Some((id, follow_entry)) = parse_wiki_link_target(target) {
+                            clicked = Some(if follow_entry {
+                                LinkClick::WikiEntry(id)
+                            } else {
+                                // Other qualifiers describe the edge (for
+                                // example `reviews`) but retain exact target
+                                // semantics.
+                                LinkClick::Wiki(id)
+                            });
                         } else {
                             eprintln!(
-                                "[wiki] link click: wiki:{hex} ({} chars) → failed to parse as Id (expected 32 hex chars)",
-                                hex.len()
+                                "[wiki] link click: wiki:{target} ({} target chars) → failed to parse as Id (expected 32 hex chars)",
+                                target.len()
                             );
                         }
                     } else if let Some(hex) = open_url.url.strip_prefix("files:") {
@@ -1239,26 +1250,40 @@ pub(crate) fn render_wiki_content(ctx: &mut CardCtx<'_>, content: &str) -> Optio
 
 // ── browser state (absorbed into WikiViewer) ─────────────────────────
 
-/// An open wiki page — tracks which version is being viewed.
+/// An open canonical Wiki revision.
 struct OpenPage {
-    frag_id: Id,
-    /// `None` = show latest version.
-    pinned_version: Option<Id>,
+    revision_id: Id,
+}
+
+fn render_diagnostic(ui: &mut egui::Ui, message: &str) {
+    let color = egui::Color32::from_rgb(0xcc, 0x0a, 0x17);
+    egui::Frame::NONE
+        .stroke(egui::Stroke::new(1.0, color))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("INVALID WIKI SNAPSHOT · {message}"))
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color),
+            );
+        });
 }
 
 // ── widget ───────────────────────────────────────────────────────────
 
 /// GORBIE-embeddable wiki viewer.
 ///
-/// Holds pure UI state plus a cached query snapshot. The wiki workspace
-/// (and optionally a native Files view, for `files:` link resolution) are
+/// Holds pure UI state plus a cached query snapshot. The wiki dataset
+/// (and optionally a files dataset, for `files:` link resolution) are
 /// passed in at render time; the viewer refreshes its cached fact space
-/// whenever the wiki workspace's head advances.
+/// whenever either dataset revision advances.
 ///
 /// ```ignore
 /// let mut viewer = WikiViewer::default();
-/// // Inside a GORBIE card, with `wiki_ws` and optional `files_view`:
-/// viewer.render(ctx, wiki_ws, files_view);
+/// // Inside a GORBIE card, with `wiki_view` and optional `files_view`:
+/// viewer.render(ctx, wiki_view, files_view);
 /// ```
 #[derive(Default)]
 pub struct WikiViewer {
@@ -1266,8 +1291,11 @@ pub struct WikiViewer {
     /// Last search miss (for the "no match" chip). Cleared whenever
     /// the query text is edited.
     search_miss: Option<String>,
-    /// Rebuilt when the wiki workspace's head advances.
+    /// Rebuilt when the wiki or files dataset revision changes.
     live: Option<WikiLive>,
+    /// Strict projection failures are rendered instead of panicking or
+    /// falling back to legacy-shaped facts.
+    error: Option<((DatasetRevision, Option<DatasetRevision>), String)>,
     /// Lazily-initialized once `live` is populated (needs queries to
     /// build). Dropped whenever `live` is rebuilt.
     graph: Option<WikiGraph>,
@@ -1281,30 +1309,49 @@ impl WikiViewer {
         Self::default()
     }
 
-    /// Render the viewer into a GORBIE card context. `wiki_ws` must point
-    /// at the wiki branch; `files_view` is optional — when provided, the
+    /// Render the viewer into a GORBIE card context. `wiki_view` is the
+    /// wiki dataset; `files_view` is optional — when provided, the
     /// viewer will resolve `files:<selector>` links and open the resulting
     /// blobs via the platform `open` command.
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        wiki_ws: &mut Workspace<Pile>,
-        files_view: Option<FilesView<'_>>,
+        wiki_view: DatasetView<'_>,
+        files_view: Option<DatasetView<'_>>,
     ) {
+        let wiki_reader = wiki_view.reader;
+        let files_reader = files_view.map(|view| view.reader);
         ctx.section("Wiki", |ctx| {
-        // Refresh cached spaces if the wiki head has advanced since the
-        // last frame (push happened, external write, or first render).
-        let wiki_head = wiki_ws.head();
+        // Refresh cached spaces if either revision changed since the last frame.
+        let wiki_revision = wiki_view.revision;
         let files_revision = files_view.map(|view| view.revision);
         let need_refresh = match self.live.as_ref() {
-            None => true,
+            None => self
+                .error
+                .as_ref()
+                .is_none_or(|(revisions, _)| *revisions != (wiki_revision, files_revision)),
             Some(l) => {
-                l.cached_head != wiki_head || l.files_cached_revision != files_revision
+                l.cached_revision != wiki_revision
+                    || l.files_cached_revision != files_revision
             }
         };
         if need_refresh {
-            self.live = Some(WikiLive::refresh(wiki_ws, files_view));
+            match WikiLive::refresh(wiki_view, files_view) {
+                Ok(live) => {
+                    self.live = Some(live);
+                    self.error = None;
+                }
+                Err(error) => {
+                    self.live = None;
+                    self.error = Some(((wiki_revision, files_revision), error));
+                }
+            }
             self.graph = None;
+        }
+
+        if let Some((_, error)) = self.error.as_ref() {
+            render_diagnostic(ctx.ui_mut(), error);
+            return;
         }
 
         let live = match self.live.as_ref() {
@@ -1318,9 +1365,9 @@ impl WikiViewer {
 
         // ── force-directed graph ─────────────────────────────────────
         if self.graph.is_none() {
-            self.graph = Some(WikiGraph::from_wiki(live, wiki_ws));
+            self.graph = Some(WikiGraph::from_wiki(live, wiki_reader));
         }
-        // Empty state when the wiki branch has no fragments at all —
+        // Empty state when the Wiki collection has no live entries —
         // otherwise the graph is a blank canvas.
         let graph_is_empty = self
             .graph
@@ -1335,7 +1382,7 @@ impl WikiViewer {
                 ui.label(egui::RichText::new("\u{1f4d6}").size(28.0).color(muted));
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("No fragments in this wiki branch")
+                    egui::RichText::new("No live entries in this Wiki collection")
                         .monospace()
                         .small()
                         .strong()
@@ -1344,7 +1391,7 @@ impl WikiViewer {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(
-                        "Create one via `faculties/wiki.rs create` and reopen the pile.",
+                        "Create one via `wiki create` and reopen the pile.",
                     )
                     .small()
                     .color(muted),
@@ -1369,12 +1416,13 @@ impl WikiViewer {
             let mut search = ctx.search();
             let (clicked_node, graph_rect) =
                 graph.show(ctx.ui_mut(), &mut search);
-            if let Some(frag_id) = clicked_node {
-                if !self.open_pages.iter().any(|p| p.frag_id == frag_id) {
-                    self.open_pages.push(OpenPage {
-                        frag_id,
-                        pinned_version: None,
-                    });
+            if let Some(revision_id) = clicked_node {
+                if !self
+                    .open_pages
+                    .iter()
+                    .any(|page| page.revision_id == revision_id)
+                {
+                    self.open_pages.push(OpenPage { revision_id });
                 }
             }
             ctx.ctx().request_repaint();
@@ -1416,7 +1464,7 @@ impl WikiViewer {
                                             GORBIE::widgets::Button::new("GO"),
                                         )
                                         .on_hover_text(
-                                            "Open fragment by hex prefix or title (Enter)",
+                                            "Open revision/legacy selector by hex prefix or title (Enter)",
                                         )
                                         .clicked()
                                     {
@@ -1472,27 +1520,32 @@ impl WikiViewer {
 
         // Search-submit handling (the overlay above populates
         // `submit_query` on GO click or Enter). Resolves hex prefixes
-        // against the wiki index or falls back to title-substring
-        // search; opens a floating page on match, shows a
+        // against canonical selectors or falls back to title-substring
+        // search; opens every matching fork/legacy-selector target, shows a
         // "No match" banner under the viewport on miss.
         if let Some(q) = submit_query {
             let is_hex = !q.is_empty() && q.chars().all(|c| c.is_ascii_hexdigit());
-            let found = if is_hex {
-                live.resolve_prefix(&q)
+            let mut found = if is_hex {
+                live.resolve_prefix(&q).unwrap_or_default()
             } else {
                 let q_lower = q.to_lowercase();
-                let frags = live.fragments_sorted(wiki_ws);
-                frags
-                    .iter()
-                    .find(|(_, vid)| live.title(wiki_ws, *vid).to_lowercase().contains(&q_lower))
-                    .map(|(frag_id, _)| *frag_id)
+                live.visible_heads(wiki_reader)
+                    .into_iter()
+                    .filter(|head| {
+                        live.title(wiki_reader, head.revision_id)
+                            .to_lowercase()
+                            .contains(&q_lower)
+                    })
+                    .map(|head| head.revision_id)
+                    .collect()
             };
-            if let Some(frag_id) = found {
-                if !self.open_pages.iter().any(|p| p.frag_id == frag_id) {
-                    self.open_pages.push(OpenPage {
-                        frag_id,
-                        pinned_version: None,
-                    });
+            found.sort_unstable();
+            found.dedup();
+            if !found.is_empty() {
+                for revision_id in found {
+                    self.open_pages
+                        .retain(|page| page.revision_id != revision_id);
+                    self.open_pages.push(OpenPage { revision_id });
                 }
                 self.search_query.clear();
                 self.search_miss = None;
@@ -1529,32 +1582,46 @@ impl WikiViewer {
         }
 
         // ── floating wiki page cards ─────────────────────────────────
-        let open_snapshot: Vec<(Id, Option<Id>)> = self
+        let open_snapshot: Vec<Id> = self
             .open_pages
             .iter()
-            .map(|p| (p.frag_id, p.pinned_version))
+            .map(|page| page.revision_id)
             .collect();
         let mut to_close: Vec<Id> = Vec::new();
-        let mut to_open_from_link: Vec<Id> = Vec::new();
+        let mut to_open_from_link: Vec<(Id, bool)> = Vec::new();
         let mut to_open_file: Vec<String> = Vec::new();
-        let mut version_nav: Option<(Id, Option<Id>)> = None; // (frag_id, new_pinned)
 
-        for (frag_id, pinned) in open_snapshot.into_iter() {
-            let frag_bytes: &[u8] = frag_id.as_ref();
-            let mut frag_key = [0u8; 16];
-            frag_key.copy_from_slice(frag_bytes);
+        for revision_id in open_snapshot {
+            let revision_bytes: &[u8] = revision_id.as_ref();
+            let mut revision_key = [0u8; 16];
+            revision_key.copy_from_slice(revision_bytes);
 
-            let history = live.version_history(frag_id);
-            let vid = pinned.or_else(|| live.latest_version(frag_id));
-            let title = vid.map(|v| live.title(wiki_ws, v)).unwrap_or_default();
-            let content = vid.map(|v| live.content(wiki_ws, v)).unwrap_or_default();
-            let current_idx = vid.and_then(|v| history.iter().position(|&h| h == v));
-            let n_versions = history.len();
+            let revision = live.revision(revision_id);
+            let entry = revision.and_then(|_| live.catalog.revisions.entry_containing(revision_id));
+            let title = live.title(wiki_reader, revision_id);
+            let content = live.content(wiki_reader, revision_id);
+            let entry_key = entry.map(WikiLive::entry_key).unwrap_or(revision_id);
+            let color = frag_color(entry_key);
+            let frontier_position = entry.and_then(|entry| {
+                entry
+                    .frontier
+                    .iter()
+                    .position(|head| head.id == revision_id)
+            });
+            let state_label = match (entry, frontier_position) {
+                (Some(entry), Some(index)) if entry.frontier.len() > 1 => {
+                    format!("FORK HEAD {}/{}", index + 1, entry.frontier.len())
+                }
+                (Some(_), Some(_)) => "HEAD".to_owned(),
+                (Some(_), None) => "HISTORICAL".to_owned(),
+                (None, _) => "MISSING".to_owned(),
+            };
+            let archived = revision.is_some_and(|row| row.tags.contains(&TAG_ARCHIVED_ID));
 
-            ctx.push_id(frag_key, |ctx| {
+            ctx.push_id(revision_key, |ctx| {
                 let resp = ctx.float(|ctx| {
                     ctx.grid(|g| {
-                        if vid.is_none() {
+                        if revision.is_none() {
                             g.full(|ctx| {
                                 ctx.add(
                                     egui::Label::new(
@@ -1565,10 +1632,10 @@ impl WikiViewer {
                             });
                             g.full(|ctx| {
                                 ctx.label(
-                                    egui::RichText::new(format!("wiki:{frag_id:x}"))
+                                    egui::RichText::new(format!("wiki:{revision_id:x}"))
                                         .monospace()
                                         .small()
-                                        .color(frag_color(frag_id)),
+                                        .color(color),
                                 );
                             });
                             g.full(|ctx| { ctx.separator(); });
@@ -1580,7 +1647,6 @@ impl WikiViewer {
                             });
                             return;
                         }
-                        let frag_col = frag_color(frag_id);
 
                         // Heading row: identity-colored dot swatch + title.
                         g.full(|ctx| {
@@ -1593,7 +1659,7 @@ impl WikiViewer {
                                 ui.painter().circle_filled(
                                     dot_rect.center(),
                                     5.0,
-                                    frag_col,
+                                    color,
                                 );
                                 ui.add(
                                     egui::Label::new(egui::RichText::new(&title).heading())
@@ -1602,99 +1668,48 @@ impl WikiViewer {
                             });
                         });
 
-                        // Meta row: multi-cell grid split. (DIAGNOSTIC)
-                        if n_versions <= 1 {
-                            g.full(|ctx| {
-                                ctx.label(
-                                    egui::RichText::new(format!("wiki:{frag_id:x}"))
-                                        .monospace()
-                                        .small()
-                                        .color(frag_col),
-                                );
-                            });
-                        } else {
-                            let vi = current_idx.unwrap_or(0);
-                            let at_latest = pinned.is_none();
-                            let back_enabled = vi + 1 < n_versions;
-                            let fwd_enabled = vi > 0 || pinned.is_some();
-                            let ver_label = if pinned.is_some() {
-                                format!("v{}/{}", n_versions - vi, n_versions)
-                            } else {
-                                format!("v{} · LATEST", n_versions)
-                            };
-
-                            g.place(6, |ctx| {
-                                ctx.label(
-                                    egui::RichText::new(format!("wiki:{frag_id:x}"))
-                                        .monospace()
-                                        .small()
-                                        .color(frag_col),
-                                );
-                            });
-                            g.place(3, |ctx| {
-                                // Right-align so the label sits flush against
-                                // the ◀ button across just one gutter, with
-                                // vertical centering against the taller
-                                // button cells in the same row. The grid's
-                                // frame-delayed row sizing bounds the cell
-                                // height to the row's actual height, so the
-                                // `Center` cross-align doesn't drift.
-                                ctx.ui_mut().with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(ver_label)
-                                                .monospace()
-                                                .small()
-                                                .strong(),
-                                        );
-                                    },
-                                );
-                            });
-                            g.place(1, |ctx| {
-                                if ctx
-                                    .ui_mut()
-                                    .add_enabled(
-                                        back_enabled,
-                                        GORBIE::widgets::Button::new("◀").columns(1),
-                                    )
-                                    .on_hover_text("Older version")
-                                    .clicked()
-                                {
-                                    version_nav =
-                                        Some((frag_id, Some(history[vi + 1])));
-                                }
-                            });
-                            g.place(1, |ctx| {
-                                if ctx
-                                    .ui_mut()
-                                    .add_enabled(
-                                        fwd_enabled,
-                                        GORBIE::widgets::Button::new("▶").columns(1),
-                                    )
-                                    .on_hover_text("Newer version")
-                                    .clicked()
-                                {
-                                    if vi > 0 {
-                                        version_nav =
-                                            Some((frag_id, Some(history[vi - 1])));
-                                    } else {
-                                        version_nav = Some((frag_id, None));
+                        // A revision DAG has no honest scalar "latest" or
+                        // prev/next order. Show the exact revision and its
+                        // causal/frontier role instead of reintroducing a
+                        // timestamp winner through navigation chrome.
+                        g.place(8, |ctx| {
+                            ctx.label(
+                                egui::RichText::new(format!("wiki:{revision_id:x}"))
+                                    .monospace()
+                                    .small()
+                                    .color(color),
+                            );
+                        });
+                        g.place(4, |ctx| {
+                            ctx.ui_mut().with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let mut label = state_label.clone();
+                                    if archived {
+                                        label.push_str(" · ARCHIVED");
                                     }
-                                }
-                            });
-                            g.place(1, |ctx| {
-                                if ctx
-                                    .ui_mut()
-                                    .add_enabled(
-                                        !at_latest,
-                                        GORBIE::widgets::Button::new("↻").columns(1),
-                                    )
-                                    .on_hover_text("Jump to latest")
-                                    .clicked()
-                                {
-                                    version_nav = Some((frag_id, None));
-                                }
+                                    ui.label(
+                                        egui::RichText::new(label)
+                                            .monospace()
+                                            .small()
+                                            .strong(),
+                                    );
+                                },
+                            );
+                        });
+
+                        if let Some(entry) = entry.filter(|entry| entry.legacy_fragments.len() > 1) {
+                            g.full(|ctx| {
+                                let weak = ctx.ctx().global_style().visuals.weak_text_color();
+                                ctx.label(
+                                    egui::RichText::new(format!(
+                                        "{} legacy aliases name this entry",
+                                        entry.legacy_fragments.len()
+                                    ))
+                                    .monospace()
+                                    .small()
+                                    .color(weak),
+                                );
                             });
                         }
 
@@ -1702,7 +1717,12 @@ impl WikiViewer {
 
                         g.full(|ctx| {
                             match render_wiki_content(ctx, &content) {
-                                Some(LinkClick::Wiki(id)) => to_open_from_link.push(id),
+                                Some(LinkClick::Wiki(id)) => {
+                                    to_open_from_link.push((id, false))
+                                }
+                                Some(LinkClick::WikiEntry(id)) => {
+                                    to_open_from_link.push((id, true))
+                                }
                                 Some(LinkClick::File(hex)) => to_open_file.push(hex),
                                 None => {}
                             }
@@ -1710,31 +1730,206 @@ impl WikiViewer {
                     });
                 });
                 if resp.closed {
-                    to_close.push(frag_id);
+                    to_close.push(revision_id);
                 }
             });
         }
 
         for id in to_close {
-            self.open_pages.retain(|p| p.frag_id != id);
+            self.open_pages.retain(|page| page.revision_id != id);
         }
-        if let Some((frag_id, new_pinned)) = version_nav {
-            if let Some(page) = self.open_pages.iter_mut().find(|p| p.frag_id == frag_id) {
-                page.pinned_version = new_pinned;
+        for (selector, follow_entry) in to_open_from_link {
+            let mut revisions = if follow_entry {
+                live.resolve_entry_selector(selector)
+            } else {
+                live.resolve_selector(selector)
+            };
+            if revisions.is_empty() {
+                revisions.push(selector);
+            }
+            for revision_id in revisions {
+                // Move to top if already open, otherwise open new. A
+                // set-valued legacy fragment therefore opens every head.
+                self.open_pages
+                    .retain(|page| page.revision_id != revision_id);
+                self.open_pages.push(OpenPage { revision_id });
             }
         }
-        for id in to_open_from_link {
-            let frag = live.to_fragment(id).unwrap_or(id);
-            // Move to top if already open, otherwise open new.
-            self.open_pages.retain(|p| p.frag_id != frag);
-            self.open_pages.push(OpenPage {
-                frag_id: frag,
-                pinned_version: None,
-            });
-        }
         for hex in to_open_file {
-            live.open_file(files_view.map(|view| view.reader), &hex);
+            live.open_file(files_reader, &hex);
         }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::schemas::files::file as file_attrs;
+    use crate::schemas::wiki::{attrs, KIND_VERSION_ID};
+    use crate::wiki::{self, RevisionDraft};
+    use ed25519_dalek::SigningKey;
+    use hifitime::Epoch;
+    use triblespace::core::metadata;
+    use triblespace::core::repo::BlobStore;
+    use triblespace::macros::{find, pattern};
+    use triblespace::prelude::*;
+
+    fn at(seconds: f64) -> wiki::IntervalValue {
+        let instant = Epoch::from_tai_seconds(seconds);
+        (instant, instant).try_to_inline().unwrap()
+    }
+
+    fn revision(
+        output: &mut Fragment,
+        author: Id,
+        title: &str,
+        tags: &[Id],
+        parents: &[Id],
+        seconds: f64,
+    ) -> Id {
+        let (fragment, revision) = wiki::revision_record(RevisionDraft {
+            title: title.to_owned(),
+            content: format!("content for {title}"),
+            tags: tags.iter().copied().collect(),
+            predecessors: parents.iter().copied().collect(),
+            author,
+            authored_at: at(seconds),
+        })
+        .unwrap();
+        *output += fragment;
+        revision
+    }
+
+    #[test]
+    fn canonical_projection_keeps_every_fork_head_visible() {
+        let signer = SigningKey::from_bytes(&[7; 32]);
+        let (mut fragment, author) = wiki::author_record(&signer.verifying_key());
+
+        let base = revision(&mut fragment, author, "base", &[], &[], 1.0);
+        let left = revision(&mut fragment, author, "left", &[], &[base], 2.0);
+        let right = revision(&mut fragment, author, "right", &[], &[base], 3.0);
+        let independent = revision(&mut fragment, author, "independent", &[], &[], 4.0);
+        let archived_root = revision(&mut fragment, author, "archived root", &[], &[], 5.0);
+        let live = revision(&mut fragment, author, "live", &[], &[archived_root], 6.0);
+        let archived = revision(
+            &mut fragment,
+            author,
+            "archived",
+            &[TAG_ARCHIVED_ID],
+            &[archived_root],
+            7.0,
+        );
+
+        let catalog = wiki::load_catalog(fragment.facts()).unwrap();
+        let projected = WikiLive::projected_heads(&catalog);
+        let by_revision: BTreeMap<_, _> = projected
+            .iter()
+            .map(|head| (head.revision_id, *head))
+            .collect();
+
+        assert_eq!(projected.len(), 5);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|head| head.entry_key)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3,
+            "independent roots remain distinct entries"
+        );
+        assert_eq!(by_revision[&left].fork_width, 2);
+        assert_eq!(by_revision[&right].fork_width, 2);
+        assert_eq!(by_revision[&live].fork_width, 2);
+        assert_eq!(by_revision[&archived].fork_width, 2);
+        assert!(by_revision[&archived].archived);
+        assert!(!by_revision[&live].archived);
+        assert!(by_revision.contains_key(&independent));
+        assert_eq!(
+            WikiLive::resolve_catalog_selector(&catalog, left),
+            vec![left],
+            "an intrinsic revision selector stays exact"
+        );
+
+        assert_eq!(
+            WikiLive::resolve_catalog_entry_selector(&catalog, base),
+            vec![left, right],
+            "an entry-qualified root selector follows the complete frontier"
+        );
+    }
+
+    #[test]
+    fn typed_wiki_links_distinguish_live_entries_from_exact_edges() {
+        let id = Id::new([0xab; 16]).unwrap();
+        let hex = format!("{id:x}");
+        assert_eq!(parse_wiki_link_target(&hex), Some((id, false)));
+        assert_eq!(
+            parse_wiki_link_target(&format!("reviews:{hex}")),
+            Some((id, false)),
+            "ordinary typed edges still cite an exact revision"
+        );
+        assert_eq!(
+            parse_wiki_link_target(&format!("entry:{hex}")),
+            Some((id, true)),
+            "entry is the one explicit follow-frontier link kind"
+        );
+    }
+
+    #[test]
+    fn legacy_fragment_selector_returns_its_complete_frontier() {
+        let fragment_id = Id::new([0xa1; 16]).unwrap();
+        let first = Id::new([0xb1; 16]).unwrap();
+        let second = Id::new([0xb2; 16]).unwrap();
+        let mut fragment = Fragment::empty();
+        let title = fragment.put::<LongString, _>("legacy title".to_owned());
+        let content = fragment.put::<LongString, _>("legacy content".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&first) @
+            metadata::tag: &KIND_VERSION_ID,
+            attrs::fragment: fragment_id,
+            attrs::title: title,
+            attrs::content: content,
+            metadata::created_at: at(1.0),
+        };
+        fragment += entity! { ExclusiveId::force_ref(&second) @
+            metadata::tag: &KIND_VERSION_ID,
+            attrs::fragment: fragment_id,
+            attrs::title: title,
+            attrs::content: content,
+            metadata::created_at: at(2.0),
+        };
+
+        let catalog = wiki::load_catalog(fragment.facts()).unwrap();
+        assert_eq!(
+            WikiLive::resolve_catalog_selector(&catalog, fragment_id),
+            vec![first, second],
+            "the alias is set-valued; time does not arbitrate the fork"
+        );
+    }
+
+    #[test]
+    fn shared_file_bytes_use_the_digest_instead_of_a_name_winner() {
+        let first = crate::files::stage(b"shared".to_vec(), "alpha.txt", "text/plain").unwrap();
+        let content = find!(
+            value: crate::files::ContentHandle,
+            pattern!(&first, [{ _?file @ file_attrs::content: ?value }])
+        )
+        .next()
+        .unwrap();
+        let second = crate::files::stage(b"shared".to_vec(), "beta.txt", "text/plain").unwrap();
+        let mut fragment = first;
+        fragment += second;
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let catalog = crate::files::load_catalog(&reader, fragment.facts()).unwrap();
+        let resolved = catalog
+            .resolve_file(&crate::files::content_hash_hex(content))
+            .unwrap();
+
+        assert_eq!(resolved.names, ["alpha.txt", "beta.txt"]);
+        assert_eq!(
+            resolved_file_name(&resolved),
+            crate::files::content_hash_hex(content)
+        );
     }
 }

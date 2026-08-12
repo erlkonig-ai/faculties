@@ -527,21 +527,27 @@ fn embed_text_query(text: &str) -> Result<Vec<f32>> {
 type Mm7bEmbedder =
     mary::models::qwen2_5_vl::embedder::NomicMultimodalEmbedder<mary::nn::backend::B>;
 
-/// Default weights pile + tokenizer for the 7b, overridable via env so the
-/// faculty isn't pinned to one machine's paths.
+/// Default weights pile + tokenizer for the 7b. Both can be overridden, while
+/// the tokenizer's ordinary fallback is resolved from the Hugging Face cache.
 #[cfg(all(feature = "local-embed", target_os = "macos"))]
 fn load_mm7b() -> Result<Mm7bEmbedder> {
-    const DEFAULT_TOKENIZER: &str = "/Users/jp/.cache/huggingface/hub/models--nomic-ai--nomic-embed-multimodal-7b/snapshots/1291f1b6ca07061b0329df9d5713c09b294be576/tokenizer.json";
+    const MODEL: &str = "nomic-ai/nomic-embed-multimodal-7b";
     let pile = match std::env::var_os("NOMIC_MM7B_PILE") {
         Some(p) => PathBuf::from(p),
         None => faculties::model_dir().join("nomic_mm7b.pile"),
     };
-    let tok =
-        std::env::var("NOMIC_MM7B_TOKENIZER").unwrap_or_else(|_| DEFAULT_TOKENIZER.to_string());
+    let tok = match std::env::var_os("NOMIC_MM7B_TOKENIZER") {
+        Some(path) => PathBuf::from(path),
+        None => mary::embed::hf_cache_resolve(MODEL, "tokenizer.json").ok_or_else(|| {
+            anyhow::anyhow!(
+                "tokenizer.json not in Hugging Face cache for {MODEL}; set NOMIC_MM7B_TOKENIZER"
+            )
+        })?,
+    };
     eprintln!("files: loading nomic-embed-multimodal-7b (once, ~20s)…");
     mary::persist::load_nomic_mm7b_aliased_from_pile(
         &pile,
-        Path::new(&tok),
+        &tok,
         mary::nn::backend::WgpuDevice::default(),
     )
 }

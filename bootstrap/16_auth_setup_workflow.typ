@@ -1,9 +1,9 @@
 = Recipe: Auth Setup for a Multi-Agent Team
 
-How to bootstrap capability auth so two or more agents can sync a
-shared pile through a relay without exposing it to anyone else.
-Chains `trible team`, `trible pile net`, and the env-var
-configuration the relay reads.
+How to bootstrap capability auth for the current legacy-head/blob network
+transport without exposing it to anyone else. This is useful infrastructure,
+but it does not yet transport native collection records. The recipe chains
+`trible team`, `trible pile net`, and the env-var configuration the relay reads.
 
 == Why a recipe
 
@@ -40,10 +40,11 @@ trible team invite \
   --scope read
 # → issued cap (sig): f0f6f41e...
 
-# 4. Send the (team_root, issued_cap_sig) pair to the invitee.
-#    These two values are NOT secrets — the team_root is the
-#    public verification anchor, the cap-sig handle is a
-#    content-addressed reference. Safe to email/Signal/etc.
+# 4. Send the public (team_root, issued_cap_sig) coordinates to the invitee,
+#    AND deliver the issued cap blob plus its complete ancestor closure. A
+#    running issuer daemon pushes that closure to the invitee daemon through
+#    OP_DELIVER_CAP. For an offline first handoff, transfer and import a pile
+#    snapshot containing it. The handle alone cannot authorize a connection.
 
 # === Invitee, on machine B ===
 
@@ -55,15 +56,16 @@ trible pile net status --key node.key
 # → team_root: d5263a4d...  (from TRIBLE_TEAM_ROOT)
 # → self_cap:  f0f6f41e...  (from TRIBLE_TEAM_CAP)
 
-# 6. Optional: rehearse the auth handshake locally before
-#    connecting. Requires the founder to have shared the
-#    cap blob too (typically via the same gossip mesh, but for
-#    first connection you can copy `shared.pile` over).
+# 6. Rehearse the auth handshake locally before connecting. This succeeds only
+#    after step 4 put the cap blob and complete ancestor closure in this pile.
 trible team show --pile shared.pile --cap "$TRIBLE_TEAM_CAP" \
   --verify "$TRIBLE_TEAM_ROOT"
 # → ✓ VERIFIED  ←  matches what the relay would report at OP_AUTH
 
-# 7. Connect to the relay (founder) and sync. The gossip mesh
+# 7. Connect to the relay (founder). This command currently syncs the legacy
+#    head/blob protocol; transport for native collection records remains a
+#    separate integration boundary.
+#    The gossip mesh
 #    is identified by the team root pubkey (no separate topic
 #    flag) — once `TRIBLE_TEAM_ROOT` is set, both peers join
 #    the same mesh automatically.
@@ -79,7 +81,8 @@ trible pile net sync ./local.pile \
     BEFORE proceeding.
   - *Identity exchange via plain text*: pubkeys and cap handles
     are not secrets. Don't paranoid-encrypt them; do paranoid-
-    encrypt the team root SECRET.
+    encrypt the team root SECRET. A handle is only a coordinate, however; the
+    invitee must also receive the referenced cap and ancestor blobs.
   - *pile net status before sync*: the diagnostic confirms
     what would be presented on `OP_AUTH`. Catches "I forgot to
     `export`" before it produces "connection refused" with no
@@ -94,30 +97,28 @@ trible pile net sync ./local.pile \
     (gossip topic) — there's no way to "join the right team but
     the wrong gossip channel" because they're the same channel.
 
-== Revoking a teammate
+== Ending a teammate's renewal
 
 ```sh
-# Founder needs the team root SECRET (loaded from the offline
-# archive, NOT from $TRIBLE_TEAM_CAP — that's the founder's
-# operating cap, not the team root's secret key).
-trible team revoke \
-  --pile shared.pile \
-  --team-root-secret <secret-hex-from-offline-archive> \
-  --target <revoked-pubkey-hex>
+# Find the local renewal-policy entry created when the capability was issued or approved.
+trible team list-issued --pile shared.pile
 
-# The revocation cascades transitively: every cap the revoked
-# pubkey signed (or chained through) is invalidated. The next
-# `pile net sync` snapshot refresh on each relay picks it up
-# without restart.
+# Stop renewing that exact (subject, scope) grant.
+trible team retract --pile shared.pile --entry <renewal-entry-id>
 ```
+
+Capabilities are deliberately short-lived. Retraction is a local policy
+decision observed by the daemon on its next tick; the existing signed chain
+expires naturally. It does not claim that a monotonic fact already observed by
+another node can be globally revoked or erased.
 
 == Cross-references
 
   - "Teams: Capability-Based Membership" — per-command
     detail and the env-var fallback semantics
-  - "Recipe: Multi-Agent Coordination" — how agents
-    coordinate AFTER they're synced (this recipe gets them
-    synced; that one runs them through their first hand-off)
+  - "Recipe: Multi-Agent Coordination" — how agents sharing one
+    natively populated pile perform a hand-off; the current network command
+    does not yet transport those collection records
   - The `triblespace-rs/book/src/capability-auth.md` chapter
     has the complete protocol-level reference
 

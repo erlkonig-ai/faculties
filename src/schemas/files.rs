@@ -51,7 +51,7 @@ pub mod file {
         "AA6AB6F5E68F3A9D95681251C2B9DAFA" unsafe as name: inlineencodings::Handle<blobencodings::LongString>;
         // file leaf: canonical media-type entity
         "B300DAE46621BF56D11621BAD9C66BA5" unsafe as media_type: inlineencodings::GenId;
-        // import: timestamp
+        // import timestamp; preserved legacy file provenance outside identity
         "3765160CC1A96BE38302B344718E4C49" unsafe as imported_at: inlineencodings::NsTAIInterval;
         // TODO: migrate to metadata::tag (GenId) — should use canonical tag
         // entities with metadata::name, not inline ShortString. See wiki.rs TagIndex.
@@ -60,7 +60,7 @@ pub mod file {
         "0AC1D962B6E8170FDD73AE3743E16578" unsafe as children: inlineencodings::GenId;
         // import: root directory or file entity
         "7B36A7A304C26C5504EA54F5723FA135" unsafe as root: inlineencodings::GenId;
-        // import: original filesystem path
+        // import path; also preserved source provenance on historical files
         "E4B24BB9F469CEC6FD12926C56514E9F" unsafe as source_path: inlineencodings::Handle<blobencodings::LongString>;
         // file leaf: CLIP-512 embedding handle (v0, untyped Embedding) —
         // semantic-search exhaust, set on `add` for image/* files. Being

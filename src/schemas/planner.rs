@@ -16,13 +16,25 @@
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
-pub const DEFAULT_BRANCH: &str = "planner";
+/// Exact historical repository branch consumed by the stopped-world cutover.
+pub const LEGACY_BRANCH_NAME: &str = "planner";
+
+/// Stable extrinsic scope of the Planner collection.
+///
+/// Minted with `trible genid` on 2026-08-09:
+/// `C1D75087D7903CF8759FA2F91290E0DD`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("C1D75087D7903CF8759FA2F91290E0DD");
 
 /// Marks an entity as an event (VEVENT-shaped record).
 pub const KIND_EVENT_ID: Id = id_hex!("576743CE8E79C663D116AAAAF5168F40");
 /// Marks an entity as a planner note (free-text context attached
 /// to an event — minutes, prep, post-meeting takeaways).
 pub const KIND_NOTE_ID: Id = id_hex!("AF8C3BF988B4D97B1AAC665F2B9B8FB5");
+/// Marks a monotone assertion that an event is cancelled.
+///
+/// Minted with `trible genid` on 2026-08-09:
+/// `73F587E9A9B956B4B3EFA8D6A6FA6EAF`.
+pub const KIND_CANCELLATION_ID: Id = id_hex!("73F587E9A9B956B4B3EFA8D6A6FA6EAF");
 
 /// Event attributes — one per RFC 5545 VEVENT property we care
 /// about. Time-of-day data lives in a single `time: NsTAIInterval`
@@ -66,10 +78,10 @@ pub mod event {
         // Free-text location (RFC 5545's LOCATION property) —
         // physical room, video-call URL, etc.
         "A487B9784985D0E285A5CC9C6B053B94" unsafe as location: inlineencodings::ShortString;
-        // RFC 5545 STATUS — one of `TENTATIVE` / `CONFIRMED` /
-        // `CANCELLED`. Cancelled events stay in the pile (history
-        // is append-only) but are filtered out of "today" /
-        // "week" views by default.
+        // Baseline RFC 5545 STATUS — one of `TENTATIVE` / `CONFIRMED` /
+        // `CANCELLED`. A later local cancellation is represented by a
+        // separate intrinsic cancellation assertion; status is never appended
+        // again as a competing scalar value.
         "BDE09DF9E0DF0A0738727348037EFA84" unsafe as status: inlineencodings::ShortString;
         // RFC 5545 TRANSP — `OPAQUE` (blocks the time slot;
         // counts toward "busy") or `TRANSPARENT` (informational,
@@ -98,5 +110,15 @@ pub mod note {
         "A7971D096F0FE50C896338802A8A3B1A" unsafe as note_about: inlineencodings::GenId;
         "4DFEEF75B29536E5F77DFFC54D7B5130" unsafe as note_text:
             inlineencodings::Handle<blobencodings::LongString>;
+    }
+}
+
+/// Attributes of a monotone event-cancellation assertion.
+pub mod cancellation {
+    use super::*;
+    attributes! {
+        // The event cancelled by this assertion. Minted with `trible genid`
+        // on 2026-08-09: `123D7A7CC84D0E95EE51298021213B46`.
+        "123D7A7CC84D0E95EE51298021213B46" unsafe as event: inlineencodings::GenId;
     }
 }

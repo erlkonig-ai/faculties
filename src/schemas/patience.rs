@@ -1,11 +1,10 @@
-//! Patience schema: timeout extension events appended to the cognition branch.
+//! Patience schema: timeout extension events in the Cognition collection.
 //!
 //! Used by `patience.rs` (the faculty CLI).
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
-pub const DEFAULT_BRANCH: &str = "cognition";
 pub const KIND_TIMEOUT_EXTENSION_ID: Id = id_hex!("75BC66A1C39131B9A0975613AC9B59FD");
 
 pub mod exec_schema {

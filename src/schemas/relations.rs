@@ -1,7 +1,11 @@
-//! Relations schema: people and their labels, aliases, contact info.
+//! Relations schemas: legacy anchor facts and canonical snapshot records.
 //!
-//! Used by `relations.rs` (the faculty CLI) and by any faculty that
-//! needs to resolve a person by label or alias (e.g. `message.rs`).
+//! The live faculty and its current consumers still read the historical
+//! anchor-shaped attributes in [`relations`]. New authored state is modelled
+//! by the intrinsic [`profile`], [`lifecycle`], [`group`], and [`identity`]
+//! snapshot records consumed by [`crate::relations`]. Keeping both schemas
+//! explicit preserves published fact identity without hiding migration policy
+//! inside the algebra.
 
 use std::collections::{HashMap, HashSet};
 use triblespace::core::metadata;
@@ -10,13 +14,31 @@ use triblespace::prelude::*;
 
 pub const DEFAULT_BRANCH: &str = "relations";
 
+/// Stable extrinsic scope of the authored Relations collection.
+///
+/// Minted with `trible genid` on 2026-08-08.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("A36AB53B3F9B4D52AC6BD473C1F8C4F1");
+
 pub const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 
 /// A group is an addressable party (like a person) whose membership is a
 /// set of `group::member` edges. Sending a message to a group id delivers
 /// to every member; a watcher wakes if a message is addressed to it OR to
-/// a group it belongs to. the broadcast group holds every window.
+/// any explicitly created group it belongs to.
 pub const KIND_GROUP: Id = id_hex!("2CEE877C6C996CE66B4572CE8863DF04");
+
+/// Intrinsic full-state person profile snapshot.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_PERSON_PROFILE: Id = id_hex!("BEFF639D71F2AF70BC01E0DBE99C0304");
+/// Intrinsic person active/retired lifecycle snapshot.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_PERSON_LIFECYCLE: Id = id_hex!("717DCED8539A871037AFFC7893F6FF9F");
+/// Intrinsic full-state group snapshot.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_GROUP_SNAPSHOT: Id = id_hex!("A42E379E89D2F3A52EEA7A40771B51BF");
+/// Intrinsic same-person/distinct-person verdict snapshot.
+/// Minted with `trible genid` on 2026-08-08.
+pub const KIND_IDENTITY_VERDICT: Id = id_hex!("4BEAD16C2FDBBDEB7BA37B464594E1CE");
 
 /// Soft-retirement events. Retiring a relation is monotonic (append-only):
 /// we never delete the person entity — instead we append a small event
@@ -26,7 +48,7 @@ pub const KIND_GROUP: Id = id_hex!("2CEE877C6C996CE66B4572CE8863DF04");
 /// A person's current state is the latest event by timestamp (retire vs
 /// unretire — exactly like compass prioritize/deprioritize). Default views
 /// exclude retired relations; `--all`/`--retired` reveal them. This keeps
-/// the active roster clean (real people + live zooids) without ever losing
+/// the active roster clean (real people + live agents) without ever losing
 /// the imported cruft, which stays fully recoverable in the pile.
 pub const KIND_RETIRE_ID: Id = id_hex!("CB9251505F663A9232C632CC9E68863A");
 pub const KIND_UNRETIRE_ID: Id = id_hex!("D2D4AFCAD74CBD193B2EB7FE94AE27E9");
@@ -47,6 +69,73 @@ pub mod group {
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+
+/// Attributes of an intrinsic, full-state person profile snapshot.
+pub mod profile {
+    use super::*;
+
+    attributes! {
+        /// Stable person anchor described by this snapshot.
+        /// Minted with `trible genid` on 2026-08-08.
+        "6BB0306AA13B62F7E5490AEB255430E3" unsafe as of: inlineencodings::GenId;
+
+        /// Exact aliases in this profile snapshot.
+        /// Minted with `trible genid` on 2026-08-08.
+        "8663728605F1212E3B454D0E7F09FB76" unsafe as alias: inlineencodings::Handle<blobencodings::LongString>;
+        /// Exact affinity/relationship labels in this profile snapshot.
+        /// Minted with `trible genid` on 2026-08-08.
+        "96101F2E1A20978BEBD12BB97D6E84F6" unsafe as affinity: inlineencodings::Handle<blobencodings::LongString>;
+        /// Tenant-scoped external Teams identifiers.
+        /// Minted with `trible genid` on 2026-08-08.
+        "9DBA8FAEF649E33919BC708F943F0C2D" unsafe as teams_user_id: inlineencodings::Handle<blobencodings::LongString>;
+        /// Exact email-address set.
+        /// Minted with `trible genid` on 2026-08-08.
+        "962F91429CE0432204B12E9A041E56A8" unsafe as email: inlineencodings::Handle<blobencodings::LongString>;
+        /// Exact phone-number set.
+        /// Minted with `trible genid` on 2026-08-08.
+        "140A6AAD3F1845694F33B00D97B9AF40" unsafe as phone: inlineencodings::Handle<blobencodings::LongString>;
+
+        // These LongString attributes retain their already-published meaning;
+        // only their subject moves from the mutable anchor to a sealed profile.
+        "F0AD0BBFAC4C4C899637573DC965622E" unsafe as first_name: inlineencodings::Handle<blobencodings::LongString>;
+        "764DD765142B3F4725B614BD3B9118EC" unsafe as last_name: inlineencodings::Handle<blobencodings::LongString>;
+        "DC0916CB5F640984EFE359A33105CA9A" unsafe as display_name: inlineencodings::Handle<blobencodings::LongString>;
+        "E3D486BD7C9C088D908DF1B9E1F4D925" unsafe as company: inlineencodings::Handle<blobencodings::LongString>;
+        "173B771D35FEE90B83F2731DD3C59EF8" unsafe as position: inlineencodings::Handle<blobencodings::LongString>;
+        "5A71C103E026FC1AC01E35EDAC274A5C" unsafe as profile_url: inlineencodings::Handle<blobencodings::LongString>;
+    }
+}
+
+/// Attributes of an intrinsic person lifecycle snapshot.
+pub mod lifecycle {
+    use super::*;
+
+    attributes! {
+        /// Stable person anchor governed by this lifecycle snapshot.
+        /// Minted with `trible genid` on 2026-08-08.
+        "36E4966DA6704AA84C44A3E4E8DEB70F" unsafe as of: inlineencodings::GenId;
+        /// Explicit active/retired state; false means active.
+        /// Minted with `trible genid` on 2026-08-08.
+        "639BD621C86B6B6C39F08D6E97026988" unsafe as retired: inlineencodings::Boolean;
+    }
+}
+
+/// Attributes of an intrinsic identity-verdict snapshot.
+pub mod identity {
+    use super::*;
+
+    attributes! {
+        /// Canonically lower person anchor of the adjudicated pair.
+        /// Minted with `trible genid` on 2026-08-08.
+        "31B34A0C3B2129DA19ECEF84961E92EC" unsafe as low: inlineencodings::GenId;
+        /// Canonically higher person anchor of the adjudicated pair.
+        /// Minted with `trible genid` on 2026-08-08.
+        "86B8EF9DA613C443C27A1A9519222CBE" unsafe as high: inlineencodings::GenId;
+        /// True means same person; false means explicitly distinct.
+        /// Minted with `trible genid` on 2026-08-08.
+        "EFBE40002918177DCBAAEC2D20D223FD" unsafe as same: inlineencodings::Boolean;
+    }
+}
 
 /// The canonical content-sealed fragment for one group snapshot. Its root IS
 /// the snapshot id: any change to the anchor, name handle, member set, or

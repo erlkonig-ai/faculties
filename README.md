@@ -19,8 +19,8 @@ Each tagged release attaches per-target tarballs containing every
 faculty CLI (and the GUI viewer where it cross-compiles cleanly):
 
 ```sh
-# pick the asset matching your platform — see github.com/triblespace/faculties/releases
-curl -L https://github.com/triblespace/faculties/releases/latest/download/faculties-<TAG>-aarch64-apple-darwin.tar.gz \
+# pick the asset matching your platform — see github.com/erlkonig-ai/faculties/releases
+curl -L https://github.com/erlkonig-ai/faculties/releases/latest/download/faculties-<TAG>-aarch64-apple-darwin.tar.gz \
   | tar -xz
 export PATH="$PWD/faculties-<TAG>-aarch64-apple-darwin:$PATH"
 ```
@@ -33,18 +33,22 @@ Install a Rust toolchain (if you don't have one):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Install all faculty CLIs (and the GUI viewer) onto `$PATH`:
+Faculties is developed with TribleSpace, Mary, and a small CubeCL fork as one
+source cohort. Clone them as siblings, then install every faculty CLI (and the
+GUI viewer) onto `$PATH`:
 
 ```sh
-cargo install --git https://github.com/triblespace/faculties --bins
-```
-
-Or from a local checkout:
-
-```sh
-git clone https://github.com/triblespace/faculties
+mkdir faculties-source && cd faculties-source
+git clone https://github.com/erlkonig-ai/faculties
+git clone https://github.com/triblespace/triblespace-rs
+git clone https://github.com/erlkonig-ai/mary
+git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
+git -C triblespace-rs checkout d8e8c13ee30f2973cb55e867b01a50f1503cc047
+git -C mary checkout 48751c261bcc98ffbe34dab4789eb49d24cd9b95
+git -C cubecl-fork checkout f299aed551ec97bf28b779bfed6e88a484a167e4
 cd faculties
-cargo install --path . --bins
+cargo install --path . --bins --locked
+cargo install --path ../triblespace-rs/trible --locked
 ```
 
 ### Use it
@@ -52,7 +56,8 @@ cargo install --path . --bins
 Create an empty pile and add a few things:
 
 ```sh
-touch ./self.pile
+trible pile create ./self.pile
+trible pile signing-key init ./self.pile
 export PILE=./self.pile
 
 compass add "ship the demo" --status doing
@@ -60,11 +65,11 @@ wiki create "Hello" "First *typst* fragment."
 viewer               # picks up PILE from the environment
 ```
 
-### For agent onboarding: the bootstrap pile
+### For agent onboarding: the portable bootstrap
 
 If you're an AI agent landing in this repo for the first time —
-or setting one up — `bootstrap.pile` ships a curated onboarding
-substrate: 21 wiki fragments, fully cross-linked into a guided
+or setting one up — the `bootstrap` binary carries a curated onboarding
+seed: 21 Wiki entries, fully cross-linked into a guided
 tour (a start-here hub plus a "Next stop" spine), in four layers:
 
   1. **Foundations** (7) — faculty model and authoring, wiki
@@ -85,32 +90,37 @@ Plus 7 `#bootstrap`-tagged compass goals walking through hands-on
 faculty use (mint an id, create a fragment, archive a file, run
 lint/check, mark a goal done with an outcome note).
 
-Use it as the **basis** of a fresh agent's pile — release
-tarballs ship it right next to the binaries:
+Import it into the recipient's already initialized pile:
 
 ```sh
-cp bootstrap.pile ./self.pile
+trible pile create ./self.pile
+trible pile signing-key init ./self.pile
 export PILE=./self.pile
+bootstrap import
 
 # Verify:
 wiki list --tag bootstrap          # 21 fragments
 compass list                       # 7 hands-on goals in TODO
 ```
 
-(To add the tour to an *existing* pile instead, append it:
-`cat bootstrap.pile >> ./self.pile` — piles merge by
-concatenation.)
+The logical seed is built deterministically from the checked-in
+`bootstrap/*.typ` sources, but its two collection COMMITs are signed by
+the recipient's own durable key. No release-builder signature, branch
+identity, or seed private key is transplanted. Re-running `bootstrap
+import` with the same key is exactly idempotent.
+
+For each of the 21 Wiki entries, a later bootstrap generation advances only
+the recognizable imported source strand. Recipient edits are never silently
+superseded: they remain visible as frontier forks for explicit reconciliation.
 
 Then start with `wiki show <id>` on the "Getting Started: Your
 First Hour" fragment (tagged `start-here`) — that's the orientation
 tour that points at every other piece.
 
-The bootstrap pile is regenerable: edit `bootstrap/*.typ` sources
-and re-run `bootstrap/build.sh`. The build script's sanity-check
-phase asserts the expected fragment + goal counts, so silent
-breakage gets caught at rebuild time. Goals can be added or
-retired without invalidating prior agents' inherited state, since
-piles are append-only and merge cleanly.
+The bootstrap is ordinary source: edit `bootstrap/*.typ` and the
+declarative manifest in `src/bootstrap.rs`, then run
+`bootstrap/build.sh`. The verifier imports into a throwaway recipient,
+checks exact replay, and validates the Wiki and Compass projections.
 
 ## Why
 
@@ -132,7 +142,7 @@ telling the tool what to show you next, and the history falls out naturally.
 | `wiki` | Personal wiki with typst fragments, links, and full-text search |
 | `files` | File organizer backed by blob storage and tags |
 | `orient` | Situation awareness and directed message/goal/note notifications |
-| `atlas` | Cross-branch map of the pile's contents |
+| `atlas` | Cross-collection map of the pile's contents |
 | `gauge` | Metrics and counters |
 | `memory` | Long-term memory: compact history and salient fragments |
 | `headspace` | Model/prompt configuration |
@@ -145,18 +155,23 @@ telling the tool what to show you next, and the history falls out naturally.
 | `archive` | Import external archives (chats, exports) into the pile |
 | `web` | Web search and fetch with results recorded |
 
-Each faculty's source is a single file under [`src/bin/`](src/bin/) —
-copy one out and tweak it as a starting point for your own.
+Each faculty's command surface lives under [`src/bin/`](src/bin/), while
+shared schemas, collection semantics, validators, and reusable capabilities
+live in the library.
 
-## Notes on pile & branches
+## Notes on piles & collections
 
 Every faculty reads `PILE` from the environment (via clap's native
 env-var support). You can pass `--pile <path>` to override it for a
-single call. A pile is an append-only file — `touch new.pile` is
-literally the whole seed. Faculties operate on named branches of
-the pile and are designed to coexist; multiple faculties on the
-same pile each own their own branch, all rooted in the same
-content-addressed blob store.
+single call. Create a pile explicitly with `trible pile create new.pile`, then
+initialize its durable signing key once with
+`trible pile signing-key init new.pile`. Faculties publish independent signed
+COMMITs into fixed, signer-owned collections. A collection descriptor names
+the collection's meaning; its known facts are the validated union of all valid,
+signer-authored COMMITs for that descriptor. There is no mutable head or
+CAS update, so independently extended pile copies converge by concatenation,
+all backed by the same content-addressed blob store. Historical branches are
+consulted only by explicit migration commands.
 
 ## GORBIE viewer
 
@@ -180,11 +195,11 @@ in your own [GORBIE] notebook) are in `examples/`: `compass_board.rs`,
 
 ## Contributing
 
-Faculties are deliberately simple. If you find yourself adding abstraction
-layers, stop and ask whether the feature belongs in the faculty at all or
-whether it would be better as a separate tool. Each `src/bin/<name>.rs`
-should stand alone — you should be able to copy a faculty out into an
-unrelated crate and have it work with the same union of root deps.
+Faculties are deliberately small at the command boundary. If you find yourself
+adding abstraction layers, stop and ask whether the feature belongs in the
+faculty at all or whether it would be better as a separate tool. Keep each
+`src/bin/<name>.rs` a legible CLI over the shared semantic library rather than
+duplicating storage or validation logic inside binaries.
 
 ## License
 

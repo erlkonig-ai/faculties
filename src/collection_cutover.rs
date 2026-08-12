@@ -11,29 +11,34 @@
 //! immutable [`PileReader`] snapshot. Those coordinates never become target
 //! authority and no operation on a frozen source can update them.
 
-use std::collections::{BTreeSet, HashSet};
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::fs::{self, File};
+use std::io::Seek;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 
 use triblespace::core::attribute::Attribute;
+use triblespace::core::blob::encodings::longstring::LongString;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, IntoBlob, MemoryBlobStore};
 use triblespace::core::collection::simplearchive_union;
 use triblespace::core::collection::{
-    discover_collection_records, Collection, CollectionCommit, CollectionDefinition,
-    CollectionDerive, CollectionMerge, CollectionRecordDiagnostic, CollectionStore,
+    discover_collection_records, Collection, CollectionCommit, CollectionDerive,
+    CollectionDescriptor, CollectionMerge, CollectionRecordDiagnostic, CollectionStore,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader, ReadError};
-use triblespace::core::repo::{self, reachable, BlobStore, BlobStoreGet, CommitHandle, PinStore};
+use triblespace::core::repo::{self, BlobStore, BlobStoreGet, CommitHandle, PinStore};
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{entity, find, pattern};
@@ -47,8 +52,7 @@ use triblespace::macros::{entity, find, pattern};
 /// representation-specific validation before they become usable equations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetDiscovery {
-    definition: CollectionDefinition,
-    definition_present: bool,
+    descriptor: CollectionDescriptor,
     commits: Vec<CollectionCommit>,
     merges: Vec<CollectionMerge>,
     derives: Vec<CollectionDerive>,
@@ -56,14 +60,9 @@ pub struct TargetDiscovery {
 }
 
 impl TargetDiscovery {
-    /// Canonical `SimpleArchive`-union definition for the requested scope.
-    pub const fn definition(&self) -> CollectionDefinition {
-        self.definition
-    }
-
-    /// Whether the definition record is already present in the store.
-    pub const fn definition_present(&self) -> bool {
-        self.definition_present
+    /// Canonical `SimpleArchive`-union descriptor for the requested scope.
+    pub const fn descriptor(&self) -> CollectionDescriptor {
+        self.descriptor
     }
 
     /// Valid self-signed commits targeting this collection, ordered by id.
@@ -95,42 +94,38 @@ impl TargetDiscovery {
 
 /// Discover one target directly through the native collection-record store.
 ///
-/// An absent definition is represented by `definition_present == false`; the
-/// canonical definition itself is still derived from `scope`. No blob scan or
-/// legacy pin lookup participates in target discovery.
+/// The canonical descriptor and its collection handle are derived from
+/// `scope`; no definition registry, blob scan, or legacy pin lookup
+/// participates in target discovery.
 pub fn discover_target<S>(store: &mut S, scope: Id) -> Result<TargetDiscovery>
 where
     S: CollectionStore,
 {
-    let definition = simplearchive_union::definition(scope);
+    let descriptor = simplearchive_union::descriptor(scope);
+    let collection = descriptor.handle();
     let records =
         discover_collection_records(store).context("discover native collection records")?;
-    let definition_present = records
-        .definitions()
-        .iter()
-        .any(|candidate| candidate == &definition);
     let commits = records
         .commits()
         .iter()
         .copied()
-        .filter(|commit| commit.collection() == definition.id())
+        .filter(|commit| commit.collection() == collection)
         .collect();
     let merges = records
         .merges()
         .iter()
         .copied()
-        .filter(|merge| merge.collection() == definition.id())
+        .filter(|merge| merge.collection() == collection)
         .collect();
     let derives = records
         .derives()
         .iter()
         .copied()
-        .filter(|derive| derive.target() == definition.id())
+        .filter(|derive| derive.target() == collection)
         .collect();
 
     Ok(TargetDiscovery {
-        definition,
-        definition_present,
+        descriptor,
         commits,
         merges,
         derives,
@@ -199,7 +194,7 @@ pub fn publish_fragment(
 
 /// Publish a deterministic sequence of complete fragments into one collection.
 ///
-/// This is the authored-leaf migration path: the target pile is opened once,
+/// This is the authored-commit migration path: the target pile is opened once,
 /// each input crosses the same narrow [`Collection::commit`] boundary, and the
 /// pile is closed even if a later publication fails. Replaying a prefix or the
 /// whole sequence is idempotent because both blobs and collection records are
@@ -238,6 +233,85 @@ pub struct SourceFingerprint {
     pub digest: [u8; 32],
 }
 
+/// Physical identity of the source pile captured for stopped-world activation.
+///
+/// This is deliberately independent of [`SourceFingerprint`]. The semantic
+/// fingerprint identifies the legacy coordinates being transformed; this
+/// fingerprint proves that the path still names the same file object with the
+/// same complete byte content immediately before activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalSourceFingerprint {
+    /// Filesystem device containing the source file.
+    #[cfg(unix)]
+    pub device: u64,
+    /// Inode of the source file on `device`.
+    #[cfg(unix)]
+    pub inode: u64,
+    /// Exact source length in bytes.
+    pub length: u64,
+    /// BLAKE3 over every source byte, in file order.
+    pub digest: [u8; 32],
+}
+
+impl PhysicalSourceFingerprint {
+    /// Capture the current complete byte identity of one file.
+    pub(crate) fn capture(path: &Path) -> Result<Self> {
+        let mut file = File::open(path)
+            .with_context(|| format!("open {} for physical fingerprint", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("stat {} for physical fingerprint", path.display()))?;
+        physical_fingerprint_from_open_file(path, &mut file, metadata)
+    }
+
+    /// Verify that `path` still names the captured file object and bytes.
+    ///
+    /// Replacement and length changes fail from metadata alone on Unix. A
+    /// same-length rewrite is detected by hashing the complete file. This is a
+    /// stopped-world guard, not a substitute for excluding writers: a writer
+    /// that races after this method returns can still invalidate activation.
+    pub fn assert_unchanged(&self, path: &Path) -> Result<()> {
+        let mut file = File::open(path)
+            .with_context(|| format!("open frozen source pile {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("stat frozen source pile {}", path.display()))?;
+        self.assert_same_file_and_length(path, &metadata)?;
+
+        let current = physical_fingerprint_from_open_file(path, &mut file, metadata)?;
+        if current.digest != self.digest {
+            bail!(
+                "source pile {} contents changed after freezing; stop every writer and retry",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_same_file_and_length(&self, path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        #[cfg(unix)]
+        if metadata.dev() != self.device || metadata.ino() != self.inode {
+            bail!(
+                "source pile {} was replaced after freezing (device/inode {}:{} -> {}:{}); stop every writer and retry",
+                path.display(),
+                self.device,
+                self.inode,
+                metadata.dev(),
+                metadata.ino()
+            );
+        }
+        if metadata.len() != self.length {
+            bail!(
+                "source pile {} length changed after freezing ({} -> {} bytes); stop every writer and retry",
+                path.display(),
+                self.length,
+                metadata.len()
+            );
+        }
+        Ok(())
+    }
+}
+
 /// One legacy pin coordinate captured in an immutable source snapshot.
 ///
 /// `value` is the exact `SimpleArchive` handle stored in the old named cell.
@@ -268,6 +342,32 @@ pub struct FrozenLegacyDelta {
     pub subject: Id,
     pub facts: TribleSet,
     commit_metadata: TribleSet,
+    content: Option<Inline<Handle<SimpleArchive>>>,
+    frozen: FrozenLegacyDeltaData,
+}
+
+/// Bytes already authenticated while freezing one legacy delta.
+///
+/// Keeping the authored content blob beside its decoded facts lets projection
+/// hydrate the exact immutable attachment closure without fetching or decoding
+/// the root archive a second time. This is deliberately crate-private source
+/// evidence, not a cache or a target-side publication concept.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenLegacyDeltaData {
+    content: Option<Blob<SimpleArchive>>,
+    verified_facts: TribleSet,
+}
+
+/// A legacy commit metadata archive fetched and decoded exactly once while
+/// walking the frozen DAG.
+///
+/// The head's raw archive is verified before this value is built; projection
+/// needs only these decoded fields and the authenticated authored content blob.
+struct FrozenLegacyCommitMetadata {
+    commit: CommitHandle,
+    facts: TribleSet,
+    subject: Id,
+    parents: Vec<CommitHandle>,
     content: Option<Inline<Handle<SimpleArchive>>>,
 }
 
@@ -316,6 +416,7 @@ pub struct ProjectedLegacyCommit {
 #[derive(Debug)]
 pub struct FrozenSource {
     fingerprint: SourceFingerprint,
+    physical_fingerprint: PhysicalSourceFingerprint,
     legacy_pins: Vec<LegacyPinCoordinate>,
     reader: PileReader,
 }
@@ -324,6 +425,19 @@ impl FrozenSource {
     /// Semantic legacy-source identity captured by this snapshot.
     pub const fn fingerprint(&self) -> SourceFingerprint {
         self.fingerprint
+    }
+
+    /// Physical file identity and complete-byte digest captured by this freeze.
+    pub const fn physical_fingerprint(&self) -> PhysicalSourceFingerprint {
+        self.physical_fingerprint
+    }
+
+    /// Assert that the source path is physically unchanged since this freeze.
+    ///
+    /// Activation must call this after all candidate work and immediately
+    /// before replacing the live path.
+    pub fn assert_unchanged(&self, path: &Path) -> Result<()> {
+        self.physical_fingerprint.assert_unchanged(path)
     }
 
     /// Legacy pin coordinates in canonical id order.
@@ -366,60 +480,23 @@ impl FrozenSource {
             count => bail!("frozen source contains {count} legacy branches named {name}"),
         };
         let head = one_legacy_value(&branch_facts, branch_entity, &repo::head, "branch head")?;
-        if let Some(head) = head {
-            let blob: Blob<SimpleArchive> = self
-                .reader
-                .get(head)
+        let deltas = if let Some(head) = head {
+            // Fetch the head metadata once. The same immutable blob first
+            // authenticates the branch coordinate and is then decoded to seed
+            // the DAG walk, so neither operation performs another lookup.
+            let head_archive = read_legacy_commit_archive(&self.reader, head)
                 .with_context(|| format!("read frozen legacy {name} branch head"))?;
-            repo::branch::verify(pin.id, blob, branch_facts.clone())
+            repo::branch::verify(pin.id, head_archive.clone(), branch_facts.clone())
                 .map_err(|_| anyhow!("frozen legacy {name} branch-head signature is invalid"))?;
-        }
+            let head_metadata = decode_legacy_commit_metadata(head, head_archive)?;
 
-        let mut deltas = Vec::new();
-        if let Some(head) = head {
-            for commit in legacy_topological(&self.reader, head)? {
-                let commit_metadata = legacy_commit_metadata(&self.reader, commit)?;
-                let subject = legacy_commit_subject(&commit_metadata, commit)?;
-                let parents = legacy_parents(&commit_metadata, subject);
-                let content =
-                    one_legacy_value(&commit_metadata, subject, &repo::content, "content")?;
-                let facts = match content {
-                    Some(content) => {
-                        let blob: Blob<SimpleArchive> =
-                            self.reader.get(content).with_context(|| {
-                                format!(
-                                    "read frozen legacy {name} content {}",
-                                    hex::encode_upper(content.raw)
-                                )
-                            })?;
-                        repo::commit::verify(blob, commit_metadata.clone()).map_err(|_| {
-                            anyhow!(
-                                "frozen legacy authored commit {} has an invalid content signature",
-                                hex::encode_upper(commit.raw)
-                            )
-                        })?;
-                        self.reader.get(content).with_context(|| {
-                            format!(
-                                "decode frozen legacy {name} content {}",
-                                hex::encode_upper(content.raw)
-                            )
-                        })?
-                    }
-                    None => {
-                        validate_contentless_merge(&commit_metadata, subject, commit)?;
-                        TribleSet::new()
-                    }
-                };
-                deltas.push(FrozenLegacyDelta {
-                    commit,
-                    parents,
-                    subject,
-                    facts,
-                    commit_metadata,
-                    content,
-                });
-            }
-        }
+            legacy_topological(&self.reader, head_metadata)?
+                .into_iter()
+                .map(|metadata| freeze_legacy_delta(&self.reader, name, metadata))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
 
         Ok(Some(FrozenLegacyBranch {
             branch: pin.id,
@@ -460,34 +537,16 @@ where
 
     let mut projected = Vec::new();
     for delta in &branch.deltas {
-        let Some(content_handle) = delta.content_handle() else {
+        let Some(content_blob) = delta.frozen.content.as_ref() else {
             continue;
         };
-        let content_blob: Blob<SimpleArchive> =
-            source.reader.get(content_handle).with_context(|| {
-                format!(
-                    "read frozen legacy content {}",
-                    hex::encode_upper(content_handle.raw)
-                )
-            })?;
-        repo::commit::verify(content_blob, delta.commit_metadata.clone()).map_err(|_| {
-            anyhow!(
-                "frozen legacy authored commit {} has an invalid content signature",
-                hex::encode_upper(delta.commit.raw)
-            )
-        })?;
-        let facts: TribleSet = source.reader.get(content_handle).with_context(|| {
-            format!(
-                "decode frozen legacy content {}",
-                hex::encode_upper(content_handle.raw)
-            )
-        })?;
-        if facts != delta.facts {
+        if delta.facts != delta.frozen.verified_facts {
             bail!(
                 "frozen legacy commit {} content differs from its verified delta",
                 hex::encode_upper(delta.commit.raw)
             );
         }
+        let facts = delta.frozen.verified_facts.clone();
         validate_payloads(&source.reader, &facts).with_context(|| {
             format!(
                 "validate frozen legacy content payloads in commit {}",
@@ -496,7 +555,10 @@ where
         })?;
         let content = Fragment::from_facts_and_blobs(
             facts,
-            hydrate_resident_closure(&source.reader, [content_handle.transmute()])?,
+            hydrate_resident_closure(
+                &source.reader,
+                [content_blob.clone().transmute::<UnknownBlob>()],
+            ),
         );
         let metadata = project_legacy_metadata(&source.reader, delta, &validate_payloads)?;
         projected.push(ProjectedLegacyCommit {
@@ -553,20 +615,111 @@ fn legacy_parents(facts: &TribleSet, subject: Id) -> Vec<CommitHandle> {
     parents
 }
 
-fn legacy_commit_metadata(reader: &PileReader, handle: CommitHandle) -> Result<TribleSet> {
-    reader.get(handle).with_context(|| {
+fn load_legacy_commit_metadata(
+    reader: &PileReader,
+    commit: CommitHandle,
+) -> Result<FrozenLegacyCommitMetadata> {
+    decode_legacy_commit_metadata(commit, read_legacy_commit_archive(reader, commit)?)
+}
+
+fn read_legacy_commit_archive(
+    reader: &PileReader,
+    commit: CommitHandle,
+) -> Result<Blob<SimpleArchive>> {
+    reader.get(commit).with_context(|| {
         format!(
             "read frozen legacy commit {}",
-            hex::encode_upper(handle.raw)
+            hex::encode_upper(commit.raw)
         )
     })
 }
 
-fn legacy_topological(reader: &PileReader, head: CommitHandle) -> Result<Vec<CommitHandle>> {
+fn decode_legacy_commit_metadata(
+    commit: CommitHandle,
+    archive: Blob<SimpleArchive>,
+) -> Result<FrozenLegacyCommitMetadata> {
+    let facts: TribleSet = archive.try_from_blob().with_context(|| {
+        format!(
+            "decode frozen legacy commit {}",
+            hex::encode_upper(commit.raw)
+        )
+    })?;
+    let subject = legacy_commit_subject(&facts, commit)?;
+    let parents = legacy_parents(&facts, subject);
+    let content = one_legacy_value(&facts, subject, &repo::content, "content")?;
+    Ok(FrozenLegacyCommitMetadata {
+        commit,
+        facts,
+        subject,
+        parents,
+        content,
+    })
+}
+
+fn freeze_legacy_delta(
+    reader: &PileReader,
+    branch_name: &str,
+    metadata: FrozenLegacyCommitMetadata,
+) -> Result<FrozenLegacyDelta> {
+    let FrozenLegacyCommitMetadata {
+        commit,
+        facts: commit_metadata,
+        subject,
+        parents,
+        content,
+    } = metadata;
+    let (facts, content) = match content {
+        Some(handle) => {
+            let blob: Blob<SimpleArchive> = reader.get(handle).with_context(|| {
+                format!(
+                    "read frozen legacy {branch_name} content {}",
+                    hex::encode_upper(handle.raw)
+                )
+            })?;
+            repo::commit::verify(blob.clone(), commit_metadata.clone()).map_err(|_| {
+                anyhow!(
+                    "frozen legacy authored commit {} has an invalid content signature",
+                    hex::encode_upper(commit.raw)
+                )
+            })?;
+            let facts: TribleSet = blob.clone().try_from_blob().with_context(|| {
+                format!(
+                    "decode frozen legacy {branch_name} content {}",
+                    hex::encode_upper(handle.raw)
+                )
+            })?;
+            (facts, Some(blob))
+        }
+        None => {
+            validate_contentless_merge(&commit_metadata, subject, commit)?;
+            (TribleSet::new(), None)
+        }
+    };
+    let frozen_facts = facts.clone();
+    Ok(FrozenLegacyDelta {
+        commit,
+        parents,
+        subject,
+        facts,
+        commit_metadata,
+        content: content.as_ref().map(Blob::get_handle),
+        frozen: FrozenLegacyDeltaData {
+            content,
+            verified_facts: frozen_facts,
+        },
+    })
+}
+
+fn legacy_topological(
+    reader: &PileReader,
+    head: FrozenLegacyCommitMetadata,
+) -> Result<Vec<FrozenLegacyCommitMetadata>> {
+    let head_commit = head.commit;
     let mut ordered = Vec::new();
     let mut emitted = HashSet::new();
     let mut active = HashSet::new();
-    let mut stack = vec![(head, false)];
+    let mut loaded = BTreeMap::from([(head_commit, head)]);
+    let mut stack = vec![(head_commit, false)];
     while let Some((commit, expanded)) = stack.pop() {
         if emitted.contains(&commit) {
             continue;
@@ -583,9 +736,14 @@ fn legacy_topological(reader: &PileReader, head: CommitHandle) -> Result<Vec<Com
                 hex::encode_upper(commit.raw)
             );
         }
-        let facts = legacy_commit_metadata(reader, commit)?;
-        let subject = legacy_commit_subject(&facts, commit)?;
-        let parents = legacy_parents(&facts, subject);
+        if let std::collections::btree_map::Entry::Vacant(entry) = loaded.entry(commit) {
+            entry.insert(load_legacy_commit_metadata(reader, commit)?);
+        }
+        let parents = loaded
+            .get(&commit)
+            .expect("visited legacy commit metadata was loaded")
+            .parents
+            .clone();
         stack.push((commit, true));
         for parent in parents.into_iter().rev() {
             if active.contains(&parent) {
@@ -599,7 +757,14 @@ fn legacy_topological(reader: &PileReader, head: CommitHandle) -> Result<Vec<Com
             }
         }
     }
-    Ok(ordered)
+    Ok(ordered
+        .into_iter()
+        .map(|commit| {
+            loaded
+                .remove(&commit)
+                .expect("ordered legacy commit metadata was loaded")
+        })
+        .collect())
 }
 
 fn validate_contentless_merge(facts: &TribleSet, subject: Id, commit: CommitHandle) -> Result<()> {
@@ -642,13 +807,13 @@ where
     let created = one_legacy_value(commit, delta.subject, &metadata::created_at, "created_at")?;
 
     let (mut facts, mut blobs) = if let Some(handle) = attached {
-        let _: Blob<SimpleArchive> = reader.get(handle).with_context(|| {
+        let blob: Blob<SimpleArchive> = reader.get(handle).with_context(|| {
             format!(
                 "strictly read attached frozen legacy metadata {}",
                 hex::encode_upper(handle.raw)
             )
         })?;
-        let facts: TribleSet = reader.get(handle).with_context(|| {
+        let facts: TribleSet = blob.clone().try_from_blob().with_context(|| {
             format!(
                 "decode attached frozen legacy metadata {}",
                 hex::encode_upper(handle.raw)
@@ -662,20 +827,29 @@ where
         })?;
         (
             facts,
-            hydrate_resident_closure(reader, [handle.transmute()])?,
+            hydrate_resident_closure(reader, [blob.transmute::<UnknownBlob>()]),
         )
     } else {
         (TribleSet::new(), MemoryBlobStore::new())
     };
 
     if let Some(handle) = message {
-        let _: View<str> = reader.get(handle).with_context(|| {
+        let blob: Blob<LongString> = reader.get(handle).with_context(|| {
             format!(
                 "strictly read frozen legacy commit message {}",
                 hex::encode_upper(handle.raw)
             )
         })?;
-        blobs.union(hydrate_resident_closure(reader, [handle.transmute()])?);
+        let _: View<str> = blob.clone().try_from_blob().with_context(|| {
+            format!(
+                "decode frozen legacy commit message {}",
+                hex::encode_upper(handle.raw)
+            )
+        })?;
+        blobs.union(hydrate_resident_closure(
+            reader,
+            [blob.transmute::<UnknownBlob>()],
+        ));
     }
 
     let projected = match (created, message) {
@@ -696,33 +870,60 @@ where
 
 fn hydrate_resident_closure(
     reader: &PileReader,
-    roots: impl IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
-) -> Result<MemoryBlobStore> {
+    roots: impl IntoIterator<Item = Blob<UnknownBlob>>,
+) -> MemoryBlobStore {
     let mut blobs = MemoryBlobStore::new();
-    for handle in reachable(reader, roots) {
-        let blob: Blob<UnknownBlob> = reader.get(handle).with_context(|| {
-            format!(
-                "load reachable frozen legacy attachment {}",
-                hex::encode_upper(handle.raw)
-            )
-        })?;
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    for blob in roots {
+        if seen.insert(blob.get_handle().raw) {
+            queue.push_back(blob);
+        }
+    }
+
+    while let Some(blob) = queue.pop_front() {
+        // This is the same conservative 32-byte scan as BlobChildren's
+        // default traversal, but starts from the already loaded root and
+        // carries each successfully resolved child blob forward. No closure
+        // member is fetched twice merely to enumerate and then copy it.
+        for raw in blob.bytes.as_ref().chunks_exact(32) {
+            let mut candidate = [0; 32];
+            candidate.copy_from_slice(raw);
+            if seen.contains(&candidate) {
+                continue;
+            }
+            let handle = Inline::<Handle<UnknownBlob>>::new(candidate);
+            if let Ok(child) = reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle) {
+                // `seen` is the reachable-handle set, not an index of every
+                // arbitrary 32-byte word in an opaque payload. Recording a
+                // miss here can retain the complete contents of a large file
+                // as hundreds of millions of unrelated hash-set entries.
+                seen.insert(candidate);
+                queue.push_back(child);
+            }
+        }
         blobs.insert(blob);
     }
-    Ok(blobs)
+    blobs
 }
 
 /// Capture an immutable reader plus read-only legacy pin coordinates.
 ///
-/// Every writer must already be stopped. The source is opened once, refreshed,
-/// snapshotted, and closed without mutation. Length checks around that snapshot
-/// catch an append racing the freeze and turn it into a retry rather than a
-/// mixed migration input. The durable fingerprint covers only the canonical
-/// pin coordinates: content-addressed values authenticate their closure, while
-/// physical compaction and unrelated append history remain irrelevant.
+/// Every writer must already be stopped. A read-only file handle anchors the
+/// physical file object while the pile is opened, refreshed, snapshotted, and
+/// closed without mutation. Identity and length checks around that snapshot
+/// catch replacement, append, or truncation racing the freeze. The physical
+/// fingerprint covers every source byte; the separate semantic fingerprint
+/// covers only canonical pin coordinates and remains insensitive to physical
+/// compaction and unrelated append history.
 pub fn freeze_source(path: &Path) -> Result<FrozenSource> {
-    let initial_length = fs::metadata(path)
-        .with_context(|| format!("stat source pile {}", path.display()))?
-        .len();
+    let mut physical_file = File::open(path)
+        .with_context(|| format!("open source pile {} for physical freeze", path.display()))?;
+    let initial_metadata = physical_file
+        .metadata()
+        .with_context(|| format!("stat source pile {}", path.display()))?;
+    let physical_fingerprint =
+        physical_fingerprint_from_open_file(path, &mut physical_file, initial_metadata)?;
     let mut pile = open_pile_strict(path)?;
     let result = (|| {
         let legacy_pins = legacy_pin_coordinates(&mut pile)?;
@@ -744,18 +945,63 @@ pub fn freeze_source(path: &Path) -> Result<FrozenSource> {
         }
     };
 
-    let final_length = fs::metadata(path)?.len();
-    if final_length != initial_length {
-        bail!(
-            "source pile changed while freezing ({initial_length} -> {final_length} bytes); stop every writer and retry"
-        );
-    }
+    let final_metadata = fs::metadata(path)
+        .with_context(|| format!("stat source pile {} after freezing", path.display()))?;
+    physical_fingerprint.assert_same_file_and_length(path, &final_metadata)?;
     let fingerprint = fingerprint_legacy_pins(&legacy_pins);
 
     Ok(FrozenSource {
         fingerprint,
+        physical_fingerprint,
         legacy_pins,
         reader,
+    })
+}
+
+fn physical_fingerprint_from_open_file(
+    path: &Path,
+    file: &mut File,
+    initial_metadata: fs::Metadata,
+) -> Result<PhysicalSourceFingerprint> {
+    let mut hasher = blake3::Hasher::new();
+    file.rewind()
+        .with_context(|| format!("rewind source pile {} for hashing", path.display()))?;
+    hasher
+        .update_reader(&mut *file)
+        .with_context(|| format!("hash complete source pile {}", path.display()))?;
+    let bytes_read = file
+        .stream_position()
+        .with_context(|| format!("measure hashed source pile {}", path.display()))?;
+    let final_metadata = file
+        .metadata()
+        .with_context(|| format!("restat open source pile {}", path.display()))?;
+
+    #[cfg(unix)]
+    if initial_metadata.dev() != final_metadata.dev()
+        || initial_metadata.ino() != final_metadata.ino()
+    {
+        bail!(
+            "open source pile {} changed file identity while hashing; stop every writer and retry",
+            path.display()
+        );
+    }
+    if initial_metadata.len() != final_metadata.len() || bytes_read != initial_metadata.len() {
+        bail!(
+            "open source pile {} changed length while hashing (expected {}, read {}, now {} bytes); stop every writer and retry",
+            path.display(),
+            initial_metadata.len(),
+            bytes_read,
+            final_metadata.len()
+        );
+    }
+
+    Ok(PhysicalSourceFingerprint {
+        #[cfg(unix)]
+        device: final_metadata.dev(),
+        #[cfg(unix)]
+        inode: final_metadata.ino(),
+        length: final_metadata.len(),
+        digest: *hasher.finalize().as_bytes(),
     })
 }
 
@@ -811,14 +1057,18 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
+    use std::fs::{File, OpenOptions};
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use anybytes::View;
     use triblespace::core::blob::encodings::longstring::LongString;
+    use triblespace::core::collection::{empty_metadata_handle, CollectionRecord};
     use triblespace::core::inline::encodings::hash::Handle;
+    use triblespace::core::inline::Inline;
     use triblespace::core::metadata;
-    use triblespace::core::repo::{BlobStorePut, PinStore, PushResult};
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
+    use triblespace::core::repo::{BlobStorePut, PinStore, PushResult, Repository};
     use triblespace::macros::entity;
 
     use super::*;
@@ -862,6 +1112,64 @@ mod tests {
     }
 
     #[test]
+    fn target_discovery_uses_descriptor_handle_without_registry_record() {
+        let target_descriptor = simplearchive_union::descriptor(id(1));
+        let other_descriptor = simplearchive_union::descriptor(id(2));
+        let target = target_descriptor.handle();
+        let other = other_descriptor.handle();
+        let signer = SigningKey::from_bytes(&[7; 32]);
+
+        let target_commit = CollectionCommit::sign(
+            &signer,
+            target,
+            Inline::new([1; 32]),
+            empty_metadata_handle(),
+        );
+        let other_commit = CollectionCommit::sign(
+            &signer,
+            other,
+            Inline::new([2; 32]),
+            empty_metadata_handle(),
+        );
+        let target_merge = CollectionMerge::new(
+            target,
+            Inline::new([3; 32]),
+            Inline::new([4; 32]),
+            Inline::new([5; 32]),
+        );
+        let other_merge = CollectionMerge::new(
+            other,
+            Inline::new([6; 32]),
+            Inline::new([7; 32]),
+            Inline::new([8; 32]),
+        );
+        let derive_to_target =
+            CollectionDerive::new(other, target, Inline::new([9; 32]), Inline::new([10; 32]));
+        let derive_from_target =
+            CollectionDerive::new(target, other, Inline::new([11; 32]), Inline::new([12; 32]));
+
+        let mut store = MemoryRepo::default();
+        for record in [
+            CollectionRecord::Commit(target_commit),
+            CollectionRecord::Commit(other_commit),
+            CollectionRecord::Merge(target_merge),
+            CollectionRecord::Merge(other_merge),
+            CollectionRecord::Derive(derive_to_target),
+            CollectionRecord::Derive(derive_from_target),
+        ] {
+            store.insert(record).unwrap();
+        }
+
+        let discovered = discover_target(&mut store, id(1)).unwrap();
+        assert_eq!(discovered.descriptor(), target_descriptor);
+        assert_eq!(discovered.commits(), &[target_commit]);
+        assert_eq!(discovered.merges(), &[target_merge]);
+        assert_eq!(discovered.derives(), &[derive_to_target]);
+        assert!(discovered.diagnostics().is_empty());
+        assert!(store.blobs.is_empty());
+    }
+
+    #[test]
     fn publication_conserves_both_fact_channels_and_attachments_and_replays_idempotently() {
         let files = TestFiles::new();
         initialize_signer(&files.pile, Some(&files.key)).unwrap();
@@ -898,14 +1206,17 @@ mod tests {
             .unwrap()
             .is_empty());
         let target = discover_target(&mut pile, id(1)).unwrap();
-        assert!(target.definition_present());
+        assert_eq!(target.descriptor(), simplearchive_union::descriptor(id(1)));
         assert_eq!(target.commits(), &[first]);
         assert!(target.merges().is_empty());
         assert!(target.derives().is_empty());
         assert!(target.diagnostics().is_empty());
 
         let unrelated_target = discover_target(&mut pile, id(2)).unwrap();
-        assert!(unrelated_target.definition_present());
+        assert_eq!(
+            unrelated_target.descriptor(),
+            simplearchive_union::descriptor(id(2))
+        );
         assert_eq!(unrelated_target.commits().len(), 1);
 
         let reader = pile.reader().unwrap();
@@ -954,6 +1265,162 @@ mod tests {
         );
         let from_snapshot: TribleSet = frozen.reader().get(value).unwrap();
         assert_eq!(from_snapshot, pin_facts);
+
+        let physical = frozen.physical_fingerprint();
+        assert_eq!(physical.length, before.len() as u64);
+        assert_eq!(physical.digest, *blake3::hash(&before).as_bytes());
+        frozen.assert_unchanged(&files.pile).unwrap();
+    }
+
+    #[test]
+    fn projection_reuses_the_frozen_verified_content_blob() {
+        const BRANCH: &str = "single-decode";
+        let files = TestFiles::new();
+        let pile = open_pile_strict(&files.pile).unwrap();
+        let mut repository =
+            Repository::new(pile, SigningKey::from_bytes(&[0x5A; 32]), Fragment::empty()).unwrap();
+        let branch_id = *repository.create_branch(BRANCH, None).unwrap();
+        let expected = entity! { _ @ metadata::tag: &id(12) };
+        let expected_facts = expected.facts().clone();
+        let mut workspace = repository.pull(branch_id).unwrap();
+        workspace.commit(expected, "frozen once");
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+
+        let source = freeze_source(&files.pile).unwrap();
+        let branch = source.legacy_branch(BRANCH).unwrap().unwrap();
+        let delta = branch
+            .deltas
+            .iter()
+            .find(|delta| delta.is_authored())
+            .expect("one authored legacy delta");
+        let content = delta.content_handle().unwrap();
+        let attached = one_legacy_value(
+            delta.commit_metadata(),
+            delta.subject,
+            &metadata::archive,
+            "metadata archive",
+        )
+        .unwrap()
+        .unwrap();
+        let message = one_legacy_value(
+            delta.commit_metadata(),
+            delta.subject,
+            &repo::message,
+            "message",
+        )
+        .unwrap()
+        .unwrap();
+
+        // Projection still needs semantic metadata roots, but deliberately
+        // receives a reader from which the authored content archive is absent.
+        // Success therefore proves it consumes the verified blob frozen on the
+        // delta rather than retrieving/decoding the content a second time.
+        let detached_path = files.directory.join("detached.pile");
+        File::create(&detached_path).unwrap();
+        let mut detached = open_pile_strict(&detached_path).unwrap();
+        let attached_blob: Blob<SimpleArchive> = source.reader().get(attached).unwrap();
+        detached
+            .put::<SimpleArchive, _>(attached_blob)
+            .expect("copy attached semantic metadata");
+        let message_blob: Blob<LongString> = source.reader().get(message).unwrap();
+        detached
+            .put::<LongString, _>(message_blob)
+            .expect("copy legacy message");
+        let detached_reader = detached.reader().unwrap();
+        assert!(detached_reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(content)
+            .is_err());
+        detached.close().unwrap();
+
+        let detached_source = FrozenSource {
+            fingerprint: source.fingerprint,
+            physical_fingerprint: source.physical_fingerprint,
+            legacy_pins: source.legacy_pins.clone(),
+            reader: detached_reader,
+        };
+
+        let mut tampered = branch.clone();
+        tampered
+            .deltas
+            .iter_mut()
+            .find(|delta| delta.is_authored())
+            .unwrap()
+            .facts += entity! { _ @ metadata::tag: &id(13) }.into_facts();
+        let error = project_legacy_authored_commits(&detached_source, &tampered, |_, _| Ok(()))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("content differs from its verified delta"));
+
+        let projected =
+            project_legacy_authored_commits(&detached_source, &branch, |_, _| Ok(())).unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].content.facts(), &expected_facts);
+    }
+
+    #[test]
+    fn physical_source_guard_rejects_append() {
+        let files = TestFiles::new();
+        let frozen = freeze_source(&files.pile).unwrap();
+
+        OpenOptions::new()
+            .append(true)
+            .open(&files.pile)
+            .unwrap()
+            .write_all(b"appended")
+            .unwrap();
+
+        let error = frozen.assert_unchanged(&files.pile).unwrap_err();
+        assert!(format!("{error:#}").contains("length changed after freezing"));
+    }
+
+    #[test]
+    fn physical_source_guard_rejects_truncation() {
+        let files = TestFiles::new();
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        pile.close().unwrap();
+        let frozen = freeze_source(&files.pile).unwrap();
+        let length = fs::metadata(&files.pile).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&files.pile)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+
+        let error = frozen.assert_unchanged(&files.pile).unwrap_err();
+        assert!(format!("{error:#}").contains("length changed after freezing"));
+    }
+
+    #[test]
+    fn physical_source_guard_rejects_same_length_rewrite() {
+        let files = TestFiles::new();
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        pile.close().unwrap();
+        let frozen = freeze_source(&files.pile).unwrap();
+
+        let mut file = OpenOptions::new().write(true).open(&files.pile).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"X").unwrap();
+        file.sync_all().unwrap();
+
+        let error = frozen.assert_unchanged(&files.pile).unwrap_err();
+        assert!(format!("{error:#}").contains("contents changed after freezing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_source_guard_rejects_byte_identical_replacement() {
+        let files = TestFiles::new();
+        let frozen = freeze_source(&files.pile).unwrap();
+        let bytes = fs::read(&files.pile).unwrap();
+        let replacement = files.directory.join("replacement.pile");
+        fs::write(&replacement, bytes).unwrap();
+        fs::rename(replacement, &files.pile).unwrap();
+
+        let error = frozen.assert_unchanged(&files.pile).unwrap_err();
+        assert!(format!("{error:#}").contains("was replaced after freezing"));
     }
 
     #[test]

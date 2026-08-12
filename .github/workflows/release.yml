@@ -2,7 +2,7 @@ name: release
 
 # Build precompiled faculty binaries on tag push and attach them to
 # the GitHub release. Restricted sandboxes can grab a tarball; dev
-# environments can still `cargo install` from source.
+# environments can still install from the documented sibling source cohort.
 
 on:
   push:
@@ -33,13 +33,40 @@ jobs:
             os: macos-14
 
     steps:
-      - uses: actions/checkout@v4
+      # Faculties is intentionally developed as one source cohort with
+      # TribleSpace, Mary, and the CubeCL zero-copy fork. Keep the repositories
+      # as siblings: their paths are part of the local Cargo manifests.
+      - name: Check out Faculties
+        uses: actions/checkout@v4
+        with:
+          path: faculties
+
+      - name: Check out TribleSpace cohort
+        uses: actions/checkout@v4
+        with:
+          repository: triblespace/triblespace-rs
+          ref: d8e8c13ee30f2973cb55e867b01a50f1503cc047
+          path: triblespace-rs
+
+      - name: Check out Mary cohort
+        uses: actions/checkout@v4
+        with:
+          repository: erlkonig-ai/mary
+          ref: 48751c261bcc98ffbe34dab4789eb49d24cd9b95
+          path: mary
+
+      - name: Check out CubeCL zero-copy cohort
+        uses: actions/checkout@v4
+        with:
+          repository: erlkonig-ai/cubecl
+          ref: f299aed551ec97bf28b779bfed6e88a484a167e4
+          path: cubecl-fork
 
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           # `wasm32-unknown-unknown` is needed because `wasmi`'s build
-          # script (pulled transitively via triblespace-core 0.37)
+          # script (pulled transitively via triblespace-core)
           # invokes rustc against it.
           targets: ${{ matrix.target }}, wasm32-unknown-unknown
 
@@ -48,28 +75,29 @@ jobs:
         # and the CLI faculties carry pre-existing unused-import
         # noise from their rust-script origins. Add a separate lint
         # workflow if/when we want to enforce.
-        run: cargo build --release --bins --target ${{ matrix.target }}
+        working-directory: faculties
+        run: cargo build --locked --release --bins --target ${{ matrix.target }}
 
       - name: Build bundled trible CLI
         # Ship the `trible` CLI alongside the faculty bins so users
         # who grab a tarball get the whole pile-management toolkit
-        # in one drop. Pulled from crates.io (latest) and built for
-        # the matrix target via `cargo install`.
+        # in one drop. Keep it on the exact TribleSpace release cohort
+        # compiled into Faculties so pile formats and management APIs agree.
+        working-directory: faculties
         run: |
-          cargo install trible \
+          cargo install \
+            --path ../triblespace-rs/trible \
             --target ${{ matrix.target }} \
             --root "$RUNNER_TEMP/trible-staged" \
             --locked
 
       - name: Stage binaries
+        working-directory: faculties
         run: |
           set -eu
           stage="faculties-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "$stage"
           cp LICENSE-MIT LICENSE-APACHE README.md "$stage/" || true
-          # Onboarding wiki fragments + starter goals; seed with
-          # `cat bootstrap.pile >> ./self.pile` after unpacking.
-          cp bootstrap.pile "$stage/"
           # All faculty binaries, including the default-enabled viewer and
           # capture tools (extension-less; .exe suffix on windows if we ever
           # add it).
@@ -85,8 +113,8 @@ jobs:
           cp "$RUNNER_TEMP/trible-staged/bin/trible" "$stage/"
           tar -czf "$stage.tar.gz" "$stage"
           shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
-          echo "STAGE_TARBALL=$stage.tar.gz" >> "$GITHUB_ENV"
-          echo "STAGE_SHA256=$stage.tar.gz.sha256" >> "$GITHUB_ENV"
+          echo "STAGE_TARBALL=faculties/$stage.tar.gz" >> "$GITHUB_ENV"
+          echo "STAGE_SHA256=faculties/$stage.tar.gz.sha256" >> "$GITHUB_ENV"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -107,14 +135,12 @@ jobs:
           echo "" >> notes.md
           echo "### Precompiled (sandboxed environments)" >> notes.md
           echo '```sh' >> notes.md
-          echo 'curl -L https://github.com/triblespace/faculties/releases/download/'"${GITHUB_REF_NAME}"'/faculties-'"${GITHUB_REF_NAME}"'-aarch64-apple-darwin.tar.gz | tar -xz' >> notes.md
+          echo 'curl -L https://github.com/erlkonig-ai/faculties/releases/download/'"${GITHUB_REF_NAME}"'/faculties-'"${GITHUB_REF_NAME}"'-aarch64-apple-darwin.tar.gz | tar -xz' >> notes.md
           echo 'export PATH="$PWD/faculties-'"${GITHUB_REF_NAME}"'-aarch64-apple-darwin:$PATH"' >> notes.md
           echo '```' >> notes.md
           echo "" >> notes.md
           echo "### From source (dev environments)" >> notes.md
-          echo '```sh' >> notes.md
-          echo 'cargo install --git https://github.com/triblespace/faculties --tag '"${GITHUB_REF_NAME}"' --bins' >> notes.md
-          echo '```' >> notes.md
+          echo "Faculties uses a sibling source cohort; see the tagged README for the exact layout." >> notes.md
       - uses: softprops/action-gh-release@v2
         with:
           body_path: notes.md

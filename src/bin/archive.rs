@@ -1,695 +1,48 @@
-use std::any::Any;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
-use std::io::{BufRead, Read};
-use std::num::NonZeroUsize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
-use std::time::Instant;
+use std::sync::Once;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand};
+use faculties::archive_claude_code::{self, ProjectionSummary};
+use faculties::archive_collection::{
+    self as archive_collection, ArchiveImportWriter, ArchivePart, ArchivePayload,
+    ArchiveProjection, ArchiveSearchSnapshot, ArchiveSnapshot,
+};
+use faculties::archive_cutover;
+use faculties::blockdag::CatalogValidation;
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::comb::{
+    self as comb_model, CombCatalog, CursorDraft, CursorResolution, CursorState,
+};
+use faculties::comb_cutover;
+use faculties::schemas::blockdag as archive_schema;
+use faculties::schemas::memory::DEFAULT_COMB_SCOPE_ID;
 use hifitime::Epoch;
-use itertools::Itertools;
-use tracing::info_span;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
-use triblespace::core::patch::PATCH;
-use triblespace::core::repo::index_home::{
-    set_index_frontier, strip_recipe_manifest, IndexHome, IndexKind, Manifest, SuccinctRollup,
-};
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{
-    ancestors, commits_topological, difference, CommitSelector, PushResult,
-};
-use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
-use triblespace::prelude::*;
-use triblespace_search::index_bm25::{query_across, Bm25Rollup};
-use triblespace_search::tokens::hash_tokens;
-
-#[path = "importers/archive_import_agy.rs"]
-mod archive_import_agy;
-#[path = "importers/archive_import_chatgpt.rs"]
-mod archive_import_chatgpt;
-#[path = "importers/archive_import_claude_code.rs"]
-mod archive_import_claude_code;
-#[path = "importers/archive_import_claude_web.rs"]
-mod archive_import_claude_web;
-#[path = "importers/archive_import_codex.rs"]
-mod archive_import_codex;
-#[path = "importers/archive_import_copilot.rs"]
-mod archive_import_copilot;
-#[path = "importers/archive_import_gemini.rs"]
-mod archive_import_gemini;
-mod common {
-    #![allow(dead_code)]
-
-    use std::path::{Path, PathBuf};
-
-    use anyhow::{anyhow, bail, Context, Result};
-    use ed25519_dalek::SigningKey;
-    use hifitime::Epoch;
-    use itertools::Itertools;
-    use rand_core::OsRng;
-    use rayon::prelude::*;
-    use rayon::ThreadPoolBuilder;
-
-    use tracing::info_span;
-    use triblespace::core::blob::Blob;
-    use triblespace::core::id::ExclusiveId;
-    pub use triblespace::core::metadata;
-    use triblespace::core::repo::index_home::{
-        append_prepared_range, set_index_frontier, validate_monotone_batch, CommitRange, IndexKind,
-        Manifest, PreparedSuccinctArtifact, SuccinctRollup,
-    };
-    use triblespace::core::repo::pile::{Pile, PileReader};
-    use triblespace::core::repo::CommitBatch;
-    use triblespace::core::repo::{Repository, Workspace};
-    use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
-    use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
-    use triblespace::prelude::*;
-    use triblespace_search::index_bm25::Bm25Rollup;
-    use triblespace_search::portable_bm25::PortableBM25Blob;
-
-    #[cfg(feature = "gpu-succinct")]
-    use triblespace::core::repo::index_home::AcceleratedSuccinctRollup;
-    #[cfg(feature = "gpu-succinct")]
-    use triblespace_gpu::WgpuWaveletFreeze;
-
-    pub use faculties::schemas::archive::{self as archive_schema, archive, import_schema};
-    pub use faculties::schemas::memory::comb;
-
-    pub type Repo = Repository<Pile>;
-    pub type Ws = Workspace<Pile>;
-    pub type CommitHandle = Inline<Handle<SimpleArchive>>;
-
-    /// Bound the transient six-PATCH view used while freezing one physical
-    /// SuccinctArchive leaf. A larger source commit is still one *logical*
-    /// commit leaf; all of its physical shards land atomically before its
-    /// coverage certificate advances.
-    const INDEX_PHYSICAL_LEAF_TRIBLES: usize = 1 << 16;
-
-    /// Conservative Apple Metal crossover measured against the summed input
-    /// rows before cross-segment deduplication.
-    #[cfg(feature = "gpu-succinct")]
-    const GPU_SUCCINCT_MIN_INPUT_ROWS: usize = 300_000;
-
-    #[cfg(feature = "gpu-succinct")]
-    pub(super) type ArchiveSuccinctRollup = AcceleratedSuccinctRollup<WgpuWaveletFreeze>;
-
-    #[cfg(not(feature = "gpu-succinct"))]
-    pub(super) type ArchiveSuccinctRollup = SuccinctRollup;
-
-    /// Construct one rollup per archive-indexing lifecycle. The hook keeps
-    /// this value alive across push attempts and batches so the WGPU runtime,
-    /// shader cache, allocator, and circuit-breaker state are reused.
-    #[cfg(feature = "gpu-succinct")]
-    pub(super) fn archive_succinct_rollup() -> ArchiveSuccinctRollup {
-        AcceleratedSuccinctRollup::new(
-            WgpuWaveletFreeze::new(&Default::default()),
-            GPU_SUCCINCT_MIN_INPUT_ROWS,
-        )
-    }
-
-    #[cfg(not(feature = "gpu-succinct"))]
-    pub(super) fn archive_succinct_rollup() -> ArchiveSuccinctRollup {
-        SuccinctRollup::new()
-    }
-
-    pub(super) fn validate_physical_leaf_boundaries(bytes: &[u8]) -> Result<()> {
-        debug_assert_eq!(bytes.len() % 64, 0);
-        let trible_count = bytes.len() / 64;
-        for boundary in
-            (INDEX_PHYSICAL_LEAF_TRIBLES..trible_count).step_by(INDEX_PHYSICAL_LEAF_TRIBLES)
-        {
-            let previous = &bytes[(boundary - 1) * 64..boundary * 64];
-            let next = &bytes[boundary * 64..(boundary + 1) * 64];
-            if previous == next {
-                bail!("redundant trible across physical shard boundary {boundary}");
-            }
-            if previous > next {
-                bail!("noncanonical ordering across physical shard boundary {boundary}");
-            }
-        }
-        Ok(())
-    }
-
-    fn acquire_or_force(id: Id) -> ExclusiveId {
-        id.acquire().unwrap_or_else(|| ExclusiveId::force(id))
-    }
-
-    pub fn parse_paths_parallel<T, F>(
-        label: &str,
-        paths: &[PathBuf],
-        parse_one: F,
-    ) -> Result<Vec<(PathBuf, Result<T>)>>
-    where
-        T: Send,
-        F: Fn(&Path) -> Result<T> + Send + Sync,
-    {
-        let _span = info_span!("parallel_parse", label = label, files = paths.len()).entered();
-        let total_files = paths.len();
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let parser_pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .with_context(|| format!("build {label} parser thread pool"))?;
-        let parse_start = std::time::Instant::now();
-        println!(
-            "{label} phase parse: {} file(s) using {} thread(s)",
-            total_files, threads
-        );
-        let parsed_files = parser_pool.install(|| {
-            paths
-                .par_iter()
-                .map(|path| {
-                    let _file_span = info_span!(
-                        "parse_file",
-                        label = label,
-                        path = %path.display()
-                    )
-                    .entered();
-                    (path.to_path_buf(), parse_one(path.as_path()))
-                })
-                .collect()
-        });
-        let elapsed = parse_start.elapsed();
-        println!("{label} phase parse: done in {:?}", elapsed);
-        tracing::info!(
-            label = label,
-            files = total_files,
-            threads = threads,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "parallel parse complete"
-        );
-        Ok(parsed_files)
-    }
-
-    pub fn open_repo_for_write(
-        pile_path: &Path,
-        branch_id: Id,
-        _branch_name: &str,
-    ) -> Result<(Repo, Id)> {
-        let mut repo = open_repo(pile_path)?;
-        install_archive_index_hook(&mut repo, branch_id);
-        Ok((repo, branch_id))
-    }
-
-    fn install_archive_index_hook(repo: &mut Repo, archive_branch: Id) {
-        // Delay backend construction until this repository actually pushes
-        // the archive branch. Other write lifecycles (notably replay cursor
-        // updates) share this opener but never need an indexing backend.
-        let mut succinct = None;
-        repo.on_commit(move |storage, pushed_branch, batch, head_meta| {
-            if pushed_branch != archive_branch {
-                return Ok(());
-            }
-            let succinct = succinct.get_or_insert_with(archive_succinct_rollup);
-            index_archive_batch(storage, batch, succinct, head_meta).map_err(|err| {
-                Box::new(std::io::Error::other(format!("{err:#}")))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })
-        });
-    }
-
-    fn index_archive_batch<K>(
-        storage: &mut Pile,
-        batch: &CommitBatch,
-        succinct: &K,
-        head_meta: &mut TribleSet,
-    ) -> Result<()>
-    where
-        K: IndexKind<PreparedArtifact = PreparedSuccinctArtifact>,
-    {
-        let content_attr = archive::content.id();
-        let reader = storage
-            .reader()
-            .map_err(|err| anyhow!("open archive index reader: {err:?}"))?;
-        validate_monotone_batch(&reader, batch.base_head, batch.new_head)
-            .map_err(|err| anyhow!("validate monotone archive batch: {err}"))?;
-        let bm25 = Bm25Rollup::new(reader.clone(), content_attr);
-        let succinct_manifest = Manifest::from_tribles(head_meta, &reader, succinct)
-            .map_err(|err| anyhow!("parse Succinct manifest: {err}"))?;
-        if !succinct_manifest.claims_head(batch.base_head) {
-            return Err(anyhow!(
-                "archive Succinct index is stale at {:?}, expected base {:?}; run `archive index`",
-                succinct_manifest.frontier(),
-                batch.base_head
-            ));
-        }
-        let bm25_manifest = Manifest::from_tribles(head_meta, &reader, &bm25)
-            .map_err(|err| anyhow!("parse BM25 manifest: {err}"))?;
-        if !bm25_manifest.claims_head(batch.base_head) {
-            return Err(anyhow!(
-                "archive BM25 index is stale at {:?}, expected base {:?}; run `archive index`",
-                bm25_manifest.frontier(),
-                batch.base_head
-            ));
-        }
-        drop((succinct_manifest, bm25_manifest));
-
-        for commit in &batch.commits {
-            let prepared = prepare_archive_commit(reader.clone(), *commit, true, true)?;
-            publish_archive_commit(storage, prepared, succinct, &bm25, head_meta)?;
-        }
-
-        set_index_frontier(storage, succinct, head_meta, vec![batch.new_head])
-            .map_err(|err| anyhow!("advance Succinct index frontier: {err}"))?;
-        set_index_frontier(storage, &bm25, head_meta, vec![batch.new_head])
-            .map_err(|err| anyhow!("advance BM25 index frontier: {err}"))?;
-        Ok(())
-    }
-
-    pub(super) struct PreparedArchiveCommit {
-        pub(super) commit: CommitHandle,
-        pub(super) succinct: Option<Vec<PreparedSuccinctArtifact>>,
-        pub(super) bm25: Option<Vec<Blob<PortableBM25Blob>>>,
-        pub(super) physical_shards: usize,
-        pub(super) tribles: usize,
-        pub(super) elapsed: std::time::Duration,
-    }
-
-    fn visit_archive_commit_shards(
-        reader: &PileReader,
-        commit: CommitHandle,
-        collect_content: bool,
-        mut visit: impl FnMut(TribleSet, TribleSet) -> Result<()>,
-    ) -> Result<usize> {
-        let commit_meta: TribleSet = reader
-            .get(commit)
-            .map_err(|err| anyhow!("load commit {commit:?}: {err:?}"))?;
-        let content_handle = find!(
-            (content_handle: Inline<Handle<SimpleArchive>>),
-            pattern!(&commit_meta, [{ triblespace::core::repo::content: ?content_handle }])
-        )
-        .at_most_one()
-        .map_err(|_| anyhow!("commit {commit:?} has ambiguous content"))?
-        .map(|(handle,)| handle);
-        let Some(content_handle) = content_handle else {
-            return Ok(0);
-        };
-        let source: Blob<SimpleArchive> = reader
-            .get(content_handle)
-            .map_err(|err| anyhow!("load content of commit {commit:?}: {err:?}"))?;
-        if source.bytes.len() % 64 != 0 {
-            return Err(anyhow!(
-                "commit {commit:?} has malformed SimpleArchive length"
-            ));
-        }
-
-        validate_physical_leaf_boundaries(&source.bytes)
-            .with_context(|| format!("commit {commit:?} has malformed SimpleArchive"))?;
-        let trible_count = source.bytes.len() / 64;
-        for start in (0..trible_count).step_by(INDEX_PHYSICAL_LEAF_TRIBLES) {
-            let end = (start + INDEX_PHYSICAL_LEAF_TRIBLES).min(trible_count);
-            let bytes = source.bytes.slice(start * 64..end * 64);
-            let chunk: TribleSet = Blob::<SimpleArchive>::new(bytes)
-                .try_from_blob()
-                .map_err(|err| anyhow!("decode commit {commit:?} shard: {err}"))?;
-
-            let mut content = TribleSet::new();
-            if collect_content {
-                for trible in chunk
-                    .iter()
-                    .filter(|trible| *trible.a() == archive::content.id())
-                {
-                    let handle = *trible.v::<Handle<LongString>>();
-                    let _: View<str> = reader.get(handle).map_err(|err| {
-                        anyhow!(
-                            "archive content {:?} in commit {commit:?} is unreadable: {err:?}",
-                            handle.raw
-                        )
-                    })?;
-                    content.insert(trible);
-                }
-            }
-            visit(chunk, content)?;
-        }
-        Ok(trible_count)
-    }
-
-    /// Resolve and freeze every physical leaf of one immutable source commit.
-    ///
-    /// This phase performs no writes: a standalone repair may run several
-    /// calls concurrently against cloned [`PileReader`] snapshots, then feed
-    /// the returned blobs to one ordered publisher. LongString handles are
-    /// deliberately validated before the infallible BM25 build seam, which
-    /// otherwise omits unreadable values.
-    pub(super) fn prepare_archive_commit(
-        reader: PileReader,
-        commit: CommitHandle,
-        prepare_succinct: bool,
-        prepare_bm25: bool,
-    ) -> Result<PreparedArchiveCommit> {
-        let started = std::time::Instant::now();
-        let succinct = SuccinctRollup::new();
-        let bm25 = Bm25Rollup::new(reader.clone(), archive::content.id());
-        let mut succinct_artifacts = prepare_succinct.then(Vec::new);
-        let mut bm25_artifacts = prepare_bm25.then(Vec::new);
-        let mut physical_shards = 0usize;
-        let trible_count =
-            visit_archive_commit_shards(&reader, commit, prepare_bm25, |chunk, content| {
-                physical_shards += 1;
-                if let Some(artifacts) = succinct_artifacts.as_mut() {
-                    artifacts.extend(
-                        succinct
-                            .build(&chunk)
-                            .map_err(|err| anyhow!("build Succinct shard: {err}"))?,
-                    );
-                }
-                if let Some(artifacts) = bm25_artifacts.as_mut() {
-                    artifacts.extend(
-                        bm25.build(&content)
-                            .map_err(|err| anyhow!("build BM25 shard: {err}"))?,
-                    );
-                }
-                Ok(())
-            })?;
-
-        Ok(PreparedArchiveCommit {
-            commit,
-            succinct: succinct_artifacts,
-            bm25: bm25_artifacts,
-            physical_shards,
-            tribles: trible_count,
-            elapsed: started.elapsed(),
-        })
-    }
-
-    /// Publish prebuilt leaves in their source shard/kind order. Mutable pile
-    /// state, manifest sequence assignment, and every LSM carry remain owned
-    /// by this one caller.
-    pub(super) fn publish_archive_commit<R, K>(
-        storage: &mut Pile,
-        prepared: PreparedArchiveCommit,
-        succinct: &K,
-        bm25: &Bm25Rollup<R>,
-        head_meta: &mut TribleSet,
-    ) -> Result<()>
-    where
-        R: triblespace::core::repo::BlobStoreGet,
-        K: IndexKind<PreparedArtifact = PreparedSuccinctArtifact>,
-    {
-        let range = CommitRange::leaf(prepared.commit);
-        if let Some(artifacts) = prepared.succinct {
-            append_prepared_range(storage, succinct, range.clone(), artifacts, head_meta)
-                .map_err(|err| anyhow!("append Succinct range for {:?}: {err}", prepared.commit))?;
-        }
-        if let Some(artifacts) = prepared.bm25 {
-            append_prepared_range(storage, bm25, range, artifacts, head_meta)
-                .map_err(|err| anyhow!("append BM25 range for {:?}: {err}", prepared.commit))?;
-        }
-        Ok(())
-    }
-
-    pub fn open_repo_for_read(
-        pile_path: &Path,
-        branch_id: Id,
-        branch_name: &str,
-    ) -> Result<(Repo, Id)> {
-        let mut repo = open_repo(pile_path)?;
-        let res = validate_branch_for_read(&mut repo, branch_id, branch_name);
-        if let Err(err) = res {
-            let _ = repo.close();
-            return Err(err);
-        }
-        Ok((repo, branch_id))
-    }
-
-    pub fn open_repo(pile_path: &Path) -> Result<Repo> {
-        let open_start = std::time::Instant::now();
-        let mut pile = Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
-        tracing::info!(
-            elapsed_ms = open_start.elapsed().as_millis() as u64,
-            "pile mmap open complete"
-        );
-        let refresh_start = std::time::Instant::now();
-        if let Err(err) = pile.refresh() {
-            // Avoid Drop warnings on early errors.
-            let _ = pile.close();
-            return Err(match err {
-                triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                    "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                     could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                    pile_path.display()
-                ),
-                other => anyhow!("refresh pile {}: {other:?}", pile_path.display()),
-            });
-        }
-        tracing::info!(
-            elapsed_ms = refresh_start.elapsed().as_millis() as u64,
-            "pile record refresh complete"
-        );
-        let repository_start = std::time::Instant::now();
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let repo = Repository::new(pile, signing_key, TribleSet::new())
-            .map_err(|err| anyhow!("create repository: {err:?}"))?;
-        tracing::info!(
-            elapsed_ms = repository_start.elapsed().as_millis() as u64,
-            "repository construction complete"
-        );
-        Ok(repo)
-    }
-
-    pub fn validate_branch_for_read(
-        repo: &mut Repo,
-        branch_id: Id,
-        branch_name: &str,
-    ) -> Result<()> {
-        if repo
-            .storage_mut()
-            .head(branch_id)
-            .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
-            .is_none()
-        {
-            return Err(anyhow!("unknown branch {branch_name} ({branch_id:x})"));
-        }
-        Ok(())
-    }
-
-    pub fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repo) -> Result<T>) -> Result<T> {
-        let mut repo = open_repo(pile)?;
-        let result = f(&mut repo);
-        let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-        if let Err(err) = close_res {
-            if result.is_ok() {
-                return Err(err);
-            }
-            eprintln!("warning: failed to close pile cleanly: {err:#}");
-        }
-        result
-    }
-
-    pub fn push_workspace(repo: &mut Repo, ws: &mut Ws) -> Result<()> {
-        while let Some(mut conflict) = repo
-            .try_push(ws)
-            .map_err(|e| anyhow!("push workspace: {e:?}"))?
-        {
-            conflict
-                .merge(ws)
-                .map_err(|e| anyhow!("merge workspace: {e:?}"))?;
-            *ws = conflict;
-        }
-        for failure in repo.take_hook_errors() {
-            eprintln!(
-                "warning: archive commit landed but derived indexes remain stale on branch {:x}: {}",
-                failure.branch, failure.error
-            );
-        }
-        Ok(())
-    }
-
-    pub fn refresh_catalog(
-        ws: &mut Ws,
-        catalog: &mut TribleSet,
-        catalog_head: &mut Option<CommitHandle>,
-    ) -> Result<()> {
-        let next_head = ws.head();
-        if *catalog_head == next_head {
-            return Ok(());
-        }
-
-        let delta = ws
-            .checkout(*catalog_head..next_head)
-            .context("checkout workspace delta")?;
-        if !delta.is_empty() {
-            *catalog += delta.into_facts();
-        }
-        *catalog_head = next_head;
-        Ok(())
-    }
-
-    pub fn commit_delta(
-        repo: &mut Repo,
-        ws: &mut Ws,
-        catalog: &mut TribleSet,
-        catalog_head: &mut Option<CommitHandle>,
-        change: TribleSet,
-        message: &'static str,
-    ) -> Result<bool> {
-        if change.is_empty() {
-            return Ok(false);
-        }
-
-        let delta = change.difference(catalog);
-        if delta.is_empty() {
-            return Ok(false);
-        }
-
-        ws.commit(delta, message);
-        push_workspace(repo, ws).with_context(|| format!("push {message}"))?;
-        refresh_catalog(ws, catalog, catalog_head)
-            .with_context(|| format!("refresh catalog after {message}"))?;
-        Ok(true)
-    }
-
-    pub fn now_epoch() -> Epoch {
-        Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-    }
-
-    pub fn unknown_epoch() -> Epoch {
-        Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0)
-    }
-
-    pub fn epoch_from_seconds(value: f64) -> Option<Epoch> {
-        if value.is_finite() {
-            Some(Epoch::from_unix_seconds(value))
-        } else {
-            None
-        }
-    }
-
-    pub fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
-        (epoch, epoch).try_to_inline().unwrap()
-    }
-
-    pub fn ensure_author(
-        ws: &mut Ws,
-        catalog: &TribleSet,
-        name: &str,
-        role: &str,
-    ) -> Result<(Id, TribleSet)> {
-        if let Some(author_id) = find_author_by_name(ws, catalog, name)? {
-            let mut change = TribleSet::new();
-            if author_role_handle(catalog, author_id).is_none() && !role.is_empty() {
-                let handle = ws.put(role.to_owned());
-                let author_entity = acquire_or_force(author_id);
-                change += entity! { &author_entity @
-                    archive::author_role: handle
-                };
-            }
-            return Ok((author_id, change));
-        }
-
-        // Identity = kind + name, content-derived via entity!'s intrinsic
-        // rooting: the same author name mints the same id in every pile and
-        // every run, so re-imports and cross-pile merges converge instead of
-        // forking (same mechanism as wiki's deterministic version/tag ids).
-        // Role is volatile metadata and merges onto the id afterwards; the
-        // per-message ground truth lives in import_schema::source_role anyway.
-        let name_handle = ws.put(name.to_owned());
-        let author_fragment = entity! { _ @
-            metadata::tag: archive::kind_author,
-            archive::author_name: name_handle,
-        };
-        let author_id = author_fragment
-            .root()
-            .expect("entity! must export a single root id");
-        let mut change = TribleSet::new();
-        change += author_fragment;
-        if !role.is_empty() {
-            let role_handle = ws.put(role.to_owned());
-            let author_entity = acquire_or_force(author_id);
-            change += entity! { &author_entity @
-                archive::author_role: role_handle,
-            };
-        }
-        Ok((author_id, change))
-    }
-
-    fn find_author_by_name(
-        ws: &mut Ws,
-        catalog: &TribleSet,
-        target_name: &str,
-    ) -> Result<Option<Id>> {
-        for (author_id, name_handle) in find!(
-            (author: Id, author_name: Inline<Handle<LongString>>),
-            pattern!(catalog, [{
-                ?author @
-                metadata::tag: archive::kind_author,
-                archive::author_name: ?author_name,
-            }])
-        ) {
-            let existing: View<str> = ws.get(name_handle).context("load author name")?;
-            if existing.as_ref() == target_name {
-                return Ok(Some(author_id));
-            }
-        }
-        Ok(None)
-    }
-
-    fn author_role_handle(
-        catalog: &TribleSet,
-        author_id: Id,
-    ) -> Option<Inline<Handle<LongString>>> {
-        for (author, role) in find!(
-            (author: Id, role: Inline<Handle<LongString>>),
-            pattern!(catalog, [{ ?author @ archive::author_role: ?role }])
-        ) {
-            if author == author_id {
-                return Some(role);
-            }
-        }
-        None
-    }
-}
-
-#[cfg(test)]
-mod index_leaf_tests {
-    use super::common::validate_physical_leaf_boundaries;
-
-    const LEAF_TRIBLES: usize = 1 << 16;
-
-    #[test]
-    fn physical_leaf_boundaries_preserve_global_canonical_order() {
-        let mut bytes = vec![0u8; (LEAF_TRIBLES + 1) * 64];
-        let previous = (LEAF_TRIBLES - 1) * 64;
-        let next = LEAF_TRIBLES * 64;
-
-        bytes[previous] = 1;
-        bytes[next] = 2;
-        validate_physical_leaf_boundaries(&bytes).unwrap();
-
-        bytes[next] = 1;
-        assert!(validate_physical_leaf_boundaries(&bytes)
-            .unwrap_err()
-            .to_string()
-            .contains("redundant"));
-
-        bytes[next] = 0;
-        assert!(validate_physical_leaf_boundaries(&bytes)
-            .unwrap_err()
-            .to_string()
-            .contains("noncanonical"));
-    }
-}
+use triblespace::core::collection::Collection;
+use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::time::NsTAIInterval;
+use triblespace::core::inline::{Inline, TryToInline};
+use triblespace::core::trible::{Fragment, TribleSet};
+use triblespace::macros::{find, pattern};
 
 #[derive(Parser)]
-#[command(version = faculties::GIT_VERSION, name = "archive", about = "Query imported archives in TribleSpace")]
+#[command(
+    version = faculties::GIT_VERSION,
+    name = "archive",
+    about = "Import and query the canonical Archive block DAG"
+)]
 struct Cli {
-    /// Path to the pile file to query.
+    /// Path to the pile file to use.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name to query.
-    #[arg(long, default_value = "archive")]
-    branch: String,
-    /// Branch id to query (hex). Overrides config/env branch id.
-    #[arg(long)]
-    branch_id: Option<String>,
-    /// Enable tracing spans for importer and search profiling.
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Enable tracing spans for projection and collection derivation.
     #[arg(long)]
     trace: bool,
     /// Optional tracing filter (defaults to `info`).
@@ -701,311 +54,113 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Import external archives into the archive branch.
+    /// Project one Claude Code JSONL file or directory and publish one COMMIT.
     Import {
-        #[arg(value_enum)]
-        source: ImportSource,
-        /// Optional path override for this source (or backup root for `all`).
-        path: Option<PathBuf>,
+        /// JSONL file or recursively scanned directory.
+        path: PathBuf,
     },
-    /// List the most recent messages through the Succinct index.
+    /// List the most recent source projections from one frozen Archive view.
     List {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Show one message by id prefix.
+    /// Show one exact source projection by id prefix.
     Show { id: String },
-    /// Show a reply_to chain ending at the given message id prefix.
+    /// Show the complete canonical ancestor DAG of one source projection.
     Thread {
         id: String,
+        /// Maximum accepted block count. Exceeding it is an error rather than
+        /// silently hiding one fork.
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
-    /// Search message content through the BM25 and Succinct indexes.
+    /// Search canonical block text through an exact portable BM25 cover.
     Search {
         #[arg(help = "Query text. Use @path for file input or @- for stdin.")]
         text: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Build or repair the Succinct and BM25 LSM indexes.
-    /// Replays each recipe's uncovered commits and durably checkpoints after
-    /// every logical range, so interrupted runs resume independently.
-    Index {
-        /// Maximum source commits being prepared or waiting for ordered
-        /// publication. Defaults to the square root of the active Rayon
-        /// worker count, balancing nested leaf-build parallelism. This bounds
-        /// commit count, not bytes; one large commit may hold several shards.
-        #[arg(long, env = "ARCHIVE_INDEX_PREPARE_IN_FLIGHT")]
-        prepare_in_flight: Option<NonZeroUsize>,
-    },
-    /// List imported conversations.
-    Imports {
-        format: Option<String>,
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-    },
-    /// Replay the archive as ONE interleaved temporal stream — the comb's
-    /// reading instrument. All conversations from all sources merge into a
-    /// single chronological view (one being, one timeline). Dialogue only by
-    /// default: tool/system exhaust is skipped, since its effect already
-    /// lives inside the dialogue's own words.
-    ///
-    /// `archive replay start <from>` begins (or restarts) at a timestamp;
-    /// bare `archive replay` emits the next batch and advances the cursor;
-    /// `archive replay stop` clears the cursor. Cursors are persona-scoped
-    /// session bookkeeping (append-only, latest-wins) — the archive itself
-    /// is never scoped.
+    /// Ensure exact raw-Succinct and portable BM25 collection derives.
+    Index,
+    /// Migrate stopped legacy Archive and optional Comb repository branches.
+    MigrateLegacy,
+    /// Replay canonical blocks as one interleaved temporal stream.
     Replay {
         /// `start <from-ts>`, `stop`, or nothing for the next batch.
         #[arg(value_name = "ACTION")]
         action: Vec<String>,
-        /// Messages per batch (a batch extends past the limit to finish
-        /// equal-timestamp runs, so the cursor can be strictly-greater).
+        /// Blocks per batch. An equal-timestamp run is never split.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Include tool/system exhaust (deliberate evidence consultation,
-        /// not part of the memory act).
+        /// Include tool, thinking, event, and media-only blocks.
         #[arg(long)]
         with_tools: bool,
-        /// Cursor owner. No default label on purpose: cursors are session
-        /// bookkeeping, and no zooid is baked in as "the" rememberer.
+        /// Cursor owner. There is deliberately no default persona.
         #[arg(long, env = "PERSONA")]
         persona: Option<String>,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ImportSource {
-    Chatgpt,
-    Codex,
-    Copilot,
-    Gemini,
-    ClaudeCode,
-    ClaudeWeb,
-    Agy,
-    All,
+#[derive(Clone, Copy)]
+struct ArchiveStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
 }
 
-impl ImportSource {
-    fn label(self) -> &'static str {
-        match self {
-            ImportSource::Chatgpt => "chatgpt",
-            ImportSource::Codex => "codex",
-            ImportSource::Copilot => "copilot",
-            ImportSource::Gemini => "gemini",
-            ImportSource::ClaudeCode => "claude-code",
-            ImportSource::ClaudeWeb => "claude-web",
-            ImportSource::Agy => "agy",
-            ImportSource::All => "all",
-        }
+struct ReplayView {
+    archive: ArchiveSnapshot,
+    comb_facts: TribleSet,
+    comb_catalog: CombCatalog,
+}
+
+impl ArchiveStorage<'_> {
+    fn load(&self) -> Result<ArchiveSnapshot> {
+        ArchiveSnapshot::load_local(self.pile, self.key, archive_schema::DEFAULT_SCOPE_ID)
+    }
+
+    fn load_comb(&self) -> Result<(TribleSet, CombCatalog)> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, DEFAULT_COMB_SCOPE_ID, signer);
+        let result = (|| {
+            let facts = collection
+                .materialize()
+                .context("materialize Comb cursor collection")?;
+            let catalog =
+                comb_model::load_catalog(&facts).context("validate Comb cursor collection")?;
+            Ok((facts, catalog))
+        })();
+        finish_collection(collection, result)
+    }
+
+    /// Materialize the Archive and its separate Comb cursor collection from
+    /// consecutive known-prefix views. Cursor publication rematerializes Comb
+    /// and validates the successor again at the commit boundary.
+    fn load_replay(&self) -> Result<ReplayView> {
+        let archive = self.load()?;
+        let (comb_facts, comb_catalog) = self.load_comb()?;
+        Ok(ReplayView {
+            archive,
+            comb_facts,
+            comb_catalog,
+        })
     }
 }
 
-#[derive(Debug, Clone)]
-struct ImportJob {
-    source: ImportSource,
-    path: PathBuf,
-}
-
-fn default_source_path(source: ImportSource, base: &Path) -> PathBuf {
-    match source {
-        ImportSource::Chatgpt => base.to_path_buf(),
-        ImportSource::Codex => base.join("codex"),
-        ImportSource::Copilot => base.join("copilot"),
-        ImportSource::Gemini => {
-            base.join("gemini/Takeout/My Activity/Gemini Apps/My Activity.html")
-        }
-        ImportSource::ClaudeCode => base.join("claude-code"),
-        ImportSource::ClaudeWeb => base.join("claude-web"),
-        ImportSource::Agy => base.join("agy"),
-        ImportSource::All => base.to_path_buf(),
+fn finish_collection<T>(
+    collection: Collection<triblespace::core::repo::pile::Pile>,
+    result: Result<T>,
+) -> Result<T> {
+    let close = collection.into_storage().close();
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(close_error)) => Err(anyhow!("close Archive pile: {close_error}")),
+        (Err(error), Err(close_error)) => Err(error.context(format!(
+            "closing Archive pile after failure also failed: {close_error}"
+        ))),
     }
-}
-
-fn resolve_import_jobs(source: ImportSource, path: Option<&Path>) -> Result<Vec<ImportJob>> {
-    match source {
-        ImportSource::All => {
-            let root = path
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("chatgptbackup"));
-            Ok(vec![
-                ImportJob {
-                    source: ImportSource::Chatgpt,
-                    path: default_source_path(ImportSource::Chatgpt, &root),
-                },
-                ImportJob {
-                    source: ImportSource::Codex,
-                    path: default_source_path(ImportSource::Codex, &root),
-                },
-                ImportJob {
-                    source: ImportSource::Copilot,
-                    path: default_source_path(ImportSource::Copilot, &root),
-                },
-                ImportJob {
-                    source: ImportSource::Gemini,
-                    path: default_source_path(ImportSource::Gemini, &root),
-                },
-                ImportJob {
-                    source: ImportSource::ClaudeCode,
-                    path: default_source_path(ImportSource::ClaudeCode, &root),
-                },
-                ImportJob {
-                    source: ImportSource::ClaudeWeb,
-                    path: default_source_path(ImportSource::ClaudeWeb, &root),
-                },
-                ImportJob {
-                    source: ImportSource::Agy,
-                    path: default_source_path(ImportSource::Agy, &root),
-                },
-            ])
-        }
-        one => Ok(vec![ImportJob {
-            source: one,
-            path: path
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| default_source_path(one, Path::new("chatgptbackup"))),
-        }]),
-    }
-}
-
-fn run_import_jobs(
-    source: ImportSource,
-    path: Option<&Path>,
-    pile_path: &Path,
-    branch_name: &str,
-    branch_id: Id,
-) -> Result<()> {
-    let all_start = Instant::now();
-    let jobs = resolve_import_jobs(source, path)?;
-    let _span = info_span!(
-        "archive_import",
-        source = source.label(),
-        jobs = jobs.len(),
-        branch = branch_name,
-        branch_id = %format!("{branch_id:x}"),
-        pile = %pile_path.display()
-    )
-    .entered();
-    println!(
-        "archive import: {} job(s) -> {} ({:x}) on pile {}",
-        jobs.len(),
-        branch_name,
-        branch_id,
-        pile_path.display()
-    );
-
-    let total_jobs = jobs.len();
-    for (job_index, job) in jobs.into_iter().enumerate() {
-        let _job_span = info_span!(
-            "archive_import_job",
-            source = job.source.label(),
-            job_index = job_index + 1,
-            total_jobs = total_jobs,
-            path = %job.path.display()
-        )
-        .entered();
-        if source == ImportSource::All && !job.path.exists() {
-            eprintln!(
-                "skip {} import (path missing): {}",
-                job.source.label(),
-                job.path.display()
-            );
-            continue;
-        }
-        if !job.path.exists() {
-            bail!(
-                "{} import path not found: {}",
-                job.source.label(),
-                job.path.display()
-            );
-        }
-        let job_start = Instant::now();
-        println!(
-            "archive import progress {}/{}: {} from {}",
-            job_index + 1,
-            total_jobs,
-            job.source.label(),
-            job.path.display()
-        );
-        match job.source {
-            ImportSource::Chatgpt => archive_import_chatgpt::import_into_archive(
-                &job.path,
-                pile_path,
-                branch_name,
-                branch_id,
-            ),
-            ImportSource::Codex => archive_import_codex::import_into_archive(
-                &job.path,
-                pile_path,
-                branch_name,
-                branch_id,
-            ),
-            ImportSource::Copilot => archive_import_copilot::import_into_archive(
-                &job.path,
-                pile_path,
-                branch_name,
-                branch_id,
-            ),
-            ImportSource::Gemini => archive_import_gemini::import_into_archive(
-                &job.path,
-                pile_path,
-                branch_name,
-                branch_id,
-            ),
-            ImportSource::ClaudeCode => archive_import_claude_code::import_into_archive(
-                &job.path,
-                pile_path,
-                branch_name,
-                branch_id,
-            ),
-            ImportSource::ClaudeWeb => archive_import_claude_web::import_into_archive(
-                &job.path,
-                pile_path,
-                branch_name,
-                branch_id,
-            ),
-            ImportSource::Agy => archive_import_agy::import_into_archive(
-                &job.path,
-                pile_path,
-                branch_name,
-                branch_id,
-            ),
-            ImportSource::All => Ok(()),
-        }
-        .with_context(|| {
-            format!(
-                "run {} importer for {}",
-                job.source.label(),
-                job.path.display()
-            )
-        })?;
-        println!(
-            "archive import done {}/{}: {} in {:?}",
-            job_index + 1,
-            total_jobs,
-            job.source.label(),
-            job_start.elapsed()
-        );
-        tracing::info!(
-            source = job.source.label(),
-            job_index = job_index + 1,
-            total_jobs = total_jobs,
-            elapsed_ms = job_start.elapsed().as_millis() as u64,
-            "archive import job complete"
-        );
-    }
-
-    let total_elapsed = all_start.elapsed();
-    println!("archive import all jobs done in {:?}", total_elapsed);
-    tracing::info!(
-        source = source.label(),
-        jobs = total_jobs,
-        elapsed_ms = total_elapsed.as_millis() as u64,
-        "archive import complete"
-    );
-
-    Ok(())
 }
 
 fn init_tracing(enabled: bool, filter: Option<&str>) {
@@ -1013,7 +168,6 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
     if !enabled {
         return;
     }
-
     TRACE_INIT.call_once(|| {
         let env_filter = filter
             .map(EnvFilter::new)
@@ -1029,348 +183,531 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
             .with_env_filter(env_filter)
             .with_span_events(FmtSpan::CLOSE)
             .try_init();
-        tracing::info!("archive tracing enabled");
     });
 }
 
-fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
-    let (lower, _upper): (Epoch, Epoch) = interval.try_from_inline().unwrap();
-    lower.to_tai_duration().total_nanoseconds()
+fn run_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let projection = archive_claude_code::project_path(path, |projected| {
+        writer
+            .stage_fragment(projected.fragment)
+            .with_context(|| format!("stage {}", projected.source_path.display()))
+    });
+    let (summary, commit) = writer.finish(projection)?;
+    print_import_summary(&summary, commit.is_some());
+    Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RecentMessage {
-    message_id: Id,
-    author_id: Id,
-    content_handle: Inline<Handle<LongString>>,
-    created_at: Inline<NsTAIInterval>,
-}
-
-fn load_longstring(ws: &mut common::Ws, handle: Inline<Handle<LongString>>) -> Result<String> {
-    let view: View<str> = ws.get(handle).context("read longstring")?;
-    Ok(view.to_string())
-}
-
-fn u256be_to_u64(value: Inline<U256BE>) -> Option<u64> {
-    let raw = value.raw;
-    if raw[..24].iter().any(|byte| *byte != 0) {
-        return None;
-    }
-    let bytes: [u8; 8] = raw[24..32].try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
-}
-
-fn author_name<P: TriblePattern>(
-    ws: &mut common::Ws,
-    catalog: &P,
-    author_id: Id,
-) -> Result<String> {
-    let Some(handle) = find!(
-        (handle: Inline<Handle<LongString>>),
-        pattern!(catalog, [{ author_id @ common::archive::author_name: ?handle }])
-    )
-    .into_iter()
-    .next()
-    .map(|(h,)| h) else {
-        return Ok("<unknown>".to_string());
-    };
-    load_longstring(ws, handle)
-}
-
-fn author_role<P: TriblePattern>(
-    ws: &mut common::Ws,
-    catalog: &P,
-    author_id: Id,
-) -> Result<Option<String>> {
-    let Some(handle) = find!(
-        (handle: Inline<Handle<LongString>>),
-        pattern!(catalog, [{ author_id @ common::archive::author_role: ?handle }])
-    )
-    .into_iter()
-    .next()
-    .map(|(h,)| h) else {
-        return Ok(None);
-    };
-    Ok(Some(load_longstring(ws, handle)?))
-}
-
-fn message_content_type<P: TriblePattern>(catalog: &P, message_id: Id) -> Option<String> {
-    find!(
-        (content_type: String),
-        pattern!(catalog, [{ message_id @ common::archive::content_type: ?content_type }])
-    )
-    .into_iter()
-    .next()
-    .map(|(ct,)| ct)
-}
-
-#[derive(Debug, Clone)]
-struct AttachmentRecord {
-    id: Id,
-    source_id: Option<String>,
-    name: Option<String>,
-    mime: Option<String>,
-    size_bytes: Option<u64>,
-    width_px: Option<u64>,
-    height_px: Option<u64>,
-    has_data: bool,
-}
-
-fn message_attachments<P: TriblePattern>(
-    ws: &mut common::Ws,
-    catalog: &P,
-    message_id: Id,
-) -> Result<Vec<AttachmentRecord>> {
-    let mut attachments: Vec<Id> = find!(
-        (attachment: Id),
-        pattern!(catalog, [{ message_id @ common::archive::attachment: ?attachment }])
-    )
-    .into_iter()
-    .map(|(a,)| a)
-    .collect();
-    attachments.sort();
-    attachments.dedup();
-
-    // Batch-query each attribute across ALL attachments at once (7 queries total
-    // instead of 7*N).
-    let source_ids: HashMap<Id, Inline<Handle<LongString>>> = find!(
-        (att: Id, handle: Inline<Handle<LongString>>),
-        pattern!(catalog, [{
-            message_id @ common::archive::attachment: ?att,
-        }, {
-            ?att @ common::archive::attachment_source_id: ?handle,
-        }])
-    )
-    .into_iter()
-    .collect();
-
-    let names: HashMap<Id, Inline<Handle<LongString>>> = find!(
-        (att: Id, handle: Inline<Handle<LongString>>),
-        pattern!(catalog, [{
-            message_id @ common::archive::attachment: ?att,
-        }, {
-            ?att @ common::archive::attachment_name: ?handle,
-        }])
-    )
-    .into_iter()
-    .collect();
-
-    let mimes: HashMap<Id, String> = find!(
-        (att: Id, mime: String),
-        pattern!(catalog, [{
-            message_id @ common::archive::attachment: ?att,
-        }, {
-            ?att @ common::archive::attachment_mime: ?mime,
-        }])
-    )
-    .into_iter()
-    .collect();
-
-    let sizes: HashMap<Id, Inline<U256BE>> = find!(
-        (att: Id, size: Inline<U256BE>),
-        pattern!(catalog, [{
-            message_id @ common::archive::attachment: ?att,
-        }, {
-            ?att @ common::archive::attachment_size_bytes: ?size,
-        }])
-    )
-    .into_iter()
-    .collect();
-
-    let widths: HashMap<Id, Inline<U256BE>> = find!(
-        (att: Id, width: Inline<U256BE>),
-        pattern!(catalog, [{
-            message_id @ common::archive::attachment: ?att,
-        }, {
-            ?att @ common::archive::attachment_width_px: ?width,
-        }])
-    )
-    .into_iter()
-    .collect();
-
-    let heights: HashMap<Id, Inline<U256BE>> = find!(
-        (att: Id, height: Inline<U256BE>),
-        pattern!(catalog, [{
-            message_id @ common::archive::attachment: ?att,
-        }, {
-            ?att @ common::archive::attachment_height_px: ?height,
-        }])
-    )
-    .into_iter()
-    .collect();
-
-    let has_data_set: HashSet<Id> = find!(
-        (att: Id),
-        pattern!(catalog, [{
-            message_id @ common::archive::attachment: ?att,
-        }, {
-            ?att @ common::archive::attachment_data: _?handle,
-        }])
-    )
-    .into_iter()
-    .map(|(a,)| a)
-    .collect();
-
-    let mut out = Vec::new();
-    for attachment_id in attachments {
-        let source_id = match source_ids.get(&attachment_id) {
-            Some(&h) => Some(load_longstring(ws, h)?),
-            None => None,
-        };
-        let name = match names.get(&attachment_id) {
-            Some(&h) => Some(load_longstring(ws, h)?),
-            None => None,
-        };
-
-        out.push(AttachmentRecord {
-            id: attachment_id,
-            source_id,
-            name,
-            mime: mimes.get(&attachment_id).cloned(),
-            size_bytes: sizes.get(&attachment_id).and_then(|&s| u256be_to_u64(s)),
-            width_px: widths.get(&attachment_id).and_then(|&w| u256be_to_u64(w)),
-            height_px: heights.get(&attachment_id).and_then(|&h| u256be_to_u64(h)),
-            has_data: has_data_set.contains(&attachment_id),
-        });
-    }
-    Ok(out)
-}
-
-fn resolve_message_id<P: TriblePattern>(catalog: &P, prefix: &str) -> Result<Id> {
-    let candidates = find!(
-        message: Id,
-        pattern!(catalog, [{
-            ?message @ common::metadata::tag: common::archive::kind_message,
-        }])
+fn print_import_summary(summary: &ProjectionSummary, published: bool) {
+    println!(
+        "projected {} file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
+        summary.files_scanned,
+        summary.fragments_emitted,
+        summary.stats.source_projections,
+        summary.stats.content_parts,
     );
-    faculties::resolve_id_prefix(prefix, candidates)
+    println!(
+        "skipped={} missing_identity={} skipped_parents={} unresolved_parents={} unresolved_tool_results={} undecodable_images={}",
+        summary.stats.skipped_records,
+        summary.stats.missing_source_identity,
+        summary.stats.skipped_parents,
+        summary.stats.unresolved_parents,
+        summary.stats.unresolved_tool_results,
+        summary.stats.undecodable_images,
+    );
+    println!(
+        "Archive collection: {}",
+        if published {
+            "one signed COMMIT published"
+        } else {
+            "unchanged (projector emitted no facts)"
+        }
+    );
 }
 
-fn message_record<P: TriblePattern>(
-    ws: &mut common::Ws,
-    catalog: &P,
-    message_id: Id,
-) -> Result<(
-    Id,
-    String,
-    Option<String>,
-    Inline<NsTAIInterval>,
-    Inline<Handle<LongString>>,
-    Option<Id>,
-)> {
-    let Some((author_id, content_handle, created_at)) = find!(
-        (
-            author: Id,
-            content: Inline<Handle<LongString>>,
-            created_at: Inline<NsTAIInterval>
-        ),
-        pattern!(catalog, [{
-            message_id @
-                common::metadata::tag: common::archive::kind_message,
-                common::archive::author: ?author,
-                common::archive::content: ?content,
-                common::metadata::created_at: ?created_at,
-        }])
-    )
-    .into_iter()
-    .next()
-    .map(|(a, c, t)| (a, c, t)) else {
-        return Err(anyhow!("message {message_id:x} missing required fields"));
+fn short_id(id: Id) -> String {
+    format!("{id:X}").chars().take(8).collect()
+}
+
+fn snippet(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    for (count, ch) in text.chars().enumerate() {
+        if count == max {
+            out.push_str("...");
+            break;
+        }
+        out.push(if ch == '\n' || ch == '\r' { ' ' } else { ch });
+    }
+    out
+}
+
+fn interval_bounds(interval: Inline<NsTAIInterval>) -> Result<(Epoch, Epoch)> {
+    interval
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode Archive timestamp: {error:?}"))
+}
+
+fn interval_key(interval: Inline<NsTAIInterval>) -> Result<i128> {
+    let (lower, _upper): (i128, i128) = interval
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode Archive timestamp: {error:?}"))?;
+    Ok(lower)
+}
+
+fn format_interval(interval: Option<Inline<NsTAIInterval>>) -> Result<String> {
+    let Some(interval) = interval else {
+        return Ok("<untimed>".to_owned());
     };
-
-    let reply_to = find!(
-        (parent: Id),
-        pattern!(catalog, [{ message_id @ common::archive::reply_to: ?parent }])
-    )
-    .into_iter()
-    .next()
-    .map(|(p,)| p);
-
-    let name = author_name(ws, catalog, author_id)?;
-    let role = author_role(ws, catalog, author_id)?;
-    Ok((message_id, name, role, created_at, content_handle, reply_to))
+    let (lower, upper) = interval_bounds(interval)?;
+    if lower == upper {
+        Ok(lower.to_string())
+    } else {
+        Ok(format!("{lower}..{upper}"))
+    }
 }
 
-/// Materialize and print exactly one message from any queryable trible view.
-///
-/// The caller chooses the logical dataset (raw checkout or certified Succinct
-/// union). Only handles reachable from the selected message and its author or
-/// attachments are dereferenced here.
-fn print_message<P: TriblePattern>(ws: &mut common::Ws, catalog: &P, message_id: Id) -> Result<()> {
-    let (message_id, name, role, created_at, content_handle, reply_to) =
-        message_record(ws, catalog, message_id)?;
-    let content = load_longstring(ws, content_handle)?;
-    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
-    let content_type = message_content_type(catalog, message_id);
-    let attachments = message_attachments(ws, catalog, message_id)?;
+fn modality_label(id: Id) -> String {
+    match id {
+        archive_schema::content_fact::modality::TEXT => "text".to_owned(),
+        archive_schema::content_fact::modality::AUDIO => "audio".to_owned(),
+        archive_schema::content_fact::modality::IMAGE => "image".to_owned(),
+        archive_schema::content_fact::modality::TOOL_CALL => "tool-call".to_owned(),
+        archive_schema::content_fact::modality::TOOL_RESULT => "tool-result".to_owned(),
+        archive_schema::content_fact::modality::THINKING => "thinking".to_owned(),
+        archive_schema::content_fact::modality::EVENT => "event".to_owned(),
+        _ => format!("modality:{id:X}"),
+    }
+}
 
-    println!("id: {message_id:x}");
-    println!("created_at: {lower}");
-    match role {
-        Some(role) => println!("author: {name} ({role})"),
-        None => println!("author: {name}"),
+fn direction_label(id: Id) -> String {
+    match id {
+        archive_schema::content_fact::direction::IN => "in".to_owned(),
+        archive_schema::content_fact::direction::OUT => "out".to_owned(),
+        archive_schema::content_fact::direction::AMBIENT => "ambient".to_owned(),
+        _ => format!("direction:{id:X}"),
     }
-    if let Some(parent) = reply_to {
-        println!("reply_to: {parent:x}");
+}
+
+fn payload_summary(payload: &ArchivePayload) -> String {
+    match payload {
+        ArchivePayload::Text(text) => snippet(text, 120),
+        ArchivePayload::Resident { blob, media_type } => format!(
+            "[resident {} bytes {}]",
+            short_id(*media_type),
+            hex::encode_upper(blob.raw),
+        ),
+        ArchivePayload::External {
+            pointer,
+            namespace,
+            media_type,
+            size,
+            resolutions,
+        } => format!(
+            "[external {} namespace={} media={} size={} resolutions={}]",
+            pointer,
+            short_id(*namespace),
+            media_type.map(short_id).unwrap_or_else(|| "?".to_owned()),
+            size.map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_owned()),
+            resolutions.len(),
+        ),
     }
-    if let Some(content_type) = content_type {
-        println!("content_type: {content_type}");
+}
+
+fn projection_snippet(projection: &ArchiveProjection) -> String {
+    let joined = projection
+        .parts
+        .iter()
+        .map(|part| payload_summary(&part.payload))
+        .collect::<Vec<_>>()
+        .join(" ");
+    snippet(&joined, 120)
+}
+
+fn projection_actor(projection: &ArchiveProjection) -> String {
+    let mut values = Vec::new();
+    if let Some(author) = &projection.raw_author {
+        values.push(author.clone());
     }
-    if !attachments.is_empty() {
-        println!("attachments: {}", attachments.len());
-        for att in attachments {
-            let mut extras = Vec::new();
-            if let Some(mime) = att.mime.as_deref() {
-                extras.push(mime.to_string());
-            }
-            if let Some(size) = att.size_bytes {
-                extras.push(format!("{size}b"));
-            }
-            if let (Some(w), Some(h)) = (att.width_px, att.height_px) {
-                extras.push(format!("{w}x{h}px"));
-            }
-            if att.has_data {
-                extras.push("data".to_string());
-            }
-            let label = att
-                .name
-                .as_deref()
-                .or(att.source_id.as_deref())
-                .unwrap_or("<unknown>");
-            if extras.is_empty() {
-                println!("  - {} {}", &format!("{:x}", att.id)[..8], label);
-            } else {
-                println!(
-                    "  - {} {} ({})",
-                    &format!("{:x}", att.id)[..8],
-                    label,
-                    extras.join(", ")
-                );
+    if let Some(role) = &projection.raw_role {
+        values.push(role.clone());
+    }
+    if let Some(model) = &projection.raw_model {
+        values.push(model.clone());
+    }
+    if values.is_empty() {
+        "<unattributed>".to_owned()
+    } else {
+        values.join("/")
+    }
+}
+
+fn render_projection_summary(projection: &ArchiveProjection) -> Result<String> {
+    Ok(format!(
+        "{} {} {} {}",
+        short_id(projection.id),
+        format_interval(projection.block_timestamp)?,
+        projection_actor(projection),
+        projection_snippet(projection),
+    ))
+}
+
+fn render_part(out: &mut String, part: &ArchivePart) -> Result<()> {
+    writeln!(
+        out,
+        "part[{}]: {} {} id={:X} fact={:X}",
+        part.ordinal,
+        modality_label(part.modality),
+        direction_label(part.direction),
+        part.id,
+        part.fact,
+    )?;
+    if let Some(target) = part.responds_to {
+        writeln!(out, "  responds_to: {target:X}")?;
+    }
+    match &part.payload {
+        ArchivePayload::Text(text) => {
+            writeln!(out, "  text:")?;
+            for line in text.lines() {
+                writeln!(out, "    {line}")?;
             }
         }
-    }
-    println!();
-    print!("{content}");
-    if !content.ends_with('\n') {
-        println!();
+        ArchivePayload::Resident { blob, media_type } => {
+            writeln!(out, "  resident_blob: {}", hex::encode_upper(blob.raw))?;
+            writeln!(out, "  media_type: {media_type:X}")?;
+        }
+        ArchivePayload::External {
+            pointer,
+            namespace,
+            media_type,
+            size,
+            resolutions,
+        } => {
+            writeln!(out, "  external_pointer: {pointer}")?;
+            writeln!(out, "  asset_namespace: {namespace:X}")?;
+            if let Some(media_type) = media_type {
+                writeln!(out, "  media_type: {media_type:X}")?;
+            }
+            if let Some(size) = size {
+                writeln!(out, "  size: {size}")?;
+            }
+            for resolution in resolutions {
+                writeln!(out, "  resolution: {}", hex::encode_upper(resolution.raw))?;
+            }
+        }
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// replay — the comb's reading instrument
-// ---------------------------------------------------------------------------
-
-/// Parse "YYYY-MM-DDTHH:MM:SS" as TAI.
-fn parse_tai_timestamp(s: &str) -> Result<Epoch> {
-    let parts: Vec<&str> = s.split('T').collect();
-    if parts.len() != 2 {
-        bail!("invalid timestamp (expected YYYY-MM-DDTHH:MM:SS): {s}");
+fn render_projection(projection: &ArchiveProjection) -> Result<String> {
+    let mut out = String::new();
+    writeln!(out, "projection: {:X}", projection.id)?;
+    writeln!(out, "source_namespace: {:X}", projection.source_namespace)?;
+    writeln!(out, "source_locator: {}", projection.source_locator)?;
+    writeln!(
+        out,
+        "raw_record: {}",
+        hex::encode_upper(projection.raw_record.raw)
+    )?;
+    writeln!(out, "block: {:X}", projection.block)?;
+    writeln!(
+        out,
+        "block_timestamp: {}",
+        format_interval(projection.block_timestamp)?
+    )?;
+    writeln!(
+        out,
+        "source_timestamp: {}",
+        format_interval(projection.source_timestamp)?
+    )?;
+    for predecessor in &projection.block_previous {
+        writeln!(out, "block_previous: {predecessor:X}")?;
     }
-    let date: Vec<&str> = parts[0].split('-').collect();
-    let time: Vec<&str> = parts[1].split(':').collect();
+    for receipt in &projection.semantic_predecessor_support {
+        writeln!(out, "semantic_predecessor_support: {receipt:X}")?;
+    }
+    if let Some(author) = projection.author {
+        writeln!(out, "author: {author:X}")?;
+    }
+    if let Some(experiencer) = projection.experiencer {
+        writeln!(out, "experiencer: {experiencer:X}")?;
+    }
+    if let Some(author) = &projection.raw_author {
+        writeln!(out, "raw_author: {author}")?;
+    }
+    if let Some(role) = &projection.raw_role {
+        writeln!(out, "raw_role: {role}")?;
+    }
+    if let Some(model) = &projection.raw_model {
+        writeln!(out, "raw_model: {model}")?;
+    }
+    for path in &projection.source_paths {
+        writeln!(out, "source_path: {path}")?;
+    }
+    for part in &projection.parts {
+        render_part(&mut out, part)?;
+    }
+    Ok(out)
+}
+
+fn run_list(storage: ArchiveStorage<'_>, limit: usize) -> Result<()> {
+    let archive = storage.load()?;
+    for id in archive.recent_projection_ids(limit) {
+        println!("{}", render_projection_summary(&archive.projection(id)?)?);
+    }
+    Ok(())
+}
+
+fn run_show(storage: ArchiveStorage<'_>, prefix: &str) -> Result<()> {
+    let archive = storage.load()?;
+    let id = archive.resolve_projection_prefix(prefix)?;
+    print!("{}", render_projection(&archive.projection(id)?)?);
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct LoadedBlock {
+    semantic: ArchiveProjection,
+    receipts: Vec<ArchiveProjection>,
+}
+
+fn load_block(archive: &ArchiveSnapshot, block: Id) -> Result<LoadedBlock> {
+    let receipt_ids = archive.projections_for_block(block);
+    if receipt_ids.is_empty() {
+        bail!("canonical Archive block {block:X} has no source projection");
+    }
+    let mut receipts = receipt_ids
+        .into_iter()
+        .map(|id| archive.projection(id))
+        .collect::<Result<Vec<_>>>()?;
+    receipts.sort_unstable_by_key(|projection| projection.id);
+    if receipts.iter().any(|projection| projection.block != block) {
+        bail!("Archive source projection lookup crossed block identities");
+    }
+    Ok(LoadedBlock {
+        semantic: receipts[0].clone(),
+        receipts,
+    })
+}
+
+fn load_thread(
+    archive: &ArchiveSnapshot,
+    projection_prefix: &str,
+    limit: usize,
+) -> Result<Vec<LoadedBlock>> {
+    if limit == 0 {
+        bail!("thread limit must be at least 1");
+    }
+    let leaf = archive.resolve_projection_prefix(projection_prefix)?;
+    let leaf_block = archive.projection(leaf)?.block;
+    let mut pending = BTreeSet::from([leaf_block]);
+    let mut nodes = BTreeMap::new();
+    while let Some(block) = pending.pop_first() {
+        if nodes.contains_key(&block) {
+            continue;
+        }
+        if nodes.len() == limit {
+            bail!(
+                "thread ancestry exceeds {limit} canonical blocks; increase --limit so no fork is hidden"
+            );
+        }
+        let loaded = load_block(archive, block)?;
+        pending.extend(loaded.semantic.block_previous.iter().copied());
+        nodes.insert(block, loaded);
+    }
+
+    let mut indegree: BTreeMap<Id, usize> = nodes
+        .iter()
+        .map(|(block, loaded)| (*block, loaded.semantic.block_previous.len()))
+        .collect();
+    let mut children = BTreeMap::<Id, BTreeSet<Id>>::new();
+    for (block, loaded) in &nodes {
+        for parent in &loaded.semantic.block_previous {
+            children.entry(*parent).or_default().insert(*block);
+        }
+    }
+    let mut ready: BTreeSet<Id> = indegree
+        .iter()
+        .filter_map(|(block, count)| (*count == 0).then_some(*block))
+        .collect();
+    let mut ordered = Vec::with_capacity(nodes.len());
+    while let Some(block) = ready.pop_first() {
+        ordered.push(nodes[&block].clone());
+        for child in children.get(&block).into_iter().flatten() {
+            let count = indegree
+                .get_mut(child)
+                .expect("every Archive child has an indegree");
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(*child);
+            }
+        }
+    }
+    if ordered.len() != nodes.len() {
+        bail!("Archive thread contains a block cycle despite catalog validation");
+    }
+    Ok(ordered)
+}
+
+fn render_block(block: &LoadedBlock, include_all_parts: bool) -> Result<String> {
+    let mut out = String::new();
+    writeln!(out, "block: {:X}", block.semantic.block)?;
+    writeln!(
+        out,
+        "timestamp: {}",
+        format_interval(block.semantic.block_timestamp)?
+    )?;
+    for predecessor in &block.semantic.block_previous {
+        writeln!(out, "previous: {predecessor:X}")?;
+    }
+    for receipt in &block.receipts {
+        writeln!(
+            out,
+            "receipt: {:X} {} {}",
+            receipt.id,
+            receipt.source_locator,
+            projection_actor(receipt),
+        )?;
+    }
+    for part in &block.semantic.parts {
+        if include_all_parts || part.modality == archive_schema::content_fact::modality::TEXT {
+            render_part(&mut out, part)?;
+        }
+    }
+    Ok(out)
+}
+
+fn run_thread(storage: ArchiveStorage<'_>, prefix: &str, limit: usize) -> Result<()> {
+    let archive = storage.load()?;
+    for (index, block) in load_thread(&archive, prefix, limit)?.iter().enumerate() {
+        if index != 0 {
+            println!("---");
+        }
+        print!("{}", render_block(block, true)?);
+    }
+    Ok(())
+}
+
+fn run_search(storage: ArchiveStorage<'_>, text: &str, limit: usize) -> Result<()> {
+    let text = faculties::text_arg(text, "search text")?;
+    let search = ArchiveSearchSnapshot::ensure_local(storage.pile, storage.key)?;
+    for hit in search.search(&text, limit)? {
+        let block = load_block(search.archive(), hit.block)?;
+        println!(
+            "{:.4} {} {} receipt(s) {} {}",
+            hit.score,
+            short_id(hit.block),
+            hit.projections.len(),
+            format_interval(block.semantic.block_timestamp)?,
+            projection_snippet(&block.semantic),
+        );
+    }
+    Ok(())
+}
+
+fn run_index(storage: ArchiveStorage<'_>) -> Result<()> {
+    let succinct = archive_collection::ensure_succinct_index(storage.pile, storage.key)?;
+    let bm25 = archive_collection::ensure_bm25_index(storage.pile, storage.key)?;
+    println!(
+        "Archive: {} authored element(s), {} exact raw-Succinct DERIVE record(s)",
+        succinct.source_commits, succinct.derived_elements,
+    );
+    println!(
+        "Archive BM25: {} exact derived element(s), {} resident cover segment(s)",
+        bm25.derived_elements, bm25.cover_segments,
+    );
+    Ok(())
+}
+
+fn run_migrate_legacy(storage: ArchiveStorage<'_>) -> Result<()> {
+    let source = freeze_source(storage.pile).context(
+        "freeze legacy Archive source; every legacy writer must be stopped before migration",
+    )?;
+    let plan = archive_cutover::plan(&source)?;
+    let comb_plan = comb_cutover::plan_if_present(&source)?;
+
+    let existing = storage.load()?;
+    let mut staged = Fragment::empty();
+    for commit in plan.commits() {
+        staged += commit.fragment().clone();
+    }
+    let (expected, validation) = faculties::blockdag::validate_catalog_union(
+        existing.reader(),
+        existing.catalog(),
+        &staged,
+    )?;
+    require_accepted(validation, "existing Archive union legacy migration")?;
+    drop(existing);
+
+    let expected_comb = if let Some(plan) = &comb_plan {
+        let (mut current, _) = storage.load_comb()?;
+        current += plan.facts().clone();
+        comb_model::load_catalog(&current)
+            .context("validate existing Comb union legacy cursor migration")?;
+        Some(current)
+    } else {
+        None
+    };
+
+    let commits = archive_cutover::publish(&source, &plan, storage.pile, storage.key)?;
+    let comb_commits = match &comb_plan {
+        Some(plan) => comb_cutover::publish(&source, plan, storage.pile, storage.key)?,
+        None => Vec::new(),
+    };
+    let materialized = storage.load()?;
+    if materialized.catalog() != &expected {
+        bail!("Archive changed during stopped-world migration; published commits are replay-safe, stop every writer and retry verification");
+    }
+    if let Some(expected_comb) = expected_comb {
+        let (actual, _) = storage.load_comb()?;
+        if actual != expected_comb {
+            bail!("Comb changed during stopped-world migration; published commits are replay-safe, stop every writer and retry verification");
+        }
+    }
+    println!(
+        "migrated {} authored legacy commit(s), {} fact(s), {} metafact(s); {} native COMMIT record(s)",
+        plan.report().authored_commits,
+        plan.report().facts,
+        plan.report().metafacts,
+        commits.len(),
+    );
+    if let Some(comb_plan) = comb_plan {
+        println!(
+            "migrated {} authored Comb cursor commit(s) into its separate collection ({} canonical cursor fact(s), {} native COMMIT record(s))",
+            comb_plan.commits().len(),
+            comb_plan.facts().len(),
+            comb_commits.len(),
+        );
+    }
+    println!("legacy branch retained as read-only migration evidence");
+    Ok(())
+}
+
+fn require_accepted(validation: CatalogValidation, label: &str) -> Result<()> {
+    match validation {
+        CatalogValidation::Accepted => Ok(()),
+        CatalogValidation::Pending { missing } => bail!(
+            "{label} is missing {} attachment blob(s): {}",
+            missing.len(),
+            missing
+                .iter()
+                .take(8)
+                .map(hex::encode_upper)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        CatalogValidation::Rejected(reason) => bail!("{label} is invalid: {reason}"),
+    }
+}
+
+fn parse_tai_timestamp(value: &str) -> Result<Epoch> {
+    let (date, time) = value
+        .split_once('T')
+        .ok_or_else(|| anyhow!("invalid timestamp (expected YYYY-MM-DDTHH:MM:SS): {value}"))?;
+    let date = date.split('-').collect::<Vec<_>>();
+    let time = time.split(':').collect::<Vec<_>>();
     if date.len() != 3 || time.len() != 3 {
-        bail!("invalid timestamp (expected YYYY-MM-DDTHH:MM:SS): {s}");
+        bail!("invalid timestamp (expected YYYY-MM-DDTHH:MM:SS): {value}");
     }
     Ok(Epoch::from_gregorian_tai(
         date[0].parse().context("year")?,
@@ -1383,1651 +720,525 @@ fn parse_tai_timestamp(s: &str) -> Result<Epoch> {
     ))
 }
 
-/// Append a cursor advance (or a stop marker when `position` is None) via
-/// the shared comb helpers (faculties::schemas::memory::comb).
-fn write_cursor(
-    repo: &mut common::Repo,
-    branch_id: Id,
+fn cursor_state(position: Option<Epoch>) -> CursorState {
+    CursorState {
+        position: position.map(|epoch| (epoch, epoch).try_to_inline().unwrap()),
+        grain: None,
+    }
+}
+
+fn plan_cursor_update(
+    catalog: &CombCatalog,
     stream: &str,
     persona: &str,
     position: Option<Epoch>,
-) -> Result<()> {
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull for cursor write: {e:?}"))?;
-    let change = common::comb::advance_change(stream, persona, position, None, common::now_epoch());
-    ws.commit(change, "archive replay cursor");
-    common::push_workspace(repo, &mut ws)
-}
-
-/// Conversation label for a message: "source · title-or-id-prefix".
-fn conversation_label(
-    ws: &mut common::Ws,
-    catalog: &TribleSet,
-    message_id: Id,
-    cache: &mut HashMap<Id, String>,
-) -> Result<String> {
-    // Forward edge (most importers) then reverse edge (claude-code).
-    let convo = find!(
-        c: Id,
-        pattern!(catalog, [{ message_id @ common::import_schema::conversation: ?c }])
-    )
-    .next()
-    .or_else(|| {
-        find!(
-            c: Id,
-            pattern!(catalog, [{ ?c @ common::import_schema::message: message_id }])
-        )
-        .next()
-    });
-    let Some(convo) = convo else {
-        return Ok("?".to_string());
-    };
-    if let Some(label) = cache.get(&convo) {
-        return Ok(label.clone());
-    }
-    let format = find!(
-        f: String,
-        pattern!(catalog, [{ convo @ common::import_schema::source_format: ?f }])
-    )
-    .next()
-    .unwrap_or_else(|| "?".to_string());
-    let title = find!(
-        t: Inline<Handle<LongString>>,
-        pattern!(catalog, [{ convo @ common::import_schema::source_conversation_title: ?t }])
-    )
-    .next()
-    .map(|h| load_longstring(ws, h))
-    .transpose()?;
-    let label = match title {
-        Some(title) if !title.is_empty() => format!("{format} · {title}"),
-        _ => {
-            let source_id = find!(
-                s: Inline<Handle<LongString>>,
-                pattern!(catalog, [{ convo @ common::import_schema::source_conversation_id: ?s }])
-            )
-            .next()
-            .map(|h| load_longstring(ws, h))
-            .transpose()?
-            .unwrap_or_default();
-            let prefix: String = source_id.chars().take(8).collect();
-            format!("{format} · {prefix}")
+) -> Result<Option<Fragment>> {
+    let state = cursor_state(position);
+    let predecessors = match catalog.resolution(stream, persona) {
+        None => BTreeSet::new(),
+        Some(resolution) => {
+            let settled = resolution.settled_state()?;
+            if matches!(resolution, CursorResolution::Unique(_)) && settled == &state {
+                return Ok(None);
+            }
+            resolution.head_ids().into_iter().collect()
         }
     };
-    cache.insert(convo, label.clone());
-    Ok(label)
+    let (fragment, _) = comb_model::cursor_fragment(CursorDraft {
+        stream: stream.to_owned(),
+        persona: persona.to_owned(),
+        position: state.position,
+        grain: state.grain,
+        predecessors,
+        observed_at: BTreeSet::new(),
+    })?;
+    Ok(Some(fragment))
+}
+
+fn active_cursor_position(catalog: &CombCatalog, stream: &str, persona: &str) -> Result<i128> {
+    let resolution = catalog.resolution(stream, persona).ok_or_else(|| {
+        anyhow!("no active replay for persona {persona}: use `archive replay start <from>`")
+    })?;
+    let state = resolution.settled_state()?;
+    let position = state.position.ok_or_else(|| {
+        anyhow!("no active replay for persona {persona}: use `archive replay start <from>`")
+    })?;
+    let (lower, upper): (i128, i128) = position
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode archive replay cursor: {error:?}"))?;
+    if lower != upper {
+        bail!("archive replay cursor is not a point interval");
+    }
+    Ok(lower)
+}
+
+fn validate_cursor_update(current: &TribleSet, fragment: &Fragment) -> Result<()> {
+    let mut candidate = current.clone();
+    candidate += fragment.clone();
+    comb_model::load_catalog(&candidate)
+        .context("validate archive replay cursor successor")
+        .map(|_| ())
+}
+
+fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Result<()> {
+    let signer = load_signer(storage.pile, storage.key)?;
+    let pile = open_pile_strict(storage.pile)?;
+    let mut collection = Collection::new(pile, DEFAULT_COMB_SCOPE_ID, signer);
+    let result = (|| {
+        let current = collection
+            .materialize()
+            .context("materialize Comb cursor collection before publication")?;
+        validate_cursor_update(&current, &fragment)?;
+        collection
+            .commit(fragment)
+            .context("publish archive replay cursor")?;
+        Ok(())
+    })();
+    finish_collection(collection, result)
 }
 
 const REPLAY_STREAM: &str = "archive-replay";
 
-/// Cursors live on their own tiny branch: per-batch reads stay instant, and
-/// the archive branch remains pure evidence — no practice state mixed in.
-const COMB_STATE_BRANCH: &str = "comb-state";
-
-/// One replay record in the disk index. The index is a disposable cache of
-/// the dialogue timeline (the pile remains the truth): rebuilt only when the
-/// archive branch head changes, i.e. after imports.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ReplayRecord {
-    /// interval_key of created_at — the timeline coordinate.
-    k: i128,
-    /// Display timestamp.
-    w: String,
-    /// Conversation label ("source · title-or-id").
-    l: String,
-    /// Author display name.
-    n: String,
-    /// Author role ("" when unknown) — tool/system filtering happens at
-    /// read time so one index serves both modes.
-    r: String,
-    /// Message content text.
-    c: String,
+#[derive(Clone)]
+struct TimelineBlock {
+    key: i128,
+    block: LoadedBlock,
 }
 
-fn replay_index_path(pile_path: &Path) -> PathBuf {
-    let mut name = pile_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "pile".to_string());
-    name.push_str(".replay-index.jsonl");
-    pile_path.with_file_name(name)
+fn is_dialogue(block: &LoadedBlock) -> bool {
+    block
+        .semantic
+        .parts
+        .iter()
+        .any(|part| part.modality == archive_schema::content_fact::modality::TEXT)
 }
 
-/// Build the timeline index from the archive branch (the expensive pass:
-/// full checkout of the evidence). Returns the number of records written.
-fn build_replay_index(
-    repo: &mut common::Repo,
-    archive_branch_id: Id,
-    head_key: &str,
-    path: &Path,
-) -> Result<usize> {
-    eprintln!("replay index stale — rebuilding (full evidence checkout; this is the slow pass)...");
-    let mut ws = repo
-        .pull(archive_branch_id)
-        .map_err(|e| anyhow!("pull archive branch: {e:?}"))?;
-    let catalog = ws.checkout(..).context("checkout archive branch")?;
-
-    let mut author_names: HashMap<Id, String> = HashMap::new();
-    let mut author_roles: HashMap<Id, String> = HashMap::new();
-    for (author_id, name_handle) in find!(
-        (a: Id, n: Inline<Handle<LongString>>),
-        pattern!(&catalog, [{
-            ?a @
-                common::metadata::tag: common::archive::kind_author,
-                common::archive::author_name: ?n,
-        }])
+fn timeline_after(
+    archive: &ArchiveSnapshot,
+    position: i128,
+    with_tools: bool,
+) -> Result<Vec<TimelineBlock>> {
+    let catalog = archive.catalog();
+    let mut seen = BTreeSet::new();
+    let mut timeline = Vec::new();
+    for (block, timestamp) in find!(
+        (block: Id, timestamp: Inline<NsTAIInterval>),
+        pattern!(catalog, [{ ?block @ archive_schema::block::timestamp: ?timestamp }])
     ) {
-        author_names.insert(author_id, load_longstring(&mut ws, name_handle)?);
-    }
-    for (author_id, role_handle) in find!(
-        (a: Id, r: Inline<Handle<LongString>>),
-        pattern!(&catalog, [{
-            ?a @
-                common::metadata::tag: common::archive::kind_author,
-                common::archive::author_role: ?r,
-        }])
-    ) {
-        author_roles.insert(author_id, load_longstring(&mut ws, role_handle)?);
-    }
-
-    let mut records: Vec<(i128, Id, Id, Inline<Handle<LongString>>)> = Vec::new();
-    for (message_id, author_id, content_handle, created_at) in find!(
-        (
-            message: Id,
-            author: Id,
-            content: Inline<Handle<LongString>>,
-            created_at: Inline<NsTAIInterval>
-        ),
-        pattern!(&catalog, [{
-            ?message @
-                common::metadata::tag: common::archive::kind_message,
-                common::archive::author: ?author,
-                common::archive::content: ?content,
-                common::metadata::created_at: ?created_at,
-        }])
-    ) {
-        records.push((
-            interval_key(created_at),
-            message_id,
-            author_id,
-            content_handle,
-        ));
-    }
-    records.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut convo_cache: HashMap<Id, String> = HashMap::new();
-    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut out = std::io::BufWriter::new(file);
-    use std::io::Write as _;
-    writeln!(out, "{head_key}")?;
-    let total = records.len();
-    for (i, (key, message_id, author_id, content_handle)) in records.into_iter().enumerate() {
-        let content = load_longstring(&mut ws, content_handle)?;
-        let label = conversation_label(&mut ws, &catalog, message_id, &mut convo_cache)?;
-        let when = {
-            let e = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(key));
-            let (y, m, d, hh, mm, ss, _) = e.to_gregorian_tai();
-            format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
-        };
-        let record = ReplayRecord {
-            k: key,
-            w: when,
-            l: label,
-            n: author_names.get(&author_id).cloned().unwrap_or_default(),
-            r: author_roles.get(&author_id).cloned().unwrap_or_default(),
-            c: content,
-        };
-        writeln!(out, "{}", serde_json::to_string(&record)?)?;
-        if (i + 1) % 100_000 == 0 {
-            eprintln!("  indexed {}/{}", i + 1, total);
+        if !seen.insert(block) {
+            continue;
+        }
+        let key = interval_key(timestamp)?;
+        if key <= position {
+            continue;
+        }
+        let block = load_block(archive, block)?;
+        if with_tools || is_dialogue(&block) {
+            timeline.push(TimelineBlock { key, block });
         }
     }
-    out.into_inner().context("flush index")?;
-    Ok(total)
+    timeline.sort_unstable_by_key(|item| (item.key, item.block.semantic.block));
+    Ok(timeline)
 }
 
-/// Replay is self-contained: it manages the comb-state branch (cursors) and
-/// the disk index (timeline cache), touching the heavy archive branch only
-/// when the index is stale.
-fn run_replay_standalone(
-    pile_path: &Path,
-    archive_branch_id: Id,
-    archive_branch_name: &str,
+fn split_replay_batch(timeline: Vec<TimelineBlock>, limit: usize) -> (Vec<TimelineBlock>, usize) {
+    let mut selected = Vec::new();
+    let mut remaining = 0usize;
+    let mut cutoff = None;
+    for item in timeline {
+        if selected.len() < limit || cutoff == Some(item.key) {
+            cutoff = Some(item.key);
+            selected.push(item);
+        } else {
+            remaining += 1;
+        }
+    }
+    (selected, remaining)
+}
+
+fn run_replay(
+    storage: ArchiveStorage<'_>,
     action: &[String],
     limit: usize,
     with_tools: bool,
     persona: Option<&str>,
 ) -> Result<()> {
     let Some(persona) = persona else {
-        bail!(
-            "no persona: set $PERSONA or pass --persona.\n\
-             Cursors are session bookkeeping — no zooid is defaulted as \
-             \"the\" rememberer; the archive and the memories belong to \
-             the one being."
-        );
+        bail!("no persona: set $PERSONA or pass --persona; replay cursors are session bookkeeping");
     };
-
-    let (mut repo, archive_branch_id) =
-        common::open_repo_for_write(pile_path, archive_branch_id, archive_branch_name)?;
-    let res = (|| -> Result<()> {
-        let comb_branch_id = repo
-            .ensure_branch(COMB_STATE_BRANCH, None)
-            .map_err(|e| anyhow!("ensure comb-state branch: {e:?}"))?;
-
-        match action.first().map(String::as_str) {
-            Some("start") => {
-                let Some(raw) = action.get(1) else {
-                    bail!("usage: archive replay start <YYYY-MM-DDTHH:MM:SS>");
-                };
-                let from = parse_tai_timestamp(raw)?;
-                // Exclusive position one ns before the requested start, so
-                // the first batch includes messages at exactly <from>.
-                let position = from - hifitime::Duration::from_total_nanoseconds(1);
-                write_cursor(
-                    &mut repo,
-                    comb_branch_id,
-                    REPLAY_STREAM,
-                    persona,
-                    Some(position),
-                )?;
-                println!("replay started at {raw} (persona {persona})");
-                return Ok(());
-            }
-            Some("stop") => {
-                write_cursor(&mut repo, comb_branch_id, REPLAY_STREAM, persona, None)?;
-                println!("replay stopped (persona {persona})");
-                return Ok(());
-            }
-            Some(other) => bail!("unknown replay action `{other}` (start/stop or nothing)"),
-            None => {}
-        }
-
-        // Cursor read: tiny branch, instant checkout.
-        let comb_catalog = {
-            let mut ws = repo
-                .pull(comb_branch_id)
-                .map_err(|e| anyhow!("pull comb-state branch: {e:?}"))?;
-            ws.checkout(..).context("checkout comb-state branch")?
-        };
-        let Some((Some(position_key), _)) =
-            common::comb::latest(&comb_catalog, REPLAY_STREAM, persona)
-        else {
-            bail!("no active replay for persona {persona}: use `archive replay start <from>`");
-        };
-
-        // Index freshness: keyed by the archive branch head.
-        let head_key = {
-            let head = repo
-                .storage_mut()
-                .head(archive_branch_id)
-                .map_err(|e| anyhow!("archive branch head: {e:?}"))?;
-            format!("{head:?}")
-        };
-        let index_path = replay_index_path(pile_path);
-        let stale = match std::fs::File::open(&index_path) {
-            Ok(file) => {
-                let mut first = String::new();
-                std::io::BufReader::new(file).read_line(&mut first)?;
-                first.trim_end() != head_key
-            }
-            Err(_) => true,
-        };
-        if stale {
-            let total = build_replay_index(&mut repo, archive_branch_id, &head_key, &index_path)?;
-            eprintln!(
-                "replay index built: {total} message(s) at {}",
-                index_path.display()
-            );
-        }
-
-        // Stream the index: filter, position, batch (extending through any
-        // equal-timestamp run so the cursor stays strictly-greater), count.
-        let file = std::fs::File::open(&index_path)
-            .with_context(|| format!("open {}", index_path.display()))?;
-        let reader = std::io::BufReader::new(file);
-        let mut emitted = 0usize;
-        let mut remaining = 0usize;
-        let mut last_key = position_key;
-        for (line_no, line) in reader.lines().enumerate() {
-            let line = line?;
-            if line_no == 0 || line.is_empty() {
-                continue;
-            }
-            let record: ReplayRecord = serde_json::from_str(&line)
-                .with_context(|| format!("parse index line {}", line_no + 1))?;
-            if !with_tools && (record.r == "tool" || record.r == "system") {
-                continue;
-            }
-            if record.k <= position_key {
-                continue;
-            }
-            if emitted < limit || record.k == last_key {
-                println!("── [{}] {} — {}:", record.w, record.l, record.n);
-                println!("{}", record.c);
-                println!();
-                last_key = record.k;
-                emitted += 1;
-            } else {
-                remaining += 1;
-            }
-        }
-
-        if emitted == 0 {
-            println!("replay complete: nothing after the cursor. The past is read.");
-            return Ok(());
-        }
-
-        let last_epoch =
-            Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(last_key));
-        write_cursor(
-            &mut repo,
-            comb_branch_id,
-            REPLAY_STREAM,
-            persona,
-            Some(last_epoch),
-        )?;
-        println!("— batch: {emitted} message(s); cursor → {last_epoch}; {remaining} remaining");
-        Ok(())
-    })();
-
-    let close_result = repo
-        .close()
-        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
-    match (res, close_result) {
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(err),
-        (Ok(()), Ok(())) => Ok(()),
+    if limit == 0 {
+        bail!("replay limit must be at least 1");
     }
-}
 
-fn snippet(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    for ch in text.chars() {
-        if out.chars().count() >= max {
-            out.push_str("...");
-            break;
-        }
-        if ch == '\n' || ch == '\r' {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
-    if let Some(path) = raw.strip_prefix('@') {
-        if path == "-" {
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .with_context(|| format!("read {label} from stdin"))?;
-            return Ok(value);
-        }
-        return std::fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
-    }
-    Ok(raw.to_string())
-}
-
-/// Resolve one author's display name from a checkout-free trible index plus
-/// one blob get for the name string.
-fn author_name_from_index<P: TriblePattern>(
-    ws: &mut common::Ws,
-    index: &P,
-    author_id: Id,
-) -> Result<String> {
-    let Some((handle,)) = find!(
-        (handle: Inline<Handle<LongString>>),
-        pattern!(index, [{ author_id @ common::archive::author_name: ?handle }])
-    )
-    .next() else {
-        return Ok("<unknown>".to_string());
-    };
-    load_longstring(ws, handle)
-}
-
-/// Resolve one author's role from a checkout-free trible index, if present.
-fn author_role_from_index<P: TriblePattern>(
-    ws: &mut common::Ws,
-    index: &P,
-    author_id: Id,
-) -> Result<Option<String>> {
-    let Some((handle,)) = find!(
-        (handle: Inline<Handle<LongString>>),
-        pattern!(index, [{ author_id @ common::archive::author_role: ?handle }])
-    )
-    .next() else {
-        return Ok(None);
-    };
-    Ok(Some(load_longstring(ws, handle)?))
-}
-
-/// Read one immutable branch-pin snapshot and its source commit HEAD.
-///
-/// Index coverage and segment handles must be interpreted against the same
-/// branch metadata tribles. Rereading the mutable pin between those checks
-/// would admit a stale index if a writer advanced the source concurrently.
-fn read_archive_branch_snapshot(
-    repo: &mut common::Repo,
-    branch_id: Id,
-) -> Result<(TribleSet, Option<Inline<Handle<SimpleArchive>>>)> {
-    let branch_meta_handle = repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("read archive branch head: {e:?}"))?
-        .ok_or_else(|| anyhow!("archive branch is missing"))?;
-    let branch_reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|e| anyhow!("open branch metadata reader: {e:?}"))?;
-    let branch_meta: TribleSet = branch_reader
-        .get(branch_meta_handle)
-        .map_err(|e| anyhow!("load archive branch metadata: {e:?}"))?;
-    let source_head = find!(
-        (head: Inline<Handle<SimpleArchive>>),
-        pattern!(&branch_meta, [{ _?branch @ triblespace::core::repo::head: ?head }])
-    )
-    .at_most_one()
-    .map_err(|_| anyhow!("archive branch metadata has ambiguous source HEADs"))?
-    .map(|(head,)| head);
-    Ok((branch_meta, source_head))
-}
-
-/// List recent messages from the certified Succinct LSM snapshot.
-///
-/// This path deliberately has no raw-repository fallback. Each segment walks
-/// its fixed-`created_at` AVE slice backward; a decoded k-way max merge then
-/// validates candidates against the logical union until `limit` complete
-/// messages have been found. Message and author blobs are fetched only for
-/// those selected rows.
-fn run_list_standalone(
-    mut repo: common::Repo,
-    pile_path: &Path,
-    branch_id: Id,
-    limit: usize,
-) -> Result<()> {
-    let res = (|| -> Result<()> {
-        let (branch_meta, source_head) = read_archive_branch_snapshot(&mut repo, branch_id)?;
-        let kind = SuccinctRollup::new();
-        let reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow!("open Succinct manifest reader: {e:?}"))?;
-        let manifest = Manifest::from_tribles(&branch_meta, &reader, &kind)
-            .map_err(|e| anyhow!("parse Succinct manifest: {e}"))?;
-        if !manifest.claims_head(source_head) {
-            bail!(
-                "Succinct index {:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
-                manifest.recipe(),
-                manifest.frontier(),
-                source_head
-            );
-        }
-
-        let attach_start = Instant::now();
-        let segments = {
-            let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
-            home.attach_manifest(&manifest)
-                .map_err(|e| anyhow!("attach Succinct segments: {e}"))?
-        };
-        tracing::info!(
-            segments = segments.len(),
-            elapsed_ms = attach_start.elapsed().as_millis() as u64,
-            "Succinct manifest and segments attached"
-        );
-        if segments.is_empty() {
-            return Ok(());
-        }
-        let succinct = SuccinctRollup::union(&segments);
-
-        let select_start = Instant::now();
-        let mut records = Vec::with_capacity(limit);
-        let mut candidates_examined = 0usize;
-        let mut duplicates_skipped = 0usize;
-        if limit != 0 {
-            let created_at_attribute = common::metadata::created_at.id();
-            let mut cursors: Vec<_> = segments
-                .iter()
-                .map(|segment| {
-                    segment
-                        .iter_attribute_value_entities(&created_at_attribute)
-                        .rev()
-                })
-                .collect();
-            let mut heads = BinaryHeap::new();
-            for (segment_index, cursor) in cursors.iter_mut().enumerate() {
-                if let Some((created_at, message_id)) = cursor.next() {
-                    heads.push((created_at, message_id, segment_index));
-                }
-            }
-
-            let mut seen = HashSet::new();
-            while records.len() < limit {
-                let Some((created_at_raw, message_id, segment_index)) = heads.pop() else {
-                    break;
-                };
-                if let Some((next_created_at, next_message_id)) = cursors[segment_index].next() {
-                    heads.push((next_created_at, next_message_id, segment_index));
-                }
-                if !seen.insert((created_at_raw, message_id)) {
-                    duplicates_skipped += 1;
-                    continue;
-                }
-                candidates_examined += 1;
-
-                let created_at = Inline::<NsTAIInterval>::new(created_at_raw);
-                let Some((author_id, content_handle)) = find!(
-                    (author: Id, content: Inline<Handle<LongString>>),
-                    pattern!(&succinct, [{
-                        message_id @
-                            common::metadata::tag: common::archive::kind_message,
-                            common::archive::author: ?author,
-                            common::archive::content: ?content,
-                            common::metadata::created_at: created_at,
-                    }])
-                )
-                .next() else {
-                    continue;
-                };
-                records.push(RecentMessage {
-                    message_id,
-                    author_id,
-                    content_handle,
-                    created_at,
-                });
-            }
-        }
-        tracing::info!(
-            candidates_examined,
-            duplicates_skipped,
-            selected = records.len(),
-            elapsed_ms = select_start.elapsed().as_millis() as u64,
-            "recent archive messages selected"
-        );
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace for blob reads: {e:?}"))?;
-        for record in records {
-            let name = author_name_from_index(&mut ws, &succinct, record.author_id)?;
-            let role = author_role_from_index(&mut ws, &succinct, record.author_id)?;
-            let content = load_longstring(&mut ws, record.content_handle)?;
-            let (lower, _upper): (Epoch, Epoch) = record.created_at.try_from_inline().unwrap();
-            let role = role.as_deref().unwrap_or("");
-            println!(
-                "{} {} {} {}",
-                &format!("{:x}", record.message_id)[..8],
-                lower,
-                if role.is_empty() {
-                    name
-                } else {
-                    format!("{name} ({role})")
-                },
-                snippet(&content, 120)
-            );
-        }
-        Ok(())
-    })();
-
-    let close_result = repo
-        .close()
-        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
-    match (res, close_result) {
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(err),
-        (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
-/// Show one message from the certified Succinct LSM snapshot.
-///
-/// ID resolution and every trible lookup run against the logical segment
-/// union. The raw commit DAG is never checked out; only the winning message's
-/// content and its directly referenced display metadata are fetched as blobs.
-fn run_show_standalone(
-    mut repo: common::Repo,
-    pile_path: &Path,
-    branch_id: Id,
-    id: String,
-) -> Result<()> {
-    let res = (|| -> Result<()> {
-        let (branch_meta, source_head) = read_archive_branch_snapshot(&mut repo, branch_id)?;
-        let kind = SuccinctRollup::new();
-        let reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow!("open Succinct manifest reader: {e:?}"))?;
-        let manifest = Manifest::from_tribles(&branch_meta, &reader, &kind)
-            .map_err(|e| anyhow!("parse Succinct manifest: {e}"))?;
-        if !manifest.claims_head(source_head) {
-            bail!(
-                "Succinct index {:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
-                manifest.recipe(),
-                manifest.frontier(),
-                source_head
-            );
-        }
-
-        let attach_start = Instant::now();
-        let segments = {
-            let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
-            home.attach_manifest(&manifest)
-                .map_err(|e| anyhow!("attach Succinct segments: {e}"))?
-        };
-        tracing::info!(
-            segments = segments.len(),
-            elapsed_ms = attach_start.elapsed().as_millis() as u64,
-            "Succinct manifest and segments attached"
-        );
-        if segments.is_empty() {
-            bail!("archive contains no indexed facts");
-        }
-        let succinct = SuccinctRollup::union(&segments);
-        let message_id = resolve_message_id(&succinct, &id)?;
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace for blob reads: {e:?}"))?;
-        print_message(&mut ws, &succinct, message_id)
-    })();
-
-    let close_result = repo
-        .close()
-        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
-    match (res, close_result) {
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(err),
-        (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
-/// Search is dispatched standalone so the fast BM25 path never pays the
-/// full-branch `ws.checkout(..)` the remaining read commands do.
-///
-/// Fast path (default / BM25): attach the branch-head BM25 and Succinct
-/// index-home segments, require both coverage certificates to equal the source
-/// HEAD, rank via [`query_across`], then resolve each hit through the
-/// cross-segment Succinct union. No checkout or monolithic content rollup is
-/// involved.
-///
-fn run_search_standalone(
-    mut repo: common::Repo,
-    pile_path: &Path,
-    branch_id: Id,
-    text: String,
-    limit: usize,
-) -> Result<()> {
-    let text = load_value_or_file(&text, "search text")?;
-    let res = (|| -> Result<()> {
-        // Read the mutable branch pin exactly once. The source HEAD and both
-        // manifests below are therefore one consistent snapshot; attaching a
-        // manifest never races by rereading the pin.
-        let (branch_meta, source_head) = read_archive_branch_snapshot(&mut repo, branch_id)?;
-
-        // Parse and validate both coverage certificates before touching any
-        // segment blob. A stale manifest may contain obsolete or missing
-        // handles; the useful diagnostic is the uncovered source gap.
-        let content_attr = common::archive::content.id();
-        let index_attach_start = Instant::now();
-        let reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow!("open pile reader: {e:?}"))?;
-        let kind = Bm25Rollup::new(reader.clone(), content_attr);
-        let bm25_manifest = Manifest::from_tribles(&branch_meta, &reader, &kind)
-            .map_err(|e| anyhow!("parse BM25 manifest: {e}"))?;
-        if !bm25_manifest.claims_head(source_head) {
-            bail!(
-                "BM25 index {:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
-                bm25_manifest.recipe(),
-                bm25_manifest.frontier(),
-                source_head
-            );
-        }
-
-        let succinct_kind = SuccinctRollup::new();
-        let succinct_manifest = Manifest::from_tribles(&branch_meta, &reader, &succinct_kind)
-            .map_err(|e| anyhow!("parse Succinct manifest: {e}"))?;
-        if !succinct_manifest.claims_head(source_head) {
-            bail!(
-                "Succinct index {:x} is stale at {:?}, source HEAD is {:?}; run `archive index`",
-                succinct_manifest.recipe(),
-                succinct_manifest.frontier(),
-                source_head
-            );
-        }
-
-        // 1. Attach only the BM25 handles from the validated snapshot.
-        let segments = {
-            let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
-            home.attach_manifest(&bm25_manifest)
-                .map_err(|e| anyhow!("attach BM25 segments: {e}"))?
-        };
-        tracing::info!(
-            segments = segments.len(),
-            elapsed_ms = index_attach_start.elapsed().as_millis() as u64,
-            "BM25 manifest and segments attached"
-        );
-        if segments.is_empty() {
-            return Ok(());
-        }
-
-        // 2. Rank across the segment union (per-segment BM25; best score wins).
-        let bm25_start = Instant::now();
-        let ranked = query_across(&segments, &hash_tokens(&text))
-            .map_err(|error| anyhow!("query BM25 segment cover: {error}"))?;
-        let total_docs: usize = segments.iter().map(|s| s.doc_count()).sum();
-        tracing::info!(
-            segment_documents = total_docs,
-            hits = ranked.len(),
-            elapsed_ms = bm25_start.elapsed().as_millis() as u64,
-            "BM25 query complete"
-        );
-        drop(segments);
-
-        if limit == 0 || ranked.is_empty() {
-            tracing::info!(
-                materialized = 0,
-                elapsed_ms = 0,
-                "search results materialized"
-            );
-            return Ok(());
-        }
-
-        // 3. Only a query with results to materialise needs the Succinct LSM.
-        let succinct_attach_start = Instant::now();
-        let succinct_segments = {
-            let mut home = IndexHome::new(repo.storage_mut(), branch_id, succinct_kind);
-            home.attach_manifest(&succinct_manifest)
-                .map_err(|e| anyhow!("attach Succinct segments: {e}"))?
-        };
-        tracing::info!(
-            segments = succinct_segments.len(),
-            elapsed_ms = succinct_attach_start.elapsed().as_millis() as u64,
-            "Succinct manifest and segments attached"
-        );
-        if succinct_segments.is_empty() {
-            bail!("BM25 returned hits but the paired Succinct recipe has no artifacts");
-        }
-        let succinct = SuccinctRollup::union(&succinct_segments);
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace for blob reads: {e:?}"))?;
-
-        let materialize_start = Instant::now();
-        let mut materialized = 0usize;
-        for (doc, score) in ranked.into_iter().take(limit) {
-            let Ok(message_id): Result<Id, _> = doc.try_from_inline() else {
-                continue;
+    match action.first().map(String::as_str) {
+        Some("start") => {
+            let Some(raw) = action.get(1) else {
+                bail!("usage: archive replay start <YYYY-MM-DDTHH:MM:SS>");
             };
-            let Some((author_id, content_handle, created_at)) = find!(
-                (
-                    author: Id,
-                    content: Inline<Handle<LongString>>,
-                    created_at: Inline<NsTAIInterval>
-                ),
-                pattern!(&succinct, [{
-                    message_id @
-                        common::archive::author: ?author,
-                        common::archive::content: ?content,
-                        common::metadata::created_at: ?created_at,
-                }])
-            )
-            .next() else {
-                continue;
-            };
-            let content = load_longstring(&mut ws, content_handle)?;
-            let name = author_name_from_index(&mut ws, &succinct, author_id)?;
-            let role = author_role_from_index(&mut ws, &succinct, author_id)?;
-            let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
-            let role = role.as_deref().unwrap_or("");
-            println!(
-                "{score:7.2} {} {} {} {}",
-                &format!("{message_id:x}")[..8],
-                lower,
-                if role.is_empty() {
-                    name
-                } else {
-                    format!("{name} ({role})")
-                },
-                snippet(&content, 120)
-            );
-            materialized += 1;
+            if action.len() != 2 {
+                bail!("usage: archive replay start <YYYY-MM-DDTHH:MM:SS>");
+            }
+            let from = parse_tai_timestamp(raw)?;
+            let position = from - hifitime::Duration::from_total_nanoseconds(1);
+            let (facts, catalog) = storage.load_comb()?;
+            if let Some(fragment) =
+                plan_cursor_update(&catalog, REPLAY_STREAM, persona, Some(position))?
+            {
+                validate_cursor_update(&facts, &fragment)?;
+                publish_cursor_update(storage, fragment)?;
+            }
+            println!("replay started at {raw} (persona {persona})");
+            return Ok(());
         }
-        tracing::info!(
-            materialized,
-            elapsed_ms = materialize_start.elapsed().as_millis() as u64,
-            "search results materialized"
-        );
-        Ok(())
-    })();
+        Some("stop") => {
+            if action.len() != 1 {
+                bail!("usage: archive replay stop");
+            }
+            let (facts, catalog) = storage.load_comb()?;
+            if let Some(fragment) = plan_cursor_update(&catalog, REPLAY_STREAM, persona, None)? {
+                validate_cursor_update(&facts, &fragment)?;
+                publish_cursor_update(storage, fragment)?;
+            }
+            println!("replay stopped (persona {persona})");
+            return Ok(());
+        }
+        Some(other) => bail!("unknown replay action `{other}` (start/stop or nothing)"),
+        None => {}
+    }
 
-    let close_start = Instant::now();
-    let close_result = repo
-        .close()
-        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
-    tracing::info!(
-        elapsed_ms = close_start.elapsed().as_millis() as u64,
-        "search repository close complete"
+    let replay = storage.load_replay()?;
+    let position = active_cursor_position(&replay.comb_catalog, REPLAY_STREAM, persona)?;
+    let (selected, remaining) = split_replay_batch(
+        timeline_after(&replay.archive, position, with_tools)?,
+        limit,
     );
-    match (res, close_result) {
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(err),
-        (Ok(()), Ok(())) => Ok(()),
+    if selected.is_empty() {
+        println!("replay complete: nothing after the cursor. The past is read.");
+        return Ok(());
     }
-}
 
-fn advance_coverage_frontier(
-    ws: &mut common::Ws,
-    frontier: &mut Vec<common::CommitHandle>,
-    commit: common::CommitHandle,
-) -> Result<()> {
-    let meta: TribleSet = ws
-        .get(commit)
-        .map_err(|err| anyhow!("load commit metadata {commit:?}: {err:?}"))?;
-    let parents: HashSet<[u8; 32]> = find!(
-        (parent: Inline<Handle<SimpleArchive>>),
-        pattern!(&meta, [{ triblespace::core::repo::parent: ?parent }])
-    )
-    .map(|(parent,)| parent.raw)
-    .collect();
-    frontier.retain(|tip| !parents.contains(&tip.raw));
-    frontier.push(commit);
-    frontier.sort_unstable_by_key(|tip| tip.raw);
-    frontier.dedup_by_key(|tip| tip.raw);
+    for block in &selected {
+        print!("{}", render_block(&block.block, with_tools)?);
+        println!("---");
+    }
+    let last_key = selected.last().expect("selected is nonempty").key;
+    let last_epoch = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(last_key));
+    let fragment = plan_cursor_update(
+        &replay.comb_catalog,
+        REPLAY_STREAM,
+        persona,
+        Some(last_epoch),
+    )?
+    .ok_or_else(|| anyhow!("replay emitted blocks without advancing its cursor"))?;
+    validate_cursor_update(&replay.comb_facts, &fragment)?;
+    publish_cursor_update(storage, fragment)?;
+    println!(
+        "batch: {} block(s); cursor -> {}; {} remaining",
+        selected.len(),
+        last_epoch,
+        remaining,
+    );
     Ok(())
-}
-
-fn panic_payload(payload: Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_owned()
-    }
-}
-
-fn default_preparation_window(rayon_threads: usize) -> usize {
-    rayon_threads.isqrt().max(1)
-}
-
-/// Run independent preparation jobs on Rayon while publishing their results
-/// in exact input order. `max_in_flight` bounds the sum of running jobs and
-/// completed results waiting behind a slow earlier job; new work enters only
-/// when one ordered result has been published. The bound counts commits, not
-/// bytes: one prepared commit can itself contain several physical shards.
-fn run_ordered_preparation_pipeline<I, T, P, U>(
-    items: &[I],
-    max_in_flight: usize,
-    prepare: P,
-    mut publish: U,
-) -> Result<()>
-where
-    I: Copy + Send + Sync,
-    T: Send,
-    P: Fn(I) -> Result<T> + Send + Sync,
-    U: FnMut(usize, I, T) -> Result<()> + Send,
-{
-    if max_in_flight == 0 {
-        bail!("archive index preparation window must be at least 1");
-    }
-    if items.is_empty() {
-        return Ok(());
-    }
-
-    // A scope owner blocks while receiving prepared results, so a one-thread
-    // pool has no second worker that could execute a spawned job. Window 1 is
-    // also the explicit serial baseline; run both cases inline while retaining
-    // the same panic-to-error and ordered-publish contract.
-    if max_in_flight == 1 || rayon::current_num_threads() == 1 {
-        for (ordinal, &item) in items.iter().enumerate() {
-            let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(item)))
-                .unwrap_or_else(|payload| {
-                    Err(anyhow!(
-                        "archive index preparation worker panicked: {}",
-                        panic_payload(payload)
-                    ))
-                })
-                .with_context(|| {
-                    format!("prepare archive commit {}/{}", ordinal + 1, items.len())
-                })?;
-            publish(ordinal, item, prepared).with_context(|| {
-                format!("publish archive commit {}/{}", ordinal + 1, items.len())
-            })?;
-        }
-        return Ok(());
-    }
-
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let prepare = Arc::new(prepare);
-    let (sender, receiver) = std::sync::mpsc::sync_channel(max_in_flight);
-
-    rayon::scope_fifo(move |scope| -> Result<()> {
-        let spawn = |ordinal: usize| {
-            let item = items[ordinal];
-            let sender = sender.clone();
-            let cancelled = Arc::clone(&cancelled);
-            let prepare = Arc::clone(&prepare);
-            scope.spawn_fifo(move |_| {
-                if cancelled.load(Ordering::Acquire) {
-                    return;
-                }
-                let outcome =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(item)))
-                        .unwrap_or_else(|payload| {
-                            Err(anyhow!(
-                                "archive index preparation worker panicked: {}",
-                                panic_payload(payload)
-                            ))
-                        });
-                // The receiver may disappear after the first ordered error.
-                // That is cancellation, not another worker failure.
-                let _ = sender.send((ordinal, outcome));
-            });
-        };
-
-        let mut next_to_dispatch = 0usize;
-        let mut next_to_publish = 0usize;
-        let mut completed = BTreeMap::new();
-        while next_to_dispatch < items.len() && next_to_dispatch < max_in_flight {
-            spawn(next_to_dispatch);
-            next_to_dispatch += 1;
-        }
-
-        while next_to_publish < items.len() {
-            let (ordinal, outcome) = match receiver.recv() {
-                Ok(value) => value,
-                Err(_) => {
-                    cancelled.store(true, Ordering::Release);
-                    bail!("archive index preparation workers stopped without a result");
-                }
-            };
-            completed.insert(ordinal, outcome);
-
-            while let Some(outcome) = completed.remove(&next_to_publish) {
-                let item = items[next_to_publish];
-                let prepared = match outcome {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        cancelled.store(true, Ordering::Release);
-                        return Err(err).with_context(|| {
-                            format!(
-                                "prepare archive commit {}/{}",
-                                next_to_publish + 1,
-                                items.len()
-                            )
-                        });
-                    }
-                };
-                if let Err(err) = publish(next_to_publish, item, prepared) {
-                    cancelled.store(true, Ordering::Release);
-                    return Err(err).with_context(|| {
-                        format!(
-                            "publish archive commit {}/{}",
-                            next_to_publish + 1,
-                            items.len()
-                        )
-                    });
-                }
-                next_to_publish += 1;
-
-                // Count both workers and reorder-buffer entries against the
-                // same window. A head-of-line stall therefore cannot admit an
-                // unbounded tail of fully materialised commit blobs.
-                if next_to_dispatch < items.len() {
-                    spawn(next_to_dispatch);
-                    next_to_dispatch += 1;
-                }
-                debug_assert!(next_to_dispatch - next_to_publish <= max_in_flight);
-            }
-        }
-        Ok(())
-    })
-}
-
-#[cfg(test)]
-mod ordered_preparation_tests {
-    use std::sync::{Arc, Barrier, Mutex};
-    use std::time::Duration;
-
-    use super::{default_preparation_window, run_ordered_preparation_pipeline};
-
-    #[test]
-    fn default_window_balances_nested_parallel_stages() {
-        assert_eq!(default_preparation_window(16), 4);
-        assert_eq!(default_preparation_window(8), 2);
-        assert_eq!(default_preparation_window(4), 2);
-        assert_eq!(default_preparation_window(2), 1);
-        assert_eq!(default_preparation_window(1), 1);
-    }
-
-    #[test]
-    fn reverse_completion_is_published_in_input_order() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(5)
-            .build()
-            .unwrap();
-        let barrier = Arc::new(Barrier::new(4));
-        let completion = Arc::new(Mutex::new(Vec::new()));
-        let completion_from_workers = Arc::clone(&completion);
-        let barrier_from_workers = Arc::clone(&barrier);
-        let mut published = Vec::new();
-
-        pool.install(|| {
-            run_ordered_preparation_pipeline(
-                &[0usize, 1, 2, 3],
-                4,
-                move |item| {
-                    barrier_from_workers.wait();
-                    std::thread::sleep(Duration::from_millis((3 - item) as u64 * 20));
-                    completion_from_workers.lock().unwrap().push(item);
-                    Ok(item)
-                },
-                |ordinal, item, prepared| {
-                    assert_eq!(ordinal, item);
-                    assert_eq!(item, prepared);
-                    published.push(item);
-                    Ok(())
-                },
-            )
-        })
-        .unwrap();
-
-        assert_eq!(*completion.lock().unwrap(), [3, 2, 1, 0]);
-        assert_eq!(published, [0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn worker_panic_is_terminal_after_a_contiguous_prefix() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-        let mut published = Vec::new();
-        let error = pool
-            .install(|| {
-                run_ordered_preparation_pipeline(
-                    &[0usize, 1, 2, 3, 4, 5],
-                    4,
-                    |item| {
-                        if item == 3 {
-                            panic!("synthetic preparation panic");
-                        }
-                        Ok(item)
-                    },
-                    |_ordinal, item, prepared| {
-                        assert_eq!(item, prepared);
-                        published.push(item);
-                        Ok(())
-                    },
-                )
-            })
-            .unwrap_err();
-
-        assert!(error.to_string().contains("prepare archive commit 4/6"));
-        assert!(format!("{error:#}").contains("synthetic preparation panic"));
-        assert_eq!(published, [0, 1, 2]);
-    }
-
-    #[test]
-    fn one_thread_pool_uses_the_deadlock_free_serial_path() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap();
-        let mut published = Vec::new();
-        pool.install(|| {
-            run_ordered_preparation_pipeline(
-                &[0usize, 1, 2, 3],
-                4,
-                Ok,
-                |_ordinal, item, prepared| {
-                    assert_eq!(item, prepared);
-                    published.push(item);
-                    Ok(())
-                },
-            )
-        })
-        .unwrap();
-        assert_eq!(published, [0, 1, 2, 3]);
-    }
-}
-
-fn inspect_recipe_manifest<K>(
-    storage: &mut Pile,
-    branch_meta: &TribleSet,
-    reachable: &PATCH<32>,
-    kind: &K,
-) -> Result<Vec<common::CommitHandle>>
-where
-    K: IndexKind,
-{
-    let reader = storage
-        .reader()
-        .map_err(|err| anyhow!("open typed manifest reader: {err:?}"))?;
-    let manifest = Manifest::from_tribles(branch_meta, &reader, kind)
-        .map_err(|err| anyhow!("parse typed manifest: {err}"))?;
-    if let Some(foreign) = manifest
-        .frontier()
-        .iter()
-        .find(|tip| reachable.get(&tip.raw).is_none())
-    {
-        bail!("certified frontier tip {foreign:?} is not an ancestor of target HEAD");
-    }
-    manifest
-        .audit_exact_cover(&reader)
-        .map_err(|err| anyhow!("audit exact commit-range cover: {err}"))?;
-    for range in manifest.ranges() {
-        for artifact in range.artifacts() {
-            kind.attach(&reader, artifact).map_err(|err| {
-                anyhow!(
-                    "attach typed artifact from range {:?}: {err}",
-                    range.range()
-                )
-            })?;
-        }
-    }
-    Ok(manifest.frontier().to_vec())
-}
-
-fn recover_recipe_frontier<K>(
-    storage: &mut Pile,
-    branch_meta: &mut TribleSet,
-    reachable: &PATCH<32>,
-    kind: &K,
-    label: &str,
-) -> Result<Vec<common::CommitHandle>>
-where
-    K: IndexKind,
-{
-    match inspect_recipe_manifest(storage, branch_meta, reachable, kind) {
-        Ok(frontier) => Ok(frontier),
-        Err(err) => {
-            let recipe = kind
-                .recipe_fragment()
-                .root()
-                .ok_or_else(|| anyhow!("{label} recipe has no stable root"))?;
-            eprintln!(
-                "discarding only the invalid {label} recipe {recipe:x}; it will be rebuilt: {err:#}"
-            );
-            strip_recipe_manifest(branch_meta, recipe);
-            Ok(Vec::new())
-        }
-    }
-}
-
-fn uncovered_commits(
-    ws: &mut common::Ws,
-    reachable: PATCH<32>,
-    frontier: &[common::CommitHandle],
-) -> Result<Vec<common::CommitHandle>> {
-    if frontier.is_empty() {
-        commits_topological(ws, reachable).context("order uncovered archive commits")
-    } else {
-        commits_topological(ws, difference(reachable, ancestors(frontier.to_vec())))
-            .context("order uncovered archive commits")
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ArchiveIndexWork {
-    commit: common::CommitHandle,
-    succinct: bool,
-    bm25: bool,
-}
-
-/// Build or repair the archive's two typed range indexes directly from source
-/// commits. Each recipe keeps an independent certified frontier; one source
-/// commit becomes exactly one inclusive leaf range even when its physical
-/// artifacts are sharded. Empty projections are retained as artifact-free
-/// range certificates.
-fn run_index_standalone(
-    pile_path: &Path,
-    branch_id: Id,
-    branch_name: &str,
-    prepare_in_flight: Option<NonZeroUsize>,
-) -> Result<()> {
-    let mut repo = common::open_repo(pile_path)?;
-    let res = (|| -> Result<()> {
-        common::validate_branch_for_read(&mut repo, branch_id, branch_name)?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let target_head = ws
-            .head()
-            .ok_or_else(|| anyhow!("archive branch has no commits to index"))?;
-
-        let mut branch_meta_handle = repo
-            .storage_mut()
-            .head(branch_id)
-            .map_err(|err| anyhow!("read archive branch head: {err:?}"))?
-            .ok_or_else(|| anyhow!("archive branch is missing"))?;
-        let mut branch_meta: TribleSet = repo
-            .storage_mut()
-            .reader()
-            .map_err(|err| anyhow!("open branch reader: {err:?}"))?
-            .get(branch_meta_handle)
-            .map_err(|err| anyhow!("load archive branch metadata: {err:?}"))?;
-
-        let reachable = ancestors(target_head)
-            .select(&mut ws)
-            .context("walk archive commit DAG")?;
-        let succinct_format = SuccinctRollup::new();
-        let bm25_reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|err| anyhow!("open BM25 reader: {err:?}"))?;
-        let bm25 = Bm25Rollup::new(bm25_reader, common::archive::content.id());
-
-        let mut succinct_frontier = recover_recipe_frontier(
-            repo.storage_mut(),
-            &mut branch_meta,
-            &reachable,
-            &succinct_format,
-            "Succinct",
-        )?;
-        let mut bm25_frontier = recover_recipe_frontier(
-            repo.storage_mut(),
-            &mut branch_meta,
-            &reachable,
-            &bm25,
-            "BM25",
-        )?;
-
-        let succinct_missing = uncovered_commits(&mut ws, reachable.clone(), &succinct_frontier)?;
-        let bm25_missing = uncovered_commits(&mut ws, reachable.clone(), &bm25_frontier)?;
-        let succinct_missing: HashSet<[u8; 32]> = succinct_missing
-            .into_iter()
-            .map(|commit| commit.raw)
-            .collect();
-        let bm25_missing: HashSet<[u8; 32]> =
-            bm25_missing.into_iter().map(|commit| commit.raw).collect();
-
-        let work: Vec<_> = commits_topological(&mut ws, reachable.clone())
-            .context("order archive commits")?
-            .into_iter()
-            .filter_map(|commit| {
-                let succinct = succinct_missing.contains(&commit.raw);
-                let bm25 = bm25_missing.contains(&commit.raw);
-                (succinct || bm25).then_some(ArchiveIndexWork {
-                    commit,
-                    succinct,
-                    bm25,
-                })
-            })
-            .collect();
-
-        if work.is_empty() {
-            println!("archive typed indexes already cover HEAD ({target_head:?})");
-            return Ok(());
-        }
-
-        eprintln!(
-            "indexing {} source commit(s) (Succinct {}, BM25 {}) as typed logical ranges…",
-            work.len(),
-            succinct_missing.len(),
-            bm25_missing.len()
-        );
-        let rayon_threads = rayon::current_num_threads();
-        let prepare_in_flight = prepare_in_flight
-            .map(NonZeroUsize::get)
-            .unwrap_or_else(|| default_preparation_window(rayon_threads));
-        eprintln!(
-            "  preparation pipeline: {prepare_in_flight} commit(s) in flight on {rayon_threads} Rayon worker(s)"
-        );
-
-        let succinct = common::archive_succinct_rollup();
-        let prepare_reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|err| anyhow!("open archive preparation reader: {err:?}"))?;
-        let index_started = Instant::now();
-        let commit_count = work.len();
-        run_ordered_preparation_pipeline(
-            &work,
-            prepare_in_flight,
-            |item| {
-                common::prepare_archive_commit(
-                    prepare_reader.clone(),
-                    item.commit,
-                    item.succinct,
-                    item.bm25,
-                )
-            },
-            |i, item, prepared| {
-                debug_assert_eq!(prepared.commit, item.commit);
-                debug_assert_eq!(prepared.succinct.is_some(), item.succinct);
-                debug_assert_eq!(prepared.bm25.is_some(), item.bm25);
-                let prepare_elapsed = prepared.elapsed;
-                let prepared_tribles = prepared.tribles;
-                let physical_shards = prepared.physical_shards;
-                let publish_started = Instant::now();
-                common::publish_archive_commit(
-                    repo.storage_mut(),
-                    prepared,
-                    &succinct,
-                    &bm25,
-                    &mut branch_meta,
-                )?;
-
-                if item.succinct {
-                    advance_coverage_frontier(&mut ws, &mut succinct_frontier, item.commit)?;
-                    set_index_frontier(
-                        repo.storage_mut(),
-                        &succinct_format,
-                        &mut branch_meta,
-                        succinct_frontier.clone(),
-                    )
-                    .map_err(|err| anyhow!("advance Succinct frontier: {err}"))?;
-                }
-                if item.bm25 {
-                    advance_coverage_frontier(&mut ws, &mut bm25_frontier, item.commit)?;
-                    set_index_frontier(
-                        repo.storage_mut(),
-                        &bm25,
-                        &mut branch_meta,
-                        bm25_frontier.clone(),
-                    )
-                    .map_err(|err| anyhow!("advance BM25 frontier: {err}"))?;
-                }
-
-                let new_meta: Inline<Handle<SimpleArchive>> = repo
-                    .storage_mut()
-                    .put(branch_meta.clone())
-                    .map_err(|err| anyhow!("store typed index checkpoint: {err:?}"))?;
-                match repo
-                    .storage_mut()
-                    .update(branch_id, Some(branch_meta_handle), Some(new_meta))
-                    .map_err(|err| anyhow!("publish typed index checkpoint: {err:?}"))?
-                {
-                    PushResult::Success() => branch_meta_handle = new_meta,
-                    PushResult::Conflict(_) => {
-                        bail!(
-                            "archive branch changed during indexing; rerun to resume each recipe from its certified frontier"
-                        )
-                    }
-                }
-                repo.storage_mut()
-                    .flush()
-                    .map_err(|err| anyhow!("flush typed index checkpoint: {err:?}"))?;
-
-                let publish_elapsed = publish_started.elapsed();
-                let commit_work = prepare_elapsed + publish_elapsed;
-                let rate = (i + 1) as f64 / index_started.elapsed().as_secs_f64().max(f64::EPSILON);
-                if commit_work.as_secs() >= 5 {
-                    eprintln!(
-                        "  …{}/{} commit {:?} indexed and flushed in {:.1?} (prepare {:.1?}; carry/checkpoint {:.1?}; {prepared_tribles} tribles/{physical_shards} physical shard(s); {rate:.2} commits/s)",
-                        i + 1,
-                        work.len(),
-                        item.commit,
-                        commit_work,
-                        prepare_elapsed,
-                        publish_elapsed,
-                    );
-                } else if (i + 1) % 100 == 0 || i + 1 == work.len() {
-                    eprintln!(
-                        "  …{}/{} commits indexed ({rate:.2} commits/s)",
-                        i + 1,
-                        work.len()
-                    );
-                }
-                Ok(())
-            },
-        )?;
-
-        for (label, frontier) in [
-            ("Succinct", succinct_frontier.as_slice()),
-            ("BM25", bm25_frontier.as_slice()),
-        ] {
-            if frontier != [target_head] {
-                bail!(
-                    "{label} traversal ended at frontier {:?}, expected {:?}",
-                    frontier,
-                    target_head
-                );
-            }
-        }
-        let final_succinct = inspect_recipe_manifest(
-            repo.storage_mut(),
-            &branch_meta,
-            &reachable,
-            &succinct_format,
-        )?;
-        let final_bm25 =
-            inspect_recipe_manifest(repo.storage_mut(), &branch_meta, &reachable, &bm25)?;
-        if final_succinct.as_slice() != [target_head] || final_bm25.as_slice() != [target_head] {
-            bail!("final typed index audit did not certify archive HEAD");
-        }
-
-        eprintln!(
-            "  indexed {commit_count} source commit(s) in {:.1?} ({:.2} commits/s)",
-            index_started.elapsed(),
-            commit_count as f64 / index_started.elapsed().as_secs_f64().max(f64::EPSILON)
-        );
-        println!("archive Succinct and BM25 typed indexes now cover HEAD");
-        Ok(())
-    })();
-
-    let close_result = repo
-        .close()
-        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
-    match (res, close_result) {
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(err),
-        (Ok(()), Ok(())) => Ok(()),
-    }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.trace, cli.trace_filter.as_deref());
-    let pile_path = cli.pile.clone();
-    let Some(cmd) = cli.command else {
+    let Some(command) = cli.command else {
         let mut command = Cli::command();
         command.print_help()?;
         println!();
         return Ok(());
     };
-
-    // Indexed reads own one repository for their whole path. Opening a fresh
-    // `Pile` rebuilds its in-memory record index, so resolving the branch in
-    // a throwaway repository and reopening for the query doubles cold-start
-    // work on archive-scale piles.
-    let standalone_read = match &cmd {
-        Command::List { .. } => Some("list"),
-        Command::Show { .. } => Some("show"),
-        Command::Search { .. } => Some("search"),
-        _ => None,
+    let storage = ArchiveStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
     };
-    if let Some(operation) = standalone_read {
-        let open_start = Instant::now();
-        let mut repo = common::open_repo(&pile_path)?;
-        tracing::info!(
-            operation,
-            elapsed_ms = open_start.elapsed().as_millis() as u64,
-            "indexed-read repository open complete"
-        );
-
-        let branch_resolution_start = Instant::now();
-        let branch_id = if let Some(hex) = cli.branch_id.as_deref() {
-            Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"))?
-        } else {
-            repo.ensure_branch(&cli.branch, None)
-                .map_err(|e| anyhow!("ensure archive branch: {e:?}"))?
-        };
-        common::validate_branch_for_read(&mut repo, branch_id, &cli.branch)?;
-        tracing::info!(
-            operation,
-            elapsed_ms = branch_resolution_start.elapsed().as_millis() as u64,
-            "indexed-read branch resolution complete"
-        );
-
-        return match &cmd {
-            Command::List { limit } => run_list_standalone(repo, &pile_path, branch_id, *limit),
-            Command::Show { id } => run_show_standalone(repo, &pile_path, branch_id, id.clone()),
-            Command::Search { text, limit } => {
-                run_search_standalone(repo, &pile_path, branch_id, text.clone(), *limit)
-            }
-            _ => unreachable!("standalone read dispatch changed after classification"),
-        };
-    }
-
-    let branch_resolution_start = Instant::now();
-    let branch_id = common::with_repo(&pile_path, |repo| {
-        if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
-        }
-        repo.ensure_branch(&cli.branch, None)
-            .map_err(|e| anyhow!("ensure archive branch: {e:?}"))
-    })?;
-    tracing::info!(
-        elapsed_ms = branch_resolution_start.elapsed().as_millis() as u64,
-        "command branch resolution complete"
-    );
-    if let Command::Import { source, path } = cmd {
-        return run_import_jobs(source, path.as_deref(), &pile_path, &cli.branch, branch_id);
-    }
-    if let Command::Replay {
-        action,
-        limit,
-        with_tools,
-        persona,
-    } = cmd
-    {
-        return run_replay_standalone(
-            &pile_path,
-            branch_id,
-            &cli.branch,
-            &action,
+    match command {
+        Command::Import { path } => run_import(storage, &path),
+        Command::List { limit } => run_list(storage, limit),
+        Command::Show { id } => run_show(storage, &id),
+        Command::Thread { id, limit } => run_thread(storage, &id, limit),
+        Command::Search { text, limit } => run_search(storage, &text, limit),
+        Command::Index => run_index(storage),
+        Command::MigrateLegacy => run_migrate_legacy(storage),
+        Command::Replay {
+            action,
             limit,
             with_tools,
-            persona.as_deref(),
-        );
+            persona,
+        } => run_replay(storage, &action, limit, with_tools, persona.as_deref()),
     }
-    if let Command::Index { prepare_in_flight } = cmd {
-        return run_index_standalone(&pile_path, branch_id, &cli.branch, prepare_in_flight);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faculties::collection_cutover::initialize_signer;
+    use std::fs;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        pile: PathBuf,
+        key: PathBuf,
     }
 
-    let (mut repo, branch_id) = common::open_repo_for_read(&pile_path, branch_id, &cli.branch)?;
-
-    let res = (|| -> Result<()> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let catalog = ws.checkout(..).context("checkout workspace")?;
-
-        match cmd {
-            Command::Import { .. } => unreachable!("import is handled before opening the branch"),
-            Command::List { .. } => {
-                unreachable!("indexed list is handled before the raw checkout path")
-            }
-            Command::Show { .. } => {
-                unreachable!("indexed show is handled before the raw checkout path")
-            }
-            Command::Thread { id, limit } => {
-                let leaf = resolve_message_id(&*catalog, &id)?;
-                let mut chain = Vec::new();
-                let mut seen = HashSet::new();
-                let mut current = leaf;
-
-                for _ in 0..limit {
-                    if !seen.insert(current) {
-                        break;
-                    }
-                    chain.push(current);
-                    let parent = find!(
-                        (parent: Id),
-                        pattern!(&catalog, [{ current @ common::archive::reply_to: ?parent }])
-                    )
-                    .into_iter()
-                    .next()
-                    .map(|(p,)| p);
-                    let Some(parent) = parent else { break };
-                    current = parent;
-                }
-
-                chain.reverse();
-                for message_id in chain {
-                    let (message_id, name, role, created_at, content_handle, _reply_to) =
-                        message_record(&mut ws, &*catalog, message_id)?;
-                    let content = load_longstring(&mut ws, content_handle)?;
-                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
-                    let role = role.as_deref().unwrap_or("");
-                    println!(
-                        "{} {} {} {}",
-                        &format!("{message_id:x}")[..8],
-                        lower,
-                        if role.is_empty() {
-                            name
-                        } else {
-                            format!("{name} ({role})")
-                        },
-                        snippet(&content, 120)
-                    );
-                }
-            }
-            Command::Search { .. } => {
-                unreachable!("search is handled before opening the branch")
-            }
-            Command::Index { .. } => {
-                unreachable!("index is handled before opening the branch")
-            }
-            Command::Imports { format, limit } => {
-                let format_filter = format.map(|s| s.to_lowercase());
-
-                let mut conversations = Vec::new();
-                for (conversation_id, source_format, source_conversation_id_handle) in find!(
-                    (
-                        conversation: Id,
-                        format: String,
-                        source_conversation_id: Inline<Handle<LongString>>
-                    ),
-                    pattern!(&catalog, [{
-                        ?conversation @
-                            common::metadata::tag: common::import_schema::kind_conversation,
-                            common::import_schema::source_format: ?format,
-                            common::import_schema::source_conversation_id: ?source_conversation_id,
-                    }])
-                ) {
-                    if let Some(filter) = format_filter.as_deref() {
-                        if source_format.to_lowercase() != filter {
-                            continue;
-                        }
-                    }
-                    let source_conversation_id =
-                        load_longstring(&mut ws, source_conversation_id_handle)?;
-                    conversations.push((conversation_id, source_format, source_conversation_id));
-                }
-
-                conversations.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
-                for (conversation_id, source_format, source_conversation_id) in
-                    conversations.into_iter().take(limit)
-                {
-                    println!(
-                        "{} {} convo={}",
-                        &format!("{conversation_id:x}")[..8],
-                        source_format,
-                        source_conversation_id
-                    );
-                }
-            }
-            Command::Replay { .. } => {
-                unreachable!("replay is handled before opening the archive branch")
-            }
+    fn fixture() -> Fixture {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("archive.pile");
+        fs::File::create(&pile).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_signer(&pile, Some(&key)).unwrap();
+        Fixture {
+            _directory: directory,
+            pile,
+            key,
         }
+    }
 
-        Ok(())
-    })();
+    fn storage(fixture: &Fixture) -> ArchiveStorage<'_> {
+        ArchiveStorage {
+            pile: &fixture.pile,
+            key: Some(&fixture.key),
+        }
+    }
 
-    let close_result = repo
-        .close()
-        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
+    fn archive_root_count(fixture: &Fixture) -> usize {
+        storage(fixture).load().unwrap().commits().len()
+    }
 
-    match (res, close_result) {
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(err),
-        (Ok(()), Ok(())) => Ok(()),
+    #[test]
+    fn cli_surface_has_no_branch_sidecar_or_legacy_importer_controls() {
+        let commands: BTreeSet<_> = Cli::command()
+            .get_subcommands()
+            .map(|command| command.get_name().to_owned())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "import",
+                "index",
+                "list",
+                "migrate-legacy",
+                "replay",
+                "search",
+                "show",
+                "thread",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+        assert!(Cli::try_parse_from([
+            "archive",
+            "--pile",
+            "archive.pile",
+            "--branch",
+            "archive",
+            "list"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "archive",
+            "--pile",
+            "archive.pile",
+            "--branch-id",
+            "11111111111111111111111111111111",
+            "show",
+            "1111"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "archive",
+            "--pile",
+            "archive.pile",
+            "index",
+            "--prepare-in-flight",
+            "4"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "archive",
+            "--pile",
+            "archive.pile",
+            "import",
+            "chatgpt",
+            "backup"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn cli_import_publishes_one_signed_visibility_edge() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("claude-code");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join("parent.jsonl"),
+            r#"{"type":"user","sessionId":"atomic","uuid":"root","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"parent"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("child.jsonl"),
+            r#"{"type":"assistant","sessionId":"atomic","uuid":"child","parentUuid":"root","timestamp":"2026-03-01T15:34:02Z","message":{"role":"assistant","content":"child"}}"#,
+        )
+        .unwrap();
+
+        run_import(storage(&fixture), &source).unwrap();
+        assert_eq!(archive_root_count(&fixture), 1);
+        let archive = storage(&fixture).load().unwrap();
+        assert_eq!(archive.projection_ids().len(), 2);
+        drop(archive);
+        let after_first = fs::metadata(&fixture.pile).unwrap().len();
+
+        run_import(storage(&fixture), &source).unwrap();
+        assert_eq!(archive_root_count(&fixture), 1);
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
+    }
+
+    #[test]
+    fn failed_cli_import_leaves_no_signed_archive_root() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("conflict");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join("origin.jsonl"),
+            r#"{"type":"user","sessionId":"origin","uuid":"message","message":{"role":"user","content":"origin"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("fork.jsonl"),
+            r#"{"type":"user","sessionId":"fork","uuid":"copy","forkedFrom":{"sessionId":"origin","messageUuid":"message"},"message":{"role":"user","content":"different"}}"#,
+        )
+        .unwrap();
+
+        let error = run_import(storage(&fixture), &source).unwrap_err();
+        assert!(format!("{error:#}").contains("conflicting semantic payloads"));
+        assert_eq!(archive_root_count(&fixture), 0);
+    }
+
+    #[test]
+    fn raw_succinct_and_bm25_derives_are_idempotent_and_search_works() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("one.jsonl");
+        fs::write(
+            &source,
+            r#"{"type":"user","sessionId":"read","uuid":"one","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"quasar needle"}}"#,
+        )
+        .unwrap();
+        run_import(storage(&fixture), &source).unwrap();
+        let first =
+            archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(first.source_commits, 1);
+        assert_eq!(first.derived_elements, 1);
+        assert_ne!(first.source_collection, first.target_collection);
+        let before = fs::metadata(&fixture.pile).unwrap().len();
+
+        let archive = storage(&fixture).load().unwrap();
+        let id = archive.projection_ids()[0];
+        let projection = archive.projection(id).unwrap();
+        assert!(render_projection(&projection)
+            .unwrap()
+            .contains("quasar needle"));
+        assert_eq!(
+            load_thread(&archive, &format!("{id:X}"), 10).unwrap().len(),
+            1
+        );
+        drop(archive);
+        let repeated =
+            archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(repeated, first);
+
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
+
+        let first_bm25 =
+            archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(first_bm25.source_commits, 1);
+        assert_eq!(first_bm25.derived_elements, 1);
+        assert_eq!(first_bm25.cover_segments, 1);
+        let after_bm25 = fs::metadata(&fixture.pile).unwrap().len();
+        assert_eq!(
+            archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap(),
+            first_bm25
+        );
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_bm25);
+
+        let search =
+            ArchiveSearchSnapshot::ensure_local(&fixture.pile, Some(&fixture.key)).unwrap();
+        let hits = search.search("quasar", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].projections, [id]);
+        drop(search);
+        run_search(storage(&fixture), "quasar", 10).unwrap();
+    }
+
+    #[test]
+    fn thread_keeps_every_parent_of_a_multi_parent_block() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("fork.jsonl");
+        fs::write(
+            &source,
+            concat!(
+                r#"{"type":"user","sessionId":"fork","uuid":"left","message":{"role":"user","content":"left"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"fork","uuid":"right","message":{"role":"user","content":"right"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"fork","uuid":"join","parentUuid":"left","message":{"role":"assistant","content":"joined"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"fork","uuid":"join","parentUuid":"right","message":{"role":"assistant","content":"joined"}}"#,
+            ),
+        )
+        .unwrap();
+        run_import(storage(&fixture), &source).unwrap();
+        let archive = storage(&fixture).load().unwrap();
+        let joined = archive
+            .projection_ids()
+            .into_iter()
+            .find(|id| {
+                archive
+                    .projection(*id)
+                    .is_ok_and(|projection| projection_snippet(&projection).contains("joined"))
+            })
+            .unwrap();
+        let thread = load_thread(&archive, &format!("{joined:X}"), 3).unwrap();
+        assert_eq!(thread.len(), 3);
+        let parent_count: usize = thread
+            .iter()
+            .map(|block| block.semantic.block_previous.len())
+            .sum();
+        assert_eq!(parent_count, 2);
+        assert!(load_thread(&archive, &format!("{joined:X}"), 2)
+            .unwrap_err()
+            .to_string()
+            .contains("no fork is hidden"));
+    }
+
+    #[test]
+    fn replay_rejects_zero_limit_and_never_splits_equal_timestamps() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("replay.jsonl");
+        fs::write(
+            &source,
+            concat!(
+                r#"{"type":"user","sessionId":"replay","uuid":"first","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"first"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"replay","uuid":"second","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"second"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"replay","uuid":"third","timestamp":"2026-03-01T15:34:02Z","message":{"role":"user","content":"third"}}"#,
+            ),
+        )
+        .unwrap();
+        run_import(storage(&fixture), &source).unwrap();
+
+        let archive = storage(&fixture).load().unwrap();
+        let timeline = timeline_after(&archive, i128::MIN, false).unwrap();
+        assert_eq!(timeline.len(), 3);
+        let (selected, remaining) = split_replay_batch(timeline, 1);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].key, selected[1].key);
+        assert_eq!(remaining, 1);
+
+        let error = run_replay(storage(&fixture), &[], 0, false, Some("replay-test")).unwrap_err();
+        assert_eq!(error.to_string(), "replay limit must be at least 1");
     }
 }

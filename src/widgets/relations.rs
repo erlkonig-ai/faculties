@@ -11,28 +11,16 @@
 //!
 //! ```ignore
 //! let mut panel = RelationsViewer::default();
-//! panel.render(ctx, relations_ws);
+//! panel.render(ctx, relations_view);
 //! ```
-
-use std::collections::HashMap;
 
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 
-use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
-
-type TextHandle = Inline<Handle<LongString>>;
+use crate::relations::{self, Head, ProfileInput, ProfileView};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 // ── Color palette ────────────────────────────────────────────────────
 
@@ -62,11 +50,13 @@ fn person_color(id: Id) -> egui::Color32 {
 struct PersonRow {
     id: Id,
     alias: Option<String>,
+    aliases: Vec<String>,
     first_name: Option<String>,
     last_name: Option<String>,
     display_name: Option<String>,
     email: Option<String>,
     affinities: Vec<String>,
+    notices: Vec<String>,
 }
 
 impl PersonRow {
@@ -74,11 +64,56 @@ impl PersonRow {
         Self {
             id,
             alias: None,
+            aliases: Vec::new(),
             first_name: None,
             last_name: None,
             display_name: None,
             email: None,
             affinities: Vec::new(),
+            notices: Vec::new(),
+        }
+    }
+
+    fn from_profile(id: Id, mut profile: ProfileInput) -> Self {
+        profile.aliases.sort();
+        profile.aliases.dedup();
+        profile.emails.sort();
+        profile.emails.dedup();
+        profile.affinities.sort();
+        profile.affinities.dedup();
+        Self {
+            id,
+            alias: Some(profile.label),
+            aliases: profile.aliases,
+            first_name: profile.first_name,
+            last_name: profile.last_name,
+            display_name: profile.display_name,
+            email: profile.emails.into_iter().next(),
+            affinities: profile.affinities,
+            notices: Vec::new(),
+        }
+    }
+}
+
+fn row_from_profile_view(person: Id, view: ProfileView) -> PersonRow {
+    match view {
+        ProfileView::Current { value, .. } => PersonRow::from_profile(person, value),
+        ProfileView::Forked(heads) => {
+            let mut row = PersonRow::empty(person);
+            row.notices.push(format!(
+                "PROFILE FORK · {}",
+                heads
+                    .iter()
+                    .map(|id| format!("{id:x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            row
+        }
+        ProfileView::Invalid(error) => {
+            let mut row = PersonRow::empty(person);
+            row.notices.push(format!("INVALID PROFILE · {error}"));
+            row
         }
     }
 }
@@ -136,110 +171,51 @@ fn id_hex(id: Id) -> String {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 struct RelationsLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     people: Vec<PersonRow>,
 }
 
 impl RelationsLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[relations] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let mut people: Vec<PersonRow> =
+            relations::person_profile_views(dataset.reader, dataset.facts)
+                .into_iter()
+                .map(|(person, view)| {
+                    let mut row = row_from_profile_view(person, view);
 
-        let mut by_id: HashMap<Id, PersonRow> = HashMap::new();
-        for (id,) in find!(
-            (p: Id,),
-            pattern!(&space, [{ ?p @ metadata::tag: KIND_PERSON_ID }])
-        ) {
-            by_id.insert(id, PersonRow::empty(id));
-        }
-
-        let alias_rows: Vec<(Id, String)> = find!(
-            (p: Id, a: String),
-            pattern!(&space, [{ ?p @ rel::alias: ?a }])
-        )
-        .collect();
-        for (pid, alias) in alias_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.alias = Some(alias);
-            }
-        }
-        let first_rows: Vec<(Id, TextHandle)> = find!(
-            (p: Id, h: TextHandle),
-            pattern!(&space, [{ ?p @ rel::first_name: ?h }])
-        )
-        .collect();
-        for (pid, h) in first_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.first_name = read_text(ws, h);
-            }
-        }
-        let last_rows: Vec<(Id, TextHandle)> = find!(
-            (p: Id, h: TextHandle),
-            pattern!(&space, [{ ?p @ rel::last_name: ?h }])
-        )
-        .collect();
-        for (pid, h) in last_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.last_name = read_text(ws, h);
-            }
-        }
-        let display_rows: Vec<(Id, TextHandle)> = find!(
-            (p: Id, h: TextHandle),
-            pattern!(&space, [{ ?p @ rel::display_name: ?h }])
-        )
-        .collect();
-        for (pid, h) in display_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.display_name = read_text(ws, h);
-            }
-        }
-        let email_rows: Vec<(Id, String)> = find!(
-            (p: Id, e: String),
-            pattern!(&space, [{ ?p @ rel::email: ?e }])
-        )
-        .collect();
-        for (pid, e) in email_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.email = Some(e);
-            }
-        }
-        // Affinities — multi-valued tag-like attribute.
-        let affinity_rows: Vec<(Id, String)> = find!(
-            (p: Id, a: String),
-            pattern!(&space, [{ ?p @ rel::affinity: ?a }])
-        )
-        .collect();
-        for (pid, aff) in affinity_rows {
-            if let Some(row) = by_id.get_mut(&pid) {
-                row.affinities.push(aff);
-            }
-        }
-        for row in by_id.values_mut() {
-            row.affinities.sort();
-            row.affinities.dedup();
-        }
-
-        let mut people: Vec<PersonRow> = by_id.into_values().collect();
+                    match relations::lifecycle_head(dataset.facts, person) {
+                        Ok(Head::Unique(snapshot)) => {
+                            match relations::lifecycle_snapshot(dataset.facts, snapshot) {
+                                Ok(lifecycle) if lifecycle.retired => {
+                                    row.notices.push("RETIRED".to_owned());
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    row.notices.push(format!("INVALID LIFECYCLE · {error}"))
+                                }
+                            }
+                        }
+                        Ok(Head::Forked(heads)) => row.notices.push(format!(
+                            "LIFECYCLE FORK · {}",
+                            heads
+                                .iter()
+                                .map(|id| format!("{id:x}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )),
+                        Ok(Head::Missing) => row.notices.push("MISSING LIFECYCLE".to_owned()),
+                        Err(error) => row.notices.push(format!("INVALID LIFECYCLE · {error}")),
+                    }
+                    row
+                })
+                .collect();
         people.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
         RelationsLive {
-            cached_head,
+            cached_revision: dataset.revision,
             people,
         }
     }
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -259,14 +235,13 @@ impl RelationsViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(RelationsLive::refresh(ws));
+            self.live = Some(RelationsLive::refresh(dataset));
         }
 
         ctx.section("Relations", |ctx| {
@@ -374,8 +349,8 @@ fn person_matches_search(p: &PersonRow, needle: &str) -> bool {
             return true;
         }
     }
-    for aff in &p.affinities {
-        if aff.to_lowercase().contains(needle) {
+    for value in p.aliases.iter().chain(&p.affinities).chain(&p.notices) {
+        if value.to_lowercase().contains(needle) {
             return true;
         }
     }
@@ -494,6 +469,17 @@ fn render_person(ui: &mut egui::Ui, person: &PersonRow, search_needle: &str, foc
                             }
                         });
                     }
+
+                    for notice in &person.notices {
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(notice)
+                                .monospace()
+                                .small()
+                                .strong()
+                                .color(egui::Color32::from_rgb(0xe6, 0x32, 0x46)),
+                        );
+                    }
                 });
         });
 }
@@ -533,5 +519,50 @@ fn mono_small_format(ui: &egui::Ui, color: egui::Color32) -> egui::TextFormat {
         font_id: egui::TextStyle::Monospace.resolve(ui.style()),
         color,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    #[test]
+    fn canonical_profile_input_maps_without_timestamp_arbitration() {
+        let row = PersonRow::from_profile(
+            id(1),
+            ProfileInput {
+                label: "example".to_owned(),
+                aliases: vec!["sample".to_owned(), "sample".to_owned()],
+                affinities: vec!["operator".to_owned()],
+                first_name: Some("Example".to_owned()),
+                emails: vec![
+                    "z@example.invalid".to_owned(),
+                    "a@example.invalid".to_owned(),
+                ],
+                ..ProfileInput::default()
+            },
+        );
+
+        assert_eq!(row.primary(), "example");
+        assert_eq!(row.aliases, vec!["sample"]);
+        assert_eq!(row.email.as_deref(), Some("a@example.invalid"));
+        assert!(row.notices.is_empty());
+    }
+
+    #[test]
+    fn forked_profile_projection_remains_visible() {
+        let person = id(2);
+        let first = id(3);
+        let second = id(4);
+        let row = row_from_profile_view(person, ProfileView::Forked(vec![first, second]));
+
+        assert_eq!(row.id, person);
+        assert_eq!(row.notices.len(), 1);
+        assert!(row.notices[0].contains(&format!("{first:x}")));
+        assert!(row.notices[0].contains(&format!("{second:x}")));
     }
 }

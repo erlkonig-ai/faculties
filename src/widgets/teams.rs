@@ -1,16 +1,15 @@
 //! Read-only GORBIE-embeddable viewer for the `teams` faculty.
 //!
-//! Microsoft Teams chat messages on disk use the protocol-agnostic
-//! `archive::kind_message` tag plus the teams-specific `teams::chat`
-//! join. This widget renders the most recent N messages as a
-//! chronological feed, each card identifying its chat + author.
+//! Renders the canonical source-scoped receipt-DAG projection. A causal fork
+//! is a visible diagnostic; this widget never recreates timestamp-based
+//! latest-message arbitration.
 //!
 //! ```ignore
 //! let mut panel = TeamsViewer::default();
 //! panel.render(ctx, teams_ws);
 //! ```
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 
@@ -18,20 +17,9 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 
-use crate::schemas::archive::archive as archive_attrs;
-use crate::schemas::teams::teams as teams_attrs;
-
-type TextHandle = Inline<Handle<LongString>>;
+use crate::teams;
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 const MAX_MESSAGES: usize = 30;
 
@@ -76,141 +64,120 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 #[derive(Clone, Debug)]
 struct MessageRow {
     id: Id,
-    at: DateTime<Utc>,
+    observation: Option<Id>,
+    at: Option<DateTime<Utc>>,
     author_id: Option<Id>,
-    author_name: Option<String>,
-    chat_id: Option<Id>,
+    author_name: String,
+    chat_id: Id,
     content: String,
-}
-
-#[derive(Clone, Debug, Default)]
-struct Chat {
-    name: Option<String>,
+    deleted: bool,
+    attachments: usize,
 }
 
 struct TeamsLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     messages: Vec<MessageRow>,
-    chats: HashMap<Id, Chat>,
+    chats: BTreeMap<Id, String>,
     total_messages: usize,
     chat_count: usize,
+    diagnostics: Vec<String>,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl TeamsLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[teams] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-
-        let mut chats: HashMap<Id, Chat> = HashMap::new();
-        for (cid,) in find!(
-            (cid: Id,),
-            pattern!(&space, [{ ?cid @ metadata::tag: &teams_attrs::kind_chat }])
-        ) {
-            chats.insert(cid, Chat::default());
-        }
-        let chat_count = chats.len();
-
-        // Chat names — chats often don't have metadata::name set
-        // (Graph API doesn't surface a name for 1:1 chats), but we
-        // still resolve when present.
-        let chat_name_rows: Vec<(Id, TextHandle)> = find!(
-            (cid: Id, h: TextHandle),
-            pattern!(&space, [{
-                ?cid @
-                metadata::tag: &teams_attrs::kind_chat,
-                metadata::name: ?h,
-            }])
-        )
-        .collect();
-        for (cid, h) in chat_name_rows {
-            if let Some(c) = chats.get_mut(&cid) {
-                c.name = read_text(ws, h);
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let mut chats = BTreeMap::new();
+        let mut messages = Vec::new();
+        let mut diagnostics = Vec::new();
+        for source in teams::source_ids(dataset.facts) {
+            let source_label = match teams::source_label(dataset.reader, dataset.facts, source) {
+                Ok(label) => label,
+                Err(error) => {
+                    diagnostics.push(format!(
+                        "Teams source {source:x} identity is invalid: {error:#}"
+                    ));
+                    short_hex(source)
+                }
+            };
+            match teams::chat_labels(dataset.reader, dataset.facts, source) {
+                Ok(labels) => chats.extend(labels),
+                Err(error) => diagnostics.push(format!(
+                    "Teams source {source_label} chat identities are invalid: {error:#}"
+                )),
+            }
+            match load_source_messages(dataset, source) {
+                Ok(mut rows) => messages.append(&mut rows),
+                Err(error) => diagnostics.push(format!(
+                    "Teams source {source_label} has no unambiguous current frontier: {error:#}"
+                )),
             }
         }
-
-        // Messages: archive::kind_message + teams::chat. The join
-        // is what makes a message a Teams message vs. a discord
-        // message vs. an archived ChatGPT export — all three share
-        // archive::kind_message.
-        let msg_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
-            (mid: Id, cid: Id, content: TextHandle, ts: (i128, i128)),
-            pattern!(&space, [{
-                ?mid @
-                metadata::tag: &archive_attrs::kind_message,
-                teams_attrs::chat: ?cid,
-                archive_attrs::content: ?content,
-                metadata::created_at: ?ts,
-            }])
-        )
-        .collect();
-
-        let author_rows: HashMap<Id, Id> = find!(
-            (mid: Id, aid: Id),
-            pattern!(&space, [{ ?mid @ archive_attrs::author: ?aid }])
-        )
-        .collect();
-        let author_name_rows: Vec<(Id, TextHandle)> = find!(
-            (aid: Id, h: TextHandle),
-            pattern!(&space, [{ ?aid @ archive_attrs::author_name: ?h }])
-        )
-        .collect();
-        let mut author_names: HashMap<Id, String> = HashMap::new();
-        for (aid, h) in author_name_rows {
-            if let Some(name) = read_text(ws, h) {
-                author_names.insert(aid, name);
-            }
-        }
-
-        let total_messages = msg_rows.len();
-        let mut messages: Vec<MessageRow> = Vec::with_capacity(msg_rows.len());
-        for (mid, cid, content_h, ts) in msg_rows {
-            let raw = read_text(ws, content_h).unwrap_or_default();
-            let content = strip_html(&raw);
-            let author_id = author_rows.get(&mid).copied();
-            let author_name = author_id.and_then(|aid| author_names.get(&aid).cloned());
-            messages.push(MessageRow {
-                id: mid,
-                at: ns_to_chrono(ts.0),
-                author_id,
-                author_name,
-                chat_id: Some(cid),
-                content,
-            });
-        }
-
+        let total_messages = messages.len();
         messages.sort_by(|a, b| b.at.cmp(&a.at));
         messages.truncate(MAX_MESSAGES);
 
         TeamsLive {
-            cached_head,
+            cached_revision: dataset.revision,
             messages,
-            chats,
             total_messages,
-            chat_count,
+            chat_count: chats.len(),
+            chats,
+            diagnostics,
         }
     }
 
     fn chat_label(&self, cid: Id) -> String {
-        match self.chats.get(&cid).and_then(|c| c.name.clone()) {
-            Some(n) => n,
+        match self.chats.get(&cid) {
+            Some(n) => n.clone(),
             None => format!("chat:{}", short_hex(cid)),
         }
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn load_source_messages(dataset: DatasetView<'_>, source: Id) -> anyhow::Result<Vec<MessageRow>> {
+    teams::current_messages(dataset.facts, source)?
+        .into_iter()
+        .map(|message| {
+            let mut names = message
+                .author_names
+                .iter()
+                .map(|&handle| teams::read_text(dataset.reader, handle, "Teams author name"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            names.sort();
+            names.dedup();
+            let author_name = if names.is_empty() {
+                message
+                    .author
+                    .map(short_hex)
+                    .unwrap_or_else(|| "unknown".to_owned())
+            } else {
+                names.join(" / ")
+            };
+            let content = message
+                .content
+                .map(|handle| teams::read_text(dataset.reader, handle, "Teams message content"))
+                .transpose()?
+                .map(|content| strip_html(&content))
+                .unwrap_or_else(|| "[deleted]".to_owned());
+            let at = message
+                .created_at
+                .or(message.modified_at)
+                .map(teams::interval_key)
+                .map(ns_to_chrono);
+            Ok(MessageRow {
+                id: message.message,
+                observation: message.observation,
+                at,
+                author_id: message.author,
+                author_name,
+                chat_id: message.chat,
+                content,
+                deleted: message.deleted,
+                attachments: message.attachments.len(),
+            })
+        })
+        .collect()
 }
 
 fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
@@ -319,14 +286,13 @@ impl TeamsViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(TeamsLive::refresh(ws));
+            self.live = Some(TeamsLive::refresh(dataset));
         }
 
         ctx.section("Teams", |ctx| {
@@ -334,6 +300,9 @@ impl TeamsViewer {
             let now = Utc::now();
 
             ctx.grid(|g| {
+                for diagnostic in &live.diagnostics {
+                    g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
+                }
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
                     let shown = live.messages.len();
@@ -408,10 +377,7 @@ impl TeamsViewer {
 
 fn render_message_card(ui: &mut egui::Ui, msg: &MessageRow, live: &TeamsLive, now: DateTime<Utc>) {
     let bubble_fill = ui.visuals().window_fill;
-    let accent = msg
-        .chat_id
-        .map(chat_color)
-        .unwrap_or_else(|| egui::Color32::from_gray(120));
+    let accent = chat_color(msg.chat_id);
     let text_on_accent = colorhash::text_color_on(accent);
     let body_muted = {
         let body_text = colorhash::text_color_on(bubble_fill);
@@ -448,31 +414,44 @@ fn render_message_card(ui: &mut egui::Ui, msg: &MessageRow, live: &TeamsLive, no
                     ui.spacing_mut().item_spacing.y = 2.0;
 
                     ui.horizontal(|ui| {
-                        if let Some(cid) = msg.chat_id {
+                        ui.label(
+                            egui::RichText::new(live.chat_label(msg.chat_id))
+                                .monospace()
+                                .strong()
+                                .color(text_on_accent),
+                        );
+                        if msg.deleted {
                             ui.label(
-                                egui::RichText::new(live.chat_label(cid))
+                                egui::RichText::new("DELETED")
                                     .monospace()
+                                    .small()
                                     .strong()
                                     .color(text_on_accent),
                             );
                         }
+                        if msg.attachments > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("📎 {}", msg.attachments))
+                                    .monospace()
+                                    .small()
+                                    .color(text_on_accent),
+                            );
+                        }
+                        let time = msg
+                            .at
+                            .map(|at| {
+                                format!("· {} · {}", format_chat_time(at), age_label(now, at))
+                            })
+                            .unwrap_or_else(|| "· SOURCE TIME UNKNOWN".to_owned());
                         ui.label(
-                            egui::RichText::new(format!(
-                                "· {} · {}",
-                                format_chat_time(msg.at),
-                                age_label(now, msg.at),
-                            ))
-                            .monospace()
-                            .small()
-                            .color(text_on_accent),
+                            egui::RichText::new(time)
+                                .monospace()
+                                .small()
+                                .color(text_on_accent),
                         );
                     });
 
-                    let author_label = msg.author_name.clone().unwrap_or_else(|| {
-                        msg.author_id
-                            .map(short_hex)
-                            .unwrap_or_else(|| "?".to_string())
-                    });
+                    let author_label = msg.author_name.clone();
                     let author_fill = msg
                         .author_id
                         .map(author_color)
@@ -527,12 +506,35 @@ fn render_message_card(ui: &mut egui::Ui, msg: &MessageRow, live: &TeamsLive, no
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(
-                        egui::RichText::new(id_hex(msg.id))
-                            .monospace()
-                            .small()
-                            .color(body_muted),
+                        egui::RichText::new(match msg.observation {
+                            Some(observation) => format!(
+                                "message {} · observation {}",
+                                id_hex(msg.id),
+                                id_hex(observation)
+                            ),
+                            None => format!("message {} · source tombstone", id_hex(msg.id)),
+                        })
+                        .monospace()
+                        .small()
+                        .color(body_muted),
                     );
                 });
+        });
+}
+
+fn render_diagnostic(ui: &mut egui::Ui, diagnostic: &str) {
+    egui::Frame::NONE
+        .fill(color_frame(ui))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("TEAMS FRONTIER REQUIRES RECONCILIATION")
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(egui::Color32::from_rgb(0xe2, 0x5b, 0x12)),
+            );
+            ui.label(egui::RichText::new(diagnostic).monospace().small());
         });
 }
 

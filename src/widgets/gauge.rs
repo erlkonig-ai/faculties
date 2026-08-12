@@ -1,10 +1,9 @@
 //! Read-only GORBIE-embeddable viewer for the `gauge` faculty.
 //!
-//! Gauge is a research-quality lens on the wiki branch — it doesn't
-//! define its own attributes, it just walks the latest version of
-//! every fragment and counts tags (epistemic status / content
-//! type) plus outgoing-link densities. This widget renders the same
-//! numbers the `gauge health` CLI command prints, as a single
+//! Gauge is a research-quality lens on the canonical Wiki revision DAG. It
+//! counts tags and content-derived link density across every visible frontier
+//! head. Concurrent heads remain separate observations and the summary calls
+//! out forks explicitly; no timestamp winner is selected. This widget renders a
 //! dashboard card grouped into two tag categories with horizontal
 //! count bars and a few derived health metrics underneath.
 //!
@@ -18,20 +17,9 @@ use std::collections::HashMap;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
-
-use crate::schemas::gauge::wiki;
-
-type TextHandle = Inline<Handle<LongString>>;
+use crate::schemas::wiki::{extract_link_targets, TAG_SPECS};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
+use crate::wiki::{self, WikiCatalog};
 
 // ── Palette ──────────────────────────────────────────────────────────
 
@@ -82,100 +70,62 @@ const CONTENT_TAGS: &[&str] = &[
 // ── Live snapshot ────────────────────────────────────────────────────
 
 struct GaugeLive {
-    cached_head: Option<CommitHandle>,
-    /// Total count of distinct fragments (= number of latest versions
-    /// found). Drives the orphan-rate percentage and the bar scales.
-    total_versions: usize,
-    /// Fragments with zero outgoing `wiki::links_to` edges. They're
-    /// "leaf" entries — useful to keep an eye on as a connection
-    /// debt indicator.
+    cached_revision: DatasetRevision,
+    /// Logical entries on the default (not wholly archived) Wiki surface.
+    total_entries: usize,
+    /// Every visible maximal revision. This may exceed `total_entries` when
+    /// one or more entry DAGs have unresolved concurrent heads.
+    total_heads: usize,
+    forked_entries: usize,
+    /// Frontier heads whose immutable content contains no outgoing Wiki link.
     orphans: usize,
-    /// Sum of outgoing-link counts across every latest version. The
-    /// average ratio is the "links per version" metric the CLI
-    /// reports.
+    /// Sum of content-derived outgoing links across every frontier head.
     total_links: usize,
-    /// Per-tag-name → fragment count, keyed by tag name (resolved
-    /// from the tag entity's `metadata::name` long-string).
+    /// Per-tag-name → frontier-head count.
     tag_counts: HashMap<String, usize>,
 }
 
 impl GaugeLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[gauge] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(dataset: DatasetView<'_>) -> Result<Self, String> {
+        let catalog = wiki::validate_catalog(dataset.reader, dataset.facts)
+            .map_err(|error| format!("validate Wiki collection for Gauge: {error:#}"))?;
+        let entries = catalog.revisions.list_entries();
+        let total_entries = entries.len();
+        let total_heads = entries.iter().map(|entry| entry.frontier.len()).sum();
+        let forked_entries = entries
+            .iter()
+            .filter(|entry| entry.frontier.len() > 1)
+            .count();
 
-        // For every fragment id, find the version with the latest
-        // `metadata::created_at` (lower bound of the interval). This
-        // mirrors what `gauge.rs::latest_versions` does in the CLI.
-        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-        for (vid, frag, ts) in find!(
-            (vid: Id, frag: Id, ts: (i128, i128)),
-            pattern!(&space, [{
-                ?vid @
-                wiki::fragment: ?frag,
-                metadata::created_at: ?ts,
-            }])
-        ) {
-            let key = ts.0;
-            latest
-                .entry(frag)
-                .and_modify(|slot| {
-                    if key > slot.1 {
-                        *slot = (vid, key);
-                    }
-                })
-                .or_insert((vid, key));
-        }
-        let total_versions = latest.len();
-
-        // Cache tag-name lookups across the whole snapshot pass —
-        // tag entities are shared across many fragments, so a name
-        // cache keyed by tag id saves a lot of redundant blob reads.
-        let mut name_cache: HashMap<Id, Option<String>> = HashMap::new();
         let mut tag_counts: HashMap<String, usize> = HashMap::new();
         let mut orphans = 0usize;
         let mut total_links = 0usize;
 
-        for (_frag, (vid, _ts)) in &latest {
-            // Tags attached to this version.
-            for tag_id in find!(
-                tag: Id,
-                pattern!(&space, [{ vid @ metadata::tag: ?tag }])
-            ) {
-                let name = name_cache
-                    .entry(tag_id)
-                    .or_insert_with(|| resolve_tag_name(ws, &space, tag_id))
-                    .clone();
-                if let Some(name) = name {
+        for head in entries.iter().flat_map(|entry| &entry.frontier) {
+            for tag in &head.tags {
+                if let Some(name) = resolve_tag_name(&catalog, dataset, *tag) {
                     *tag_counts.entry(name).or_insert(0) += 1;
                 }
             }
 
-            // Outgoing link count (orphan = zero out-links).
-            let link_count = find!(
-                target: Id,
-                pattern!(&space, [{ vid @ wiki::links_to: ?target }])
-            )
-            .count();
+            let content = wiki::read_text(dataset.reader, head.content)
+                .map_err(|error| format!("read Wiki revision {:x}: {error:#}", head.id))?;
+            let link_count = extract_link_targets(&content).len();
             if link_count == 0 {
                 orphans += 1;
             }
             total_links += link_count;
         }
 
-        GaugeLive {
-            cached_head,
-            total_versions,
+        Ok(GaugeLive {
+            cached_revision: dataset.revision,
+            total_entries,
+            total_heads,
+            forked_entries,
             orphans,
             total_links,
             tag_counts,
-        }
+        })
     }
 
     fn count(&self, name: &str) -> usize {
@@ -183,25 +133,32 @@ impl GaugeLive {
     }
 }
 
-fn resolve_tag_name(ws: &mut Workspace<Pile>, space: &TribleSet, tag_id: Id) -> Option<String> {
-    let handle = find!(
-        h: TextHandle,
-        pattern!(space, [{ tag_id @ metadata::name: ?h }])
-    )
-    .next()?;
-    let view: View<str> = ws.get(handle).ok()?;
-    Some(view.as_ref().to_string())
+fn resolve_tag_name(
+    catalog: &WikiCatalog,
+    dataset: DatasetView<'_>,
+    tag: triblespace::core::id::Id,
+) -> Option<String> {
+    if let Some(handle) = catalog.tag_names.get(&tag) {
+        return wiki::read_text(dataset.reader, *handle).ok();
+    }
+    TAG_SPECS
+        .iter()
+        .find_map(|(known, name)| (*known == tag).then(|| (*name).to_owned()))
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
 
 pub struct GaugeViewer {
     live: Option<GaugeLive>,
+    error: Option<(DatasetRevision, String)>,
 }
 
 impl Default for GaugeViewer {
     fn default() -> Self {
-        Self { live: None }
+        Self {
+            live: None,
+            error: None,
+        }
     }
 }
 
@@ -210,17 +167,43 @@ impl GaugeViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
-            None => true,
-            Some(l) => l.cached_head != head,
+            None => self
+                .error
+                .as_ref()
+                .is_none_or(|(revision, _)| *revision != dataset.revision),
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(GaugeLive::refresh(ws));
+            match GaugeLive::refresh(dataset) {
+                Ok(live) => {
+                    self.live = Some(live);
+                    self.error = None;
+                }
+                Err(error) => {
+                    self.live = None;
+                    self.error = Some((dataset.revision, error));
+                }
+            }
         }
 
         ctx.section("Gauge", |ctx| {
+            if let Some((_, error)) = self.error.as_ref() {
+                ctx.grid(|g| {
+                    g.full(|ctx| {
+                        let color = egui::Color32::from_rgb(0xcc, 0x0a, 0x17);
+                        ctx.label(
+                            egui::RichText::new(format!("INVALID WIKI SNAPSHOT · {error}"))
+                                .monospace()
+                                .small()
+                                .strong()
+                                .color(color),
+                        );
+                    });
+                });
+                return;
+            }
             let Some(live) = self.live.as_ref() else {
                 return;
             };
@@ -238,21 +221,25 @@ impl GaugeViewer {
 }
 
 fn render_summary_line(ui: &mut egui::Ui, live: &GaugeLive) {
-    let total = live.total_versions;
-    let orphan_pct = if total > 0 {
-        (live.orphans as f32 / total as f32) * 100.0
+    let heads = live.total_heads;
+    let orphan_pct = if heads > 0 {
+        (live.orphans as f32 / heads as f32) * 100.0
     } else {
         0.0
     };
-    let links_per = if total > 0 {
-        live.total_links as f32 / total as f32
+    let links_per = if heads > 0 {
+        live.total_links as f32 / heads as f32
     } else {
         0.0
     };
     ui.label(
         egui::RichText::new(format!(
-            "{total} FRAGMENT{} · {:.1} LINKS/VERSION · {} ORPHAN{} ({:.0}%)",
-            if total == 1 { "" } else { "S" },
+            "{} ENTR{} · {heads} HEAD{} · {} FORK{} · {:.1} LINKS/HEAD · {} ORPHAN{} ({:.0}%)",
+            live.total_entries,
+            if live.total_entries == 1 { "Y" } else { "IES" },
+            if heads == 1 { "" } else { "S" },
+            live.forked_entries,
+            if live.forked_entries == 1 { "" } else { "S" },
             links_per,
             live.orphans,
             if live.orphans == 1 { "" } else { "S" },
@@ -437,4 +424,89 @@ fn render_metric_chip(ui: &mut egui::Ui, label: &str) {
                     .color(text),
             );
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::File;
+
+    use crate::collection_cutover::{initialize_signer, open_pile_strict};
+    use crate::widgets::storage::{SourceKey, StorageState};
+    use crate::wiki::{self, RevisionDraft};
+    use hifitime::Epoch;
+    use triblespace::prelude::*;
+
+    fn at(seconds: f64) -> wiki::IntervalValue {
+        let instant = Epoch::from_tai_seconds(seconds);
+        (instant, instant).try_to_inline().unwrap()
+    }
+
+    fn revision(
+        output: &mut Fragment,
+        author: Id,
+        title: &str,
+        content: &str,
+        tags: &[Id],
+        predecessors: &[Id],
+        seconds: f64,
+    ) -> Id {
+        let (record, id) = wiki::revision_record(RevisionDraft {
+            title: title.to_owned(),
+            content: content.to_owned(),
+            tags: tags.iter().copied().collect(),
+            predecessors: predecessors.iter().copied().collect(),
+            author,
+            authored_at: at(seconds),
+        })
+        .unwrap();
+        *output += record;
+        id
+    }
+
+    #[test]
+    fn gauge_counts_every_frontier_head_without_a_timestamp_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("gauge.pile");
+        File::create(&pile_path).unwrap();
+        let signer = initialize_signer(&pile_path, None).unwrap();
+        let (mut fragment, author) = wiki::author_record(&signer.verifying_key());
+        let tag = TAG_SPECS[1].0;
+        let root = revision(&mut fragment, author, "root", "root", &[], &[], 1.0);
+        let linked = revision(
+            &mut fragment,
+            author,
+            "linked",
+            &format!(r#"#link("wiki:{root:x}")[root]"#),
+            &[tag],
+            &[root],
+            2.0,
+        );
+        let unlinked = revision(
+            &mut fragment,
+            author,
+            "unlinked",
+            "no links",
+            &[tag],
+            &[root],
+            3.0,
+        );
+        assert_ne!(linked, unlinked);
+
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        wiki::commit_collection(&mut pile, &signer, fragment).unwrap();
+        pile.close().unwrap();
+
+        let mut storage = StorageState::new(&pile_path);
+        let context = storage.context();
+        let dataset = context.dataset(SourceKey::Wiki).unwrap();
+        let live = GaugeLive::refresh(dataset).unwrap();
+        assert_eq!(live.total_entries, 1);
+        assert_eq!(live.total_heads, 2);
+        assert_eq!(live.forked_entries, 1);
+        assert_eq!(live.total_links, 1);
+        assert_eq!(live.orphans, 1);
+        assert_eq!(live.count(TAG_SPECS[1].1), 2);
+    }
 }

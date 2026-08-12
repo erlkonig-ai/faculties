@@ -5,15 +5,17 @@
 //! Extracted from `body` (2026-06-30): speaking is its own organ, not a limb of
 //! the Reachy body. The body stays the physical Reachy loop (pose/look/feel/act);
 //! the voice owns synthesis (F5/mary) and output
-//! routing. Utterances and routing config live on the `voice` branch.
+//! routing. New utterances and routing config live in one fixed native
+//! collection. The historical `voice` Repository branch is migration input
+//! only and is never consulted by the live faculty.
 //!
 //! Two channels, each a hard contract — NOT a soft preference:
-//!   - `say`   — the PRIVATE channel: in-ear/headphone only. If no private
-//!               device is connected it falls back to printing text. There is no
-//!               code path that lets a `say` utterance play through a room
-//!               speaker (the invariant is enforced in `voice.rs`, not here).
-//!   - `shout` — the PUBLIC channel: broadcast freely (Reachy speaker → room →
-//!               laptop), audible by design.
+//! - `say` — the PRIVATE channel: in-ear/headphone only. If no private device
+//!   is connected it falls back to printing text. There is no code path that
+//!   lets a `say` utterance play through a room speaker (the invariant is
+//!   enforced in `voice.rs`, not here).
+//! - `shout` — the PUBLIC channel: broadcast freely (Reachy speaker → room →
+//!   laptop), audible by design.
 //!
 //! Routing is an ORDERED list of device preferences per channel: a `KIND_ROUTE`
 //! entity per (channel, device, priority). At speak-time the faculty reads the
@@ -27,7 +29,23 @@ use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, ShortString, U256BE};
 use triblespace::prelude::*;
 
-pub const VOICE_BRANCH_NAME: &str = "voice";
+/// Exact historical Repository branch consumed by stopped-world migration.
+pub const LEGACY_BRANCH_NAME: &str = "voice";
+
+/// Stable extrinsic scope of the one canonical Voice collection.
+///
+/// Minted with `trible genid` on 2026-08-07 while the first collection-backed
+/// Voice implementation was developed:
+/// `D51A6FB28036D12290404277F273E909`.
+pub const COLLECTION_SCOPE_ID: Id = id_hex!("D51A6FB28036D12290404277F273E909");
+
+/// Marks records admitted to live Voice semantics.
+///
+/// Both the native writer and the stopped-world canonical rewrite emit this
+/// tag. Marker-free rows from the historical identity epoch remain inert if
+/// they coexist in a collection. Minted with `trible genid` on 2026-08-11:
+/// `6EDFB5684161B58337A0EBB9B10836DC`.
+pub const KIND_LIVE_RECORD: Id = id_hex!("6EDFB5684161B58337A0EBB9B10836DC");
 
 /// Canonical channel names — also the `route::channel` discriminator.
 pub const CHANNEL_SAY: &str = "say";
@@ -53,9 +71,9 @@ pub mod utterance {
 
 /// Tag for a ROUTE preference — one (channel, device, priority) entry. A
 /// channel's policy is the set of its entries read in ascending priority. The
-/// latest entry per (channel, device) wins on `metadata::updated_at`
-/// (coordinate-and-cursor), so re-configuring is a monotonic append, never a
-/// mutation.
+/// route-set operation publishes a complete timestamped generation, and
+/// readers choose the latest generation by `metadata::updated_at`; exact-time
+/// ties are unioned. Reconfiguring is a monotonic append, never a mutation.
 pub const KIND_ROUTE: Id = id_hex!("1198DF29E642F2598BB4BDF9D4CD1F07");
 
 pub mod route {

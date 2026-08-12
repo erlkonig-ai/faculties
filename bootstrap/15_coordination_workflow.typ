@@ -1,16 +1,21 @@
 = Recipe: Multi-Agent Coordination
 
-How several agents sharing a pile (or team-mesh-synced piles) divide work,
-hand it off, and review one another without a shadow workflow. This recipe
-chains `relations`, `message`, `orient`, and `compass`.
+How several agents sharing one pile divide work, hand it off, and review one
+another without a shadow workflow. This recipe chains `relations`, `message`,
+`orient`, and `compass`. The current team mesh does not yet transport native
+collection records between independent piles.
 
 == Setup once
 
 ```sh
-relations add agent-a --affinity zooid
-relations add agent-b --affinity zooid
-relations add agent-c --affinity zooid
-relations add jp --affinity user
+relations add agent-a
+relations add agent-b
+relations add agent-c
+relations add operator
+relations group create agents
+relations group add agents agent-a
+relations group add agents agent-b
+relations group add agents agent-c
 
 export PERSONA=agent-a
 ```
@@ -78,8 +83,9 @@ orient wait
 ```
 
 With a persona set, the watcher wakes for directed news: unread inbox or group
-messages, relevant goal transitions, persona/colony-tagged new goals, and new
-zooids. An agent's own status edits stay quiet.
+messages, relevant goal transitions, new goals tagged with the persona or one
+of its Relations groups, and newly status-bearing windows. An agent's own
+status edits stay quiet.
 
 == Cross-references
 
@@ -88,6 +94,6 @@ zooids. An agent's own status edits stay quiet.
   - "Orient: The Situation-Snapshot Faculty"
   - "Compass Goals Workflow"
   - "Teams: Capability-Based Membership"
-  - [Harness Hooks: Mechanical Colony Sync](wiki:5c86df3dcd5994de2967483fca7170ac)
+  - [Harness Hooks: Mechanical Agent Sync](wiki:5c86df3dcd5994de2967483fca7170ac)
 
-Next stop: [Harness Hooks: Mechanical Colony Sync](wiki:5c86df3dcd5994de2967483fca7170ac).
+Next stop: [Harness Hooks: Mechanical Agent Sync](wiki:5c86df3dcd5994de2967483fca7170ac).

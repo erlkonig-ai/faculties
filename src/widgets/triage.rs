@@ -1,57 +1,36 @@
 //! Read-only GORBIE-embeddable viewer for the `triage` faculty.
 //!
-//! Triage is the diagnostic faculty: it cross-references exec
-//! requests / model requests / reason events on the cognition
-//! branch to surface "what is the agent doing right now and what
-//! recently went wrong". This widget renders the same information
-//! the `triage scan` and `triage timeline` CLI commands print, as
-//! a queue-counts dashboard plus a chronological feed of the most
-//! recent exec / model / reason events.
+//! Triage is the diagnostic faculty: it cross-references canonical Cognition,
+//! Headspace, Secrets, Relations, and Messages collection snapshots to surface
+//! "what is the agent doing right now and what recently went wrong". The
+//! widget consumes the same library read model as `triage scan`; it does not
+//! maintain a second event projector.
 //!
 //! Card shape:
-//! - Top: dashboard card with EXEC and MODEL queue counts (requests,
-//!   pending, running, completed) and the number of stale
-//!   in-progress entries (> 15 min).
+//! - Top: dashboard card with disjoint EXEC and MODEL request states plus
+//!   Headspace, inbox, Relations, attempt-fork, and loop diagnostics.
 //! - Below: a chronological feed of recent activity, newest first.
 //!   Each event renders as a small card with a kind-coloured header
 //!   (EXEC / MODEL / REASON), a short summary line, and the
 //!   canonical entity id at the bottom.
 //!
-//! v1 limits: no failure-pattern grouping (the `triage loops`
-//! command is the right tool for that), no turn-level drill-down,
-//! no live token-usage histogram (just totals per event when
-//! present).
+//! v1 limits: no turn-level drill-down and no live token-usage histogram
+//! (just totals per event when present).
 //!
 //! ```ignore
 //! let mut panel = TriageViewer::default();
-//! panel.render(ctx, cognition_ws);
+//! panel.render(ctx, cognition, headspace, secrets, relations, messages);
 //! ```
-
-use chrono::{DateTime, TimeZone, Timelike, Utc};
-use hifitime::Epoch;
 
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::U256BE;
-use triblespace::prelude::View;
-
-use crate::schemas::triage::{
-    exec as exec_attrs, model_chat as model_attrs, reason as reason_attrs,
-    KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID, KIND_MODEL_IN_PROGRESS_ID,
-    KIND_MODEL_REQUEST_ID, KIND_MODEL_RESULT_ID, KIND_REASON_EVENT_ID,
+use crate::triage::{
+    self as triage_model, PatternSummary, QueueCounts, ScanOptions, ScanReport, ScanSources,
+    SourceView, UnreadMessages, UnreadUnavailable,
 };
-
-type TextHandle = Inline<Handle<LongString>>;
+use crate::widgets::storage::{DatasetRevision, DatasetView};
+use triblespace::core::id::Id;
 
 /// How many timeline events to keep in the live snapshot. Older
 /// entries are still in the pile — `triage timeline` is the right
@@ -141,7 +120,7 @@ impl EventKind {
 struct EventRow {
     id: Id,
     kind: EventKind,
-    at: DateTime<Utc>,
+    at: Option<i128>,
     /// One-line summary used as the card heading. Exec: command
     /// (or error). Model: first 80 chars of output_text (or error).
     /// Reason: first 80 chars of text.
@@ -154,313 +133,230 @@ struct EventRow {
     is_error: bool,
 }
 
-#[derive(Clone, Debug, Default)]
-struct QueueCounts {
-    requests: usize,
-    in_progress: usize,
-    stale_in_progress: usize,
-    results: usize,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TriageRevisions {
+    cognition: DatasetRevision,
+    headspace: DatasetRevision,
+    secrets: DatasetRevision,
+    relations: DatasetRevision,
+    messages: DatasetRevision,
 }
 
 struct TriageLive {
-    cached_head: Option<CommitHandle>,
+    cached_revisions: TriageRevisions,
+    report: Option<ScanReport>,
     exec: QueueCounts,
     model: QueueCounts,
     events: Vec<EventRow>,
     total_events: usize,
+    diagnostic: Option<String>,
+    headspace_error: Option<String>,
+    config_heads: usize,
+    active_profile_heads: usize,
+    persona_id: Option<Id>,
+    relation_forks: usize,
+    exec_fork_history: usize,
+    model_fork_history: usize,
+    lifecycle_diagnostics: Vec<String>,
+    unread_messages: UnreadMessages,
+    probable_loop: Option<PatternSummary>,
+    suggestions: Vec<String>,
+}
+
+fn source_view<'a>(view: DatasetView<'a>) -> SourceView<'a> {
+    SourceView {
+        facts: view.facts,
+        reader: view.reader,
+    }
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl TriageLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[triage] checkout: {e:?}");
-                TribleSet::new()
+    fn refresh(
+        cognition: DatasetView<'_>,
+        headspace: DatasetView<'_>,
+        secrets: DatasetView<'_>,
+        relations: DatasetView<'_>,
+        messages: DatasetView<'_>,
+    ) -> Self {
+        let cached_revisions = TriageRevisions {
+            cognition: cognition.revision,
+            headspace: headspace.revision,
+            secrets: secrets.revision,
+            relations: relations.revision,
+            messages: messages.revision,
+        };
+        let report = triage_model::project_scan(
+            ScanSources {
+                cognition: source_view(cognition),
+                headspace: source_view(headspace),
+                secrets: source_view(secrets),
+                relations: source_view(relations),
+                messages: source_view(messages),
+            },
+            ScanOptions {
+                now: triage_model::now_tai_ns(),
+                stale_after_ns: STALE_SECONDS as i128 * 1_000_000_000,
+                recent_attempts: MAX_EVENTS,
+                loop_min: 3,
+            },
+        );
+        match report {
+            Ok(report) => Self::from_report(cached_revisions, report),
+            Err(error) => Self {
+                cached_revisions,
+                report: None,
+                exec: QueueCounts::default(),
+                model: QueueCounts::default(),
+                events: Vec::new(),
+                total_events: 0,
+                diagnostic: Some(format!("{error:#}")),
+                headspace_error: None,
+                config_heads: 0,
+                active_profile_heads: 0,
+                persona_id: None,
+                relation_forks: 0,
+                exec_fork_history: 0,
+                model_fork_history: 0,
+                lifecycle_diagnostics: Vec::new(),
+                unread_messages: UnreadMessages::Unavailable(UnreadUnavailable::HeadspaceUnsettled),
+                probable_loop: None,
+                suggestions: Vec::new(),
+            },
+        }
+    }
+    fn from_report(cached_revisions: TriageRevisions, report: ScanReport) -> Self {
+        let mut events = Vec::new();
+        for result in &report.exec_state.results {
+            let command = report
+                .exec_state
+                .requests
+                .get(&result.about_request)
+                .map(|request| request.command.as_str());
+            let summary = command
+                .map(|command| first_line(command, 80))
+                .or_else(|| {
+                    result
+                        .error
+                        .as_deref()
+                        .map(|error| format!("error: {}", first_line(error, 60)))
+                })
+                .unwrap_or_else(|| "(exec result with missing request)".to_owned());
+            let mut details = Vec::new();
+            if let Some(exit) = result.exit_code {
+                details.push(format!("exit {exit}"));
+            }
+            if let Some(error) = result.error.as_deref() {
+                details.push(first_line(error, 80));
+            } else if result.exit_code.unwrap_or(0) != 0 {
+                if let Some(stderr) = result.stderr_text.as_deref() {
+                    details.push(first_line(stderr, 80));
+                }
+            }
+            events.push(EventRow {
+                id: result.id,
+                kind: EventKind::ExecResult,
+                at: Some(result.finished_at),
+                summary,
+                detail: (!details.is_empty()).then(|| details.join(" · ")),
+                is_error: result.error.is_some() || result.exit_code.is_some_and(|code| code != 0),
             });
-        let cached_head = ws.head();
-
-        let now_ns = now_tai_ns();
-        let stale_cutoff_ns = now_ns - (STALE_SECONDS as i128) * 1_000_000_000;
-
-        let exec = collect_queue(
-            &space,
-            KIND_EXEC_REQUEST_ID,
-            KIND_EXEC_IN_PROGRESS_ID,
-            KIND_EXEC_RESULT_ID,
-            stale_cutoff_ns,
-        );
-        let model = collect_queue(
-            &space,
-            KIND_MODEL_REQUEST_ID,
-            KIND_MODEL_IN_PROGRESS_ID,
-            KIND_MODEL_RESULT_ID,
-            stale_cutoff_ns,
-        );
-
-        let mut events: Vec<EventRow> = Vec::new();
-        collect_exec_results(ws, &space, &mut events);
-        collect_model_results(ws, &space, &mut events);
-        collect_reason_events(ws, &space, &mut events);
-
-        events.sort_by(|a, b| b.at.cmp(&a.at));
+        }
+        for result in &report.model_state.results {
+            let summary = result
+                .output_text
+                .as_deref()
+                .map(|output| first_line(output, 80))
+                .or_else(|| {
+                    result
+                        .error
+                        .as_deref()
+                        .map(|error| format!("error: {}", first_line(error, 60)))
+                })
+                .unwrap_or_else(|| "(model result)".to_owned());
+            let mut details = Vec::new();
+            if let Some(input) = result.input_tokens {
+                details.push(format!("{} in", format_count(input)));
+            }
+            if let Some(output) = result.output_tokens {
+                details.push(format!("{} out", format_count(output)));
+            }
+            if let Some(error) = result.error.as_deref() {
+                details.push(first_line(error, 80));
+            }
+            events.push(EventRow {
+                id: result.id,
+                kind: EventKind::ModelResult,
+                at: Some(result.finished_at),
+                summary,
+                detail: (!details.is_empty()).then(|| details.join(" · ")),
+                is_error: result.error.is_some(),
+            });
+        }
+        for reason in &report.reason_events {
+            events.push(EventRow {
+                id: reason.id,
+                kind: EventKind::Reason,
+                at: reason.created_at,
+                summary: reason
+                    .text
+                    .as_deref()
+                    .map(|text| first_line(text, 80))
+                    .unwrap_or_else(|| "(reason event without text)".to_owned()),
+                detail: reason
+                    .command_text
+                    .as_deref()
+                    .map(|command| format!("→ {}", first_line(command, 60))),
+                is_error: false,
+            });
+        }
+        events.sort_by_key(|event| (event.at.unwrap_or(i128::MIN), event.id));
+        events.reverse();
         let total_events = events.len();
         events.truncate(MAX_EVENTS);
 
-        TriageLive {
-            cached_head,
-            exec,
-            model,
+        let live = Self {
+            cached_revisions,
+            report: None,
+            exec: report.exec_queue.clone(),
+            model: report.model_queue.clone(),
             events,
             total_events,
+            diagnostic: None,
+            headspace_error: report.headspace.unsettled_reason(),
+            config_heads: report.headspace.config_heads().len(),
+            active_profile_heads: report.headspace.active_profile_heads().len(),
+            persona_id: report.headspace.persona_id,
+            relation_forks: report.relations.forked_profiles.len(),
+            exec_fork_history: report.exec_attempt_forks.len(),
+            model_fork_history: report.model_attempt_forks.len(),
+            lifecycle_diagnostics: report.lifecycle_diagnostics.clone(),
+            unread_messages: report.unread_messages,
+            probable_loop: report.probable_loop.clone(),
+            suggestions: report.suggestions.clone(),
+        };
+        Self {
+            report: Some(report),
+            ..live
         }
     }
-}
 
-fn collect_queue(
-    space: &TribleSet,
-    request_kind: Id,
-    in_progress_kind: Id,
-    result_kind: Id,
-    stale_cutoff_ns: i128,
-) -> QueueCounts {
-    let mut counts = QueueCounts::default();
-    for (_id,) in find!(
-        (id: Id,),
-        pattern!(space, [{ ?id @ metadata::tag: request_kind }])
-    ) {
-        counts.requests += 1;
-    }
-    for (_id, _ts) in find!(
-        (id: Id, ts: (i128, i128)),
-        pattern!(space, [{
-            ?id @
-            metadata::tag: in_progress_kind,
-            metadata::created_at: ?ts,
-        }])
-    ) {
-        counts.in_progress += 1;
-        if _ts.0 < stale_cutoff_ns {
-            counts.stale_in_progress += 1;
+    fn refresh_time(&mut self, now: i128) {
+        let Some(report) = self.report.as_mut() else {
+            return;
+        };
+        if let Err(error) = report.refresh_time(now, STALE_SECONDS as i128 * 1_000_000_000) {
+            self.diagnostic = Some(format!("{error:#}"));
+            return;
         }
+        self.exec = report.exec_queue.clone();
+        self.model = report.model_queue.clone();
+        self.exec_fork_history = report.exec_attempt_forks.len();
+        self.model_fork_history = report.model_attempt_forks.len();
+        self.lifecycle_diagnostics = report.lifecycle_diagnostics.clone();
+        self.suggestions = report.suggestions.clone();
     }
-    for (_id,) in find!(
-        (id: Id,),
-        pattern!(space, [{ ?id @ metadata::tag: result_kind }])
-    ) {
-        counts.results += 1;
-    }
-    counts
-}
-
-fn collect_exec_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut Vec<EventRow>) {
-    // Each exec result has: about_request → command_text,
-    // exit_code, stdout/stderr/error handles, created_at.
-    // For the timeline we just need the result entity + its
-    // created_at + summary fields.
-    for (id, ts) in find!(
-        (id: Id, ts: (i128, i128)),
-        pattern!(space, [{
-            ?id @
-            metadata::tag: KIND_EXEC_RESULT_ID,
-            metadata::created_at: ?ts,
-        }])
-    ) {
-        let at = ns_to_chrono(ts.0);
-        let exit = find_u64(space, id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ exec_attrs::exit_code: ?v }])
-            )
-            .next()
-        });
-        let is_error = exit.map_or(false, |c| c != 0);
-        // Pull the originating request's command_text for context.
-        let about_request = find!(
-            r: Id,
-            pattern!(space, [{ id @ exec_attrs::about_request: ?r }])
-        )
-        .next();
-        let command_handle = about_request.and_then(|req| {
-            find!(
-                h: TextHandle,
-                pattern!(space, [{ req @ exec_attrs::command_text: ?h }])
-            )
-            .next()
-        });
-        let command = command_handle.and_then(|h| read_text(ws, h));
-        let error_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ id @ exec_attrs::error: ?h }])
-        )
-        .next();
-        let error_text = error_handle.and_then(|h| read_text(ws, h));
-
-        let summary = command
-            .clone()
-            .map(|c| first_line(&c, 80))
-            .or(error_text
-                .clone()
-                .map(|e| format!("error: {}", first_line(&e, 60))))
-            .unwrap_or_else(|| "(exec result)".to_string());
-
-        let detail = match exit {
-            Some(c) if c != 0 => Some(format!("exit {c}")),
-            Some(_) => None,
-            None => None,
-        };
-
-        out.push(EventRow {
-            id,
-            kind: EventKind::ExecResult,
-            at,
-            summary,
-            detail,
-            is_error,
-        });
-    }
-}
-
-fn collect_model_results(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut Vec<EventRow>) {
-    for (id, ts) in find!(
-        (id: Id, ts: (i128, i128)),
-        pattern!(space, [{
-            ?id @
-            metadata::tag: KIND_MODEL_RESULT_ID,
-            metadata::created_at: ?ts,
-        }])
-    ) {
-        let at = ns_to_chrono(ts.0);
-        let error_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ id @ model_attrs::error: ?h }])
-        )
-        .next();
-        let error_text = error_handle.and_then(|h| read_text(ws, h));
-        let is_error = error_text.is_some();
-
-        let output_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ id @ model_attrs::output_text: ?h }])
-        )
-        .next();
-        let output_text = output_handle.and_then(|h| read_text(ws, h));
-
-        let input_tokens = find_u64(space, id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ model_attrs::input_tokens: ?v }])
-            )
-            .next()
-        });
-        let output_tokens = find_u64(space, id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ model_attrs::output_tokens: ?v }])
-            )
-            .next()
-        });
-
-        let summary = output_text
-            .as_ref()
-            .map(|t| first_line(t, 80))
-            .or(error_text
-                .clone()
-                .map(|e| format!("error: {}", first_line(&e, 60))))
-            .unwrap_or_else(|| "(model result)".to_string());
-
-        let detail = match (input_tokens, output_tokens) {
-            (Some(i), Some(o)) => Some(format!("{} in · {} out", format_count(i), format_count(o))),
-            (Some(i), None) => Some(format!("{} in", format_count(i))),
-            (None, Some(o)) => Some(format!("{} out", format_count(o))),
-            (None, None) => None,
-        };
-
-        out.push(EventRow {
-            id,
-            kind: EventKind::ModelResult,
-            at,
-            summary,
-            detail,
-            is_error,
-        });
-    }
-}
-
-fn collect_reason_events(ws: &mut Workspace<Pile>, space: &TribleSet, out: &mut Vec<EventRow>) {
-    for (id, ts) in find!(
-        (id: Id, ts: (i128, i128)),
-        pattern!(space, [{
-            ?id @
-            metadata::tag: KIND_REASON_EVENT_ID,
-            metadata::created_at: ?ts,
-        }])
-    ) {
-        let at = ns_to_chrono(ts.0);
-        let text_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ id @ reason_attrs::text: ?h }])
-        )
-        .next();
-        let text = text_handle.and_then(|h| read_text(ws, h));
-        let cmd_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ id @ reason_attrs::command_text: ?h }])
-        )
-        .next();
-        let cmd = cmd_handle.and_then(|h| read_text(ws, h));
-
-        let summary = text
-            .as_ref()
-            .map(|t| first_line(t, 80))
-            .unwrap_or_else(|| "(reason event)".to_string());
-        let detail = cmd.map(|c| format!("→ {}", first_line(&c, 60)));
-
-        out.push(EventRow {
-            id,
-            kind: EventKind::Reason,
-            at,
-            summary,
-            detail,
-            is_error: false,
-        });
-    }
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
-}
-
-fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
-    let secs = (ns / 1_000_000_000) as i64;
-    let nanos = ((ns % 1_000_000_000) as u32).min(999_999_999);
-    Utc.timestamp_opt(secs, nanos)
-        .single()
-        .unwrap_or_else(Utc::now)
-}
-
-fn now_tai_ns() -> i128 {
-    Epoch::now()
-        .map(|e| e.to_tai_duration().total_nanoseconds())
-        .unwrap_or(0)
-}
-
-fn find_u64<F>(_space: &TribleSet, entity_id: Id, query: F) -> Option<u64>
-where
-    F: FnOnce(Id) -> Option<Inline<U256BE>>,
-{
-    let raw = query(entity_id)?;
-    if raw.raw[..24].iter().any(|b| *b != 0) {
-        return None;
-    }
-    let bytes: [u8; 8] = raw.raw[24..32].try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
 }
 
 fn first_line(text: &str, max: usize) -> String {
@@ -483,12 +379,22 @@ fn format_count(n: u64) -> String {
     }
 }
 
-fn format_time(t: DateTime<Utc>) -> String {
-    format!("{:02}:{:02}:{:02}", t.hour(), t.minute(), t.second())
+fn format_time(at: Option<i128>) -> String {
+    let Some(at) = at else {
+        return "--:--:--".to_owned();
+    };
+    let ns = at.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    let epoch =
+        hifitime::Epoch::from_tai_duration(hifitime::Duration::from_truncated_nanoseconds(ns));
+    let (_, _, _, hour, minute, second, _) = epoch.to_gregorian_utc();
+    format!("{hour:02}:{minute:02}:{second:02}")
 }
 
-fn age_label(now: DateTime<Utc>, at: DateTime<Utc>) -> String {
-    let secs = (now - at).num_seconds().max(0);
+fn age_label(now: i128, at: Option<i128>) -> String {
+    let Some(at) = at else {
+        return "TIME UNKNOWN".to_owned();
+    };
+    let secs = (now.saturating_sub(at) / 1_000_000_000).max(0) as i64;
     if secs < 60 {
         format!("{secs}S AGO")
     } else if secs < 3_600 {
@@ -521,25 +427,53 @@ impl TriageViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(
+        &mut self,
+        ctx: &mut CardCtx<'_>,
+        cognition: DatasetView<'_>,
+        headspace: DatasetView<'_>,
+        secrets: DatasetView<'_>,
+        relations: DatasetView<'_>,
+        messages: DatasetView<'_>,
+    ) {
+        let revisions = TriageRevisions {
+            cognition: cognition.revision,
+            headspace: headspace.revision,
+            secrets: secrets.revision,
+            relations: relations.revision,
+            messages: messages.revision,
+        };
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(live) => live.cached_revisions != revisions,
         };
         if need_refresh {
-            self.live = Some(TriageLive::refresh(ws));
+            self.live = Some(TriageLive::refresh(
+                cognition, headspace, secrets, relations, messages,
+            ));
+        }
+        let now = triage_model::now_tai_ns();
+        if let Some(live) = self.live.as_mut() {
+            live.refresh_time(now);
         }
 
         ctx.section("Triage", |ctx| {
             let Some(live) = self.live.as_ref() else { return };
-            let now = Utc::now();
 
             ctx.grid(|g| {
+                if let Some(error) = live.diagnostic.as_deref() {
+                    g.full(|ctx| render_diagnostic_card(ctx.ui_mut(), error));
+                    return;
+                }
+
                 // Queue counts dashboard.
                 g.full(|ctx| {
-                    render_queues_card(ctx.ui_mut(), &live.exec, &live.model);
+                    render_queues_card(ctx.ui_mut(), live);
                 });
+
+                if !live.suggestions.is_empty() {
+                    g.full(|ctx| render_suggestions_card(ctx.ui_mut(), &live.suggestions));
+                }
 
                 if live.events.is_empty() {
                     g.full(|ctx| {
@@ -553,7 +487,7 @@ impl TriageViewer {
                             );
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new("No agent activity on this branch yet.")
+                                egui::RichText::new("No canonical agent activity yet.")
                                     .monospace()
                                     .small()
                                     .strong()
@@ -609,7 +543,59 @@ impl TriageViewer {
 
 // ── Queue-counts dashboard ──────────────────────────────────────────
 
-fn render_queues_card(ui: &mut egui::Ui, exec: &QueueCounts, model: &QueueCounts) {
+fn render_diagnostic_card(ui: &mut egui::Ui, error: &str) {
+    let color = color_error();
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            32,
+        ))
+        .stroke(egui::Stroke::new(1.0, color))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("INVALID TRIAGE SNAPSHOT")
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color),
+            );
+            ui.label(egui::RichText::new(error).monospace().small().color(color));
+        });
+}
+
+fn render_suggestions_card(ui: &mut egui::Ui, suggestions: &[String]) {
+    let fill = ui.visuals().window_fill;
+    egui::Frame::NONE
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, color_frame(ui)))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("SUGGESTED NEXT CHECKS")
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color_reason()),
+            );
+            for suggestion in suggestions {
+                ui.label(
+                    egui::RichText::new(format!("· {suggestion}"))
+                        .monospace()
+                        .small()
+                        .color(color_muted(ui)),
+                );
+            }
+        });
+}
+
+fn render_queues_card(ui: &mut egui::Ui, live: &TriageLive) {
     let bubble_fill = ui.visuals().window_fill;
     let body_text = colorhash::text_color_on(bubble_fill);
     let body_muted = mix(body_text, bubble_fill, 0.30);
@@ -634,9 +620,138 @@ fn render_queues_card(ui: &mut egui::Ui, exec: &QueueCounts, model: &QueueCounts
             ui.set_min_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 4.0;
 
-            render_queue_row(ui, "EXEC", color_exec(), exec, body_text, body_muted);
-            render_queue_row(ui, "MODEL", color_model(), model, body_text, body_muted);
+            render_queue_row(ui, "EXEC", color_exec(), &live.exec, body_text, body_muted);
+            render_queue_row(
+                ui,
+                "MODEL",
+                color_model(),
+                &live.model,
+                body_text,
+                body_muted,
+            );
+            ui.separator();
+
+            if let Some(error) = live.headspace_error.as_deref() {
+                render_status_line(
+                    ui,
+                    "HEADSPACE UNRESOLVED",
+                    &first_line(error, 140),
+                    color_error(),
+                );
+            } else {
+                let agreement = if live.config_heads > 1 || live.active_profile_heads > 1 {
+                    "AGREED"
+                } else {
+                    "SETTLED"
+                };
+                let persona = live
+                    .persona_id
+                    .map(|id| format!("persona {}", &id_hex(id)[..8]))
+                    .unwrap_or_else(|| "no persona".to_owned());
+                render_status_line(
+                    ui,
+                    &format!("HEADSPACE {agreement}"),
+                    &format!(
+                        "config heads {} · profile heads {} · {persona}",
+                        live.config_heads, live.active_profile_heads
+                    ),
+                    color_exec(),
+                );
+            }
+
+            match live.unread_messages {
+                UnreadMessages::Available { count: unread, .. } => render_status_line(
+                    ui,
+                    "INBOX",
+                    &format!(
+                        "{unread} unread canonical message{}",
+                        if unread == 1 { "" } else { "s" }
+                    ),
+                    if unread == 0 {
+                        body_muted
+                    } else {
+                        color_reason()
+                    },
+                ),
+                UnreadMessages::Unavailable(reason) => {
+                    let detail = match reason {
+                        UnreadUnavailable::HeadspaceUnsettled => {
+                            "Headspace active state is unsettled"
+                        }
+                        UnreadUnavailable::PersonaNotConfigured => {
+                            "Headspace has no configured persona"
+                        }
+                    };
+                    render_status_line(ui, "INBOX UNAVAILABLE", detail, color_reason())
+                }
+            }
+            if live.relation_forks > 0 {
+                render_status_line(
+                    ui,
+                    "RELATIONS FORK",
+                    &format!(
+                        "{} person profile{} have competing heads",
+                        live.relation_forks,
+                        if live.relation_forks == 1 { "" } else { "s" }
+                    ),
+                    color_reason(),
+                );
+            }
+            if live.exec_fork_history > 0 || live.model_fork_history > 0 {
+                render_status_line(
+                    ui,
+                    "ATTEMPT FORKS",
+                    &format!(
+                        "exec {} · model {} (historical and current)",
+                        live.exec_fork_history, live.model_fork_history
+                    ),
+                    color_reason(),
+                );
+            }
+            for diagnostic in &live.lifecycle_diagnostics {
+                render_status_line(
+                    ui,
+                    "INVALID LIFECYCLE",
+                    &first_line(diagnostic, 140),
+                    color_error(),
+                );
+            }
+            if let Some(pattern) = live.probable_loop.as_ref() {
+                render_status_line(
+                    ui,
+                    "PROBABLE LOOP",
+                    &format!(
+                        "{}× · exit {} · {}",
+                        pattern.count,
+                        pattern
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "-".to_owned()),
+                        first_line(&pattern.command, 80)
+                    ),
+                    color_error(),
+                );
+            }
         });
+}
+
+fn render_status_line(ui: &mut egui::Ui, label: &str, detail: &str, color: egui::Color32) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(
+            egui::RichText::new(label)
+                .monospace()
+                .small()
+                .strong()
+                .color(color),
+        );
+        ui.label(
+            egui::RichText::new(detail)
+                .monospace()
+                .small()
+                .color(color_muted(ui)),
+        );
+    });
 }
 
 fn render_queue_row(
@@ -667,13 +782,20 @@ fn render_queue_row(
             });
 
         render_count(ui, "REQ", counts.requests, text, muted);
-        render_count(ui, "RUN", counts.in_progress, text, muted);
-        if counts.stale_in_progress > 0 {
+        render_count(ui, "PEND", counts.pending, text, muted);
+        render_count(ui, "RUN", counts.running, text, muted);
+        if counts.stale > 0 {
             // Stale items are surfaced in error red so they catch
             // the eye — the user probably wants to triage them.
-            render_count_colored(ui, "STALE", counts.stale_in_progress, color_error());
+            render_count_colored(ui, "STALE", counts.stale, color_error());
         }
-        render_count(ui, "DONE", counts.results, text, muted);
+        if counts.forked > 0 {
+            render_count_colored(ui, "FORK", counts.forked, color_reason());
+        }
+        if counts.invalid > 0 {
+            render_count_colored(ui, "INVALID", counts.invalid, color_error());
+        }
+        render_count(ui, "DONE", counts.done, text, muted);
     });
 }
 
@@ -717,7 +839,7 @@ fn render_count_colored(ui: &mut egui::Ui, label: &str, n: usize, color: egui::C
 
 // ── Event card ──────────────────────────────────────────────────────
 
-fn render_event_card(ui: &mut egui::Ui, ev: &EventRow, now: DateTime<Utc>) {
+fn render_event_card(ui: &mut egui::Ui, ev: &EventRow, now: i128) {
     let bubble_fill = ui.visuals().window_fill;
     let accent = if ev.is_error {
         color_error()

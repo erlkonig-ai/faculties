@@ -5,7 +5,9 @@
 //! Extracted from `body` (2026-06-30). The body is the physical Reachy loop
 //! (pose/look/feel/act); the voice is its own organ — synthesis (Qwen3-TTS via
 //! mary) plus output routing.
-//! Utterances and the routing config live on the pile's `voice` branch.
+//! New utterances and routing config live in one fixed native collection.
+//! Stopped-world migration validates historical records and reconstructs them
+//! under the current live ontology and intrinsic identities.
 //!
 //! Two channels, each a hard contract, not a soft preference:
 //!   - `voice say <text>`   — the PRIVATE channel: in-ear / headphone only. If no
@@ -48,21 +50,23 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
 use faculties::schemas::voice::{
-    route, utterance, CHANNEL_SAY, CHANNEL_SHOUT, KIND_ROUTE, KIND_UTTERANCE, VOICE_BRANCH_NAME,
+    route, CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID, KIND_LIVE_RECORD, KIND_ROUTE,
 };
+use faculties::voice as voice_model;
+use faculties::voice_cutover;
 use hifitime::efmt::consts::ISO8601;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
+use triblespace::core::collection::{Collection, CollectionCommit};
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
-type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 type U256 = Inline<inlineencodings::U256BE>;
 
 const DEFAULT_DAEMON: &str = "http://localhost:8000";
@@ -104,9 +108,10 @@ struct Cli {
     /// Path to the pile file
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch id (hex). Overrides name-based lookup.
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it;
+    /// initialize explicitly with `trible pile signing-key init <pile>`.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     /// Reachy daemon base URL (the `shout` Reachy-speaker target).
     #[arg(long, env = "REACHY_DAEMON", default_value = DEFAULT_DAEMON)]
     daemon: String,
@@ -119,7 +124,7 @@ enum Command {
     /// Speak on the PRIVATE channel — in-ear / headphone only. Routes to the
     /// highest-priority connected private device; if none can be safely
     /// targeted, prints the text instead of playing aloud. Recorded on the
-    /// voice branch.
+    /// fixed Voice collection.
     Say {
         /// What to say.
         text: String,
@@ -130,7 +135,7 @@ enum Command {
     },
     /// Speak ALOUD on the PUBLIC channel — Reachy speaker → room → laptop.
     /// Broadcasting is the point; falls back to any audible device. Recorded on
-    /// the voice branch.
+    /// the fixed Voice collection.
     Shout {
         /// What to shout.
         text: String,
@@ -155,6 +160,12 @@ enum Command {
     /// List the connected audio output devices and their privacy class. The
     /// raw input to routing — a quick way to see what `say`/`shout` can target.
     Devices,
+    /// Canonically and additively reconstruct the stopped legacy `voice`
+    /// branch and the pre-extraction utterances on `body` in the fixed native
+    /// Voice collection. Stop every writer to both branches and initialize the
+    /// durable signer first. Reconstructed routes are live immediately; a
+    /// later native route set supersedes them by timestamp.
+    MigrateLegacy,
 }
 
 // ── time / id helpers (mirrors body/headspace) ─────────────────────────────
@@ -483,71 +494,96 @@ fn route_shout(prefs: &[String], devices: &[AudioDevice], daemon_up: bool) -> Ro
     }
 }
 
-// ── pile plumbing ───────────────────────────────────────────────────────────
+// ── native collection persistence ─────────────────────────────────────────
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
+#[derive(Clone, Copy)]
+struct VoiceStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
 }
 
-fn with_voice<T>(
-    pile: &Path,
-    explicit_branch: Option<&str>,
-    f: impl FnOnce(&mut Repository<Pile>, &mut Workspace<Pile>) -> Result<T>,
-) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let branch_id = if let Some(hex) = explicit_branch {
-        Id::from_hex(hex.trim()).ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"))?
-    } else {
-        repo.ensure_branch(VOICE_BRANCH_NAME, None)
-            .map_err(|e| anyhow::anyhow!("ensure voice branch: {e:?}"))?
-    };
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull voice workspace: {e:?}"))?;
-    let result = f(&mut repo, &mut ws);
-    let close_res = repo
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
+struct VoiceSession<'a> {
+    collection: &'a mut Collection<Pile>,
+    facts: TribleSet,
+    reader: PileReader,
+}
+
+impl VoiceSession<'_> {
+    fn commit(
+        &mut self,
+        mut fragment: Fragment,
+        description: &'static str,
+    ) -> Result<CollectionCommit> {
+        voice_model::validate_candidate(&self.reader, &self.facts, &fragment)?;
+        let added = fragment.facts().clone();
+        fragment.describe_with(entity! { metadata::description: description });
+        let commit = self
+            .collection
+            .commit(fragment)
+            .context("commit Voice fragment")?;
+        self.facts += added;
+        self.reader = self
+            .collection
+            .storage_mut()
+            .reader()
+            .context("refresh Voice attachment snapshot")?;
+        Ok(commit)
     }
-    result
+}
+
+impl VoiceStorage<'_> {
+    fn with_session<T>(
+        &self,
+        operation: impl FnOnce(&mut VoiceSession<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, COLLECTION_SCOPE_ID, signer);
+        let result = (|| {
+            let facts = collection
+                .materialize()
+                .context("materialize Voice collection")?;
+            let reader = collection
+                .storage_mut()
+                .reader()
+                .context("open Voice attachment reader")?;
+            voice_model::validate_catalog(&reader, &facts)
+                .context("validate native Voice collection")?;
+            operation(&mut VoiceSession {
+                collection: &mut collection,
+                facts,
+                reader,
+            })
+        })();
+        finish_pile(collection.into_storage(), result)
+    }
+}
+
+fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context("close Voice pile")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing Voice pile also failed: {close_error}")))
+        }
+    }
 }
 
 /// Read a channel's routing policy from the pile. Each `voice route set` writes
 /// a whole GENERATION of entries sharing one `metadata::updated_at`; the policy
-/// is the LATEST generation only (a set replaces, it doesn't accumulate —
-/// coordinate-and-cursor on the set timestamp keeps the pile append-only while
-/// the read sees one current policy). Falls back to the baked-in defaults when
-/// the pile holds no policy for the channel.
-fn load_route(ws: &mut Workspace<Pile>, channel: &str) -> Result<Vec<String>> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+/// is the LATEST generation only (a set replaces, it doesn't accumulate).
+/// Exact timestamp ties are unioned. Falls back to the baked-in defaults when
+/// the live projection holds no policy for the channel.
+fn load_route(space: &TribleSet, channel: &str) -> Result<Vec<String>> {
     // (set-generation key, priority, device) for this channel.
     let mut rows: Vec<(i128, u64, String)> = Vec::new();
     for (dev, prio, updated) in find!(
         (d: String, p: U256, u: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
+        pattern!(space, [{
             _?e @
+                metadata::tag: KIND_LIVE_RECORD,
                 metadata::tag: KIND_ROUTE,
                 route::channel: channel.to_string(),
                 route::device: ?d,
@@ -573,62 +609,46 @@ fn load_route(ws: &mut Workspace<Pile>, channel: &str) -> Result<Vec<String>> {
     Ok(entries.into_iter().map(|(_, d)| d).collect())
 }
 
-fn store_route(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
+fn route_set_fragment(
     channel: &str,
     devices: &[String],
-) -> Result<()> {
-    // One timestamp for the whole set — the generation marker `load_route` keys
-    // on, so this set wholly replaces the previous policy for the channel.
-    let set_time = now_tai();
+    set_time: Inline<inlineencodings::NsTAIInterval>,
+) -> Fragment {
+    let mut generation = Fragment::empty();
     for (i, dev) in devices.iter().enumerate() {
         let prio: U256 = (i as u64).to_inline();
-        let frag = entity! {
-            metadata::tag: &KIND_ROUTE,
-            metadata::updated_at: set_time,
-            route::channel: channel,
-            route::device: dev.as_str(),
-            route::priority: prio,
-        };
-        ws.commit(frag, "voice route set");
+        generation += voice_model::route_record(channel, dev, prio, set_time);
     }
-    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    generation
+}
+
+fn store_route(session: &mut VoiceSession<'_>, channel: &str, devices: &[String]) -> Result<()> {
+    let generation = route_set_fragment(channel, devices, now_tai());
+    session.commit(generation, "voice route set")?;
     Ok(())
 }
 
-/// Record an utterance on the voice branch. The fact falls out of speaking —
+/// Record an utterance in the fixed Voice collection. The fact falls out of speaking —
 /// logging is a side effect of the act, not a separate obligation.
 /// `commit_msg` is the ledger line: "voice spoke" on the happy path, an
 /// explicit failure marker when there was no trustworthy audio to attach
 /// (synthesis died mid-stream) — the words never vanish from the pile.
 fn log_utterance(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
+    session: &mut VoiceSession<'_>,
     channel: &str,
     text: &str,
     wav: Option<&Path>,
-    commit_msg: &str,
+    commit_msg: &'static str,
 ) -> Result<()> {
-    let text_h: TextHandle = ws.put(text.to_string());
-    let audio_h: Option<RawHandle> = match wav {
-        Some(p) => {
-            let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
-            Some(ws.put::<blobencodings::RawBytes, _>(bytes))
+    let audio = match wav {
+        Some(path) => {
+            Some(std::fs::read(path).with_context(|| format!("read {}", path.display()))?)
         }
         None => None,
     };
-    let frag = entity! {
-        metadata::tag: &KIND_UTTERANCE,
-        metadata::created_at: now_tai(),
-        utterance::channel: channel,
-        utterance::text: text_h,
-        utterance::audio?: audio_h,
-        utterance::mime?: wav.map(|_| "audio/wav"),
-    };
-    let id = frag.root().expect("utterance id");
-    ws.commit(frag, commit_msg);
-    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    let fragment = voice_model::utterance_fragment(channel, text, audio, now_tai())?;
+    let id = fragment.root().expect("utterance id");
+    session.commit(fragment, commit_msg)?;
     println!("  logged utterance {} [{channel}]", &fmt_id(id)[..12]);
     Ok(())
 }
@@ -698,7 +718,7 @@ fn prebuffer_target_secs(total_est_secs: f32, production_rate: f32) -> f32 {
 //     to a WAV first. Streaming into the daemon is a noted follow-up on the
 //     daemon side; this lane does not touch it.
 // Every sink also accumulates the full utterance, which `cmd_speak` logs on
-// the voice branch after completion — logging is unchanged.
+// the Voice collection after completion — logging is unchanged.
 
 /// What `speak_and_play` accomplished. An `Err` from it means SYNTHESIS
 /// failed — `out` was NOT written and there is no trustworthy audio (the
@@ -991,17 +1011,15 @@ fn speak_and_play(
 
 // ── commands ────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_speak(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
+    session: &mut VoiceSession<'_>,
     daemon: &str,
     channel: &str,
     text: &str,
     dry_run: bool,
 ) -> Result<()> {
     let devices = detect_output_devices()?;
-    let prefs = load_route(ws, channel)?;
+    let prefs = load_route(&session.facts, channel)?;
 
     let routed = if channel == CHANNEL_SAY {
         route_say(&prefs, &devices)
@@ -1020,7 +1038,7 @@ fn cmd_speak(
     if let Routed::Text(_) = routed {
         // Print the words (private, silent), log without audio.
         println!("{text}");
-        return log_utterance(repo, ws, channel, text, None, "voice spoke");
+        return log_utterance(session, channel, text, None, "voice spoke");
     }
 
     // ONE generation path (streaming synthesis), sink chosen by the route —
@@ -1036,8 +1054,7 @@ fn cmd_speak(
             let _ = std::fs::remove_file(&out);
             eprintln!("synthesis failed — logging the utterance text-only: {synth_err:#}");
             if let Err(log_err) = log_utterance(
-                repo,
-                ws,
+                session,
                 channel,
                 text,
                 None,
@@ -1050,7 +1067,7 @@ fn cmd_speak(
         Ok(outcome) => {
             // Log the utterance with its audio regardless of a playback
             // hiccup, so the fact survives; surface a playback error after.
-            let log = log_utterance(repo, ws, channel, text, Some(&out), "voice spoke");
+            let log = log_utterance(session, channel, text, Some(&out), "voice spoke");
             let _ = std::fs::remove_file(&out);
             if let Spoken::PlaybackFailed(play_err) = outcome {
                 if channel == CHANNEL_SAY {
@@ -1102,7 +1119,7 @@ fn unique_voice_tmp() -> Result<PathBuf> {
     );
 }
 
-fn cmd_route(ws: &mut Workspace<Pile>, daemon: &str) -> Result<()> {
+fn cmd_route(session: &VoiceSession<'_>, daemon: &str) -> Result<()> {
     let devices = detect_output_devices()?;
     let daemon_up = reachy_reachable(daemon);
 
@@ -1124,7 +1141,7 @@ fn cmd_route(ws: &mut Workspace<Pile>, daemon: &str) -> Result<()> {
     println!();
 
     for channel in [CHANNEL_SAY, CHANNEL_SHOUT] {
-        let prefs = load_route(ws, channel)?;
+        let prefs = load_route(&session.facts, channel)?;
         println!("{channel} policy (priority order): {}", prefs.join(" → "));
         let routed = if channel == CHANNEL_SAY {
             route_say(&prefs, &devices)
@@ -1136,12 +1153,7 @@ fn cmd_route(ws: &mut Workspace<Pile>, daemon: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_route_set(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
-    channel: &str,
-    devices: &[String],
-) -> Result<()> {
+fn cmd_route_set(session: &mut VoiceSession<'_>, channel: &str, devices: &[String]) -> Result<()> {
     let channel = match channel.to_lowercase().as_str() {
         "say" => CHANNEL_SAY,
         "shout" => CHANNEL_SHOUT,
@@ -1158,7 +1170,7 @@ fn cmd_route_set(
             }
         }
     }
-    store_route(repo, ws, channel, devices)?;
+    store_route(session, channel, devices)?;
     println!("{channel} policy set: {}", devices.join(" → "));
     Ok(())
 }
@@ -1180,10 +1192,38 @@ fn cmd_devices() -> Result<()> {
     Ok(())
 }
 
+fn migrate_legacy(pile: &Path, key: Option<&Path>) -> Result<()> {
+    let frozen = freeze_source(pile)?;
+    let plan = voice_cutover::plan(&frozen)?;
+    let report = plan.report().clone();
+    let commits = voice_cutover::publish(&frozen, &plan, pile, key)?;
+    println!(
+        "Validated {} Voice + {} Body authored commits ({} split across native transaction boundaries; {} native transactions coalesced several route sources; {} unrelated Body commits omitted; {} source-empty; {} contentless merges remained ancestry); reconstructed {} routes and {} utterances ({} from Voice, {} from Body) / {} facts in {} native commits.",
+        report.voice_authored_commits,
+        report.body_authored_commits,
+        report.split_authored_commits,
+        report.coalesced_native_commits,
+        report.body_without_voice_commits,
+        report.authored_empty_commits,
+        report.contentless_merges,
+        report.canonical_routes,
+        report.canonical_utterances,
+        report.legacy_voice_utterances,
+        report.legacy_body_utterances,
+        report.output_facts,
+        commits.len(),
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let pile = cli.pile.clone();
-    let branch = cli.branch_id.as_deref();
+    let key = cli.key.clone();
+    let storage = VoiceStorage {
+        pile: &pile,
+        key: key.as_deref(),
+    };
     let daemon = cli.daemon.clone();
 
     match cli.command {
@@ -1191,17 +1231,16 @@ fn main() -> Result<()> {
             Cli::command().print_help().ok();
             println!();
         }
-        Some(Command::Say { text, dry_run }) => with_voice(&pile, branch, |repo, ws| {
-            cmd_speak(repo, ws, &daemon, CHANNEL_SAY, &text, dry_run)
-        })?,
-        Some(Command::Shout { text, dry_run }) => with_voice(&pile, branch, |repo, ws| {
-            cmd_speak(repo, ws, &daemon, CHANNEL_SHOUT, &text, dry_run)
-        })?,
-        Some(Command::Route) => with_voice(&pile, branch, |_repo, ws| cmd_route(ws, &daemon))?,
-        Some(Command::RouteSet { channel, devices }) => with_voice(&pile, branch, |repo, ws| {
-            cmd_route_set(repo, ws, &channel, &devices)
-        })?,
+        Some(Command::Say { text, dry_run }) => storage
+            .with_session(|session| cmd_speak(session, &daemon, CHANNEL_SAY, &text, dry_run))?,
+        Some(Command::Shout { text, dry_run }) => storage
+            .with_session(|session| cmd_speak(session, &daemon, CHANNEL_SHOUT, &text, dry_run))?,
+        Some(Command::Route) => storage.with_session(|session| cmd_route(session, &daemon))?,
+        Some(Command::RouteSet { channel, devices }) => {
+            storage.with_session(|session| cmd_route_set(session, &channel, &devices))?
+        }
         Some(Command::Devices) => cmd_devices()?,
+        Some(Command::MigrateLegacy) => migrate_legacy(&pile, key.as_deref())?,
     }
     Ok(())
 }
@@ -1210,6 +1249,13 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs::File;
+    use triblespace::core::collection::simplearchive_union;
+    use triblespace::core::repo::BlobStoreGet;
+
+    use faculties::collection_cutover::{discover_target, initialize_signer};
+    use faculties::schemas::voice::{utterance, KIND_UTTERANCE};
 
     fn dev(name: &str, default: bool) -> AudioDevice {
         AudioDevice {
@@ -1227,6 +1273,68 @@ mod tests {
             Routed::Devices(l) => l,
             other => panic!("expected a device ladder, got: {}", other.describe()),
         }
+    }
+
+    #[test]
+    fn native_storage_uses_fixed_descriptor_and_atomic_voice_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("voice.pile");
+        let key = directory.path().join("voice.key");
+        File::create(&pile).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let storage = VoiceStorage {
+            pile: &pile,
+            key: Some(&key),
+        };
+
+        let route = vec!["AirPods Max".to_owned(), "AirPods Pro".to_owned()];
+        storage
+            .with_session(|session| store_route(session, CHANNEL_SAY, &route))
+            .unwrap();
+        let wav = directory.path().join("utterance.wav");
+        std::fs::write(&wav, b"synthetic wav bytes").unwrap();
+        storage
+            .with_session(|session| {
+                log_utterance(
+                    session,
+                    CHANNEL_SAY,
+                    "hello collection",
+                    Some(&wav),
+                    "voice spoke",
+                )
+            })
+            .unwrap();
+
+        storage
+            .with_session(|session| {
+                assert_eq!(load_route(&session.facts, CHANNEL_SAY)?, route);
+                let (text, audio) = find!(
+                    (text: voice_model::TextHandle, audio: voice_model::AudioHandle),
+                    pattern!(&session.facts, [{
+                        metadata::tag: KIND_LIVE_RECORD,
+                        metadata::tag: KIND_UTTERANCE,
+                        utterance::text: ?text,
+                        utterance::audio: ?audio,
+                    }])
+                )
+                .next()
+                .expect("one live utterance");
+                let text: anybytes::View<str> = session.reader.get(text)?;
+                let audio: anybytes::Bytes = session.reader.get(audio)?;
+                assert_eq!(text.as_ref(), "hello collection");
+                assert_eq!(audio.as_ref(), b"synthetic wav bytes");
+                Ok(())
+            })
+            .unwrap();
+
+        let mut pile_storage = open_pile_strict(&pile).unwrap();
+        let discovery = discover_target(&mut pile_storage, COLLECTION_SCOPE_ID).unwrap();
+        assert_eq!(
+            discovery.descriptor(),
+            simplearchive_union::descriptor(COLLECTION_SCOPE_ID)
+        );
+        assert_eq!(discovery.commits().len(), 2);
+        pile_storage.close().unwrap();
     }
 
     #[test]

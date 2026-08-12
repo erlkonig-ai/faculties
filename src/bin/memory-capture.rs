@@ -1,11 +1,11 @@
-//! Minimal capture target for iterating on the memory widget.
-//! Memory chunks live on the `cognition` branch by default (per the
-//! memory faculty's DEFAULT_MEMORY_BRANCH, which is "memory" — but
-//! older agent runs may have written them to `cognition`).
+//! Minimal native-collection capture target for iterating on the memory widget.
+//! The production Memory faculty now uses a native collection; this notebook
+//! remains an explicit compatibility surface for historical `memory` and
+//! `cognition` branches until the widget itself is ported.
 
 use std::path::PathBuf;
 
-use faculties::widgets::{MemoryViewer, StorageState};
+use faculties::widgets::{MemoryViewer, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -21,29 +21,26 @@ fn resolve_pile_path() -> PathBuf {
         );
         std::process::exit(0);
     }
-    std::env::var("PILE")
-        .ok()
-        .or_else(|| std::env::args().skip(1).find(|a| !a.starts_with("--")))
-        .unwrap_or_else(|| "./self.pile".to_owned())
-        .into()
+    faculties::widgets::resolve_pile_path(std::env::args().skip(1), std::env::var("PILE").ok())
 }
 
 #[notebook]
 fn main(nb: &mut NotebookCtx) {
     let path = resolve_pile_path();
 
-    let storage = nb.state("storage", StorageState::new(path), |ctx, st| {
-        st.top_bar(ctx);
-    });
+    let storage = nb.state(
+        "storage",
+        StorageState::for_sources(path, [SourceKey::Memory]),
+        |ctx, st| {
+            st.top_bar(ctx);
+        },
+    );
 
     nb.state("memory", MemoryViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        // Try `memory` first, fall back to `cognition` for older
-        // agent runs (which wrote chunks to the cognition branch
-        // before the memory branch became canonical).
-        let ws = st.workspace("memory").or_else(|| st.workspace("cognition"));
-        let Some(mut ws) = ws else { return };
-        panel.render(ctx, &mut ws);
-        st.push(&mut ws);
+        let Some(view) = st.context().dataset(SourceKey::Memory) else {
+            return;
+        };
+        panel.render(ctx, view);
     });
 }

@@ -21,17 +21,23 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::body::{capture, intent, BODY_BRANCH_NAME, KIND_CAPTURE, KIND_INTENT};
+use faculties::body_cutover;
+use faculties::collection_cutover::{
+    freeze_source, load_signer, open_pile_strict, publish_fragment,
+};
+use faculties::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
 use hifitime::efmt::consts::ISO8601;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
-use rand_core::OsRng;
 use std::path::{Path, PathBuf};
 use std::process::Command as PCommand;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
 
 type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -53,12 +59,12 @@ const FRAME_SHIM: &str = include_str!("body_frame.py");
     about = "The Reachy Mini body: perception in, action out, deliberate captures to the pile"
 )]
 struct Cli {
-    /// Path to the pile file
+    /// Path to the pile file. Required only by commands that keep or read data.
     #[arg(long, env = "PILE")]
-    pile: PathBuf,
-    /// Branch id (hex). Overrides name-based lookup.
-    #[arg(long)]
-    branch_id: Option<String>,
+    pile: Option<PathBuf>,
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     /// Daemon base URL
     #[arg(long, env = "REACHY_DAEMON", default_value = DEFAULT_DAEMON)]
     daemon: String,
@@ -104,8 +110,9 @@ enum Command {
     },
     /// Set or read the current INTENT — gemma's reasoned instruction that
     /// conditions the VLA (the perceive→reason→act seam). With text: writes a
-    /// timestamped intent on the body branch. Without: prints the LATEST intent
-    /// text to stdout (what the control loop reads each cycle), time to stderr.
+    /// timestamped intent in the Body collection. Without: prints the LATEST
+    /// intent text to stdout (what the control loop reads each cycle), time to
+    /// stderr.
     Intent {
         /// The instruction to set ("lean into the touch, perk the antennas").
         /// Omit to read the latest intent instead.
@@ -127,6 +134,11 @@ enum Command {
         /// Output path. Omit for a default name, @- for stdout.
         output: Option<String>,
     },
+    /// Additively reconstruct the frozen legacy `body` and `senses` branches
+    /// as current native Body records. Stop every writer to both branches
+    /// before running this command. The old pins are retained and no live
+    /// command ever reads or writes them afterwards.
+    MigrateLegacy,
     /// Gentle wake-up motion (daemon-defined, bounded).
     Wake,
     /// Gentle go-to-sleep motion (daemon-defined, bounded).
@@ -399,51 +411,53 @@ fn read_state(daemon: &str) -> Result<[f64; 9]> {
     ])
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
+#[derive(Clone, Copy)]
+struct BodyStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
 }
 
-fn with_body<T>(
-    pile: &Path,
-    explicit_branch: Option<&str>,
-    f: impl FnOnce(&mut Repository<Pile>, &mut Workspace<Pile>) -> Result<T>,
-) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let branch_id = if let Some(hex) = explicit_branch {
-        Id::from_hex(hex.trim()).ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"))?
-    } else {
-        repo.ensure_branch(BODY_BRANCH_NAME, None)
-            .map_err(|e| anyhow::anyhow!("ensure body branch: {e:?}"))?
-    };
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull body workspace: {e:?}"))?;
-    let result = f(&mut repo, &mut ws);
-    let close_res = repo
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
+impl BodyStorage<'_> {
+    fn publish(&self, fragment: Fragment) -> Result<()> {
+        publish_fragment(self.pile, self.key, DEFAULT_SCOPE_ID, fragment)?;
+        Ok(())
     }
-    result
+
+    fn with_collection<T>(&self, f: impl FnOnce(&mut Collection<Pile>) -> Result<T>) -> Result<T> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let result = f(&mut collection);
+        let close = collection.into_storage().close();
+        match (result, close) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(close_error)) => {
+                Err(error.context(format!("closing pile also failed: {close_error}")))
+            }
+        }
+    }
+
+    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileReader) -> Result<T>) -> Result<T> {
+        self.with_collection(|collection| {
+            let facts = collection
+                .materialize()
+                .context("materialize Body collection")?;
+            let reader = collection
+                .storage_mut()
+                .reader()
+                .context("open Body blob reader")?;
+            f(&facts, &reader)
+        })
+    }
+}
+
+fn require_storage<'a>(pile: Option<&'a Path>, key: Option<&'a Path>) -> Result<BodyStorage<'a>> {
+    let pile = pile.ok_or_else(|| {
+        anyhow::anyhow!("this command requires --pile (or PILE); hardware-only commands do not")
+    })?;
+    Ok(BodyStorage { pile, key })
 }
 
 // ── feel: the mic-array touch sense ────────────────────────────────────────
@@ -606,105 +620,122 @@ fn report_felt(felt: &Felt) {
     }
 }
 
-fn keep_felt(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
+fn felt_fragment(
     felt: &Felt,
     note: Option<&str>,
-) -> Result<()> {
-    let pose_h: TextHandle = ws.put(felt.signature_json.clone());
-    let note_h: Option<TextHandle> = note
-        .map(|n| n.to_string())
-        .or_else(|| Some("a touch on the head".to_string()))
-        .map(|n| ws.put(n));
-    let frag = entity! {
+    created: Inline<inlineencodings::NsTAIInterval>,
+) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let pose_h: TextHandle = fragment.put(felt.signature_json.clone());
+    let note_h: TextHandle = fragment.put(note.unwrap_or("a touch on the head").to_owned());
+    fragment += entity! {
         metadata::tag: &KIND_CAPTURE,
-        metadata::created_at: now_tai(),
+        metadata::created_at: created,
         capture::modality: "touch",
         capture::pose: pose_h,
-        capture::note?: note_h,
+        capture::note: note_h,
     };
-    let id = frag.root().expect("capture id");
-    ws.commit(frag, "body feel");
-    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    fragment
+}
+
+fn keep_felt(collection: &mut Collection<Pile>, felt: &Felt, note: Option<&str>) -> Result<()> {
+    let fragment = felt_fragment(felt, note, now_tai());
+    let id = fragment.root().expect("capture id");
+    collection
+        .commit(fragment)
+        .context("publish felt Body capture")?;
     println!("  kept it — {}", &fmt_id(id)[..12]);
     Ok(())
 }
 
 /// Set a new intent, or (with no text) print the latest one. The intent
 /// channel is the pile-native seam between perception/reason (gemma) and action
-/// (the VLA): writes append a timestamped KIND_INTENT on the body branch; the
+/// (the VLA): writes append a timestamped KIND_INTENT in the Body collection;
 /// reader is coordinate-and-cursor — the most recent `metadata::created_at`
-/// wins. Latest text goes to stdout so a control loop can read it directly.
-fn cmd_intent(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
-    text: Option<&str>,
-) -> Result<()> {
+/// wins, with the intrinsic event id breaking equal-time ties. Latest text goes
+/// to stdout so a control loop can read it directly.
+fn intent_fragment(text: &str, created: Inline<inlineencodings::NsTAIInterval>) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let text_h: TextHandle = fragment.put(text.to_owned());
+    fragment += entity! {
+        metadata::tag: &KIND_INTENT,
+        metadata::created_at: created,
+        intent::text: text_h,
+    };
+    fragment
+}
+
+fn latest_intent(space: &TribleSet, reader: &PileReader) -> Result<Option<(i128, Id, String)>> {
+    let mut best: Option<(i128, Id, TextHandle)> = None;
+    for (intent_id, handle, created) in find!(
+        (i: Id, h: TextHandle, t: Inline<inlineencodings::NsTAIInterval>),
+        pattern!(space, [{
+            ?i @
+                metadata::tag: KIND_INTENT,
+                intent::text: ?h,
+                metadata::created_at: ?t,
+        }])
+    ) {
+        let candidate = (interval_key(created), intent_id);
+        if best
+            .as_ref()
+            .is_none_or(|(time, id, _)| candidate > (*time, *id))
+        {
+            best = Some((candidate.0, candidate.1, handle));
+        }
+    }
+
+    let Some((time, id, handle)) = best else {
+        return Ok(None);
+    };
+    let text: View<str> = reader
+        .get(handle)
+        .map_err(|error| anyhow::anyhow!("read latest intent {id:X}: {error}"))?;
+    Ok(Some((time, id, text.to_string())))
+}
+
+fn cmd_intent(storage: BodyStorage<'_>, text: Option<&str>) -> Result<()> {
     match text {
         Some(t) => {
-            let text_h: TextHandle = ws.put(t.to_string());
-            let frag = entity! {
-                metadata::tag: &KIND_INTENT,
-                metadata::created_at: now_tai(),
-                intent::text: text_h,
-            };
-            let id = frag.root().expect("intent id");
-            ws.commit(frag, "body intent");
-            repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+            let fragment = intent_fragment(t, now_tai());
+            let id = fragment.root().expect("intent id");
+            storage.publish(fragment)?;
             println!("  intent {} set: {t}", &fmt_id(id)[..12]);
         }
         None => {
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            let mut best: Option<(i128, TextHandle)> = None;
-            for (h, created) in find!(
-                (h: TextHandle, t: Inline<inlineencodings::NsTAIInterval>),
-                pattern!(&space, [{
-                    _?i @
-                        metadata::tag: KIND_INTENT,
-                        intent::text: ?h,
-                        metadata::created_at: ?t,
-                }])
-            ) {
-                let k = interval_key(created);
-                if best.as_ref().map_or(true, |(bk, _)| k > *bk) {
-                    best = Some((k, h));
+            storage.with_view(|space, reader| {
+                match latest_intent(space, reader)? {
+                    Some((time, _, text)) => {
+                        eprintln!("  ({})", format_time(time));
+                        println!("{text}");
+                    }
+                    None => println!("(no intent yet — gemma hasn't reasoned anything)"),
                 }
-            }
-            match best {
-                Some((k, h)) => {
-                    let v: View<str> = ws
-                        .get(h)
-                        .map_err(|e| anyhow::anyhow!("read intent: {e:?}"))?;
-                    eprintln!("  ({})", format_time(k));
-                    println!("{}", v.as_ref());
-                }
-                None => println!("(no intent yet — gemma hasn't reasoned anything)"),
-            }
+                Ok(())
+            })?;
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_feel(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
+    mut collection: Option<&mut Collection<Pile>>,
     daemon: &str,
     secs: Option<f64>,
     loop_: bool,
-    keep: bool,
     respond: bool,
     note: Option<&str>,
 ) -> Result<()> {
     if loop_ {
         let session = secs.unwrap_or(300.0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let requested = Arc::clone(&stop);
+        ctrlc::set_handler(move || requested.store(true, Ordering::SeqCst))
+            .context("install Ctrl-C handler")?;
         println!("feeling continuously for {session:.0}s — pet the top of my head whenever; Ctrl-C to stop.");
         let start = Instant::now();
         let mut felt_count = 0usize;
-        while start.elapsed().as_secs_f64() < session {
+        while start.elapsed().as_secs_f64() < session && !stop.load(Ordering::SeqCst) {
             let felt = feel_window(daemon, 3.0);
             if felt.samples > 0 && felt.touched() {
                 felt_count += 1;
@@ -714,13 +745,18 @@ fn cmd_feel(
                         eprintln!("  (couldn't wiggle back: {e})");
                     }
                 }
-                if keep {
-                    keep_felt(repo, ws, &felt, note)?;
+                if let Some(writer) = collection.as_deref_mut() {
+                    keep_felt(writer, &felt, note)?;
                 }
             }
         }
         println!(
-            "(stopped — felt {felt_count} touch{} this session)",
+            "(stopped{} — felt {felt_count} touch{} this session)",
+            if stop.load(Ordering::SeqCst) {
+                " by request"
+            } else {
+                ""
+            },
             if felt_count == 1 { "" } else { "es" }
         );
         return Ok(());
@@ -739,8 +775,8 @@ fn cmd_feel(
                 eprintln!("  (couldn't wiggle back: {e})");
             }
         }
-        if keep {
-            keep_felt(repo, ws, &felt, note)?;
+        if let Some(writer) = collection.as_deref_mut() {
+            keep_felt(writer, &felt, note)?;
         }
     } else {
         println!(
@@ -805,51 +841,43 @@ fn cmd_pose(daemon: &str) -> Result<()> {
     Ok(())
 }
 
+fn vision_capture_fragment(
+    bytes: Vec<u8>,
+    pose_json: String,
+    note: Option<&str>,
+    width: u64,
+    height: u64,
+    created: Inline<inlineencodings::NsTAIInterval>,
+) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let frame_h: RawHandle = fragment.put::<blobencodings::RawBytes, _>(bytes);
+    let pose_h: TextHandle = fragment.put(pose_json);
+    let note_h: Option<TextHandle> = note.map(|note| fragment.put(note.to_owned()));
+    let width: Inline<inlineencodings::U256BE> = width.to_inline();
+    let height: Inline<inlineencodings::U256BE> = height.to_inline();
+    fragment += entity! {
+        metadata::tag: &KIND_CAPTURE,
+        metadata::created_at: created,
+        capture::frame: frame_h,
+        capture::mime: "image/png",
+        capture::modality: "vision",
+        capture::width: width,
+        capture::height: height,
+        capture::pose: pose_h,
+        capture::note?: note_h,
+    };
+    fragment
+}
+
 fn cmd_look(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
+    storage: BodyStorage<'_>,
     daemon: &str,
     python: &str,
     note: Option<&str>,
 ) -> Result<()> {
     let tmp = std::env::temp_dir();
-    let shim_path = tmp.join("body_frame.py");
-    std::fs::write(&shim_path, FRAME_SHIM).context("write frame shim")?;
     let out_png = tmp.join(format!("body_capture_{}.png", std::process::id()));
-
-    let mut child = PCommand::new(python)
-        .arg(&shim_path)
-        .arg(&out_png)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("run frame shim with {python}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-    loop {
-        if child.try_wait().context("poll frame shim")?.is_some() {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("frame grab timed out after 45s (cold WebRTC negotiation stalled — retry)");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    let output = child
-        .wait_with_output()
-        .context("collect frame shim output")?;
-    if !output.status.success() {
-        bail!(
-            "frame grab failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let dims = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let (w, h) = dims
-        .split_once('x')
-        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
-        .unwrap_or((0, 0));
+    let (w, h) = grab_frame(python, &out_png)?;
 
     let bytes = std::fs::read(&out_png).with_context(|| format!("read {}", out_png.display()))?;
     let nbytes = bytes.len();
@@ -858,27 +886,9 @@ fn cmd_look(
     let pose_json = daemon_get(daemon, "/api/state/full")
         .map(|v| v.to_string())
         .unwrap_or_default();
-
-    let frame_h: RawHandle = ws.put::<blobencodings::RawBytes, _>(bytes);
-    let pose_h: TextHandle = ws.put(pose_json);
-    let note_h: Option<TextHandle> = note.map(|n| ws.put(n.to_string()));
-    let w_val: Inline<inlineencodings::U256BE> = w.to_inline();
-    let h_val: Inline<inlineencodings::U256BE> = h.to_inline();
-
-    let frag = entity! {
-        metadata::tag: &KIND_CAPTURE,
-        metadata::created_at: now_tai(),
-        capture::frame: frame_h,
-        capture::mime: "image/png",
-        capture::modality: "vision",
-        capture::width: w_val,
-        capture::height: h_val,
-        capture::pose: pose_h,
-        capture::note?: note_h,
-    };
-    let cap_id = frag.root().expect("capture has an id");
-    ws.commit(frag, "body look");
-    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    let fragment = vision_capture_fragment(bytes, pose_json, note, w, h, now_tai());
+    let cap_id = fragment.root().expect("capture has an id");
+    storage.publish(fragment)?;
 
     println!("captured {w}x{h} vision frame ({} KiB)", nbytes / 1024);
     println!("  id   {}", fmt_id(cap_id));
@@ -888,87 +898,94 @@ fn cmd_look(
     Ok(())
 }
 
-fn cmd_list(ws: &mut Workspace<Pile>) -> Result<()> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let mut rows: Vec<(i128, Id, String, String)> = Vec::new();
-    for (cid, modality, created) in find!(
-        (c: Id, m: String, t: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?c @
-                metadata::tag: KIND_CAPTURE,
-                capture::modality: ?m,
-                metadata::created_at: ?t,
-        }])
-    ) {
-        let note = find!(
-            (h: Inline<inlineencodings::Handle<blobencodings::LongString>>),
-            pattern!(&space, [{ cid @ capture::note: ?h }])
-        )
-        .next()
-        .and_then(|(h,)| {
-            let v: Result<View<str>, _> = ws.get(h);
-            v.ok().map(|s| s.to_string())
-        })
-        .unwrap_or_default();
-        rows.push((interval_key(created), cid, modality, note));
-    }
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
-    if rows.is_empty() {
-        println!("no captures yet — `body look` keeps a frame, `body feel --keep` a touch.");
-        return Ok(());
-    }
-    for (k, cid, modality, note) in rows {
-        let when = format_time(k);
-        let suffix = if note.is_empty() {
-            String::new()
-        } else {
-            format!("  — {note}")
-        };
-        println!("{}  {:<6}  {when}{suffix}", &fmt_id(cid)[..12], modality);
-    }
-    Ok(())
+fn cmd_list(storage: BodyStorage<'_>) -> Result<()> {
+    storage.with_view(|space, reader| {
+        let mut rows: Vec<(i128, Id, String, String)> = Vec::new();
+        for (cid, modality, created) in find!(
+            (c: Id, m: String, t: Inline<inlineencodings::NsTAIInterval>),
+            pattern!(space, [{
+                ?c @
+                    metadata::tag: KIND_CAPTURE,
+                    capture::modality: ?m,
+                    metadata::created_at: ?t,
+            }])
+        ) {
+            let note = find!(
+                (h: TextHandle),
+                pattern!(space, [{ cid @ capture::note: ?h }])
+            )
+            .next()
+            .map(|(handle,)| {
+                reader
+                    .get::<View<str>, _>(handle)
+                    .map(|text| text.to_string())
+                    .map_err(|error| anyhow::anyhow!("read note for capture {cid:X}: {error}"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+            rows.push((interval_key(created), cid, modality, note));
+        }
+        rows.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+        if rows.is_empty() {
+            println!("no captures yet — `body look` keeps a frame, `body feel --keep` a touch.");
+            return Ok(());
+        }
+        for (time, capture, modality, note) in rows {
+            let when = format_time(time);
+            let suffix = if note.is_empty() {
+                String::new()
+            } else {
+                format!("  — {note}")
+            };
+            println!(
+                "{}  {:<6}  {when}{suffix}",
+                &fmt_id(capture)[..12],
+                modality
+            );
+        }
+        Ok(())
+    })
 }
 
-fn cmd_get(ws: &mut Workspace<Pile>, id: &str, output: Option<&str>) -> Result<()> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let needle = id.to_lowercase();
-    let cap_id = find!(
-        (c: Id),
-        pattern!(&space, [{ ?c @ metadata::tag: KIND_CAPTURE }])
-    )
-    .map(|(c,)| c)
-    .find(|c| fmt_id(*c).starts_with(&needle))
-    .ok_or_else(|| anyhow::anyhow!("no capture matching '{id}'"))?;
+fn cmd_get(storage: BodyStorage<'_>, id: &str, output: Option<&str>) -> Result<()> {
+    storage.with_view(|space, reader| {
+        let needle = id.to_lowercase();
+        let capture_id = find!(
+            (c: Id),
+            pattern!(space, [{ ?c @ metadata::tag: KIND_CAPTURE }])
+        )
+        .map(|(capture,)| capture)
+        .find(|capture| fmt_id(*capture).starts_with(&needle))
+        .ok_or_else(|| anyhow::anyhow!("no capture matching '{id}'"))?;
 
-    let h = find!(
-        (h: RawHandle),
-        pattern!(&space, [{ cap_id @ capture::frame: ?h }])
-    )
-    .next()
-    .map(|(h,)| h)
-    .ok_or_else(|| anyhow::anyhow!("capture has no frame payload (a touch capture has no file)"))?;
-    let bytes: anybytes::Bytes = ws
-        .get::<anybytes::Bytes, _>(h)
-        .map_err(|e| anyhow::anyhow!("get blob: {e:?}"))?;
+        let handle = find!(
+            (h: RawHandle),
+            pattern!(space, [{ capture_id @ capture::frame: ?h }])
+        )
+        .next()
+        .map(|(handle,)| handle)
+        .ok_or_else(|| {
+            anyhow::anyhow!("capture has no frame payload (a touch capture has no file)")
+        })?;
+        let bytes: anybytes::Bytes = reader
+            .get(handle)
+            .map_err(|error| anyhow::anyhow!("read frame for capture {capture_id:X}: {error}"))?;
 
-    if output == Some("@-") {
-        use std::io::Write;
-        std::io::stdout()
-            .write_all(bytes.as_ref())
-            .context("write to stdout")?;
-    } else {
-        let out_path = output
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(format!("{}.png", &fmt_id(cap_id)[..12])));
-        std::fs::write(&out_path, bytes.as_ref())
-            .with_context(|| format!("write {}", out_path.display()))?;
-        eprintln!("Wrote {} ({} KiB)", out_path.display(), bytes.len() / 1024);
-    }
-    Ok(())
+        if output == Some("@-") {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(bytes.as_ref())
+                .context("write to stdout")?;
+        } else {
+            let out_path = output
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("{}.png", &fmt_id(capture_id)[..12])));
+            std::fs::write(&out_path, bytes.as_ref())
+                .with_context(|| format!("write {}", out_path.display()))?;
+            eprintln!("Wrote {} ({} KiB)", out_path.display(), bytes.len() / 1024);
+        }
+        Ok(())
+    })
 }
 
 // ── VLA interface: raw observe / absolute act ──────────────────────────────
@@ -1058,10 +1075,50 @@ fn cmd_act(daemon: &str, pose: &str, duration: f64, dt: f64, now: bool) -> Resul
     Ok(())
 }
 
+fn cmd_migrate_legacy(storage: BodyStorage<'_>) -> Result<()> {
+    // Fail before inspecting legacy state if no durable native authority was
+    // explicitly initialized for this pile.
+    load_signer(storage.pile, storage.key)?;
+    let existing = storage.with_view(|facts, _| Ok(facts.clone()))?;
+    let source = freeze_source(storage.pile).context("freeze legacy Body source")?;
+    let plan = body_cutover::plan(&source)?;
+    let mut expected = existing;
+    expected += plan.materialized_facts();
+
+    let commits = body_cutover::publish(&source, &plan, storage.pile, storage.key)?;
+    let actual = storage.with_view(|facts, _| Ok(facts.clone()))?;
+    if actual != expected {
+        bail!("Body migration result is not exactly the prior native value union the canonical legacy rewrite");
+    }
+
+    let report = plan.report();
+    println!(
+        "migrated {} authored Body/Senses commit{} ({} source-empty; {} contentless merges remained ancestry), reconstructing {} captures and {} intents / {} facts in {} native commits into scope {:X}",
+        report.authored_commits,
+        if report.authored_commits == 1 {
+            ""
+        } else {
+            "s"
+        },
+        report.authored_empty_commits,
+        report.contentless_merges,
+        report.canonical_captures,
+        report.canonical_intents,
+        report.output_facts,
+        commits.len(),
+        DEFAULT_SCOPE_ID
+    );
+    println!(
+        "validated and excluded {} historical utterances for the Voice rewrite; legacy branches retained",
+        report.excluded_utterances
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let pile = cli.pile.clone();
-    let branch = cli.branch_id.as_deref();
+    let pile = cli.pile;
+    let key = cli.key;
     let daemon = cli.daemon.clone();
     let python = cli.python.clone();
 
@@ -1085,22 +1142,28 @@ fn main() -> Result<()> {
             keep,
             respond,
             note,
-        }) => with_body(&pile, branch, |repo, ws| {
-            cmd_feel(
-                repo,
-                ws,
-                &daemon,
-                secs,
-                loop_,
-                keep,
-                respond,
-                note.as_deref(),
-            )
-        })?,
+        }) => {
+            if keep {
+                let storage = require_storage(pile.as_deref(), key.as_deref())?;
+                storage.with_collection(|collection| {
+                    cmd_feel(
+                        Some(collection),
+                        &daemon,
+                        secs,
+                        loop_,
+                        respond,
+                        note.as_deref(),
+                    )
+                })?;
+            } else {
+                cmd_feel(None, &daemon, secs, loop_, respond, note.as_deref())?;
+            }
+        }
         Some(Command::Gesture { name }) => cmd_gesture(&daemon, &name)?,
-        Some(Command::Intent { text }) => with_body(&pile, branch, |repo, ws| {
-            cmd_intent(repo, ws, text.as_deref())
-        })?,
+        Some(Command::Intent { text }) => cmd_intent(
+            require_storage(pile.as_deref(), key.as_deref())?,
+            text.as_deref(),
+        )?,
         Some(Command::Observe { frame, no_frame }) => {
             cmd_observe(&daemon, &python, frame.as_deref(), no_frame)?
         }
@@ -1110,13 +1173,104 @@ fn main() -> Result<()> {
             dt,
             now,
         }) => cmd_act(&daemon, &pose, duration, dt, now)?,
-        Some(Command::Look { note }) => with_body(&pile, branch, |repo, ws| {
-            cmd_look(repo, ws, &daemon, &python, note.as_deref())
-        })?,
-        Some(Command::List) => with_body(&pile, branch, |_repo, ws| cmd_list(ws))?,
-        Some(Command::Get { id, output }) => with_body(&pile, branch, |_repo, ws| {
-            cmd_get(ws, &id, output.as_deref())
-        })?,
+        Some(Command::Look { note }) => cmd_look(
+            require_storage(pile.as_deref(), key.as_deref())?,
+            &daemon,
+            &python,
+            note.as_deref(),
+        )?,
+        Some(Command::List) => cmd_list(require_storage(pile.as_deref(), key.as_deref())?)?,
+        Some(Command::Get { id, output }) => cmd_get(
+            require_storage(pile.as_deref(), key.as_deref())?,
+            &id,
+            output.as_deref(),
+        )?,
+        Some(Command::MigrateLegacy) => {
+            cmd_migrate_legacy(require_storage(pile.as_deref(), key.as_deref())?)?
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use faculties::collection_cutover::initialize_signer;
+
+    use super::*;
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let serial = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "faculties-body-live-{}-{serial}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn at_unix(seconds: f64) -> Inline<inlineencodings::NsTAIInterval> {
+        let epoch = Epoch::from_unix_seconds(seconds);
+        (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    #[test]
+    fn equal_time_intents_coexist_and_higher_event_id_wins() {
+        let directory = TestDirectory::new();
+        let pile = directory.0.join("body.pile");
+        let key = directory.0.join("body.key");
+        File::create(&pile).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let storage = BodyStorage {
+            pile: &pile,
+            key: Some(&key),
+        };
+
+        let created = at_unix(1_750_000_000.0);
+        let first = intent_fragment("first", created);
+        let second = intent_fragment("second", created);
+        let first_id = first.root().unwrap();
+        let second_id = second.root().unwrap();
+        storage.publish(second).unwrap();
+        storage.publish(first).unwrap();
+
+        storage
+            .with_view(|space, reader| {
+                let intents: Vec<Id> = find!(
+                    (i: Id),
+                    pattern!(space, [{ ?i @ metadata::tag: KIND_INTENT }])
+                )
+                .map(|(id,)| id)
+                .collect();
+                assert_eq!(intents.len(), 2);
+
+                let (_, selected_id, selected_text) =
+                    latest_intent(space, reader)?.expect("latest intent");
+                let expected_id = first_id.max(second_id);
+                let expected_text = if expected_id == first_id {
+                    "first"
+                } else {
+                    "second"
+                };
+                assert_eq!(selected_id, expected_id);
+                assert_eq!(selected_text, expected_text);
+                Ok(())
+            })
+            .unwrap();
+    }
 }

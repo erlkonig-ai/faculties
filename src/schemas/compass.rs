@@ -8,6 +8,14 @@ use triblespace::core::metadata;
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
+/// Stable scope of the authored Compass collection.
+///
+/// Minted with `trible genid` on 2026-08-08. The id first appeared in the
+/// earlier Compass collection experiment; retaining it here preserves the
+/// collection's identity while deliberately discarding that experiment's
+/// snapshot-DAG ontology.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("B9566CF892C55CCB0E58411E1B18CD7F");
+
 pub const KIND_GOAL_LABEL: &str = "goal";
 pub const KIND_STATUS_LABEL: &str = "status";
 pub const KIND_NOTE_LABEL: &str = "note";

@@ -1,14 +1,14 @@
 //! Read-only GORBIE-embeddable viewer for the `status` faculty.
 //!
-//! A "colony board": the latest present-tense status per window
+//! A "window status board": the latest present-tense status per window
 //! (`status set "<text>"`), rendered as a compact roster — one row
 //! per window, most-recently-updated first, so the active windows
-//! float to the top. This is the colony seeing itself at a glance,
-//! the GUI counterpart to `status list` / orient's Colony section.
+//! float to the top. This is the team seeing itself at a glance,
+//! the GUI counterpart to `status list` / orient's Window status section.
 //!
-//! Filtering is by *has-a-status*, not by zooid affinity: any window
+//! Filtering is by *has-a-status*, not by a separate affinity: any window
 //! that has ever filed a status update appears here. That keeps the
-//! board open to non-zooid windows — a future Teams/Discord user with
+//! board open to other windows — a future Teams/Discord user with
 //! a presence status drops in with no widget change, resolving their
 //! name from `relations` (or showing a hex id until they're known).
 //!
@@ -18,10 +18,8 @@
 //!
 //! ```ignore
 //! let mut panel = StatusViewer::default();
-//! panel.render(ctx, status_ws, relations_ws.as_mut());
+//! panel.render(ctx, status_view, relations_view);
 //! ```
-
-use std::collections::HashMap;
 
 use hifitime::Epoch;
 
@@ -29,20 +27,12 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::pile::PileReader;
 use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 
-use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
-use crate::schemas::status::{status as status_attrs, KIND_STATUS_UPDATE};
-
-type TextHandle = Inline<Handle<LongString>>;
+use crate::relations::{self as native_relations, Head};
+use crate::status as native_status;
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 // ── Palette ──────────────────────────────────────────────────────────
 
@@ -80,189 +70,87 @@ struct WindowStatus {
 }
 
 struct StatusLive {
-    cached_head: Option<CommitHandle>,
-    relations_cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
+    relations_cached_revision: Option<DatasetRevision>,
     windows: Vec<WindowStatus>,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl StatusLive {
-    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[status] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
+    fn refresh(view: DatasetView<'_>, relations: Option<DatasetView<'_>>) -> Self {
+        let relations_cached_revision = relations.map(|relations| relations.revision);
+        let empty_relations = TribleSet::new();
+        let relations_facts = relations
+            .map(|relations| relations.facts)
+            .unwrap_or(&empty_relations);
+        let latest = native_status::latest_per_window(
+            native_status::load_status_rows(view.facts)
+                .expect("Viewer storage exposed an invalid Status collection"),
+        )
+        .expect("Viewer storage exposed ambiguous Status identities");
+        let mut keyed = latest
+            .into_values()
+            .map(|row| {
+                let at_ns = native_status::point_timestamp(row.at)
+                    .expect("validated Status time is a point interval");
+                (
+                    (at_ns, row.event),
+                    WindowStatus {
+                        window: row.window,
+                        name: native_window_label(view.reader, relations_facts, row.window),
+                        text: native_status::read_text(view.reader, row.text)
+                            .expect("validated Status text is resident"),
+                        at_ns,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
 
-        // Resolve window names from the relations branch (optional).
-        let (relations_cached_head, names) = match relations_ws {
-            Some(rws) => {
-                let head = rws.head();
-                let rspace = rws
-                    .checkout(..)
-                    .map(|co| co.into_facts())
-                    .unwrap_or_else(|e| {
-                        eprintln!("[status] relations checkout: {e:?}");
-                        TribleSet::new()
-                    });
-                (head, build_names(&rspace, rws))
-            }
-            None => (None, HashMap::new()),
-        };
-
-        // Every status event: (window, text-handle, created_at). Keep
-        // the latest per window by the interval's lower bound — same
-        // latest-per-window semantics as the `status list` CLI.
-        let mut latest: HashMap<Id, (TextHandle, i128)> = HashMap::new();
-        for (window, text_h, at) in find!(
-            (window: Id, text: TextHandle, at: (i128, i128)),
-            pattern!(&space, [{
-                _?sid @
-                metadata::tag: KIND_STATUS_UPDATE,
-                status_attrs::window: ?window,
-                status_attrs::text: ?text,
-                metadata::created_at: ?at,
-            }])
-        ) {
-            latest
-                .entry(window)
-                .and_modify(|slot| {
-                    if at.0 > slot.1 {
-                        *slot = (text_h, at.0);
-                    }
-                })
-                .or_insert((text_h, at.0));
-        }
-
-        let mut windows: Vec<WindowStatus> = Vec::with_capacity(latest.len());
-        for (window, (text_h, at_ns)) in latest {
-            let text = read_text(ws, text_h).unwrap_or_default();
-            let name = names
-                .get(&window)
-                .cloned()
-                .unwrap_or_else(|| id_hex(window));
-            windows.push(WindowStatus {
-                window,
-                name,
-                text,
-                at_ns,
-            });
-        }
-
-        // Most-recently-updated first — the live glance.
-        windows.sort_by(|a, b| b.at_ns.cmp(&a.at_ns).then(a.name.cmp(&b.name)));
+        // Match the Status domain's `(point timestamp, intrinsic event id)`
+        // arbitration exactly, including deterministic equal-time ties.
+        keyed.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.name.cmp(&right.1.name))
+        });
+        let windows = keyed.into_iter().map(|(_, window)| window).collect();
 
         StatusLive {
-            cached_head,
-            relations_cached_head,
+            cached_revision: view.revision,
+            relations_cached_revision,
             windows,
         }
     }
 }
 
-/// Display-name map for relations persons: alias > first+last >
-/// display_name > (caller falls back to hex id). Only persons are
-/// enumerated; windows absent here render by hex id.
-fn build_names(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, String> {
-    #[derive(Default)]
-    struct N {
-        alias: Option<String>,
-        first: Option<String>,
-        last: Option<String>,
-        display: Option<String>,
+fn native_window_label(reader: &PileReader, facts: &TribleSet, window: Id) -> String {
+    if !native_relations::person_anchors(facts).contains(&window) {
+        return id_hex(window);
     }
-    let mut acc: HashMap<Id, N> = HashMap::new();
-    for (pid,) in find!(
-        (p: Id,),
-        pattern!(rspace, [{ ?p @ metadata::tag: KIND_PERSON_ID }])
-    ) {
-        acc.entry(pid).or_default();
-    }
-    for (pid, a) in find!(
-        (p: Id, a: String),
-        pattern!(rspace, [{ ?p @ rel::alias: ?a }])
-    ) {
-        if let Some(n) = acc.get_mut(&pid) {
-            // Prefer the shortest alias as the canonical short handle
-            // (e.g. "Zeta" over "Zeta Lyrae") — matches the star-as-label feel.
-            match n.alias.as_ref() {
-                Some(existing) if existing.len() <= a.len() => {}
-                _ => n.alias = Some(a),
-            }
+    let mut label = match native_relations::profile_head(facts, window)
+        .expect("Viewer storage exposed invalid Relations profile state")
+    {
+        Head::Unique(profile) => {
+            let snapshot = native_relations::profile_snapshot(facts, profile)
+                .expect("validated Relations profile is readable");
+            native_relations::read_text(reader, snapshot.label)
+                .expect("validated Relations label is resident")
         }
-    }
-    let first_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::first_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in first_rows {
-        if acc.contains_key(&pid) {
-            if let Some(v) = read_text(rws, h) {
-                if let Some(n) = acc.get_mut(&pid) {
-                    n.first.get_or_insert(v);
-                }
-            }
+        Head::Forked(heads) => {
+            return format!("{} [profile fork: {} heads]", id_hex(window), heads.len());
         }
+        Head::Missing => return format!("{} [missing profile]", id_hex(window)),
+    };
+    match native_relations::lifecycle_head(facts, window)
+        .expect("Viewer storage exposed invalid Relations lifecycle state")
+    {
+        Head::Forked(heads) => label.push_str(&format!(" [lifecycle fork: {} heads]", heads.len())),
+        Head::Missing => label.push_str(" [missing lifecycle]"),
+        Head::Unique(_) => {}
     }
-    let last_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::last_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in last_rows {
-        if acc.contains_key(&pid) {
-            if let Some(v) = read_text(rws, h) {
-                if let Some(n) = acc.get_mut(&pid) {
-                    n.last.get_or_insert(v);
-                }
-            }
-        }
-    }
-    let display_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::display_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in display_rows {
-        if acc.contains_key(&pid) {
-            if let Some(v) = read_text(rws, h) {
-                if let Some(n) = acc.get_mut(&pid) {
-                    n.display.get_or_insert(v);
-                }
-            }
-        }
-    }
-
-    acc.into_iter()
-        .map(|(id, n)| {
-            let name = n
-                .alias
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| match (n.first.as_ref(), n.last.as_ref()) {
-                    (Some(f), Some(l)) if !f.trim().is_empty() && !l.trim().is_empty() => {
-                        Some(format!("{f} {l}"))
-                    }
-                    (Some(f), _) if !f.trim().is_empty() => Some(f.clone()),
-                    (_, Some(l)) if !l.trim().is_empty() => Some(l.clone()),
-                    _ => None,
-                })
-                .or_else(|| n.display.filter(|s| !s.trim().is_empty()))
-                .unwrap_or_else(|| id_hex(id));
-            (id, name)
-        })
-        .collect()
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+    label
 }
 
 fn id_hex(id: Id) -> String {
@@ -312,20 +200,19 @@ impl StatusViewer {
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-        mut relations_ws: Option<&mut Workspace<Pile>>,
+        view: DatasetView<'_>,
+        relations: Option<DatasetView<'_>>,
     ) {
-        let head = ws.head();
-        let rhead = relations_ws.as_ref().and_then(|w| w.head());
+        let revision = view.revision;
+        let relations_revision = relations.map(|view| view.revision);
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head || l.relations_cached_head != rhead,
+            Some(l) => {
+                l.cached_revision != revision || l.relations_cached_revision != relations_revision
+            }
         };
         if need_refresh {
-            self.live = Some(StatusLive::refresh(
-                ws,
-                relations_ws.as_mut().map(|w| &mut **w),
-            ));
+            self.live = Some(StatusLive::refresh(view, relations));
         }
 
         ctx.section("Status", |ctx| {
@@ -403,7 +290,7 @@ impl StatusViewer {
 
 /// One window's current status as a low-chrome roster row:
 /// `[dot] NAME            <age>` on top, the status text wrapping
-/// beneath. Matches orient's Colony section — a glance, not a card.
+/// beneath. Matches orient's Window status section — a glance, not a card.
 fn render_status_row(ui: &mut egui::Ui, w: &WindowStatus, now: i128) {
     let accent = window_color(w.window);
     let muted = color_muted(ui);

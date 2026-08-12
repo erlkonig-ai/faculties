@@ -11,21 +11,29 @@ Atomic, cross-linked, written in typst, rendered by GORBIE.
     stdin (useful in pipes).
   - `wiki edit <ID> @/tmp/body.typ` — bump a new version of an
     existing fragment.
-  - `wiki lint` — lint markdown→typst, expand short ids,
-    rebuild the `links_to` index.
-  - `wiki check` — diagnose orphan fragments, broken links,
-    truncated ids, missing format tags.
+  - `wiki lint --fix` — normalize markdown→typst and expand
+    unambiguous short references; `wiki lint --check` verifies that
+    the current frontier already needs no rewrite.
+  - `wiki check` — diagnose broken links on the complete current
+    frontier; add `--compile` to validate Typst too.
 
 == One claim per fragment
 
 If you find yourself writing "and another thing", split. The
 fragment's title should fit on one line and accurately describe
-its single claim. Cross-link with the labelled form
-`[label](wiki:<full-id>)` (and `[label](files:<hash>)` for
-files) — a graph edge comes only from that explicit link. A
-*bare* `wiki:<id>` or `files:<hash>` in prose does NOT link;
-the wiki warns you if you write one. The label also reads far
-better than a raw id.
+its single claim. Cross-link with `[label](wiki:<full-revision-id>)`
+for an immutable citation, or use the `entry` link kind in
+`[label](wiki:entry:<root-revision-id>)` for a living entry that
+follows its complete current frontier, and
+`[label](files:<hash>)` for files. A graph edge comes only from that
+explicit link. Entry links are set-valued when concurrent edits leave
+a fork; they never choose a winner by timestamp. A *bare* `wiki:<id>`
+or `files:<hash>` in prose does NOT link; the wiki warns you if you
+write one. The label also reads far better than a raw id.
+
+The graphical viewer follows `wiki:entry:<root>` automatically. At the CLI,
+use `wiki show <root> --latest` to navigate the living entry; plain
+`wiki show <root>` deliberately shows the immutable anchor revision itself.
 
 == Tagging
 

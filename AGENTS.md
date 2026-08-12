@@ -6,20 +6,21 @@ human-facing project description and install steps are in
 
 ## What faculties are
 
-Small, single-file CLIs that persist their state in a TribleSpace pile.
-Each binary lives at `src/bin/<name>.rs`, owns a named branch on the
-pile (e.g. `wiki`, `compass`, `message`), and is designed to
-coexist with the others on the same pile. Shared schemas + GORBIE
+Small CLIs that persist their state in a TribleSpace pile. Each binary lives at
+`src/bin/<name>.rs` and publishes through one or more fixed, signer-owned
+collections. A collection is identified by its semantic descriptor and the
+pile's durable signer; its value is the monotonic union of signed COMMIT
+fragments, not a mutable named branch. Shared domain models, schemas,
+validation, cutover logic, and GORBIE
 widgets live in `src/lib.rs` (and `src/widgets/` under the `widgets`
 feature).
 
 ## Editing a faculty
 
-* Each `src/bin/<name>.rs` is meant to stand alone — read it
-  end-to-end before changing it. The single-file property is
-  deliberate; resist the urge to extract helpers into `src/lib.rs`
-  unless the duplication is causing actual drift bugs across three
-  or more faculties.
+* Keep binaries as thin orchestration shells. Reusable domain construction,
+  validation, and read models belong in `src/lib.rs`; UI projections belong in
+  `src/widgets/`. Read both the binary and its library module before changing
+  either boundary.
 * Schemas (attribute IDs, shared kinds) live under
   [`src/schemas/`](src/schemas/) and are imported via
   `use faculties::schemas::<faculty>::*;`. New attribute IDs go
@@ -49,22 +50,31 @@ cargo install --path . --bins
 env-var support). Set it once per shell — `export PILE=./self.pile`
 — and skip the `--pile` flag.
 
-## Bootstrap pile
+## Portable bootstrap
 
-`bootstrap.pile` ships curated onboarding fragments + compass goals
-for fresh agents. Sources are `bootstrap/*.typ`; rebuild with
-`bootstrap/build.sh` (which `cargo build --release`s the wiki +
-compass bins on demand). The build script's sanity-check phase
-asserts the expected fragment + goal counts — if you add or remove
-entries, bump the `EXPECTED_FRAGMENTS` / `EXPECTED_GOALS` constants
-to match.
+The `bootstrap` binary imports curated onboarding entries + Compass goals
+as locally signed collection COMMITs. Sources are `bootstrap/*.typ`; their
+declarative manifest and the already-shipped goal/note occurrence anchors live
+in `src/bootstrap.rs`. Import only after explicitly initializing the
+destination's durable signer (`trible pile signing-key init <pile>`). Never
+copy a pre-signed seed pile: signer-owned collections deliberately do not
+authorize its builder key. Run `bootstrap/build.sh` for the fresh-recipient,
+exact-replay, and semantic-closure checks.
+
+For each of the 21 seeded Wiki entries, a later bootstrap generation advances
+only the recognizable imported source strand. Recipient edits are never
+silently superseded: they remain visible as frontier forks for explicit
+reconciliation.
 
 ## CI / releases
 
 * `.github/workflows/release.yml` fires on `v*` tags. It builds
-  every CLI faculty for x86_64-linux-gnu, aarch64-linux-gnu (via
-  cross), x86_64-apple-darwin, and aarch64-apple-darwin, then
+  every CLI faculty for x86_64-linux-gnu, native aarch64-linux-gnu,
+  and aarch64-apple-darwin, then
   attaches a tarball + sha256 per target to the GH release.
+* Faculties, TribleSpace, Mary, and the CubeCL fork are a pinned sibling source
+  cohort. The release workflow checks out the exact revisions named there;
+  local source installs must use the same layout documented in `README.md`.
 * The `widgets` feature is enabled by default, so `viewer` and the
   capture binaries are included in normal builds and release
   tarballs. Use `--no-default-features` for a CLI-only build.
@@ -75,20 +85,24 @@ to match.
 
 ## Conventions
 
-* **Single-file faculty.** A new faculty is a new `src/bin/<name>.rs`
-  + a new module in `src/schemas/<name>.rs`. No helper crates, no
-  framework abstraction, nothing clever.
-* **Faithful CLI to pile.** Every faculty operation is one
-  triblespace commit on its branch. The CLI is a thin shell over
-  the data model — surface arguments map directly to attributes.
+* **Thin faculty binary.** A new faculty normally has
+  `src/bin/<name>.rs`, a reusable domain module, and a schema module. Share
+  capabilities when several faculties need the same model; keep the CLI a
+  small projection over that library.
+* **Faithful CLI to pile.** Each publication into one collection commits one
+  self-contained `Fragment`; a compound operation may publish to several fixed
+  collections. Validate every candidate union before the first dependent
+  `Collection::commit`; never introduce a mutable head, branch selector, or
+  CAS loop.
 * **No shadow datamodels.** If state belongs in the pile, query the
   pile on demand via `pattern!` / `find!`. Don't pre-materialise
   into structs/maps.
 * **`PILE` env var, not flags.** Faculties default to `PILE` from
   the environment; `--pile` is the override, not the primary path.
-* **Atomic commits.** Each faculty operation produces one commit
-  with a descriptive message. The pile's commit log is the audit
-  trail.
+* **Atomic COMMITs.** Each individual collection publication produces one
+  independent signed COMMIT. Facts are the collection element, metafacts are
+  its canonical metadata, and referenced attachments travel with the
+  Fragment. Exact retries must be idempotent.
 
 ## Push / PR
 

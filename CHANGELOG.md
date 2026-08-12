@@ -4,6 +4,189 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Retired the unused branch-era persisted HNSW API.** The public
+  `embedding_rollup`, `refresh_index`, and `nearest_via_index` helpers and their
+  mutable-head tests are removed. Live Files, Wiki, and Memory similarity uses
+  the in-memory `nearest` core; it now preserves distinct entities with
+  byte-identical vectors and orders equal-score results canonically. A future
+  persisted accelerator belongs in the collection `DERIVE`/`MERGE` algebra.
+- **Onboarding is now a recipient-authored, portable bootstrap.** The
+  `bootstrap import` command deterministically builds the curated Wiki and
+  Compass seed under the destination pile's durable signer, validates both
+  attachment closures before publication, and replays without appending.
+  Release archives no longer carry a builder-signed `bootstrap.pile`.
+- **Orient derives attention from Relations groups and explicit presence.**
+  New goals and notes wake a persona when tagged with that person or any group
+  containing it; forked group heads are conservatively unioned for this
+  read-only projection so unrelated concurrent edits cannot disable watchers.
+  The status roster now contains exactly the windows that have published a
+  status, without a magic affinity or globally privileged tag. Codex hook
+  helpers are persona-configurable, recognize the faculty's CLI/environment
+  forms, canonicalize the pile path, and only reap provably orphaned watchers.
+- **Wiki migration preserves deterministic-era reassertions.** Legacy version
+  identities can carry several exact `created_at` observations because the old
+  writer reasserted identical content with a fresh timestamp. The native read
+  model retains and validates the complete set, while lineage positions each
+  distinct state by its latest observation so `A -> B -> A` reverts keep `A`
+  current. Every derived supersedes edge is owned by an authored source commit
+  carrying that selected observation.
+- **Archive full-text search is live on the descriptor-handle V4 algebra.**
+  Each authored Archive `COMMIT` is projected by the frozen block-text recipe
+  into a canonical portable exact-TF BM25 leaf; byte-exact `DERIVE` and
+  pointwise-maximum `MERGE` validators admit a resident cover without a
+  branch, manifest, registry, timestamp winner, or legacy index trust. The
+  `archive index` and `archive search` commands now build and query that cover.
+  Archive reads bind facts, the exact authorized source commits, and their
+  validating blob reader through one coherent collection snapshot; a source
+  element missing the complete block/part/fact closure fails before any index
+  record is appended.
+- **Viewer projections now preserve native ambiguity instead of inventing
+  winners.** Files validates exact scalar records and uses neutral digest names
+  for shared content; Atlas renders every metadata variant; Triage reduces
+  causal attempt slots into disjoint current states while retaining historical
+  forks and re-deriving staleness from wall time. Capture binaries load only
+  their transitive semantic source closure, so malformed unrelated collections
+  no longer prevent a focused capture.
+- **The generic viewer and capture harnesses now consume immutable native
+  collection snapshots.** A fixed catalog materializes descriptor-handle V4
+  collections under the pile's durable signer and exposes keyed `DatasetView`
+  values to reusable widgets without Repository branches, mutable Workspace
+  heads, compatibility fallbacks, or read-side writes. Shared collections are
+  loaded once and reused across semantic views. This is the shared storage
+  cutover, not domain-renderer parity: legacy-shaped widget projections remain
+  on independent semantic-port lanes, and Headspace remains on its independent
+  native-cutover lane.
+- **Headspace is now a fork-visible native configuration algebra.** One fixed
+  collection holds complete intrinsic config snapshots and per-profile
+  snapshot DAGs; concurrent equal values agree without losing provenance,
+  divergent heads remain visible, and reconciliation supersedes every live
+  head explicitly. Runtime credentials are exact immutable Secrets-version
+  references rather than plaintext or latest-by-label lookups. The additive
+  cutover keeps every legacy fact, identity, metafact, resident attachment,
+  authored-empty commit, and merge lineage, while copied plaintext rows remain
+  semantically inert until native state is deliberately bootstrapped.
+- **Web now records observations in one fixed native collection and resolves
+  credentials by exact identity.** Search and fetch commands commit complete
+  intrinsic fragments directly, with no branch, head, CAS, ephemeral signer,
+  or public scope selector. Tavily and Exa credentials come from the settled
+  Headspace state as exact immutable Secrets-version references (unless the
+  caller explicitly overrides them), never from plaintext config rows or a
+  latest-by-label lookup. The stopped-world migration preserves every legacy
+  fact, identity, metafact, resident attachment, and authored-empty commit
+  exactly while retaining the old branch as inert evidence.
+- **Triage is now a read-only diagnosis over fixed native collections.** One
+  durable signer and one opened pile prefix feed the current Cognition,
+  Headspace, Secrets, Memory, Relations, and Message validators; legacy
+  branches, caller-selected heads/scopes, CAS repair, and timestamp winners
+  cannot influence the view. Headspace forks and missing exact credential
+  versions remain visible, and inspection never appends. Triage owns no data
+  branch to migrate: the historical `cognition` branch belongs to the shared
+  Cognition stopped-world migration, while any same-named legacy branch is
+  inert to this reader.
+- **Discord now records immutable observations and bounded coverage in one
+  fixed native collection.** Message semantics ignore volatile delivery URLs
+  and profile decoration, edits remain explicit observations, and interval
+  receipts close pagination gaps without a mutable cursor. Credentials stay
+  external. The stopped-world migration preserves old facts, identities,
+  semantic metadata, resident closure, and authored-empty commits exactly,
+  while every migrated token, cursor, and log row remains inert evidence.
+- **Mail is now an immutable multi-collection evidence and intent ledger.**
+  Accounts reference exact immutable Secrets versions; POP observations,
+  parser projections, drafts, authorization attempts, SMTP acceptances, and
+  reads are self-contained native records under fixed collection identities.
+  POP commits before deletion, SMTP keeps its affine external-effect boundary
+  explicit, and stopped-world migration preserves all historical facts,
+  identities, semantic metadata, resident blobs, and authored-empty commits
+  additively. Orient renders the native inbox and watches unread, non-spam
+  `WireMessage` identities, so a new inbound wire wakes once while duplicate
+  source observations, outgoing mail, and read-state removal stay quiet.
+- **Atlas now reads one fixed native schema-metadata collection.** The CLI has
+  no branch, head, CAS, repair, or public scope selector; it materializes the
+  durable signer-owned descriptor directly and keeps attachment reads within
+  the same pile lifetime. Its stopped-world migration preserves every legacy
+  fact, entity id, semantic metafact, resident attachment, and authored-empty
+  commit exactly, while contentless merges remain verified ancestry and the
+  old pin remains inert evidence.
+- **Cognition has a fixed descriptor-handle collection lane.** Reason and
+  Patience now publish one validated, self-contained intrinsic event per
+  signed commit under the shared durable Cognition identity, with no runtime
+  repository, branch, head, CAS, or scope selector. A whole-dataset
+  stopped-world migration preserves exact legacy facts, entity IDs, semantic
+  metafacts, resident attachments, authored-empty commits, and the old pin.
+  Triage now shares the canonical Cognition reducer with its viewer, and the
+  Drive collection consumer is frozen on its own integration-ready branch.
+- **Voice now has one fixed native collection and an explicit live boundary.**
+  Route generations and utterances are complete intrinsic records committed
+  under the durable pile signer, with no branch, CAS, ephemeral signer, or
+  public scope knob. Hardware probing, synthesis, and playback remain outside
+  the collection algebra. Its stopped-world migration validates the exact
+  legacy Voice and Body pins, then reconstructs their historical speech under
+  the current intrinsic identity and live marker. The rewrite uses the same
+  native transaction boundary as live writes: source batches split into single
+  utterances, per-device route commits coalesce into complete generations,
+  authored-empty Voice commits remain fact-empty with exact source-coordinate
+  provenance, and unrelated Body deltas do not manufacture Voice authority.
+- **Secrets is a fixed native collection with reusable envelope semantics.**
+  The capability algebra, strict catalog, attachment validation, and envelope
+  operations live in `faculties-secrets`; the CLI loads one durable signer,
+  opens the pile once per command, and commits one self-contained `Fragment`
+  without Repository branches, CAS, signer rosters, or scope knobs. Its bounded
+  stopped-world migration preserves canonical Secrets identities, facts,
+  authored partitions, semantic metadata, attachment closure, and
+  authored-empty commits. It separately validates and retires the exact
+  historical Mail account/pointer shape found on the old Secrets branch, while
+  retaining that branch as inert source evidence.
+- **Decisions are collection-native and preserve concurrent resolution.** A
+  stable decision anchor has one immutable intrinsic genesis, while factors are
+  additive occurrence records and resolutions form intrinsic predecessor DAGs.
+  Reads expose missing, unique, semantically agreed, forked, and invalid states
+  without timestamp arbitration. Every non-forced resolution freezes the exact
+  same-decision pro and con evidence it used; forcedness is an explicit bit,
+  and agreement quotients heads only by outcome plus forcedness while retaining
+  distinct evidence and history. Publication validates the exact ontology,
+  attachments, closed acyclic history, and all-head reconciliation.
+- **The reusable Secrets core loads its root password without exporting it to
+  every child process.** `FACULTIES_SECRETS_PW` remains the first source, then
+  `FACULTIES_SECRETS_PW_FILE` or the XDG configuration path is read on demand.
+  Group- or world-readable files are refused and editor line endings are
+  stripped. The Secrets CLI consumes this shared capability instead of owning
+  another password loader.
+- **Posture now runs on two fixed native collections.** Policy and scan
+  fragments are committed through descriptor-handle V4 `Collection` records
+  under one durable signer, with no live repository, branch, head, or CAS
+  path. Scan, finding-occurrence, and decision-target identities are semantic
+  and deterministic; PDF/OOXML/EXIF extraction and git auditing remain intact,
+  and git hits now become durable findings whose exact occurrence IDs can be
+  classified benign by resolved Decide decisions across scans. Git occurrence
+  coordinates canonicalize the physical repository root and retain the full
+  object ID plus per-occurrence position; hashes are abbreviated only when
+  rendered. The stopped-world legacy policy migration is
+  strictly additive, preserves exact authored facts, attachments, metadata,
+  empty commits, and the old pin, and adds only canonical intrinsic shadows.
+- **Archive and memory search attributes follow the exact-TF BM25 format.**
+  Both typed index attributes have fresh IDs for the breaking
+  `SuccinctBM25Blob` layout. Retired score-index facts remain inert; the normal
+  `archive index` / `memory index` refresh paths rebuild under the new schema.
+- **Status now runs directly on its native collection.** Immutable intrinsic
+  events are published under one fixed scope with the durable pile signer;
+  reads validate the complete event ontology and attachments, join labels from
+  the native Relations collection, and choose current status by the canonical
+  maximum `(point timestamp, event id)`. The stopped-world transform rewrites
+  legacy random event IDs, collapses exact duplicate tuples, preserves commit
+  metadata and resident payloads, and leaves the old branch untouched.
+- **The shared Status board accepts a native read model.** Its narrow native
+  source loads one durable signer, keeps one pile open, and delegates event
+  arbitration to the Status API; the standalone capture is again only a tiny
+  harness around that shared renderer. It no longer pulls or pushes a legacy
+  branch merely to render a frame.
+- **Body now runs directly on its native collection.** Deliberate captures and
+  intents are immutable `Fragment` commits in the fixed Body scope, signed by
+  the pile's durable key; live branch/head/CAS and ephemeral signing identities
+  are gone. Reads materialize the signer-owned collection, and equal-time
+  intents select the greater intrinsic event ID deterministically. A separate
+  stopped-world migration preserves every legacy fact, entity ID, attachment,
+  and semantic commit metafact without removing the old pin or enabling a dual
+  runtime.
 - **Files now runs directly on its native collection.** Read commands load the
   durable signer and materialize one immutable signer-owned view; append-only
   commands publish self-contained `Fragment` commits without reconstructing
@@ -13,7 +196,7 @@ All notable changes to this project will be documented in this file.
   callers.
 - **Files has a strictly additive native-collection migration.** The
   stopped-world planner preserves every legacy fact and entity ID, derives
-  only missing canonical media-type facts, and publishes authored leaves
+  only missing canonical media-type facts, and publishes authored commits
   through collection commits without target pins or compare-and-swap state.
 - **Native collection publication has a central, pinless seam.** Faculties can
   discover scoped targets through `CollectionStore` and publish complete
@@ -21,6 +204,18 @@ All notable changes to this project will be documented in this file.
   metafacts, and their shared attachments without a target head or CAS cell.
   Stopped-world migrations get a read-only frozen legacy-pin snapshot whose
   semantic fingerprint ignores physical pile history.
+- **LinkedIn imports now speak the Relations collection algebra directly.**
+  Each command reads and exactly validates one immutable Relations snapshot,
+  plans the complete import in memory, and publishes one signed fragment
+  through the durable commit-last path. Canonical profile URLs (or email as a
+  fallback) derive stable person anchors; name-only rows honestly mint fresh
+  anchors. Input rows first close as a set under shared canonical keys, settled
+  same-person components are enriched together, repeated stable-key imports are
+  true no-ops, and conflicting or unsettled evidence fails closed. Same-name
+  review is derived from current labels and aliases plus the existing
+  fork-visible verdict DAG rather than persisted as a second ontology. Dry runs
+  perform the same union validation without writing, and the legacy
+  repository/branch plus ephemeral-signer path is gone.
 - **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
   `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
   the tokenizer graph in the text model pile
@@ -50,9 +245,10 @@ All notable changes to this project will be documented in this file.
   exactly-once delivery lock, and keeps persisted note history linear.
 - **Codex can enforce orient-watcher continuity and ingest news while busy.**
   Versioned SessionStart, UserPromptSubmit, and Stop hook helpers under
-  `hooks/codex/` hand the `liora-gpt` watcher to each new primary thread, clear
-  stale invisible consumers, inject non-consuming `orient poll --peek` news at
-  prompt boundaries, and require one rearm attempt before a turn can idle.
+  `hooks/codex/` report the configured persona watcher to each new primary
+  thread, clear only provably orphaned invisible consumers, inject
+  non-consuming `orient poll --peek` news at prompt boundaries, and require one
+  rearm attempt before a turn can idle.
 - **Group broadcasts are first-class inbox messages.** `message list` and
   `orient show` now include messages addressed to any group the reader belongs
   to, matching `orient wait` wakeups and keeping read acknowledgements scoped

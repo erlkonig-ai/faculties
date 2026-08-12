@@ -1,17 +1,13 @@
 //! Read-only GORBIE-embeddable viewer for the `discord` faculty.
 //!
-//! Discord messages on disk use the protocol-agnostic
-//! `archive::kind_message` tag plus the discord-specific
-//! `discord::channel` / `discord::guild` joins. This widget renders
-//! the most recent N messages as a chronological feed, with each
-//! card identifying its channel/guild and author.
+//! Renders the canonical Discord read model: immutable observations selected
+//! by official source version, with divergent maximal semantic variants kept
+//! visible rather than reduced to an iteration-order winner.
 //!
 //! ```ignore
 //! let mut panel = DiscordViewer::default();
 //! panel.render(ctx, discord_ws);
 //! ```
-
-use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 
@@ -19,20 +15,9 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 
-use crate::schemas::archive::archive as archive_attrs;
-use crate::schemas::discord::discord as discord_attrs;
-
-type TextHandle = Inline<Handle<LongString>>;
+use crate::discord;
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 /// Cap on visible messages. Older messages are still on the
 /// branch; the `discord read` CLI is the right tool for full
@@ -80,196 +65,120 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 #[derive(Clone, Debug)]
 struct MessageRow {
     id: Id,
+    anchor: Id,
     at: DateTime<Utc>,
-    author_id: Option<Id>,
-    author_name: Option<String>,
-    channel_id: Option<Id>,
+    author_id: Id,
+    author_name: String,
+    channel_id: Id,
     content: String,
-}
-
-#[derive(Clone, Debug, Default)]
-struct Channel {
-    name: Option<String>,
-    guild_id: Option<Id>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct Guild {
-    name: Option<String>,
+    variant_index: usize,
+    variant_count: usize,
 }
 
 struct DiscordLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     messages: Vec<MessageRow>,
-    channels: HashMap<Id, Channel>,
-    guilds: HashMap<Id, Guild>,
+    channels: std::collections::BTreeMap<Id, String>,
     total_messages: usize,
     channel_count: usize,
-    guild_count: usize,
+    conflict_count: usize,
+    diagnostic: Option<String>,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl DiscordLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[discord] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-
-        // Channels — read first so messages can look up channel
-        // names without an extra per-message find!().
-        let mut channels: HashMap<Id, Channel> = HashMap::new();
-        for (cid,) in find!(
-            (cid: Id,),
-            pattern!(&space, [{ ?cid @ metadata::tag: &discord_attrs::kind_channel }])
-        ) {
-            channels.insert(cid, Channel::default());
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        match Self::load(dataset) {
+            Ok(live) => live,
+            Err(error) => Self {
+                cached_revision: dataset.revision,
+                messages: Vec::new(),
+                channels: Default::default(),
+                total_messages: 0,
+                channel_count: 0,
+                conflict_count: 0,
+                diagnostic: Some(format!("Discord projection is invalid: {error:#}")),
+            },
         }
-        let channel_count = channels.len();
+    }
 
-        // Channel names (metadata::name long-string).
-        let chan_name_rows: Vec<(Id, TextHandle)> = find!(
-            (cid: Id, h: TextHandle),
-            pattern!(&space, [{
-                ?cid @
-                metadata::tag: &discord_attrs::kind_channel,
-                metadata::name: ?h,
-            }])
-        )
-        .collect();
-        for (cid, h) in chan_name_rows {
-            if let Some(c) = channels.get_mut(&cid) {
-                c.name = read_text(ws, h);
-            }
-        }
-        // Channel → guild pointer (so chips can show the guild).
-        for (cid, gid) in find!(
-            (cid: Id, gid: Id),
-            pattern!(&space, [{ ?cid @ discord_attrs::guild: ?gid }])
-        ) {
-            if let Some(c) = channels.get_mut(&cid) {
-                c.guild_id = Some(gid);
-            }
-        }
-
-        // Guilds — names only; we don't need to enumerate them
-        // exhaustively, the message-loop only references the ones
-        // a channel points to.
-        let mut guilds: HashMap<Id, Guild> = HashMap::new();
-        for (gid,) in find!(
-            (gid: Id,),
-            pattern!(&space, [{ ?gid @ metadata::tag: &discord_attrs::kind_guild }])
-        ) {
-            guilds.insert(gid, Guild::default());
-        }
-        let guild_count = guilds.len();
-        let guild_name_rows: Vec<(Id, TextHandle)> = find!(
-            (gid: Id, h: TextHandle),
-            pattern!(&space, [{
-                ?gid @
-                metadata::tag: &discord_attrs::kind_guild,
-                metadata::name: ?h,
-            }])
-        )
-        .collect();
-        for (gid, h) in guild_name_rows {
-            if let Some(g) = guilds.get_mut(&gid) {
-                g.name = read_text(ws, h);
-            }
-        }
-
-        // Messages: archive::kind_message + discord::channel
-        // (filters out any message-style entries that
-        // accidentally share the tag — discord branch shouldn't
-        // have those, but the join is harmless and explicit).
-        let msg_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
-            (mid: Id, cid: Id, content: TextHandle, ts: (i128, i128)),
-            pattern!(&space, [{
-                ?mid @
-                metadata::tag: &archive_attrs::kind_message,
-                discord_attrs::channel: ?cid,
-                archive_attrs::content: ?content,
-                metadata::created_at: ?ts,
-            }])
-        )
-        .collect();
-
-        // Per-message author lookup. We do it separately so the
-        // main query stays manageable; authors are shared across
-        // many messages.
-        let author_rows: HashMap<Id, Id> = find!(
-            (mid: Id, aid: Id),
-            pattern!(&space, [{ ?mid @ archive_attrs::author: ?aid }])
-        )
-        .collect();
-        let author_name_rows: Vec<(Id, TextHandle)> = find!(
-            (aid: Id, h: TextHandle),
-            pattern!(&space, [{ ?aid @ archive_attrs::author_name: ?h }])
-        )
-        .collect();
-        let mut author_names: HashMap<Id, String> = HashMap::new();
-        for (aid, h) in author_name_rows {
-            if let Some(name) = read_text(ws, h) {
-                author_names.insert(aid, name);
-            }
-        }
-
-        let total_messages = msg_rows.len();
-        let mut messages: Vec<MessageRow> = Vec::with_capacity(msg_rows.len());
-        for (mid, cid, content_h, ts) in msg_rows {
-            let raw = read_text(ws, content_h).unwrap_or_default();
-            let content = strip_html(&raw);
-            let author_id = author_rows.get(&mid).copied();
-            let author_name = author_id.and_then(|aid| author_names.get(&aid).cloned());
-            messages.push(MessageRow {
-                id: mid,
-                at: ns_to_chrono(ts.0),
-                author_id,
-                author_name,
-                channel_id: Some(cid),
-                content,
-            });
-        }
-
-        // Newest first, clamp to MAX_MESSAGES.
-        messages.sort_by(|a, b| b.at.cmp(&a.at));
-        messages.truncate(MAX_MESSAGES);
-
-        DiscordLive {
-            cached_head,
+    fn load(dataset: DatasetView<'_>) -> anyhow::Result<Self> {
+        let channels = discord::channel_labels(dataset.facts, dataset.reader)?;
+        let authors = discord::user_labels(dataset.facts, dataset.reader)?;
+        let selected = discord::select_messages(dataset.facts, None, None)?;
+        let total_messages = selected
+            .iter()
+            .map(|message| message.anchor)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let conflict_count = selected
+            .iter()
+            .filter(|message| message.variant_count > 1)
+            .map(|message| message.anchor)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let all_messages = selected
+            .into_iter()
+            .map(|message| {
+                let content =
+                    discord::read_text(dataset.reader, message.content, "Discord message content")?;
+                Ok(MessageRow {
+                    id: message.observation,
+                    anchor: message.anchor,
+                    at: ns_to_chrono(discord::interval_key(message.created_at)),
+                    author_id: message.author,
+                    author_name: authors
+                        .get(&message.author)
+                        .cloned()
+                        .unwrap_or_else(|| short_hex(message.author)),
+                    channel_id: message.channel,
+                    content: strip_html(&content),
+                    variant_index: message.variant_index,
+                    variant_count: message.variant_count,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let messages = newest_complete_message_groups(all_messages, MAX_MESSAGES);
+        Ok(Self {
+            cached_revision: dataset.revision,
+            channel_count: channels.len(),
             messages,
             channels,
-            guilds,
             total_messages,
-            channel_count,
-            guild_count,
-        }
+            conflict_count,
+            diagnostic: None,
+        })
     }
 
     fn channel_label(&self, cid: Id) -> String {
-        match self.channels.get(&cid).and_then(|c| c.name.clone()) {
-            Some(n) => format!("#{n}"),
+        match self.channels.get(&cid) {
+            Some(name) => format!("#{name}"),
             None => format!("#{}", short_hex(cid)),
         }
     }
-
-    fn guild_label_for(&self, cid: Id) -> Option<String> {
-        let gid = self.channels.get(&cid)?.guild_id?;
-        let name = self.guilds.get(&gid).and_then(|g| g.name.clone());
-        Some(name.unwrap_or_else(|| short_hex(gid)))
-    }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn newest_complete_message_groups(all_messages: Vec<MessageRow>, limit: usize) -> Vec<MessageRow> {
+    let mut by_anchor = std::collections::BTreeMap::<Id, Vec<MessageRow>>::new();
+    for message in all_messages {
+        by_anchor.entry(message.anchor).or_default().push(message);
+    }
+    let mut groups = by_anchor.into_values().collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        right
+            .iter()
+            .map(|message| message.at)
+            .max()
+            .cmp(&left.iter().map(|message| message.at).max())
+            .then_with(|| left[0].anchor.cmp(&right[0].anchor))
+    });
+    let mut messages = Vec::new();
+    for mut group in groups.into_iter().take(limit) {
+        group.sort_by_key(|message| (message.variant_index, message.id));
+        messages.append(&mut group);
+    }
+    messages
 }
 
 fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
@@ -376,14 +285,13 @@ impl DiscordViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(DiscordLive::refresh(ws));
+            self.live = Some(DiscordLive::refresh(dataset));
         }
 
         ctx.section("Discord", |ctx| {
@@ -393,26 +301,39 @@ impl DiscordViewer {
             let now = Utc::now();
 
             ctx.grid(|g| {
+                if let Some(diagnostic) = &live.diagnostic {
+                    g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
+                    return;
+                }
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
-                    let shown = live.messages.len();
-                    let label = if shown < live.total_messages {
+                    let shown_states = live.messages.len();
+                    let shown_messages = live
+                        .messages
+                        .iter()
+                        .map(|message| message.anchor)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len();
+                    let label = if shown_messages < live.total_messages {
                         format!(
-                            "SHOWING {shown} OF {} MESSAGES · {} CHANNEL{} · {} GUILD{}",
+                            "SHOWING {shown_messages} OF {} MESSAGES · {shown_states} STATES · {} CHANNEL{} · {} CONFLICT{}",
                             live.total_messages,
                             live.channel_count,
                             if live.channel_count == 1 { "" } else { "S" },
-                            live.guild_count,
-                            if live.guild_count == 1 { "" } else { "S" },
+                            live.conflict_count,
+                            if live.conflict_count == 1 { "" } else { "S" },
                         )
                     } else {
                         format!(
-                            "{shown} MESSAGE{} · {} CHANNEL{} · {} GUILD{}",
-                            if shown == 1 { "" } else { "S" },
+                            "{} MESSAGE{} · {} VISIBLE STATE{} · {} CHANNEL{} · {} CONFLICT{}",
+                            live.total_messages,
+                            if live.total_messages == 1 { "" } else { "S" },
+                            shown_states,
+                            if shown_states == 1 { "" } else { "S" },
                             live.channel_count,
                             if live.channel_count == 1 { "" } else { "S" },
-                            live.guild_count,
-                            if live.guild_count == 1 { "" } else { "S" },
+                            live.conflict_count,
+                            if live.conflict_count == 1 { "" } else { "S" },
                         )
                     };
                     ui.label(
@@ -478,10 +399,7 @@ fn render_message_card(
     let bubble_fill = ui.visuals().window_fill;
     // Header accent = channel's hashed colour so all messages from
     // the same channel visually group.
-    let accent = msg
-        .channel_id
-        .map(channel_color)
-        .unwrap_or_else(|| egui::Color32::from_gray(120));
+    let accent = channel_color(msg.channel_id);
     let text_on_accent = colorhash::text_color_on(accent);
     let body_muted = {
         let body_text = colorhash::text_color_on(bubble_fill);
@@ -518,27 +436,23 @@ fn render_message_card(
                     ui.spacing_mut().item_spacing.y = 2.0;
 
                     ui.horizontal(|ui| {
-                        if let Some(cid) = msg.channel_id {
-                            if let Some(guild) = live.guild_label_for(cid) {
-                                ui.label(
-                                    egui::RichText::new(guild)
-                                        .monospace()
-                                        .strong()
-                                        .small()
-                                        .color(text_on_accent),
-                                );
-                                ui.label(
-                                    egui::RichText::new("·")
-                                        .monospace()
-                                        .small()
-                                        .color(text_on_accent),
-                                );
-                            }
+                        ui.label(
+                            egui::RichText::new(live.channel_label(msg.channel_id))
+                                .monospace()
+                                .strong()
+                                .color(text_on_accent),
+                        );
+                        if msg.variant_count > 1 {
                             ui.label(
-                                egui::RichText::new(live.channel_label(cid))
-                                    .monospace()
-                                    .strong()
-                                    .color(text_on_accent),
+                                egui::RichText::new(format!(
+                                    "CONFLICT {}/{}",
+                                    msg.variant_index + 1,
+                                    msg.variant_count
+                                ))
+                                .monospace()
+                                .small()
+                                .strong()
+                                .color(text_on_accent),
                             );
                         }
                         ui.label(
@@ -554,15 +468,8 @@ fn render_message_card(
                     });
 
                     // Author chip + content first line.
-                    let author_label = msg.author_name.clone().unwrap_or_else(|| {
-                        msg.author_id
-                            .map(short_hex)
-                            .unwrap_or_else(|| "?".to_string())
-                    });
-                    let author_fill = msg
-                        .author_id
-                        .map(author_color)
-                        .unwrap_or_else(|| egui::Color32::from_gray(150));
+                    let author_label = msg.author_name.clone();
+                    let author_fill = author_color(msg.author_id);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
                         render_author_chip(ui, &author_label, author_fill);
@@ -613,13 +520,37 @@ fn render_message_card(
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(
-                        egui::RichText::new(id_hex(msg.id))
-                            .monospace()
-                            .small()
-                            .color(body_muted),
+                        egui::RichText::new(format!(
+                            "observation {} · message {}",
+                            id_hex(msg.id),
+                            id_hex(msg.anchor)
+                        ))
+                        .monospace()
+                        .small()
+                        .color(body_muted),
                     );
                 });
         });
+}
+
+fn render_diagnostic(ui: &mut egui::Ui, diagnostic: &str) {
+    egui::Frame::NONE
+        .fill(color_frame(ui))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("DISCORD STATE NOT SELECTABLE")
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color_contrast_warning()),
+            );
+            ui.label(egui::RichText::new(diagnostic).monospace().small());
+        });
+}
+
+fn color_contrast_warning() -> egui::Color32 {
+    egui::Color32::from_rgb(0xe2, 0x5b, 0x12)
 }
 
 fn render_author_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
@@ -637,4 +568,36 @@ fn render_author_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
                     .color(text),
             );
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn row(anchor: Id, observation: Id, variant_index: usize, variant_count: usize) -> MessageRow {
+        MessageRow {
+            id: observation,
+            anchor,
+            at: Utc.timestamp_opt(1_000, 0).single().unwrap(),
+            author_id: id(9),
+            author_name: "author".to_owned(),
+            channel_id: id(8),
+            content: String::new(),
+            variant_index,
+            variant_count,
+        }
+    }
+
+    #[test]
+    fn message_limit_never_slices_a_conflict_frontier() {
+        let anchor = id(1);
+        let rows = vec![row(anchor, id(2), 0, 2), row(anchor, id(3), 1, 2)];
+        let visible = newest_complete_message_groups(rows, 1);
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|row| row.anchor == anchor));
+    }
 }

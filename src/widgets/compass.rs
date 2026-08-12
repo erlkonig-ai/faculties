@@ -3,16 +3,11 @@
 //! Renders goals from a triblespace pile's `compass` branch grouped into
 //! kanban columns by their latest status (default: todo / doing / blocked /
 //! done). The widget holds only UI + cached-query state; the host is
-//! responsible for pulling the compass branch and passing the workspace
-//! in at render time. Writes go through `Workspace::commit(..)`; pushing
-//! is the host's responsibility (e.g. via
-//! [`StorageState::push`](crate::widgets::StorageState::push)).
+//! responsible for loading the compass dataset and passing its immutable
+//! [`DatasetView`](crate::widgets::DatasetView) at render time.
 //!
-//! Features beyond read-only display:
+//! Interactive display features:
 //!
-//! - Composing new goals (title, tags, optional parent, initial status)
-//! - Moving a goal to a new status (click a goal card → pick a status)
-//! - Adding notes to an expanded goal
 //! - Parent/child indentation with a collapse toggle per subtree
 //! - Priority arrows: `board::higher` / `board::lower` edges rendered as
 //!   `> over <id_str>` badges on the card
@@ -30,8 +25,7 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::LongString;
@@ -41,9 +35,10 @@ use GORBIE::themes::colorhash;
 use GORBIE::widgets::ChoiceToggle;
 
 use crate::schemas::compass::{
-    board as compass, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
-    KIND_STATUS_ID,
+    board as compass, interval_key, latest_status_event, DEFAULT_STATUSES, KIND_GOAL_ID,
+    KIND_NOTE_ID,
 };
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 /// Handle to a long-string blob (titles, notes).
 type TextHandle = Inline<Handle<LongString>>;
@@ -167,31 +162,24 @@ struct NoteRow {
 
 // ── Cached compass query state ───────────────────────────────────────
 
-/// Holds a cached fact space for the compass branch plus a head marker.
-/// Queries run against `space`; writes take a `&mut Workspace<Pile>` from
-/// the host and call `ws.commit(..)`. Push is the host's concern.
+/// Holds a cached fact space for the compass dataset plus its semantic revision.
 struct CompassLive {
     space: TribleSet,
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
 }
 
 impl CompassLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[compass] checkout: {e:?}");
-                TribleSet::new()
-            });
+    fn refresh(dataset: DatasetView<'_>) -> Self {
         Self {
-            space,
-            cached_head: ws.head(),
+            space: dataset.facts.clone(),
+            cached_revision: dataset.revision,
         }
     }
 
-    fn text(&self, ws: &mut Workspace<Pile>, h: TextHandle) -> String {
-        ws.get::<View<str>, LongString>(h)
+    fn text(&self, dataset: DatasetView<'_>, h: TextHandle) -> String {
+        dataset
+            .reader
+            .get::<View<str>, LongString>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
                 s.to_string()
@@ -200,11 +188,11 @@ impl CompassLive {
     }
 
     /// Notes on a specific goal, sorted newest-first.
-    fn notes_for(&self, ws: &mut Workspace<Pile>, goal_id: Id) -> Vec<NoteRow> {
-        let raw: Vec<(TextHandle, (i128, i128))> = find!(
-            (note_handle: TextHandle, ts: (i128, i128)),
+    fn notes_for(&self, dataset: DatasetView<'_>, goal_id: Id) -> Vec<NoteRow> {
+        let mut raw: Vec<(Id, TextHandle, (i128, i128))> = find!(
+            (event: Id, note_handle: TextHandle, ts: (i128, i128)),
             pattern!(&self.space, [{
-                _?event @
+                ?event @
                 metadata::tag: &KIND_NOTE_ID,
                 compass::task: &goal_id,
                 compass::note: ?note_handle,
@@ -212,16 +200,14 @@ impl CompassLive {
             }])
         )
         .collect();
+        raw.sort_unstable_by(|left, right| (right.2 .0, right.0).cmp(&(left.2 .0, left.0)));
 
-        let mut notes: Vec<NoteRow> = raw
-            .into_iter()
-            .map(|(h, ts)| NoteRow {
+        raw.into_iter()
+            .map(|(_, h, ts)| NoteRow {
                 at: Some(ts.0),
-                body: self.text(ws, h),
+                body: self.text(dataset, h),
             })
-            .collect();
-        notes.sort_by(|a, b| b.at.cmp(&a.at));
-        notes
+            .collect()
     }
 }
 
@@ -299,7 +285,7 @@ fn order_rows(lane_ids: Vec<Id>, space: &TribleSet) -> Vec<(Id, usize)> {
 /// — single-digit µs each per JP's measurement.
 fn goal_matches_search(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    dataset: DatasetView<'_>,
     goal_id: Id,
     needle: &str,
 ) -> bool {
@@ -316,7 +302,7 @@ fn goal_matches_search(
     )
     .next()
     {
-        if let Ok(v) = ws.get::<View<str>, LongString>(handle) {
+        if let Ok(v) = dataset.reader.get::<View<str>, LongString>(handle) {
             if v.as_ref().to_lowercase().contains(needle) {
                 return true;
             }
@@ -472,44 +458,23 @@ impl CompassBoard {
         Self::default()
     }
 
-    /// Render the board into a GORBIE card context. `ws` must point at
-    /// the compass branch.
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        // Refresh cached state if the workspace head has advanced.
-        let head = ws.head();
+    /// Render the board from an immutable compass dataset.
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
+        // Refresh cached state if the semantic dataset revision has advanced.
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(CompassLive::refresh(ws));
+            self.live = Some(CompassLive::refresh(dataset));
         }
         let live = self.live.as_ref().expect("refreshed above");
 
-        // Top-level query: latest status per goal, then enumerate every
-        // goal as (id, effective_status, sort_at). No row struct — the
-        // renderer reads what it needs from the tribleset inline.
+        // Enumerate every goal with the collection's canonical effective
+        // status. Equal timestamps are resolved by event id in
+        // `latest_status_event`, exactly as in the CLI and independent of
+        // query iteration order.
         let space = &live.space;
-        let mut latest_status: HashMap<Id, (String, i128)> = HashMap::new();
-        for (gid, status, ts) in find!(
-            (gid: Id, status: String, ts: (i128, i128)),
-            pattern!(space, [{
-                _?event @
-                metadata::tag: &KIND_STATUS_ID,
-                compass::task: ?gid,
-                compass::status: ?status,
-                metadata::created_at: ?ts,
-            }])
-        ) {
-            match latest_status.get_mut(&gid) {
-                Some(slot) if slot.1 < ts.0 => *slot = (status, ts.0),
-                Some(_) => {}
-                None => {
-                    latest_status.insert(gid, (status, ts.0));
-                }
-            }
-        }
-
         let mut goals: Vec<(Id, String, i128)> = Vec::new();
         for (gid, _t, created) in find!(
             (gid: Id, _t: TextHandle, created: (i128, i128)),
@@ -520,12 +485,12 @@ impl CompassBoard {
                 metadata::created_at: ?created,
             }])
         ) {
-            let (status, sort_at) = match latest_status.get(&gid) {
-                Some((s, t)) => (s.clone(), *t),
-                None => ("todo".to_string(), created.0),
-            };
+            let (status, sort_at) = latest_status_event(space, gid)
+                .map(|(_, status, at)| (status, interval_key(at)))
+                .unwrap_or_else(|| ("todo".to_string(), created.0));
             goals.push((gid, status, sort_at));
         }
+        let active_priority_edges = crate::compass::active_priority_edges(space);
 
         // Per-status counts for the section header chips.
         let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -563,7 +528,7 @@ impl CompassBoard {
         // Resolve expanded goal's notes (if any).
         let expanded = self.expanded_goal;
         let expanded_notes: Option<(Id, Vec<NoteRow>)> = expanded.map(|gid| {
-            let notes = live.notes_for(ws, gid);
+            let notes = live.notes_for(dataset, gid);
             (gid, notes)
         });
 
@@ -667,7 +632,7 @@ impl CompassBoard {
                         continue;
                     }
                     let match_info = if search_active {
-                        if !goal_matches_search(space, ws, item.id, &needle) {
+                        if !goal_matches_search(space, dataset, item.id, &needle) {
                             continue;
                         }
                         Some(search.report(egui::Id::new(("compass_match", item.id))))
@@ -684,10 +649,11 @@ impl CompassBoard {
                             status_str,
                             depth,
                             space,
-                            ws,
+                            dataset,
                             expanded_goal,
                             expanded_notes.as_ref(),
                             collapsed,
+                            &active_priority_edges,
                             &mut card_rects,
                             &needle,
                         );
@@ -713,26 +679,17 @@ impl CompassBoard {
                 let base = status_color(&item.status);
                 let edge_color =
                     egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 200);
-                let higher_id = item.id;
-                for (lower,) in find!(
-                    (lower: Id),
-                    pattern!(space, [{
-                        _?event @
-                        metadata::tag: &KIND_PRIORITIZE_ID,
-                        compass::higher: higher_id,
-                        compass::lower: ?lower,
-                    }])
-                ) {
-                    let Some(to_rect) = card_rects.get(&lower) else {
+                for (_, lower) in active_priority_edges
+                    .iter()
+                    .filter(|(higher, _)| *higher == item.id)
+                {
+                    let Some(to_rect) = card_rects.get(lower) else {
                         continue;
                     };
                     draw_priority_edge(&painter, *from_rect, *to_rect, edge_color);
                 }
             }
         });
-
-        // Read-only viewer: no writes to apply post-render.
-        let _ = ws; // suppress unused-warning while ws stays in the signature
     }
 }
 
@@ -745,10 +702,11 @@ fn render_goal_card(
     status: &str,
     depth: usize,
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    dataset: DatasetView<'_>,
     expanded_goal: &mut Option<Id>,
     expanded_notes: Option<&(Id, Vec<NoteRow>)>,
     collapsed: &mut HashSet<Id>,
+    active_priority_edges: &std::collections::BTreeSet<(Id, Id)>,
     card_rects: &mut HashMap<Id, egui::Rect>,
     // Lowercased search needle ("" = no search).
     search_needle: &str,
@@ -821,7 +779,7 @@ fn render_goal_card(
                 )
                 .next()
                 {
-                    if let Ok(v) = ws.get::<View<str>, LongString>(handle) {
+                    if let Ok(v) = dataset.reader.get::<View<str>, LongString>(handle) {
                         let base = egui::TextFormat {
                             font_id: egui::TextStyle::Monospace.resolve(ui.style()),
                             color: ui.visuals().text_color(),
@@ -881,27 +839,23 @@ fn render_goal_card(
             // queries are empty it's a near-zero-height no-op.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                for (lower,) in find!(
-                    (lower: Id),
-                    pattern!(space, [{
-                        _?event @
-                        metadata::tag: &KIND_PRIORITIZE_ID,
-                        compass::higher: goal_id,
-                        compass::lower: ?lower,
-                    }])
-                ) {
+                for (_, lower) in active_priority_edges
+                    .iter()
+                    .filter(|(higher, _)| *higher == goal_id)
+                {
+                    let lower_id = *lower;
                     let target_label = find!(
                         (t: TextHandle),
                         pattern!(space, [{
-                            lower @
+                            lower_id @
                             metadata::tag: &KIND_GOAL_ID,
                             compass::title: ?t,
                         }])
                     )
                     .next()
-                    .and_then(|(h,)| ws.get::<View<str>, LongString>(h).ok())
+                    .and_then(|(h,)| dataset.reader.get::<View<str>, LongString>(h).ok())
                     .map(|v| truncate_inline(v.as_ref(), 16))
-                    .unwrap_or_else(|| fmt_id_full(lower));
+                    .unwrap_or_else(|| fmt_id_full(lower_id));
                     render_chip(
                         ui,
                         &format!("▲ {target_label}"),

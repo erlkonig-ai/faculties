@@ -1,17 +1,17 @@
 //! Read-only GORBIE-embeddable message panel.
 //!
-//! Renders the append-only direct messages kept on a pile's
-//! `message` branch as a chronological feed: oldest at the top,
+//! Renders the canonical immutable envelopes in a Message collection as a
+//! chronological feed: oldest at the top,
 //! newest at the bottom. Each message lays out as a sharp-cornered
 //! paper-card bubble — sender + recipient chips, body text (with
 //! search-match underlines when a notebook-wide search is active),
 //! optional read receipts, and a short id footer.
 //!
 //! The widget holds UI + cached-query state only; the host supplies
-//! the message workspace (required) and an optional `relations`
-//! workspace at render time.
+//! the message dataset (required) and an optional `relations`
+//! dataset at render time.
 //!
-//! Identity display is resolved against the relations branch (if
+//! Identity display is resolved against the Relations collection (if
 //! supplied): `alias → first_name last_name → display_name → 8-char
 //! hex prefix`. If relations is absent the widget quietly degrades to
 //! the hex-prefix view. Per-person color chips use
@@ -20,29 +20,18 @@
 //!
 //! ```ignore
 //! let mut panel = MessagesPanel::default();
-//! panel.render(ctx, messages_ws, Some(relations_ws));
+//! panel.render(ctx, messages_view, Some(relations_view));
 //! ```
 
 use std::collections::HashMap;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use crate::schemas::message::{local, KIND_MESSAGE_ID, KIND_READ_ID};
-use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
-
-/// Handle to a long-string blob (message bodies).
-type TextHandle = Inline<Handle<LongString>>;
+use crate::message as message_model;
+use crate::relations::{self, Head, ProfileInput, ProfileView};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 // ── ID / time helpers ────────────────────────────────────────────────
 
@@ -131,19 +120,24 @@ struct MessageRow {
     body: String,
     /// TAI ns of the message's `metadata::created_at` (sort key).
     created_at: Option<i128>,
-    /// Read receipts for this message. Each entry is `(reader, ts_ns)`.
-    reads: Vec<(Id, i128)>,
+    /// Canonical read markers and every additive observation attached to them.
+    reads: Vec<ReadReceipt>,
+    /// At least one current operator is a canonical inbox recipient.
+    is_inbox: bool,
+    /// At least one eligible operator has no equivalent canonical read marker.
+    is_unread: bool,
 }
 
 impl MessageRow {
     fn sort_key(&self) -> i128 {
         self.created_at.unwrap_or(i128::MIN)
     }
+}
 
-    /// True when `id` has filed a read receipt for this message.
-    fn read_by(&self, id: Id) -> bool {
-        self.reads.iter().any(|(reader, _)| *reader == id)
-    }
+#[derive(Clone, Debug)]
+struct ReadReceipt {
+    reader: Id,
+    observations: Vec<i128>,
 }
 
 /// Everything we know about a person for UI purposes.
@@ -154,12 +148,25 @@ struct Person {
     last_name: Option<String>,
     display_name: Option<String>,
     /// True when the relations entry carries the `operator` affinity —
-    /// i.e. this is a human the agents work for, not another zooid.
+    /// i.e. this is a human the agents work for, not another agent.
     /// Messages addressed to an operator form the "inbox" subset.
     is_operator: bool,
 }
 
 impl Person {
+    fn from_profile(profile: ProfileInput) -> Self {
+        Self {
+            alias: Some(profile.label),
+            first_name: profile.first_name,
+            last_name: profile.last_name,
+            display_name: profile.display_name,
+            is_operator: profile
+                .affinities
+                .iter()
+                .any(|affinity| affinity.eq_ignore_ascii_case("operator")),
+        }
+    }
+
     /// Display name: alias > first+last > display_name > hex prefix.
     fn display(&self, fallback_id: Id) -> String {
         if let Some(a) = self.alias.as_ref() {
@@ -186,60 +193,37 @@ impl Person {
 
 // ── Cached message query state ───────────────────────────────────────
 
-/// Cached fact spaces + head markers + resolved people map. Rebuilt
-/// whenever the message head advances or the relations head
-/// changes.
+/// Cached canonical projections + revision markers + resolved people map.
+/// Rebuilt whenever the Message or Relations dataset revision changes.
 struct MessagesLive {
-    space: TribleSet,
-    cached_head: Option<CommitHandle>,
-    relations_cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
+    relations_cached_revision: Option<DatasetRevision>,
     people: HashMap<Id, Person>,
+    messages: Vec<MessageRow>,
+    diagnostics: Vec<String>,
 }
 
 impl MessagesLive {
-    /// Refresh cached fact spaces + people map from the provided
-    /// workspaces.
-    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[messages] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-
-        let (relations_cached_head, people) = match relations_ws {
-            Some(rws) => {
-                let head = rws.head();
-                let rspace = rws
-                    .checkout(..)
-                    .map(|co| co.into_facts())
-                    .unwrap_or_else(|e| {
-                        eprintln!("[messages] relations checkout: {e:?}");
-                        TribleSet::new()
-                    });
-                let people = build_people(&rspace, rws);
-                (head, people)
+    /// Refresh canonical Message/Relations projections from the provided
+    /// dataset views.
+    fn refresh(view: DatasetView<'_>, relations: Option<DatasetView<'_>>) -> Self {
+        let (relations_cached_revision, people, mut diagnostics) = match relations {
+            Some(relations) => {
+                let (people, diagnostics) = build_people(relations);
+                (Some(relations.revision), people, diagnostics)
             }
-            None => (None, HashMap::new()),
+            None => (None, HashMap::new(), Vec::new()),
         };
+        let (messages, message_diagnostics) = collect_messages(view, relations, &people);
+        diagnostics.extend(message_diagnostics);
 
         MessagesLive {
-            space,
-            cached_head,
-            relations_cached_head,
+            cached_revision: view.revision,
+            relations_cached_revision,
             people,
+            messages,
+            diagnostics,
         }
-    }
-
-    fn text(&self, ws: &mut Workspace<Pile>, h: TextHandle) -> String {
-        ws.get::<View<str>, LongString>(h)
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
-            .unwrap_or_default()
     }
 
     /// Friendly display name for an Id, falling back to hex prefix.
@@ -249,177 +233,206 @@ impl MessagesLive {
             None => id_hex(id),
         }
     }
-
-    /// Collect every message with its from/to/body/created_at and fold
-    /// in the read-receipt events that target it.
-    fn messages(&self, ws: &mut Workspace<Pile>) -> Vec<MessageRow> {
-        let mut by_id: HashMap<Id, MessageRow> = HashMap::new();
-
-        let rows: Vec<(Id, Id, Id, TextHandle, (i128, i128))> = find!(
-            (
-                mid: Id,
-                from: Id,
-                to: Id,
-                body: TextHandle,
-                ts: (i128, i128)
-            ),
-            pattern!(&self.space, [{
-                ?mid @
-                metadata::tag: &KIND_MESSAGE_ID,
-                local::from: ?from,
-                local::to: ?to,
-                local::body: ?body,
-                metadata::created_at: ?ts,
-            }])
-        )
-        .collect();
-
-        for (mid, from, to, body_handle, ts) in rows {
-            if by_id.contains_key(&mid) {
-                continue;
-            }
-            let body = self.text(ws, body_handle);
-            by_id.insert(
-                mid,
-                MessageRow {
-                    id: mid,
-                    from,
-                    to,
-                    body,
-                    created_at: Some(ts.0),
-                    reads: Vec::new(),
-                },
-            );
-        }
-
-        // Read-receipt pairing.
-        let mut latest: HashMap<(Id, Id), i128> = HashMap::new();
-        for (mid, reader, ts) in find!(
-            (mid: Id, reader: Id, ts: (i128, i128)),
-            pattern!(&self.space, [{
-                _?event @
-                metadata::tag: &KIND_READ_ID,
-                local::about_message: ?mid,
-                local::reader: ?reader,
-                local::read_at: ?ts,
-            }])
-        ) {
-            let key = (mid, reader);
-            let entry = latest.entry(key).or_insert(i128::MIN);
-            if ts.0 > *entry {
-                *entry = ts.0;
-            }
-        }
-        for ((mid, reader), ts) in latest {
-            if let Some(row) = by_id.get_mut(&mid) {
-                row.reads.push((reader, ts));
-            }
-        }
-
-        for row in by_id.values_mut() {
-            row.reads.sort_by(|a, b| b.1.cmp(&a.1));
-        }
-
-        by_id.into_values().collect()
-    }
 }
 
-/// Build the people map by scanning the relations fact space.
-fn build_people(
-    relations_space: &TribleSet,
-    relations_ws: &mut Workspace<Pile>,
-) -> HashMap<Id, Person> {
-    let mut people: HashMap<Id, Person> = HashMap::new();
-
-    let person_ids: Vec<Id> = find!(
-        pid: Id,
-        pattern!(relations_space, [{ ?pid @ metadata::tag: &KIND_PERSON_ID }])
-    )
-    .collect();
-    for pid in &person_ids {
-        people.insert(*pid, Person::default());
-    }
-
-    let alias_rows: Vec<(Id, String)> = find!(
-        (pid: Id, alias: String),
-        pattern!(relations_space, [{ ?pid @ rel::alias: ?alias }])
-    )
-    .collect();
-    for (pid, alias) in alias_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            match p.alias.as_ref() {
-                Some(existing) if existing.as_str() <= alias.as_str() => {}
-                _ => p.alias = Some(alias),
+fn build_people(relations_view: DatasetView<'_>) -> (HashMap<Id, Person>, Vec<String>) {
+    let mut people = HashMap::new();
+    let mut diagnostics = Vec::new();
+    for (person, view) in
+        relations::person_profile_views(relations_view.reader, relations_view.facts)
+    {
+        match view {
+            ProfileView::Current { value, .. } => {
+                people.insert(person, Person::from_profile(value));
+            }
+            ProfileView::Forked(heads) => diagnostics.push(format!(
+                "Relations profile {person:x} is forked across {}",
+                heads
+                    .iter()
+                    .map(|id| format!("{id:x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            ProfileView::Invalid(error) => {
+                diagnostics.push(format!("Relations profile {person:x} is invalid: {error}"));
             }
         }
-    }
 
-    let relations_text = |ws: &mut Workspace<Pile>, h: TextHandle| -> Option<String> {
-        ws.get::<View<str>, LongString>(h).ok().map(|v| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        })
+        match relations::lifecycle_head(relations_view.facts, person) {
+            Ok(Head::Unique(snapshot)) => {
+                if let Err(error) = relations::lifecycle_snapshot(relations_view.facts, snapshot) {
+                    diagnostics.push(format!(
+                        "Relations lifecycle {person:x} is invalid: {error}"
+                    ));
+                }
+            }
+            Ok(Head::Forked(heads)) => diagnostics.push(format!(
+                "Relations lifecycle {person:x} is forked across {}",
+                heads
+                    .iter()
+                    .map(|id| format!("{id:x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Ok(Head::Missing) => diagnostics.push(format!(
+                "Relations person {person:x} has no lifecycle snapshot"
+            )),
+            Err(error) => diagnostics.push(format!(
+                "Relations lifecycle {person:x} is invalid: {error}"
+            )),
+        }
+    }
+    (people, diagnostics)
+}
+
+fn collect_messages(
+    view: DatasetView<'_>,
+    relations_view: Option<DatasetView<'_>>,
+    people: &HashMap<Id, Person>,
+) -> (Vec<MessageRow>, Vec<String>) {
+    let mut diagnostics = Vec::new();
+    let rows = match message_model::load_message_rows(view.facts) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![format!("Messages catalog is invalid: {error}")],
+            );
+        }
     };
+    let domain_rows: HashMap<Id, message_model::MessageRow> =
+        rows.iter().map(|row| (row.id, *row)).collect();
 
-    let first_rows: Vec<(Id, TextHandle)> = find!(
-        (pid: Id, h: TextHandle),
-        pattern!(relations_space, [{ ?pid @ rel::first_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in first_rows {
-        if people.contains_key(&pid) {
-            if let Some(v) = relations_text(relations_ws, h) {
-                if let Some(p) = people.get_mut(&pid) {
-                    p.first_name.get_or_insert(v);
+    let mut messages: HashMap<Id, MessageRow> = rows
+        .into_iter()
+        .map(|row| {
+            let body = match message_model::read_body(view.reader, row.body) {
+                Ok(body) => body,
+                Err(error) => {
+                    diagnostics.push(format!("Message {:x} body is unavailable: {error}", row.id));
+                    "⚠ body unavailable".to_owned()
+                }
+            };
+            let created_at = match row.created_at.try_from_inline::<(i128, i128)>() {
+                Ok((start, _)) => Some(start),
+                Err(error) => {
+                    diagnostics.push(format!(
+                        "Message {:x} has an invalid creation interval: {error:?}",
+                        row.id
+                    ));
+                    None
+                }
+            };
+            (
+                row.id,
+                MessageRow {
+                    id: row.id,
+                    from: row.from,
+                    to: row.to,
+                    body,
+                    created_at,
+                    reads: Vec::new(),
+                    is_inbox: false,
+                    is_unread: false,
+                },
+            )
+        })
+        .collect();
+
+    let mut domain_reads = Vec::new();
+    match message_model::load_read_receipts(view.facts) {
+        Ok(receipts) => {
+            for receipt in receipts {
+                let read = receipt.marker;
+                domain_reads.push(read);
+                let mut observations = Vec::new();
+                for observed_at in receipt.observed_at {
+                    match observed_at.try_from_inline::<(i128, i128)>() {
+                        Ok((start, _)) => observations.push(start),
+                        Err(error) => diagnostics.push(format!(
+                            "Read marker {:x} has an invalid observation: {error:?}",
+                            read.id
+                        )),
+                    }
+                }
+                observations.sort_unstable();
+                observations.dedup();
+                match messages.get_mut(&read.message) {
+                    Some(message) => message.reads.push(ReadReceipt {
+                        reader: read.reader,
+                        observations,
+                    }),
+                    None => diagnostics.push(format!(
+                        "Read marker {:x} names absent message {:x}",
+                        read.id, read.message
+                    )),
                 }
             }
         }
+        Err(error) => diagnostics.push(format!("Message read catalog is invalid: {error}")),
     }
 
-    let last_rows: Vec<(Id, TextHandle)> = find!(
-        (pid: Id, h: TextHandle),
-        pattern!(relations_space, [{ ?pid @ rel::last_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in last_rows {
-        if people.contains_key(&pid) {
-            if let Some(v) = relations_text(relations_ws, h) {
-                if let Some(p) = people.get_mut(&pid) {
-                    p.last_name.get_or_insert(v);
+    if let Some(relations_view) = relations_view {
+        match relations::IdentityComponents::from_facts(relations_view.facts) {
+            Ok(identities) => {
+                let operators: Vec<Id> = people
+                    .iter()
+                    .filter_map(|(id, person)| person.is_operator.then_some(*id))
+                    .collect();
+                for message in messages.values_mut() {
+                    let domain = domain_rows
+                        .get(&message.id)
+                        .expect("display message came from the canonical domain rows");
+                    let mut eligible = Vec::new();
+                    for operator in &operators {
+                        match message_model::is_inbox_message(
+                            domain,
+                            *operator,
+                            relations_view.facts,
+                            &identities,
+                        ) {
+                            Ok(true) => eligible.push(*operator),
+                            Ok(false) => {}
+                            Err(error) => diagnostics.push(format!(
+                                "Message {:x} inbox relation for operator {operator:x} is unsettled: {error}",
+                                message.id
+                            )),
+                        }
+                    }
+                    message.is_inbox = !eligible.is_empty();
+                    for operator in eligible {
+                        match message_model::is_read_by(
+                            &domain_reads,
+                            message.id,
+                            operator,
+                            &identities,
+                        ) {
+                            Ok(false) => message.is_unread = true,
+                            Ok(true) => {}
+                            Err(error) => diagnostics.push(format!(
+                                "Message {:x} read state for operator {operator:x} is unsettled: {error}",
+                                message.id
+                            )),
+                        }
+                    }
                 }
             }
+            Err(error) => diagnostics.push(format!(
+                "Relations identity catalog cannot classify the inbox: {error}"
+            )),
         }
     }
 
-    let display_rows: Vec<(Id, TextHandle)> = find!(
-        (pid: Id, h: TextHandle),
-        pattern!(relations_space, [{ ?pid @ rel::display_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in display_rows {
-        if people.contains_key(&pid) {
-            if let Some(v) = relations_text(relations_ws, h) {
-                if let Some(p) = people.get_mut(&pid) {
-                    p.display_name.get_or_insert(v);
-                }
-            }
-        }
+    for message in messages.values_mut() {
+        message.reads.sort_by_key(|read| read.reader);
     }
-
-    // Operator detection — the `operator` affinity marks humans the
-    // agents work for. Their inbound messages form the inbox subset.
-    for (pid, affinity) in find!(
-        (pid: Id, a: String),
-        pattern!(relations_space, [{ ?pid @ rel::affinity: ?a }])
-    ) {
-        if affinity.eq_ignore_ascii_case("operator") {
-            if let Some(p) = people.get_mut(&pid) {
-                p.is_operator = true;
-            }
-        }
-    }
-
-    people
+    let mut messages: Vec<_> = messages.into_values().collect();
+    messages.sort_by(|left, right| {
+        left.sort_key()
+            .cmp(&right.sort_key())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    (messages, diagnostics)
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -432,7 +445,7 @@ fn build_people(
 /// Which subset of the stream to show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamFilter {
-    /// Everything — intra-zooid traffic included.
+    /// Everything — agent-to-agent traffic included.
     All,
     /// Only messages addressed to an operator (a relations entry with
     /// the `operator` affinity) — the human's inbox.
@@ -440,7 +453,7 @@ enum StreamFilter {
 }
 
 pub struct MessagesPanel {
-    /// Rebuilt when the messages / relations head changes.
+    /// Rebuilt when the messages / relations revision changes.
     live: Option<MessagesLive>,
     /// Current stream filter — toggled via the ALL / INBOX chips.
     filter: StreamFilter,
@@ -468,27 +481,26 @@ impl MessagesPanel {
         self
     }
 
-    /// Render the panel. `ws` must point at the message branch;
-    /// `relations_ws` is optional and, when provided, is used for
+    /// Render the panel. `view` is the messages dataset;
+    /// `relations` is optional and, when provided, is used for
     /// friendly-name resolution.
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-        mut relations_ws: Option<&mut Workspace<Pile>>,
+        view: DatasetView<'_>,
+        relations: Option<DatasetView<'_>>,
     ) {
-        // Refresh cached state if any head advanced.
-        let head = ws.head();
-        let rhead = relations_ws.as_ref().and_then(|w| w.head());
+        // Refresh cached state if either logical dataset changed.
+        let revision = view.revision;
+        let relations_revision = relations.map(|view| view.revision);
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head || l.relations_cached_head != rhead,
+            Some(l) => {
+                l.cached_revision != revision || l.relations_cached_revision != relations_revision
+            }
         };
         if need_refresh {
-            self.live = Some(MessagesLive::refresh(
-                ws,
-                relations_ws.as_mut().map(|w| &mut **w),
-            ));
+            self.live = Some(MessagesLive::refresh(view, relations));
         }
 
         let filter = &mut self.filter;
@@ -498,12 +510,7 @@ impl MessagesPanel {
             };
 
             // Pre-materialize everything the UI closure needs.
-            let mut messages = live.messages(ws);
-            messages.sort_by(|a, b| {
-                a.sort_key()
-                    .cmp(&b.sort_key())
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            let messages = live.messages.clone();
 
             // Build a name lookup for every id we'll paint.
             let mut names: HashMap<Id, String> = HashMap::new();
@@ -512,8 +519,10 @@ impl MessagesPanel {
                     .entry(m.from)
                     .or_insert_with(|| live.display_name(m.from));
                 names.entry(m.to).or_insert_with(|| live.display_name(m.to));
-                for (r, _) in &m.reads {
-                    names.entry(*r).or_insert_with(|| live.display_name(*r));
+                for read in &m.reads {
+                    names
+                        .entry(read.reader)
+                        .or_insert_with(|| live.display_name(read.reader));
                 }
             }
 
@@ -528,11 +537,10 @@ impl MessagesPanel {
             // Inbox stats: messages addressed to an operator (a human
             // per the relations `operator` affinity); unread = the
             // recipient hasn't filed a read receipt yet.
-            let is_inbox = |m: &MessageRow| live.people.get(&m.to).map_or(false, |p| p.is_operator);
-            let inbox_total = messages.iter().filter(|m| is_inbox(m)).count();
+            let inbox_total = messages.iter().filter(|m| m.is_inbox).count();
             let inbox_unread = messages
                 .iter()
-                .filter(|m| is_inbox(m) && !m.read_by(m.to))
+                .filter(|m| m.is_inbox && m.is_unread)
                 .count();
             // No operators in relations → no inbox notion; pin the
             // filter back to ALL so the chip row doesn't strand the
@@ -549,6 +557,10 @@ impl MessagesPanel {
             let search_active = !needle.is_empty();
 
             ctx.grid(|g| {
+                for diagnostic in &live.diagnostics {
+                    g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
+                }
+
                 // Header row: filter chips + count on the left,
                 // "LAST <age>" right.
                 g.full(|ctx| {
@@ -612,7 +624,7 @@ impl MessagesPanel {
                 // arrival/stickiness state machine — the viewer is
                 // read-only, so the user just scrolls the notebook.
                 for msg in &messages {
-                    let msg_is_inbox = is_inbox(msg);
+                    let msg_is_inbox = msg.is_inbox;
                     if *filter == StreamFilter::Inbox && !msg_is_inbox {
                         continue;
                     }
@@ -625,7 +637,7 @@ impl MessagesPanel {
                         None
                     };
                     let is_focused = match_info.as_ref().map_or(false, |i| i.is_focused);
-                    let inbox_unread_msg = msg_is_inbox && !msg.read_by(msg.to);
+                    let inbox_unread_msg = msg.is_unread;
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
@@ -652,9 +664,6 @@ impl MessagesPanel {
                     });
                 }
             });
-
-            // Read-only viewer — no writes to apply post-render.
-            let _ = ws;
         });
     }
 }
@@ -844,7 +853,7 @@ fn render_message(
                                 .color(color_read()),
                         );
                         let mut first = true;
-                        for (reader, ts) in &msg.reads {
+                        for read in &msg.reads {
                             if !first {
                                 ui.label(
                                     egui::RichText::new("\u{00b7}")
@@ -854,25 +863,42 @@ fn render_message(
                             }
                             first = false;
                             let name = names
-                                .get(reader)
+                                .get(&read.reader)
                                 .cloned()
-                                .unwrap_or_else(|| id_hex(*reader));
+                                .unwrap_or_else(|| id_hex(read.reader));
                             // Tint each reader name with its own person
                             // color so the reader list matches the
                             // sender/recipient chips above.
                             let response = ui.label(
                                 egui::RichText::new(name)
                                     .small()
-                                    .color(person_color(*reader)),
+                                    .color(person_color(read.reader)),
                             );
-                            response.on_hover_text(format!(
-                                "read {} · {}",
-                                format_age_key(now, *ts),
-                                format_timestamp_key(*ts),
-                            ));
+                            let hover = if read.observations.is_empty() {
+                                "read · no timestamp observation".to_owned()
+                            } else {
+                                read.observations
+                                    .iter()
+                                    .map(|timestamp| {
+                                        format!(
+                                            "read {} · {}",
+                                            format_age_key(now, *timestamp),
+                                            format_timestamp_key(*timestamp),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            };
+                            response.on_hover_text(hover);
                         }
-                        // Newest-reader age as a trailing muted suffix.
-                        if let Some((_, newest_ts)) = msg.reads.iter().max_by_key(|(_, t)| *t) {
+                        // Most recent observation is a compact presentation
+                        // summary; every observation remains visible on hover.
+                        if let Some(newest_ts) = msg
+                            .reads
+                            .iter()
+                            .flat_map(|read| read.observations.iter())
+                            .max()
+                        {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "\u{00b7} {}",
@@ -1004,6 +1030,24 @@ fn paint_party_stripe(
     painter.add(text_shape);
 }
 
+fn render_diagnostic(ui: &mut egui::Ui, message: &str) {
+    let accent = egui::Color32::from_rgb(0xe6, 0x32, 0x46);
+    egui::Frame::NONE
+        .fill(accent.gamma_multiply(0.12))
+        .stroke(egui::Stroke::new(1.0, accent))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(format!("⚠ {message}"))
+                    .monospace()
+                    .small()
+                    .color(ui.visuals().text_color()),
+            );
+        });
+}
+
 /// Centered empty-state block with an envelope glyph, a headline
 /// message, and an optional muted sub-line. Used whenever the
 /// messages panel has nothing to show.
@@ -1029,4 +1073,46 @@ fn render_messages_empty_state(ui: &mut egui::Ui, headline: &str, hint: Option<&
         }
     });
     ui.add_space(24.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_relation_profile_controls_name_and_operator_classification() {
+        let person = Person::from_profile(ProfileInput {
+            label: "Example".to_owned(),
+            aliases: vec!["sample".to_owned()],
+            affinities: vec!["Operator".to_owned()],
+            first_name: Some("Example".to_owned()),
+            ..ProfileInput::default()
+        });
+
+        let id = Id::new([1; 16]).unwrap();
+        assert_eq!(person.display(id), "Example");
+        assert!(person.is_operator);
+    }
+
+    #[test]
+    fn read_marker_without_observation_remains_visible() {
+        let reader = Id::new([2; 16]).unwrap();
+        let message = MessageRow {
+            id: Id::new([3; 16]).unwrap(),
+            from: Id::new([4; 16]).unwrap(),
+            to: reader,
+            body: "hello".to_owned(),
+            created_at: None,
+            reads: vec![ReadReceipt {
+                reader,
+                observations: Vec::new(),
+            }],
+            is_inbox: true,
+            is_unread: false,
+        };
+
+        assert_eq!(message.reads.len(), 1);
+        assert_eq!(message.reads[0].reader, reader);
+        assert!(message.reads[0].observations.is_empty());
+    }
 }

@@ -9,9 +9,25 @@ use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
-pub const DEFAULT_MEMORY_BRANCH: &str = "memory";
-pub const DEFAULT_COGNITION_BRANCH: &str = "cognition";
-pub const DEFAULT_ARCHIVE_BRANCH: &str = "archive";
+/// Stable extrinsic scope of the durable Memory journal collection.
+///
+/// Minted with `trible genid` on 2026-08-09:
+/// `E12E0AF29345CA6D9C58A32B50BAC9D8`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("E12E0AF29345CA6D9C58A32B50BAC9D8");
+
+/// Historical input consumed only by the stopped-world additive cutover.
+/// Ordinary Memory readers and writers never resolve a named branch.
+pub const LEGACY_MEMORY_BRANCH_NAME: &str = "memory";
+
+/// Stable extrinsic scope of persona-scoped Comb cursor state.
+///
+/// Minted with `trible genid` on 2026-08-08 in the canonical Memory/Comb
+/// collection lineage. Archive replay shares this scope; Archive facts never
+/// enter it.
+pub const DEFAULT_COMB_SCOPE_ID: Id = id_hex!("6CB9F473105A56504531486F14382F78");
+
+/// Historical branch name consumed only by stopped-world migrations.
+pub const LEGACY_COMB_BRANCH_NAME: &str = "comb-state";
 
 pub const KIND_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
 
@@ -27,7 +43,7 @@ pub const KIND_EXEC_RESULT: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
 
 pub const KIND_ARCHIVE_MESSAGE: Id = id_hex!("1A0841C92BBDA0A26EA9A8252D6ECD9B");
 
-/// Tag for BM25 search-index entities on the memory branch. Each
+/// Tag for historical BM25 search-index entities in Memory. Each
 /// `memory index` run mints a fresh entity (kind + blob handle +
 /// indexed_at); readers take the latest by `indexed_at` — indexes are
 /// rebuild-and-replace, the history is just exhaust.
@@ -37,7 +53,10 @@ pub mod search_index {
     use super::*;
     use triblespace_search::succinct::SuccinctBM25Blob;
     attributes! {
-        "3BAF1837E1A1128042A0582CF6D71CE0" unsafe as index: Handle<SuccinctBM25Blob>;
+        /// Exact-TF BM25 artifact. Rotated with `SuccinctBM25Blob` on
+        /// 2026-08-03; retired score blobs remain inert and `memory index`
+        /// rebuilds under this attribute.
+        "E8AE08F96BB552892BD106E45AAB5007" unsafe as index: Handle<SuccinctBM25Blob>;
         "FD8C086B68F20AD04B2C70B9CE3C2BCC" unsafe as indexed_at: NsTAIInterval;
     }
 }

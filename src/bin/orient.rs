@@ -3,30 +3,34 @@ use chrono::{
     DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
 };
 use clap::{CommandFactory, Parser, Subcommand};
+use ed25519_dalek::SigningKey;
+use faculties::collection_cutover::{load_signer, open_pile_strict};
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::compass::latest_status_event;
-use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
-use faculties::schemas::memory::DEFAULT_MEMORY_BRANCH;
-use faculties::schemas::message::is_inbox_message;
-use faculties::schemas::orient::{
-    board, local, orient_state, KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_NOTE_ID,
-    KIND_ORIENT_CHECKPOINT_ID, KIND_READ_ID, KIND_STATUS_ID,
+use faculties::schemas::compass::{
+    board, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
-use faculties::schemas::relations::{groups_for_member, relations as rel_attrs};
-use faculties::schemas::status::{status as status_attrs, KIND_STATUS_UPDATE};
-use faculties::schemas::wiki::{cover_fragments, WIKI_BRANCH_NAME};
+use faculties::schemas::habit::DEFAULT_SCOPE_ID as HABIT_SCOPE_ID;
+use faculties::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
+use faculties::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
+use faculties::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
+use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
+use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
+use faculties::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
+use faculties::{
+    compass, habits, mail as mail_model, memory as memory_model, message, orient as orient_model,
+    relations, status, wiki as wiki_model,
+};
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::PileReader;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-type CommitHandle = Inline<inlineencodings::Handle<SimpleArchive>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 fn interval_key(interval: IntervalValue) -> i128 {
@@ -49,13 +53,34 @@ struct Cli {
     /// under distinct identities.
     #[arg(long, env = "PERSONA")]
     persona: Option<String>,
+    /// Durable collection signing key. Defaults to the pile-adjacent key.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
+/// The four orientation modes, and which is for what (operator, 2026-07-28 — stated
+/// after a window inferred it wrong from the fact that `show` is the cheap one):
+///
+/// - `wake`  — **session start, after a compaction.** The whole self: memory
+///   cover + cover-tagged beliefs + goals. Deliberately large; the point is
+///   wholeness, not efficiency, so it is read whole.
+/// - `show`  — a general overview mid-session, for "what's up right now".
+///   **Neither memories nor wiki entries belong here** — it is a situation
+///   snapshot, not a self. Keeping it cheap is what makes it runnable often.
+/// - `wait`  — blocking. Things you might want to deal with, so it wakes you
+///   out of idling. Terse by design: the reasons plus what changed.
+/// - `poll`  — the same content as `wait`, returned immediately. For per-turn
+///   hooks that cannot block.
+///
+/// The distinction that is easy to get backwards: `wake` and `show` are not
+/// long and short versions of one thing. `wake` answers "who am I", `show`
+/// answers "what is happening" — which is why the belief set lives in one and
+/// is out of place in the other however cheap it would be to add.
 #[derive(Subcommand)]
 enum Command {
-    /// Show an orientation snapshot
+    /// Mid-session overview of the current situation (no memories, no wiki)
     Show {
         /// Max local messages to show
         #[arg(long, default_value_t = 10)]
@@ -67,7 +92,8 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
     },
-    /// Assemble the full wake bundle: memory cover + cover-tagged beliefs + goals
+    /// Session start after a compaction: the whole self — memory cover +
+    /// cover-tagged beliefs + goals
     Wake {
         /// CHARACTER budget for the memory cover — the wake ritual is for
         /// wholeness, so the default is generous (matches the SessionStart hook);
@@ -82,7 +108,7 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
     },
-    /// Wait until relevant branches change, then show orientation
+    /// Wait until the persona-visible semantic view gains news
     Wait {
         #[command(subcommand)]
         target: Option<WaitTarget>,
@@ -95,7 +121,7 @@ enum Command {
         /// Max todo goals to show
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
-        /// Poll interval while waiting for branch changes
+        /// Poll interval for the append-only pile growth gate
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
     },
@@ -130,27 +156,16 @@ enum WaitTarget {
     },
 }
 
-#[derive(Debug, Clone)]
-struct MessageRow {
-    id: Id,
-    from: Id,
-    to: Id,
-    created_at: i128,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WatchedHeads {
-    local: Option<CommitHandle>,
-    compass: Option<CommitHandle>,
-    relations: Option<CommitHandle>,
-}
-
 fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
 fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
     (epoch, epoch).try_to_inline().unwrap()
+}
+
+fn epoch_seconds(epoch: Epoch) -> i64 {
+    (epoch.to_tai_duration().total_nanoseconds() / 1_000_000_000) as i64
 }
 
 fn format_age(now_key: i128, past_key: i128) -> String {
@@ -171,206 +186,6 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn person_label(ws: &mut Workspace<Pile>, space: &TribleSet, person_id: Id) -> String {
-    find!(h: TextHandle, pattern!(space, [{ person_id @ metadata::name: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-        .unwrap_or_else(|| fmt_id(person_id))
-}
-
-fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
-    let view: View<str> = ws
-        .get::<View<str>, blobencodings::LongString>(handle)
-        .map_err(|e| anyhow!("load longstring: {e:?}"))?;
-    Ok(view.to_string())
-}
-
-/// Load messages without resolving body blobs — sorted newest first.
-fn load_message_ids(space: &TribleSet) -> Vec<MessageRow> {
-    let mut messages: Vec<MessageRow> = find!(
-        (message_id: Id, from: Id, to: Id, created_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(space, [{
-            ?message_id @
-            metadata::tag: &KIND_MESSAGE_ID,
-            local::from: ?from,
-            local::to: ?to,
-            metadata::created_at: ?created_at,
-        }])
-    )
-    .map(|(id, from, to, created_at)| MessageRow {
-        id,
-        from,
-        to,
-        created_at: interval_key(created_at),
-    })
-    .collect();
-    messages.sort_by_key(|msg| std::cmp::Reverse(msg.created_at));
-    messages
-}
-
-fn resolve_message_body(ws: &mut Workspace<Pile>, space: &TribleSet, msg_id: Id) -> String {
-    find!(h: TextHandle, pattern!(space, [{ msg_id @ local::body: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-        .unwrap_or_default()
-}
-
-fn load_reads(space: &TribleSet) -> HashMap<(Id, Id), i128> {
-    let mut reads = HashMap::new();
-    for (_read_id, message_id, reader_id, read_at) in find!(
-        (
-            read_id: Id,
-            message_id: Id,
-            reader_id: Id,
-            read_at: Inline<inlineencodings::NsTAIInterval>
-        ),
-        pattern!(&space, [{
-            ?read_id @
-            metadata::tag: &KIND_READ_ID,
-            local::about_message: ?message_id,
-            local::reader: ?reader_id,
-            local::read_at: ?read_at,
-        }])
-    ) {
-        let key = (message_id, reader_id);
-        let ts = interval_key(read_at);
-        reads
-            .entry(key)
-            .and_modify(|existing| {
-                if ts > *existing {
-                    *existing = ts;
-                }
-            })
-            .or_insert(ts);
-    }
-    reads
-}
-
-/// Resolve the mail-faculty self identity: the relations entry
-/// whose `email` attribute matches `$MAIL_USER` (case-folded).
-/// Returns None if `MAIL_USER` isn't set or if no relations entry
-/// has been auto-registered for it yet.
-fn find_mail_self(relations_space: &TribleSet) -> Option<(String, Id)> {
-    let user = std::env::var("MAIL_USER").ok()?;
-    let needle = user.trim().to_ascii_lowercase();
-    let id = find!(
-        (id: Id, e: String),
-        pattern!(relations_space, [{
-            ?id @ rel_attrs::email: ?e,
-        }])
-    )
-    .find_map(|(id, e)| {
-        if e.to_ascii_lowercase() == needle {
-            Some(id)
-        } else {
-            None
-        }
-    })?;
-    Some((user, id))
-}
-
-/// Render the "Mail (unread inbox for ...)" section. Treats absence
-/// of the `mail` branch or `MAIL_USER` env var as a graceful "skip"
-/// rather than an error — orient is a snapshot, not a config tool.
-fn render_unread_mail(
-    repo: &mut Repository<Pile>,
-    relations_branch_id: Id,
-    message_limit: usize,
-    now_key: i128,
-) -> Result<()> {
-    // Need a relations workspace to resolve the self identity.
-    let mut rws = repo
-        .pull(relations_branch_id)
-        .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-    let rel_space = rws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-
-    let Some((user, self_id)) = find_mail_self(&rel_space) else {
-        // Either MAIL_USER isn't set or the auto-registration hasn't
-        // happened yet (no fetch/send has run). Either way, render
-        // a brief note rather than crashing.
-        println!("Mail:");
-        match std::env::var("MAIL_USER") {
-            Ok(u) => {
-                println!("- No relations entry for {u} yet (run `mail fetch` or `mail send` once)")
-            }
-            Err(_) => println!("- MAIL_USER env var not set; skipping"),
-        }
-        return Ok(());
-    };
-
-    let mail_branch_id = match repo.ensure_branch("mail", None) {
-        Ok(id) => id,
-        Err(_) => {
-            println!("Mail (unread for {user}):");
-            println!("- mail branch not present yet");
-            return Ok(());
-        }
-    };
-    let mut mws = repo
-        .pull(mail_branch_id)
-        .map_err(|e| anyhow!("pull mail: {e:?}"))?;
-    let mail_space = mws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout mail: {e:?}"))?;
-
-    let mut rows: Vec<(i128, Id, Option<Id>, String)> = find!(
-        (id: Id, from: Id, sent_at: IntervalValue, subject_h: TextHandle),
-        pattern!(&mail_space, [{
-            ?id @
-            metadata::tag: KIND_MAIL_MESSAGE,
-            mail::from: ?from,
-            mail::sent_at: ?sent_at,
-            mail::subject: ?subject_h,
-        }])
-    )
-    .filter(|&(_, from, _, _)| from != self_id)
-    .filter(|&(id, _, _, _)| !exists!(pattern!(&mail_space, [{ id @ metadata::tag: &KIND_SPAM }])))
-    .filter(|&(id, _, _, _)| {
-        !exists!(pattern!(&mail_space, [{
-            _?r @
-            metadata::tag: KIND_READ_ID,
-            local::about_message: id,
-            local::reader: self_id,
-        }]))
-    })
-    .map(|(id, from, sent_at, subject_h)| {
-        let subject = read_text(&mut mws, subject_h).unwrap_or_default();
-        (interval_key(sent_at), id, Some(from), subject)
-    })
-    .collect();
-    // Newest first.
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
-
-    println!("Mail (unread for {user}):");
-    if rows.is_empty() {
-        println!("- None");
-    } else {
-        for (sent_at_key, id, from_id, subject) in rows.into_iter().take(message_limit) {
-            let from_email = from_id
-                .and_then(|rid| {
-                    find!(
-                        e: String,
-                        pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])
-                    )
-                    .next()
-                })
-                .unwrap_or_else(|| "?".into());
-            let age = format_age(now_key, sent_at_key);
-            println!("- [{}] {} {} — {}", fmt_id(id), age, from_email, subject);
-        }
-    }
-    Ok(())
-}
-
-fn task_title(ws: &mut Workspace<Pile>, space: &TribleSet, task_id: Id) -> String {
-    find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-        .unwrap_or_default()
-}
-
 fn entity_tags(space: &TribleSet, entity_id: Id) -> Vec<String> {
     let mut tags: Vec<String> =
         find!(tag: String, pattern!(space, [{ entity_id @ board::tag: ?tag }])).collect();
@@ -382,7 +197,7 @@ fn entity_tags(space: &TribleSet, entity_id: Id) -> Vec<String> {
 fn visible_notes(
     space: &TribleSet,
     persona_id: Id,
-    persona_keys: &HashSet<String>,
+    attention_keys: &HashSet<String>,
     relevant_goals: &HashSet<Id>,
 ) -> BTreeMap<Id, Id> {
     let mut notes = BTreeMap::new();
@@ -402,9 +217,9 @@ fn visible_notes(
         if own_note {
             continue;
         }
-        let directly_addressed = entity_tags(space, note_id).iter().any(|tag| {
-            tag.eq_ignore_ascii_case("colony") || persona_keys.contains(&tag.to_ascii_lowercase())
-        });
+        let directly_addressed = entity_tags(space, note_id)
+            .iter()
+            .any(|tag| attention_keys.contains(&tag.to_ascii_lowercase()));
         if directly_addressed || relevant_goals.contains(&goal_id) {
             insert_note_goal(&mut notes, note_id, goal_id);
         }
@@ -412,362 +227,599 @@ fn visible_notes(
     notes
 }
 
-fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, IntervalValue)> {
-    latest_status_event(space, task_id).map(|(_, status, at)| (status, at))
+struct NativeCatalogs {
+    messages: TribleSet,
+    mail: TribleSet,
+    compass: TribleSet,
+    relations: TribleSet,
+    status: TribleSet,
+    habits: habits::Catalog,
+    checkpoints: TribleSet,
+    reader: PileReader,
 }
 
-/// Render the `Compass:` goal block (Doing/Todo, most-recent first, capped by
-/// the two limits) exactly as the orient snapshot shows it, into a string.
-/// Shared by `cmd_show` (which prints it) and `cmd_wake` (which appends it to
-/// the wake bundle) so the two can never drift.
-fn render_compass_goals(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
+fn materialize_scope(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    scope: Id,
+    label: &str,
+) -> Result<TribleSet> {
+    Collection::new(&mut *pile, scope, signer.clone())
+        .materialize()
+        .map_err(|error| anyhow!("materialize {label} collection: {error}"))
+}
+
+/// Read every collection that contributes to Orient from one refreshed Pile.
+/// Collection history and record ordering stop at this boundary: callers see
+/// only their materialized set values.
+fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCatalogs> {
+    let relations_facts = materialize_scope(pile, signer, RELATIONS_SCOPE_ID, "Relations")?;
+    let mail_facts = materialize_scope(pile, signer, MAIL_SCOPE_ID, "Mail")?;
+    let message_facts = materialize_scope(pile, signer, MESSAGE_SCOPE_ID, "Message")?;
+    let compass_facts = materialize_scope(pile, signer, COMPASS_SCOPE_ID, "Compass")?;
+    let status_facts = materialize_scope(pile, signer, STATUS_SCOPE_ID, "Status")?;
+    let habit_facts = materialize_scope(pile, signer, HABIT_SCOPE_ID, "Habit")?;
+    let checkpoint_facts = materialize_scope(
+        pile,
+        signer,
+        faculties::schemas::orient::DEFAULT_SCOPE_ID,
+        "Orient checkpoint",
+    )?;
+    let reader = pile
+        .reader()
+        .map_err(|error| anyhow!("open Orient collection reader: {error}"))?;
+
+    relations::validate_catalog(&reader, &relations_facts)
+        .map_err(|error| anyhow!("validate Relations collection: {error:#}"))?;
+    mail_model::validate_local_catalog(&reader, &mail_facts)
+        .map_err(|error| anyhow!("validate Mail collection: {error:#}"))?;
+    message::validate_catalog(&reader, &message_facts, &relations_facts)
+        .map_err(|error| anyhow!("validate Message collection: {error:#}"))?;
+    compass::validate_known_payloads(&reader, &compass_facts)
+        .map_err(|error| anyhow!("validate Compass collection: {error:#}"))?;
+    status::validate_catalog(&reader, &status_facts)
+        .map_err(|error| anyhow!("validate Status collection: {error:#}"))?;
+    let habits = habits::load_catalog(&reader, &habit_facts)
+        .map_err(|error| anyhow!("validate Habit collection: {error:#}"))?;
+    orient_model::validate_catalog(&reader, &checkpoint_facts)
+        .map_err(|error| anyhow!("validate Orient checkpoint collection: {error:#}"))?;
+
+    Ok(NativeCatalogs {
+        messages: message_facts,
+        mail: mail_facts,
+        compass: compass_facts,
+        relations: relations_facts,
+        status: status_facts,
+        habits,
+        checkpoints: checkpoint_facts,
+        reader,
+    })
+}
+
+fn native_task_title(catalogs: &NativeCatalogs, task: Id) -> String {
+    find!(
+        handle: compass::TextHandle,
+        pattern!(&catalogs.compass, [{ task @ board::title: ?handle }])
+    )
+    .next()
+    .and_then(|handle| compass::read_text(&catalogs.reader, handle).ok())
+    .unwrap_or_default()
+}
+
+fn render_native_messages(
+    catalogs: &NativeCatalogs,
+    persona: Option<Id>,
+    limit: usize,
+) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let Some(persona) = persona else {
+        writeln!(out, "Local messages:").unwrap();
+        writeln!(
+            out,
+            "- Unavailable: no persona (pass --persona <label-or-hex> or set $PERSONA)"
+        )
+        .unwrap();
+        return Ok(out);
+    };
+
+    let identities = relations::IdentityComponents::from_facts(&catalogs.relations)?;
+    let reads = message::load_read_rows(&catalogs.messages)?;
+    let mut rows = message::load_message_rows(&catalogs.messages)?;
+    rows.sort_by_key(|row| std::cmp::Reverse(interval_key(row.created_at)));
+    let mut unread = Vec::new();
+    for row in rows {
+        if message::is_inbox_message(&row, persona, &catalogs.relations, &identities)?
+            && !message::is_read_by(&reads, row.id, persona, &identities)?
+        {
+            if unread.len() >= limit {
+                break;
+            }
+            unread.push(row);
+        }
+    }
+
+    writeln!(
+        out,
+        "Local messages (unread inbox for {}):",
+        native_person_label(catalogs, persona)
+    )
+    .unwrap();
+    if unread.is_empty() {
+        writeln!(out, "- None").unwrap();
+        return Ok(out);
+    }
+    let now = interval_key(epoch_interval(now_epoch()));
+    for row in unread {
+        writeln!(
+            out,
+            "- [{}] {} {} -> {} (unread)",
+            fmt_id(row.id),
+            format_age(now, interval_key(row.created_at)),
+            native_person_label(catalogs, row.from),
+            native_person_label(catalogs, row.to),
+        )
+        .unwrap();
+        let body = message::read_body(&catalogs.reader, row.body)?;
+        if body.is_empty() {
+            writeln!(out, "    ").unwrap();
+        } else {
+            for line in body.lines() {
+                writeln!(out, "    {}", line.trim_end_matches('\r')).unwrap();
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MailSummary {
+    claimed_at: Option<i128>,
+    from: Option<String>,
+    subject: String,
+    spam: bool,
+}
+
+/// One attention item per unread, non-spam inbound wire message. Re-observing
+/// the same wire through another source is idempotent when its presentation
+/// agrees; conflicting parser projections are not silently arbitrated.
+fn native_unread_mail(catalogs: &NativeCatalogs, persona: Id) -> Result<BTreeMap<Id, MailSummary>> {
+    let mut by_wire = BTreeMap::new();
+    for row in mail_model::inbox_projection(&catalogs.mail, &catalogs.relations, persona)? {
+        if !row.unread {
+            continue;
+        }
+        let view = mail_model::projection_view(&catalogs.reader, &catalogs.mail, row.projection)?;
+        let summary = MailSummary {
+            claimed_at: view.claimed_date.map(interval_key),
+            from: view.from,
+            subject: view.subject,
+            spam: view.spam,
+        };
+        match by_wire.entry(row.wire) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(summary);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &summary => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                bail!(
+                    "wire message {:x} has conflicting parser projections for Orient",
+                    row.wire
+                );
+            }
+        }
+    }
+    by_wire.retain(|_, summary| !summary.spam);
+    Ok(by_wire)
+}
+
+/// Render the same unread native Mail projection that drives `orient wait`.
+fn render_native_mail(
+    catalogs: &NativeCatalogs,
+    persona: Option<Id>,
+    limit: usize,
+) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let Some(persona) = persona else {
+        writeln!(out, "Mail:").unwrap();
+        writeln!(
+            out,
+            "- Unavailable: no persona (pass --persona <label-or-hex> or set $PERSONA)"
+        )
+        .unwrap();
+        return Ok(out);
+    };
+
+    let mut rows = native_unread_mail(catalogs, persona)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(wire, summary)| {
+        (
+            std::cmp::Reverse(summary.claimed_at),
+            std::cmp::Reverse(*wire),
+        )
+    });
+
+    writeln!(
+        out,
+        "Mail (unread for {}):",
+        native_person_label(catalogs, persona)
+    )
+    .unwrap();
+    if rows.is_empty() {
+        writeln!(out, "- None").unwrap();
+        return Ok(out);
+    }
+    let now = interval_key(epoch_interval(now_epoch()));
+    for (wire, summary) in rows.into_iter().take(limit) {
+        let age = summary
+            .claimed_at
+            .map(|at| format_age(now, at))
+            .unwrap_or_else(|| "?".to_owned());
+        writeln!(
+            out,
+            "- [{}] {} {} — {}",
+            fmt_id(wire),
+            age,
+            summary.from.unwrap_or_else(|| "(no From)".to_owned()),
+            summary.subject,
+        )
+        .unwrap();
+    }
+    Ok(out)
+}
+
+fn render_native_compass_goals(
+    catalogs: &NativeCatalogs,
     doing_limit: usize,
     todo_limit: usize,
 ) -> String {
     use std::fmt::Write as _;
 
-    let mut doing: Vec<(i128, Id)> = Vec::new();
-    let mut todo: Vec<(i128, Id)> = Vec::new();
-    for task_id in find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
-        let (status, status_at) = task_latest_status(space, task_id)
-            .map(|(s, at)| (s.to_lowercase(), Some(interval_key(at))))
-            .unwrap_or_else(|| ("todo".to_string(), None));
-        let created_key: i128 =
-            find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }]))
-                .next()
-                .map(interval_key)
-                .unwrap_or(0);
-        let sort_key = status_at.unwrap_or(created_key);
-        if status == "doing" {
-            doing.push((sort_key, task_id));
-        } else if status == "todo" {
-            todo.push((sort_key, task_id));
+    let mut doing = Vec::<(i128, Id)>::new();
+    let mut todo = Vec::<(i128, Id)>::new();
+    for task in compass::goal_ids(&catalogs.compass) {
+        let (status, status_at) = latest_status_event(&catalogs.compass, task)
+            .map(|(_, value, at)| (value.to_ascii_lowercase(), Some(interval_key(at))))
+            .unwrap_or_else(|| ("todo".to_owned(), None));
+        let created = find!(
+            at: IntervalValue,
+            pattern!(&catalogs.compass, [{ task @ metadata::created_at: ?at }])
+        )
+        .map(interval_key)
+        .min()
+        .unwrap_or(0);
+        let key = status_at.unwrap_or(created);
+        match status.as_str() {
+            "doing" => doing.push((key, task)),
+            "todo" => todo.push((key, task)),
+            _ => {}
         }
     }
-
-    doing.sort_by(|a, b| b.0.cmp(&a.0));
-    todo.sort_by(|a, b| b.0.cmp(&a.0));
+    doing.sort_by(|left, right| right.cmp(left));
+    todo.sort_by(|left, right| right.cmp(left));
 
     let mut out = String::new();
     writeln!(out, "Compass:").unwrap();
     if doing.is_empty() && todo.is_empty() {
         writeln!(out, "- No goals.").unwrap();
+        return out;
+    }
+    writeln!(out, "Doing:").unwrap();
+    if doing.is_empty() {
+        writeln!(out, "- None").unwrap();
     } else {
-        writeln!(out, "Doing:").unwrap();
-        if doing.is_empty() {
-            writeln!(out, "- None").unwrap();
-        } else {
-            for (_key, task_id) in doing.into_iter().take(doing_limit) {
-                let title = task_title(ws, space, task_id);
-                let tag_suffix = render_tags(&entity_tags(space, task_id));
-                writeln!(out, "- [{}] {}{}", fmt_id(task_id), title, tag_suffix).unwrap();
-            }
+        for (_, task) in doing.into_iter().take(doing_limit) {
+            writeln!(
+                out,
+                "- [{}] {}{}",
+                fmt_id(task),
+                native_task_title(catalogs, task),
+                render_tags(&entity_tags(&catalogs.compass, task)),
+            )
+            .unwrap();
         }
-        writeln!(out, "Todo:").unwrap();
-        if todo.is_empty() {
-            writeln!(out, "- None").unwrap();
-        } else {
-            for (_key, task_id) in todo.into_iter().take(todo_limit) {
-                let title = task_title(ws, space, task_id);
-                let tag_suffix = render_tags(&entity_tags(space, task_id));
-                writeln!(out, "- [{}] {}{}", fmt_id(task_id), title, tag_suffix).unwrap();
-            }
+    }
+    writeln!(out, "Todo:").unwrap();
+    if todo.is_empty() {
+        writeln!(out, "- None").unwrap();
+    } else {
+        for (_, task) in todo.into_iter().take(todo_limit) {
+            writeln!(
+                out,
+                "- [{}] {}{}",
+                fmt_id(task),
+                native_task_title(catalogs, task),
+                render_tags(&entity_tags(&catalogs.compass, task)),
+            )
+            .unwrap();
         }
     }
     out
 }
 
-/// Resolve a persona given as 32-char hex id or a relations label/alias
-/// (matched against the pre-normalized `label_norm` / `alias_norm` fields,
-/// same semantics as `message`).
-fn resolve_persona(relations_space: &TribleSet, input: &str) -> Result<Id> {
-    let trimmed = input.trim();
-    if let Some(id) = Id::from_hex(trimmed) {
-        return Ok(id);
+fn render_window_status(catalogs: &NativeCatalogs) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let latest = status::latest_per_window(status::load_status_rows(&catalogs.status)?)?;
+    let mut rows = Vec::new();
+    for person in latest.keys() {
+        let text = latest
+            .get(person)
+            .map(|row| status::read_text(&catalogs.reader, row.text))
+            .transpose()?;
+        rows.push((native_person_label(catalogs, *person), text));
     }
-    let key = trimmed.to_ascii_lowercase();
-    let matches: Vec<Id> = find!(
-        person_id: Id,
-        pattern!(relations_space, [{ ?person_id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID }])
-    )
-    .filter(|&person_id| {
-        exists!(pattern!(relations_space, [{ person_id @ rel_attrs::label_norm: key.as_str() }]))
-            || exists!(pattern!(relations_space, [{ person_id @ rel_attrs::alias_norm: key.as_str() }]))
-    })
-    .collect();
-    match matches.len() {
-        0 => bail!("unknown persona label '{trimmed}' (no relations entry; try the hex id)"),
-        1 => Ok(matches[0]),
-        _ => bail!("multiple relations entries match persona label '{trimmed}'"),
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut out = String::new();
+    writeln!(out, "Window status:").unwrap();
+    if rows.is_empty() {
+        writeln!(out, "- (none)").unwrap();
     }
+    for (label, text) in rows {
+        writeln!(out, "- {label}: {}", text.unwrap_or_else(|| "—".to_owned())).unwrap();
+    }
+    Ok(out)
 }
 
-fn cmd_show(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DueHabit {
+    label: String,
+    nudge: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct HabitObservation {
+    due: BTreeMap<Id, DueHabit>,
+    attention: BTreeMap<Id, String>,
+    /// Earliest completion-relative deadline that can change a cooling row.
+    next_cooldown_at: Option<i64>,
+}
+
+/// Evaluate the shared Habit read model once. The wall clock and evaluation
+/// directory are explicit so the wait loop can re-run this without requiring
+/// any collection append, and tests can exercise the temporal edge directly.
+fn observe_habits(
+    catalogs: &NativeCatalogs,
     pile: &Path,
-    persona: Option<&str>,
-    message_limit: usize,
-    doing_limit: usize,
-    todo_limit: usize,
-) -> Result<()> {
-    with_repo(pile, |repo| {
-        let compass_branch_id = repo
-            .ensure_branch("compass", None)
-            .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
-        let local_branch_id = repo
-            .ensure_branch("message", None)
-            .map_err(|e| anyhow::anyhow!("ensure message branch: {e:?}"))?;
-        let relations_branch_id = repo
-            .ensure_branch("relations", None)
-            .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
-        let orient_state_branch_id = repo
-            .ensure_branch("orient-state", None)
-            .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
-        let current_heads = load_watched_heads(
-            repo,
-            local_branch_id,
-            compass_branch_id,
-            relations_branch_id,
-        )?;
-
-        let mut local_ws = repo
-            .pull(local_branch_id)
-            .map_err(|e| anyhow!("pull local workspace: {e:?}"))?;
-        let local_space = local_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout local: {e:?}"))?;
-        let reads = load_reads(&local_space);
-        let all_messages = load_message_ids(&local_space);
-
-        let now_key = interval_key(epoch_interval(now_epoch()));
-
-        // Persona is strictly per-process (flag / $PERSONA): multiple
-        // agents share one pile but must not share one identity, so there
-        // is deliberately no pile-level fallback.
-        let effective_persona = match persona {
-            Some(input) => {
-                let mut relations_ws = repo
-                    .pull(relations_branch_id)
-                    .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-                let relations_space = relations_ws
-                    .checkout(..)
-                    .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-                Some(resolve_persona(&relations_space, input)?)
-            }
-            None => None,
-        };
-
-        println!("Orient");
-        match effective_persona {
-            Some(reader_id) => {
-                let mut relations_ws = repo
-                    .pull(relations_branch_id)
-                    .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-                let relations_space = relations_ws
-                    .checkout(..)
-                    .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-                let reader_groups = groups_for_member(&relations_space, reader_id);
-
-                let unread: Vec<&MessageRow> = all_messages
-                    .iter()
-                    .filter(|msg| {
-                        is_inbox_message(msg.from, msg.to, reader_id, &reader_groups)
-                            && !reads.contains_key(&(msg.id, reader_id))
-                    })
-                    .take(message_limit)
-                    .collect();
-
-                let reader_label = person_label(&mut relations_ws, &relations_space, reader_id);
-                println!("Local messages (unread inbox for {}):", reader_label);
-                if unread.is_empty() {
-                    println!("- None");
-                } else {
-                    for msg in &unread {
-                        let from_label =
-                            person_label(&mut relations_ws, &relations_space, msg.from);
-                        let to_label = person_label(&mut relations_ws, &relations_space, msg.to);
-                        let age = format_age(now_key, msg.created_at);
-                        println!(
-                            "- [{}] {} {} -> {} ({})",
-                            fmt_id(msg.id),
-                            age,
-                            from_label,
-                            to_label,
-                            "unread",
-                        );
-                        // Resolve body lazily — only for displayed messages.
-                        let body = resolve_message_body(&mut local_ws, &local_space, msg.id);
-                        if body.is_empty() {
-                            println!("    ");
-                        } else {
-                            for line in body.lines() {
-                                println!("    {}", line.trim_end_matches('\r'));
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
-                println!("Local messages:");
-                println!(
-                    "- Unavailable: no persona (pass --persona <label-or-hex> or set $PERSONA)"
+    now_secs: i64,
+) -> Result<HabitObservation> {
+    let at = habits::evaluation_dir(pile);
+    let mut observation = HabitObservation::default();
+    for row in catalogs.habits.rows()? {
+        let state = habits::evaluate(&row, now_secs, &at);
+        match &state {
+            habits::State::Due => {
+                observation.due.insert(
+                    row.id,
+                    DueHabit {
+                        label: row.label.clone(),
+                        nudge: row.nudge.clone(),
+                    },
                 );
             }
-        }
-
-        drop(local_ws);
-
-        // ── Mail (unread inbox for the address in $MAIL_USER) ────
-        render_unread_mail(repo, relations_branch_id, message_limit, now_key)?;
-
-        let mut compass_ws = repo
-            .pull(compass_branch_id)
-            .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
-        let compass_space = compass_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
-
-        println!();
-        print!(
-            "{}",
-            render_compass_goals(&mut compass_ws, &compass_space, doing_limit, todo_limit)
-        );
-
-        drop(compass_ws);
-
-        // Colony: each zooid's current status (latest-per-window).
-        let status_branch_id = repo
-            .ensure_branch("status", None)
-            .map_err(|e| anyhow!("ensure status branch: {e:?}"))?;
-        let mut status_ws = repo
-            .pull(status_branch_id)
-            .map_err(|e| anyhow!("pull status: {e:?}"))?;
-        let status_space = status_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout status: {e:?}"))?;
-        let mut latest_status: HashMap<Id, (TextHandle, i128)> = HashMap::new();
-        for (window, text, at) in find!(
-            (window: Id, text: TextHandle, at: IntervalValue),
-            pattern!(&status_space, [{ _?ev @
-                metadata::tag: &KIND_STATUS_UPDATE,
-                status_attrs::window: ?window,
-                status_attrs::text: ?text,
-                metadata::created_at: ?at,
-            }])
-        ) {
-            let k = interval_key(at);
-            latest_status
-                .entry(window)
-                .and_modify(|e| {
-                    if k > e.1 {
-                        *e = (text, k);
-                    }
-                })
-                .or_insert((text, k));
-        }
-        let mut rel_ws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rel_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-        let zooids: Vec<Id> = find!(
-            id: Id,
-            pattern!(&rel_space, [{ ?id @
-                metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID,
-                rel_attrs::affinity: "zooid",
-            }])
-        )
-        .collect();
-        let mut lines: Vec<(String, Option<String>)> = Vec::new();
-        for id in zooids {
-            let label = person_label(&mut rel_ws, &rel_space, id);
-            let text = latest_status
-                .get(&id)
-                .map(|(h, _)| *h)
-                .and_then(|h| read_text(&mut status_ws, h).ok());
-            lines.push((label, text));
-        }
-        lines.sort_by(|a, b| a.0.cmp(&b.0));
-        println!("Colony:");
-        if lines.is_empty() {
-            println!("- (no zooids)");
-        }
-        for (label, text) in lines {
-            match text {
-                Some(t) => println!("- {label}: {t}"),
-                None => println!("- {label}: —"),
-            }
-        }
-
-        let persona_view = match effective_persona {
-            Some(persona_id) => {
-                let view = load_watched_view(
-                    repo,
-                    persona_id,
-                    local_branch_id,
-                    compass_branch_id,
-                    relations_branch_id,
-                )?;
-                let seen_notes = if let Some(checkpoint) =
-                    load_checkpoint_view(repo, orient_state_branch_id, persona_id)?
+            habits::State::Cooling => {
+                if let Some(deadline) = row
+                    .next_cooldown_at()
+                    .map_err(anyhow::Error::msg)?
+                    .filter(|deadline| *deadline > now_secs)
                 {
-                    checkpoint.view.notes
-                } else {
-                    BTreeMap::new()
-                };
-                let notes_delta = newly_seen_notes(&view.notes, &seen_notes);
-                Some((persona_id, view, notes_delta))
+                    observation.next_cooldown_at = Some(
+                        observation
+                            .next_cooldown_at
+                            .map_or(deadline, |seen| seen.min(deadline)),
+                    );
+                }
             }
-            None => None,
+            habits::State::Forked(heads) => {
+                observation.attention.insert(
+                    row.id,
+                    format!(
+                        "{} [{:x}] has conflicting state heads: {}",
+                        row.label,
+                        row.id,
+                        heads
+                            .iter()
+                            .map(|(id, state)| format!("{id:x}={}", state.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+            habits::State::Unparseable(error) | habits::State::Failed(error) => {
+                observation.attention.insert(
+                    row.id,
+                    format!("{} [{:x}] {}: {error}", row.label, row.id, state.word()),
+                );
+            }
+            habits::State::Waiting | habits::State::Paused => {}
+        }
+    }
+    Ok(observation)
+}
+
+fn render_native_habits(observation: &HabitObservation) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    writeln!(out, "Habits due:").unwrap();
+    if observation.due.is_empty() {
+        writeln!(out, "- None").unwrap();
+    } else {
+        for (id, habit) in &observation.due {
+            writeln!(out, "- [{}] {}: {}", fmt_id(*id), habit.label, habit.nudge).unwrap();
+        }
+    }
+    if !observation.attention.is_empty() {
+        writeln!(out, "Habit attention:").unwrap();
+        for warning in observation.attention.values() {
+            writeln!(out, "- {warning}").unwrap();
+        }
+    }
+    out
+}
+
+fn newly_due(previous: &HabitObservation, current: &HabitObservation) -> Vec<(Id, DueHabit)> {
+    current
+        .due
+        .iter()
+        .filter(|(id, _)| !previous.due.contains_key(*id))
+        .map(|(id, habit)| (*id, habit.clone()))
+        .collect()
+}
+
+fn newly_needing_attention(
+    previous: &HabitObservation,
+    current: &HabitObservation,
+) -> Vec<(Id, String)> {
+    current
+        .attention
+        .iter()
+        .filter(|(id, warning)| previous.attention.get(*id) != Some(*warning))
+        .map(|(id, warning)| (*id, warning.clone()))
+        .collect()
+}
+
+fn print_habit_transitions(previous: &HabitObservation, current: &HabitObservation) -> bool {
+    let due = newly_due(previous, current);
+    let attention = newly_needing_attention(previous, current);
+    if due.is_empty() && attention.is_empty() {
+        return false;
+    }
+    for (id, habit) in &due {
+        println!("News: habit [{}] became due ({})", fmt_id(*id), habit.label);
+    }
+    for (id, _) in &attention {
+        println!("News: habit [{}] needs attention", fmt_id(*id));
+    }
+    if !due.is_empty() {
+        println!("\nHabits newly due:");
+        for (_, habit) in due {
+            println!("- {}: {}", habit.label, habit.nudge);
+        }
+    }
+    if !attention.is_empty() {
+        println!("\nHabit attention:");
+        for (_, warning) in attention {
+            println!("- {warning}");
+        }
+    }
+    true
+}
+
+fn resolve_native_persona(catalogs: &NativeCatalogs, input: &str) -> Result<Id> {
+    let input = input.trim();
+    if let Some(id) = Id::from_hex(input) {
+        // Exact anchors remain useful before a profile has arrived.
+        return Ok(id);
+    }
+    relations::resolve_person(&catalogs.reader, &catalogs.relations, input, false)?
+        .require_unique("person", input)
+}
+
+fn profile_inputs(
+    reader: &PileReader,
+    facts: &TribleSet,
+    person: Id,
+) -> Result<Vec<relations::ProfileInput>> {
+    let heads = match relations::profile_head(facts, person)? {
+        relations::Head::Missing => Vec::new(),
+        relations::Head::Unique(id) => vec![id],
+        relations::Head::Forked(ids) => ids,
+    };
+    heads
+        .into_iter()
+        .map(|id| {
+            let snapshot = relations::profile_snapshot(facts, id)?;
+            relations::profile_input(reader, &snapshot)
+        })
+        .collect()
+}
+
+fn native_person_label(catalogs: &NativeCatalogs, person: Id) -> String {
+    match profile_inputs(&catalogs.reader, &catalogs.relations, person) {
+        Ok(inputs) if inputs.len() == 1 => inputs[0].label.clone(),
+        _ => fmt_id(person),
+    }
+}
+
+fn persona_keys(catalogs: &NativeCatalogs, persona: Id) -> Result<HashSet<String>> {
+    let mut keys = HashSet::new();
+    for profile in profile_inputs(&catalogs.reader, &catalogs.relations, persona)? {
+        keys.insert(profile.label.to_ascii_lowercase());
+        keys.extend(
+            profile
+                .aliases
+                .into_iter()
+                .map(|alias| alias.to_ascii_lowercase()),
+        );
+    }
+    Ok(keys)
+}
+
+/// Every textual group selector that may currently address `persona`.
+///
+/// Attention is a conservative read projection, not a mutation precondition:
+/// a legitimate fork in one group must not disable every watcher. We therefore
+/// union names and membership over each group's maximal heads. Settled
+/// same-person components still participate in membership, while an exact id
+/// without a Relations person record simply belongs to no group yet.
+fn group_attention_keys(
+    reader: &PileReader,
+    facts: &TribleSet,
+    persona: Id,
+) -> Result<HashSet<String>> {
+    if !relations::person_anchors(facts).contains(&persona) {
+        return Ok(HashSet::new());
+    }
+    let equivalent = relations::IdentityComponents::from_facts(facts)?.component(persona)?;
+    let mut keys = HashSet::new();
+    for group in relations::group_anchors(facts) {
+        let heads = match relations::group_head(facts, group)? {
+            relations::Head::Missing => continue,
+            relations::Head::Unique(head) => vec![head],
+            relations::Head::Forked(heads) => heads,
         };
-        save_checkpoint_heads(
-            repo,
-            orient_state_branch_id,
-            &current_heads,
-            persona_view
-                .as_ref()
-                .map(|(pid, view, notes_delta)| (*pid, view, notes_delta)),
-        )?;
-        Ok(())
-    })
+        let snapshots: Vec<_> = heads
+            .into_iter()
+            .map(|head| relations::group_snapshot(facts, head))
+            .collect::<Result<_>>()?;
+        if snapshots
+            .iter()
+            .flat_map(|snapshot| snapshot.members.iter())
+            .any(|member| equivalent.contains(member))
+        {
+            for snapshot in snapshots {
+                keys.insert(relations::lookup_key(&relations::read_text(
+                    reader,
+                    snapshot.name,
+                )?));
+            }
+        }
+    }
+    Ok(keys)
 }
 
-fn load_watched_heads(
-    repo: &mut Repository<Pile>,
-    local_branch_id: Id,
-    compass_branch_id: Id,
-    relations_branch_id: Id,
-) -> Result<WatchedHeads> {
-    Ok(WatchedHeads {
-        local: branch_head_by_id(repo, local_branch_id)?,
-        compass: branch_head_by_id(repo, compass_branch_id)?,
-        relations: branch_head_by_id(repo, relations_branch_id)?,
-    })
+fn attention_keys(catalogs: &NativeCatalogs, persona: Id) -> Result<HashSet<String>> {
+    let mut keys = persona_keys(catalogs, persona)?;
+    keys.extend(group_attention_keys(
+        &catalogs.reader,
+        &catalogs.relations,
+        persona,
+    )?);
+    Ok(keys)
 }
 
-/// The persona-relevant view of the watched branches: what counts as
-/// NEWS for one zooid. Raw branch movement that doesn't change this
-/// view — the persona's own acks and sends, another persona's reads —
-/// is not news and must not wake the persona's watcher.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WatchedView {
-    unread: BTreeSet<Id>,
-    goals_view: String,
-    roster: BTreeSet<Id>,
-    // Cumulative seen note ids mapped to their goal for compact wake text.
-    // `load_watched_view` starts with the currently visible set; callers
-    // union the checkpoint history into it before comparing or saving.
-    notes: BTreeMap<Id, Id>,
-}
-
-#[derive(Debug, Clone)]
-struct CheckpointView {
-    view: WatchedView,
-    // False only for checkpoints written before notes_view existed. That
-    // transition establishes a quiet baseline instead of replaying history.
-    has_notes_view: bool,
+fn status_roster(catalogs: &NativeCatalogs) -> Result<BTreeSet<Id>> {
+    Ok(
+        status::latest_per_window(status::load_status_rows(&catalogs.status)?)?
+            .into_keys()
+            .collect(),
+    )
 }
 
 fn insert_note_goal(notes: &mut BTreeMap<Id, Id>, note_id: Id, goal_id: Id) {
@@ -780,134 +832,41 @@ fn insert_note_goal(notes: &mut BTreeMap<Id, Id>, note_id: Id, goal_id: Id) {
         })
         .or_insert(goal_id);
 }
-
-fn union_note_views(target: &mut BTreeMap<Id, Id>, source: &BTreeMap<Id, Id>) {
-    for (&note_id, &goal_id) in source {
-        insert_note_goal(target, note_id, goal_id);
-    }
-}
-
-fn newly_seen_notes(visible: &BTreeMap<Id, Id>, seen: &BTreeMap<Id, Id>) -> BTreeMap<Id, Id> {
-    visible
-        .iter()
-        .filter(|(note_id, _)| !seen.contains_key(*note_id))
-        .map(|(&note_id, &goal_id)| (note_id, goal_id))
-        .collect()
-}
-
-fn serialize_notes_view(notes: &BTreeMap<Id, Id>) -> String {
-    notes
-        .iter()
-        .map(|(note_id, goal_id)| format!("{note_id:x}:{goal_id:x}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn parse_notes_view(text: &str) -> Result<BTreeMap<Id, Id>> {
-    let mut notes = BTreeMap::new();
-    for (index, line) in text.lines().enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        let (note, goal) = line
-            .split_once(':')
-            .ok_or_else(|| anyhow!("invalid notes_view line {}: missing ':'", index + 1))?;
-        let note_id = Id::from_hex(note)
-            .ok_or_else(|| anyhow!("invalid note id on notes_view line {}", index + 1))?;
-        let goal_id = Id::from_hex(goal)
-            .ok_or_else(|| anyhow!("invalid goal id on notes_view line {}", index + 1))?;
-        insert_note_goal(&mut notes, note_id, goal_id);
-    }
-    Ok(notes)
-}
-
-/// Canonicalize a current visibility snapshot against the cumulative seen
-/// history. A legacy checkpoint has no note baseline, so all notes visible at
-/// upgrade time become seen without producing news.
-fn carry_seen_notes(seen: &mut WatchedView, current: &mut WatchedView, has_notes_view: bool) {
-    if !has_notes_view {
-        seen.notes = current.notes.clone();
-    }
-    union_note_views(&mut current.notes, &seen.notes);
-}
-
 fn load_watched_view(
-    repo: &mut Repository<Pile>,
+    catalogs: &NativeCatalogs,
     persona_id: Id,
-    local_branch_id: Id,
-    compass_branch_id: Id,
-    relations_branch_id: Id,
-) -> Result<WatchedView> {
-    let mut local_ws = repo
-        .pull(local_branch_id)
-        .map_err(|e| anyhow!("pull local workspace: {e:?}"))?;
-    let local_space = local_ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout local: {e:?}"))?;
-    let reads = load_reads(&local_space);
-    let message_rows = load_message_ids(&local_space);
-
-    let mut relations_ws = repo
-        .pull(relations_branch_id)
-        .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-    let relations_space = relations_ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-    let my_groups = groups_for_member(&relations_space, persona_id);
-    let unread = message_rows
-        .into_iter()
-        .filter(|msg| {
-            is_inbox_message(msg.from, msg.to, persona_id, &my_groups)
-                && !reads.contains_key(&(msg.id, persona_id))
-        })
-        .map(|msg| msg.id)
+) -> Result<orient_model::WatchedView> {
+    let identities = relations::IdentityComponents::from_facts(&catalogs.relations)?;
+    let reads = message::load_read_rows(&catalogs.messages)?;
+    let mut unread = BTreeSet::new();
+    for row in message::load_message_rows(&catalogs.messages)? {
+        if message::is_inbox_message(&row, persona_id, &catalogs.relations, &identities)?
+            && !message::is_read_by(&reads, row.id, persona_id, &identities)?
+        {
+            unread.insert(row.id);
+        }
+    }
+    let mail_unread = native_unread_mail(catalogs, persona_id)?
+        .into_keys()
         .collect();
 
-    // Only zooid personas count toward the watched roster. Bulk contact
-    // imports must not wake every watcher.
-    let roster = find!(
-        person_id: Id,
-        pattern!(&relations_space, [{
-            ?person_id @
-                metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID,
-                rel_attrs::affinity: "zooid",
-        }])
-    )
-    .collect();
-
-    // A goal tagged with one of this persona's normalized labels or aliases is
-    // explicitly addressed to them.
-    let persona_keys: HashSet<String> = find!(
-        key: String,
-        pattern!(&relations_space, [{ persona_id @ rel_attrs::label_norm: ?key }])
-    )
-    .chain(find!(
-        key: String,
-        pattern!(&relations_space, [{ persona_id @ rel_attrs::alias_norm: ?key }])
-    ))
-    .collect();
-
-    let mut compass_ws = repo
-        .pull(compass_branch_id)
-        .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
-    let compass_space = compass_ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
+    let roster = status_roster(catalogs)?;
+    let attention_keys = attention_keys(catalogs, persona_id)?;
 
     // One line per goal: "id:status:author:flags". Author is the acting
     // persona on the latest status event. Flags are i = this persona has
-    // authored a status or note on the goal, p = explicitly persona-tagged, and
-    // c = colony-tagged.
+    // authored a status or note on the goal, and a = addressed through a
+    // Relations person or group selector.
     let mut goal_lines = Vec::new();
     let mut relevant_goals = HashSet::new();
-    for id in find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
-        let authored_status = exists!(pattern!(&compass_space, [{
+    for id in find!(id: Id, pattern!(&catalogs.compass, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
+        let authored_status = exists!(pattern!(&catalogs.compass, [{
             _?evt @
             metadata::tag: &KIND_STATUS_ID,
             board::task: &id,
             board::by: &persona_id,
         }]));
-        let authored_note = exists!(pattern!(&compass_space, [{
+        let authored_note = exists!(pattern!(&catalogs.compass, [{
             _?evt @
             metadata::tag: &KIND_NOTE_ID,
             board::task: &id,
@@ -915,30 +874,26 @@ fn load_watched_view(
             board::by: &persona_id,
         }]));
         let involved = authored_status || authored_note;
-        let tags = entity_tags(&compass_space, id);
-        let persona_tagged = tags
+        let tags = entity_tags(&catalogs.compass, id);
+        let addressed = tags
             .iter()
-            .any(|tag| persona_keys.contains(&tag.to_ascii_lowercase()));
-        let colony_tagged = tags.iter().any(|tag| tag.eq_ignore_ascii_case("colony"));
+            .any(|tag| attention_keys.contains(&tag.to_ascii_lowercase()));
         let mut flags = String::new();
         if involved {
             flags.push('i');
         }
-        if persona_tagged {
-            flags.push('p');
+        if addressed {
+            flags.push('a');
         }
-        if colony_tagged {
-            flags.push('c');
-        }
-        if involved || persona_tagged || colony_tagged {
+        if involved || addressed {
             relevant_goals.insert(id);
         }
 
-        let line = match latest_status_event(&compass_space, id) {
+        let line = match latest_status_event(&catalogs.compass, id) {
             Some((event, status, _)) => {
                 let by = find!(
                     by: Id,
-                    pattern!(&compass_space, [{ event @ board::by: ?by }])
+                    pattern!(&catalogs.compass, [{ event @ board::by: ?by }])
                 )
                 .next()
                 .map(fmt_id)
@@ -953,13 +908,19 @@ fn load_watched_view(
 
     // Notes are neutral ledger records. A foreign or unattributed note is
     // visible when its goal is already relevant to this persona, or when the
-    // note itself carries a persona/colony attention tag. Own attributed
+    // note itself carries a Relations-resolvable attention tag. Own attributed
     // notes remain quiet; absence of attribution is deliberately not treated
     // as ownership.
-    let notes = visible_notes(&compass_space, persona_id, &persona_keys, &relevant_goals);
+    let notes = visible_notes(
+        &catalogs.compass,
+        persona_id,
+        &attention_keys,
+        &relevant_goals,
+    );
 
-    Ok(WatchedView {
+    Ok(orient_model::WatchedView {
         unread,
+        mail_unread,
         goals_view: goal_lines.join("\n"),
         roster,
         notes,
@@ -969,11 +930,18 @@ fn load_watched_view(
 /// What news is in `new` relative to `old`? Returns one line per
 /// item, empty = no news. Unread and roster are growth-only. Goal status
 /// changes wake only when the goal is relevant to this persona; a new goal
-/// wakes only when explicitly addressed by persona or colony tag.
-fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String> {
+/// wakes only when explicitly addressed by a Relations person or group tag.
+fn view_news(
+    old: &orient_model::WatchedView,
+    new: &orient_model::WatchedView,
+    persona_id: Id,
+) -> Vec<String> {
     let mut reasons = Vec::new();
     for msg in new.unread.difference(&old.unread) {
         reasons.push(format!("new message [{}]", fmt_id(*msg)));
+    }
+    for mail in new.mail_unread.difference(&old.mail_unread) {
+        reasons.push(format!("new mail [{}]", fmt_id(*mail)));
     }
 
     let parse = |view: &str| -> HashMap<String, (String, String, String)> {
@@ -997,7 +965,7 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
 
     for (id, (status, by, flags)) in &new_goals {
         let own_edit = *by == me;
-        let addressed = flags.contains('p') || flags.contains('c');
+        let addressed = flags.contains('a');
         let relevant = flags.contains('i') || addressed;
         match old_goals.get(id) {
             None if !own_edit && addressed => {
@@ -1011,7 +979,9 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
     }
 
     for person in new.roster.difference(&old.roster) {
-        reasons.push(format!("new person [{}]", fmt_id(*person)));
+        if *person != persona_id {
+            reasons.push(format!("new status window [{}]", fmt_id(*person)));
+        }
     }
     for (note_id, goal_id) in &new.notes {
         if !old.notes.contains_key(note_id) {
@@ -1025,201 +995,78 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
     reasons
 }
 
-fn load_checkpoint_heads(
-    repo: &mut Repository<Pile>,
-    orient_state_branch_id: Id,
-) -> Result<Option<WatchedHeads>> {
-    let Some(_head) = repo
-        .storage_mut()
-        .head(orient_state_branch_id)
-        .map_err(|e| anyhow!("orient state branch head: {e:?}"))?
-    else {
-        return Ok(None);
-    };
-    let mut ws = repo
-        .pull(orient_state_branch_id)
-        .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout orient state: {e:?}"))?;
-
-    let mut latest: Option<(Id, i128)> = None;
-    for (checkpoint_id, at) in find!(
-        (checkpoint_id: Id, at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?checkpoint_id @
-            metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
-            orient_state::at: ?at,
-        }])
-    ) {
-        let key = interval_key(at);
-        if latest.is_none_or(|(_, current)| key > current) {
-            latest = Some((checkpoint_id, key));
-        }
-    }
-
-    let Some((checkpoint_id, _)) = latest else {
-        return Ok(None);
-    };
-
-    Ok(Some(WatchedHeads {
-        local: load_optional_commit_head(&space, checkpoint_id, &orient_state::local_head),
-        compass: load_optional_commit_head(&space, checkpoint_id, &orient_state::compass_head),
-        relations: load_optional_commit_head(&space, checkpoint_id, &orient_state::relations_head),
-    }))
+fn latest_checkpoint_view(
+    catalogs: &NativeCatalogs,
+    persona: Id,
+) -> Result<Option<orient_model::WatchedView>> {
+    let events = orient_model::load_checkpoint_events(&catalogs.reader, &catalogs.checkpoints)?;
+    Ok(orient_model::latest_checkpoint(events, persona)?.map(|event| event.view))
 }
 
-fn load_optional_commit_head(
-    space: &TribleSet,
-    checkpoint_id: Id,
-    attr: &Attribute<inlineencodings::Handle<blobencodings::SimpleArchive>>,
-) -> Option<CommitHandle> {
-    find!(
-        value: CommitHandle,
-        pattern!(space, [{ checkpoint_id @ attr: ?value }])
-    )
-    .next()
-}
-
-/// Latest checkpoint VIEW saved by this persona, if any. Old-style
-/// checkpoints (no persona attribute) never match — each zooid's
-/// watch state is its own.
-fn load_checkpoint_view(
-    repo: &mut Repository<Pile>,
-    orient_state_branch_id: Id,
-    persona_id: Id,
-) -> Result<Option<CheckpointView>> {
-    let Some(_head) = repo
-        .storage_mut()
-        .head(orient_state_branch_id)
-        .map_err(|e| anyhow!("orient state branch head: {e:?}"))?
-    else {
-        return Ok(None);
-    };
-    let mut ws = repo
-        .pull(orient_state_branch_id)
-        .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout orient state: {e:?}"))?;
-
-    let mut checkpoints = Vec::new();
-    for (checkpoint_id, at) in find!(
-        (checkpoint_id: Id, at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?checkpoint_id @
-            metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
-            orient_state::persona: &persona_id,
-            orient_state::at: ?at,
-        }])
-    ) {
-        let key = interval_key(at);
-        checkpoints.push((checkpoint_id, key));
-    }
-    let Some((checkpoint_id, _)) = checkpoints
-        .iter()
-        .copied()
-        .max_by_key(|(checkpoint_id, key)| (*key, *checkpoint_id))
-    else {
-        return Ok(None);
-    };
-
-    let unread: BTreeSet<Id> = find!(
-        msg: Id,
-        pattern!(&space, [{ checkpoint_id @ orient_state::unread_msg: ?msg }])
-    )
-    .collect();
-    let goals_view = find!(
-        h: TextHandle,
-        pattern!(&space, [{ checkpoint_id @ orient_state::goals_view: ?h }])
-    )
-    .next()
-    .map(|h| read_text(&mut ws, h))
-    .transpose()?
-    .unwrap_or_default();
-    let roster: BTreeSet<Id> = find!(
-        person: Id,
-        pattern!(&space, [{ checkpoint_id @ orient_state::roster_member: ?person }])
-    )
-    .collect();
-
-    // notes_view is a per-checkpoint delta, unlike the latest-snapshot fields
-    // above. Union every persona checkpoint so two divergent committed
-    // checkpoints cannot cause either one's seen note IDs to replay later.
-    let mut notes = BTreeMap::new();
-    let mut has_notes_view = false;
-    for (checkpoint_id, _) in checkpoints {
-        let handles: Vec<TextHandle> = find!(
-            handle: TextHandle,
-            pattern!(&space, [{ checkpoint_id @ orient_state::notes_view: ?handle }])
-        )
-        .collect();
-        if !handles.is_empty() {
-            has_notes_view = true;
-        }
-        for handle in handles {
-            let encoded = read_text(&mut ws, handle)?;
-            union_note_views(&mut notes, &parse_notes_view(&encoded)?);
-        }
-    }
-
-    Ok(Some(CheckpointView {
-        view: WatchedView {
-            unread,
-            goals_view,
-            roster,
-            notes,
-        },
-        has_notes_view,
-    }))
-}
-
-fn save_checkpoint_heads(
-    repo: &mut Repository<Pile>,
-    orient_state_branch_id: Id,
-    heads: &WatchedHeads,
-    persona_view: Option<(Id, &WatchedView, &BTreeMap<Id, Id>)>,
+fn save_checkpoint(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    persona: Id,
+    view: &orient_model::WatchedView,
 ) -> Result<()> {
-    let mut ws = repo
-        .pull(orient_state_branch_id)
-        .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
-
-    let checkpoint_id = ufoid();
-    let now = epoch_interval(now_epoch());
-    let mut change = TribleSet::new();
-    change += entity! { &checkpoint_id @
-        metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
-        orient_state::at: now,
-        orient_state::local_head?: heads.local,
-        orient_state::compass_head?: heads.compass,
-        orient_state::relations_head?: heads.relations,
-    };
-    if let Some((persona_id, view, notes_delta)) = persona_view {
-        let goals_handle = ws.put(view.goals_view.clone());
-        // Persist only newly seen pairs. Presence of this handle, even when
-        // empty, marks the checkpoint as notes-aware. Readers union all
-        // committed deltas, so divergent checkpoints cannot replay an ID
-        // after both are visible; this is not a simultaneous-delivery lock.
-        let notes_handle = ws.put(serialize_notes_view(notes_delta));
-        change += entity! { &checkpoint_id @
-            orient_state::persona: &persona_id,
-            orient_state::goals_view: goals_handle,
-            orient_state::notes_view: notes_handle,
-            orient_state::unread_msg*: view.unread.iter(),
-            orient_state::roster_member*: view.roster.iter(),
-        };
-    }
-
-    ws.commit(change, "orient checkpoint");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow!("push orient checkpoint: {e:?}"))?;
+    let (fragment, _) =
+        orient_model::checkpoint_fragment(persona, view, epoch_interval(now_epoch()))?;
+    Collection::new(
+        pile,
+        faculties::schemas::orient::DEFAULT_SCOPE_ID,
+        signer.clone(),
+    )
+    .commit(fragment)
+    .map_err(|error| anyhow!("commit Orient semantic checkpoint: {error}"))?;
     Ok(())
 }
 
-fn branch_head_by_id(repo: &mut Repository<Pile>, branch_id: Id) -> Result<Option<CommitHandle>> {
-    repo.storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("branch head {:x}: {e:?}", branch_id))
+fn cmd_show(
+    pile_path: &Path,
+    key: Option<&Path>,
+    persona: Option<&str>,
+    message_limit: usize,
+    doing_limit: usize,
+    todo_limit: usize,
+) -> Result<()> {
+    let signer = load_signer(pile_path, key)?;
+    let mut pile = open_pile_strict(pile_path)?;
+    let mut habits = None;
+    let result = (|| {
+        let catalogs = load_native_catalogs(&mut pile, &signer)?;
+        let persona_id = persona
+            .map(|input| resolve_native_persona(&catalogs, input))
+            .transpose()?;
+        let messages = render_native_messages(&catalogs, persona_id, message_limit)?;
+        let mail = render_native_mail(&catalogs, persona_id, message_limit)?;
+        habits = Some(render_native_habits(&observe_habits(
+            &catalogs,
+            pile_path,
+            epoch_seconds(now_epoch()),
+        )?));
+        let goals = render_native_compass_goals(&catalogs, doing_limit, todo_limit);
+        let window_status = render_window_status(&catalogs)?;
+        if let Some(persona_id) = persona_id {
+            let view = load_watched_view(&catalogs, persona_id)?;
+            if latest_checkpoint_view(&catalogs, persona_id)?.as_ref() != Some(&view) {
+                save_checkpoint(&mut pile, &signer, persona_id, &view)?;
+            }
+        }
+        Ok((messages, mail, goals, window_status))
+    })();
+    let (messages, mail, goals, window_status) = close_pile(pile, result)?;
+    let habits =
+        habits.ok_or_else(|| anyhow!("native observation produced no Habits presentation"))?;
+
+    println!("Orient");
+    print!("{messages}");
+    print!("{mail}");
+
+    println!();
+    print!("{habits}");
+    print!("{goals}");
+    print!("{window_status}");
+    Ok(())
 }
 
 fn parse_wait_target(target: Option<&WaitTarget>) -> Result<Option<Duration>> {
@@ -1327,52 +1174,58 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
     }
 }
 
-/// Print only the *novel* content behind the news — new messages (sender +
-/// body) and newly-arrived zooids — so a woken watcher gets what actually
-/// changed, not a full re-dump of the snapshot. The `News:` reason lines
-/// are printed by the caller; this fills in the detail worth reading.
+/// Print only the *novel* content behind the news — new messages and Mail,
+/// plus newly-arrived roster members — so a woken watcher gets what changed,
+/// not a full re-dump of the snapshot. The `News:` reason lines are printed by
+/// the caller; this fills in the detail worth reading.
 fn print_news_detail(
-    repo: &mut Repository<Pile>,
-    old: &WatchedView,
-    new: &WatchedView,
-    local_branch_id: Id,
-    relations_branch_id: Id,
+    catalogs: &NativeCatalogs,
+    old: &orient_model::WatchedView,
+    new: &orient_model::WatchedView,
+    persona_id: Id,
 ) -> Result<()> {
     let new_msgs: Vec<Id> = new.unread.difference(&old.unread).copied().collect();
     if !new_msgs.is_empty() {
-        let mut local_ws = repo
-            .pull(local_branch_id)
-            .map_err(|e| anyhow!("pull local: {e:?}"))?;
-        let local_space = local_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout local: {e:?}"))?;
-        let mut rel_ws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rel_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-        let rows = load_message_ids(&local_space);
+        let rows = message::load_message_rows(&catalogs.messages)?;
         println!("\nNew messages:");
         for id in &new_msgs {
             if let Some(row) = rows.iter().find(|r| r.id == *id) {
-                let from = person_label(&mut rel_ws, &rel_space, row.from);
-                let body = resolve_message_body(&mut local_ws, &local_space, *id);
+                let from = native_person_label(catalogs, row.from);
+                let body = message::read_body(&catalogs.reader, row.body)?;
                 println!("- {from}: {body}");
             }
         }
     }
-    let new_people: Vec<Id> = new.roster.difference(&old.roster).copied().collect();
+    let new_mail: Vec<Id> = new
+        .mail_unread
+        .difference(&old.mail_unread)
+        .copied()
+        .collect();
+    if !new_mail.is_empty() {
+        let summaries = native_unread_mail(catalogs, persona_id)?;
+        println!("\nNew mail:");
+        for wire in &new_mail {
+            let summary = summaries.get(wire).ok_or_else(|| {
+                anyhow!("new Mail wire {} vanished from current view", fmt_id(*wire))
+            })?;
+            println!(
+                "- [{}] {} — {}",
+                fmt_id(*wire),
+                summary.from.as_deref().unwrap_or("(no From)"),
+                summary.subject,
+            );
+        }
+    }
+    let new_people: Vec<Id> = new
+        .roster
+        .difference(&old.roster)
+        .copied()
+        .filter(|person| *person != persona_id)
+        .collect();
     if !new_people.is_empty() {
-        let mut rel_ws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rel_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-        println!("\nNew zooid(s):");
+        println!("\nNew status window(s):");
         for id in &new_people {
-            println!("- {}", person_label(&mut rel_ws, &rel_space, *id));
+            println!("- {}", native_person_label(catalogs, *id));
         }
     }
     Ok(())
@@ -1382,80 +1235,49 @@ fn print_news_detail(
 enum NewsCheck {
     /// News was printed tersely and the checkpoint advanced.
     Fired,
-    /// A checkpoint exists and nothing is new. Carries the freshly
-    /// loaded view so `wait` can use it as its loop baseline.
-    Quiet(WatchedView),
+    /// A checkpoint exists and nothing is new.
+    Quiet,
     /// No checkpoint for this persona yet — the caller decides how to
     /// establish the baseline (`wait` and non-peeking `poll` save it
     /// silently; peeking remains read-only).
-    NoCheckpoint(WatchedView),
+    NoCheckpoint(orient_model::WatchedView),
 }
 
 /// One shot of the wait fire-path for a persona: load the current
 /// watched view, diff it against the persona's last checkpoint, and if
 /// there is news print the terse report (`News:` reasons + the novel
-/// message bodies / zooids) and advance the checkpoint. Shared by
+/// message bodies / status windows) and advance the checkpoint. Shared by
 /// `wait` (pre-loop check) and `poll` (the whole command) — one code
 /// path, blocking vs non-blocking only in the caller.
 fn check_news_once(
-    repo: &mut Repository<Pile>,
+    pile: &mut Pile,
+    signer: &SigningKey,
+    catalogs: &NativeCatalogs,
     persona_id: Id,
-    heads: &WatchedHeads,
-    local_branch_id: Id,
-    compass_branch_id: Id,
-    relations_branch_id: Id,
-    orient_state_branch_id: Id,
     peek: bool,
 ) -> Result<NewsCheck> {
-    let mut view = load_watched_view(
-        repo,
-        persona_id,
-        local_branch_id,
-        compass_branch_id,
-        relations_branch_id,
-    )?;
-    let Some(mut seen) = load_checkpoint_view(repo, orient_state_branch_id, persona_id)? else {
+    let view = load_watched_view(catalogs, persona_id)?;
+    let Some(seen) = latest_checkpoint_view(catalogs, persona_id)? else {
         return Ok(NewsCheck::NoCheckpoint(view));
     };
-    let legacy_upgrade = !seen.has_notes_view;
-    let notes_delta = newly_seen_notes(&view.notes, &seen.view.notes);
-    carry_seen_notes(&mut seen.view, &mut view, seen.has_notes_view);
-    let reasons = view_news(&seen.view, &view, persona_id);
+    let reasons = view_news(&seen, &view, persona_id);
     if reasons.is_empty() {
-        // Quiet changes still update the comparison baseline. Peek remains
-        // strictly read-only.
-        if !peek && (legacy_upgrade || view != seen.view) {
-            save_checkpoint_heads(
-                repo,
-                orient_state_branch_id,
-                heads,
-                Some((persona_id, &view, &notes_delta)),
-            )?;
+        if !peek && view != seen {
+            save_checkpoint(pile, signer, persona_id, &view)?;
         }
-        return Ok(NewsCheck::Quiet(view));
+        return Ok(NewsCheck::Quiet);
     }
     for reason in &reasons {
         println!("News: {reason}");
     }
-    print_news_detail(
-        repo,
-        &seen.view,
-        &view,
-        local_branch_id,
-        relations_branch_id,
-    )?;
+    print_news_detail(catalogs, &seen, &view, persona_id)?;
     // Advance the checkpoint — the terse path skips cmd_show, which is
     // what normally saves it. Without this the checkpoint never moves
     // and every re-arm / next poll instantly re-fires on the same news.
     // Peek mode skips the save: report without consuming, for hooks that
     // can't tell whose turn they fire on (root vs subagent).
     if !peek {
-        save_checkpoint_heads(
-            repo,
-            orient_state_branch_id,
-            heads,
-            Some((persona_id, &view, &notes_delta)),
-        )?;
+        save_checkpoint(pile, signer, persona_id, &view)?;
     }
     Ok(NewsCheck::Fired)
 }
@@ -1463,56 +1285,33 @@ fn check_news_once(
 /// One-shot, non-blocking `wait`: report news since the persona's
 /// checkpoint tersely, or print nothing and exit 0. Meant for per-turn
 /// harness hooks (UserPromptSubmit and friends) so busy sessions
-/// passively ingest colony news at every turn boundary, while `wait`
+/// passively ingest team news at every turn boundary, while `wait`
 /// keeps its job of waking idle ones.
-fn cmd_poll(pile: &Path, persona: Option<&str>, peek: bool) -> Result<()> {
-    with_repo(pile, |repo| {
-        let compass_branch_id = repo
-            .ensure_branch("compass", None)
-            .map_err(|e| anyhow!("ensure compass branch: {e:?}"))?;
-        let local_branch_id = repo
-            .ensure_branch("message", None)
-            .map_err(|e| anyhow!("ensure message branch: {e:?}"))?;
-        let relations_branch_id = repo
-            .ensure_branch("relations", None)
-            .map_err(|e| anyhow!("ensure relations branch: {e:?}"))?;
-        let orient_state_branch_id = repo
-            .ensure_branch("orient-state", None)
-            .map_err(|e| anyhow!("ensure orient-state branch: {e:?}"))?;
+fn close_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+    match (result, pile.close()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(anyhow!("close pile: {error}")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing pile also failed: {close_error}")))
+        }
+    }
+}
 
-        let Some(input) = persona else {
-            bail!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
-        };
-        let persona_id = {
-            let mut relations_ws = repo
-                .pull(relations_branch_id)
-                .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-            let relations_space = relations_ws
-                .checkout(..)
-                .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-            resolve_persona(&relations_space, input)?
-        };
-
-        let heads = load_watched_heads(
-            repo,
-            local_branch_id,
-            compass_branch_id,
-            relations_branch_id,
-        )?;
-        match check_news_once(
-            repo,
-            persona_id,
-            &heads,
-            local_branch_id,
-            compass_branch_id,
-            relations_branch_id,
-            orient_state_branch_id,
-            peek,
-        )? {
+fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: bool) -> Result<()> {
+    let Some(input) = persona else {
+        bail!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
+    };
+    let signer = load_signer(pile_path, key)?;
+    let mut pile = open_pile_strict(pile_path)?;
+    let result = (|| {
+        let catalogs = load_native_catalogs(&mut pile, &signer)?;
+        let persona_id = resolve_native_persona(&catalogs, input)?;
+        match check_news_once(&mut pile, &signer, &catalogs, persona_id, peek)? {
             // News printed (+ checkpoint advanced unless peeking).
             NewsCheck::Fired => {}
             // No news: print nothing, write nothing.
-            NewsCheck::Quiet(_) => {}
+            NewsCheck::Quiet => {}
             // First poll for this persona: establish a baseline silently.
             // Dumping "everything currently unread" is a snapshot's job
             // (`orient show`), not a turn-boundary hook's; subsequent
@@ -1521,23 +1320,18 @@ fn cmd_poll(pile: &Path, persona: Option<&str>, peek: bool) -> Result<()> {
             // root persona's checkpoint).
             NewsCheck::NoCheckpoint(view) => {
                 if !peek {
-                    let notes_delta = view.notes.clone();
-                    save_checkpoint_heads(
-                        repo,
-                        orient_state_branch_id,
-                        &heads,
-                        Some((persona_id, &view, &notes_delta)),
-                    )?;
+                    save_checkpoint(&mut pile, &signer, persona_id, &view)?;
                 }
-                let _ = view;
             }
         }
         Ok(())
-    })
+    })();
+    close_pile(pile, result)
 }
 
 fn cmd_wait(
-    pile: &Path,
+    pile_path: &Path,
+    key: Option<&Path>,
     persona: Option<&str>,
     target: Option<WaitTarget>,
     message_limit: usize,
@@ -1545,81 +1339,36 @@ fn cmd_wait(
     todo_limit: usize,
     poll_ms: u64,
 ) -> Result<()> {
+    let Some(persona_input) = persona else {
+        bail!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
+    };
     let timeout = parse_wait_target(target.as_ref())?;
-    let (detected_change_before_wait, changed, news_printed) = with_repo(pile, |repo| {
-        let compass_branch_id = repo
-            .ensure_branch("compass", None)
-            .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
-        let local_branch_id = repo
-            .ensure_branch("message", None)
-            .map_err(|e| anyhow::anyhow!("ensure message branch: {e:?}"))?;
-        let relations_branch_id = repo
-            .ensure_branch("relations", None)
-            .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
-        let orient_state_branch_id = repo
-            .ensure_branch("orient-state", None)
-            .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
+    let signer = load_signer(pile_path, key)?;
+    let mut pile = open_pile_strict(pile_path)?;
+    let result = (|| {
+        // This is a processed-prefix watermark, not a last-observed size.
+        // Sample before refresh: bytes appended while materializing the
+        // baseline then remain beyond the watermark and force another pass.
+        let mut observed_length = std::fs::metadata(pile_path)
+            .map_err(|error| anyhow!("stat pile {}: {error}", pile_path.display()))?
+            .len();
+        pile.refresh()
+            .map_err(|error| anyhow!("refresh pile {}: {error}", pile_path.display()))?;
+        let mut catalogs = load_native_catalogs(&mut pile, &signer)?;
+        let persona_id = resolve_native_persona(&catalogs, persona_input)?;
+        // Already-due habits establish a quiet, process-local baseline. A
+        // rearmed one-shot watcher therefore waits for a transition instead
+        // of reporting the same unsatisfied intention forever.
+        let mut habit_seen = observe_habits(&catalogs, pile_path, epoch_seconds(now_epoch()))?;
+        let mut last_habit_sweep = Instant::now();
 
-        let mut baseline_heads = load_watched_heads(
-            repo,
-            local_branch_id,
-            compass_branch_id,
-            relations_branch_id,
-        )?;
-
-        // With a persona, the wake condition is NEWS for that persona
-        // (a new unread message, a goals change) — not raw branch
-        // movement, which would fire on the persona's own acks/sends.
-        let persona_id = match persona {
-            Some(input) => {
-                let mut relations_ws = repo
-                    .pull(relations_branch_id)
-                    .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-                let relations_space = relations_ws
-                    .checkout(..)
-                    .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-                Some(resolve_persona(&relations_space, input)?)
+        match check_news_once(&mut pile, &signer, &catalogs, persona_id, false)? {
+            NewsCheck::Fired => return Ok((true, true)),
+            NewsCheck::Quiet => {}
+            NewsCheck::NoCheckpoint(view) => {
+                save_checkpoint(&mut pile, &signer, persona_id, &view)?;
             }
-            None => None,
-        };
-
-        let mut baseline_view = match persona_id {
-            Some(pid) => match check_news_once(
-                repo,
-                pid,
-                &baseline_heads,
-                local_branch_id,
-                compass_branch_id,
-                relations_branch_id,
-                orient_state_branch_id,
-                false,
-            )? {
-                NewsCheck::Fired => return Ok((true, true, true)),
-                NewsCheck::Quiet(view) => Some(view),
-                NewsCheck::NoCheckpoint(view) => {
-                    // A wait may run for hours before another watched branch
-                    // moves. Persist its quiet initial note baseline now; if
-                    // only a later delta were saved, these pre-existing IDs
-                    // could replay after the watcher restarted.
-                    let notes_delta = view.notes.clone();
-                    save_checkpoint_heads(
-                        repo,
-                        orient_state_branch_id,
-                        &baseline_heads,
-                        Some((pid, &view, &notes_delta)),
-                    )?;
-                    Some(view)
-                }
-            },
-            None => {
-                if let Some(last_seen) = load_checkpoint_heads(repo, orient_state_branch_id)? {
-                    if baseline_heads != last_seen {
-                        return Ok((true, true, false));
-                    }
-                }
-                None
-            }
-        };
+        }
 
         let poll = Duration::from_millis(poll_ms.max(1));
         let start = Instant::now();
@@ -1627,80 +1376,81 @@ fn cmd_wait(
         loop {
             if let Some(timeout) = timeout {
                 if start.elapsed() >= timeout {
-                    return Ok((false, false, false));
+                    return Ok((false, false));
                 }
             }
             std::thread::sleep(poll);
-            let current_heads = load_watched_heads(
-                repo,
-                local_branch_id,
-                compass_branch_id,
-                relations_branch_id,
-            )?;
-            if current_heads == baseline_heads {
+            let current_length = std::fs::metadata(pile_path)
+                .map_err(|error| anyhow!("stat pile {}: {error}", pile_path.display()))?
+                .len();
+            let pile_changed = current_length != observed_length;
+            let now_secs = epoch_seconds(now_epoch());
+            let cooldown_elapsed = habit_seen
+                .next_cooldown_at
+                .is_some_and(|deadline| now_secs >= deadline);
+            let periodic_condition_check = last_habit_sweep.elapsed() >= Duration::from_secs(60);
+            if !pile_changed && !cooldown_elapsed && !periodic_condition_check {
                 continue;
             }
-            match (persona_id, baseline_view.as_mut()) {
-                (Some(pid), Some(view)) => {
-                    let mut current_view = load_watched_view(
-                        repo,
-                        pid,
-                        local_branch_id,
-                        compass_branch_id,
-                        relations_branch_id,
-                    )?;
-                    let notes_delta = newly_seen_notes(&current_view.notes, &view.notes);
-                    union_note_views(&mut current_view.notes, &view.notes);
-                    let reasons = view_news(view, &current_view, pid);
-                    if !reasons.is_empty() {
-                        for reason in &reasons {
-                            println!("News: {reason}");
-                        }
-                        print_news_detail(
-                            repo,
-                            view,
-                            &current_view,
-                            local_branch_id,
-                            relations_branch_id,
-                        )?;
-                        // Advance the checkpoint (terse path skips cmd_show).
-                        save_checkpoint_heads(
-                            repo,
-                            orient_state_branch_id,
-                            &current_heads,
-                            Some((pid, &current_view, &notes_delta)),
-                        )?;
-                        return Ok((false, true, true));
+
+            if pile_changed {
+                pile.refresh()
+                    .map_err(|error| anyhow!("refresh pile {}: {error}", pile_path.display()))?;
+                catalogs = load_native_catalogs(&mut pile, &signer)?;
+            }
+
+            // This happens before the append-driven news path. If ordinary
+            // news and a Habit transition arrive together, both are printed
+            // before the one-shot watcher exits; rearming cannot erase either.
+            let current_habits = observe_habits(&catalogs, pile_path, now_secs)?;
+            let habit_fired = print_habit_transitions(&habit_seen, &current_habits);
+            habit_seen = current_habits;
+            last_habit_sweep = Instant::now();
+
+            let ordinary_fired = if pile_changed {
+                match check_news_once(&mut pile, &signer, &catalogs, persona_id, false)? {
+                    NewsCheck::Fired => true,
+                    NewsCheck::Quiet => false,
+                    NewsCheck::NoCheckpoint(view) => {
+                        // This can only happen if an external rewrite removed
+                        // the append-only checkpoint collection. Retain total
+                        // behavior without inventing a partial baseline.
+                        save_checkpoint(&mut pile, &signer, persona_id, &view)?;
+                        false
                     }
-                    // Movement without news (an own edit or another persona's
-                    // traffic) is absorbed while the watcher keeps waiting.
-                    if *view != current_view {
-                        save_checkpoint_heads(
-                            repo,
-                            orient_state_branch_id,
-                            &current_heads,
-                            Some((pid, &current_view, &notes_delta)),
-                        )?;
-                    }
-                    baseline_heads = current_heads;
-                    *view = current_view;
                 }
-                _ => return Ok((false, true, false)),
+            } else {
+                false
+            };
+            if habit_fired || ordinary_fired {
+                return Ok((true, true));
+            }
+            // Advance only through the exact prefix refreshed above. An
+            // external append (or our own checkpoint append) which raced with
+            // processing remains beyond this watermark and triggers another
+            // refresh instead of being silently swallowed.
+            if pile_changed {
+                observed_length = current_length;
             }
         }
-    })?;
+    })();
+    let (changed, news_printed) = close_pile(pile, result)?;
     if news_printed {
         // Terse path: the News: reasons and the novel detail were already
         // printed inside the wait loop — don't re-dump the full snapshot.
         return Ok(());
     }
-    if detected_change_before_wait {
-        println!("Detected branch changes since last orientation snapshot; returning immediately.");
-    }
     if !changed {
         println!("No change detected since wait started; showing current snapshot.");
     }
-    cmd_show(pile, persona, message_limit, doing_limit, todo_limit)
+    cmd_show(
+        pile_path,
+        key,
+        persona,
+        message_limit,
+        doing_limit,
+        todo_limit,
+    )
 }
 
 fn render_tags(tags: &[String]) -> String {
@@ -1726,104 +1476,67 @@ fn render_tags(tags: &[String]) -> String {
     )
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        // Avoid Drop warnings on early errors.
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))
-}
-
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
 /// `orient wake` — assemble the full wake bundle a fresh face reads to come
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
-/// goals. READ-ONLY: it pulls and checks out, never writes to any branch.
-fn cmd_wake(pile: &Path, chars: usize, doing_limit: usize, todo_limit: usize) -> Result<()> {
-    with_repo(pile, |repo| {
-        // (1) Memory cover — the same render `memory context` produces.
-        let memory_branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut memory_ws = repo
-            .pull(memory_branch_id)
-            .map_err(|e| anyhow!("pull memory workspace: {e:?}"))?;
-        let memory_space = memory_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout memory: {e:?}"))?;
-        print!(
-            "{}",
-            render_cover(&memory_space, &mut memory_ws, &CoverOpts::plain(chars))?
-        );
-        drop(memory_ws);
+/// goals. READ-ONLY: it materializes or checks out, but publishes nothing.
+fn cmd_wake(
+    pile: &Path,
+    key: Option<&Path>,
+    chars: usize,
+    doing_limit: usize,
+    todo_limit: usize,
+) -> Result<()> {
+    // Memory, Wiki, and Compass all come from one refreshed native snapshot.
+    // A plain wake cover never consults rebuildable embeddings, so it
+    // deliberately cannot be taken down by a missing or corrupt embedding
+    // artifact. Exact preserved legacy rows remain durable evidence without
+    // becoming duplicate memories or beliefs in the native projections.
+    let signer = load_signer(pile, key)?;
+    let mut storage = open_pile_strict(pile)?;
+    let result = (|| {
+        let memory_facts = materialize_scope(&mut storage, &signer, MEMORY_SCOPE_ID, "Memory")?;
+        let wiki_facts = materialize_scope(&mut storage, &signer, WIKI_SCOPE_ID, "Wiki")?;
+        let catalogs = load_native_catalogs(&mut storage, &signer)?;
 
-        // (2) Cover-tagged wiki beliefs — the ambient always-true set.
-        println!();
-        println!("Beliefs (cover):");
-        let wiki_branch_id = repo
-            .ensure_branch(WIKI_BRANCH_NAME, None)
-            .map_err(|e| anyhow!("ensure wiki branch: {e:?}"))?;
-        let mut wiki_ws = repo
-            .pull(wiki_branch_id)
-            .map_err(|e| anyhow!("pull wiki workspace: {e:?}"))?;
-        let wiki_space = wiki_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout wiki: {e:?}"))?;
-        let beliefs = cover_fragments(&wiki_space, &mut wiki_ws);
-        if beliefs.is_empty() {
-            println!("- None");
-        } else {
-            for (title, content) in &beliefs {
-                println!("- {title}");
-                for line in content.lines() {
-                    println!("    {line}");
-                }
+        let memory_catalog = memory_model::validate_catalog(&catalogs.reader, &memory_facts)
+            .map_err(|error| anyhow!("validate Memory collection: {error:#}"))?;
+        let nodes = memory_catalog.node_ids();
+        let mut memory = TribleSet::new();
+        for fact in memory_facts.iter().filter(|fact| nodes.contains(fact.e())) {
+            memory.insert(fact);
+        }
+        let cover = render_cover(
+            &memory,
+            &TribleSet::new(),
+            &catalogs.reader,
+            &CoverOpts::plain(chars),
+        )?;
+
+        let wiki_catalog = wiki_model::validate_catalog(&catalogs.reader, &wiki_facts)
+            .map_err(|error| anyhow!("validate Wiki collection: {error:#}"))?;
+        let beliefs = wiki_model::cover_fragments(&catalogs.reader, &wiki_catalog)?;
+        let goals = render_native_compass_goals(&catalogs, doing_limit, todo_limit);
+        Ok((cover, beliefs, goals))
+    })();
+    let (cover, beliefs, goals) = close_pile(storage, result)?;
+
+    print!("{cover}");
+    println!();
+    println!("Beliefs (cover):");
+    if beliefs.is_empty() {
+        println!("- None");
+    } else {
+        for (title, content) in beliefs {
+            println!("- {title}");
+            for line in content.lines() {
+                println!("    {line}");
             }
         }
-        drop(wiki_ws);
-
-        // (3) Compass goals — exactly as the orient snapshot renders them.
-        println!();
-        let compass_branch_id = repo
-            .ensure_branch("compass", None)
-            .map_err(|e| anyhow!("ensure compass branch: {e:?}"))?;
-        let mut compass_ws = repo
-            .pull(compass_branch_id)
-            .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
-        let compass_space = compass_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
-        print!(
-            "{}",
-            render_compass_goals(&mut compass_ws, &compass_space, doing_limit, todo_limit)
-        );
-        drop(compass_ws);
-
-        Ok(())
-    })
+    }
+    println!();
+    print!("{goals}");
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -1841,6 +1554,7 @@ fn main() -> Result<()> {
             todo_limit,
         } => cmd_show(
             &cli.pile,
+            cli.key.as_deref(),
             cli.persona.as_deref(),
             message_limit,
             doing_limit,
@@ -1854,6 +1568,7 @@ fn main() -> Result<()> {
             poll_ms,
         } => cmd_wait(
             &cli.pile,
+            cli.key.as_deref(),
             cli.persona.as_deref(),
             target,
             message_limit,
@@ -1865,8 +1580,16 @@ fn main() -> Result<()> {
             chars,
             doing_limit,
             todo_limit,
-        } => cmd_wake(&cli.pile, chars, doing_limit, todo_limit),
-        Command::Poll { peek } => cmd_poll(&cli.pile, cli.persona.as_deref(), peek),
+        } => cmd_wake(
+            &cli.pile,
+            cli.key.as_deref(),
+            chars,
+            doing_limit,
+            todo_limit,
+        ),
+        Command::Poll { peek } => {
+            cmd_poll(&cli.pile, cli.key.as_deref(), cli.persona.as_deref(), peek)
+        }
     }
 }
 
@@ -1878,15 +1601,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
-
-    fn view(goals_view: impl Into<String>) -> WatchedView {
-        WatchedView {
-            unread: BTreeSet::new(),
-            goals_view: goals_view.into(),
-            roster: BTreeSet::new(),
-            notes: BTreeMap::new(),
-        }
-    }
 
     struct TestPile {
         dir: PathBuf,
@@ -1901,7 +1615,7 @@ mod tests {
                 .as_nanos();
             let sequence = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "faculties-orient-note-{}-{nonce}-{sequence}",
+                "faculties-orient-native-{}-{nonce}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir_all(&dir).unwrap();
@@ -1917,11 +1631,34 @@ mod tests {
         }
     }
 
+    fn commit_scope(pile: &mut Pile, signer: &SigningKey, scope: Id, fragment: Fragment) {
+        Collection::new(pile, scope, signer.clone())
+            .commit(fragment)
+            .unwrap();
+    }
+
+    fn profile(label: &str) -> relations::ProfileInput {
+        relations::ProfileInput {
+            label: label.to_owned(),
+            ..relations::ProfileInput::default()
+        }
+    }
+
+    fn view(goals_view: impl Into<String>) -> orient_model::WatchedView {
+        orient_model::WatchedView {
+            unread: BTreeSet::new(),
+            mail_unread: BTreeSet::new(),
+            goals_view: goals_view.into(),
+            roster: BTreeSet::new(),
+            notes: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn addressed_new_goal_wakes() {
         let me = ufoid().id;
         let goal = ufoid().id;
-        let news = view_news(&view(""), &view(format!("{goal:x}:todo::p")), me);
+        let news = view_news(&view(""), &view(format!("{goal:x}:todo::a")), me);
         assert_eq!(news, [format!("new goal [{goal:x}] (todo)")]);
     }
 
@@ -1936,8 +1673,8 @@ mod tests {
     fn own_status_change_is_quiet() {
         let me = ufoid().id;
         let goal = ufoid().id;
-        let old = view(format!("{goal:x}:todo:{me:x}:ip"));
-        let new = view(format!("{goal:x}:doing:{me:x}:ip"));
+        let old = view(format!("{goal:x}:todo:{me:x}:ia"));
+        let new = view(format!("{goal:x}:doing:{me:x}:ia"));
         assert!(view_news(&old, &new, me).is_empty());
     }
 
@@ -1946,8 +1683,8 @@ mod tests {
         let me = ufoid().id;
         let peer = ufoid().id;
         let goal = ufoid().id;
-        let old = view(format!("{goal:x}:todo:{peer:x}:p"));
-        let new = view(format!("{goal:x}:doing:{peer:x}:p"));
+        let old = view(format!("{goal:x}:todo:{peer:x}:a"));
+        let new = view(format!("{goal:x}:doing:{peer:x}:a"));
         assert_eq!(
             view_news(&old, &new, me),
             [format!("goal [{goal:x}]: todo → doing")]
@@ -1968,9 +1705,23 @@ mod tests {
             news,
             [
                 format!("new message [{message:x}]"),
-                format!("new person [{person:x}]"),
+                format!("new status window [{person:x}]"),
             ]
         );
+    }
+
+    #[test]
+    fn unread_mail_growth_wakes_and_read_removal_is_quiet() {
+        let me = ufoid().id;
+        let wire = ufoid().id;
+        let old = view("");
+        let mut unread = old.clone();
+        unread.mail_unread.insert(wire);
+        assert_eq!(
+            view_news(&old, &unread, me),
+            [format!("new mail [{wire:x}]")]
+        );
+        assert!(view_news(&unread, &old, me).is_empty());
     }
 
     #[test]
@@ -1988,141 +1739,322 @@ mod tests {
     }
 
     #[test]
-    fn legacy_checkpoint_establishes_a_quiet_note_baseline() {
-        let me = ufoid().id;
-        let goal = ufoid().id;
-        let existing = ufoid().id;
-        let later = ufoid().id;
-        let mut seen = view("");
-        let mut current = view("");
-        current.notes.insert(existing, goal);
-
-        carry_seen_notes(&mut seen, &mut current, false);
-        assert!(view_news(&seen, &current, me).is_empty());
-
-        let baseline = current;
-        let mut next = baseline.clone();
-        next.notes.insert(later, goal);
-        assert_eq!(
-            view_news(&baseline, &next, me),
-            [format!("new note [{later:x}] on goal [{goal:x}]")]
-        );
-    }
-
-    #[test]
-    fn divergent_committed_note_deltas_union_without_later_replay() {
-        let me = ufoid().id;
-        let goal = ufoid().id;
-        let first = ufoid().id;
-        let second = ufoid().id;
-        let left = BTreeMap::from([(first, goal)]);
-        let right = BTreeMap::from([(second, goal)]);
-        let visible = BTreeMap::from([(first, goal), (second, goal)]);
-        assert_eq!(newly_seen_notes(&visible, &left), right);
-        let mut union = left;
-        union_note_views(&mut union, &right);
-
-        let encoded = serialize_notes_view(&union);
-        let decoded = parse_notes_view(&encoded).unwrap();
-        assert_eq!(decoded, BTreeMap::from([(first, goal), (second, goal)]));
-
-        let mut seen = view("");
-        seen.notes = decoded;
-        let mut current = view("");
-        current.notes = BTreeMap::from([(first, goal), (second, goal)]);
-        carry_seen_notes(&mut seen, &mut current, true);
-        assert!(view_news(&seen, &current, me).is_empty());
-    }
-
-    #[test]
-    fn stored_legacy_and_divergent_checkpoint_deltas_upgrade_and_union() {
-        let pile = TestPile::new();
+    fn same_view_after_different_collection_history_is_silent() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
         let persona = ufoid().id;
-        let goal = ufoid().id;
-        let existing = ufoid().id;
-        let concurrent = ufoid().id;
-        let mut repo = open_repo(&pile.path).unwrap();
-        let branch_id = repo.ensure_branch("orient-state", None).unwrap();
-
-        // Write the old shape directly: persona view, but no notes_view.
-        let mut ws = repo.pull(branch_id).unwrap();
-        let checkpoint = ufoid();
-        let at = epoch_interval(now_epoch());
-        let goals = ws.put(String::new());
-        let mut change = TribleSet::new();
-        change += entity! { &checkpoint @
-            metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
-            orient_state::at: at,
-            orient_state::persona: &persona,
-            orient_state::goals_view: goals,
-        };
-        ws.commit(change, "legacy orient checkpoint");
-        repo.push(&mut ws).unwrap();
-
-        let mut loaded = load_checkpoint_view(&mut repo, branch_id, persona)
-            .unwrap()
-            .unwrap();
-        assert!(!loaded.has_notes_view);
-        let mut current = view("");
-        current.notes.insert(existing, goal);
-        carry_seen_notes(&mut loaded.view, &mut current, loaded.has_notes_view);
-        assert!(view_news(&loaded.view, &current, persona).is_empty());
-
-        let heads = WatchedHeads {
-            local: None,
-            compass: None,
-            relations: None,
-        };
-        let initial_delta = BTreeMap::from([(existing, goal)]);
-        save_checkpoint_heads(
-            &mut repo,
-            branch_id,
-            &heads,
-            Some((persona, &current, &initial_delta)),
-        )
-        .unwrap();
-
-        // Model a stale concurrent writer that only carried its own note.
-        let mut stale = view("");
-        stale.notes.insert(concurrent, goal);
-        let concurrent_delta = BTreeMap::from([(concurrent, goal)]);
-        save_checkpoint_heads(
-            &mut repo,
-            branch_id,
-            &heads,
-            Some((persona, &stale, &concurrent_delta)),
-        )
-        .unwrap();
-
-        let mut ws = repo.pull(branch_id).unwrap();
-        let space = ws.checkout(..).unwrap();
-        let mut persisted_deltas: Vec<String> = find!(
-            handle: TextHandle,
-            pattern!(&space, [{
-                _?checkpoint @
-                orient_state::persona: &persona,
-                orient_state::notes_view: ?handle,
-            }])
-        )
-        .map(|handle| read_text(&mut ws, handle).unwrap())
-        .collect();
-        persisted_deltas.sort();
-        let mut expected_deltas = vec![
-            serialize_notes_view(&initial_delta),
-            serialize_notes_view(&concurrent_delta),
-        ];
-        expected_deltas.sort();
-        assert_eq!(persisted_deltas, expected_deltas);
-
-        let loaded = load_checkpoint_view(&mut repo, branch_id, persona)
-            .unwrap()
-            .unwrap();
-        assert!(loaded.has_notes_view);
-        assert_eq!(
-            loaded.view.notes,
-            BTreeMap::from([(existing, goal), (concurrent, goal)])
+        let (relations_fragment, _, _) =
+            relations::person_fragment(persona, profile("persona")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(
+            &mut pile,
+            &signer,
+            RELATIONS_SCOPE_ID,
+            relations_fragment.clone(),
         );
-        repo.close().unwrap();
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline).unwrap();
+
+        // A second authored leaf has distinct metadata/history but contributes
+        // exactly the same Relations set value.
+        let mut replay = relations_fragment;
+        *replay.metafacts_mut() += entity! { &ufoid() @ metadata::tag: &ufoid().id };
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, replay);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        assert_eq!(load_watched_view(&catalogs, persona).unwrap(), baseline);
+
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+        let after = fs::metadata(&fixture.path).unwrap().len();
+        assert_eq!(before, after, "equal semantic views must not checkpoint");
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn publishing_status_is_what_places_a_window_on_the_roster() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let quiet = ufoid().id;
+        let active = ufoid().id;
+        let mut relations_fragment = relations::person_fragment(quiet, profile("quiet"))
+            .unwrap()
+            .0;
+        relations_fragment += relations::person_fragment(active, profile("active"))
+            .unwrap()
+            .0;
+
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let status = status::status_fragment(
+            active,
+            "building",
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+        )
+        .unwrap();
+        commit_scope(&mut pile, &signer, STATUS_SCOPE_ID, status);
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        assert_eq!(status_roster(&catalogs).unwrap(), BTreeSet::from([active]));
+        let rendered = render_window_status(&catalogs).unwrap();
+        assert!(rendered.contains("active: building"));
+        assert!(!rendered.contains("quiet"));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn own_first_status_is_quiet() {
+        let me = ufoid().id;
+        let old = view("");
+        let mut new = view("");
+        new.roster.insert(me);
+
+        assert!(view_news(&old, &new, me).is_empty());
+    }
+
+    #[test]
+    fn group_attention_tolerates_unrelated_and_member_forks() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let me = ufoid().id;
+        let peer = ufoid().id;
+        let addressed = ufoid().id;
+        let unrelated = ufoid().id;
+
+        let mut fragment = relations::person_fragment(me, profile("me")).unwrap().0;
+        fragment += relations::person_fragment(peer, profile("peer")).unwrap().0;
+
+        let (addressed_root, addressed_initial) =
+            relations::group_create_fragment(addressed, "reviewers").unwrap();
+        fragment += addressed_root;
+        fragment +=
+            relations::group_snapshot_fragment(addressed, "reviewers", &[me], &[addressed_initial])
+                .unwrap();
+        fragment +=
+            relations::group_snapshot_fragment(addressed, "review-team", &[], &[addressed_initial])
+                .unwrap();
+
+        let (unrelated_root, unrelated_initial) =
+            relations::group_create_fragment(unrelated, "other").unwrap();
+        fragment += unrelated_root;
+        fragment += relations::group_snapshot_fragment(
+            unrelated,
+            "other-left",
+            &[peer],
+            &[unrelated_initial],
+        )
+        .unwrap();
+        fragment +=
+            relations::group_snapshot_fragment(unrelated, "other-right", &[], &[unrelated_initial])
+                .unwrap();
+
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let keys = group_attention_keys(&catalogs.reader, &catalogs.relations, me).unwrap();
+
+        assert_eq!(
+            keys,
+            HashSet::from(["reviewers".to_owned(), "review-team".to_owned()]),
+            "all maximal names of a containing fork address the member, while an unrelated fork is inert"
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn habit_cooldown_deadline_wakes_without_pile_growth() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let (definition, habit) =
+            habits::habit_fragment("lineage-hygiene", "every 1s", "inspect branches").unwrap();
+        let completed_at = Epoch::from_unix_seconds(100.0);
+        let completed_secs = epoch_seconds(completed_at);
+        let (completion, _) =
+            habits::completion_fragment(habit, epoch_interval(completed_at)).unwrap();
+
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, HABIT_SCOPE_ID, definition);
+        commit_scope(&mut pile, &signer, HABIT_SCOPE_ID, completion);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let before = observe_habits(&catalogs, &fixture.path, completed_secs).unwrap();
+        assert!(before.due.is_empty());
+        assert_eq!(before.next_cooldown_at, Some(completed_secs + 1));
+        let pile_length = fs::metadata(&fixture.path).unwrap().len();
+
+        // No refresh and no new collection record: only the explicit wall
+        // clock advances across the completion-relative deadline.
+        let after = observe_habits(&catalogs, &fixture.path, completed_secs + 1).unwrap();
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), pile_length);
+        assert_eq!(
+            newly_due(&before, &after),
+            [(
+                habit,
+                DueHabit {
+                    label: "lineage-hygiene".to_owned(),
+                    nudge: "inspect branches".to_owned(),
+                },
+            )]
+        );
+        assert!(
+            newly_due(&after, &after).is_empty(),
+            "rearm baseline is quiet"
+        );
+        assert!(render_native_habits(&after).contains("Habits due:"));
+        assert!(render_native_habits(&after).contains("inspect branches"));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn habit_attention_transition_wakes_once() {
+        let habit = Id::new([0xA5; 16]).unwrap();
+        let quiet = HabitObservation::default();
+        let mut broken = HabitObservation::default();
+        broken.attention.insert(
+            habit,
+            "lineage-hygiene [a5] ERROR: command not found".to_owned(),
+        );
+
+        assert_eq!(
+            newly_needing_attention(&quiet, &broken),
+            [(
+                habit,
+                "lineage-hygiene [a5] ERROR: command not found".to_owned()
+            )]
+        );
+        assert!(newly_needing_attention(&broken, &broken).is_empty());
+    }
+
+    #[test]
+    fn actual_semantic_message_change_is_news() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let persona = ufoid().id;
+        let sender = ufoid().id;
+        let mut relations_fragment = relations::person_fragment(persona, profile("persona"))
+            .unwrap()
+            .0;
+        relations_fragment += relations::person_fragment(sender, profile("sender"))
+            .unwrap()
+            .0;
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline).unwrap();
+
+        let (message_fragment, message_id) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(persona),
+            "hello",
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+        );
+        commit_scope(&mut pile, &signer, MESSAGE_SCOPE_ID, message_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let current = load_watched_view(&catalogs, persona).unwrap();
+        assert_eq!(
+            view_news(&baseline, &current, persona),
+            [format!("new message [{message_id:x}]")]
+        );
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Fired
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn incoming_native_mail_wakes_once_per_wire_and_reading_is_quiet() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let persona = ufoid().id;
+        let (relations_fragment, _, _) =
+            relations::person_fragment(persona, profile("persona")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline).unwrap();
+
+        let account = ufoid().id;
+        let (account_fragment, config) = mail_model::account_config_fragment(
+            account,
+            mail_model::AccountConfigInput {
+                address: "persona@example.test".to_owned(),
+                display_name: "Persona".to_owned(),
+                pop_endpoint: "pop.example.test:995".to_owned(),
+                smtp_endpoint: "smtp.example.test:465".to_owned(),
+                username: "persona@example.test".to_owned(),
+                credential: ufoid().id,
+                enabled: true,
+                predecessors: Vec::new(),
+            },
+        )
+        .unwrap();
+        commit_scope(&mut pile, &signer, MAIL_SCOPE_ID, account_fragment);
+        let raw = b"From: sender@example.test\r\nTo: persona@example.test\r\nSubject: Native hello\r\nMessage-ID: <native-hello@example.test>\r\nDate: Tue, 11 Aug 2026 06:00:00 +0200\r\n\r\nBody\r\n";
+        let publication = mail_model::pop_publication(account, config, "uid-native", raw).unwrap();
+        let wire = publication.wire;
+        commit_scope(&mut pile, &signer, MAIL_SCOPE_ID, publication.mail);
+
+        let mut catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let incoming = load_watched_view(&catalogs, persona).unwrap();
+        assert_eq!(incoming.mail_unread, BTreeSet::from([wire]));
+        assert_eq!(
+            view_news(&baseline, &incoming, persona),
+            [format!("new mail [{wire:x}]")]
+        );
+        let rendered = render_native_mail(&catalogs, Some(persona), 10).unwrap();
+        assert!(rendered.contains(&fmt_id(wire)));
+        assert!(rendered.contains("sender@example.test"));
+        assert!(rendered.contains("Native hello"));
+
+        // Outgoing observations are not inbox rows. Injecting one exact
+        // parser publication therefore cannot add its wire to the watched
+        // projection (the complete acceptance-chain invariant is exercised
+        // by Mail's own catalog tests).
+        let outbound = mail_model::outgoing_publication(
+            ufoid().id,
+            b"From: persona@example.test\r\nTo: other@example.test\r\nSubject: Sent\r\nMessage-ID: <sent@example.test>\r\n\r\nBody\r\n",
+        )
+        .unwrap();
+        let outbound_wire = outbound.wire;
+        catalogs.mail += outbound.mail.into_facts();
+        let with_outbound = load_watched_view(&catalogs, persona).unwrap();
+        assert_eq!(with_outbound.mail_unread, BTreeSet::from([wire]));
+        assert!(!with_outbound.mail_unread.contains(&outbound_wire));
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Fired
+        ));
+
+        // A second POP source for the same wire is a storage change, not a
+        // new attention item.
+        let replay = mail_model::pop_publication(account, config, "uid-replay", raw).unwrap();
+        assert_eq!(replay.wire, wire);
+        commit_scope(&mut pile, &signer, MAIL_SCOPE_ID, replay.mail);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let replayed = load_watched_view(&catalogs, persona).unwrap();
+        assert_eq!(replayed, incoming);
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+
+        let (read, _) = mail_model::read_observation_fragment(wire, persona);
+        commit_scope(&mut pile, &signer, MAIL_SCOPE_ID, read);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let read = load_watched_view(&catalogs, persona).unwrap();
+        assert!(read.mail_unread.is_empty());
+        assert!(view_news(&incoming, &read, persona).is_empty());
+        let rendered = render_native_mail(&catalogs, Some(persona), 10).unwrap();
+        assert!(rendered.contains("- None"));
+        pile.close().unwrap();
     }
 
     #[test]

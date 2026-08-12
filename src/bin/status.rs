@@ -1,49 +1,40 @@
-//! `status` — per-window "currently doing X" status.
+//! `status` — immutable per-window "currently doing X" events.
 //!
-//! Each window (a relations persona / zooid) has a current status it sets
-//! with `status set "<text>"`; everyone else reads `status list` (the
-//! colony at a glance) or `status show <window>`. Status is append-only
-//! timestamped events keyed to the window — latest-per-window is current,
-//! the history is a free per-window activity timeline (coordinate-and-
-//! cursor). Lives on its own `status` branch.
-//!
-//! The star-handle (stable address) names the window; the status names
-//! what it's doing now — so the role is never pinned to the name.
-//!
-//! Commands:
-//!   status set "<text>"          — set $PERSONA's current status
-//!   status list                  — latest status of every window
-//!   status show <window> [--limit N]
+//! Live data is one fixed native collection. Current status is the canonical
+//! maximum `(point timestamp, intrinsic event id)` per window; history is the
+//! complete event set. Relations is a separate native collection used only to
+//! resolve human selectors and render labels.
 
-use anyhow::{anyhow, bail, Result};
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::relations::relations as rel_attrs;
-use faculties::schemas::status::{status, DEFAULT_BRANCH, KIND_STATUS_UPDATE};
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::relations::{self, Head, SelectorOutcome};
+use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
+use faculties::schemas::status::DEFAULT_SCOPE_ID;
+use faculties::{status, status_cutover};
 use hifitime::Epoch;
-use rand_core::OsRng;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-
 #[derive(Parser)]
-#[command(version = faculties::GIT_VERSION, name = "status", about = "Per-window 'currently doing X' status")]
+#[command(
+    version = faculties::GIT_VERSION,
+    name = "status",
+    about = "Per-window 'currently doing X' status"
+)]
 struct Cli {
-    /// Path to the pile file
+    /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name for status data
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
-    /// Branch name for relations (window labels)
-    #[arg(long, default_value = "relations")]
-    relations_branch: String,
-    /// Acting persona (relations label or 32-char hex id)
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Acting persona: Relations label/alias or exact 32-character id.
     #[arg(long, env = "PERSONA")]
     persona: Option<String>,
     #[command(subcommand)]
@@ -52,328 +43,599 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Set the current status for your window ($PERSONA)
+    /// Set the current status for your window ($PERSONA).
     Set {
         #[arg(
             help = "Status text, e.g. \"porting SigLIP\". Use @path for file input or @- for stdin."
         )]
         text: String,
     },
-    /// Show the latest status of every window
+    /// Show the latest status of every window.
     List,
-    /// Show a window's current status + recent history
+    /// Show a window's current status and recent history.
     Show {
-        /// Window: relations label or 32-char hex id
+        /// Relations label/alias or exact 32-character id.
         window: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Additively publish the frozen legacy `status` branch as intrinsic
+    /// native events. Stop every legacy Status writer before running this.
+    MigrateLegacy,
 }
 
-// ── time + ids ──────────────────────────────────────────────────────────────
-
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
+#[derive(Clone, Copy)]
+struct StatusStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
 }
 
-fn epoch_interval(epoch: Epoch) -> IntervalValue {
-    (epoch, epoch).try_to_inline().unwrap()
+struct Catalogs {
+    status: TribleSet,
+    relations: TribleSet,
+    reader: PileReader,
 }
 
-fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
-    lower
+impl StatusStorage<'_> {
+    fn with_loaded_pile<T>(
+        &self,
+        signer: &SigningKey,
+        f: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>,
+    ) -> Result<T> {
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = f(&mut pile, signer);
+        let close = pile.close();
+        match (result, close) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(anyhow!("close pile: {error}")),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(close_error)) => {
+                Err(error.context(format!("closing pile also failed: {close_error}")))
+            }
+        }
+    }
+
+    fn with_pile<T>(&self, f: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>) -> Result<T> {
+        // Authority is loaded before storage is touched. No ordinary command
+        // mints an identity or substitutes an ephemeral signer.
+        let signer = load_signer(self.pile, self.key)?;
+        self.with_loaded_pile(&signer, f)
+    }
+}
+
+fn materialize_scope(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    scope: Id,
+    label: &str,
+) -> Result<TribleSet> {
+    let mut collection = Collection::new(&mut *pile, scope, signer.clone());
+    collection
+        .materialize()
+        .with_context(|| format!("materialize authored {label} collection"))
+}
+
+fn load_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<Catalogs> {
+    let status_facts = materialize_scope(pile, signer, DEFAULT_SCOPE_ID, "Status")?;
+    let relations_facts = materialize_scope(pile, signer, RELATIONS_SCOPE_ID, "Relations")?;
+    let reader = pile.reader().context("open Status/Relations blob reader")?;
+    status::validate_catalog(&reader, &status_facts).context("validate Status collection")?;
+    relations::validate_catalog(&reader, &relations_facts)
+        .context("validate Relations collection")?;
+    Ok(Catalogs {
+        status: status_facts,
+        relations: relations_facts,
+        reader,
+    })
+}
+
+fn commit_status(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    fragment: Fragment,
+) -> Result<CollectionCommit> {
+    let mut collection = Collection::new(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
+    collection
+        .commit(fragment)
+        .context("commit authored Status event")
+}
+
+fn now_interval() -> status::IntervalValue {
+    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_unix_seconds(0.0));
+    (now, now)
+        .try_to_inline()
+        .expect("current point time is inline")
 }
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-/// Compact age like "3m" / "2h" / "5d" from two ns keys.
-fn format_age(now_key: i128, past_key: i128) -> String {
-    let secs = ((now_key - past_key) / 1_000_000_000).max(0);
+/// Compact age like "3m" / "2h" / "5d" from two nanosecond coordinates.
+fn format_age(now: i128, past: i128) -> String {
+    let secs = ((now - past) / 1_000_000_000).max(0);
     if secs < 60 {
         format!("{secs}s")
-    } else if secs < 3600 {
+    } else if secs < 3_600 {
         format!("{}m", secs / 60)
     } else if secs < 86_400 {
-        format!("{}h", secs / 3600)
+        format!("{}h", secs / 3_600)
     } else {
         format!("{}d", secs / 86_400)
     }
 }
 
-// ── repo plumbing ─────────────────────────────────────────────────────────────
-
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|e| anyhow!("create repository: {e:?}"))
-}
-
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, blobencodings::LongString>(h)
-        .ok()
-        .map(|v| v.to_string())
-}
-
-/// Resolve a window (relations label or hex id) to its persona id.
-fn resolve_window_id(
-    repo: &mut Repository<Pile>,
-    relations_branch_id: Id,
-    input: &str,
-) -> Result<Id> {
-    let trimmed = input.trim();
-    if let Some(id) = Id::from_hex(trimmed) {
+/// Exact ids deliberately do not require Relations membership. Labels and
+/// aliases use the complete native Relations read model and fail closed on
+/// ambiguity or a forked profile/lifecycle track.
+fn resolve_window_id(reader: &PileReader, facts: &TribleSet, input: &str) -> Result<Id> {
+    let input = input.trim();
+    if let Some(id) = Id::from_hex(input) {
         return Ok(id);
     }
-    let mut ws = repo
-        .pull(relations_branch_id)
-        .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-    let key = trimmed.to_ascii_lowercase();
-    let matches: Vec<Id> = find!(
-        person_id: Id,
-        pattern!(&space, [{ ?person_id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID }])
-    )
-    .filter(|&person_id| {
-        exists!(pattern!(&space, [{ person_id @ rel_attrs::label_norm: key.as_str() }]))
-            || exists!(pattern!(&space, [{ person_id @ rel_attrs::alias_norm: key.as_str() }]))
-    })
-    .collect();
-    match matches.len() {
-        0 => bail!("unknown window '{trimmed}' (no relations entry; try the hex id)"),
-        1 => Ok(matches[0]),
-        _ => bail!("multiple relations entries match '{trimmed}'"),
+    match relations::resolve_person(reader, facts, input, true)? {
+        SelectorOutcome::Unique(id) => Ok(id),
+        outcome => outcome.require_unique("person", input),
     }
 }
 
-fn window_label(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
-    find!(h: TextHandle, pattern!(space, [{ id @ metadata::name: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h))
-        .unwrap_or_else(|| fmt_id(id))
-}
+/// Render a Relations label without hiding unsettled state. Unknown anchors
+/// remain valid Status windows and render as their exact id.
+fn window_label(reader: &PileReader, facts: &TribleSet, window: Id) -> Result<String> {
+    if !relations::person_anchors(facts).contains(&window) {
+        return Ok(fmt_id(window));
+    }
 
-// ── status events ─────────────────────────────────────────────────────────────
-
-struct StatusRow {
-    window: Id,
-    text: TextHandle,
-    at: IntervalValue,
-}
-
-fn load_status_rows(space: &TribleSet) -> Vec<StatusRow> {
-    find!(
-        (ev: Id, window: Id, text: TextHandle, at: IntervalValue),
-        pattern!(space, [{
-            ?ev @
-            metadata::tag: &KIND_STATUS_UPDATE,
-            status::window: ?window,
-            status::text: ?text,
-            metadata::created_at: ?at,
-        }])
-    )
-    .map(|(_ev, window, text, at)| StatusRow { window, text, at })
-    .collect()
-}
-
-/// Latest status row per window.
-fn latest_per_window(rows: Vec<StatusRow>) -> HashMap<Id, StatusRow> {
-    let mut latest: HashMap<Id, StatusRow> = HashMap::new();
-    for row in rows {
-        match latest.get(&row.window) {
-            Some(existing) if interval_key(existing.at) >= interval_key(row.at) => {}
-            _ => {
-                latest.insert(row.window, row);
-            }
+    let mut label = match relations::profile_head(facts, window)? {
+        Head::Unique(profile) => {
+            let snapshot = relations::profile_snapshot(facts, profile)?;
+            relations::read_text(reader, snapshot.label)?
         }
+        Head::Forked(heads) => {
+            return Ok(format!(
+                "{} [profile fork: {} heads]",
+                fmt_id(window),
+                heads.len()
+            ));
+        }
+        Head::Missing => return Ok(format!("{} [missing profile]", fmt_id(window))),
+    };
+
+    match relations::lifecycle_head(facts, window)? {
+        Head::Forked(heads) => label.push_str(&format!(" [lifecycle fork: {} heads]", heads.len())),
+        Head::Missing => label.push_str(" [missing lifecycle]"),
+        Head::Unique(_) => {}
     }
-    latest
+    Ok(label)
 }
 
-// ── commands ──────────────────────────────────────────────────────────────────
+fn store_status_at(
+    storage: StatusStorage<'_>,
+    selector: &str,
+    text: &str,
+    at: status::IntervalValue,
+) -> Result<(CollectionCommit, Id)> {
+    storage.with_pile(|pile, signer| {
+        let catalogs = load_catalogs(pile, signer)?;
+        let window = resolve_window_id(&catalogs.reader, &catalogs.relations, selector)?;
+        let fragment = status::status_fragment(window, text, at)?;
+        status::validate_catalog_union(&catalogs.reader, &catalogs.status, &fragment)
+            .context("preflight authored Status union")?;
+        Ok((commit_status(pile, signer, fragment)?, window))
+    })
+}
 
-fn cmd_set(
-    pile: &Path,
-    branch: &str,
-    relations_branch: &str,
-    persona: Option<&str>,
-    text: String,
-) -> Result<()> {
+fn cmd_set(storage: StatusStorage<'_>, persona: Option<&str>, text: String) -> Result<()> {
     let text = faculties::text_arg(&text, "status text")?;
-    let text = text.trim().to_string();
+    let text = text.trim();
     if text.is_empty() {
         bail!("status text is empty");
     }
     let persona = persona.ok_or_else(|| {
-        anyhow!("no persona — set $PERSONA or pass --persona <label> (whose status is this?)")
+        anyhow!("no persona — set $PERSONA or pass --persona <Relations label or exact id>")
     })?;
-    with_repo(pile, |repo| {
-        let branch_id = repo
-            .ensure_branch(branch, None)
-            .map_err(|e| anyhow!("ensure branch '{branch}': {e:?}"))?;
-        let relations_branch_id = repo
-            .ensure_branch(relations_branch, None)
-            .map_err(|e| anyhow!("ensure relations branch: {e:?}"))?;
-        let window = resolve_window_id(repo, relations_branch_id, persona)?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull status: {e:?}"))?;
-        let now = epoch_interval(now_epoch());
-        let handle = ws.put(text.clone());
-        let change = entity! { ufoid() @
-            metadata::tag: &KIND_STATUS_UPDATE,
-            status::window: window,
-            status::text: handle,
-            metadata::created_at: now,
-        };
-        ws.commit(change, "status set");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push status: {e:?}"))?;
-        println!("{} → {text}", fmt_id(window));
-        Ok(())
-    })
+    let (_, window) = store_status_at(storage, persona, text, now_interval())?;
+    println!("{} → {text}", fmt_id(window));
+    Ok(())
 }
 
-fn cmd_list(pile: &Path, branch: &str, relations_branch: &str) -> Result<()> {
-    with_repo(pile, |repo| {
-        let branch_id = repo
-            .ensure_branch(branch, None)
-            .map_err(|e| anyhow!("ensure branch '{branch}': {e:?}"))?;
-        let relations_branch_id = repo
-            .ensure_branch(relations_branch, None)
-            .map_err(|e| anyhow!("ensure relations branch: {e:?}"))?;
-
-        let mut status_ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull status: {e:?}"))?;
-        let status_space = status_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout status: {e:?}"))?;
-        let latest = latest_per_window(load_status_rows(&status_space));
-
-        let mut rel_ws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rel_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-
+fn cmd_list(storage: StatusStorage<'_>) -> Result<()> {
+    storage.with_pile(|pile, signer| {
+        let catalogs = load_catalogs(pile, signer)?;
+        let latest = status::latest_per_window(status::load_status_rows(&catalogs.status)?)?;
         if latest.is_empty() {
             println!("No statuses set yet.");
             return Ok(());
         }
-        let now = interval_key(epoch_interval(now_epoch()));
-        let mut rows: Vec<(String, String, String)> = latest
+
+        let now = status::point_timestamp(now_interval())?;
+        let mut rows: Vec<(String, Id, String, String)> = latest
             .into_values()
             .map(|row| {
-                let label = window_label(&mut rel_ws, &rel_space, row.window);
-                let text = read_text(&mut status_ws, row.text).unwrap_or_default();
-                let age = format_age(now, interval_key(row.at));
-                (label, text, age)
+                let label = window_label(&catalogs.reader, &catalogs.relations, row.window)?;
+                let text = status::read_text(&catalogs.reader, row.text)?;
+                let age = format_age(now, status::point_timestamp(row.at)?);
+                Ok((label, row.window, text, age))
             })
-            .collect();
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        for (label, text, age) in rows {
+            .collect::<Result<_>>()?;
+        rows.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+        for (label, _, text, age) in rows {
             println!("{label}: {text}  ({age} ago)");
         }
         Ok(())
     })
 }
 
-fn cmd_show(
-    pile: &Path,
-    branch: &str,
-    relations_branch: &str,
-    window: String,
-    limit: usize,
-) -> Result<()> {
-    with_repo(pile, |repo| {
-        let branch_id = repo
-            .ensure_branch(branch, None)
-            .map_err(|e| anyhow!("ensure branch '{branch}': {e:?}"))?;
-        let relations_branch_id = repo
-            .ensure_branch(relations_branch, None)
-            .map_err(|e| anyhow!("ensure relations branch: {e:?}"))?;
-        let window_id = resolve_window_id(repo, relations_branch_id, &window)?;
+fn cmd_show(storage: StatusStorage<'_>, selector: String, limit: usize) -> Result<()> {
+    storage.with_pile(|pile, signer| {
+        let catalogs = load_catalogs(pile, signer)?;
+        let window = resolve_window_id(&catalogs.reader, &catalogs.relations, &selector)?;
+        let label = window_label(&catalogs.reader, &catalogs.relations, window)?;
+        let mut rows: Vec<((i128, Id), status::StatusRow)> =
+            status::load_status_rows(&catalogs.status)?
+                .into_iter()
+                .filter(|row| row.window == window)
+                .map(|row| Ok((status::event_key(&row)?, row)))
+                .collect::<Result<_>>()?;
+        rows.sort_by(|left, right| right.0.cmp(&left.0));
 
-        let mut status_ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull status: {e:?}"))?;
-        let status_space = status_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout status: {e:?}"))?;
-        let mut rel_ws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rel_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-        let label = window_label(&mut rel_ws, &rel_space, window_id);
-
-        let mut rows: Vec<StatusRow> = load_status_rows(&status_space)
-            .into_iter()
-            .filter(|r| r.window == window_id)
-            .collect();
-        rows.sort_by(|a, b| interval_key(b.at).cmp(&interval_key(a.at)));
-
-        println!("status for {label} ({})", fmt_id(window_id));
+        println!("status for {label} ({})", fmt_id(window));
         if rows.is_empty() {
             println!("- (no status set)");
             return Ok(());
         }
-        let now = interval_key(epoch_interval(now_epoch()));
-        for (i, row) in rows.into_iter().take(limit).enumerate() {
-            let text = read_text(&mut status_ws, row.text).unwrap_or_default();
-            let age = format_age(now, interval_key(row.at));
-            let marker = if i == 0 { "*" } else { " " };
+        let now = status::point_timestamp(now_interval())?;
+        for (index, ((at, _), row)) in rows.into_iter().take(limit).enumerate() {
+            let text = status::read_text(&catalogs.reader, row.text)?;
+            let age = format_age(now, at);
+            let marker = if index == 0 { "*" } else { " " };
             println!("{marker} {text}  ({age} ago)");
         }
         Ok(())
     })
 }
 
+fn cmd_migrate_legacy(storage: StatusStorage<'_>) -> Result<()> {
+    // Migration is the deliberate exception to the ordinary one-open path:
+    // the old branch is first frozen and closed as immutable input, then the
+    // target pile is opened once for preflight, publication, and verification.
+    let signer = load_signer(storage.pile, storage.key)?;
+    let source = freeze_source(storage.pile).context("freeze legacy Status source")?;
+    let plan = status_cutover::plan(&source)?;
+
+    storage.with_loaded_pile(&signer, |pile, signer| {
+        let existing = materialize_scope(pile, signer, DEFAULT_SCOPE_ID, "Status")?;
+        let reader = pile.reader().context("open Status migration reader")?;
+        status::validate_catalog(&reader, &existing).context("validate prior native Status")?;
+
+        let mut candidate = Fragment::empty();
+        for commit in plan.commits() {
+            candidate += commit.fragment.clone();
+        }
+        let expected = status::validate_catalog_union(&reader, &existing, &candidate)
+            .context("preflight native Status plus legacy rewrite")?;
+
+        let mut published = Vec::with_capacity(plan.commits().len());
+        {
+            let mut collection = Collection::new(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
+            for commit in plan.commits() {
+                published.push(
+                    collection
+                        .commit(commit.fragment.clone())
+                        .context("publish migrated Status commit")?,
+                );
+            }
+        }
+
+        let actual = materialize_scope(pile, signer, DEFAULT_SCOPE_ID, "Status")?;
+        let reader = pile.reader().context("open migrated Status reader")?;
+        status::validate_catalog(&reader, &actual).context("validate migrated Status")?;
+        if actual != expected {
+            bail!("Status migration result differs from prior native union canonical rewrite");
+        }
+
+        println!(
+            "migrated {} authored Status commit{}: {} legacy events → {} canonical events ({} preserved facts + {} canonical shadow facts = {} total) in scope {:X}",
+            published.len(),
+            if published.len() == 1 { "" } else { "s" },
+            plan.report().legacy_events,
+            plan.report().canonical_events,
+            plan.report().preserved_facts,
+            plan.report().canonical_facts,
+            plan.report().output_facts,
+            DEFAULT_SCOPE_ID
+        );
+        println!("legacy branch retained; native commands no longer consult it");
+        Ok(())
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let storage = StatusStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+    };
     match cli.command {
-        Command::Set { text } => cmd_set(
-            &cli.pile,
-            &cli.branch,
-            &cli.relations_branch,
-            cli.persona.as_deref(),
-            text,
-        ),
-        Command::List => cmd_list(&cli.pile, &cli.branch, &cli.relations_branch),
-        Command::Show { window, limit } => {
-            cmd_show(&cli.pile, &cli.branch, &cli.relations_branch, window, limit)
+        Command::Set { text } => cmd_set(storage, cli.persona.as_deref(), text),
+        Command::List => cmd_list(storage),
+        Command::Show { window, limit } => cmd_show(storage, window, limit),
+        Command::MigrateLegacy => cmd_migrate_legacy(storage),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use faculties::collection_cutover::initialize_signer;
+    use faculties::relations::ProfileInput;
+    use faculties::schemas::status::{
+        status as status_attr, KIND_STATUS_UPDATE, STATUS_BRANCH_NAME,
+    };
+    use triblespace::core::metadata;
+    use triblespace::core::repo::Repository;
+
+    use super::*;
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let serial = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "faculties-status-live-{}-{serial}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
         }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Fixture {
+        _directory: TestDirectory,
+        pile: PathBuf,
+        key: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        let directory = TestDirectory::new();
+        let pile = directory.0.join("status.pile");
+        let key = directory.0.join("status.key");
+        File::create(&pile).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        Fixture {
+            _directory: directory,
+            pile,
+            key,
+        }
+    }
+
+    fn at(seconds: f64) -> status::IntervalValue {
+        let epoch = Epoch::from_unix_seconds(seconds);
+        (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    fn storage(fixture: &Fixture) -> StatusStorage<'_> {
+        StatusStorage {
+            pile: &fixture.pile,
+            key: Some(&fixture.key),
+        }
+    }
+
+    fn profile(label: &str, aliases: &[&str]) -> ProfileInput {
+        ProfileInput {
+            label: label.to_owned(),
+            aliases: aliases.iter().map(|value| (*value).to_owned()).collect(),
+            ..ProfileInput::default()
+        }
+    }
+
+    fn publish_relations(fixture: &Fixture, fragment: Fragment) {
+        storage(fixture)
+            .with_pile(|pile, signer| {
+                let current = materialize_scope(pile, signer, RELATIONS_SCOPE_ID, "Relations")?;
+                let reader = pile.reader().unwrap();
+                relations::validate_catalog_union(&reader, &current, &fragment)?;
+                let mut collection =
+                    Collection::new(&mut *pile, RELATIONS_SCOPE_ID, signer.clone());
+                collection.commit(fragment)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_replay_is_one_commit_and_does_not_grow_the_pile() {
+        let fixture = fixture();
+        let window = Id::new([0x81; 16]).unwrap();
+        let first = store_status_at(storage(&fixture), &fmt_id(window), "same", at(10.0)).unwrap();
+        let length = fs::metadata(&fixture.pile).unwrap().len();
+        let second = store_status_at(storage(&fixture), &fmt_id(window), "same", at(10.0)).unwrap();
+        assert_eq!(first.0, second.0);
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
+
+        storage(&fixture)
+            .with_pile(|pile, signer| {
+                let catalogs = load_catalogs(pile, signer)?;
+                assert_eq!(status::load_status_rows(&catalogs.status)?.len(), 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn independent_events_materialize_as_one_union_and_reads_are_immutable() {
+        let fixture = fixture();
+        let window = Id::new([0x82; 16]).unwrap();
+        store_status_at(storage(&fixture), &fmt_id(window), "first", at(20.0)).unwrap();
+        store_status_at(storage(&fixture), &fmt_id(window), "second", at(21.0)).unwrap();
+        let length = fs::metadata(&fixture.pile).unwrap().len();
+        let key = fs::read(&fixture.key).unwrap();
+
+        for _ in 0..2 {
+            storage(&fixture)
+                .with_pile(|pile, signer| {
+                    let catalogs = load_catalogs(pile, signer)?;
+                    assert_eq!(status::load_status_rows(&catalogs.status)?.len(), 2);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
+        assert_eq!(fs::read(&fixture.key).unwrap(), key);
+    }
+
+    #[test]
+    fn foreign_signer_does_not_introduce_status_membership() {
+        let fixture = fixture();
+        let window = Id::new([0x83; 16]).unwrap();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        {
+            let mut foreign = Collection::new(
+                &mut pile,
+                DEFAULT_SCOPE_ID,
+                SigningKey::from_bytes(&[0x84; 32]),
+            );
+            foreign
+                .commit(status::status_fragment(window, "foreign", at(30.0)).unwrap())
+                .unwrap();
+        }
+        pile.close().unwrap();
+
+        storage(&fixture)
+            .with_pile(|pile, signer| {
+                assert!(load_catalogs(pile, signer)?.status.is_empty());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn native_relations_resolves_labels_aliases_and_retired_people() {
+        let fixture = fixture();
+        let person = Id::new([0x85; 16]).unwrap();
+        let (initial, _, lifecycle) =
+            relations::person_fragment(person, profile("Example", &["sample"])).unwrap();
+        publish_relations(&fixture, initial);
+        publish_relations(
+            &fixture,
+            relations::lifecycle_fragment(person, true, &[lifecycle]),
+        );
+
+        storage(&fixture)
+            .with_pile(|pile, signer| {
+                let catalogs = load_catalogs(pile, signer)?;
+                assert_eq!(
+                    resolve_window_id(&catalogs.reader, &catalogs.relations, "example")?,
+                    person
+                );
+                assert_eq!(
+                    resolve_window_id(&catalogs.reader, &catalogs.relations, "SAMPLE")?,
+                    person
+                );
+                assert_eq!(
+                    window_label(&catalogs.reader, &catalogs.relations, person)?,
+                    "Example"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_unknown_id_passes_through_but_ambiguous_and_forked_labels_fail() {
+        let fixture = fixture();
+        let unknown = Id::new([0x86; 16]).unwrap();
+        let first = Id::new([0x87; 16]).unwrap();
+        let second = Id::new([0x88; 16]).unwrap();
+        let (first_fragment, first_profile, _) =
+            relations::person_fragment(first, profile("shared", &[])).unwrap();
+        let (second_fragment, _, _) =
+            relations::person_fragment(second, profile("shared", &[])).unwrap();
+        publish_relations(&fixture, first_fragment);
+        publish_relations(&fixture, second_fragment);
+
+        storage(&fixture)
+            .with_pile(|pile, signer| {
+                let catalogs = load_catalogs(pile, signer)?;
+                assert_eq!(
+                    resolve_window_id(&catalogs.reader, &catalogs.relations, &fmt_id(unknown))?,
+                    unknown
+                );
+                assert!(
+                    resolve_window_id(&catalogs.reader, &catalogs.relations, "shared").is_err()
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        publish_relations(
+            &fixture,
+            relations::profile_fragment(first, profile("fork-a", &[]), &[first_profile]).unwrap(),
+        );
+        publish_relations(
+            &fixture,
+            relations::profile_fragment(first, profile("fork-b", &[]), &[first_profile]).unwrap(),
+        );
+        storage(&fixture)
+            .with_pile(|pile, signer| {
+                let catalogs = load_catalogs(pile, signer)?;
+                assert!(
+                    resolve_window_id(&catalogs.reader, &catalogs.relations, "fork-a").is_err()
+                );
+                assert!(window_label(&catalogs.reader, &catalogs.relations, first)?
+                    .contains("profile fork"));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn migrate_command_reuses_one_target_open_and_is_exactly_replayable() {
+        let fixture = fixture();
+        let legacy_signer = SigningKey::from_bytes(&[0x89; 32]);
+        let pile = open_pile_strict(&fixture.pile).unwrap();
+        let mut repository = Repository::new(pile, legacy_signer, Fragment::empty()).unwrap();
+        let branch = *repository.create_branch(STATUS_BRANCH_NAME, None).unwrap();
+        let mut workspace = repository.pull(branch).unwrap();
+        let window = Id::new([0x8A; 16]).unwrap();
+        let mut legacy = Fragment::empty();
+        let text = legacy.put::<blobencodings::LongString, _>("legacy".to_owned());
+        legacy += entity! { ufoid() @
+            metadata::tag: &KIND_STATUS_UPDATE,
+            status_attr::window: window,
+            status_attr::text: text,
+            metadata::created_at: at(40.0),
+        };
+        workspace.commit(legacy, "legacy status");
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+
+        cmd_migrate_legacy(storage(&fixture)).unwrap();
+        let length = fs::metadata(&fixture.pile).unwrap().len();
+        cmd_migrate_legacy(storage(&fixture)).unwrap();
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
+
+        storage(&fixture)
+            .with_pile(|pile, signer| {
+                let catalogs = load_catalogs(pile, signer)?;
+                let rows = status::load_status_rows(&catalogs.status)?;
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].window, window);
+                assert_eq!(status::read_text(&catalogs.reader, rows[0].text)?, "legacy");
+                Ok(())
+            })
+            .unwrap();
     }
 }

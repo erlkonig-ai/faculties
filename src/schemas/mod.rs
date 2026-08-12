@@ -1,20 +1,25 @@
 //! Faculty schemas: attribute IDs and kind markers per faculty.
 
 pub mod archive;
+pub mod atlas;
+pub mod blockdag;
 pub mod body;
+pub mod cognition;
 pub mod compass;
 pub mod decide;
 pub mod discord;
 pub mod embeddings;
 pub mod files;
-pub mod gauge;
+pub mod habit;
 pub mod headspace;
+pub mod linkedin;
 pub mod mail;
 pub mod memory;
 pub mod message;
 pub mod orient;
 pub mod patience;
 pub mod planner;
+pub mod posture;
 pub mod reason;
 pub mod relations;
 pub mod selfimage;

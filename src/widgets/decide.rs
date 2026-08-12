@@ -5,32 +5,21 @@
 //! pros + cons in two columns (RAL signal green / traffic red), and
 //! the outcome at the bottom when resolved.
 //!
-//! The widget holds UI + cached-query state only; the host supplies
-//! the `decide` workspace at render time. Decisions sort newest-first.
+//! The widget consumes Decide's canonical genesis/factor/resolution read
+//! model. Concurrent resolution heads remain visible as agreed or divergent
+//! state; no timestamp winner is recreated here.
 //!
 //! ```ignore
 //! let mut panel = DecidePanel::default();
 //! panel.render(ctx, decide_ws);
 //! ```
 
-use std::collections::HashMap;
-
 use GORBIE::prelude::CardCtx;
 
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
 
-use crate::schemas::decide::{decide as decide_attrs, factor, KIND_CON, KIND_DECISION, KIND_PRO};
-
-type TextHandle = Inline<Handle<LongString>>;
+use crate::decide::{self, FactorSide, Resolution};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 // ── Color palette ────────────────────────────────────────────────────
 
@@ -87,8 +76,7 @@ struct DecisionRow {
     context: Option<String>,
     about: Option<Id>,
     created_at: Option<i128>,
-    finished_at: Option<i128>,
-    outcome: Option<String>,
+    resolution: ResolutionRow,
     pros: Vec<FactorRow>,
     cons: Vec<FactorRow>,
 }
@@ -96,8 +84,32 @@ struct DecisionRow {
 #[derive(Clone, Debug)]
 struct FactorRow {
     text: String,
-    detail: Option<String>,
     created_at: Option<i128>,
+}
+
+#[derive(Clone, Debug)]
+enum ResolutionRow {
+    Proposed,
+    Unique {
+        id: Id,
+        outcome: String,
+        forced: bool,
+        finished_at: i128,
+    },
+    Agreed {
+        heads: Vec<Id>,
+        outcome: String,
+        forced: bool,
+    },
+    Forked(Vec<ForkRow>),
+    Invalid(String),
+}
+
+#[derive(Clone, Debug)]
+struct ForkRow {
+    id: Id,
+    outcome: String,
+    forced: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,21 +117,20 @@ enum Status {
     Proposed,
     Resolved,
     Forced,
+    Agreed,
+    Forked,
+    Invalid,
 }
 
 impl DecisionRow {
     fn status(&self) -> Status {
-        let resolved = self.finished_at.is_some()
-            && self
-                .outcome
-                .as_ref()
-                .map_or(false, |s| !s.trim().is_empty());
-        if !resolved {
-            Status::Proposed
-        } else if self.pros.is_empty() && self.cons.is_empty() {
-            Status::Forced
-        } else {
-            Status::Resolved
+        match &self.resolution {
+            ResolutionRow::Proposed => Status::Proposed,
+            ResolutionRow::Unique { forced: true, .. } => Status::Forced,
+            ResolutionRow::Unique { .. } => Status::Resolved,
+            ResolutionRow::Agreed { .. } => Status::Agreed,
+            ResolutionRow::Forked(_) => Status::Forked,
+            ResolutionRow::Invalid(_) => Status::Invalid,
         }
     }
 
@@ -135,214 +146,112 @@ impl DecisionRow {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 struct DecideLive {
-    cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
     decisions: Vec<DecisionRow>,
 }
 
 impl DecideLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[decide] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-
-        // Per-decision rollups — title / description / outcome handles,
-        // about pointer, created/finished timestamps.
-        let mut decisions: HashMap<Id, DecisionRow> = HashMap::new();
-
-        for (id,) in find!(
-            (d: Id,),
-            pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
-        ) {
-            decisions.insert(
-                id,
-                DecisionRow {
-                    id,
-                    title: String::from("(untitled)"),
-                    context: None,
-                    about: None,
-                    created_at: None,
-                    finished_at: None,
-                    outcome: None,
-                    pros: Vec::new(),
-                    cons: Vec::new(),
-                },
-            );
-        }
-
-        // Title.
-        let title_rows: Vec<(Id, TextHandle)> = find!(
-            (d: Id, h: TextHandle),
-            pattern!(&space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                metadata::name: ?h,
-            }])
-        )
-        .collect();
-        for (id, h) in title_rows {
-            if let Some(row) = decisions.get_mut(&id) {
-                if let Some(text) = read_text(ws, h) {
-                    row.title = text;
-                }
-            }
-        }
-
-        // Context (description).
-        let ctx_rows: Vec<(Id, TextHandle)> = find!(
-            (d: Id, h: TextHandle),
-            pattern!(&space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                metadata::description: ?h,
-            }])
-        )
-        .collect();
-        for (id, h) in ctx_rows {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.context = read_text(ws, h);
-            }
-        }
-
-        // Outcome (only set on resolved).
-        let outcome_rows: Vec<(Id, TextHandle)> = find!(
-            (d: Id, h: TextHandle),
-            pattern!(&space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                decide_attrs::outcome: ?h,
-            }])
-        )
-        .collect();
-        for (id, h) in outcome_rows {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.outcome = read_text(ws, h);
-            }
-        }
-
-        // About pointer.
-        for (id, target) in find!(
-            (d: Id, a: Id),
-            pattern!(&space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                decide_attrs::about: ?a,
-            }])
-        ) {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.about = Some(target);
-            }
-        }
-
-        // Timestamps (intervals — take the start ns).
-        for (id, ts) in find!(
-            (d: Id, ts: (i128, i128)),
-            pattern!(&space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                metadata::created_at: ?ts,
-            }])
-        ) {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.created_at = Some(ts.0);
-            }
-        }
-        for (id, ts) in find!(
-            (d: Id, ts: (i128, i128)),
-            pattern!(&space, [{
-                ?d @
-                metadata::tag: KIND_DECISION,
-                metadata::finished_at: ?ts,
-            }])
-        ) {
-            if let Some(row) = decisions.get_mut(&id) {
-                row.finished_at = Some(ts.0);
-            }
-        }
-
-        // Pros / cons. Each factor has metadata::name (one-liner),
-        // optional metadata::description (long form), and a
-        // factor::about_decision pointer back to its parent.
-        collect_factors(ws, &space, KIND_PRO, &mut decisions, |row, f| {
-            row.pros.push(f);
-        });
-        collect_factors(ws, &space, KIND_CON, &mut decisions, |row, f| {
-            row.cons.push(f);
-        });
-
-        // Stable factor ordering: oldest-first within each column.
-        for row in decisions.values_mut() {
-            row.pros.sort_by_key(|f| f.created_at.unwrap_or(i128::MAX));
-            row.cons.sort_by_key(|f| f.created_at.unwrap_or(i128::MAX));
-        }
-
-        let mut decisions: Vec<DecisionRow> = decisions.into_values().collect();
-        // Newest first; undated decisions (MIN key) sink to the bottom.
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        let mut decisions = decide::decision_anchors(dataset.facts)
+            .into_iter()
+            .map(|id| {
+                load_decision(dataset, id).unwrap_or_else(|error| invalid_decision(id, error))
+            })
+            .collect::<Vec<_>>();
         decisions.sort_by_key(|d| std::cmp::Reverse(d.sort_key()));
 
         DecideLive {
-            cached_head,
+            cached_revision: dataset.revision,
             decisions,
         }
     }
 }
 
-fn collect_factors(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    kind: Id,
-    decisions: &mut HashMap<Id, DecisionRow>,
-    mut push: impl FnMut(&mut DecisionRow, FactorRow),
-) {
-    // Pull the (factor_id, decision_id, name_handle) triple in one
-    // pass; description and created_at are looked up per-factor since
-    // they're optional.
-    let rows: Vec<(Id, Id, TextHandle)> = find!(
-        (f: Id, d: Id, name: TextHandle),
-        pattern!(space, [{
-            ?f @
-                metadata::tag: kind,
-                metadata::name: ?name,
-                factor::about_decision: ?d,
-        }])
-    )
-    .collect();
-    for (factor_id, decision_id, name) in rows {
-        let text = read_text(ws, name).unwrap_or_else(|| "(unnamed)".into());
-        let detail = find!(
-            (h: TextHandle,),
-            pattern!(space, [{ factor_id @ metadata::description: ?h }])
-        )
-        .next()
-        .and_then(|(h,)| read_text(ws, h));
-        let created_at = find!(
-            (ts: (i128, i128),),
-            pattern!(space, [{ factor_id @ metadata::created_at: ?ts }])
-        )
-        .next()
-        .map(|(ts,)| ts.0);
-        if let Some(row) = decisions.get_mut(&decision_id) {
-            push(
-                row,
-                FactorRow {
-                    text,
-                    detail,
-                    created_at,
-                },
-            );
-        }
+fn invalid_decision(id: Id, error: anyhow::Error) -> DecisionRow {
+    DecisionRow {
+        id,
+        title: format!("Invalid decision {}", id_hex(id)),
+        context: None,
+        about: None,
+        created_at: None,
+        resolution: ResolutionRow::Invalid(format!("{error:#}")),
+        pros: Vec::new(),
+        cons: Vec::new(),
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
+fn load_decision(dataset: DatasetView<'_>, id: Id) -> anyhow::Result<DecisionRow> {
+    let genesis = decide::genesis_for_decision(dataset.facts, id)?
+        .ok_or_else(|| anyhow::anyhow!("decision {id:x} has no canonical genesis"))?;
+    let mut pros = Vec::new();
+    let mut cons = Vec::new();
+    for factor in decide::factors_for_decision(dataset.facts, id)? {
+        let row = FactorRow {
+            text: decide::read_text(dataset.reader, factor.text)?,
+            created_at: Some(interval_ns(factor.created_at)?),
+        };
+        match factor.side {
+            FactorSide::Pro => pros.push(row),
+            FactorSide::Con => cons.push(row),
+        }
+    }
+    pros.sort_by_key(|factor| factor.created_at.unwrap_or(i128::MAX));
+    cons.sort_by_key(|factor| factor.created_at.unwrap_or(i128::MAX));
+    Ok(DecisionRow {
+        id,
+        title: decide::read_text(dataset.reader, genesis.title)?,
+        context: genesis
+            .context
+            .map(|handle| decide::read_text(dataset.reader, handle))
+            .transpose()?,
+        about: genesis.about,
+        created_at: Some(interval_ns(genesis.created_at)?),
+        resolution: load_resolution(dataset, id)?,
+        pros,
+        cons,
     })
+}
+
+fn load_resolution(dataset: DatasetView<'_>, decision: Id) -> anyhow::Result<ResolutionRow> {
+    Ok(match decide::resolution(dataset.facts, decision) {
+        Resolution::Missing => ResolutionRow::Proposed,
+        Resolution::Unique(snapshot) => ResolutionRow::Unique {
+            id: snapshot.id,
+            outcome: decide::read_text(dataset.reader, snapshot.outcome)?,
+            forced: snapshot.forced,
+            finished_at: interval_ns(snapshot.finished_at)?,
+        },
+        Resolution::Agreed(snapshots) => {
+            let first = snapshots
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("agreed resolution frontier is empty"))?;
+            ResolutionRow::Agreed {
+                heads: snapshots.iter().map(|snapshot| snapshot.id).collect(),
+                outcome: decide::read_text(dataset.reader, first.outcome)?,
+                forced: first.forced,
+            }
+        }
+        Resolution::Forked(snapshots) => ResolutionRow::Forked(
+            snapshots
+                .into_iter()
+                .map(|snapshot| {
+                    Ok(ForkRow {
+                        id: snapshot.id,
+                        outcome: decide::read_text(dataset.reader, snapshot.outcome)?,
+                        forced: snapshot.forced,
+                    })
+                })
+                .collect::<anyhow::Result<_>>()?,
+        ),
+        Resolution::Invalid(error) => ResolutionRow::Invalid(error),
+    })
+}
+
+fn interval_ns(value: decide::IntervalValue) -> anyhow::Result<i128> {
+    let (lower, _upper): (i128, i128) = value
+        .try_from_inline()
+        .map_err(|error| anyhow::anyhow!("decode Decide timestamp: {error:?}"))?;
+    Ok(lower)
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -362,14 +271,13 @@ impl DecidePanel {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(DecideLive::refresh(ws));
+            self.live = Some(DecideLive::refresh(dataset));
         }
 
         ctx.section("Decisions", |ctx| {
@@ -380,7 +288,12 @@ impl DecidePanel {
             let resolved = live
                 .decisions
                 .iter()
-                .filter(|d| matches!(d.status(), Status::Resolved | Status::Forced))
+                .filter(|d| {
+                    matches!(
+                        d.status(),
+                        Status::Resolved | Status::Forced | Status::Agreed
+                    )
+                })
                 .count();
             let open = count - resolved;
 
@@ -480,22 +393,30 @@ fn decision_matches_search(dec: &DecisionRow, needle: &str) -> bool {
             return true;
         }
     }
-    if let Some(outcome) = &dec.outcome {
-        if outcome.to_lowercase().contains(needle) {
-            return true;
+    match &dec.resolution {
+        ResolutionRow::Unique { outcome, .. } | ResolutionRow::Agreed { outcome, .. } => {
+            if outcome.to_lowercase().contains(needle) {
+                return true;
+            }
         }
+        ResolutionRow::Forked(heads) => {
+            if heads.iter().any(|head| outcome_matches(head, needle)) {
+                return true;
+            }
+        }
+        ResolutionRow::Invalid(error) if error.to_lowercase().contains(needle) => return true,
+        _ => {}
     }
     for f in dec.pros.iter().chain(dec.cons.iter()) {
         if f.text.to_lowercase().contains(needle) {
             return true;
         }
-        if let Some(d) = &f.detail {
-            if d.to_lowercase().contains(needle) {
-                return true;
-            }
-        }
     }
     false
+}
+
+fn outcome_matches(head: &ForkRow, needle: &str) -> bool {
+    head.outcome.to_lowercase().contains(needle) || id_hex(head.id).to_lowercase().contains(needle)
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
@@ -508,6 +429,9 @@ fn status_color(status: Status, ui: &egui::Ui) -> egui::Color32 {
         Status::Proposed => color_proposed(ui),
         Status::Resolved => color_resolved(),
         Status::Forced => color_forced(),
+        Status::Agreed => color_pro(),
+        Status::Forked => color_forced(),
+        Status::Invalid => color_con(),
     }
 }
 
@@ -516,6 +440,9 @@ fn status_label(status: Status) -> &'static str {
         Status::Proposed => "PROPOSED",
         Status::Resolved => "RESOLVED",
         Status::Forced => "FORCED",
+        Status::Agreed => "AGREED",
+        Status::Forked => "FORKED",
+        Status::Invalid => "INVALID",
     }
 }
 
@@ -609,39 +536,7 @@ fn render_decision(ui: &mut egui::Ui, dec: &DecisionRow, search_needle: &str, fo
                     );
                 });
 
-                if let Some(outcome) = &dec.outcome {
-                    if !outcome.trim().is_empty() {
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(2.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                            if let Some(age) = format_relative_age(dec.finished_at) {
-                                ui.label(
-                                    egui::RichText::new(age)
-                                        .monospace()
-                                        .small()
-                                        .color(color_muted(ui)),
-                                );
-                            }
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                                ui.label(
-                                    egui::RichText::new("OUTCOME")
-                                        .monospace()
-                                        .small()
-                                        .strong()
-                                        .color(color_resolved()),
-                                );
-                            });
-                        });
-                        GORBIE::search::highlight_label(
-                            ui,
-                            outcome,
-                            search_needle,
-                            body_format(ui, ui.visuals().text_color()),
-                            focused,
-                        );
-                    }
-                }
+                render_resolution(ui, &dec.resolution, search_needle, focused);
             });
 
         // Left status stripe, compass-card idiom.
@@ -691,17 +586,128 @@ fn render_factor_column(
                     focused,
                 );
             });
-            if let Some(detail) = &f.detail {
-                GORBIE::search::highlight_label(
-                    ui,
-                    detail,
-                    search_needle,
-                    body_format(ui, color_muted(ui)),
-                    focused,
-                );
-            }
         }
     });
+}
+
+fn render_resolution(
+    ui: &mut egui::Ui,
+    resolution: &ResolutionRow,
+    search_needle: &str,
+    focused: bool,
+) {
+    let (outcome, finished_at, note) = match resolution {
+        ResolutionRow::Proposed => return,
+        ResolutionRow::Unique {
+            id,
+            outcome,
+            finished_at,
+            ..
+        } => (
+            Some(outcome.as_str()),
+            Some(*finished_at),
+            Some(format!("HEAD {}", id_hex(*id))),
+        ),
+        ResolutionRow::Agreed {
+            heads,
+            outcome,
+            forced,
+        } => (
+            Some(outcome.as_str()),
+            None,
+            Some(format!(
+                "{} AGREED HEADS{}",
+                heads.len(),
+                if *forced { " · FORCED" } else { "" }
+            )),
+        ),
+        ResolutionRow::Forked(heads) => {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!("{} DIVERGENT RESOLUTION HEADS", heads.len()))
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color_forced()),
+            );
+            for head in heads {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}{}",
+                            if head.forced { "FORCED · " } else { "" },
+                            id_hex(head.id)
+                        ))
+                        .monospace()
+                        .small()
+                        .color(color_muted(ui)),
+                    );
+                    GORBIE::search::highlight_label(
+                        ui,
+                        &head.outcome,
+                        search_needle,
+                        body_format(ui, ui.visuals().text_color()),
+                        focused,
+                    );
+                });
+            }
+            return;
+        }
+        ResolutionRow::Invalid(error) => {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label(
+                egui::RichText::new("INVALID RESOLUTION GRAPH")
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color_con()),
+            );
+            ui.label(egui::RichText::new(error).monospace().small());
+            return;
+        }
+    };
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(2.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+        if let Some(age) = format_relative_age(finished_at) {
+            ui.label(
+                egui::RichText::new(age)
+                    .monospace()
+                    .small()
+                    .color(color_muted(ui)),
+            );
+        }
+        if let Some(note) = note {
+            ui.label(
+                egui::RichText::new(note)
+                    .monospace()
+                    .small()
+                    .color(color_muted(ui)),
+            );
+        }
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+            ui.label(
+                egui::RichText::new("OUTCOME")
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color_resolved()),
+            );
+        });
+    });
+    if let Some(outcome) = outcome {
+        GORBIE::search::highlight_label(
+            ui,
+            outcome,
+            search_needle,
+            body_format(ui, ui.visuals().text_color()),
+            focused,
+        );
+    }
 }
 
 fn paint_status_stripe(
@@ -779,4 +785,50 @@ fn now_tai_ns() -> i128 {
     use hifitime::Epoch;
     let now = Epoch::now().unwrap_or_else(|_| Epoch::from_tai_seconds(0.0));
     now.to_tai_duration().total_nanoseconds()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decision(resolution: ResolutionRow) -> DecisionRow {
+        DecisionRow {
+            id: Id::new([1; 16]).unwrap(),
+            title: "test".to_owned(),
+            context: None,
+            about: None,
+            created_at: None,
+            resolution,
+            pros: Vec::new(),
+            cons: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fork_and_agreement_are_distinct_visible_states() {
+        let first = Id::new([2; 16]).unwrap();
+        let second = Id::new([3; 16]).unwrap();
+        let forked = decision(ResolutionRow::Forked(vec![
+            ForkRow {
+                id: first,
+                outcome: "left".to_owned(),
+                forced: false,
+            },
+            ForkRow {
+                id: second,
+                outcome: "right".to_owned(),
+                forced: true,
+            },
+        ]));
+        assert_eq!(forked.status(), Status::Forked);
+        assert!(decision_matches_search(&forked, "right"));
+
+        let agreed = decision(ResolutionRow::Agreed {
+            heads: vec![first, second],
+            outcome: "same".to_owned(),
+            forced: false,
+        });
+        assert_eq!(agreed.status(), Status::Agreed);
+        assert!(decision_matches_search(&agreed, "same"));
+    }
 }

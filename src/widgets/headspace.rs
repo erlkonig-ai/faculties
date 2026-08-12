@@ -1,24 +1,18 @@
 //! Read-only GORBIE-embeddable viewer for the `headspace` faculty.
 //!
-//! Headspace is the playground's active-agent config: which model
-//! profile is active, what its model name / base URL / reasoning
-//! effort / token budgets look like, plus the inactive profiles
-//! available to switch to. This widget renders the live state as a
-//! single "you are here" card plus a compact roster of other
-//! profiles.
+//! Headspace is the playground's active-agent config: which model profile is
+//! active, what its model name / base URL / reasoning effort / token budgets
+//! look like, plus the inactive profiles available to switch to. This widget
+//! renders the live state as a single "you are here" card plus a compact
+//! roster of other profiles.
 //!
-//! The data lives on the `config` branch (the faculty's
-//! `CONFIG_BRANCH` constant). One `KIND_CONFIG_ID` entity carries
-//! the active configuration; the active model profile is referenced
-//! by `active_model_profile_id` and resolves to a
-//! `KIND_MODEL_PROFILE_ID` entity that holds the model-name,
-//! base-url, token-budget, etc. attributes. The latest entry per
-//! kind is selected by `metadata::updated_at` — appends are
-//! history-preserving so older rows stay readable via timeline.
+//! It consumes the exact native Headspace and Secrets collection snapshots.
+//! The shared projector preserves missing, agreed, and forked DAG heads; this
+//! widget never chooses a timestamp winner and never decrypts a credential.
 //!
 //! ```ignore
 //! let mut panel = HeadspaceViewer::default();
-//! panel.render(ctx, config_ws);
+//! panel.render(ctx, headspace_view, secrets_view);
 //! ```
 
 use std::collections::HashMap;
@@ -26,21 +20,11 @@ use std::collections::HashMap;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
+use crate::headspace::{self, ProfileValue, Resolution};
+use crate::secrets as secrets_model;
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{NsTAIInterval, U256BE};
-use triblespace::prelude::View;
 
-use crate::schemas::headspace::{playground_config, KIND_CONFIG_ID, KIND_MODEL_PROFILE_ID};
-
-type TextHandle = Inline<Handle<LongString>>;
+use super::storage::{DatasetRevision, DatasetView};
 
 // ── Palette ──────────────────────────────────────────────────────────
 
@@ -89,6 +73,7 @@ struct ModelProfile {
     context_safety_margin_tokens: Option<u64>,
     chars_per_token: Option<u64>,
     has_api_key: bool,
+    resolution: Option<String>,
 }
 
 impl ModelProfile {
@@ -105,6 +90,24 @@ impl ModelProfile {
             context_safety_margin_tokens: None,
             chars_per_token: None,
             has_api_key: false,
+            resolution: None,
+        }
+    }
+
+    fn from_value(value: &ProfileValue, resolution: Option<String>) -> Self {
+        Self {
+            id: value.anchor,
+            name: value.name.clone(),
+            model_name: Some(value.model.clone()),
+            base_url: Some(value.base_url.clone()),
+            reasoning_effort: value.reasoning_effort.clone(),
+            stream: Some(value.stream),
+            context_window_tokens: Some(value.context_window_tokens),
+            max_output_tokens: Some(value.max_output_tokens),
+            context_safety_margin_tokens: Some(value.context_safety_margin_tokens),
+            chars_per_token: Some(value.chars_per_token),
+            has_api_key: value.model_secret_version.is_some(),
+            resolution,
         }
     }
 }
@@ -113,228 +116,111 @@ impl ModelProfile {
 struct ActiveConfig {
     persona_id: Option<Id>,
     active_profile_id: Option<Id>,
+    resolution: Option<String>,
 }
 
 struct HeadspaceLive {
-    cached_head: Option<CommitHandle>,
+    headspace_revision: DatasetRevision,
+    secrets_revision: DatasetRevision,
     active: ActiveConfig,
-    /// All known model profiles, keyed by their profile id (the
-    /// `playground_config::model_profile_id` value on the catalog
-    /// entry — distinct from the entry's own entity id, which is
-    /// the timestamped revision row).
     profiles: HashMap<Id, ModelProfile>,
+    diagnostic: Option<String>,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl HeadspaceLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[headspace] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-        let active = load_active_config(ws, &space);
-        let profiles = load_profiles(ws, &space);
-        HeadspaceLive {
-            cached_head,
+    fn refresh(headspace_view: DatasetView<'_>, secrets_view: DatasetView<'_>) -> Self {
+        let result = (|| {
+            let secrets = secrets_model::validate_catalog(secrets_view.reader, secrets_view.facts)
+                .map_err(|error| format!("Secrets collection: {error:#}"))?;
+            let catalog = headspace::project_result(headspace_view.reader, headspace_view.facts)
+                .map_err(|error| format!("Headspace collection: {error:#}"))?;
+            headspace::validate_secret_references(&catalog, &secrets)
+                .map_err(|error| format!("Headspace secret references: {error:#}"))?;
+            Ok::<_, String>((load_active_config(&catalog), load_profiles(&catalog)))
+        })();
+
+        let (active, profiles, diagnostic) = match result {
+            Ok((active, profiles)) => (active, profiles, None),
+            Err(error) => (ActiveConfig::default(), HashMap::new(), Some(error)),
+        };
+        Self {
+            headspace_revision: headspace_view.revision,
+            secrets_revision: secrets_view.revision,
             active,
             profiles,
+            diagnostic,
         }
     }
 }
 
-/// Pick the most-recently-updated `KIND_CONFIG_ID` entity and read
-/// its persona pointer + active-profile pointer. There can be many
-/// historical config rows; `metadata::updated_at` orders them and
-/// the latest wins.
-fn load_active_config(_ws: &mut Workspace<Pile>, space: &TribleSet) -> ActiveConfig {
-    let mut best: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(space, [{
-            ?config_id @
-            metadata::tag: KIND_CONFIG_ID,
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match best {
-            Some((_, ck)) if ck >= key => {}
-            _ => best = Some((config_id, key)),
-        }
-    }
-    let Some((config_id, _)) = best else {
-        return ActiveConfig::default();
-    };
-    let persona_id = find!(
-        v: Id,
-        pattern!(space, [{ config_id @ playground_config::persona_id: ?v }])
-    )
-    .next();
-    let active_profile_id = find!(
-        v: Id,
-        pattern!(space, [{
-            config_id @ playground_config::active_model_profile_id: ?v
-        }])
-    )
-    .next();
-    ActiveConfig {
-        persona_id,
-        active_profile_id,
-    }
-}
-
-/// Walk every `KIND_MODEL_PROFILE_ID` catalog entry, keep only the
-/// latest per `model_profile_id`, and load its attributes. The
-/// catalog stores append-only revisions per profile id; the latest
-/// `metadata::updated_at` is the live row.
-fn load_profiles(ws: &mut Workspace<Pile>, space: &TribleSet) -> HashMap<Id, ModelProfile> {
-    // Map profile_id → (entry_id, updated_at key) — pick the latest.
-    let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-    for (entry_id, profile_id, updated_at) in find!(
-        (entry_id: Id, profile_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(space, [{
-            ?entry_id @
-            metadata::tag: KIND_MODEL_PROFILE_ID,
-            metadata::updated_at: ?updated_at,
-            playground_config::model_profile_id: ?profile_id,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        latest
-            .entry(profile_id)
-            .and_modify(|slot| {
-                if key > slot.1 {
-                    *slot = (entry_id, key);
-                }
+fn load_active_config(catalog: &headspace::Catalog) -> ActiveConfig {
+    match &catalog.config {
+        Resolution::Missing => ActiveConfig {
+            resolution: Some("NO NATIVE CONFIG".to_owned()),
+            ..ActiveConfig::default()
+        },
+        Resolution::Unique(snapshot) => ActiveConfig {
+            persona_id: snapshot.value.persona,
+            active_profile_id: Some(snapshot.value.active_profile),
+            resolution: None,
+        },
+        Resolution::Agreed(snapshots) => snapshots
+            .first()
+            .map(|snapshot| ActiveConfig {
+                persona_id: snapshot.value.persona,
+                active_profile_id: Some(snapshot.value.active_profile),
+                resolution: Some(format!("{} CONFIG HEADS AGREE", snapshots.len())),
             })
-            .or_insert((entry_id, key));
+            .unwrap_or_default(),
+        Resolution::Forked(snapshots) => ActiveConfig {
+            resolution: Some(format!("CONFIG FORK · {} HEADS", snapshots.len())),
+            ..ActiveConfig::default()
+        },
+        Resolution::Invalid(error) => ActiveConfig {
+            resolution: Some(format!("INVALID CONFIG · {error}")),
+            ..ActiveConfig::default()
+        },
     }
+}
 
-    let mut out: HashMap<Id, ModelProfile> = HashMap::new();
-    for (profile_id, (entry_id, _)) in latest {
-        let mut p = ModelProfile::empty(profile_id);
-
-        // Friendly name from metadata::name (Handle<LongString>).
-        let name_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ metadata::name: ?h }])
-        )
-        .next();
-        p.name = name_handle
-            .and_then(|h| read_text(ws, h))
-            .unwrap_or_else(|| format!("profile-{}", short_hex(profile_id)));
-
-        // Model name (Handle<LongString>).
-        let model_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ playground_config::model_name: ?h }])
-        )
-        .next();
-        p.model_name = model_handle.and_then(|h| read_text(ws, h));
-
-        // Base URL (Handle<LongString>).
-        let url_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ playground_config::model_base_url: ?h }])
-        )
-        .next();
-        p.base_url = url_handle.and_then(|h| read_text(ws, h));
-
-        // Reasoning effort (Handle<LongString>).
-        let effort_handle = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ playground_config::model_reasoning_effort: ?h }])
-        )
-        .next();
-        p.reasoning_effort = effort_handle.and_then(|h| read_text(ws, h));
-
-        // API key presence (Handle<LongString>) — we don't surface
-        // the secret, just whether one is configured.
-        p.has_api_key = find!(
-            h: TextHandle,
-            pattern!(space, [{ entry_id @ playground_config::model_api_key: ?h }])
-        )
-        .next()
-        .is_some();
-
-        // U256BE numerics — extracted to u64 when the upper 24 bytes
-        // are zero (i.e. the value really fits a u64).
-        p.stream = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ playground_config::model_stream: ?v }])
-            )
-            .next()
-        })
-        .map(|n| n != 0);
-        p.context_window_tokens = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ playground_config::model_context_window_tokens: ?v }])
-            )
-            .next()
-        });
-        p.max_output_tokens = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ playground_config::model_max_output_tokens: ?v }])
-            )
-            .next()
-        });
-        p.context_safety_margin_tokens = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{
-                    id @ playground_config::model_context_safety_margin_tokens: ?v
-                }])
-            )
-            .next()
-        });
-        p.chars_per_token = find_u64(space, entry_id, |id| {
-            find!(
-                v: Inline<U256BE>,
-                pattern!(space, [{ id @ playground_config::model_chars_per_token: ?v }])
-            )
-            .next()
-        });
-        out.insert(profile_id, p);
+fn load_profiles(catalog: &headspace::Catalog) -> HashMap<Id, ModelProfile> {
+    let mut out = HashMap::new();
+    for (anchor, resolution) in &catalog.profiles {
+        let profile = match resolution {
+            Resolution::Unique(snapshot) => ModelProfile::from_value(&snapshot.value, None),
+            Resolution::Agreed(snapshots) => snapshots
+                .first()
+                .map(|snapshot| {
+                    ModelProfile::from_value(
+                        &snapshot.value,
+                        Some(format!("{} HEADS AGREE", snapshots.len())),
+                    )
+                })
+                .unwrap_or_else(|| ModelProfile::empty(*anchor)),
+            Resolution::Forked(snapshots) => {
+                let mut profile = ModelProfile::empty(*anchor);
+                profile.name = format!("forked-{}", short_hex(*anchor));
+                profile.resolution = Some(format!("FORK · {} HEADS", snapshots.len()));
+                profile
+            }
+            Resolution::Missing => {
+                let mut profile = ModelProfile::empty(*anchor);
+                profile.name = format!("missing-{}", short_hex(*anchor));
+                profile.resolution = Some("MISSING".to_owned());
+                profile
+            }
+            Resolution::Invalid(error) => {
+                let mut profile = ModelProfile::empty(*anchor);
+                profile.name = format!("invalid-{}", short_hex(*anchor));
+                profile.resolution = Some(format!("INVALID · {error}"));
+                profile
+            }
+        };
+        out.insert(*anchor, profile);
     }
     out
-}
-
-fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
-    // Two i128s packed as big-endian-ordered halves. Use the first
-    // (start) bound as the sort key — matches what headspace.rs does.
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&interval.raw[..16]);
-    i128::from_be_bytes(bytes)
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
-}
-
-/// Decode a 32-byte big-endian U256 to u64 when the value fits.
-/// `query` is a tiny closure that does the per-attribute find!() —
-/// keeps the call sites readable without generic type plumbing.
-fn find_u64<F>(_space: &TribleSet, entity_id: Id, query: F) -> Option<u64>
-where
-    F: FnOnce(Id) -> Option<Inline<U256BE>>,
-{
-    let raw = query(entity_id)?;
-    if raw.raw[..24].iter().any(|b| *b != 0) {
-        return None;
-    }
-    let bytes: [u8; 8] = raw.raw[24..32].try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
 }
 
 fn short_hex(id: Id) -> String {
@@ -373,14 +259,21 @@ impl HeadspaceViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(
+        &mut self,
+        ctx: &mut CardCtx<'_>,
+        headspace_view: DatasetView<'_>,
+        secrets_view: DatasetView<'_>,
+    ) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(live) => {
+                live.headspace_revision != headspace_view.revision
+                    || live.secrets_revision != secrets_view.revision
+            }
         };
         if need_refresh {
-            self.live = Some(HeadspaceLive::refresh(ws));
+            self.live = Some(HeadspaceLive::refresh(headspace_view, secrets_view));
         }
 
         ctx.section("Headspace", |ctx| {
@@ -388,7 +281,16 @@ impl HeadspaceViewer {
                 return;
             };
 
+            if let Some(diagnostic) = live.diagnostic.as_deref() {
+                render_diagnostic(ctx.ui_mut(), diagnostic);
+                return;
+            }
+
             ctx.grid(|g| {
+                if let Some(resolution) = live.active.resolution.as_deref() {
+                    g.full(|ctx| render_diagnostic(ctx.ui_mut(), resolution));
+                }
+
                 // Header line — total profile count + persona summary.
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
@@ -570,6 +472,9 @@ fn render_active_card(ui: &mut egui::Ui, p: &ModelProfile, persona_id: Option<Id
                     ui.add_space(2.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        if let Some(resolution) = p.resolution.as_deref() {
+                            render_chip(ui, resolution);
+                        }
                         if let Some(eff) = p.reasoning_effort.as_ref() {
                             render_chip(ui, &format!("REASONING {}", eff.to_uppercase()));
                         }
@@ -726,6 +631,9 @@ fn render_other_profile_card(ui: &mut egui::Ui, p: &ModelProfile) {
                     );
                     ui.label(egui::RichText::new(m).monospace().small().color(body_muted));
                 }
+                if let Some(resolution) = p.resolution.as_deref() {
+                    render_chip(ui, resolution);
+                }
             });
             ui.label(
                 egui::RichText::new(id_hex(p.id))
@@ -752,6 +660,26 @@ fn render_chip(ui: &mut egui::Ui, label: &str) {
                     .small()
                     .strong()
                     .color(text),
+            );
+        });
+}
+
+fn render_diagnostic(ui: &mut egui::Ui, message: &str) {
+    let color = egui::Color32::from_rgb(0xd1, 0x83, 0x16);
+    let background = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 36);
+    egui::Frame::NONE
+        .fill(background)
+        .stroke(egui::Stroke::new(1.0, color))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(message)
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color),
             );
         });
 }

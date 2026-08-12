@@ -15,31 +15,31 @@
 //! merely hide the old pin/CAS model.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::{BlobEncoding, TryFromBlob};
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::encodings::shortstring::ShortString;
+use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::BlobStoreGet;
-use triblespace::core::trible::{Fragment, Trible, TribleSet};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::trible::{intrinsic_entity_id_v1, Fragment, Trible, TribleSet};
 use triblespace::macros::{attributes, entity, find, pattern};
-use triblespace::prelude::blobencodings::RawBytes;
-use triblespace::prelude::ExclusiveId;
-use triblespace_search::schemas::Embedding;
+use triblespace::prelude::{inlineencodings::R256, ExclusiveId};
 
 use crate::collection_cutover::{
     project_legacy_authored_commits, publish_fragments, FrozenSource, LegacyCommitCoordinate,
     LegacyPinCoordinate, ProjectedLegacyCommit,
 };
 use crate::files as file_capability;
-use crate::schemas::embeddings;
 use crate::schemas::files::{
     file, DEFAULT_SCOPE_ID, FILES_BRANCH_NAME, KIND_FILE, KIND_MEDIA_TYPE,
 };
@@ -51,6 +51,57 @@ mod legacy {
         // Historical Files inline MIME field. The id is source vocabulary,
         // not a newly minted schema id.
         "BFE2C88ECD13D56F80967C343FC072EE" unsafe as mime: ShortString;
+    }
+}
+
+/// Planned fragments own blobs which are not resident in the frozen source
+/// yet. Complete-candidate validation reads those first, then falls back to
+/// the immutable source reader for historical attachments.
+struct PlannedBlobReader<'a, Overlay> {
+    overlay: &'a Overlay,
+    source: &'a PileReader,
+}
+
+#[derive(Debug)]
+struct PlannedBlobReadError(String);
+
+impl fmt::Display for PlannedBlobReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlannedBlobReadError {}
+
+impl<Overlay> BlobStoreGet for PlannedBlobReader<'_, Overlay>
+where
+    Overlay: BlobStoreGet + BlobStoreMeta,
+{
+    type GetError<E: std::error::Error + Send + Sync + 'static> = PlannedBlobReadError;
+
+    fn get<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> std::result::Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
+    where
+        S: BlobEncoding + 'static,
+        T: TryFromBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        let staged = self
+            .overlay
+            .metadata(handle)
+            .map_err(|error| PlannedBlobReadError(format!("inspect planned blob: {error:?}")))?
+            .is_some();
+        if staged {
+            self.overlay
+                .get(handle)
+                .map_err(|error| PlannedBlobReadError(format!("read planned blob: {error:?}")))
+        } else {
+            self.source
+                .get(handle)
+                .map_err(|error| PlannedBlobReadError(format!("read source blob: {error:?}")))
+        }
     }
 }
 
@@ -128,7 +179,7 @@ impl FilesMigrationPlan {
         &self.report
     }
 
-    /// Union every planned authored leaf.
+    /// Union every planned authored commit.
     pub fn materialized_facts(&self) -> TribleSet {
         let mut facts = TribleSet::new();
         for commit in &self.commits {
@@ -276,8 +327,8 @@ fn plan_projected(
         // commits, so its support is the union of their immutable coordinates.
         // Attribution chooses the least coordinate from that complete support
         // set; it does not claim that one commit introduced every input.
-        let kind_fact = original
-            .iter()
+        let kind_fact = facts_for(&original, *file_id, metadata::tag.id())
+            .into_iter()
             .find(|fact| {
                 fact.e() == file_id
                     && fact.a() == &metadata::tag.id()
@@ -286,7 +337,6 @@ fn plan_projected(
                         .try_from_inline::<Id>()
                         .is_ok_and(|kind| kind == KIND_FILE)
             })
-            .copied()
             .expect("file query supplied its kind fact");
         let owner = [kind_fact, name_fact, mime_fact]
             .into_iter()
@@ -377,6 +427,20 @@ fn plan_projected(
         report,
     };
     plan.verify_conservation()?;
+    let mut staged = Fragment::empty();
+    for commit in &plan.commits {
+        staged.blobs_mut().union(commit.fragment.blobs().clone());
+    }
+    let overlay = staged
+        .blobs_mut()
+        .reader()
+        .context("snapshot complete planned Files payloads")?;
+    let candidate_reader = PlannedBlobReader {
+        overlay: &overlay,
+        source: reader,
+    };
+    file_capability::validate_catalog(&candidate_reader, &plan.materialized_facts())
+        .context("validate complete planned Files catalog")?;
     Ok(plan)
 }
 
@@ -397,11 +461,28 @@ fn assign_addition(
 }
 
 fn facts_for(facts: &TribleSet, entity: Id, attribute: Id) -> Vec<Trible> {
-    facts
-        .iter()
-        .filter(|fact| fact.e() == &entity && fact.a() == &attribute)
-        .copied()
-        .collect()
+    let mut prefix = [0u8; 32];
+    prefix[..16].copy_from_slice(&entity[..]);
+    prefix[16..].copy_from_slice(&attribute[..]);
+
+    // The EAV PATCH already is the exact per-entity/per-attribute index. A
+    // bounded view locates that prefix once, gives us its exact cardinality,
+    // and then enumerates only the matching values from the located subtree.
+    let values = facts
+        .eav
+        .bounded_infixes(&prefix, facts.len() as u64)
+        .expect("an EAV prefix cannot contain more values than the complete set");
+    let mut matching = Vec::with_capacity(values.len() as usize);
+    values.for_each(|value: &[u8; 32]| {
+        let mut raw = [0u8; 64];
+        raw[..32].copy_from_slice(&prefix);
+        raw[32..].copy_from_slice(value);
+        matching.push(
+            Trible::force_raw(raw)
+                .expect("non-nil entity and attribute prefix must form a valid trible"),
+        );
+    });
+    matching
 }
 
 fn exactly_one_fact(facts: &TribleSet, entity: Id, attribute: Id, field: &str) -> Result<Trible> {
@@ -420,14 +501,19 @@ fn validate_existing_media_type(
     reader: &PileReader,
     media_type: Id,
 ) -> Result<()> {
-    let tagged = find!(
-        id: Id,
-        pattern!(facts, [{ media_type @ metadata::tag: ?id }])
-    )
-    .any(|id| id == KIND_MEDIA_TYPE);
-    if !tagged {
+    let kind_fact = facts_for(facts, media_type, metadata::tag.id())
+        .into_iter()
+        .find(|fact| {
+            fact.e() == &media_type
+                && fact.a() == &metadata::tag.id()
+                && fact
+                    .v::<GenId>()
+                    .try_from_inline::<Id>()
+                    .is_ok_and(|kind| kind == KIND_MEDIA_TYPE)
+        });
+    let Some(kind_fact) = kind_fact else {
         bail!("file points at non-media-type entity {media_type:x}");
-    }
+    };
     let name_fact = exactly_one_fact(facts, media_type, metadata::name.id(), "media-type name")?;
     let handle = *name_fact.v::<Handle<LongString>>();
     let name: View<str> = reader
@@ -438,8 +524,14 @@ fn validate_existing_media_type(
         bail!("media-type entity {media_type:x} stores a non-normalized name");
     }
     let canonical = media_type_fragment(name.as_ref())?;
-    if canonical.root() != Some(media_type) {
-        bail!("file points at non-intrinsic media-type entity {media_type:x}");
+    let historical = intrinsic_entity_id_v1(vec![
+        (*kind_fact.a(), kind_fact.v::<R256>().raw),
+        (*name_fact.a(), name_fact.v::<R256>().raw),
+    ]);
+    if canonical.root() != Some(media_type) && historical != media_type {
+        bail!(
+            "file points at non-intrinsic media-type entity {media_type:x} under both the current v2 and historical v1 identity rules"
+        );
     }
     Ok(())
 }
@@ -477,49 +569,12 @@ fn choose_media_type(name: &str, legacy_value: &str) -> (String, MediaTypeSource
 }
 
 /// Strictly read every Files payload whose encoding is known to this domain.
-fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
-    for fact in facts {
-        if fact.a() == &file::content.id() {
-            let handle = *fact.v::<Handle<RawBytes>>();
-            let _: anybytes::Bytes = reader.get(handle).with_context(|| {
-                format!("strictly read file content {}", hex::encode(handle.raw))
-            })?;
-        } else if fact.a() == &file::name.id()
-            || fact.a() == &file::source_path.id()
-            || fact.a() == &metadata::name.id()
-            || fact.a() == &metadata::description.id()
-        {
-            let handle = *fact.v::<Handle<LongString>>();
-            let _: View<str> = reader
-                .get(handle)
-                .with_context(|| format!("strictly read Files text {}", hex::encode(handle.raw)))?;
-        } else if fact.a() == &file::embedding.id() {
-            let handle = *fact.v::<Handle<Embedding>>();
-            let _: View<[f32]> = reader.get(handle).with_context(|| {
-                format!(
-                    "strictly read Files CLIP embedding {}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-        } else if fact.a() == &embeddings::attr::embedding.id() {
-            let handle = *fact.v::<Handle<embeddings::Embedding768>>();
-            let _: View<[f32]> = reader.get(handle).with_context(|| {
-                format!(
-                    "strictly read Files 768-d embedding {}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-        } else if fact.a() == &embeddings::attr_mm7b::embedding.id() {
-            let handle = *fact.v::<Handle<embeddings::Embedding3584>>();
-            let _: View<[f32]> = reader.get(handle).with_context(|| {
-                format!(
-                    "strictly read Files 3584-d embedding {}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-        }
-    }
-    Ok(())
+///
+/// This is also the exact residency boundary used by collection-native
+/// read-only consumers such as the generic viewer. It validates payloads
+/// without selecting, mutating, or migrating any Files state.
+pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+    file_capability::validate_known_payloads(reader, facts)
 }
 
 #[cfg(test)]
@@ -530,10 +585,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ed25519_dalek::SigningKey;
+    use hifitime::Epoch;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::inline::Inline;
     use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, Repository};
     use triblespace::macros::exists;
+    use triblespace::prelude::{blobencodings::RawBytes, TryToInline};
 
     use crate::collection_cutover::{discover_target, freeze_source, initialize_signer};
 
@@ -600,6 +657,14 @@ mod tests {
         };
         let old_file = file_record.root().unwrap();
         file_fragment += file_record;
+        let source_path = file_fragment.put::<LongString, _>("mail:legacy-report".to_owned());
+        let imported_at = Epoch::from_tai_seconds(41.0);
+        let imported_at: file_capability::ImportTime =
+            (imported_at, imported_at).try_to_inline().unwrap();
+        file_fragment += entity! { ExclusiveId::force_ref(&old_file) @
+            file::source_path: source_path,
+            file::imported_at: imported_at,
+        };
         let semantic = entity! { metadata::description: "semantic metadata" };
         workspace.commit_with_metadata(file_fragment.clone(), semantic, "legacy file");
         repository.push(&mut workspace).unwrap();
@@ -645,10 +710,58 @@ mod tests {
     }
 
     #[test]
+    fn eav_prefix_lookup_returns_only_the_exact_entity_attribute_slice() {
+        let entity = Id::new([0x81; 16]).unwrap();
+        let attribute = Id::new([0x82; 16]).unwrap();
+        let other_attribute = Id::new([0x83; 16]).unwrap();
+        let first_value = Inline::<R256>::new([0x11; 32]);
+        let second_value = Inline::<R256>::new([0x22; 32]);
+
+        let first = Trible::force(ExclusiveId::force_ref(&entity), &attribute, &first_value);
+        let second = Trible::force(ExclusiveId::force_ref(&entity), &attribute, &second_value);
+        let mut facts = TribleSet::new();
+        facts.insert(&first);
+        facts.insert(&second);
+        facts.insert(&Trible::force(
+            ExclusiveId::force_ref(&entity),
+            &other_attribute,
+            &first_value,
+        ));
+
+        // Keep the target slice tiny inside a much larger EAV population. The
+        // lookup must walk the exact indexed prefix rather than rediscovering
+        // it with a scan of every unrelated entity.
+        for serial in 0u32..4096 {
+            let mut raw = [0x91; 16];
+            raw[12..].copy_from_slice(&serial.to_be_bytes());
+            let noise = Id::new(raw).unwrap();
+            facts.insert(&Trible::force(
+                ExclusiveId::force_ref(&noise),
+                &attribute,
+                &first_value,
+            ));
+        }
+
+        let actual: BTreeSet<_> = facts_for(&facts, entity, attribute).into_iter().collect();
+        assert_eq!(actual, BTreeSet::from([first, second]));
+        assert!(facts_for(&facts, entity, Id::new([0x84; 16]).unwrap()).is_empty());
+    }
+
+    #[test]
     fn plan_is_strictly_additive_and_preserves_every_existing_identity() {
         let fixture = fixture();
         let before = fs::read(&fixture.source).unwrap();
         let frozen = freeze_source(&fixture.source).unwrap();
+        let expected_media_type = file_capability::media_type_fragment("application/pdf").unwrap();
+        let expected_name = find!(
+            name: file_capability::NameHandle,
+            pattern!(&expected_media_type, [{
+                _?media_type @ metadata::name: ?name
+            }])
+        )
+        .next()
+        .unwrap();
+        assert!(frozen.reader().metadata(expected_name).unwrap().is_none());
         let plan = plan(&frozen).unwrap();
 
         assert_eq!(fs::read(&fixture.source).unwrap(), before);
@@ -672,6 +785,13 @@ mod tests {
         .expect("additive media type relation");
         assert!(exists!(pattern!(&materialized, [{
             media_type @ metadata::tag: &KIND_MEDIA_TYPE
+        }])));
+        assert!(exists!(pattern!(&materialized, [{
+            fixture.old_file @ file::source_path: _?path,
+            file::imported_at: _?time,
+        }])));
+        assert!(!exists!(pattern!(&materialized, [{
+            _?import @ metadata::tag: &crate::schemas::files::KIND_IMPORT
         }])));
         assert_eq!(plan.decisions().len(), 2);
         assert!(plan.decisions().iter().all(|decision| {
@@ -704,7 +824,10 @@ mod tests {
             .unwrap()
             .is_empty());
         let target = discover_target(&mut pile, DEFAULT_SCOPE_ID).unwrap();
-        assert!(target.definition_present());
+        assert_eq!(
+            target.descriptor(),
+            triblespace::core::collection::simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
+        );
         let mut expected_commits = first.clone();
         expected_commits.sort_unstable_by_key(CollectionCommit::id);
         assert_eq!(target.commits(), expected_commits.as_slice());
@@ -793,9 +916,97 @@ mod tests {
     }
 
     #[test]
-    fn existing_media_type_must_have_its_intrinsic_identity() {
+    fn incomplete_import_is_rejected_by_complete_planner_preflight() {
         let directory = TestDirectory::new();
-        let path = directory.path().join("media-type.pile");
+        let source = directory.path().join("partial-import.pile");
+        File::create(&source).unwrap();
+        let pile = crate::collection_cutover::open_pile_strict(&source).unwrap();
+        let mut repository =
+            Repository::new(pile, SigningKey::from_bytes(&[0x62; 32]), Fragment::empty()).unwrap();
+        let branch = *repository.create_branch(FILES_BRANCH_NAME, None).unwrap();
+        let mut workspace = repository.pull(branch).unwrap();
+        let mut malformed = Fragment::empty();
+        let content = malformed.put::<RawBytes, _>(b"partial import".to_vec());
+        let name = malformed.put::<LongString, _>("partial.txt".to_owned());
+        let file = entity! {
+            metadata::tag: &KIND_FILE,
+            file::content: content,
+            file::name: name,
+            legacy::mime: "text/plain",
+        };
+        let root = file.root().unwrap();
+        malformed += file;
+        let import_id = Id::new([0x63; 16]).unwrap();
+        malformed += entity! { ExclusiveId::force_ref(&import_id) @
+            metadata::tag: &crate::schemas::files::KIND_IMPORT,
+            file::root: &root,
+        };
+        workspace.commit(malformed, "partial import");
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+
+        let frozen = freeze_source(&source).unwrap();
+        let error = plan(&frozen).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("validate complete planned Files catalog"));
+        assert!(message.contains("0 values for imported_at"));
+    }
+
+    #[test]
+    fn existing_media_type_accepts_current_v2_intrinsic_identity() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("media-type-v2.pile");
+        File::create(&path).unwrap();
+        let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
+        let name = pile
+            .put::<LongString, _>("application/pdf".to_owned())
+            .unwrap();
+        let facts = entity! {
+            metadata::tag: &KIND_MEDIA_TYPE,
+            metadata::name: name,
+        };
+        let current = facts.root().expect("current media type has one root");
+        let reader = pile.reader().unwrap();
+        pile.close().unwrap();
+
+        validate_existing_media_type(facts.facts(), &reader, current).unwrap();
+    }
+
+    #[test]
+    fn existing_media_type_accepts_historical_v1_intrinsic_identity() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("media-type-v1.pile");
+        File::create(&path).unwrap();
+        let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
+        let name = pile
+            .put::<LongString, _>("application/octet-stream".to_owned())
+            .unwrap();
+        let current = entity! {
+            metadata::tag: &KIND_MEDIA_TYPE,
+            metadata::name: name,
+        };
+        let historical = intrinsic_entity_id_v1(
+            current
+                .facts()
+                .iter()
+                .map(|fact| (*fact.a(), fact.v::<R256>().raw))
+                .collect(),
+        );
+        let facts = entity! { ExclusiveId::force_ref(&historical) @
+            metadata::tag: &KIND_MEDIA_TYPE,
+            metadata::name: name,
+        }
+        .into_facts();
+        let reader = pile.reader().unwrap();
+        pile.close().unwrap();
+
+        validate_existing_media_type(&facts, &reader, historical).unwrap();
+    }
+
+    #[test]
+    fn existing_media_type_rejects_random_extrinsic_identity() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("media-type-extrinsic.pile");
         File::create(&path).unwrap();
         let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
         let name = pile

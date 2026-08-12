@@ -1,9 +1,9 @@
-//! Minimal capture target for iterating on the headspace widget in
-//! isolation. The headspace config lives on the `config` branch.
+//! Minimal capture target for iterating on the collection-native Headspace
+//! widget in isolation.
 
 use std::path::PathBuf;
 
-use faculties::widgets::{HeadspaceViewer, StorageState};
+use faculties::widgets::{HeadspaceViewer, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -19,31 +19,34 @@ fn resolve_pile_path() -> PathBuf {
         );
         std::process::exit(0);
     }
-    std::env::var("PILE")
-        .ok()
-        .or_else(|| std::env::args().skip(1).find(|a| !a.starts_with("--")))
-        .unwrap_or_else(|| "./self.pile".to_owned())
-        .into()
+    faculties::widgets::resolve_pile_path(std::env::args().skip(1), std::env::var("PILE").ok())
 }
 
 #[notebook]
 fn main(nb: &mut NotebookCtx) {
     let path = resolve_pile_path();
 
-    let storage = nb.state("storage", StorageState::new(path), |ctx, st| {
-        st.top_bar(ctx);
-    });
+    let storage = nb.state(
+        "storage",
+        StorageState::for_sources(path, [SourceKey::Headspace]),
+        |ctx, st| {
+            st.top_bar(ctx);
+        },
+    );
 
     nb.state(
         "headspace",
         HeadspaceViewer::default(),
         move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
-            let Some(mut ws) = st.workspace("config") else {
+            let sources = st.context();
+            let Some(headspace) = sources.dataset(SourceKey::Headspace) else {
                 return;
             };
-            panel.render(ctx, &mut ws);
-            st.push(&mut ws);
+            let Some(secrets) = sources.dataset(SourceKey::Secrets) else {
+                return;
+            };
+            panel.render(ctx, headspace, secrets);
         },
     );
 }

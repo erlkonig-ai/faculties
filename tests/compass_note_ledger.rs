@@ -25,6 +25,7 @@ impl TestPile {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.pile");
         fs::File::create(&path).unwrap();
+        faculties::collection_cutover::initialize_signer(&path, None).unwrap();
         Self { dir, path }
     }
 }
@@ -68,12 +69,8 @@ fn note_metadata_is_stored_and_rendered_without_hiding_history() {
     let relations = env!("CARGO_BIN_EXE_relations");
     let compass = env!("CARGO_BIN_EXE_compass");
 
-    let person = stdout(run(
-        relations,
-        &pile.path,
-        &["add", "ledger-author", "--affinity", "zooid"],
-    ));
-    let person_id = id_after("Added ", &person);
+    let person = stdout(run(relations, &pile.path, &["add", "ledger-author"]));
+    let person_id = id_after("person: ", &person);
 
     let added = stdout(run(
         compass,
@@ -102,7 +99,7 @@ fn note_metadata_is_stored_and_rendered_without_hiding_history() {
             &goal_id,
             "follow-up [code](git:DEADBEEF)",
             "--tag",
-            "liora-gpt",
+            "reviewer",
             "--ref",
             " exact ref ",
             "--supersedes",
@@ -115,7 +112,7 @@ fn note_metadata_is_stored_and_rendered_without_hiding_history() {
     assert!(shown.contains(&format!("[{first_note}]")));
     assert!(shown.contains(&format!("[{second_note}]")));
     assert!(shown.contains(&format!("by {person_id}")));
-    assert!(shown.contains("tags: #liora-gpt"));
+    assert!(shown.contains("tags: #reviewer"));
     assert!(shown.contains("refs:  exact ref , git:DEADBEEF"));
     assert!(shown.contains(&format!("supersedes: {first_note}")));
     assert!(shown.contains("refs: wiki:ABCD1234"));
@@ -160,15 +157,17 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let compass = env!("CARGO_BIN_EXE_compass");
     let orient = env!("CARGO_BIN_EXE_orient");
 
+    stdout(run(relations, &pile.path, &["add", "me"]));
+    stdout(run(relations, &pile.path, &["add", "peer"]));
     stdout(run(
         relations,
         &pile.path,
-        &["add", "me", "--affinity", "zooid"],
+        &["group", "create", "reviewers"],
     ));
     stdout(run(
         relations,
         &pile.path,
-        &["add", "peer", "--affinity", "zooid"],
+        &["group", "add", "reviewers", "me"],
     ));
     let added = stdout(run(
         compass,
@@ -179,6 +178,23 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
 
     let baseline = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(baseline.is_empty());
+
+    let addressed = stdout(run(
+        compass,
+        &pile.path,
+        &[
+            "--persona",
+            "peer",
+            "add",
+            "Group-addressed goal",
+            "--tag",
+            "reviewers",
+        ],
+    ));
+    let addressed_goal = id_after("Added goal ", &addressed);
+    let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
+    assert!(news.contains(&format!("new goal [{addressed_goal}] (todo)")));
+    assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 
     let foreign = stdout(run(
         compass,
@@ -223,7 +239,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
             &unrelated_goal,
             "direct ping",
             "--tag",
-            "me",
+            "reviewers",
         ],
     ));
     let direct_id = id_after("Added note ", &direct);

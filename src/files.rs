@@ -9,25 +9,30 @@
 //! - [`file::media_type`] = an intrinsic [`KIND_MEDIA_TYPE`] entity
 //!
 //! Paths, source-system identifiers, timestamps, tags, embeddings, and other
-//! provenance are deliberately not accepted here. Callers attach those facts
-//! to imports or source-specific occurrence entities instead.
+//! provenance are deliberately absent from that identity. New callers attach
+//! those facts to imports or source-specific occurrence entities; complete
+//! catalogs also preserve historical path/timestamp provenance on file ids.
 
 use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
-use std::collections::BTreeSet;
+use hifitime::Epoch;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use triblespace::core::collection::{Collection, CollectionCommit};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStore;
+use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
-use triblespace::prelude::inlineencodings::Handle;
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
+use triblespace_search::schemas::Embedding;
 
+use crate::schemas::embeddings;
 use crate::schemas::files::{file, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_MEDIA_TYPE};
 
 pub type ContentHandle = Inline<Handle<RawBytes>>;
 pub type NameHandle = Inline<Handle<LongString>>;
+pub type ImportTime = Inline<NsTAIInterval>;
 pub const DEFAULT_MEDIA_TYPE: &str = "application/octet-stream";
 
 /// The two canonical targets carried by a `files:` reference token.
@@ -45,6 +50,169 @@ impl FileReference {
         match self {
             Self::Entity(entity) => format!("{entity:x}"),
             Self::Content(content) => content_hash_hex(content),
+        }
+    }
+}
+
+/// One structurally complete file in a validated Files snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileRecord {
+    pub id: Id,
+    pub name: String,
+    pub content: ContentHandle,
+    pub media_type: Id,
+}
+
+/// One structurally complete directory in a validated Files snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryRecord {
+    pub id: Id,
+    pub name: String,
+    pub children: Vec<Id>,
+}
+
+/// One structurally complete import in a validated Files snapshot.
+///
+/// The writer derives an import id from exactly one source path, timestamp,
+/// and root. Repeated values are therefore corruption or conflicting additive
+/// evidence, not alternate candidates from which a reader may choose.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportRecord {
+    pub id: Id,
+    pub imported_at: Epoch,
+    pub source_path: String,
+    pub root: Id,
+    pub tags: Vec<String>,
+}
+
+/// A validated file-system node.
+#[derive(Clone, Copy, Debug)]
+pub enum NodeRecord<'a> {
+    File(&'a FileRecord),
+    Directory(&'a DirectoryRecord),
+}
+
+/// A byte reference together with every catalog name that describes it.
+///
+/// Entity references always have one name because [`FilesCatalog`] rejects
+/// malformed scalar fields. Content references may intentionally be shared by
+/// several differently named files, so callers must not pick one name as a
+/// winner. [`ResolvedFile::unique_name`] is `None` in that case.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedFile {
+    pub content: ContentHandle,
+    pub names: Vec<String>,
+}
+
+impl ResolvedFile {
+    pub fn unique_name(&self) -> Option<&str> {
+        (self.names.len() == 1).then(|| self.names[0].as_str())
+    }
+}
+
+/// Canonical read model for one complete Files collection value.
+///
+/// Scalar writer fields are validated as exactly-one values. Directory edges
+/// and tags remain set-valued and are sorted for deterministic presentation.
+/// This type is the shared boundary for the Files and Wiki widgets so neither
+/// can accidentally reinstate `Iterator::next()` winner semantics.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FilesCatalog {
+    files: BTreeMap<Id, FileRecord>,
+    directories: BTreeMap<Id, DirectoryRecord>,
+    imports: BTreeMap<Id, ImportRecord>,
+}
+
+impl FilesCatalog {
+    pub fn files(&self) -> impl ExactSizeIterator<Item = &FileRecord> {
+        self.files.values()
+    }
+
+    pub fn directories(&self) -> impl ExactSizeIterator<Item = &DirectoryRecord> {
+        self.directories.values()
+    }
+
+    pub fn imports(&self) -> impl ExactSizeIterator<Item = &ImportRecord> {
+        self.imports.values()
+    }
+
+    pub fn file(&self, id: Id) -> Option<&FileRecord> {
+        self.files.get(&id)
+    }
+
+    pub fn directory(&self, id: Id) -> Option<&DirectoryRecord> {
+        self.directories.get(&id)
+    }
+
+    pub fn import(&self, id: Id) -> Option<&ImportRecord> {
+        self.imports.get(&id)
+    }
+
+    pub fn node(&self, id: Id) -> Option<NodeRecord<'_>> {
+        self.file(id)
+            .map(NodeRecord::File)
+            .or_else(|| self.directory(id).map(NodeRecord::Directory))
+    }
+
+    /// Resolve the canonical selector language using only validated records.
+    pub fn resolve_reference(&self, input: &str) -> Result<FileReference> {
+        let selector = normalize_selector(input)?;
+
+        if selector.len() == 32 {
+            return Id::from_hex(&selector)
+                .map(FileReference::Entity)
+                .ok_or_else(|| anyhow!("invalid entity id '{selector}'"));
+        }
+        if selector.len() == 64 {
+            let hash = inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(&selector)
+                .map_err(|_| anyhow!("invalid content hash '{selector}'"))?;
+            return Ok(FileReference::Content(inlineencodings::Handle::from_hash(
+                hash,
+            )));
+        }
+
+        let mut matches = BTreeSet::new();
+        for file in self.files.values() {
+            if format!("{:x}", file.id).starts_with(&selector) {
+                matches.insert(FileReference::Entity(file.id));
+            }
+            if content_hash_hex(file.content).starts_with(&selector) {
+                matches.insert(FileReference::Content(file.content));
+            }
+        }
+        for id in self.directories.keys().chain(self.imports.keys()).copied() {
+            if format!("{id:x}").starts_with(&selector) {
+                matches.insert(FileReference::Entity(id));
+            }
+        }
+        exactly_one(&selector, matches, "file reference", |reference| {
+            format!("files:{}", reference.hex())
+        })
+    }
+
+    /// Resolve bytes without manufacturing a display-name winner.
+    pub fn resolve_file(&self, input: &str) -> Result<ResolvedFile> {
+        match self.resolve_reference(input)? {
+            FileReference::Entity(id) => {
+                let file = self
+                    .file(id)
+                    .ok_or_else(|| anyhow!("files entity {id:x} is not a file"))?;
+                Ok(ResolvedFile {
+                    content: file.content,
+                    names: vec![file.name.clone()],
+                })
+            }
+            FileReference::Content(content) => {
+                let names = self
+                    .files
+                    .values()
+                    .filter(|file| file.content == content)
+                    .map(|file| file.name.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                Ok(ResolvedFile { content, names })
+            }
         }
     }
 }
@@ -310,6 +478,456 @@ pub fn media_type_name_handle(space: &TribleSet, file_id: Id) -> Option<NameHand
     .map(|(name,)| name)
 }
 
+fn one_file_value<T: Ord>(values: BTreeSet<T>, field: &str, file_id: Id) -> Result<Option<T>> {
+    match values.len() {
+        0 => Ok(None),
+        1 => Ok(values.into_iter().next()),
+        count => anyhow::bail!("file {file_id:x} has {count} values for {field}"),
+    }
+}
+
+/// Resolve the unique content handle of one file entity, if present.
+pub fn content_handle(space: &TribleSet, file_id: Id) -> Result<Option<ContentHandle>> {
+    one_file_value(
+        find!(
+            content: ContentHandle,
+            pattern!(space, [{ file_id @ file::content: ?content }])
+        )
+        .collect(),
+        "content",
+        file_id,
+    )
+}
+
+/// Resolve the unique leaf-name handle of one file entity, if present.
+pub fn name_handle(space: &TribleSet, file_id: Id) -> Result<Option<NameHandle>> {
+    one_file_value(
+        find!(
+            name: NameHandle,
+            pattern!(space, [{ file_id @ file::name: ?name }])
+        )
+        .collect(),
+        "name",
+        file_id,
+    )
+}
+
+/// Resolve a file's unique media-type name while checking the referenced
+/// entity's canonical kind.
+pub fn media_type_name_handle_strict(space: &TribleSet, file_id: Id) -> Result<Option<NameHandle>> {
+    one_file_value(
+        find!(
+            name: NameHandle,
+            pattern!(space, [
+                { file_id @ file::media_type: _?media_type },
+                { _?media_type @ metadata::tag: &KIND_MEDIA_TYPE, metadata::name: ?name }
+            ])
+        )
+        .collect(),
+        "media type name",
+        file_id,
+    )
+}
+
+fn required_catalog_value<T: Ord>(values: BTreeSet<T>, field: &str, id: Id) -> Result<T> {
+    match values.len() {
+        1 => Ok(values.into_iter().next().expect("one catalog value")),
+        count => anyhow::bail!(
+            "Files entity {id:x} has {count} values for {field}; expected exactly one"
+        ),
+    }
+}
+
+fn read_catalog_text<R: BlobStoreGet>(
+    reader: &R,
+    handle: NameHandle,
+    field: &str,
+    id: Id,
+) -> Result<String> {
+    let value: anybytes::View<str> = reader
+        .get(handle)
+        .map_err(|error| anyhow!("read Files {field} for {id:x}: {error:?}"))?;
+    Ok(value.to_string())
+}
+
+fn decode_point_imported_at(value: ImportTime, owner: &str, id: Id) -> Result<Epoch> {
+    let (start, end): (Epoch, Epoch) = value
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode Files {owner} imported_at for {id:x}: {error:?}"))?;
+    if start != end {
+        anyhow::bail!("Files {owner} {id:x} has a non-point imported_at interval");
+    }
+    Ok(start)
+}
+
+fn entities_with_attributes(facts: &TribleSet, attributes: &[Id]) -> BTreeSet<Id> {
+    facts
+        .iter()
+        .filter(|fact| attributes.contains(fact.a()))
+        .map(|fact| *fact.e())
+        .collect()
+}
+
+fn validate_directory_acyclic(
+    id: Id,
+    directories: &BTreeMap<Id, DirectoryRecord>,
+    visiting: &mut BTreeSet<Id>,
+    visited: &mut BTreeSet<Id>,
+) -> Result<()> {
+    if visited.contains(&id) {
+        return Ok(());
+    }
+    if !visiting.insert(id) {
+        anyhow::bail!("Files directory graph contains a cycle through {id:x}");
+    }
+    let directory = directories
+        .get(&id)
+        .expect("cycle walk starts from a directory");
+    for child in &directory.children {
+        if directories.contains_key(child) {
+            validate_directory_acyclic(*child, directories, visiting, visited)?;
+        }
+    }
+    visiting.remove(&id);
+    visited.insert(id);
+    Ok(())
+}
+
+/// Strictly read every payload whose encoding is known to Files.
+///
+/// Structural validation lives in [`load_catalog`]; this narrower function is
+/// also used while replaying stopped legacy commits, where preserving an exact
+/// authored delta must happen before the union-level structure can be checked.
+pub fn validate_known_payloads<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<()> {
+    for fact in facts {
+        if fact.a() == &file::content.id() {
+            let handle = *fact.v::<Handle<RawBytes>>();
+            let _: anybytes::Bytes = reader.get(handle).map_err(|error| {
+                anyhow!(
+                    "strictly read file content {}: {error:?}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        } else if fact.a() == &file::name.id()
+            || fact.a() == &file::source_path.id()
+            || fact.a() == &metadata::name.id()
+            || fact.a() == &metadata::description.id()
+        {
+            let handle = *fact.v::<Handle<LongString>>();
+            let _: anybytes::View<str> = reader.get(handle).map_err(|error| {
+                anyhow!(
+                    "strictly read Files text {}: {error:?}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        } else if fact.a() == &file::embedding.id() {
+            let handle = *fact.v::<Handle<Embedding>>();
+            let _: anybytes::View<[f32]> = reader.get(handle).map_err(|error| {
+                anyhow!(
+                    "strictly read Files CLIP embedding {}: {error:?}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        } else if fact.a() == &embeddings::attr::embedding.id() {
+            let handle = *fact.v::<Handle<embeddings::Embedding768>>();
+            let _: anybytes::View<[f32]> = reader.get(handle).map_err(|error| {
+                anyhow!(
+                    "strictly read Files 768-d embedding {}: {error:?}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        } else if fact.a() == &embeddings::attr_mm7b::embedding.id() {
+            let handle = *fact.v::<Handle<embeddings::Embedding3584>>();
+            let _: anybytes::View<[f32]> = reader.get(handle).map_err(|error| {
+                anyhow!(
+                    "strictly read Files 3584-d embedding {}: {error:?}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Project and validate one complete canonical Files collection value.
+///
+/// Every scalar used by a reader is checked for exact cardinality before any
+/// record is returned. Imports cannot be partial, conflicting file names or
+/// content cannot acquire an implicit winner, and directory extraction cannot
+/// overwrite one same-named child with another.
+pub fn load_catalog<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<FilesCatalog> {
+    validate_known_payloads(reader, facts)?;
+
+    let file_ids = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &KIND_FILE }])
+    )
+    .collect::<BTreeSet<_>>();
+    let directory_ids = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &KIND_DIRECTORY }])
+    )
+    .collect::<BTreeSet<_>>();
+    let import_ids = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &KIND_IMPORT }])
+    )
+    .collect::<BTreeSet<_>>();
+
+    for id in file_ids
+        .intersection(&directory_ids)
+        .chain(file_ids.intersection(&import_ids))
+        .chain(directory_ids.intersection(&import_ids))
+    {
+        anyhow::bail!("Files entity {id:x} carries competing file/directory/import kinds");
+    }
+
+    let file_candidates =
+        entities_with_attributes(facts, &[file::content.id(), file::media_type.id()]);
+    if let Some(id) = file_candidates.difference(&file_ids).next() {
+        anyhow::bail!("Files entity {id:x} carries file fields without KIND_FILE");
+    }
+    let directory_candidates = entities_with_attributes(facts, &[file::children.id()]);
+    if let Some(id) = directory_candidates.difference(&directory_ids).next() {
+        anyhow::bail!("Files entity {id:x} carries directory children without KIND_DIRECTORY");
+    }
+    let root_candidates = entities_with_attributes(facts, &[file::root.id()]);
+    if let Some(id) = root_candidates.difference(&import_ids).next() {
+        anyhow::bail!("Files entity {id:x} carries an import root without KIND_IMPORT");
+    }
+    let provenance_candidates =
+        entities_with_attributes(facts, &[file::imported_at.id(), file::source_path.id()]);
+    let provenance_owners = file_ids
+        .union(&import_ids)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if let Some(id) = provenance_candidates.difference(&provenance_owners).next() {
+        anyhow::bail!(
+            "Files entity {id:x} carries source_path/imported_at provenance without KIND_FILE or KIND_IMPORT"
+        );
+    }
+    // Historical producers attached path/time provenance directly to some
+    // file ids. It remains set-valued and outside canonical file identity,
+    // but every timestamp still has to be a decodable point interval.
+    for fact in facts
+        .iter()
+        .filter(|fact| fact.a() == &file::imported_at.id() && file_ids.contains(fact.e()))
+    {
+        decode_point_imported_at(*fact.v::<NsTAIInterval>(), "file", *fact.e())?;
+    }
+    let named_candidates = entities_with_attributes(facts, &[file::name.id()]);
+    let named_nodes = file_ids
+        .union(&directory_ids)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if let Some(id) = named_candidates.difference(&named_nodes).next() {
+        anyhow::bail!("Files entity {id:x} carries a file name without a file or directory kind");
+    }
+
+    let media_type_ids = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &KIND_MEDIA_TYPE }])
+    )
+    .collect::<BTreeSet<_>>();
+    let mut media_type_names = BTreeMap::new();
+    for &id in &media_type_ids {
+        let handle = required_catalog_value(
+            find!(
+                name: NameHandle,
+                pattern!(facts, [{ id @ metadata::name: ?name }])
+            )
+            .collect(),
+            "media-type name",
+            id,
+        )?;
+        let name = read_catalog_text(reader, handle, "media-type name", id)?;
+        let normalized = normalize_media_type(&name)?;
+        if normalized != name {
+            anyhow::bail!("Files media-type entity {id:x} stores non-normalized name {name:?}");
+        }
+        media_type_names.insert(id, name);
+    }
+
+    let mut files = BTreeMap::new();
+    for &id in &file_ids {
+        let name_handle = required_catalog_value(
+            find!(
+                name: NameHandle,
+                pattern!(facts, [{ id @ file::name: ?name }])
+            )
+            .collect(),
+            "file name",
+            id,
+        )?;
+        let content = required_catalog_value(
+            find!(
+                content: ContentHandle,
+                pattern!(facts, [{ id @ file::content: ?content }])
+            )
+            .collect(),
+            "file content",
+            id,
+        )?;
+        let media_type = required_catalog_value(
+            find!(
+                media_type: Id,
+                pattern!(facts, [{ id @ file::media_type: ?media_type }])
+            )
+            .collect(),
+            "file media type",
+            id,
+        )?;
+        if !media_type_names.contains_key(&media_type) {
+            anyhow::bail!("Files file {id:x} points at unknown media type {media_type:x}");
+        }
+        files.insert(
+            id,
+            FileRecord {
+                id,
+                name: read_catalog_text(reader, name_handle, "file name", id)?,
+                content,
+                media_type,
+            },
+        );
+    }
+
+    let mut directories = BTreeMap::new();
+    for &id in &directory_ids {
+        let name_handle = required_catalog_value(
+            find!(
+                name: NameHandle,
+                pattern!(facts, [{ id @ file::name: ?name }])
+            )
+            .collect(),
+            "directory name",
+            id,
+        )?;
+        let children = find!(
+            child: Id,
+            pattern!(facts, [{ id @ file::children: ?child }])
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+        directories.insert(
+            id,
+            DirectoryRecord {
+                id,
+                name: read_catalog_text(reader, name_handle, "directory name", id)?,
+                children,
+            },
+        );
+    }
+
+    for directory in directories.values() {
+        let mut child_names = BTreeMap::<&str, Id>::new();
+        for child in &directory.children {
+            let name = if let Some(file) = files.get(child) {
+                file.name.as_str()
+            } else if let Some(child_directory) = directories.get(child) {
+                child_directory.name.as_str()
+            } else {
+                anyhow::bail!(
+                    "Files directory {:x} names unknown child {child:x}",
+                    directory.id
+                );
+            };
+            if let Some(previous) = child_names.insert(name, *child) {
+                anyhow::bail!(
+                    "Files directory {:x} has same-named children {previous:x} and {child:x} ({name:?})",
+                    directory.id
+                );
+            }
+        }
+    }
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for id in directories.keys().copied() {
+        validate_directory_acyclic(id, &directories, &mut visiting, &mut visited)?;
+    }
+
+    let mut imports = BTreeMap::new();
+    for &id in &import_ids {
+        let imported_at = required_catalog_value(
+            find!(
+                value: ImportTime,
+                pattern!(facts, [{ id @ file::imported_at: ?value }])
+            )
+            .collect(),
+            "imported_at",
+            id,
+        )?;
+        let imported_at = decode_point_imported_at(imported_at, "import", id)?;
+        let source_path = required_catalog_value(
+            find!(
+                value: NameHandle,
+                pattern!(facts, [{ id @ file::source_path: ?value }])
+            )
+            .collect(),
+            "source_path",
+            id,
+        )?;
+        let root = required_catalog_value(
+            find!(
+                value: Id,
+                pattern!(facts, [{ id @ file::root: ?value }])
+            )
+            .collect(),
+            "root",
+            id,
+        )?;
+        if !files.contains_key(&root) && !directories.contains_key(&root) {
+            anyhow::bail!("Files import {id:x} points at unknown root {root:x}");
+        }
+        let tags = find!(
+            value: Inline<ShortString>,
+            pattern!(facts, [{ id @ file::tag: ?value }])
+        )
+        .map(|value| {
+            String::try_from_inline(&value)
+                .map_err(|error| anyhow!("decode Files tag for {id:x}: {error:?}"))
+        })
+        .collect::<Result<BTreeSet<_>>>()?
+        .into_iter()
+        .collect();
+        imports.insert(
+            id,
+            ImportRecord {
+                id,
+                imported_at,
+                source_path: read_catalog_text(reader, source_path, "source_path", id)?,
+                root,
+                tags,
+            },
+        );
+    }
+
+    Ok(FilesCatalog {
+        files,
+        directories,
+        imports,
+    })
+}
+
+/// Validate one complete Files value without retaining its projection.
+pub fn validate_catalog<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<()> {
+    load_catalog(reader, facts).map(drop)
+}
+
+/// Construct the canonical intrinsic entity for one normalized IANA media
+/// type. Other faculties use this when describing bytes which are not Files
+/// records while still sharing Files' media-type vocabulary.
+pub fn media_type_fragment(media_type: &str) -> Result<Fragment> {
+    let media_type = normalize_media_type(media_type)?;
+    let mut fragment = Fragment::empty();
+    let name = fragment.put::<LongString, _>(media_type);
+    fragment += entity! {
+        metadata::tag: &KIND_MEDIA_TYPE,
+        metadata::name: name,
+    };
+    Ok(fragment)
+}
+
 /// Build one self-contained canonical file fragment.
 ///
 /// `name` is a leaf name supplied by the caller, not a filesystem path. The
@@ -421,6 +1039,193 @@ mod tests {
             facts += fragment;
         }
         facts
+    }
+
+    fn imported_file_fragment(path: &str) -> (Fragment, Id, Id) {
+        let mut fragment = stage(b"imported bytes".to_vec(), "report.txt", "text/plain").unwrap();
+        let root = fragment.root().unwrap();
+        let source_path = fragment.put::<LongString, _>(path.to_owned());
+        let instant = Epoch::from_tai_seconds(42.0);
+        let imported_at: ImportTime = (instant, instant).try_to_inline().unwrap();
+        let import = entity! {
+            metadata::tag: &KIND_IMPORT,
+            file::root: &root,
+            file::imported_at: imported_at,
+            file::source_path: source_path,
+        };
+        let import_id = import.root().unwrap();
+        fragment += import;
+        (fragment, root, import_id)
+    }
+
+    #[test]
+    fn catalog_projects_complete_imports_without_scalar_arbitration() {
+        let (fragment, root, import_id) = imported_file_fragment("/tmp/report.txt");
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let catalog = load_catalog(&reader, fragment.facts()).unwrap();
+        let import = catalog.import(import_id).unwrap();
+
+        assert_eq!(import.root, root);
+        assert_eq!(import.source_path, "/tmp/report.txt");
+        assert_eq!(catalog.files().len(), 1);
+        assert_eq!(catalog.imports().len(), 1);
+    }
+
+    #[test]
+    fn catalog_preserves_set_valued_legacy_file_provenance() {
+        let mut fragment = stage(b"legacy bytes".to_vec(), "legacy.txt", "text/plain").unwrap();
+        let file_id = fragment.root().unwrap();
+        let first_path = fragment.put::<LongString, _>("mail:first".to_owned());
+        let second_path = fragment.put::<LongString, _>("mail:second".to_owned());
+        let first_time = Epoch::from_tai_seconds(41.0);
+        let first_time: ImportTime = (first_time, first_time).try_to_inline().unwrap();
+        let second_time = Epoch::from_tai_seconds(42.0);
+        let second_time: ImportTime = (second_time, second_time).try_to_inline().unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&file_id) @
+            file::source_path: first_path,
+            file::imported_at: first_time,
+        };
+        fragment += entity! { ExclusiveId::force_ref(&file_id) @
+            file::source_path: second_path,
+            file::imported_at: second_time,
+        };
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.reader().unwrap();
+
+        let catalog = load_catalog(&reader, fragment.facts()).unwrap();
+
+        assert!(catalog.file(file_id).is_some());
+        assert_eq!(catalog.files().len(), 1);
+        assert_eq!(catalog.imports().len(), 0);
+    }
+
+    #[test]
+    fn catalog_rejects_non_point_file_provenance_timestamps() {
+        let mut fragment = stage(b"legacy bytes".to_vec(), "legacy.txt", "text/plain").unwrap();
+        let file_id = fragment.root().unwrap();
+        let start = Epoch::from_tai_seconds(41.0);
+        let end = Epoch::from_tai_seconds(42.0);
+        let interval: ImportTime = (start, end).try_to_inline().unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::imported_at: interval };
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.reader().unwrap();
+
+        let error = load_catalog(&reader, fragment.facts()).unwrap_err();
+
+        assert!(format!("{error:#}").contains("non-point imported_at interval"));
+    }
+
+    #[test]
+    fn catalog_rejects_provenance_or_roots_on_untyped_entities() {
+        let mut with_path = stage(b"typed".to_vec(), "typed.txt", "text/plain").unwrap();
+        let unknown = Id::new([0x53; 16]).unwrap();
+        let path = with_path.put::<LongString, _>("unknown:path".to_owned());
+        with_path += entity! { ExclusiveId::force_ref(&unknown) @ file::source_path: path };
+        let mut blobs = with_path.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let error = load_catalog(&reader, with_path.facts()).unwrap_err();
+        assert!(format!("{error:#}")
+            .contains("source_path/imported_at provenance without KIND_FILE or KIND_IMPORT"));
+
+        let mut with_time = stage(b"typed".to_vec(), "typed.txt", "text/plain").unwrap();
+        let instant = Epoch::from_tai_seconds(43.0);
+        let instant: ImportTime = (instant, instant).try_to_inline().unwrap();
+        with_time += entity! { ExclusiveId::force_ref(&unknown) @ file::imported_at: instant };
+        let mut blobs = with_time.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let error = load_catalog(&reader, with_time.facts()).unwrap_err();
+        assert!(format!("{error:#}")
+            .contains("source_path/imported_at provenance without KIND_FILE or KIND_IMPORT"));
+
+        let mut with_root = stage(b"typed".to_vec(), "typed.txt", "text/plain").unwrap();
+        let root = with_root.root().unwrap();
+        with_root += entity! { ExclusiveId::force_ref(&unknown) @ file::root: &root };
+        let mut blobs = with_root.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let error = load_catalog(&reader, with_root.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("import root without KIND_IMPORT"));
+    }
+
+    #[test]
+    fn catalog_rejects_partial_and_conflicting_imports() {
+        let (mut conflicting, _, import_id) = imported_file_fragment("/tmp/report.txt");
+        let alternate = Epoch::from_tai_seconds(43.0);
+        let alternate: ImportTime = (alternate, alternate).try_to_inline().unwrap();
+        conflicting +=
+            entity! { ExclusiveId::force_ref(&import_id) @ file::imported_at: alternate };
+        let mut blobs = conflicting.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let error = load_catalog(&reader, conflicting.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("2 values for imported_at"));
+
+        let (mut conflicting, _, import_id) = imported_file_fragment("/tmp/report.txt");
+        let alternate = conflicting.put::<LongString, _>("/tmp/alternate.txt".to_owned());
+        conflicting +=
+            entity! { ExclusiveId::force_ref(&import_id) @ file::source_path: alternate };
+        let mut blobs = conflicting.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let error = load_catalog(&reader, conflicting.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("2 values for source_path"));
+
+        let (mut conflicting, _, import_id) = imported_file_fragment("/tmp/report.txt");
+        let alternate_root = Id::new([0x51; 16]).unwrap();
+        conflicting += entity! { ExclusiveId::force_ref(&import_id) @ file::root: &alternate_root };
+        let mut blobs = conflicting.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let error = load_catalog(&reader, conflicting.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("2 values for root"));
+
+        let file = stage(b"partial bytes".to_vec(), "partial.txt", "text/plain").unwrap();
+        let root = file.root().unwrap();
+        let partial_id = Id::new([0x52; 16]).unwrap();
+        let mut partial = file;
+        partial += entity! { ExclusiveId::force_ref(&partial_id) @
+            metadata::tag: &KIND_IMPORT,
+            file::root: &root,
+        };
+        let mut blobs = partial.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let error = load_catalog(&reader, partial.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("0 values for imported_at"));
+    }
+
+    #[test]
+    fn catalog_rejects_competing_file_name_and_content() {
+        let mut fragment = stage(b"named".to_vec(), "record.txt", "text/plain").unwrap();
+        let file_id = fragment.root().unwrap();
+        let competing = fragment.put::<LongString, _>("alternate.txt".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::name: competing };
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let error = load_catalog(&reader, fragment.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("2 values for file name"));
+
+        let mut fragment = stage(b"first".to_vec(), "record.txt", "text/plain").unwrap();
+        let file_id = fragment.root().unwrap();
+        let competing = fragment.put::<RawBytes, _>(b"second".to_vec());
+        fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::content: competing };
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.reader().unwrap();
+
+        let error = load_catalog(&reader, fragment.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("2 values for file content"));
+    }
+
+    #[test]
+    fn shared_content_keeps_all_names_and_has_no_name_winner() {
+        let first = stage(b"shared".to_vec(), "alpha.txt", "text/plain").unwrap();
+        let content = content_of(&first);
+        let second = stage(b"shared".to_vec(), "beta.txt", "text/plain").unwrap();
+        let mut fragment = first;
+        fragment += second;
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let catalog = load_catalog(&reader, fragment.facts()).unwrap();
+
+        let resolved = catalog.resolve_file(&content_hash_hex(content)).unwrap();
+        assert_eq!(resolved.names, ["alpha.txt", "beta.txt"]);
+        assert_eq!(resolved.unique_name(), None);
     }
 
     #[test]

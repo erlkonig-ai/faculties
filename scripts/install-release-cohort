@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""Install one coherent Faculties binary cohort and atomically activate it."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+
+GENERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+BINARY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class ReleaseError(RuntimeError):
+    pass
+
+
+def run(*args: str, cwd: Path | None = None) -> str:
+    try:
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = getattr(error, "stderr", "") or str(error)
+        raise ReleaseError(f"{' '.join(args)} failed: {detail.strip()}") from error
+    return result.stdout
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fsync_file(path: Path) -> None:
+    with path.open("rb") as file:
+        os.fsync(file.fileno())
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def discover_binaries(build_dir: Path) -> list[Path]:
+    if not build_dir.is_dir():
+        raise ReleaseError(f"build directory does not exist: {build_dir}")
+    binaries: list[Path] = []
+    for candidate in build_dir.iterdir():
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        if not os.access(candidate, os.X_OK):
+            continue
+        if not BINARY_RE.fullmatch(candidate.name):
+            raise ReleaseError(
+                f"unsafe executable name in build directory: {candidate.name!r}"
+            )
+        binaries.append(candidate)
+    if not binaries:
+        raise ReleaseError(f"no executable files found directly in {build_dir}")
+    return sorted(binaries, key=lambda path: path.name)
+
+
+def stable_name(binary_name: str) -> str:
+    # Do not shadow the operating system's mail(1).
+    return "faculties-mail" if binary_name == "mail" else binary_name
+
+
+def cargo_metadata(
+    source_dir: Path, *, no_default_features: bool, features: list[str]
+) -> dict[str, Any]:
+    command = [
+        "cargo",
+        "metadata",
+        "--format-version",
+        "1",
+        "--locked",
+        "--manifest-path",
+        str(source_dir / "Cargo.toml"),
+    ]
+    if no_default_features:
+        command.append("--no-default-features")
+    if features:
+        command.extend(("--features", ",".join(features)))
+    try:
+        return json.loads(run(*command, cwd=source_dir))
+    except json.JSONDecodeError as error:
+        raise ReleaseError("cargo metadata returned invalid JSON") from error
+
+
+def source_repositories(
+    source_dir: Path, metadata: dict[str, Any]
+) -> list[dict[str, Any]]:
+    packages = {package["id"]: package for package in metadata["packages"]}
+    resolved_ids = {node["id"] for node in metadata["resolve"]["nodes"]}
+    repo_packages: dict[Path, dict[str, set[Any]]] = {}
+
+    for package_id in resolved_ids:
+        package = packages[package_id]
+        if package.get("source") is not None:
+            continue
+        manifest_dir = Path(package["manifest_path"]).resolve().parent
+        try:
+            root = Path(
+                run("git", "rev-parse", "--show-toplevel", cwd=manifest_dir).strip()
+            )
+        except ReleaseError as error:
+            raise ReleaseError(
+                f"local package {package['name']} is not in a Git repository"
+            ) from error
+        root = root.resolve()
+        repository = repo_packages.setdefault(
+            root, {"names": set(), "directories": set()}
+        )
+        repository["names"].add(package["name"])
+        repository["directories"].add(manifest_dir.relative_to(root))
+
+    repositories: list[dict[str, Any]] = []
+    for root, repository in sorted(
+        repo_packages.items(), key=lambda item: str(item[0])
+    ):
+        paths = [str(path) or "." for path in sorted(repository["directories"])]
+        # Limit dirtiness to package directories in Cargo's resolved local
+        # graph. Untracked siblings and target/ trees are unrelated build
+        # state. Tracked selected-package changes make HEAD's tree hash
+        # insufficient provenance; untracked files are deliberately outside
+        # the claimed Git tree rather than guessed to be build inputs.
+        changed = run(
+            "git", "diff", "--name-only", "-z", "HEAD", "--", *paths, cwd=root
+        )
+        relevant = sorted(
+            {
+                path
+                for path in changed.split("\0")
+                if path and "target" not in Path(path).parts
+            }
+        )
+        if relevant:
+            summary = ", ".join(relevant[:5])
+            raise ReleaseError(f"source repository is dirty: {root} ({summary})")
+        repositories.append(
+            {
+                "path": os.path.relpath(root, source_dir),
+                "revision": run("git", "rev-parse", "HEAD", cwd=root).strip(),
+                "tree": run("git", "rev-parse", "HEAD^{tree}", cwd=root).strip(),
+                "packages": sorted(repository["names"]),
+            }
+        )
+    return repositories
+
+
+def parse_features(value: str) -> list[str]:
+    features = sorted(
+        {feature.strip() for feature in value.split(",") if feature.strip()}
+    )
+    invalid = [feature for feature in features if not BINARY_RE.fullmatch(feature)]
+    if invalid:
+        raise ReleaseError(f"invalid Cargo feature name: {invalid[0]!r}")
+    return features
+
+
+def expected_link(prefix: Path, binary: str) -> str:
+    destination = prefix / "lib" / "faculties" / "current" / "bin" / binary
+    return os.path.relpath(destination, prefix / "bin")
+
+
+def read_previous_links(current: Path) -> dict[str, str]:
+    manifest_path = current / "manifest.json"
+    if not manifest_path.is_file():
+        return {}
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        return {
+            item["link_name"]: item["name"]
+            for item in manifest.get("binaries", [])
+            if isinstance(item.get("link_name"), str)
+            and isinstance(item.get("name"), str)
+        }
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise ReleaseError(
+            f"cannot read current release manifest: {manifest_path}"
+        ) from error
+
+
+def preflight_links(prefix: Path, links: dict[str, str]) -> None:
+    seen: set[str] = set()
+    for link_name, binary_name in links.items():
+        if link_name in seen:
+            raise ReleaseError(
+                f"stable command name {link_name!r} is claimed by multiple binaries"
+            )
+        seen.add(link_name)
+        path = prefix / "bin" / link_name
+        target = expected_link(prefix, binary_name)
+        if os.path.lexists(path):
+            if not path.is_symlink() or os.readlink(path) != target:
+                raise ReleaseError(f"refusing to replace unmanaged command: {path}")
+
+
+def links_for_binaries(binaries: list[Path]) -> dict[str, str]:
+    links: dict[str, str] = {}
+    for binary in binaries:
+        link_name = stable_name(binary.name)
+        if link_name in links:
+            raise ReleaseError(
+                f"stable command name {link_name!r} is claimed by multiple binaries"
+            )
+        links[link_name] = binary.name
+    return links
+
+
+def manifest_for(
+    *,
+    generation: str,
+    build_dir: Path,
+    source_dir: Path,
+    binaries: list[Path],
+    repositories: list[dict[str, Any]],
+    lock_path: Path,
+    no_default_features: bool,
+    features: list[str],
+    resolved_features: list[str],
+) -> dict[str, Any]:
+    return {
+        "format": 1,
+        "generation": generation,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "platform": platform.platform(),
+        "build_directory": str(build_dir),
+        "cargo": {
+            "default_features": not no_default_features,
+            "features": features,
+            "resolved_features": resolved_features,
+            "lockfile": "Cargo.lock",
+            "lockfile_sha256": sha256(lock_path),
+        },
+        "rustc": run("rustc", "--version", "--verbose").rstrip(),
+        "sources": repositories,
+        "binaries": [
+            {
+                "name": binary.name,
+                "link_name": stable_name(binary.name),
+                "size": binary.stat().st_size,
+                "sha256": sha256(binary),
+            }
+            for binary in binaries
+        ],
+    }
+
+
+def atomic_symlink(target: str, destination: Path) -> None:
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.new")
+    if os.path.lexists(temporary):
+        temporary.unlink()
+    os.symlink(target, temporary)
+    os.replace(temporary, destination)
+
+
+def stage_release(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+    source_dir = args.source_dir.resolve()
+    if args.build_dir is None:
+        raise ReleaseError("build_dir is required unless --activate-staged is used")
+    build_dir = args.build_dir.resolve()
+    prefix = args.prefix.expanduser().resolve()
+    features = parse_features(args.features)
+    generation = args.generation
+    if generation is None:
+        revision = run("git", "rev-parse", "--short=12", "HEAD", cwd=source_dir).strip()
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        generation = f"{stamp}-{revision}"
+    if not GENERATION_RE.fullmatch(generation):
+        raise ReleaseError(f"invalid generation name: {generation!r}")
+
+    lock_path = source_dir / "Cargo.lock"
+    if not lock_path.is_file():
+        raise ReleaseError(f"Cargo.lock does not exist: {lock_path}")
+    binaries = discover_binaries(build_dir)
+    links_for_binaries(binaries)
+    metadata = cargo_metadata(
+        source_dir,
+        no_default_features=args.no_default_features,
+        features=features,
+    )
+    repositories = source_repositories(source_dir, metadata)
+    root_id = metadata["resolve"].get("root")
+    resolved_features = sorted(
+        next(
+            (
+                node["features"]
+                for node in metadata["resolve"]["nodes"]
+                if node["id"] == root_id
+            ),
+            [],
+        )
+    )
+    manifest = manifest_for(
+        generation=generation,
+        build_dir=build_dir,
+        source_dir=source_dir,
+        binaries=binaries,
+        repositories=repositories,
+        lock_path=lock_path,
+        no_default_features=args.no_default_features,
+        features=features,
+        resolved_features=resolved_features,
+    )
+    if args.dry_run:
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return generation, manifest
+
+    release_root = prefix / "lib" / "faculties"
+    releases = release_root / "releases"
+    release_dir = releases / generation
+    if os.path.lexists(release_dir):
+        raise ReleaseError(f"release generation already exists: {release_dir}")
+
+    releases.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{generation}.", dir=releases))
+    try:
+        stage_bin = stage / "bin"
+        stage_bin.mkdir()
+        for source in binaries:
+            destination = stage_bin / source.name
+            shutil.copy2(source, destination)
+            destination.chmod(destination.stat().st_mode | stat.S_IXUSR)
+            if sha256(destination) != sha256(source):
+                raise ReleaseError(f"copy verification failed for {source.name}")
+            fsync_file(destination)
+        shutil.copy2(lock_path, stage / "Cargo.lock")
+        fsync_file(stage / "Cargo.lock")
+        manifest_path = stage / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        fsync_file(manifest_path)
+        fsync_directory(stage_bin)
+        fsync_directory(stage)
+        os.rename(stage, release_dir)
+        fsync_directory(releases)
+    except BaseException:
+        if stage.exists():
+            shutil.rmtree(stage)
+        raise
+    print(f"staged Faculties release {generation} ({len(binaries)} binaries)")
+    return generation, manifest
+
+
+def validate_staged_release(
+    release_dir: Path, generation: str
+) -> tuple[dict[str, Any], dict[str, str]]:
+    manifest_path = release_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReleaseError(
+            f"cannot read staged release manifest: {manifest_path}"
+        ) from error
+    if manifest.get("format") != 1 or manifest.get("generation") != generation:
+        raise ReleaseError(
+            f"staged release manifest does not name generation {generation}"
+        )
+    cargo = manifest.get("cargo")
+    if not isinstance(cargo, dict):
+        raise ReleaseError("staged release manifest has no Cargo provenance")
+    lock_path = release_dir / "Cargo.lock"
+    if not lock_path.is_file() or sha256(lock_path) != cargo.get("lockfile_sha256"):
+        raise ReleaseError("staged Cargo.lock does not match its manifest hash")
+
+    items = manifest.get("binaries")
+    if not isinstance(items, list) or not items:
+        raise ReleaseError("staged release manifest has no binaries")
+    links: dict[str, str] = {}
+    names: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ReleaseError("invalid binary entry in staged release manifest")
+        name = item.get("name")
+        link_name = item.get("link_name")
+        if not isinstance(name, str) or not BINARY_RE.fullmatch(name) or name in names:
+            raise ReleaseError(f"invalid or duplicate staged binary name: {name!r}")
+        if link_name != stable_name(name) or link_name in links:
+            raise ReleaseError(f"invalid or duplicate stable link for binary {name!r}")
+        path = release_dir / "bin" / name
+        if path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK):
+            raise ReleaseError(f"staged binary is absent or not executable: {path}")
+        if path.stat().st_size != item.get("size") or sha256(path) != item.get(
+            "sha256"
+        ):
+            raise ReleaseError(f"staged binary does not match its manifest: {name}")
+        names.add(name)
+        links[link_name] = name
+    actual_names = {
+        path.name
+        for path in (release_dir / "bin").iterdir()
+        if path.is_file() or path.is_symlink()
+    }
+    if actual_names != names:
+        raise ReleaseError("staged bin directory and manifest contain different files")
+    return manifest, links
+
+
+def activate_staged(prefix: Path, generation: str, *, dry_run: bool) -> dict[str, Any]:
+    if not GENERATION_RE.fullmatch(generation):
+        raise ReleaseError(f"invalid generation name: {generation!r}")
+    prefix = prefix.expanduser().resolve()
+    release_root = prefix / "lib" / "faculties"
+    release_dir = release_root / "releases" / generation
+    current = release_root / "current"
+    command_dir = prefix / "bin"
+    manifest, links = validate_staged_release(release_dir, generation)
+    preflight_links(prefix, links)
+    if os.path.lexists(current) and not current.is_symlink():
+        raise ReleaseError(f"current is not a symlink: {current}")
+    if dry_run:
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return manifest
+
+    previous_links = read_previous_links(current) if current.is_symlink() else {}
+    command_dir.mkdir(parents=True, exist_ok=True)
+
+    created_links: list[Path] = []
+    try:
+        for link_name, binary_name in links.items():
+            path = command_dir / link_name
+            if not os.path.lexists(path):
+                os.symlink(expected_link(prefix, binary_name), path)
+                created_links.append(path)
+        atomic_symlink(f"releases/{generation}", current)
+        fsync_directory(release_root)
+        fsync_directory(command_dir)
+    except BaseException:
+        for path in created_links:
+            path.unlink(missing_ok=True)
+        raise
+
+    for link_name, old_binary in previous_links.items():
+        if link_name in links:
+            continue
+        path = command_dir / link_name
+        if path.is_symlink() and os.readlink(path) == expected_link(prefix, old_binary):
+            path.unlink()
+    fsync_directory(command_dir)
+    print(f"activated Faculties release {generation} ({len(links)} binaries)")
+    return manifest
+
+
+def install(args: argparse.Namespace) -> dict[str, Any]:
+    prefix = args.prefix.expanduser().resolve()
+    if args.activate_staged is not None:
+        if args.build_dir is not None or args.generation is not None or args.stage_only:
+            raise ReleaseError(
+                "--activate-staged cannot be combined with build_dir, --generation, or --stage-only"
+            )
+        return activate_staged(prefix, args.activate_staged, dry_run=args.dry_run)
+
+    generation, manifest = stage_release(args)
+    if args.dry_run or args.stage_only:
+        return manifest
+    return activate_staged(prefix, generation, dry_run=False)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Stage a coherent Faculties binary cohort and atomically switch it live."
+    )
+    result.add_argument(
+        "build_dir",
+        type=Path,
+        nargs="?",
+        help="directory containing built executables",
+    )
+    result.add_argument(
+        "--source-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent,
+        help="Faculties source checkout (default: this script's checkout)",
+    )
+    result.add_argument(
+        "--prefix",
+        type=Path,
+        default=Path("~/.local"),
+        help="installation prefix (default: ~/.local)",
+    )
+    result.add_argument("--generation", help="immutable release generation name")
+    result.add_argument(
+        "--stage-only",
+        action="store_true",
+        help="publish and verify the immutable generation without switching current",
+    )
+    result.add_argument(
+        "--activate-staged",
+        metavar="GENERATION",
+        help="verify and atomically activate an already staged generation",
+    )
+    result.add_argument(
+        "--no-default-features",
+        action="store_true",
+        help="record and resolve the cohort as built without default Cargo features",
+    )
+    result.add_argument(
+        "--features",
+        default="",
+        help="comma-separated Cargo features used for the build",
+    )
+    result.add_argument(
+        "--dry-run", action="store_true", help="validate and print manifest only"
+    )
+    return result
+
+
+def main() -> int:
+    try:
+        install(parser().parse_args())
+    except ReleaseError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

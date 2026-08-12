@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{FilesViewer, StorageState};
+use faculties::widgets::{FilesViewer, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -18,26 +18,26 @@ fn resolve_pile_path() -> PathBuf {
         );
         std::process::exit(0);
     }
-    std::env::var("PILE")
-        .ok()
-        .or_else(|| std::env::args().skip(1).find(|a| !a.starts_with("--")))
-        .unwrap_or_else(|| "./self.pile".to_owned())
-        .into()
+    faculties::widgets::resolve_pile_path(std::env::args().skip(1), std::env::var("PILE").ok())
 }
 
 #[notebook]
 fn main(nb: &mut NotebookCtx) {
     let path = resolve_pile_path();
 
-    let storage = nb.state("storage", StorageState::new(path), |ctx, st| {
-        st.top_bar(ctx);
-    });
+    let storage = nb.state(
+        "storage",
+        StorageState::for_sources(path, [SourceKey::Files]),
+        |ctx, st| {
+            st.top_bar(ctx);
+        },
+    );
 
     nb.state("files", FilesViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let Some(files) = st.files_view() else {
+        let Some(view) = st.context().dataset(SourceKey::Files) else {
             return;
         };
-        panel.render(ctx, files);
+        panel.render(ctx, view);
     });
 }

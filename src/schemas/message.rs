@@ -1,37 +1,45 @@
-//! Local messages schema: append-only messages addressed to people or
-//! groups, with per-person read acknowledgements.
+//! Collection-native local messaging schema.
 //!
-//! Used by `message.rs` (the faculty CLI) and by readers (e.g.
-//! `orient.rs`) that need the same message/read attribute view.
+//! A message is the canonical intrinsic identity of one complete immutable
+//! envelope. A read acknowledgement is likewise the canonical intrinsic fact
+//! `(message, reader)`; optional timestamps are merely additive evidence about
+//! that fact. Group delivery records the stable group anchor, the exact
+//! immutable Relations group snapshot used for delivery, and a typed basis for
+//! that choice, so later membership edits cannot rewrite an old audience and a
+//! migration cannot masquerade inferred history as directly witnessed fact.
 
-use std::collections::HashSet;
-use triblespace::macros::id_hex;
+use triblespace::macros::{attributes, id_hex};
 use triblespace::prelude::*;
 
-pub const DEFAULT_BRANCH: &str = "message";
-pub const DEFAULT_RELATIONS_BRANCH: &str = "relations";
+use std::collections::HashSet;
 
-pub const KIND_MESSAGE_LABEL: &str = "local_message";
-pub const KIND_READ_LABEL: &str = "local_read";
+/// Stable extrinsic scope of the Message `SimpleArchive`-union collection.
+///
+/// Minted with `trible genid` on 2026-08-08.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("D04664CE96355FFF819AC0F2642A81A8");
 
+/// Intrinsic immutable message envelope.
 pub const KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
+/// Intrinsic `(message, reader)` acknowledgement.
 pub const KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
 
-pub const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
+/// The sender directly witnessed this exact Relations group snapshot.
+/// Minted with `trible genid` on 2026-08-08.
+pub const GROUP_SNAPSHOT_BASIS_WITNESSED: Id = id_hex!("28CB0DE44836C9FA412EAB697F17502A");
+/// Atomic legacy migration inferred the snapshot from the old event time.
+/// Minted with `trible genid` on 2026-08-08.
+pub const GROUP_SNAPSHOT_BASIS_LEGACY_TIME_INFERRED: Id =
+    id_hex!("42E01196896E2465625BC74DFB46DA9D");
+/// Atomic cutover froze an operator-approved reconstructed audience.
+/// Minted with `trible genid` on 2026-08-08.
+pub const GROUP_SNAPSHOT_BASIS_CUTOVER_RECONSTRUCTED: Id =
+    id_hex!("B2DDAE4D699D3C67C898926B607978C7");
 
-pub const KIND_SPECS: [(Id, &str); 2] = [
-    (KIND_MESSAGE_ID, KIND_MESSAGE_LABEL),
-    (KIND_READ_ID, KIND_READ_LABEL),
+pub const GROUP_SNAPSHOT_BASES: [Id; 3] = [
+    GROUP_SNAPSHOT_BASIS_WITNESSED,
+    GROUP_SNAPSHOT_BASIS_LEGACY_TIME_INFERRED,
+    GROUP_SNAPSHOT_BASIS_CUTOVER_RECONSTRUCTED,
 ];
-
-/// Whether a message belongs to `reader`'s inbox.
-///
-/// A reader receives messages addressed directly to them or to any group they
-/// belong to. Their own sends are never incoming, including broadcasts to one
-/// of their groups.
-pub fn is_inbox_message(from: Id, to: Id, reader: Id, reader_groups: &HashSet<Id>) -> bool {
-    from != reader && (to == reader || reader_groups.contains(&to))
-}
 
 pub mod local {
     use super::*;
@@ -41,36 +49,35 @@ pub mod local {
         "95D58D3E68A43979F8AA51415541414C" unsafe as to: inlineencodings::GenId;
         "23075866B369B5F393D43B30649469F6" unsafe as body: inlineencodings::Handle<blobencodings::LongString>;
 
+        /// Exact immutable Relations group snapshot witnessed at send time.
+        /// Present exactly when `to` is a group anchor.
+        /// Minted with `trible genid` on 2026-08-08.
+        "3E30BBF68B2930146A296BD9346DAFDE" unsafe as group_snapshot: inlineencodings::GenId;
+        /// How the exact frozen snapshot was selected. The value is one of
+        /// `GROUP_SNAPSHOT_BASES`, never a free-form migration label.
+        /// Minted with `trible genid` on 2026-08-08.
+        "9DDB67BEBA6ED435D1C007CD8E1ACE1B" unsafe as group_snapshot_basis: inlineencodings::GenId;
+
         "2213B191326E9B99605FA094E516E50E" unsafe as about_message: inlineencodings::GenId;
         "99E92F483731FA6D59115A8D6D187A37" unsafe as reader: inlineencodings::GenId;
+        /// Optional, additive observation about an already-canonical read fact.
         "CFEF2E96BC66FF3BE0A39C34E70A5032" unsafe as read_at: inlineencodings::NsTAIInterval;
     }
 }
 
+/// Legacy branch-reader predicate retained for consumers not migrated in this
+/// lane. Native Message readers use the frozen-snapshot semantics in
+/// [`crate::message::is_inbox_message`].
+pub fn is_inbox_message(from: Id, to: Id, reader: Id, reader_groups: &HashSet<Id>) -> bool {
+    from != reader && (to == reader || reader_groups.contains(&to))
+}
+
+/// Legacy normalized lookup vocabulary retained until its remaining branch
+/// consumers move to the native Relations resolver.
 pub mod relations_schema {
     use super::*;
     attributes! {
         "299E28A10114DC8C3B1661CD90CB8DF6" unsafe as label_norm: inlineencodings::ShortString;
         "3E8812F6D22B2C93E2BCF0CE3C8C1979" unsafe as alias_norm: inlineencodings::ShortString;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inbox_includes_direct_and_group_messages_but_not_own_sends() {
-        let reader = ufoid().id;
-        let sender = ufoid().id;
-        let group = ufoid().id;
-        let unrelated = ufoid().id;
-        let groups = HashSet::from([group]);
-
-        assert!(is_inbox_message(sender, reader, reader, &groups));
-        assert!(is_inbox_message(sender, group, reader, &groups));
-        assert!(!is_inbox_message(sender, unrelated, reader, &groups));
-        assert!(!is_inbox_message(reader, group, reader, &groups));
-        assert!(!is_inbox_message(reader, reader, reader, &groups));
     }
 }

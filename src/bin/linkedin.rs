@@ -13,36 +13,45 @@
 //!
 //! ## Entity resolution (non-destructive)
 //!
-//! An append-only pile can't merge entities irreversibly, so identity is
-//! modelled as edges, never a destructive merge:
-//!   * deterministic key match (same `profile_url`, or same `email` as an
-//!     existing person) → the row enriches that existing entity in place;
-//!   * a name-only collision → a NEW distinct person plus a
-//!     `review_candidate` edge to the lookalike, queued for an agent to
-//!     adjudicate with common-sense reasoning;
-//!   * `linkedin review` lists the open candidates; `linkedin resolve A B
-//!     --same | --distinct` records the verdict as `same_as` /
-//!     `distinct_from` (both correctable later by superseding).
+//! This is a conservative adapter from one external snapshot into authored
+//! Relations state, not a source-observation ledger. Before consulting current
+//! state, it treats input rows as a set and closes them under shared canonical
+//! URL/email keys. Identity remains monotone evidence, never a destructive
+//! merge:
+//!   * deterministic key matches enrich every anchor in the one settled
+//!     same-person component; distinct, forked, or contradictory evidence
+//!     fails closed;
+//!   * a previously unseen stable URL/email derives the person anchor from a
+//!     domain-separated canonical key, so identical imports converge;
+//!   * a genuinely name-only row has no honest stable identity key and mints a
+//!     fresh anchor (a dry-run reports that such ids are provisional);
+//!   * same-label review pairs are a derived view over current Relations
+//!     profiles and identity verdicts, not another persisted ontology;
+//!   * `linkedin review` lists those derived pairs; `linkedin resolve A B
+//!     --same | --distinct` records a fork-visible identity verdict (either
+//!     outcome remains correctable by an explicit successor).
 //!
 //! Commands:
 //!   linkedin import <snapshot.json> [--dry-run]
 //!   linkedin review [--limit N]
 //!   linkedin resolve <id-a> <id-b> --same | --distinct
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::relations::{relations, DEFAULT_BRANCH, KIND_PERSON_ID};
-use rand_core::OsRng;
+#[cfg(test)]
+use faculties::collection_cutover;
+use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::relations::{self, Head, ProfileInput};
+use faculties::schemas::linkedin;
+use faculties::schemas::relations::DEFAULT_SCOPE_ID;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
-use triblespace::macros::{entity, find, pattern};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::macros::entity;
 use triblespace::prelude::*;
-
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -52,9 +61,9 @@ struct Cli {
     /// Path to the pile file
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name for relations data (imports land here)
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -89,7 +98,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// List open identity-resolution candidates (name collisions to adjudicate).
+    /// Derive unresolved same-label identity pairs from current Relations state.
     Review {
         /// Max pairs to show.
         #[arg(long, default_value_t = 50)]
@@ -129,12 +138,6 @@ struct Conn {
 }
 
 impl Conn {
-    fn full_name(&self) -> String {
-        format!("{} {}", self.first.trim(), self.last.trim())
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
     fn email_key(&self) -> Option<String> {
         let e = self.email.trim().to_ascii_lowercase();
         if e.is_empty() {
@@ -183,159 +186,732 @@ fn name_key(name: &str) -> Option<String> {
     }
 }
 
-// ── repo plumbing (mirrors mail.rs / relations.rs) ──────────────────────────
+// ── collection access ───────────────────────────────────────────────────────
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|e| anyhow!("create repository: {e:?}"))
+#[derive(Clone, Copy)]
+struct RelationsStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
 }
 
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
+#[derive(Clone)]
+struct RelationsView {
+    facts: TribleSet,
+    reader: PileReader,
+}
+
+impl RelationsStorage<'_> {
+    /// Keep planning, union validation, and publication on one observed pile
+    /// prefix. No repository workspace, branch head, CAS cell, or reopen sits
+    /// between the semantic decision and its signed collection commit.
+    fn with_collection<T>(
+        &self,
+        operation: impl FnOnce(&mut Collection<Pile>, &RelationsView) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let result = (|| {
+            let facts = collection
+                .materialize()
+                .context("materialize authored Relations collection")?;
+            let reader = collection
+                .storage_mut()
+                .reader()
+                .context("open Relations blob reader")?;
+            relations::validate_catalog(&reader, &facts)
+                .context("validate authored Relations collection")?;
+            operation(&mut collection, &RelationsView { facts, reader })
+        })();
+        finish_pile(collection.into_storage(), result)
     }
-    result
+
+    fn with_view<T>(&self, operation: impl FnOnce(&RelationsView) -> Result<T>) -> Result<T> {
+        self.with_collection(|_, view| operation(view))
+    }
+
+    /// Validate and publish at most one complete Relations fragment.
+    fn update<T>(
+        &self,
+        description: &'static str,
+        operation: impl FnOnce(&RelationsView) -> Result<(Option<Fragment>, T)>,
+    ) -> Result<T> {
+        self.with_collection(|collection, view| {
+            let (fragment, value) = operation(view)?;
+            if let Some(mut fragment) = fragment {
+                relations::validate_catalog_union(&view.reader, &view.facts, &fragment)
+                    .context("preflight authored Relations union")?;
+                fragment.describe_with(entity! { metadata::description: description });
+                collection
+                    .commit(fragment)
+                    .context("commit authored Relations fragment")?;
+            }
+            Ok(value)
+        })
+    }
+
+    #[cfg(test)]
+    fn view(&self) -> Result<RelationsView> {
+        self.with_view(|view| Ok(view.clone()))
+    }
+
+    #[cfg(test)]
+    fn publish(&self, fragment: Fragment) -> Result<()> {
+        self.update("test relations input", |_| Ok((Some(fragment), ())))
+    }
+
+    #[cfg(test)]
+    fn commit_count(&self) -> Result<usize> {
+        let signer = load_signer(self.pile, self.key)?;
+        let author = signer.verifying_key().to_bytes();
+        let mut pile = open_pile_strict(self.pile)?;
+        let result =
+            collection_cutover::discover_target(&mut pile, DEFAULT_SCOPE_ID).map(|target| {
+                target
+                    .commits()
+                    .iter()
+                    .filter(|commit| commit.public_key().raw == author)
+                    .count()
+            });
+        finish_pile(pile, result)
+    }
+}
+
+fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context("close LinkedIn Relations pile")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => Err(error.context(format!(
+            "closing LinkedIn Relations pile also failed: {close_error}"
+        ))),
+    }
 }
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, blobencodings::LongString>(h)
-        .ok()
-        .map(|v| v.to_string())
-}
-
 // ── existing-people lookup maps ─────────────────────────────────────────────
 
 struct Lookup {
-    by_url: HashMap<String, Id>,
-    by_email: HashMap<String, Id>,
-    by_name: HashMap<String, Vec<Id>>,
+    by_url: HashMap<String, BTreeSet<Id>>,
+    by_email: HashMap<String, BTreeSet<Id>>,
+    profiles: BTreeMap<Id, PlannedProfile>,
+    forked_profiles: BTreeMap<Id, Vec<Id>>,
+    identities: relations::IdentityComponents,
 }
 
-fn build_lookup(ws: &mut Workspace<Pile>, space: &TribleSet) -> Lookup {
-    let mut by_url = HashMap::new();
-    let mut by_email = HashMap::new();
-    let mut by_name: HashMap<String, Vec<Id>> = HashMap::new();
+#[derive(Clone)]
+struct PlannedProfile {
+    predecessor: Option<Id>,
+    value: ProfileInput,
+    dirty: bool,
+}
 
-    // email + label_norm live inline, so one pass over people.
-    for (id, email) in find!(
-        (id: Id, e: String),
-        pattern!(space, [{ ?id @ metadata::tag: KIND_PERSON_ID, relations::email: ?e }])
-    ) {
-        if let Some(k) = name_key(&email) {
-            by_email.insert(k, id);
+fn index_key(map: &mut HashMap<String, BTreeSet<Id>>, key: Option<String>, person: Id) {
+    if let Some(key) = key {
+        map.entry(key).or_default().insert(person);
+    }
+}
+
+fn index_profile_keys(
+    by_url: &mut HashMap<String, BTreeSet<Id>>,
+    by_email: &mut HashMap<String, BTreeSet<Id>>,
+    person: Id,
+    value: &ProfileInput,
+) {
+    for url in &value.profile_urls {
+        index_key(by_url, normalize_url(url), person);
+    }
+    for email in &value.emails {
+        index_key(by_email, name_key(email), person);
+    }
+}
+
+fn build_lookup(view: &RelationsView) -> Result<Lookup> {
+    let mut lookup = Lookup {
+        by_url: HashMap::new(),
+        by_email: HashMap::new(),
+        profiles: BTreeMap::new(),
+        forked_profiles: BTreeMap::new(),
+        identities: relations::IdentityComponents::from_facts(&view.facts)?,
+    };
+    for person in relations::person_anchors(&view.facts) {
+        match relations::profile_head(&view.facts, person)? {
+            Head::Missing => bail!("validated Relations person {person:x} has no profile"),
+            Head::Unique(id) => {
+                let snapshot = relations::profile_snapshot(&view.facts, id)?;
+                let value = relations::profile_input(&view.reader, &snapshot)?;
+                index_profile_keys(&mut lookup.by_url, &mut lookup.by_email, person, &value);
+                lookup.profiles.insert(
+                    person,
+                    PlannedProfile {
+                        predecessor: Some(id),
+                        value,
+                        dirty: false,
+                    },
+                );
+            }
+            Head::Forked(heads) => {
+                for &id in &heads {
+                    let snapshot = relations::profile_snapshot(&view.facts, id)?;
+                    let value = relations::profile_input(&view.reader, &snapshot)?;
+                    index_profile_keys(&mut lookup.by_url, &mut lookup.by_email, person, &value);
+                }
+                lookup.forked_profiles.insert(person, heads);
+            }
         }
     }
-    for (id, norm) in find!(
-        (id: Id, n: String),
-        pattern!(space, [{ ?id @ metadata::tag: KIND_PERSON_ID, relations::label_norm: ?n }])
-    ) {
-        if let Some(k) = name_key(&norm) {
-            by_name.entry(k).or_default().push(id);
+    Ok(lookup)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CanonicalName {
+    full: String,
+    first: String,
+    last: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CanonicalRow {
+    name: Option<CanonicalName>,
+    company: Option<String>,
+    position: Option<String>,
+    url: Option<String>,
+    email: Option<String>,
+}
+
+fn trimmed(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn normalized_words(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+impl CanonicalRow {
+    fn from_conn(conn: &Conn) -> Option<Self> {
+        let first = normalized_words(&conn.first);
+        let last = normalized_words(&conn.last);
+        let full = [first.as_str(), last.as_str()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let name = (!full.is_empty()).then_some(CanonicalName { full, first, last });
+        let url = conn.url_key();
+        let email = conn.email_key();
+        if name.is_none() && url.is_none() && email.is_none() {
+            return None;
+        }
+        Some(Self {
+            name,
+            company: trimmed(&conn.company),
+            position: trimmed(&conn.position),
+            url,
+            email,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ImportComponent {
+    urls: BTreeSet<String>,
+    emails: BTreeSet<String>,
+    name: Option<CanonicalName>,
+    company: Option<String>,
+    position: Option<String>,
+}
+
+#[derive(Debug)]
+struct CanonicalInput {
+    components: Vec<ImportComponent>,
+    skipped: usize,
+}
+
+struct Dsu {
+    parent: Vec<usize>,
+}
+
+impl Dsu {
+    fn new(len: usize) -> Self {
+        Self {
+            parent: (0..len).collect(),
         }
     }
-    // profile_url is a LongString handle → resolve each blob.
-    let url_handles: Vec<(Id, TextHandle)> = find!(
-        (id: Id, h: TextHandle),
-        pattern!(space, [{ ?id @ metadata::tag: KIND_PERSON_ID, relations::profile_url: ?h }])
-    )
-    .collect();
-    for (id, h) in url_handles {
-        if let Some(url) = read_text(ws, h) {
-            if let Some(k) = normalize_url(&url) {
-                by_url.insert(k, id);
+
+    fn root(&mut self, mut index: usize) -> usize {
+        while self.parent[index] != index {
+            let parent = self.parent[index];
+            self.parent[index] = self.parent[parent];
+            index = self.parent[index];
+        }
+        index
+    }
+
+    fn union(&mut self, first: usize, second: usize) {
+        let first = self.root(first);
+        let second = self.root(second);
+        if first == second {
+            return;
+        }
+        let (low, high) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        self.parent[high] = low;
+    }
+}
+
+fn one_value(values: BTreeSet<String>, field: &str, component: &str) -> Result<Option<String>> {
+    match values.into_iter().collect::<Vec<_>>().as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some(value.clone())),
+        values => bail!(
+            "LinkedIn component {component} has conflicting {field} observations: {}",
+            values.join(" / ")
+        ),
+    }
+}
+
+fn component_description(
+    urls: &BTreeSet<String>,
+    emails: &BTreeSet<String>,
+    names: &BTreeMap<String, BTreeSet<CanonicalName>>,
+) -> String {
+    urls.iter()
+        .next()
+        .map(|value| format!("url:{value}"))
+        .or_else(|| emails.iter().next().map(|value| format!("email:{value}")))
+        .or_else(|| {
+            names
+                .values()
+                .next()
+                .and_then(|values| values.iter().next())
+                .map(|value| format!("name:{}", value.full))
+        })
+        .unwrap_or_else(|| "<empty>".to_owned())
+}
+
+fn canonical_input(conns: &[Conn]) -> Result<CanonicalInput> {
+    let mut rows = BTreeSet::new();
+    let mut skipped = 0;
+    for conn in conns {
+        if let Some(row) = CanonicalRow::from_conn(conn) {
+            rows.insert(row);
+        } else {
+            skipped += 1;
+        }
+    }
+    let rows: Vec<CanonicalRow> = rows.into_iter().collect();
+    let mut dsu = Dsu::new(rows.len());
+    let mut owners: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        for key in row
+            .url
+            .iter()
+            .map(|value| format!("url:{value}"))
+            .chain(row.email.iter().map(|value| format!("email:{value}")))
+        {
+            if let Some(&other) = owners.get(&key) {
+                dsu.union(index, other);
+            } else {
+                owners.insert(key, index);
             }
         }
     }
 
-    Lookup {
-        by_url,
-        by_email,
-        by_name,
+    let mut groups: BTreeMap<usize, Vec<CanonicalRow>> = BTreeMap::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        let root = dsu.root(index);
+        groups.entry(root).or_default().push(row);
+    }
+
+    let mut components = Vec::new();
+    for rows in groups.into_values() {
+        let mut urls = BTreeSet::new();
+        let mut emails = BTreeSet::new();
+        let mut names = BTreeMap::new();
+        let mut companies = BTreeSet::new();
+        let mut positions = BTreeSet::new();
+        for row in rows {
+            urls.extend(row.url);
+            emails.extend(row.email);
+            if let Some(name) = row.name {
+                names
+                    .entry(relations::lookup_key(&name.full))
+                    .or_insert_with(BTreeSet::new)
+                    .insert(name);
+            }
+            companies.extend(row.company);
+            positions.extend(row.position);
+        }
+        let description = component_description(&urls, &emails, &names);
+        let name_groups: Vec<BTreeSet<CanonicalName>> = names.into_values().collect();
+        let name = match name_groups.as_slice() {
+            [] => None,
+            [variants] => {
+                let partitions: BTreeSet<(String, String)> = variants
+                    .iter()
+                    .map(|name| {
+                        (
+                            relations::lookup_key(&name.first),
+                            relations::lookup_key(&name.last),
+                        )
+                    })
+                    .collect();
+                if partitions.len() > 1 {
+                    bail!(
+                        "LinkedIn component {description} has conflicting first/last name partitions: {}",
+                        variants
+                            .iter()
+                            .map(|name| format!("'{}' | '{}'", name.first, name.last))
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    );
+                }
+                variants.iter().next().cloned()
+            }
+            groups => bail!(
+                "LinkedIn component {description} has conflicting full-name observations: {}",
+                groups
+                    .iter()
+                    .flat_map(|names| names.iter().map(|name| name.full.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            ),
+        };
+        components.push(ImportComponent {
+            urls,
+            emails,
+            name,
+            company: one_value(companies, "company", &description)?,
+            position: one_value(positions, "position", &description)?,
+        });
+    }
+    components.sort();
+    Ok(CanonicalInput {
+        components,
+        skipped,
+    })
+}
+
+fn stable_person_id(component: &ImportComponent) -> Option<Id> {
+    let key = component
+        .urls
+        .iter()
+        .next()
+        .map(|key| format!("url:{key}"))
+        .or_else(|| {
+            component
+                .emails
+                .iter()
+                .next()
+                .map(|key| format!("email:{key}"))
+        })?;
+    entity! { linkedin::person_key: key }.root()
+}
+
+fn new_profile(component: &ImportComponent) -> ProfileInput {
+    let label = component
+        .name
+        .as_ref()
+        .map(|name| name.full.clone())
+        .or_else(|| component.emails.iter().next().cloned())
+        .or_else(|| component.urls.iter().next().cloned())
+        .expect("an import component has a name or stable key");
+    ProfileInput {
+        label,
+        first_name: component
+            .name
+            .as_ref()
+            .filter(|name| !name.first.is_empty())
+            .map(|name| name.first.clone()),
+        last_name: component
+            .name
+            .as_ref()
+            .filter(|name| !name.last.is_empty())
+            .map(|name| name.last.clone()),
+        display_name: component.name.as_ref().map(|name| name.full.clone()),
+        emails: component.emails.iter().cloned().collect(),
+        company: component.company.clone(),
+        position: component.position.clone(),
+        profile_urls: component.urls.iter().cloned().collect(),
+        ..ProfileInput::default()
     }
 }
 
-// ── emitting person facts ───────────────────────────────────────────────────
+fn canonical_profile_emails(values: &[String]) -> BTreeSet<String> {
+    values.iter().filter_map(|value| name_key(value)).collect()
+}
 
-/// Append the LinkedIn-sourced facts for `conn` onto person `id`. When
-/// `core` is set (a brand-new entity) we also stamp the canonical identity
-/// fields (`tag`, `name`, `label_norm`, first/last/display); enrichment of
-/// an existing person only adds the contact/provenance facts so we never
-/// clobber a hand-curated label with two competing display names.
-fn emit_person(ws: &mut Workspace<Pile>, change: &mut TribleSet, id: Id, conn: &Conn, core: bool) {
-    if let Some(url) = conn.url_key().map(|_| conn.url.trim().to_string()) {
-        if !url.is_empty() {
-            let h = ws.put(url);
-            *change += entity! { ExclusiveId::force_ref(&id) @ relations::profile_url: h };
-        }
-    }
-    if !conn.company.trim().is_empty() {
-        let h = ws.put(conn.company.trim().to_string());
-        *change += entity! { ExclusiveId::force_ref(&id) @ relations::company: h };
-    }
-    if !conn.position.trim().is_empty() {
-        let h = ws.put(conn.position.trim().to_string());
-        *change += entity! { ExclusiveId::force_ref(&id) @ relations::position: h };
-    }
-    *change += entity! { ExclusiveId::force_ref(&id) @ relations::source: "linkedin" };
-    if let Some(email) = conn.email_key() {
-        if email.len() <= 32 {
-            *change += entity! { ExclusiveId::force_ref(&id) @ relations::email: email.as_str() };
-        }
-    }
+fn canonical_profile_urls(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .filter_map(|value| normalize_url(value))
+        .collect()
+}
 
-    if core {
-        let name = conn.full_name();
-        if !name.is_empty() {
-            let h = ws.put(name.clone());
-            *change += entity! { ExclusiveId::force_ref(&id) @
-                metadata::tag: &KIND_PERSON_ID,
-                metadata::name: h,
-            };
-            let norm = name.to_ascii_lowercase();
-            if norm.len() <= 32 {
-                *change +=
-                    entity! { ExclusiveId::force_ref(&id) @ relations::label_norm: norm.as_str() };
-            }
-            let dh = ws.put(name);
-            *change += entity! { ExclusiveId::force_ref(&id) @ relations::display_name: dh };
+fn merge_scalar(
+    target: &mut Option<String>,
+    incoming: Option<&String>,
+    label: &str,
+) -> Result<bool> {
+    let Some(incoming) = incoming else {
+        return Ok(false);
+    };
+    match target {
+        None => {
+            *target = Some(incoming.clone());
+            Ok(true)
         }
-        if !conn.first.trim().is_empty() {
-            let h = ws.put(conn.first.trim().to_string());
-            *change += entity! { ExclusiveId::force_ref(&id) @ relations::first_name: h };
-        }
-        if !conn.last.trim().is_empty() {
-            let h = ws.put(conn.last.trim().to_string());
-            *change += entity! { ExclusiveId::force_ref(&id) @ relations::last_name: h };
+        Some(existing) if existing == incoming => Ok(false),
+        Some(existing) => bail!(
+            "LinkedIn {label} '{incoming}' conflicts with current Relations value '{existing}'"
+        ),
+    }
+}
+
+fn enrich_profile(planned: &mut PlannedProfile, component: &ImportComponent) -> Result<()> {
+    let profile = &mut planned.value;
+    let mut email_keys = canonical_profile_emails(&profile.emails);
+    for email in &component.emails {
+        if email_keys.insert(email.clone()) {
+            profile.emails.push(email.clone());
+            planned.dirty = true;
         }
     }
+    let mut url_keys = canonical_profile_urls(&profile.profile_urls);
+    for url in &component.urls {
+        if url_keys.insert(url.clone()) {
+            profile.profile_urls.push(url.clone());
+            planned.dirty = true;
+        }
+    }
+    planned.dirty |= merge_scalar(&mut profile.company, component.company.as_ref(), "company")?;
+    planned.dirty |= merge_scalar(
+        &mut profile.position,
+        component.position.as_ref(),
+        "position",
+    )?;
+    if let Some(name) = &component.name {
+        let key = relations::lookup_key(&name.full);
+        let already_named = relations::lookup_key(&profile.label) == key
+            || profile
+                .aliases
+                .iter()
+                .any(|alias| relations::lookup_key(alias) == key);
+        if !already_named {
+            profile.aliases.push(name.full.clone());
+            planned.dirty = true;
+        }
+    }
+    Ok(())
+}
+
+fn matched_anchors(map: &HashMap<String, BTreeSet<Id>>, keys: &BTreeSet<String>) -> BTreeSet<Id> {
+    keys.iter()
+        .filter_map(|key| map.get(key))
+        .flatten()
+        .copied()
+        .collect()
+}
+
+fn settled_identity_component(lookup: &Lookup, raw: &BTreeSet<Id>) -> Result<BTreeSet<Id>> {
+    let first = *raw.iter().next().expect("called only for matched anchors");
+    for person in raw {
+        if let Some(heads) = lookup.forked_profiles.get(person) {
+            bail!(
+                "LinkedIn key matches person {} whose profile is forked across {} heads",
+                fmt_id(*person),
+                heads.len()
+            );
+        }
+    }
+    let component = lookup.identities.component(first).with_context(|| {
+        format!("LinkedIn key match touches unsettled identity around {first:x}")
+    })?;
+    if lookup
+        .identities
+        .mixed_forked_pairs()
+        .iter()
+        .any(|(low, high)| component.contains(low) || component.contains(high))
+    {
+        bail!(
+            "LinkedIn key match touches an identity component with a mixed same/distinct verdict fork"
+        );
+    }
+    for &person in raw.iter().skip(1) {
+        let other = lookup.identities.component(person).with_context(|| {
+            format!("LinkedIn key match touches unsettled identity around {person:x}")
+        })?;
+        if other != component {
+            bail!(
+                "LinkedIn URL/email keys match distinct identity components: {}",
+                raw.iter()
+                    .map(|id| fmt_id(*id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    for person in &component {
+        if let Some(heads) = lookup.forked_profiles.get(person) {
+            bail!(
+                "LinkedIn match expands to same-person anchor {} whose profile is forked across {} heads",
+                fmt_id(*person),
+                heads.len()
+            );
+        }
+        if !lookup.profiles.contains_key(person) {
+            bail!("LinkedIn identity component contains missing person profile {person:x}");
+        }
+    }
+    Ok(component)
 }
 
 // ── import ──────────────────────────────────────────────────────────────────
 
-fn cmd_import(pile: &Path, branch_id: Id, snapshot: &Path, dry_run: bool) -> Result<()> {
+struct IngestPlan {
+    fragment: Fragment,
+    created: usize,
+    matched_by_url: usize,
+    matched_by_email: usize,
+    skipped: usize,
+    name_only: usize,
+    prospective_collisions: Vec<(Id, Id, String)>,
+}
+
+struct IngestReport {
+    created: usize,
+    matched_by_url: usize,
+    matched_by_email: usize,
+    skipped: usize,
+    name_only: usize,
+    prospective_collisions: Vec<(Id, Id, String)>,
+    committed: bool,
+}
+
+fn ordered_pair(first: Id, second: Id) -> (Id, Id) {
+    if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn index_profile_labels(
+    labels: &mut BTreeMap<String, BTreeSet<Id>>,
+    person: Id,
+    profile: &ProfileInput,
+) {
+    for label in std::iter::once(&profile.label).chain(profile.aliases.iter()) {
+        labels
+            .entry(relations::lookup_key(label))
+            .or_default()
+            .insert(person);
+    }
+}
+
+fn plan_import(view: &RelationsView, conns: &[Conn]) -> Result<IngestPlan> {
+    let CanonicalInput {
+        components,
+        skipped,
+    } = canonical_input(conns)?;
+    let mut lookup = build_lookup(view)?;
+    let mut labels: BTreeMap<String, BTreeSet<Id>> = BTreeMap::new();
+    for (&person, profile) in &lookup.profiles {
+        index_profile_labels(&mut labels, person, &profile.value);
+    }
+
+    let mut created = 0;
+    let mut matched_by_url = 0;
+    let mut matched_by_email = 0;
+    let mut name_only = 0;
+    let mut prospective_collisions = BTreeSet::new();
+
+    for component in components {
+        let url_matches = matched_anchors(&lookup.by_url, &component.urls);
+        let email_matches = matched_anchors(&lookup.by_email, &component.emails);
+        let raw_matches: BTreeSet<Id> = url_matches.union(&email_matches).copied().collect();
+
+        if !raw_matches.is_empty() {
+            matched_by_url += usize::from(!url_matches.is_empty());
+            matched_by_email += usize::from(!email_matches.is_empty());
+            let settled = settled_identity_component(&lookup, &raw_matches)?;
+            for person in settled {
+                let profile = lookup
+                    .profiles
+                    .get_mut(&person)
+                    .expect("settled identity component contains a current profile");
+                enrich_profile(profile, &component)
+                    .with_context(|| format!("enrich Relations person {}", fmt_id(person)))?;
+            }
+            continue;
+        }
+
+        let person = match stable_person_id(&component) {
+            Some(person) => person,
+            None => {
+                name_only += 1;
+                genid().id
+            }
+        };
+        if lookup.profiles.contains_key(&person) || lookup.forked_profiles.contains_key(&person) {
+            bail!(
+                "derived LinkedIn person anchor {} already exists without matching its canonical URL/email key",
+                fmt_id(person)
+            );
+        }
+
+        let value = new_profile(&component);
+        if component.name.is_some() {
+            let label_key = relations::lookup_key(&value.label);
+            for &existing in labels.get(&label_key).into_iter().flatten() {
+                let (first, second) = ordered_pair(person, existing);
+                prospective_collisions.insert((first, second, value.label.clone()));
+            }
+        }
+        index_profile_labels(&mut labels, person, &value);
+        lookup.profiles.insert(
+            person,
+            PlannedProfile {
+                predecessor: None,
+                value,
+                dirty: true,
+            },
+        );
+        created += 1;
+    }
+
+    let mut fragment = Fragment::empty();
+    for (person, planned) in lookup.profiles {
+        if !planned.dirty {
+            continue;
+        }
+        if let Some(predecessor) = planned.predecessor {
+            fragment += relations::profile_fragment(person, planned.value, &[predecessor])?;
+        } else {
+            fragment += relations::person_fragment(person, planned.value)?.0;
+        }
+    }
+
+    Ok(IngestPlan {
+        fragment,
+        created,
+        matched_by_url,
+        matched_by_email,
+        skipped,
+        name_only,
+        prospective_collisions: prospective_collisions.into_iter().collect(),
+    })
+}
+
+fn cmd_import(storage: RelationsStorage<'_>, snapshot: &Path, dry_run: bool) -> Result<()> {
     let raw = std::fs::read_to_string(snapshot)
         .map_err(|e| anyhow!("read snapshot {}: {e}", snapshot.display()))?;
     let conns: Vec<Conn> =
@@ -345,127 +921,83 @@ fn cmd_import(pile: &Path, branch_id: Id, snapshot: &Path, dry_run: bool) -> Res
         conns.len(),
         snapshot.display()
     );
-    ingest(pile, branch_id, &conns, dry_run)
+    ingest(storage, &conns, dry_run)
 }
 
 /// Resolve every connection against existing relations and (unless
 /// `dry_run`) commit. Shared by `import <file>` and `pull --import`.
-fn ingest(pile: &Path, branch_id: Id, conns: &[Conn], dry_run: bool) -> Result<()> {
-    let (created, enriched_url, merged_email, skipped, ambiguous_pairs, committed) =
-        with_repo(pile, |repo| {
-            let mut ws = repo
-                .pull(branch_id)
-                .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-            let mut look = build_lookup(&mut ws, &space);
-
-            let mut change = TribleSet::new();
-            let mut created = 0usize;
-            let mut enriched_url = 0usize;
-            let mut merged_email = 0usize;
-            let mut skipped = 0usize;
-            let mut ambiguous: Vec<(Id, Id, String)> = Vec::new();
-
-            for conn in conns {
-                let url_k = conn.url_key();
-                let email_k = conn.email_key();
-                let name = conn.full_name();
-                let name_k = name_key(&name);
-
-                // skip identity-less junk rows (empty export records) — they
-                // carry no key, so they'd mint a fresh ghost on every import.
-                if url_k.is_none() && email_k.is_none() && name_k.is_none() {
-                    skipped += 1;
-                    continue;
-                }
-
-                // 1. deterministic: same profile_url → idempotent enrich.
-                if let Some(uk) = &url_k {
-                    if let Some(&id) = look.by_url.get(uk) {
-                        emit_person(&mut ws, &mut change, id, conn, false);
-                        enriched_url += 1;
-                        continue;
-                    }
-                }
-                // 2. deterministic: same email → cross-source merge (mail/booth).
-                if let Some(ek) = &email_k {
-                    if let Some(&id) = look.by_email.get(ek) {
-                        emit_person(&mut ws, &mut change, id, conn, false);
-                        if let Some(uk) = &url_k {
-                            look.by_url.insert(uk.clone(), id);
-                        }
-                        merged_email += 1;
-                        continue;
-                    }
-                }
-                // 3. name-only collision → distinct person + review candidate.
-                let collision = name_k
-                    .as_ref()
-                    .and_then(|nk| look.by_name.get(nk))
-                    .and_then(|ids| ids.first().copied());
-
-                let new_id = ufoid().id;
-                emit_person(&mut ws, &mut change, new_id, conn, true);
-                if let Some(existing) = collision {
-                    change += entity! { ExclusiveId::force_ref(&new_id) @
-                        relations::review_candidate: existing,
-                    };
-                    ambiguous.push((new_id, existing, name.clone()));
-                }
-                created += 1;
-
-                // index the new person so later rows in this same import dedup.
-                if let Some(uk) = url_k {
-                    look.by_url.insert(uk, new_id);
-                }
-                if let Some(ek) = email_k {
-                    look.by_email.insert(ek, new_id);
-                }
-                if let Some(nk) = name_k {
-                    look.by_name.entry(nk).or_default().push(new_id);
-                }
-            }
-
-            let committed = if dry_run || change.is_empty() {
-                false
-            } else {
-                ws.commit(change, "linkedin: import connections");
-                repo.push(&mut ws)
-                    .map_err(|e| anyhow!("push relations: {e:?}"))?;
-                true
-            };
-            Ok((
+fn ingest(storage: RelationsStorage<'_>, conns: &[Conn], dry_run: bool) -> Result<()> {
+    let report = storage.update("linkedin: import connections", |view| {
+        let IngestPlan {
+            fragment,
+            created,
+            matched_by_url,
+            matched_by_email,
+            skipped,
+            name_only,
+            prospective_collisions,
+        } = plan_import(view, conns)?;
+        let committed = !dry_run && !fragment.facts().is_empty();
+        if !committed {
+            // Dry runs and semantic no-ops still validate the exact
+            // prospective union, including staged text payloads.
+            relations::validate_catalog_union(&view.reader, &view.facts, &fragment)
+                .context("preflight LinkedIn import")?;
+        }
+        Ok((
+            committed.then_some(fragment),
+            IngestReport {
                 created,
-                enriched_url,
-                merged_email,
+                matched_by_url,
+                matched_by_email,
                 skipped,
-                ambiguous,
+                name_only,
+                prospective_collisions,
                 committed,
-            ))
-        })?;
+            },
+        ))
+    })?;
 
     println!();
-    println!("  new people:        {created}");
-    println!("  merged by email:   {merged_email}   (enriched existing mail/booth contacts)");
-    println!("  matched by url:    {enriched_url}   (idempotent re-import)");
+    println!("  new people:        {}", report.created);
     println!(
-        "  needs review:      {}   (name collision, kept distinct)",
-        ambiguous_pairs.len()
+        "  matched by email:  {}   (components with existing email evidence)",
+        report.matched_by_email
     );
-    if skipped > 0 {
-        println!("  skipped:           {skipped}   (identity-less junk rows)");
+    println!(
+        "  matched by url:    {}   (components with existing profile-URL evidence)",
+        report.matched_by_url
+    );
+    println!(
+        "  prospective review:{}   (same current label, kept distinct)",
+        report.prospective_collisions.len()
+    );
+    if report.skipped > 0 {
+        println!(
+            "  skipped:           {}   (identity-less junk rows)",
+            report.skipped
+        );
     }
-    if !ambiguous_pairs.is_empty() {
-        println!("\nReview candidates (run `linkedin review` to adjudicate):");
-        for (new_id, existing, name) in &ambiguous_pairs {
+    if report.name_only > 0 {
+        let qualification = if dry_run {
+            "fresh provisional dry-run anchors; no stable upstream key"
+        } else {
+            "fresh anchors; no stable upstream key"
+        };
+        println!(
+            "  name-only rows:     {}   ({qualification})",
+            report.name_only
+        );
+    }
+    if !report.prospective_collisions.is_empty() {
+        println!("\nProspective name collisions (derived, not persisted):");
+        for (new_id, existing, name) in &report.prospective_collisions {
             println!("  {} ~ {}   {name}", fmt_id(*new_id), fmt_id(*existing));
         }
     }
     if dry_run {
         println!("\n(dry run — nothing committed)");
-    } else if committed {
+    } else if report.committed {
         println!("\nCommitted to relations.");
     } else {
         println!("\nNothing to commit.");
@@ -529,8 +1061,7 @@ fn fetch_snapshot(token: &str, domain: &str, api_version: &str) -> Result<Vec<Co
 }
 
 fn cmd_pull(
-    pile: &Path,
-    branch_id: Id,
+    storage: RelationsStorage<'_>,
     token: &str,
     domain: &str,
     api_version: &str,
@@ -540,94 +1071,78 @@ fn cmd_pull(
     let conns = fetch_snapshot(token, domain, api_version)?;
     println!("Fetched {} {domain} record(s).", conns.len());
     println!();
-    ingest(pile, branch_id, &conns, dry_run)
+    ingest(storage, &conns, dry_run)
 }
 
 // ── review ──────────────────────────────────────────────────────────────────
 
-fn describe(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
-    let name = find!(
-        h: TextHandle,
-        pattern!(space, [{ id @ metadata::name: ?h }])
-    )
-    .next()
-    .and_then(|h| read_text(ws, h))
-    .unwrap_or_else(|| "(no name)".into());
-    let company = find!(
-        h: TextHandle,
-        pattern!(space, [{ id @ relations::company: ?h }])
-    )
-    .next()
-    .and_then(|h| read_text(ws, h));
-    let position = find!(
-        h: TextHandle,
-        pattern!(space, [{ id @ relations::position: ?h }])
-    )
-    .next()
-    .and_then(|h| read_text(ws, h));
-    let email = find!(
-        e: String,
-        pattern!(space, [{ id @ relations::email: ?e }])
-    )
-    .next();
-    let url = find!(
-        h: TextHandle,
-        pattern!(space, [{ id @ relations::profile_url: ?h }])
-    )
-    .next()
-    .and_then(|h| read_text(ws, h));
-    let sources: Vec<String> = find!(
-        s: String,
-        pattern!(space, [{ id @ relations::source: ?s }])
-    )
-    .collect();
-
-    let mut parts = vec![format!("{}  {name}", fmt_id(id))];
-    if let Some(p) = position {
+fn describe(view: &RelationsView, id: Id) -> Result<String> {
+    let snapshot = relations::current_profile(&view.facts, id)?;
+    let profile = relations::profile_input(&view.reader, &snapshot)?;
+    let mut parts = vec![format!("{}  {}", fmt_id(id), profile.label)];
+    if let Some(p) = profile.position {
         parts.push(format!("    position: {p}"));
     }
-    if let Some(c) = company {
+    if let Some(c) = profile.company {
         parts.push(format!("    company:  {c}"));
     }
-    if let Some(e) = email {
+    for e in profile.emails {
         parts.push(format!("    email:    {e}"));
     }
-    if let Some(u) = url {
+    for u in profile.profile_urls {
         parts.push(format!("    url:      {u}"));
     }
-    if !sources.is_empty() {
-        parts.push(format!("    source:   {}", sources.join(", ")));
-    }
-    parts.join("\n")
+    Ok(parts.join("\n"))
 }
 
-fn edge_exists(space: &TribleSet, a: Id, b: Id) -> bool {
-    let has = |x: Id, y: Id| {
-        find!((), pattern!(space, [{ x @ relations::same_as: y }]))
-            .next()
-            .is_some()
-            || find!((), pattern!(space, [{ x @ relations::distinct_from: y }]))
-                .next()
-                .is_some()
+fn direct_verdict_is_mixed(facts: &TribleSet, first: Id, second: Id) -> Result<bool> {
+    let Head::Forked(heads) = relations::identity_head(facts, first, second)? else {
+        return Ok(false);
     };
-    has(a, b) || has(b, a)
+    let values: BTreeSet<bool> = heads
+        .into_iter()
+        .map(|id| Ok(relations::identity_verdict(facts, id)?.same))
+        .collect::<Result<_>>()?;
+    Ok(values.len() > 1)
 }
 
-fn cmd_review(pile: &Path, branch_id: Id, limit: usize) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+fn derived_review_pairs(view: &RelationsView) -> Result<Vec<(Id, Id)>> {
+    let identities = relations::IdentityComponents::from_facts(&view.facts)?;
+    let mut labels: BTreeMap<String, BTreeSet<Id>> = BTreeMap::new();
+    for person in relations::person_anchors(&view.facts) {
+        let Head::Unique(profile) = relations::profile_head(&view.facts, person)? else {
+            continue;
+        };
+        let snapshot = relations::profile_snapshot(&view.facts, profile)?;
+        let profile = relations::profile_input(&view.reader, &snapshot)?;
+        index_profile_labels(&mut labels, person, &profile);
+    }
 
-        let pairs: Vec<(Id, Id)> = find!(
-            (a: Id, b: Id),
-            pattern!(&space, [{ ?a @ relations::review_candidate: ?b }])
-        )
-        .filter(|(a, b)| !edge_exists(&space, *a, *b))
-        .collect();
+    let mut pairs = BTreeSet::new();
+    for people in labels.into_values() {
+        let people: Vec<Id> = people.into_iter().collect();
+        for (index, &first) in people.iter().enumerate() {
+            for &second in &people[index + 1..] {
+                match identities.relation(first, second) {
+                    Ok(relations::IdentityRelation::Same)
+                    | Ok(relations::IdentityRelation::Distinct) => {}
+                    Ok(relations::IdentityRelation::Unknown) => {
+                        pairs.insert((first, second));
+                    }
+                    Err(_) if direct_verdict_is_mixed(&view.facts, first, second)? => {
+                        pairs.insert((first, second));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    Ok(pairs.into_iter().collect())
+}
+
+fn cmd_review(storage: RelationsStorage<'_>, limit: usize) -> Result<()> {
+    storage.with_view(|view| {
+        let pairs = derived_review_pairs(view)?;
 
         if pairs.is_empty() {
             println!("No open review candidates. 🎉");
@@ -636,9 +1151,9 @@ fn cmd_review(pile: &Path, branch_id: Id, limit: usize) -> Result<()> {
         println!("{} open review candidate(s):\n", pairs.len());
         for (i, (a, b)) in pairs.iter().take(limit).enumerate() {
             println!("[{}] ─────────────────────────────────────", i + 1);
-            println!("{}", describe(&mut ws, &space, *a));
+            println!("{}", describe(view, *a)?);
             println!("    ~ same person? ~");
-            println!("{}", describe(&mut ws, &space, *b));
+            println!("{}", describe(view, *b)?);
             println!(
                 "  → linkedin resolve {} {} --same | --distinct\n",
                 fmt_id(*a),
@@ -660,10 +1175,7 @@ fn resolve_person_id(space: &TribleSet, raw: &str) -> Result<Id> {
         bail!("person id must be hex (got '{raw}')");
     }
     let mut matches = Vec::new();
-    for (id,) in find!(
-        (id: Id),
-        pattern!(space, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])
-    ) {
+    for id in relations::person_anchors(space) {
         let hex = format!("{id:x}");
         if hex == prefix || (prefix.len() < 32 && hex.starts_with(&prefix)) {
             matches.push(id);
@@ -677,8 +1189,7 @@ fn resolve_person_id(space: &TribleSet, raw: &str) -> Result<Id> {
 }
 
 fn cmd_resolve(
-    pile: &Path,
-    branch_id: Id,
+    storage: RelationsStorage<'_>,
     id_a: &str,
     id_b: &str,
     same: bool,
@@ -687,63 +1198,687 @@ fn cmd_resolve(
     if same == distinct {
         bail!("pass exactly one of --same / --distinct");
     }
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-        let a = resolve_person_id(&space, id_a)?;
-        let b = resolve_person_id(&space, id_b)?;
+    enum Outcome {
+        Already(Id),
+        Recorded { first: Id, second: Id, id: Id },
+    }
+    let outcome = storage.update("linkedin: identity verdict", |view| {
+        let a = resolve_person_id(&view.facts, id_a)?;
+        let b = resolve_person_id(&view.facts, id_b)?;
         if a == b {
             bail!("both ids resolve to the same person {}", fmt_id(a));
         }
-        let mut change = TribleSet::new();
-        if same {
-            // symmetric assertion: identity is the connected component.
-            change += entity! { ExclusiveId::force_ref(&a) @ relations::same_as: b };
-            change += entity! { ExclusiveId::force_ref(&b) @ relations::same_as: a };
-        } else {
-            change += entity! { ExclusiveId::force_ref(&a) @ relations::distinct_from: b };
-            change += entity! { ExclusiveId::force_ref(&b) @ relations::distinct_from: a };
+        let predecessors = match relations::identity_head(&view.facts, a, b)? {
+            Head::Missing => Vec::new(),
+            Head::Unique(id) => {
+                if relations::identity_verdict(&view.facts, id)?.same == same {
+                    return Ok((None, Outcome::Already(id)));
+                }
+                vec![id]
+            }
+            Head::Forked(ids) => ids,
+        };
+        let fragment = relations::identity_verdict_fragment(a, b, same, &predecessors)?;
+        let successor = fragment.root().expect("identity verdict root");
+        Ok((
+            Some(fragment),
+            Outcome::Recorded {
+                first: a,
+                second: b,
+                id: successor,
+            },
+        ))
+    })?;
+    match outcome {
+        Outcome::Already(id) => println!("Identity verdict is already settled at {}.", fmt_id(id)),
+        Outcome::Recorded { first, second, id } => {
+            let verdict = if same { "same_as" } else { "distinct_from" };
+            println!(
+                "Recorded {verdict}: {} ↔ {} ({})",
+                fmt_id(first),
+                fmt_id(second),
+                fmt_id(id)
+            );
         }
-        let verdict = if same { "same_as" } else { "distinct_from" };
-        ws.commit(change, "linkedin: identity verdict");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push relations: {e:?}"))?;
-        println!("Recorded {verdict}: {} ↔ {}", fmt_id(a), fmt_id(b));
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
 
-fn resolve_branch(repo: &mut Repository<Pile>, name: &str) -> Result<Id> {
-    repo.ensure_branch(name, None)
-        .map_err(|e| anyhow!("ensure branch '{name}': {e:?}"))
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let branch_id = with_repo(&cli.pile, |repo| resolve_branch(repo, &cli.branch))?;
+    let storage = RelationsStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+    };
 
     match cli.command {
-        Command::Import { snapshot, dry_run } => {
-            cmd_import(&cli.pile, branch_id, &snapshot, dry_run)
-        }
+        Command::Import { snapshot, dry_run } => cmd_import(storage, &snapshot, dry_run),
         Command::Pull {
             token,
             domain,
             api_version,
             dry_run,
-        } => cmd_pull(&cli.pile, branch_id, &token, &domain, &api_version, dry_run),
-        Command::Review { limit } => cmd_review(&cli.pile, branch_id, limit),
+        } => cmd_pull(storage, &token, &domain, &api_version, dry_run),
+        Command::Review { limit } => cmd_review(storage, limit),
         Command::Resolve {
             id_a,
             id_b,
             same,
             distinct,
-        } => cmd_resolve(&cli.pile, branch_id, &id_a, &id_b, same, distinct),
+        } => cmd_resolve(storage, &id_a, &id_b, same, distinct),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        pile: PathBuf,
+        key: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let pile = directory.path().join("linkedin.pile");
+            let key = directory.path().join("linkedin.key");
+            File::create(&pile).unwrap();
+            collection_cutover::initialize_signer(&pile, Some(&key)).unwrap();
+            Self {
+                _directory: directory,
+                pile,
+                key,
+            }
+        }
+
+        fn storage(&self) -> RelationsStorage<'_> {
+            RelationsStorage {
+                pile: &self.pile,
+                key: Some(&self.key),
+            }
+        }
+
+        fn view(&self) -> RelationsView {
+            self.storage().view().unwrap()
+        }
+
+        fn publish(&self, fragment: Fragment) {
+            self.storage().publish(fragment).unwrap();
+        }
+
+        fn commit_count(&self) -> usize {
+            self.storage().commit_count().unwrap()
+        }
+    }
+
+    fn connection(name: &str, url: &str, email: &str) -> Conn {
+        let mut names = name.splitn(2, ' ');
+        Conn {
+            first: names.next().unwrap_or_default().to_owned(),
+            last: names.next().unwrap_or_default().to_owned(),
+            url: url.to_owned(),
+            email: email.to_owned(),
+            ..Conn::default()
+        }
+    }
+
+    fn person(label: &str, url: &str, email: &str) -> (Id, Fragment) {
+        let id = genid().id;
+        let profile = ProfileInput {
+            label: label.to_owned(),
+            emails: (!email.is_empty())
+                .then(|| email.to_owned())
+                .into_iter()
+                .collect(),
+            profile_urls: (!url.is_empty())
+                .then(|| url.to_owned())
+                .into_iter()
+                .collect(),
+            ..ProfileInput::default()
+        };
+        (id, relations::person_fragment(id, profile).unwrap().0)
+    }
+
+    fn person_with_aliases(label: &str, aliases: &[&str]) -> (Id, Fragment) {
+        let id = genid().id;
+        let profile = ProfileInput {
+            label: label.to_owned(),
+            aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+            ..ProfileInput::default()
+        };
+        (id, relations::person_fragment(id, profile).unwrap().0)
+    }
+
+    fn one_component(rows: &[Conn]) -> ImportComponent {
+        let mut input = canonical_input(rows).unwrap();
+        assert_eq!(input.components.len(), 1);
+        input.components.pop().unwrap()
+    }
+
+    fn fork_profile(fixture: &Fixture, person: Id) -> String {
+        let view = fixture.view();
+        let current = relations::current_profile(&view.facts, person).unwrap();
+        let base = relations::profile_input(&view.reader, &current).unwrap();
+        let alternate = "linkedin.com/in/fork-alternate".to_owned();
+        let mut left = base.clone();
+        left.company = Some("Left".to_owned());
+        left.profile_urls.push(alternate.clone());
+        let mut right = base;
+        right.company = Some("Right".to_owned());
+        let fork = relations::profile_fragment(person, left, &[current.id]).unwrap()
+            + relations::profile_fragment(person, right, &[current.id]).unwrap();
+        fixture.publish(fork);
+        alternate
+    }
+
+    #[test]
+    fn stable_anchor_uses_canonical_url_then_email() {
+        let first = one_component(&[connection(
+            "Ada Lovelace",
+            "https://www.linkedin.com/in/ada/",
+            "ada@first.test",
+        )]);
+        let same_url = one_component(&[connection(
+            "Ada Lovelace",
+            "LINKEDIN.COM/in/ada",
+            "ada@second.test",
+        )]);
+        assert_eq!(stable_person_id(&first), stable_person_id(&same_url));
+
+        let first_email = one_component(&[connection("Ada", "", "ADA@example.test")]);
+        let same_email = one_component(&[connection("Ada", "", "ada@example.test")]);
+        assert_eq!(
+            stable_person_id(&first_email),
+            stable_person_id(&same_email)
+        );
+        let name_only = one_component(&[connection("Ada", "", "")]);
+        assert!(stable_person_id(&name_only).is_none());
+    }
+
+    #[test]
+    fn row_permutations_with_a_bridge_produce_the_same_fragment() {
+        let fixture = Fixture::new();
+        let rows = [
+            connection("Ada Lovelace", "linkedin.com/in/ada", ""),
+            connection("Ada Lovelace", "", "ada@example.test"),
+            connection(
+                "Ada Lovelace",
+                "https://www.linkedin.com/in/ada/",
+                "ADA@example.test",
+            ),
+        ];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let mut expected = None;
+        for order in orders {
+            let permutation = order.map(|index| rows[index].clone());
+            let plan = plan_import(&fixture.view(), &permutation).unwrap();
+            assert_eq!(plan.created, 1);
+            if let Some(expected) = &expected {
+                assert_eq!(&plan.fragment, expected);
+            } else {
+                expected = Some(plan.fragment);
+            }
+        }
+    }
+
+    #[test]
+    fn three_rows_close_transitively_under_shared_keys() {
+        let rows = [
+            connection("Ada Lovelace", "linkedin.com/in/one", "one@example.test"),
+            connection("Ada Lovelace", "linkedin.com/in/one", "two@example.test"),
+            connection("Ada Lovelace", "linkedin.com/in/two", "two@example.test"),
+        ];
+        let component = one_component(&rows);
+        assert_eq!(component.urls.len(), 2);
+        assert_eq!(component.emails.len(), 2);
+
+        let fixture = Fixture::new();
+        let plan = plan_import(&fixture.view(), &rows).unwrap();
+        assert_eq!(plan.created, 1);
+        assert_eq!(relations::person_anchors(plan.fragment.facts()).len(), 1);
+        let first_key = one_component(&[connection(
+            "Ada Lovelace",
+            "linkedin.com/in/one",
+            "ignored@example.test",
+        )]);
+        assert_eq!(
+            stable_person_id(&component),
+            stable_person_id(&first_key),
+            "the lexicographically first URL, not an email, names the component"
+        );
+    }
+
+    #[test]
+    fn duplicate_import_is_a_no_op_and_url_spelling_is_canonical() {
+        let fixture = Fixture::new();
+        let row = connection(
+            "Ada Lovelace",
+            "https://WWW.LinkedIn.com/in/Ada/",
+            "ada@example.test",
+        );
+        let person = stable_person_id(&one_component(std::slice::from_ref(&row))).unwrap();
+        ingest(fixture.storage(), std::slice::from_ref(&row), false).unwrap();
+        let first = fixture.view();
+        let first_head = relations::current_profile(&first.facts, person).unwrap().id;
+        let first_commits = fixture.commit_count();
+        let profile = relations::current_profile(&first.facts, person).unwrap();
+        let profile = relations::profile_input(&first.reader, &profile).unwrap();
+        assert_eq!(profile.profile_urls, ["linkedin.com/in/ada"]);
+
+        let canonical = connection("Ada Lovelace", "linkedin.com/in/ada", "ADA@example.test");
+        ingest(fixture.storage(), &[canonical], false).unwrap();
+        let second = fixture.view();
+        assert_eq!(
+            relations::current_profile(&second.facts, person)
+                .unwrap()
+                .id,
+            first_head
+        );
+        assert_eq!(fixture.commit_count(), first_commits);
+    }
+
+    #[test]
+    fn repeated_multi_key_import_does_not_depend_on_handle_order() {
+        let fixture = Fixture::new();
+        let rows = [
+            connection("Ada Lovelace", "linkedin.com/in/one", "one@example.test"),
+            connection("Ada Lovelace", "linkedin.com/in/one", "two@example.test"),
+            connection("Ada Lovelace", "linkedin.com/in/two", "two@example.test"),
+        ];
+        let person = stable_person_id(&one_component(&rows)).unwrap();
+        ingest(fixture.storage(), &rows, false).unwrap();
+        let first = fixture.view();
+        let head = relations::current_profile(&first.facts, person).unwrap().id;
+        let commits = fixture.commit_count();
+
+        ingest(fixture.storage(), &rows, false).unwrap();
+        let second = fixture.view();
+        assert_eq!(
+            relations::current_profile(&second.facts, person)
+                .unwrap()
+                .id,
+            head
+        );
+        assert_eq!(fixture.commit_count(), commits);
+    }
+
+    #[test]
+    fn equivalent_keys_preserve_existing_generic_values_byte_for_byte() {
+        let fixture = Fixture::new();
+        let exact_url = "https://Example.com/CaseSensitive";
+        let exact_email = "Exact.Case@Example.test";
+        let (person, fragment) = person("Exact Person", exact_url, exact_email);
+        fixture.publish(fragment);
+        let before = fixture.view();
+        let head = relations::current_profile(&before.facts, person)
+            .unwrap()
+            .id;
+        let commits = fixture.commit_count();
+
+        let equivalent = connection(
+            "Exact Person",
+            "http://www.EXAMPLE.com/CaseSensitive/",
+            "exact.case@example.test",
+        );
+        ingest(fixture.storage(), &[equivalent], false).unwrap();
+
+        let after = fixture.view();
+        assert_eq!(
+            relations::current_profile(&after.facts, person).unwrap().id,
+            head
+        );
+        assert_eq!(fixture.commit_count(), commits);
+        let snapshot = relations::current_profile(&after.facts, person).unwrap();
+        let value = relations::profile_input(&after.reader, &snapshot).unwrap();
+        assert_eq!(value.profile_urls, [exact_url]);
+        assert_eq!(value.emails, [exact_email]);
+    }
+
+    #[test]
+    fn dry_run_leaves_the_pile_byte_identical() {
+        let fixture = Fixture::new();
+        let before = std::fs::read(&fixture.pile).unwrap();
+        let row = connection(
+            "Ada Lovelace",
+            "https://linkedin.com/in/ada",
+            "ada@example.test",
+        );
+
+        ingest(fixture.storage(), &[row], true).unwrap();
+
+        assert_eq!(std::fs::read(&fixture.pile).unwrap(), before);
+        assert!(relations::person_anchors(&fixture.view().facts).is_empty());
+    }
+
+    #[test]
+    fn distinct_url_and_email_matches_fail_closed() {
+        let fixture = Fixture::new();
+        let (_, url_person) = person("URL Person", "linkedin.com/in/url", "");
+        fixture.publish(url_person);
+        let (_, email_person) = person("Email Person", "", "shared@example.test");
+        fixture.publish(email_person);
+
+        let row = connection(
+            "Conflict Person",
+            "linkedin.com/in/url",
+            "shared@example.test",
+        );
+        let error = ingest(fixture.storage(), &[row], true).unwrap_err();
+        assert!(error.to_string().contains("distinct identity components"));
+    }
+
+    #[test]
+    fn a_settled_same_person_bridge_enriches_every_anchor() {
+        let fixture = Fixture::new();
+        let (url_person, url_fragment) = person("URL Person", "linkedin.com/in/url", "");
+        let (email_person, email_fragment) = person("Email Person", "", "shared@example.test");
+        fixture.publish(url_fragment + email_fragment);
+        fixture.publish(
+            relations::identity_verdict_fragment(url_person, email_person, true, &[]).unwrap(),
+        );
+
+        let mut row = connection(
+            "Combined Person",
+            "https://www.linkedin.com/in/url/",
+            "SHARED@example.test",
+        );
+        row.company = "Analytical Engines".to_owned();
+        ingest(fixture.storage(), &[row], false).unwrap();
+
+        let view = fixture.view();
+        for person in [url_person, email_person] {
+            let current = relations::current_profile(&view.facts, person).unwrap();
+            let value = relations::profile_input(&view.reader, &current).unwrap();
+            assert_eq!(value.emails, ["shared@example.test"]);
+            assert_eq!(value.profile_urls, ["linkedin.com/in/url"]);
+            assert_eq!(value.company.as_deref(), Some("Analytical Engines"));
+            assert!(value.aliases.contains(&"Combined Person".to_owned()));
+        }
+    }
+
+    #[test]
+    fn an_unrelated_profile_fork_does_not_block_but_a_matching_fork_does() {
+        let fixture = Fixture::new();
+        let (forked, fragment) = person("Forked", "linkedin.com/in/fork", "");
+        fixture.publish(fragment);
+        let alternate = fork_profile(&fixture, forked);
+
+        let unrelated = connection("Ada Lovelace", "linkedin.com/in/ada", "");
+        ingest(fixture.storage(), &[unrelated], true).unwrap();
+
+        let matching = connection("Forked", &alternate, "");
+        let error = ingest(fixture.storage(), &[matching], true).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("profile is forked"), "{message}");
+        assert!(message.contains(&fmt_id(forked)), "{message}");
+    }
+
+    #[test]
+    fn current_scalar_conflict_fails_without_appending() {
+        let fixture = Fixture::new();
+        let mut row = connection("Ada Lovelace", "linkedin.com/in/ada", "");
+        row.company = "Analytical Engines".to_owned();
+        ingest(fixture.storage(), std::slice::from_ref(&row), false).unwrap();
+        let before = std::fs::read(&fixture.pile).unwrap();
+
+        ingest(fixture.storage(), std::slice::from_ref(&row), false).unwrap();
+        assert_eq!(std::fs::read(&fixture.pile).unwrap(), before);
+
+        row.company = "Difference Engines".to_owned();
+        let error = ingest(fixture.storage(), &[row], false).unwrap_err();
+        assert!(format!("{error:#}").contains("company"));
+        assert_eq!(std::fs::read(&fixture.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn conflicting_observations_inside_a_new_component_fail() {
+        let fixture = Fixture::new();
+        let mut first = connection("Ada Lovelace", "linkedin.com/in/ada", "");
+        first.company = "Analytical Engines".to_owned();
+        let mut second = connection("Ada Lovelace", "linkedin.com/in/ada", "");
+        second.company = "Difference Engines".to_owned();
+        let error = ingest(fixture.storage(), &[first, second], true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting company observations"));
+
+        let first = connection("Ada Lovelace", "linkedin.com/in/ada", "");
+        let second = connection("Grace Hopper", "linkedin.com/in/ada", "");
+        let error = ingest(fixture.storage(), &[first, second], true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting full-name observations"));
+
+        let first = Conn {
+            first: "Mary Ann".to_owned(),
+            last: "Smith".to_owned(),
+            url: "linkedin.com/in/mary".to_owned(),
+            ..Conn::default()
+        };
+        let second = Conn {
+            first: "Mary".to_owned(),
+            last: "Ann Smith".to_owned(),
+            url: "linkedin.com/in/mary".to_owned(),
+            ..Conn::default()
+        };
+        let error = ingest(fixture.storage(), &[first, second], true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting first/last name partitions"));
+        assert!(relations::person_anchors(&fixture.view().facts).is_empty());
+    }
+
+    #[test]
+    fn differing_existing_name_becomes_an_alias() {
+        let fixture = Fixture::new();
+        let (person, fragment) = person("Augusta Ada King", "linkedin.com/in/ada", "");
+        fixture.publish(fragment);
+        ingest(
+            fixture.storage(),
+            &[connection("Ada Lovelace", "linkedin.com/in/ada", "")],
+            false,
+        )
+        .unwrap();
+        let view = fixture.view();
+        let profile = relations::current_profile(&view.facts, person).unwrap();
+        let profile = relations::profile_input(&view.reader, &profile).unwrap();
+        assert_eq!(profile.label, "Augusta Ada King");
+        assert_eq!(profile.aliases, ["Ada Lovelace"]);
+    }
+
+    #[test]
+    fn same_label_review_is_derived_and_respects_verdict_algebra() {
+        let fixture = Fixture::new();
+        let (first, first_fragment) = person("Ada Lovelace", "", "");
+        let (second, second_fragment) = person("ada lovelace", "", "");
+        fixture.publish(first_fragment + second_fragment);
+        let pair = ordered_pair(first, second);
+        assert_eq!(derived_review_pairs(&fixture.view()).unwrap(), [pair]);
+
+        fixture.publish(relations::identity_verdict_fragment(first, second, false, &[]).unwrap());
+        assert!(derived_review_pairs(&fixture.view()).unwrap().is_empty());
+
+        let view = fixture.view();
+        let Head::Unique(predecessor) =
+            relations::identity_head(&view.facts, first, second).unwrap()
+        else {
+            panic!("expected one direct verdict head")
+        };
+        let mixed = relations::identity_verdict_fragment(first, second, true, &[predecessor])
+            .unwrap()
+            + relations::identity_verdict_fragment(first, second, false, &[predecessor]).unwrap();
+        fixture.publish(mixed);
+        assert_eq!(derived_review_pairs(&fixture.view()).unwrap(), [pair]);
+    }
+
+    #[test]
+    fn review_suppresses_distinctness_propagated_through_same_identity() {
+        let fixture = Fixture::new();
+        let (first, first_fragment) = person("Shared Label", "", "");
+        let (bridge, bridge_fragment) = person("Bridge", "", "");
+        let (same_as_bridge, same_fragment) = person("shared label", "", "");
+        fixture.publish(first_fragment + bridge_fragment + same_fragment);
+        fixture.publish(relations::identity_verdict_fragment(first, bridge, false, &[]).unwrap());
+        fixture.publish(
+            relations::identity_verdict_fragment(bridge, same_as_bridge, true, &[]).unwrap(),
+        );
+
+        assert!(derived_review_pairs(&fixture.view()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn review_suppresses_same_identity_reached_transitively() {
+        let fixture = Fixture::new();
+        let (first, first_fragment) = person("Shared Label", "", "");
+        let (bridge, bridge_fragment) = person("Bridge", "", "");
+        let (same_as_first, same_fragment) = person("shared label", "", "");
+        fixture.publish(first_fragment + bridge_fragment + same_fragment);
+        fixture.publish(relations::identity_verdict_fragment(first, bridge, true, &[]).unwrap());
+        fixture.publish(
+            relations::identity_verdict_fragment(bridge, same_as_first, true, &[]).unwrap(),
+        );
+
+        assert!(derived_review_pairs(&fixture.view()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn review_suppresses_same_valued_verdict_forks() {
+        let fixture = Fixture::new();
+        let (same_a, same_a_fragment) = person("Same Pair", "", "");
+        let (same_b, same_b_fragment) = person("same pair", "", "");
+        let (distinct_a, distinct_a_fragment) = person("Distinct Pair", "", "");
+        let (distinct_b, distinct_b_fragment) = person("distinct pair", "", "");
+        fixture
+            .publish(same_a_fragment + same_b_fragment + distinct_a_fragment + distinct_b_fragment);
+
+        for (first, second, settled_value) in
+            [(same_a, same_b, true), (distinct_a, distinct_b, false)]
+        {
+            let initial =
+                relations::identity_verdict_fragment(first, second, settled_value, &[]).unwrap();
+            let initial_id = initial.root().unwrap();
+            fixture.publish(initial);
+            fixture.publish(
+                relations::identity_verdict_fragment(first, second, settled_value, &[initial_id])
+                    .unwrap(),
+            );
+            let detour =
+                relations::identity_verdict_fragment(first, second, !settled_value, &[initial_id])
+                    .unwrap();
+            let detour_id = detour.root().unwrap();
+            fixture.publish(detour);
+            fixture.publish(
+                relations::identity_verdict_fragment(first, second, settled_value, &[detour_id])
+                    .unwrap(),
+            );
+            assert!(matches!(
+                relations::identity_head(&fixture.view().facts, first, second).unwrap(),
+                Head::Forked(_)
+            ));
+        }
+
+        assert!(derived_review_pairs(&fixture.view()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn review_indexes_primary_labels_and_aliases_and_deduplicates_pairs() {
+        let fixture = Fixture::new();
+        let (alias_person, alias_fragment) =
+            person_with_aliases("First", &["Alias Meets Label", "Duplicate Key"]);
+        let (label_person, label_fragment) =
+            person_with_aliases("alias meets label", &["duplicate key"]);
+        let (left_alias, left_fragment) = person_with_aliases("Left", &["Shared Alias"]);
+        let (right_alias, right_fragment) = person_with_aliases("Right", &["shared alias"]);
+        fixture.publish(alias_fragment + label_fragment + left_fragment + right_fragment);
+
+        let expected: BTreeSet<(Id, Id)> = [
+            ordered_pair(alias_person, label_person),
+            ordered_pair(left_alias, right_alias),
+        ]
+        .into();
+        assert_eq!(
+            derived_review_pairs(&fixture.view())
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn prospective_collision_index_includes_existing_aliases() {
+        let fixture = Fixture::new();
+        let (_, existing) = person_with_aliases("Augusta King", &["Ada Lovelace"]);
+        fixture.publish(existing);
+        let row = connection("ada lovelace", "linkedin.com/in/ada", "");
+
+        let plan = plan_import(&fixture.view(), &[row]).unwrap();
+        assert_eq!(plan.prospective_collisions.len(), 1);
+    }
+
+    #[test]
+    fn transitive_contradiction_does_not_emit_an_unresolvable_pair() {
+        let fixture = Fixture::new();
+        let (first, first_fragment) = person("Shared", "", "");
+        let (second, second_fragment) = person("shared", "", "");
+        let (third, third_fragment) = person("Third", "", "");
+        fixture.publish(first_fragment + second_fragment + third_fragment);
+        fixture.publish(relations::identity_verdict_fragment(first, second, true, &[]).unwrap());
+        fixture.publish(relations::identity_verdict_fragment(second, third, true, &[]).unwrap());
+        fixture.publish(relations::identity_verdict_fragment(first, third, false, &[]).unwrap());
+
+        assert!(derived_review_pairs(&fixture.view()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_mixed_fork_elsewhere_does_not_mislabel_a_name_pair() {
+        let fixture = Fixture::new();
+        let (first, first_fragment) = person("Shared", "", "");
+        let (second, second_fragment) = person("shared", "", "");
+        let (same_as_second, third_fragment) = person("Third", "", "");
+        fixture.publish(first_fragment + second_fragment + third_fragment);
+        fixture.publish(
+            relations::identity_verdict_fragment(second, same_as_second, true, &[]).unwrap(),
+        );
+        fixture.publish(
+            relations::identity_verdict_fragment(first, same_as_second, true, &[]).unwrap(),
+        );
+        fixture.publish(
+            relations::identity_verdict_fragment(first, same_as_second, false, &[]).unwrap(),
+        );
+
+        assert!(derived_review_pairs(&fixture.view()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_matching_mixed_identity_fork_fails_as_unsettled() {
+        let fixture = Fixture::new();
+        let (first, first_fragment) = person("First", "linkedin.com/in/first", "");
+        let (second, second_fragment) = person("Second", "", "second@example.test");
+        fixture.publish(first_fragment + second_fragment);
+        let predecessor = relations::identity_verdict_fragment(first, second, false, &[]).unwrap();
+        let predecessor_id = predecessor.root().unwrap();
+        fixture.publish(predecessor);
+        fixture.publish(
+            relations::identity_verdict_fragment(first, second, true, &[predecessor_id]).unwrap()
+                + relations::identity_verdict_fragment(first, second, false, &[predecessor_id])
+                    .unwrap(),
+        );
+
+        let row = connection("First", "linkedin.com/in/first", "");
+        let error = ingest(fixture.storage(), &[row], true).unwrap_err();
+        assert!(format!("{error:#}").contains("mixed same/distinct verdict fork"));
     }
 }

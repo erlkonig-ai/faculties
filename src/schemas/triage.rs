@@ -1,11 +1,11 @@
-//! Triage schema: doctor-style diagnostic attributes plus the kind markers
-//! and foreign attribute views the faculty reads when cross-referencing
-//! cognition, compass, message, and relations branches.
+//! Triage's historical view of Cognition event attributes and the compatibility
+//! views still consumed by the separately migrated widget surface.
 //!
-//! Used by `triage.rs` (the faculty CLI). Most of these kind/attribute
-//! IDs are duplicated from the faculties that own them; triage keeps its
-//! own view so it can inspect piles without coupling to other faculty
-//! library modules.
+//! The CLI reads the fixed native Cognition collection and uses the current
+//! Headspace, Memory, Message, and Relations projectors for their respective
+//! domains. These literal-pinned IDs remain only for Cognition event kinds
+//! whose original producers did not expose one shared schema module, plus the
+//! old widget until that independent viewer lane is retired.
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
@@ -61,6 +61,9 @@ pub mod exec {
         "AA2F34973589295FA70B538D92CD30F8" unsafe as kind: inlineencodings::GenId;
         "79DD6A1A02E598033EDCE5C667E8E3E6" unsafe as command_text: inlineencodings::Handle<blobencodings::LongString>;
         "C4C3870642CAB5F55E7E575B1A62E640" unsafe as about_request: inlineencodings::GenId;
+        // Published by historical worker event records before this shared
+        // schema owned the read path. Literal pinning preserves that identity.
+        "79474B948670C7D0322C309EB65219F8" unsafe as attempt: inlineencodings::U256BE;
         "B68F9025545C7E616EB90C6440220348" unsafe as exit_code: inlineencodings::U256BE;
         "CA7AF66AAF5105EC15625ED14E1A2AC0" unsafe as stdout_text: inlineencodings::Handle<blobencodings::LongString>;
         "BE4D1876B22EAF93AAD1175DB76D1C72" unsafe as stderr_text: inlineencodings::Handle<blobencodings::LongString>;
@@ -74,6 +77,8 @@ pub mod model_chat {
     attributes! {
         "5F10520477A04E5FB322C85CC78C6762" unsafe as kind: inlineencodings::GenId;
         "5A14A02113CE43A59881D0717726F465" unsafe as about_request: inlineencodings::GenId;
+        // Published model-attempt identity; see the Exec attempt note above.
+        "8CAEF4617646F8C9E90BC9A3ED3D0496" unsafe as attempt: inlineencodings::U256BE;
         "DA8E31E47919337B3E00724EBE32D14E" unsafe as about_thought: inlineencodings::GenId;
         "B1B904590F0FA70AD1BA247F3D23A6CC" unsafe as output_text: inlineencodings::Handle<blobencodings::LongString>;
         "567E35DACDB00C799E75AEED0B6EFDF7" unsafe as reasoning_text: inlineencodings::Handle<blobencodings::LongString>;
@@ -103,7 +108,7 @@ pub mod context {
         "DF84E872EB68FBFCA63D760F27FD8A6F" unsafe as end_at: inlineencodings::NsTAIInterval;
         "CB97C36A32DEC70E0D1149E7C5D88588" unsafe as left: inlineencodings::GenId;
         "087D07E3D9D94F0C4E96813C7BC5E74C" unsafe as right: inlineencodings::GenId;
-        "9B83D68AECD6888AA9CE95E754494768" unsafe as reference: inlineencodings::GenId; // renamed from `child` (same id): annotation, not tree structure
+        "9B83D68AECD6888AA9CE95E754494768" unsafe as reference: inlineencodings::GenId;
         "316834CC6B0EA6F073BF5362D67AC530" unsafe as about_exec_result: inlineencodings::GenId;
     }
 }

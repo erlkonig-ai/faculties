@@ -1,2773 +1,2144 @@
-//! `mail` — RFC 5322 email faculty.
-//!
-//! POP3 fetch with delete-after-pile-commit semantics, SMTP submission
-//! for send/reply, thread walks via `in_reply_to` + `references` graph
-//! edges. Attachments land in the `files` faculty (content-addressed
-//! dedup is automatic); senders auto-register in `relations` so the
-//! social graph grows from incoming traffic.
-//!
-//! Identity: outgoing mail signs as `"Toby Trible" <toby@trible.space>`.
-//!
-//! Env vars:
-//!   MAIL_USER       — full address (e.g. toby@trible.space)
-//!   MAIL_PASS       — Migadu app-password or main password
-//!   MAIL_FROM_NAME  — display name on outgoing From (default: Toby Trible)
-//!   MAIL_POP3_HOST  — default pop.migadu.com
-//!   MAIL_POP3_PORT  — default 995 (TLS)
-//!   MAIL_SMTP_HOST  — default smtp.migadu.com
-//!   MAIL_SMTP_PORT  — default 465 (TLS)
+//! `mail` — collection-native RFC 5322 evidence, intent, and receipt faculty.
 
-use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Local, Utc};
-use clap::{Parser, Subcommand};
-use ed25519_dalek::SigningKey;
-use faculties::collection_cutover::load_signer;
-use faculties::files as file_capability;
-use faculties::schemas::decide::{decide as decide_attrs, KIND_DECISION};
-use faculties::schemas::files::file;
-use faculties::schemas::mail::{mail, KIND_DRAFT, KIND_MESSAGE, KIND_SPAM};
-use faculties::schemas::message::{local as read_attrs, KIND_READ_ID};
-use faculties::schemas::relations::{relations as rel_attrs, KIND_PERSON_ID};
-use hifitime::Epoch;
-use lettre::message::{header, Mailbox, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{Message, SmtpTransport, Transport};
-use rand_core::OsRng;
-use rust_pop3_client::{Pop3Connection, Pop3ConnectionFactory};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use triblespace::core::blob::IntoBlob;
+
+use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use clap::{Args, Parser, Subcommand};
+use ed25519_dalek::SigningKey;
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::decide;
+use faculties::files;
+use faculties::mail::{self, AccountConfigInput, DraftInput, Head, SendAttemptInput};
+use faculties::mail_cutover;
+use faculties::mail_pop;
+use faculties::relations;
+use faculties::schemas::{
+    decide as decide_schema, files as files_schema, mail as mail_schema,
+    relations as relations_schema,
+};
+use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
+use hifitime::Epoch;
+use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{SmtpTransport, Transport};
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStoreGet, Repository, Workspace};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
-type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
-
-const DEFAULT_FROM_NAME: &str = "Toby Trible";
-
-// ── CLI ───────────────────────────────────────────────────────────────────
-
 #[derive(Parser)]
-#[command(version = faculties::GIT_VERSION, name = "mail", about = "RFC 5322 email faculty")]
+#[command(version = faculties::GIT_VERSION, name = "mail", about = "Immutable email evidence, drafts, and delivery receipts")]
 struct Cli {
-    /// Path to the pile file
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name for the mail state
-    #[arg(long, default_value = "mail")]
-    branch: String,
-    /// Branch name for relations (auto-registered senders)
-    #[arg(long, default_value = "relations")]
-    relations_branch: String,
-    /// Branch name for decide (deliberation gate for outbound mail)
-    #[arg(long, default_value = "decide")]
-    decide_branch: String,
+    /// Existing durable collection signer. Ordinary commands never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Secrets identity used to open mailbox passwords. This is deliberately
+    /// independent of the Relations `PERSONA`; omitting it reuses the PERSONA
+    /// selector only as a label-level convenience.
+    #[arg(long, env = "SECRETS_IDENTITY")]
+    secrets_identity: Option<String>,
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fetch new messages from the POP3 server. Each retrieved message
-    /// is decomposed into tribles, attachments land in the files
-    /// branch, then the server-side message is deleted (atomically
-    /// on QUIT — if anything fails before then, nothing is deleted).
+    /// Manage immutable full-state mail-account configurations.
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
+    /// Fetch every enabled account through UIDL-safe POP.
     Fetch,
-    /// Compose a new email as a draft. Does NOT transmit; mints a
-    /// linked `decide` decision that must be resolved before
-    /// `mail send` will transmit. Prints both the draft id and the
-    /// decision id (use the latter with `decide pro/con/resolve`).
-    ///
-    /// Recipients are relation references — comma-separated hex
-    /// prefixes that resolve against the relations branch. The
-    /// faculty refuses raw email strings: if you want to send mail
-    /// to someone, they should exist as a relation first. Run
-    /// `relations list` to find an existing person or
-    /// `relations add 'Name' --email <addr>` to record a new one.
-    Draft {
-        /// Comma-separated relation hex prefixes (TO).
-        to: String,
-        /// Subject line.
-        subject: String,
-        /// Body text. Use @path for file input or @- for stdin.
-        body: String,
-        /// Relation hex prefix for CC (repeatable).
-        #[arg(long)]
-        cc: Vec<String>,
-        /// Relation hex prefix for BCC (repeatable).
-        #[arg(long)]
-        bcc: Vec<String>,
-        /// File to attach (repeatable). Stored in the Files collection
-        /// first, then referenced from the draft so `mail send`
-        /// attaches it automatically.
-        #[arg(long)]
-        attach: Vec<PathBuf>,
-    },
-    /// Compose a reply as a draft. Pre-fills In-Reply-To and
-    /// References from the parent's headers; rest of the flow
-    /// (decide pros/cons/resolve, then mail send) is the same.
-    Reply {
-        /// Full 32-char hex entity id of the message to reply to
-        /// (use `mail show` to find one).
-        message: String,
-        /// Reply body. Use @path for file input or @- for stdin.
-        body: String,
-    },
-    /// Transmit a drafted message. Refuses unless the draft's
-    /// linked decision is resolved (and the resolution is newer
-    /// than the most recent draft body change).
-    Send {
-        /// Full 32-char hex draft id.
-        draft: String,
-    },
-    /// Discard a draft — resolves the linked decision with
-    /// outcome="discard". Subject to the same deliberation gate as
-    /// any other resolve; pass `--force` to skip pros/cons.
-    Discard {
-        /// Full 32-char hex draft id.
-        draft: String,
-        /// Bypass the ≥1 pro AND ≥1 con check on the linked decision.
-        #[arg(long)]
-        force: bool,
-    },
-    /// List pending drafts (KIND_DRAFT entities not yet sent).
+    /// Create one immutable draft and its deterministic Decide proposal.
+    Draft(DraftArgs),
+    /// Create a reply draft from an inbound wire message.
+    Reply(ReplyArgs),
+    /// Submit one authorized draft under externally serialized execution.
+    Send { draft: String },
+    /// List immutable drafts and their delivery state.
     Outbox,
-    /// List messages overlapping the given window.
+    /// List inbound projections for the configured persona.
     List {
-        /// Window start (ISO 8601 date or datetime).
-        #[arg(long)]
-        from: Option<String>,
-        /// Window end (ISO 8601 date or datetime).
-        #[arg(long)]
-        to: Option<String>,
-        /// Show only spam-tagged messages.
-        #[arg(long)]
-        spam: bool,
-        /// Show everything (spam + ham).
-        #[arg(long)]
-        all: bool,
-        /// Show only unread messages (no read-receipt by us).
         #[arg(long)]
         unread: bool,
+        #[arg(long)]
+        spam: bool,
     },
-    /// Mark a message as read (a no-op if already marked).
-    Read {
-        /// Full 32-char hex entity id.
-        message: String,
+    /// Record intrinsic read evidence for one inbound wire message.
+    Read { message: String },
+    /// Show one inbound or outgoing wire message.
+    Show { message: String },
+    /// Case-insensitive substring search over projected subject and body.
+    Search { query: String },
+    /// Migrate the stopped legacy `mail` Repository branch additively.
+    MigrateLegacy,
+}
+
+#[derive(Subcommand)]
+enum AccountCommand {
+    /// Add an account or append a full-state successor to an existing account.
+    Set {
+        /// Existing account id/address. Omit only when creating a new anchor.
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        display_name: String,
+        /// Implicit-TLS endpoint as `host:port`.
+        #[arg(long)]
+        pop_endpoint: String,
+        /// Implicit-TLS endpoint as `host:port`.
+        #[arg(long)]
+        smtp_endpoint: String,
+        #[arg(long)]
+        username: Option<String>,
+        /// Mailbox secret. Prefer MAIL_PASS rather than a visible argv value.
+        #[arg(long, env = "MAIL_PASS", hide_env_values = true)]
+        password: Option<String>,
+        /// Exact existing shared-Secrets version. This is the repair path when
+        /// a Secrets-first account update was interrupted before Mail commit.
+        #[arg(long, conflicts_with = "password")]
+        credential_version: Option<String>,
+        /// Secrets scope receiving a newly sealed mailbox password. Required
+        /// for a new account; an existing unique account defaults to its old
+        /// secret's scope when omitted.
+        #[arg(long)]
+        secret_scope: Option<String>,
+        #[arg(long)]
+        disabled: bool,
     },
-    /// Messages received or sent today (local TZ).
-    Today,
-    /// Messages from the last 7 days (local TZ).
-    Week,
-    /// Walk the thread containing the given message — both up
-    /// (ancestors via in_reply_to / references) and down (descendants
-    /// that point at any of those).
-    Thread {
-        /// Full 32-char hex entity id of any message in the thread.
-        message: String,
-    },
-    /// Show one message with all properties + attachments.
-    Show {
-        /// Full 32-char hex entity id.
-        message: String,
-    },
-    /// Substring search over subject + body (case-insensitive).
-    Search {
-        /// Query string.
-        query: String,
-    },
-    /// Resolve a hex prefix to a full 32-char message entity id.
-    Resolve { prefix: String },
+    List,
 }
 
-// ── config ────────────────────────────────────────────────────────────────
-
-struct MailConfig {
-    user: String,
-    pass: String,
-    from_name: String,
-    pop3_host: String,
-    pop3_port: u16,
-    smtp_host: String,
-    smtp_port: u16,
+#[derive(Args)]
+struct DraftArgs {
+    /// Account id/address; required even when only one account exists.
+    #[arg(long)]
+    account: String,
+    #[arg(long, required = true)]
+    to: Vec<String>,
+    #[arg(long)]
+    cc: Vec<String>,
+    #[arg(long)]
+    bcc: Vec<String>,
+    #[arg(long)]
+    subject: String,
+    /// Literal text, `@path`, or `@-`.
+    body: String,
+    #[arg(long)]
+    attach: Vec<PathBuf>,
 }
 
-fn load_config() -> Result<MailConfig> {
-    let user = std::env::var("MAIL_USER").context("MAIL_USER not set (e.g. toby@trible.space)")?;
-    let pass = std::env::var("MAIL_PASS").context("MAIL_PASS not set")?;
-    let from_name = std::env::var("MAIL_FROM_NAME").unwrap_or_else(|_| DEFAULT_FROM_NAME.into());
-    let pop3_host = std::env::var("MAIL_POP3_HOST").unwrap_or_else(|_| "pop.migadu.com".into());
-    let pop3_port = std::env::var("MAIL_POP3_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(995);
-    let smtp_host = std::env::var("MAIL_SMTP_HOST").unwrap_or_else(|_| "smtp.migadu.com".into());
-    let smtp_port = std::env::var("MAIL_SMTP_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(465);
-    Ok(MailConfig {
-        user,
-        pass,
-        from_name,
-        pop3_host,
-        pop3_port,
-        smtp_host,
-        smtp_port,
-    })
+#[derive(Args)]
+struct ReplyArgs {
+    message: String,
+    #[arg(long)]
+    account: String,
+    /// Literal text, `@path`, or `@-`.
+    body: String,
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────
-
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
+#[derive(Clone, Copy)]
+struct Scopes {
+    mail: Id,
+    files: Id,
+    decide: Id,
+    relations: Id,
 }
 
-fn epoch_to_chrono_utc(e: Epoch) -> DateTime<Utc> {
-    let secs = e.to_unix_seconds();
-    DateTime::from_timestamp(secs as i64, ((secs.fract() * 1e9) as u32).min(999_999_999))
-        .unwrap_or_else(Utc::now)
+impl Scopes {
+    const FIXED: Self = Self {
+        mail: mail_schema::DEFAULT_SCOPE_ID,
+        files: files_schema::DEFAULT_SCOPE_ID,
+        decide: decide_schema::DEFAULT_SCOPE_ID,
+        relations: relations_schema::DEFAULT_SCOPE_ID,
+    };
 }
 
-fn chrono_to_epoch(dt: DateTime<Utc>) -> Epoch {
-    Epoch::from_unix_seconds(dt.timestamp() as f64 + dt.timestamp_subsec_nanos() as f64 * 1e-9)
+struct CollectionView {
+    facts: TribleSet,
+    reader: PileReader,
 }
 
-fn instant_interval(at: Epoch) -> IntervalValue {
-    (at, at).try_to_inline().unwrap()
+struct Views {
+    mail: CollectionView,
+    files: CollectionView,
+    decide: CollectionView,
+    relations: CollectionView,
+    secrets: CollectionView,
+    secrets_catalog: SecretsCatalog,
 }
 
-fn unpack_interval(iv: IntervalValue) -> (Epoch, Epoch) {
-    iv.try_from_inline().unwrap()
+struct Storage<'a> {
+    pile_path: &'a Path,
+    pile: RefCell<Option<Pile>>,
+    signer: SigningKey,
+    scopes: Scopes,
+    secrets_identity: Option<&'a str>,
 }
 
-/// Deterministic entity id derived from a Message-Id string, via `entity!`'s
-/// intrinsic derivation over the single `mail::message_id` fact — the same id
-/// the message entity gets when it materializes. Same Message-Id always
-/// produces the same Id, so `in_reply_to`/`references` point at predicted ids
-/// even when the referenced message isn't in our pile yet. (Uses the macro's
-/// derivation rather than a hand-rolled hash so the convergent-naming intent is
-/// expressed the canonical way — see the scope id in `secrets.rs`.)
-fn entity_id_for_message(message_id: &str) -> Id {
-    entity! { _ @
-        mail::message_id: message_id.trim().to_string().to_blob().get_handle(),
+impl Storage<'_> {
+    fn open<'a>(
+        pile_path: &'a Path,
+        key: Option<&Path>,
+        scopes: Scopes,
+        secrets_identity: Option<&'a str>,
+    ) -> Result<Storage<'a>> {
+        let signer = load_signer(pile_path, key)?;
+        let pile = open_pile_strict(pile_path)?;
+        Ok(Storage {
+            pile_path,
+            pile: RefCell::new(Some(pile)),
+            signer,
+            scopes,
+            secrets_identity,
+        })
     }
-    .root()
-    .expect("entity! derives a root id")
+
+    fn materialize(&self, scope: Id, label: &str) -> Result<CollectionView> {
+        let mut pile = self.pile.borrow_mut();
+        let pile = pile
+            .as_mut()
+            .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
+        let facts = Collection::new(&mut *pile, scope, self.signer.clone())
+            .materialize()
+            .with_context(|| format!("materialize {label} collection"))?;
+        let reader = pile
+            .reader()
+            .with_context(|| format!("open {label} blob reader"))?;
+        Ok(CollectionView { facts, reader })
+    }
+
+    fn views(&self) -> Result<Views> {
+        let secrets = self.materialize(secrets_schema::DEFAULT_SCOPE_ID, "Secrets")?;
+        let secrets_catalog = secrets_model::validate_catalog(&secrets.reader, &secrets.facts)
+            .context("validate Secrets collection")?;
+        let views = Views {
+            mail: self.materialize(self.scopes.mail, "Mail")?,
+            files: self.materialize(self.scopes.files, "Files")?,
+            decide: self.materialize(self.scopes.decide, "Decide")?,
+            relations: self.materialize(self.scopes.relations, "Relations")?,
+            secrets,
+            secrets_catalog,
+        };
+        decide::validate_catalog(&views.decide.reader, &views.decide.facts)
+            .context("validate Decide collection")?;
+        relations::validate_catalog(&views.relations.reader, &views.relations.facts)
+            .context("validate Relations collection")?;
+        mail::validate_catalog(
+            &views.mail.reader,
+            &views.mail.facts,
+            &views.files.facts,
+            &views.decide.facts,
+            &views.relations.facts,
+            &views.secrets_catalog,
+        )
+        .context("validate Mail collection")?;
+        Ok(views)
+    }
+
+    fn publish(&self, scope: Id, fragment: Fragment, description: &str) -> Result<()> {
+        let mut fragment = fragment;
+        fragment.describe_with(entity! { metadata::description: description.to_owned() });
+        let mut pile = self.pile.borrow_mut();
+        let pile = pile
+            .as_mut()
+            .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
+        Collection::new(&mut *pile, scope, self.signer.clone())
+            .commit(fragment)
+            .with_context(|| format!("commit collection {scope:x}"))?;
+        Ok(())
+    }
+
+    fn close(self) -> Result<()> {
+        self.close_inner()
+    }
+
+    fn close_inner(&self) -> Result<()> {
+        let Some(pile) = self.pile.borrow_mut().take() else {
+            return Ok(());
+        };
+        pile.close()
+            .with_context(|| format!("close Mail pile {}", self.pile_path.display()))
+    }
+}
+
+impl Drop for Storage<'_> {
+    fn drop(&mut self) {
+        // Command dispatch reports close failures explicitly through `close`.
+        // This fallback keeps early-returning tests and callers from silently
+        // abandoning a live Pile handle.
+        let _ = self.close_inner();
+    }
 }
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-/// Resolve a message/draft id, accepting either a full 32-char hex
-/// or a shorter prefix. Faculty-specific candidate set: `KIND_MESSAGE`
-/// and `KIND_DRAFT` entities, since they share the entity-id namespace
-/// and the user often wants either.
-fn resolve_message_id(space: &TribleSet, input: &str) -> Result<Id> {
-    let messages = find!(e: Id, pattern!(space, [{ ?e @ metadata::tag: KIND_MESSAGE }]));
-    let drafts = find!(e: Id, pattern!(space, [{ ?e @ metadata::tag: KIND_DRAFT }]));
-    faculties::resolve_id_prefix(input, messages.chain(drafts))
+fn point_now() -> Result<mail::IntervalValue> {
+    let now = Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))?;
+    (now, now)
+        .try_to_inline()
+        .map_err(|error| anyhow!("encode current clock: {error:?}"))
 }
 
-fn parse_iso8601(input: &str) -> Result<DateTime<Utc>> {
-    let trimmed = input.trim();
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
-        return Ok(Utc.from_utc_datetime(&naive));
-    }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        let naive = date.and_hms_opt(0, 0, 0).unwrap();
-        return Ok(Utc.from_utc_datetime(&naive));
-    }
-    bail!("could not parse '{}' as ISO 8601", trimmed)
+fn identity_password() -> Result<Vec<u8>> {
+    faculties::secrets::password::read("unlock the selected Secrets identity")
 }
 
-// chrono TimeZone re-export for the parse helper above.
-use chrono::TimeZone;
-
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
+fn persona_selector() -> Result<String> {
+    std::env::var("PERSONA").context("PERSONA must select an active Relations person")
 }
 
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
+fn relation_persona(views: &Views) -> Result<Id> {
+    let raw = persona_selector()?;
+    relations::resolve_person(&views.relations.reader, &views.relations.facts, &raw, false)?
+        .require_unique("active Relations person", &raw)
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, blobencodings::LongString>(h)
-        .ok()
-        .map(|view| view.to_string())
-}
-
-fn read_files_text(reader: &PileReader, h: TextHandle) -> Option<String> {
-    reader
-        .get::<View<str>, blobencodings::LongString>(h)
-        .ok()
-        .map(|view| view.to_string())
-}
-
-// ── read tracking ─────────────────────────────────────────────────────────
-//
-// Re-uses the KIND_READ_ID + about_message/reader/read_at schema from
-// `message` — those attributes are generic message-read-receipt
-// shapes (the module name is historical from the faculty that
-// introduced them; the IDs themselves are cross-faculty).
-
-/// Find a relations entry whose `email` attribute matches the
-/// provided address (case-folded). Used to resolve "the local
-/// agent's identity" — i.e. who we are when marking messages read.
-fn find_self_persona(relations_space: &TribleSet, email: &str) -> Option<Id> {
-    let needle = email.trim().to_ascii_lowercase();
-    find!(
-        (id: Id, e: String),
-        pattern!(relations_space, [{
-            ?id @
-                metadata::tag: KIND_PERSON_ID,
-                rel_attrs::email: ?e,
-        }])
-    )
-    .find_map(|(id, e)| {
-        if e.to_ascii_lowercase() == needle {
-            Some(id)
-        } else {
-            None
-        }
-    })
-}
-
-/// Returns true if `reader_id` has marked `message_id` as read.
-fn is_read(mail_space: &TribleSet, message_id: Id, reader_id: Id) -> bool {
-    find!(
-        r: Id,
-        pattern!(mail_space, [{
-            ?r @
-                metadata::tag: KIND_READ_ID,
-                read_attrs::about_message: message_id,
-                read_attrs::reader: reader_id,
-        }])
-    )
-    .next()
-    .is_some()
-}
-
-/// Mint a read-receipt entity if one doesn't already exist for
-/// `(message_id, reader_id)`. Idempotent.
-fn mark_read_if_unread(
-    repo: &mut Repository<Pile>,
-    mail_branch_id: Id,
-    message_id: Id,
-    reader_id: Id,
-) -> Result<bool> {
-    let mut ws = repo
-        .pull(mail_branch_id)
-        .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    if is_read(&space, message_id, reader_id) {
-        return Ok(false);
-    }
-    let read_id = ufoid();
-    let now = instant_interval(now_epoch());
-    let mut change = TribleSet::new();
-    change += entity! { &read_id @
-        metadata::tag: &KIND_READ_ID,
-        metadata::created_at: now,
-        read_attrs::about_message: &message_id,
-        read_attrs::reader: &reader_id,
-        read_attrs::read_at: now,
+fn secrets_identity(views: &Views, explicit: Option<&str>) -> Result<Id> {
+    let raw = match explicit {
+        Some(raw) => raw.to_owned(),
+        None => persona_selector().context(
+            "set --secrets-identity/SECRETS_IDENTITY when the Secrets identity differs from PERSONA",
+        )?,
     };
-    ws.commit(change, "mail: mark read");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push read receipt: {e:?}"))?;
-    Ok(true)
-}
-
-// ── address handling ──────────────────────────────────────────────────────
-
-/// (display_name, email) pair parsed from RFC 5322 address forms like
-/// `"Alice" <alice@example.com>` or just `alice@example.com`.
-#[derive(Debug, Clone)]
-struct Address {
-    name: Option<String>,
-    email: String,
-}
-
-fn parse_address(input: &str) -> Result<Address> {
-    let trimmed = input.trim();
-    // Use mailparse's address parser (handles RFC 5322 quoting/encoding).
-    let addrs =
-        mailparse::addrparse(trimmed).with_context(|| format!("parse address '{}'", trimmed))?;
-    let first = addrs
-        .iter()
-        .find_map(|a| match a {
-            mailparse::MailAddr::Single(s) => Some(s),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow::anyhow!("no address in '{}'", trimmed))?;
-    Ok(Address {
-        name: first.display_name.clone(),
-        email: first.addr.clone(),
-    })
-}
-
-fn parse_address_list(input: &str) -> Result<Vec<Address>> {
-    let mut out = Vec::new();
-    let addrs = mailparse::addrparse(input.trim())
-        .with_context(|| format!("parse address list '{}'", input.trim()))?;
-    for a in addrs.iter() {
-        if let mailparse::MailAddr::Single(s) = a {
-            out.push(Address {
-                name: s.display_name.clone(),
-                email: s.addr.clone(),
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// Resolve a relation hex prefix to a single relation id by scanning
-/// `KIND_PERSON_ID` entries and matching the leading hex of each id.
-/// Used by `mail draft` to refuse free-floating email strings: the
-/// operator names a relation, we resolve to its entity id, and the
-/// recipient becomes a first-class part of the knowledge base. Errors
-/// distinguish "no match" (user needs to `relations add` first) from
-/// "ambiguous" (user needs more characters of the prefix).
-fn resolve_relation_prefix(space: &TribleSet, prefix: &str) -> Result<Id> {
-    let trimmed = prefix.trim();
-    if trimmed.is_empty() {
-        bail!("relation prefix is empty");
-    }
-    let needle = trimmed.to_ascii_lowercase();
-    if !needle.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!(
-            "'{trimmed}' is not a hex prefix. \
-             `mail draft` takes relation references, not email \
-             addresses — see `relations list` for existing relations \
-             or `relations add 'Name' --email <addr>` to record a \
-             new one"
-        );
-    }
-    let matches: Vec<Id> = find!(
-        id: Id,
-        pattern!(space, [{ ?id @ metadata::tag: KIND_PERSON_ID }])
-    )
-    .filter(|id| format!("{id:x}").starts_with(&needle))
-    .collect();
-    match matches.len() {
-        0 => bail!(
-            "no relation matches prefix '{trimmed}'. Run \
-             `relations add 'Name' --email <addr>` to record them \
-             first, then redraft"
-        ),
-        1 => Ok(matches[0]),
-        n => bail!(
-            "prefix '{trimmed}' is ambiguous ({n} relations match) — \
-             use more characters or `relations list` to disambiguate"
-        ),
-    }
-}
-
-/// Look up the email attribute on a relation. Returns an error if
-/// missing because `mail draft` can't construct an RFC 5322 envelope
-/// without an address — operator should set the email via
-/// `relations set <id> --email <addr>` first.
-fn relation_email_required(space: &TribleSet, id: Id) -> Result<String> {
-    find!(e: String, pattern!(space, [{ id @ rel_attrs::email: ?e }]))
-        .next()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "relation {id:x} has no email attribute set — \
-             `relations set {id:x} --email <addr>` to add one"
+    secrets_model::resolve_identity(&views.secrets.reader, &views.secrets_catalog, &raw)
+        .with_context(|| {
+            format!(
+                "resolve Secrets identity {raw:?}; set --secrets-identity/SECRETS_IDENTITY explicitly when namespaces differ"
             )
         })
 }
 
-/// Look up an optional display label for the relation (metadata::name).
-/// Returns `None` if the relation has no human-readable label set yet
-/// — autoregistered relations from incoming mail commonly do.
-fn relation_label(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    let handle = find!(
-        h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
-        pattern!(space, [{ id @ metadata::name: ?h }])
-    )
-    .next()?;
-    ws.get::<View<str>, blobencodings::LongString>(handle)
-        .ok()
-        .map(|v| v.to_string())
+fn mailbox_secret_name(account: Id) -> String {
+    format!("mail/{}", URL_SAFE_NO_PAD.encode(account.raw()))
 }
 
-/// Look up an existing relations entry by email (case-folded). Returns
-/// the entity id if found.
-fn find_relation_by_email(space: &TribleSet, email: &str) -> Option<Id> {
-    let needle = email.trim().to_ascii_lowercase();
-    find!(
-        (id: Id, e: String),
-        pattern!(space, [{
-            ?id @
-                metadata::tag: KIND_PERSON_ID,
-                rel_attrs::email: ?e,
-        }])
-    )
-    .find_map(|(id, e)| {
-        if e.to_ascii_lowercase() == needle {
-            Some(id)
-        } else {
-            None
+fn resolve_account(views: &Views, input: &str) -> Result<Id> {
+    let anchors = mail::account_anchors(&views.mail.facts);
+    if let Some(id) = Id::from_hex(input.trim()) {
+        if anchors.contains(&id) {
+            return Ok(id);
         }
-    })
-}
-
-/// Resolve an Address to a relations entity id. Mints a new entry
-/// with the email (and display_name if known) tagged `KIND_PERSON_ID`
-/// if no existing entry matches. New entries are deliberately
-/// minimal — promotion to "verified" happens by manually editing the
-/// relations entry (adding display_name, affinity, etc.).
-fn resolve_or_register(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    addr: &Address,
-    change: &mut TribleSet,
-) -> Option<Id> {
-    let email = addr.email.trim();
-    if email.is_empty() {
-        return None;
+        bail!("unknown mail account {id:x}");
     }
-    if email.as_bytes().len() > 32 {
-        eprintln!("[mail] skipping auto-register for over-long email '{email}'");
-        return None;
-    }
-    if let Some(id) = find_relation_by_email(space, email) {
-        return Some(id);
-    }
-    let new_id = ufoid();
-    let new_ref = new_id.id;
-    let now = instant_interval(now_epoch());
-    let mut entity_change = TribleSet::new();
-    entity_change += entity! { &new_id @
-        metadata::tag: &KIND_PERSON_ID,
-        metadata::created_at: now,
-        rel_attrs::email: email,
-    };
-    if let Some(name) = addr.name.as_deref() {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            let handle = ws.put(trimmed.to_string());
-            entity_change += entity! { &new_id @
-                rel_attrs::display_name: handle,
-            };
+    let lowered = input.trim().to_ascii_lowercase();
+    let mut matches = BTreeSet::new();
+    for anchor in anchors {
+        if fmt_id(anchor).starts_with(&lowered) {
+            matches.insert(anchor);
+            continue;
+        }
+        let config = match mail::account_head(&views.mail.facts, anchor)? {
+            Head::Unique(id) => mail::account_config(&views.mail.facts, id)?,
+            Head::Missing | Head::Forked(_) => continue,
+        };
+        if mail::read_text(&views.mail.reader, config.address)?.eq_ignore_ascii_case(input.trim()) {
+            matches.insert(anchor);
         }
     }
-    *change += entity_change;
-    Some(new_ref)
+    match matches.len() {
+        0 => bail!("no mail account matches {input:?}"),
+        1 => Ok(matches.pop_first().unwrap()),
+        count => bail!("{count} mail accounts match {input:?}"),
+    }
 }
 
-// ── kind entities ─────────────────────────────────────────────────────────
-
-fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let existing: HashSet<Id> = find!(
-        (kind: Id),
-        pattern!(&space, [{ ?kind @ metadata::name: _?handle }])
+fn resolve_draft(facts: &TribleSet, input: &str) -> Result<Id> {
+    let candidates: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::tag: &mail_schema::KIND_DRAFT_INTENT }])
     )
-    .map(|(kind,)| kind)
     .collect();
-    let mut change = TribleSet::new();
-    let label = |id: Id| -> &'static str {
-        if id == KIND_MESSAGE {
-            "mail-message"
-        } else {
-            "mail-spam"
-        }
-    };
-    for kind in [KIND_MESSAGE, KIND_SPAM] {
-        if !existing.contains(&kind) {
-            let name = ws.put(label(kind));
-            change += entity! { ExclusiveId::force_ref(&kind) @
-                metadata::name: name,
-            };
-        }
-    }
-    Ok(change)
+    faculties::resolve_id_prefix(input, candidates)
 }
 
-// ── ingest: RFC 5322 → tribles ────────────────────────────────────────────
+fn wire_candidates(facts: &TribleSet) -> BTreeSet<Id> {
+    find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &mail_schema::KIND_WIRE_MESSAGE }]))
+        .collect()
+}
 
-/// Decomposed view of an RFC 5322 message ready for trible-land.
-struct ParsedMail {
-    message_id: String,
-    from: Option<Address>,
-    to: Vec<Address>,
-    cc: Vec<Address>,
-    bcc: Vec<Address>,
+fn resolve_wire(facts: &TribleSet, input: &str) -> Result<Id> {
+    faculties::resolve_id_prefix(input, wire_candidates(facts))
+}
+
+fn account_set(
+    storage: &Storage<'_>,
+    account_selector: Option<String>,
+    address: String,
+    display_name: String,
+    pop_endpoint: String,
+    smtp_endpoint: String,
+    username: Option<String>,
+    password: Option<String>,
+    credential_version: Option<String>,
+    secret_scope: Option<String>,
+    disabled: bool,
+) -> Result<()> {
+    let mut views = storage.views()?;
+    let (anchor, predecessors, old_credential, replacing_fork) =
+        if let Some(selector) = account_selector {
+            let anchor = resolve_account(&views, &selector)?;
+            match mail::account_head(&views.mail.facts, anchor)? {
+                Head::Unique(head) => {
+                    let config = mail::account_config(&views.mail.facts, head)?;
+                    (anchor, vec![head], Some(config.credential), false)
+                }
+                Head::Missing => bail!("account {anchor:x} has no configuration"),
+                // A complete new snapshot can reconcile every observed branch,
+                // but no branch may be selected as the credential donor.
+                Head::Forked(heads) => (anchor, heads, None, true),
+            }
+        } else {
+            (genid().id, Vec::new(), None, false)
+        };
+
+    let explicit_credential = credential_version
+        .as_deref()
+        .map(|value| {
+            let id = Id::from_hex(value.trim()).ok_or_else(|| {
+                anyhow!("--credential-version requires one exact 32-hex Secrets id")
+            })?;
+            if !views.secrets_catalog.secrets.contains_key(&id) {
+                bail!("unknown Secrets credential version {id:x}");
+            }
+            Ok(id)
+        })
+        .transpose()?;
+    let (credential_id, staged_secret) = match (password, explicit_credential, old_credential) {
+        (None, None, Some(id)) => {
+            if secret_scope.is_some() {
+                bail!("--secret-scope only applies when sealing a supplied --password");
+            }
+            (id, None)
+        }
+        (None, None, None) if replacing_fork => {
+            bail!("--credential-version or MAIL_PASS/--password is required to reconcile a forked account")
+        }
+        (None, None, None) => {
+            bail!("--credential-version or MAIL_PASS/--password is required for a new account")
+        }
+        (None, Some(id), _) => {
+            if secret_scope.is_some() {
+                bail!("--secret-scope cannot be combined with --credential-version");
+            }
+            (id, None)
+        }
+        (Some(value), None, old) => {
+            let scope = match secret_scope.as_deref() {
+                Some(selector) => secrets_model::resolve_scope(
+                    &views.secrets.reader,
+                    &views.secrets_catalog,
+                    selector,
+                )?,
+                None => old
+                    .and_then(|id| views.secrets_catalog.secrets.get(&id))
+                    .map(|secret| secret.scope)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "--secret-scope is required when no unique predecessor secret exists"
+                        )
+                    })?,
+            };
+            let sealed = secrets_model::seal_version(
+                &views.secrets.reader,
+                &views.secrets_catalog,
+                scope,
+                &mailbox_secret_name(anchor),
+                value.as_bytes(),
+                point_now()?,
+            )?;
+            let id = sealed.secret;
+            let candidate_catalog = secrets_model::validate_candidate(
+                &views.secrets.reader,
+                &views.secrets.facts,
+                &sealed.fragment,
+            )
+            .context("validate mailbox secret version")?;
+            (id, Some((sealed.fragment, candidate_catalog)))
+        }
+        (Some(_), Some(_), _) => unreachable!("clap rejects password plus credential version"),
+    };
+    let username = username.unwrap_or_else(|| address.clone());
+    let input = AccountConfigInput {
+        address,
+        display_name,
+        pop_endpoint,
+        smtp_endpoint,
+        username,
+        credential: credential_id,
+        enabled: !disabled,
+        predecessors,
+    }
+    .canonicalized()?;
+    if let [predecessor] = input.predecessors.as_slice() {
+        let previous = mail::account_config(&views.mail.facts, *predecessor)?;
+        let same = mail::read_text(&views.mail.reader, previous.address)? == input.address
+            && mail::read_text(&views.mail.reader, previous.display_name)? == input.display_name
+            && mail::read_text(&views.mail.reader, previous.pop_endpoint)? == input.pop_endpoint
+            && mail::read_text(&views.mail.reader, previous.smtp_endpoint)? == input.smtp_endpoint
+            && mail::read_text(&views.mail.reader, previous.username)? == input.username
+            && previous.credential == input.credential
+            && previous.enabled == input.enabled;
+        if same {
+            println!(
+                "Account {} already has config {}",
+                fmt_id(anchor),
+                fmt_id(*predecessor)
+            );
+            return Ok(());
+        }
+    }
+
+    let mut fragment = Fragment::empty();
+    let (config_fragment, config_id) = mail::account_config_fragment(anchor, input)?;
+    fragment += config_fragment;
+    let preflight_secrets = staged_secret
+        .as_ref()
+        .map(|(_, catalog)| catalog)
+        .unwrap_or(&views.secrets_catalog);
+    mail::validate_catalog_union(
+        &views.mail.reader,
+        &views.mail.facts,
+        &fragment,
+        &views.files.facts,
+        &views.decide.facts,
+        &views.relations.facts,
+        preflight_secrets,
+    )?;
+
+    if let Some((secret_fragment, _)) = staged_secret {
+        storage.publish(
+            secrets_schema::DEFAULT_SCOPE_ID,
+            secret_fragment,
+            "mail: mailbox password version",
+        )?;
+        eprintln!(
+            "Published mailbox credential {credential_id:x}; if Mail publication is interrupted, retry with --credential-version {credential_id:x}"
+        );
+        // Take a fresh snapshot from the same open Pile before authoring the
+        // Mail edge. A crash or Mail publication failure after this point
+        // leaves a valid, harmless orphan secret, never a dangling account
+        // configuration.
+        views = storage.views()?;
+        if !views.secrets_catalog.secrets.contains_key(&credential_id) {
+            bail!("published mailbox secret {credential_id:x} did not materialize");
+        }
+        mail::validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &fragment,
+            &views.files.facts,
+            &views.decide.facts,
+            &views.relations.facts,
+            &views.secrets_catalog,
+        )?;
+    }
+    storage.publish(
+        storage.scopes.mail,
+        fragment,
+        "mail: account full-state config",
+    )?;
+    println!("Account {} config {}", fmt_id(anchor), fmt_id(config_id));
+    Ok(())
+}
+
+fn account_list(storage: &Storage<'_>) -> Result<()> {
+    let views = storage.views()?;
+    for anchor in mail::account_anchors(&views.mail.facts) {
+        match mail::account_head(&views.mail.facts, anchor)? {
+            Head::Missing => println!("{}  MISSING", fmt_id(anchor)),
+            Head::Forked(ids) => println!("{}  FORKED {:?}", fmt_id(anchor), ids),
+            Head::Unique(id) => {
+                let config = mail::account_config(&views.mail.facts, id)?;
+                let address = mail::read_text(&views.mail.reader, config.address)?;
+                let state = if config.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                println!(
+                    "{}  {}  {}  config={}",
+                    fmt_id(anchor),
+                    address,
+                    state,
+                    fmt_id(id)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stage_attachments(paths: &[PathBuf]) -> Result<(Fragment, Vec<Id>)> {
+    let mut fragment = Fragment::empty();
+    let mut ids = Vec::new();
+    for path in paths {
+        let bytes =
+            fs::read(path).with_context(|| format!("read attachment {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment.bin");
+        let file = files::stage(bytes, name, files::infer_media_type(path))?;
+        ids.push(file.root().expect("canonical file root"));
+        fragment += file;
+    }
+    Ok((fragment, ids))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_draft(
+    storage: &Storage<'_>,
+    views: &Views,
+    account_selector: &str,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
     subject: String,
     body: String,
-    sent_at: Epoch,
-    in_reply_to: Vec<String>,
-    references: Vec<String>,
-    is_spam: bool,
-    raw: Vec<u8>,
-    attachments: Vec<Attachment>,
-}
-
-struct Attachment {
-    filename: String,
-    mime: String,
-    bytes: Vec<u8>,
-}
-
-fn parse_message_id_list(field: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut chars = field.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '<' {
-            let mut id = String::new();
-            for cc in chars.by_ref() {
-                if cc == '>' {
-                    break;
-                }
-                id.push(cc);
-            }
-            let trimmed = id.trim();
-            if !trimmed.is_empty() {
-                out.push(trimmed.to_string());
-            }
-        }
-    }
-    out
-}
-
-fn parse_rfc5322(bytes: &[u8]) -> Result<ParsedMail> {
-    let parsed = mailparse::parse_mail(bytes).context("parse RFC 5322")?;
-    let headers = &parsed.headers;
-    let get = |name: &str| -> Option<String> {
-        headers
-            .iter()
-            .find(|h| h.get_key().eq_ignore_ascii_case(name))
-            .map(|h| h.get_value())
+    attach: &[PathBuf],
+    in_reply_to: Vec<Id>,
+    references: Vec<Id>,
+) -> Result<()> {
+    let account_id = resolve_account(views, account_selector)?;
+    let account = match mail::account_head(&views.mail.facts, account_id)? {
+        Head::Unique(id) => mail::account_config(&views.mail.facts, id)?,
+        Head::Missing => bail!("account {account_id:x} has no configuration"),
+        Head::Forked(ids) => bail!("account {account_id:x} has forked configurations {ids:?}"),
     };
-
-    let message_id_raw = get("Message-Id")
-        .or_else(|| get("Message-ID"))
-        .unwrap_or_default();
-    let message_id = parse_message_id_list(&message_id_raw)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| {
-            // Synthesize a stable id if the message arrived without one.
-            // Hash the raw bytes so re-fetching the same message produces
-            // the same synth-id (dedupable).
-            let h = blake3::hash(bytes);
-            format!("synth-{}@trible.space", hex::encode(&h.as_bytes()[..8]))
-        });
-
-    let from = get("From").and_then(|s| parse_address(&s).ok());
-    let to = get("To")
-        .map(|s| parse_address_list(&s).unwrap_or_default())
-        .unwrap_or_default();
-    let cc = get("Cc")
-        .map(|s| parse_address_list(&s).unwrap_or_default())
-        .unwrap_or_default();
-    let bcc = get("Bcc")
-        .map(|s| parse_address_list(&s).unwrap_or_default())
-        .unwrap_or_default();
-    let subject = get("Subject").unwrap_or_default();
-
-    let sent_at = get("Date")
-        .and_then(|s| mailparse::dateparse(&s).ok())
-        .map(|ts| Epoch::from_unix_seconds(ts as f64))
-        .unwrap_or_else(now_epoch);
-
-    let in_reply_to = get("In-Reply-To")
-        .map(|s| parse_message_id_list(&s))
-        .unwrap_or_default();
-    let references = get("References")
-        .map(|s| parse_message_id_list(&s))
-        .unwrap_or_default();
-
-    let is_spam = get("X-Spam-Status")
-        .map(|s| s.trim_start().to_ascii_lowercase().starts_with("yes"))
-        .unwrap_or(false);
-
-    let (body, attachments) = extract_body_and_attachments(&parsed);
-
-    Ok(ParsedMail {
-        message_id,
-        from,
+    if !account.enabled {
+        bail!("account {account_id:x} is disabled");
+    }
+    let envelope_from = mail::read_text(&views.mail.reader, account.address)?;
+    let (files_fragment, attachment_ids) = stage_attachments(attach)?;
+    let draft = mail::draft_publication(DraftInput {
+        nonce: genid().id,
+        account: account_id,
+        envelope_from,
         to,
         cc,
         bcc,
         subject,
         body,
-        sent_at,
+        attachments: attachment_ids,
         in_reply_to,
         references,
-        is_spam,
-        raw: bytes.to_vec(),
-        attachments,
-    })
-}
-
-fn extract_body_and_attachments(part: &mailparse::ParsedMail) -> (String, Vec<Attachment>) {
-    let mut body = String::new();
-    let mut attachments = Vec::new();
-    collect_parts(part, &mut body, &mut attachments);
-    (body, attachments)
-}
-
-fn collect_parts(
-    part: &mailparse::ParsedMail,
-    body: &mut String,
-    attachments: &mut Vec<Attachment>,
-) {
-    let ctype = part.ctype.mimetype.to_ascii_lowercase();
-    let disposition = part.get_content_disposition();
-    let is_attachment = matches!(
-        disposition.disposition,
-        mailparse::DispositionType::Attachment
-    ) || disposition
-        .params
-        .get("filename")
-        .map(|n| !n.is_empty())
-        .unwrap_or(false);
-
-    if ctype.starts_with("multipart/") {
-        for sub in &part.subparts {
-            collect_parts(sub, body, attachments);
-        }
-        return;
+        created_at: point_now()?,
+    })?;
+    let mut files_union = views.files.facts.clone();
+    files_union += files_fragment.facts().clone();
+    let decide_union =
+        decide::validate_catalog_union(&views.decide.reader, &views.decide.facts, &draft.decide)?;
+    let mut blob_overlay = files_fragment.clone();
+    blob_overlay += draft.decide.clone();
+    blob_overlay += draft.mail.clone();
+    mail::validate_catalog_union_with_blobs(
+        &views.mail.reader,
+        &views.mail.facts,
+        &draft.mail,
+        &blob_overlay,
+        &files_union,
+        &decide_union,
+        &views.relations.facts,
+        &views.secrets_catalog,
+    )?;
+    if !files_fragment.facts().is_empty() {
+        storage.publish(
+            storage.scopes.files,
+            files_fragment,
+            "mail: draft attachments",
+        )?;
     }
+    storage.publish(
+        storage.scopes.decide,
+        draft.decide,
+        "mail: draft send decision",
+    )?;
+    storage.publish(
+        storage.scopes.mail,
+        draft.mail,
+        "mail: immutable draft intent",
+    )?;
+    println!("Draft {}", fmt_id(draft.draft));
+    println!("Decision {}", fmt_id(draft.decision));
+    Ok(())
+}
 
-    if is_attachment || (!ctype.starts_with("text/") && !part.subparts.is_empty() == false) {
-        if !ctype.starts_with("text/") || is_attachment {
-            let filename = disposition
-                .params
-                .get("filename")
-                .cloned()
-                .unwrap_or_else(|| {
-                    part.ctype
-                        .params
-                        .get("name")
-                        .cloned()
-                        .unwrap_or_else(|| "attachment.bin".into())
-                });
-            if let Ok(bytes) = part.get_body_raw() {
-                attachments.push(Attachment {
-                    filename,
-                    mime: ctype.clone(),
-                    bytes,
-                });
+fn cmd_draft(storage: &Storage<'_>, args: DraftArgs) -> Result<()> {
+    let views = storage.views()?;
+    create_draft(
+        storage,
+        &views,
+        &args.account,
+        args.to,
+        args.cc,
+        args.bcc,
+        args.subject,
+        faculties::text_arg(&args.body, "draft body")?,
+        &args.attach,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn projection_for_wire(views: &Views, wire_id: Id) -> Result<mail::ProjectionView> {
+    let ids: BTreeSet<Id> = find!(
+        projection_id: Id,
+        pattern!(&views.mail.facts, [
+            { _?source @ observation::wire: &wire_id },
+            { ?projection_id @ projection::source: _?source, projection::recipe: &mail_schema::RECIPE_RFC5322_V1 }
+        ])
+    )
+    .collect();
+    let candidates = ids
+        .into_iter()
+        .map(|id| mail::projection_view(&views.mail.reader, &views.mail.facts, id))
+        .collect::<Result<Vec<_>>>()?;
+    let Some(chosen) = candidates.first().cloned() else {
+        bail!("wire message {wire_id:x} has no parser projection");
+    };
+    // Re-observing byte-identical mail creates another source/projection pair
+    // but must not make the WireMessage unusable.  The source-local attachment
+    // occurrence ids legitimately differ, so reply arbitration compares the
+    // semantic fields a reply consumes and rejects only a real conflict.
+    let agrees = |other: &mail::ProjectionView| {
+        chosen.wire == other.wire
+            && chosen.message_id == other.message_id
+            && chosen.from == other.from
+            && chosen.to == other.to
+            && chosen.cc == other.cc
+            && chosen.bcc == other.bcc
+            && chosen.subject == other.subject
+            && chosen.body == other.body
+            && chosen.claimed_date == other.claimed_date
+            && chosen.in_reply_to == other.in_reply_to
+            && chosen.references == other.references
+            && chosen.spam == other.spam
+    };
+    if candidates.iter().skip(1).all(agrees) {
+        Ok(chosen)
+    } else {
+        bail!(
+            "wire message {wire_id:x} has conflicting parser projections; choose an exact source before replying"
+        )
+    }
+}
+
+fn cmd_reply(storage: &Storage<'_>, args: ReplyArgs) -> Result<()> {
+    let views = storage.views()?;
+    let wire_id = resolve_wire(&views.mail.facts, &args.message)?;
+    let parent = projection_for_wire(&views, wire_id)?;
+    let recipient = parent
+        .from
+        .ok_or_else(|| anyhow!("parent message has no From mailbox claim"))?;
+    let subject = if parent.subject.to_ascii_lowercase().starts_with("re:") {
+        parent.subject
+    } else {
+        format!("Re: {}", parent.subject)
+    };
+    let mut references = parent.references;
+    let in_reply_to = if parent.message_id.is_some() {
+        references.push(wire_id);
+        vec![wire_id]
+    } else {
+        // A digest-only parent did not claim an RFC Message-ID. It is a valid
+        // local WireMessage identity, but cannot honestly appear in a remote
+        // In-Reply-To or References header.
+        Vec::new()
+    };
+    create_draft(
+        storage,
+        &views,
+        &args.account,
+        vec![recipient],
+        Vec::new(),
+        Vec::new(),
+        subject,
+        faculties::text_arg(&args.body, "reply body")?,
+        &[],
+        in_reply_to,
+        references,
+    )
+}
+
+struct LettreSubmit {
+    transport: SmtpTransport,
+}
+
+impl mail::SmtpSubmit for LettreSubmit {
+    fn submit(&mut self, envelope: &mail::SmtpEnvelope, raw: &[u8]) -> Result<mail::AcceptedReply> {
+        let from: SmtpAddress = envelope.from.parse().context("parse SMTP reverse path")?;
+        let recipients = envelope
+            .recipients
+            .iter()
+            .map(|value| {
+                value
+                    .parse()
+                    .with_context(|| format!("parse SMTP recipient {value:?}"))
+            })
+            .collect::<Result<Vec<SmtpAddress>>>()?;
+        let envelope =
+            LettreEnvelope::new(Some(from), recipients).context("construct SMTP envelope")?;
+        let response = self
+            .transport
+            .send_raw(&envelope, raw)
+            .context("SMTP submission is uncertain; the durable SendAttempt must not be retried")?;
+        let code: u16 = response.code().into();
+        let message = response.message().collect::<Vec<_>>().join(" ");
+        Ok(mail::AcceptedReply {
+            code,
+            message: if message.is_empty() {
+                code.to_string()
+            } else {
+                message
+            },
+        })
+    }
+}
+
+fn endpoint<'a>(value: &'a str, label: &str) -> Result<(&'a str, u16)> {
+    let (host, port) = value
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("{label} endpoint must be host:port"))?;
+    if host.is_empty() {
+        bail!("{label} endpoint has an empty host");
+    }
+    Ok((
+        host,
+        port.parse()
+            .with_context(|| format!("parse {label} port"))?,
+    ))
+}
+
+fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
+    let views = storage.views()?;
+    let draft_id = resolve_draft(&views.mail.facts, selector)?;
+    let existing = mail::attempts_for_draft(&views.mail.facts, draft_id);
+    if let Some(&attempt) = existing.first() {
+        if mail::acceptances_for_attempt(&views.mail.facts, attempt).is_empty() {
+            bail!("draft {draft_id:x} already has uncertain attempt {attempt:x}; never retry automatically");
+        }
+        println!(
+            "Draft {} was already accepted (attempt {}).",
+            fmt_id(draft_id),
+            fmt_id(attempt)
+        );
+        return Ok(());
+    }
+    let record = mail::draft_value(&views.mail.facts, draft_id)?;
+    let current_config = match mail::account_head(&views.mail.facts, record.account)? {
+        Head::Unique(id) => mail::account_config(&views.mail.facts, id)?,
+        Head::Missing => bail!("draft account {:x} has no configuration", record.account),
+        Head::Forked(ids) => bail!(
+            "draft account {:x} has forked configuration heads: {ids:?}",
+            record.account
+        ),
+    };
+    if !current_config.enabled {
+        bail!("draft account {} is disabled", fmt_id(record.account));
+    }
+    let secret_identity = secrets_identity(&views, storage.secrets_identity)?;
+    let identity_password = identity_password()?;
+    let account = mail::open_account(
+        &views.mail.reader,
+        &views.mail.facts,
+        &views.secrets.reader,
+        &views.secrets_catalog,
+        record.account,
+        secret_identity,
+        &identity_password,
+    )?;
+    let draft = mail::materialize_draft(
+        &views.mail.reader,
+        &views.mail.facts,
+        &views.files.facts,
+        draft_id,
+    )?;
+    let rendered = mail::render_draft(&draft, &account)?;
+    let (decision, heads) =
+        mail::authorized_send(&views.decide.reader, &views.decide.facts, draft_id)?;
+    let prepared = mail::prepare_send(
+        &views.mail.reader,
+        &views.decide.reader,
+        &views.mail.facts,
+        &views.files.facts,
+        &views.decide.facts,
+        &views.relations.facts,
+        &views.secrets_catalog,
+        SendAttemptInput {
+            draft: draft_id,
+            config: account.config,
+            decision,
+            decision_heads: heads,
+            raw: rendered.raw.clone(),
+            envelope_from: draft.envelope_from.clone(),
+            to: draft.to.clone(),
+            cc: draft.cc.clone(),
+            bcc: draft.bcc.clone(),
+        },
+    )?;
+    let attempt_id = prepared.attempt_id();
+    let mut files_union = views.files.facts.clone();
+    files_union += prepared.outgoing_files().facts().clone();
+    // Any Files evidence needed by the post-effect outgoing projection is
+    // durable before SMTP. Most drafts reuse already-published file values.
+    if !prepared.outgoing_files().facts().is_empty() {
+        storage.publish(
+            storage.scopes.files,
+            prepared.outgoing_files().clone(),
+            "mail: outgoing attachment evidence",
+        )?;
+    }
+    let smtp_endpoint = account.smtp_endpoint.clone();
+    let (host, port) = endpoint(&smtp_endpoint, "SMTP")?;
+    let creds = Credentials::new(account.username.clone(), account.password.clone());
+    let transport = SmtpTransport::relay(host)
+        .with_context(|| format!("configure SMTP relay {host}"))?
+        .port(port)
+        .credentials(creds)
+        .build();
+    let mut submitter = LettreSubmit { transport };
+    let response = mail::submit_once(
+        &mut submitter,
+        &prepared,
+        |fragment| {
+            storage.publish(
+                storage.scopes.mail,
+                fragment.clone(),
+                "mail: send attempt before SMTP",
+            )
+        },
+        |fragment| {
+            let after_attempt = storage.views()?;
+            let mut blob_overlay = prepared.outgoing_files().clone();
+            blob_overlay += fragment.clone();
+            mail::validate_catalog_union_with_blobs(
+                &after_attempt.mail.reader,
+                &after_attempt.mail.facts,
+                fragment,
+                &blob_overlay,
+                &files_union,
+                &after_attempt.decide.facts,
+                &after_attempt.relations.facts,
+                &after_attempt.secrets_catalog,
+            )?;
+            storage.publish(
+                storage.scopes.mail,
+                fragment.clone(),
+                "mail: SMTP acceptance and outgoing evidence",
+            )
+        },
+    )?;
+    println!(
+        "Accepted draft {} as attempt {}: {} {}",
+        fmt_id(draft_id),
+        fmt_id(attempt_id),
+        response.code,
+        response.message
+    );
+    Ok(())
+}
+
+fn cmd_outbox(storage: &Storage<'_>) -> Result<()> {
+    let views = storage.views()?;
+    let drafts: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(&views.mail.facts, [{ ?id @ metadata::tag: &mail_schema::KIND_DRAFT_INTENT }])
+    )
+    .collect();
+    for id in drafts {
+        let draft = mail::materialize_draft(
+            &views.mail.reader,
+            &views.mail.facts,
+            &views.files.facts,
+            id,
+        )?;
+        let attempts = mail::attempts_for_draft(&views.mail.facts, id);
+        let state = match attempts.as_slice() {
+            [] => "pending".to_owned(),
+            [attempt] if mail::acceptances_for_attempt(&views.mail.facts, *attempt).is_empty() => {
+                format!("UNCERTAIN attempt={}", fmt_id(*attempt))
             }
-            return;
-        }
+            [attempt] => format!("accepted attempt={}", fmt_id(*attempt)),
+            _ => "INVALID multiple attempts".to_owned(),
+        };
+        println!("{}  {}  {}", fmt_id(id), state, draft.subject);
     }
-
-    // Plain text part — prefer text/plain over text/html for body.
-    if ctype == "text/plain" {
-        if let Ok(text) = part.get_body() {
-            if body.is_empty() {
-                *body = text;
-            }
-        }
-    } else if ctype == "text/html" && body.is_empty() {
-        if let Ok(text) = part.get_body() {
-            *body = text;
-        }
-    }
+    Ok(())
 }
 
-// ── fetch (POP3) ──────────────────────────────────────────────────────────
+fn cmd_list(storage: &Storage<'_>, unread_only: bool, spam_only: bool) -> Result<()> {
+    let views = storage.views()?;
+    let persona = relation_persona(&views)?;
+    for row in mail::inbox_projection(&views.mail.facts, &views.relations.facts, persona)? {
+        if unread_only && !row.unread {
+            continue;
+        }
+        let view = mail::projection_view(&views.mail.reader, &views.mail.facts, row.projection)?;
+        if spam_only && !view.spam {
+            continue;
+        }
+        println!(
+            "{}  {}{}  {}  {}",
+            fmt_id(view.wire),
+            if row.unread { "UNREAD" } else { "read" },
+            if view.spam { "/spam" } else { "" },
+            view.from.unwrap_or_else(|| "(no From)".into()),
+            view.subject,
+        );
+    }
+    Ok(())
+}
 
-fn cmd_fetch(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result<()> {
-    let config = load_config()?;
-    eprintln!(
-        "Connecting to {}:{} as {}...",
-        config.pop3_host, config.pop3_port, config.user
-    );
-    let mut connection: Box<dyn Pop3Connection> = Box::new(
-        Pop3ConnectionFactory::new(&config.pop3_host, config.pop3_port)
-            .map_err(|e| anyhow::anyhow!("connect pop3: {e}"))?,
-    );
-    connection
-        .login(&config.user, &config.pass)
-        .map_err(|e| anyhow::anyhow!("pop3 login: {e}"))?;
-    let stat = connection
-        .stat()
-        .map_err(|e| anyhow::anyhow!("pop3 stat: {e}"))?;
-    eprintln!(
-        "{} messages on server ({} bytes total)",
-        stat.message_count, stat.maildrop_size
-    );
-    if stat.message_count == 0 {
+fn cmd_read(storage: &Storage<'_>, selector: &str) -> Result<()> {
+    let views = storage.views()?;
+    let wire = resolve_wire(&views.mail.facts, selector)?;
+    let reader = relation_persona(&views)?;
+    let (fragment, id) = mail::read_observation_fragment(wire, reader);
+    mail::validate_catalog_union(
+        &views.mail.reader,
+        &views.mail.facts,
+        &fragment,
+        &views.files.facts,
+        &views.decide.facts,
+        &views.relations.facts,
+        &views.secrets_catalog,
+    )?;
+    storage.publish(storage.scopes.mail, fragment, "mail: read observation")?;
+    println!("Read {} ({})", fmt_id(wire), fmt_id(id));
+    Ok(())
+}
+
+fn cmd_show(storage: &Storage<'_>, selector: &str) -> Result<()> {
+    let views = storage.views()?;
+    let wire = resolve_wire(&views.mail.facts, selector)?;
+    let projections: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(&views.mail.facts, [
+            { _?source @ observation::wire: &wire },
+            { ?id @ projection::source: _?source, projection::recipe: &mail_schema::RECIPE_RFC5322_V1 }
+        ])
+    )
+    .collect();
+    if projections.is_empty() {
+        bail!("wire message {wire:x} has no parser projection");
+    }
+    for id in projections {
+        let view = mail::projection_view(&views.mail.reader, &views.mail.facts, id)?;
+        println!("Wire: {}", fmt_id(view.wire));
+        println!(
+            "Message-ID: {}",
+            view.message_id.as_deref().unwrap_or("(not claimed)")
+        );
+        println!("Source: {}", fmt_id(view.source));
+        println!("From: {}", view.from.unwrap_or_default());
+        println!("To: {}", view.to.join(", "));
+        if !view.cc.is_empty() {
+            println!("Cc: {}", view.cc.join(", "));
+        }
+        println!("Subject: {}", view.subject);
+        println!();
+        println!("{}", view.body);
+        if !view.attachments.is_empty() {
+            println!(
+                "\nAttachment occurrences: {}",
+                view.attachments
+                    .iter()
+                    .map(|id| fmt_id(*id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_search(storage: &Storage<'_>, query: &str) -> Result<()> {
+    let views = storage.views()?;
+    let needle = query.to_lowercase();
+    let projections: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(&views.mail.facts, [{ ?id @ metadata::tag: &mail_schema::KIND_PARSED_PROJECTION }])
+    )
+    .collect();
+    for id in projections {
+        let view = mail::projection_view(&views.mail.reader, &views.mail.facts, id)?;
+        if view.subject.to_lowercase().contains(&needle)
+            || view.body.to_lowercase().contains(&needle)
+        {
+            println!(
+                "{}  {}  {}",
+                fmt_id(view.wire),
+                view.from.unwrap_or_default(),
+                view.subject
+            );
+        }
+    }
+    Ok(())
+}
+
+fn fragment_is_materialized(facts: &TribleSet, fragment: &Fragment) -> bool {
+    fragment.facts().iter().all(|fact| facts.contains(fact))
+}
+
+fn publish_pop_publication_with<V, P>(
+    publication: &mail::SourcePublication,
+    scopes: Scopes,
+    mut materialize: V,
+    mut publish: P,
+) -> Result<()>
+where
+    V: FnMut() -> Result<Views>,
+    P: FnMut(Id, Fragment, &str) -> Result<()>,
+{
+    // First prove the prospective cross-scope state while both fragments and
+    // all of their attachment blobs are still available in memory.
+    let before = materialize()?;
+    let mut prospective_files = before.files.facts.clone();
+    prospective_files += publication.files.facts().clone();
+    let mut blob_overlay = publication.files.clone();
+    blob_overlay += publication.mail.clone();
+    mail::validate_catalog_union_with_blobs(
+        &before.mail.reader,
+        &before.mail.facts,
+        &publication.mail,
+        &blob_overlay,
+        &prospective_files,
+        &before.decide.facts,
+        &before.relations.facts,
+        &before.secrets_catalog,
+    )?;
+
+    if !publication.files.facts().is_empty()
+        && !fragment_is_materialized(&before.files.facts, &publication.files)
+    {
+        publish(
+            scopes.files,
+            publication.files.clone(),
+            "mail: POP attachment evidence",
+        )?;
+    }
+
+    // A PileReader is an immutable snapshot. Take another reader from the
+    // same open Pile after Files so exact validation sees both its facts and
+    // newly appended attachment blobs.
+    let after_files = materialize()?;
+    if !fragment_is_materialized(&after_files.files.facts, &publication.files) {
+        bail!("published POP attachment evidence did not materialize");
+    }
+    mail::validate_catalog_union(
+        &after_files.mail.reader,
+        &after_files.mail.facts,
+        &publication.mail,
+        &after_files.files.facts,
+        &after_files.decide.facts,
+        &after_files.relations.facts,
+        &after_files.secrets_catalog,
+    )?;
+    if fragment_is_materialized(&after_files.mail.facts, &publication.mail) {
+        return Ok(());
+    }
+    publish(
+        scopes.mail,
+        publication.mail.clone(),
+        "mail: POP source evidence and parser projection",
+    )?;
+
+    // Only a fully rematerialized, exactly validated Mail observation lets
+    // drain_pop proceed to DELE.
+    let after_mail = materialize()?;
+    if !fragment_is_materialized(&after_mail.mail.facts, &publication.mail) {
+        bail!("published POP mail evidence did not materialize");
+    }
+    Ok(())
+}
+
+fn cmd_fetch(storage: &Storage<'_>) -> Result<()> {
+    let views = storage.views()?;
+    let mut enabled_anchors = Vec::new();
+    for anchor in mail::account_anchors(&views.mail.facts) {
+        let config_id = match mail::account_head(&views.mail.facts, anchor)? {
+            Head::Unique(id) => id,
+            Head::Missing => bail!("mail account {anchor:x} has no configuration"),
+            Head::Forked(ids) => {
+                bail!("mail account {anchor:x} has forked configuration heads: {ids:?}")
+            }
+        };
+        if mail::account_config(&views.mail.facts, config_id)?.enabled {
+            enabled_anchors.push(anchor);
+        }
+    }
+    if enabled_anchors.is_empty() {
         return Ok(());
     }
 
-    let infos = connection
-        .list()
-        .map_err(|e| anyhow::anyhow!("pop3 list: {e}"))?;
-
-    // Two-phase: retrieve all messages, commit + push everything to
-    // the pile, then issue DELE for each retrieved one, then QUIT.
-    // QUIT is what atomically commits the deletions server-side; if
-    // anything blows up before then, nothing is deleted and we re-
-    // fetch next session (idempotent via entity-id-from-Message-Id).
-    let mut retrieved: Vec<(u32, Vec<u8>)> = Vec::new();
-    for info in &infos {
-        let mut buf = Vec::new();
-        connection
-            .retrieve(info.message_id, &mut buf)
-            .map_err(|e| anyhow::anyhow!("pop3 retrieve {}: {e}", info.message_id))?;
-        retrieved.push((info.message_id, buf));
+    let secret_identity = secrets_identity(&views, storage.secrets_identity)?;
+    let identity_password = identity_password()?;
+    let mut accounts = Vec::new();
+    for anchor in enabled_anchors {
+        let account = mail::open_account(
+            &views.mail.reader,
+            &views.mail.facts,
+            &views.secrets.reader,
+            &views.secrets_catalog,
+            anchor,
+            secret_identity,
+            &identity_password,
+        )
+        .with_context(|| format!("open POP account {anchor:x}"))?;
+        accounts.push(account);
     }
+    drop(views);
 
-    let mut ingested = 0usize;
-    let mut files_signer = None;
-    with_repo(pile, |repo| {
-        for (_, bytes) in &retrieved {
-            let parsed = match parse_rfc5322(bytes) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("[mail] skipping unparseable message: {e:#}");
-                    continue;
-                }
-            };
-            if !parsed.attachments.is_empty() && files_signer.is_none() {
-                files_signer = Some(load_signer(pile, None)?);
-            }
-            ingest_message(
-                repo,
-                mail_branch_id,
-                relations_branch_id,
-                files_signer.as_ref(),
-                parsed,
+    for account in accounts {
+        let (host, port) = endpoint(&account.pop_endpoint, "POP")?;
+        let session =
+            mail_pop::connect_implicit_tls(host, port, &account.username, &account.password)
+                .with_context(|| format!("connect POP account {}", account.address))?;
+        let mut fetched = 0usize;
+        mail::drain_pop(session, account.anchor, account.config, |publication| {
+            publish_pop_publication_with(
+                publication,
+                storage.scopes,
+                || storage.views(),
+                |scope, fragment, description| storage.publish(scope, fragment, description),
             )?;
-            ingested += 1;
-        }
-        Ok(())
-    })?;
-
-    eprintln!("Ingested {ingested} messages into the pile.");
-
-    // Pile is durable; issue deletes.
-    for (sid, _) in &retrieved {
-        if let Err(e) = connection.delete(*sid) {
-            eprintln!("[mail] delete server msg {sid}: {e}");
-        }
-    }
-    // QUIT commits the deletions. The `Pop3Connection` doesn't expose
-    // a QUIT method explicitly; dropping the connection sends QUIT in
-    // this crate's implementation.
-    drop(connection);
-    eprintln!("Server deletes committed.");
-    Ok(())
-}
-
-/// Decompose one parsed message + its attachments into tribles and
-/// commit them across the three branches (relations, files, mail).
-/// Persist a parsed message into the pile. With `as_draft = false`,
-/// the entity is tagged `KIND_MESSAGE` (used by `mail fetch` for
-/// inbound, and by `mark_sent` after SMTP for outbound). With
-/// `as_draft = true`, it's tagged `KIND_DRAFT` only — the
-/// `mail::raw` / `mail::sent_at` attrs are skipped (those become
-/// known at send time).
-fn ingest_message(
-    repo: &mut Repository<Pile>,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    files_signer: Option<&SigningKey>,
-    parsed: ParsedMail,
-) -> Result<()> {
-    persist_message(
-        repo,
-        mail_branch_id,
-        relations_branch_id,
-        files_signer,
-        parsed,
-        false,
-    )
-    .map(|_| ())
-}
-
-fn persist_message(
-    repo: &mut Repository<Pile>,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    files_signer: Option<&SigningKey>,
-    parsed: ParsedMail,
-    as_draft: bool,
-) -> Result<Id> {
-    // 1. relations branch: auto-register any new addresses.
-    let mut from_id: Option<Id> = None;
-    let mut to_ids: Vec<Id> = Vec::new();
-    let mut cc_ids: Vec<Id> = Vec::new();
-    let mut bcc_ids: Vec<Id> = Vec::new();
-    {
-        let mut ws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
-
-        let mut change = TribleSet::new();
-        if let Some(addr) = &parsed.from {
-            from_id = resolve_or_register(&mut ws, &space, addr, &mut change);
-        }
-        for addr in &parsed.to {
-            if let Some(id) = resolve_or_register(&mut ws, &space, addr, &mut change) {
-                to_ids.push(id);
-            }
-        }
-        for addr in &parsed.cc {
-            if let Some(id) = resolve_or_register(&mut ws, &space, addr, &mut change) {
-                cc_ids.push(id);
-            }
-        }
-        for addr in &parsed.bcc {
-            if let Some(id) = resolve_or_register(&mut ws, &space, addr, &mut change) {
-                bcc_ids.push(id);
-            }
-        }
-        if !change.is_empty() {
-            ws.commit(change, "mail: register senders/recipients");
-            repo.push(&mut ws)
-                .map_err(|e| anyhow::anyhow!("push relations: {e:?}"))?;
-        }
-    }
-
-    // 2. Files collection: publish attachment closure before the source
-    // message can become visible. Each file is its own canonical fragment;
-    // replay derives the same signed commit id and is an append-free no-op.
-    let mut attachment_ids: Vec<Id> = Vec::new();
-    if !parsed.attachments.is_empty() {
-        let files_signer = files_signer.ok_or_else(|| {
-            anyhow::anyhow!("Files signing authority is required for mail attachments")
-        })?;
-        let mut staged = std::collections::HashSet::new();
-        for att in &parsed.attachments {
-            let media_type = file_capability::normalize_media_type_or_default(&att.mime);
-            let file_fragment =
-                file_capability::stage(att.bytes.clone(), att.filename.clone(), &media_type)?;
-            let file_ref = file_fragment
-                .root()
-                .expect("canonical file fragment has one root");
-            if staged.insert(file_ref) {
-                file_capability::commit_collection(
-                    repo.storage_mut(),
-                    files_signer,
-                    file_fragment,
-                )?;
-            }
-            attachment_ids.push(file_ref);
-        }
-    }
-
-    // 3. mail branch: the message entity.
-    {
-        let mut ws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-
-        let entity_id = entity_id_for_message(&parsed.message_id);
-        let now = instant_interval(now_epoch());
-        let subject_handle: TextHandle = ws.put(parsed.subject.clone());
-        let body_handle: TextHandle = ws.put(parsed.body.clone());
-        let message_id_handle: TextHandle = ws.put(parsed.message_id.clone());
-
-        let in_reply_ids: Vec<Id> = parsed
-            .in_reply_to
-            .iter()
-            .map(|m| entity_id_for_message(m))
-            .collect();
-        let reference_ids: Vec<Id> = parsed
-            .references
-            .iter()
-            .map(|m| entity_id_for_message(m))
-            .collect();
-
-        let kind = if as_draft { KIND_DRAFT } else { KIND_MESSAGE };
-        change += entity! { ExclusiveId::force_ref(&entity_id) @
-            metadata::tag: &kind,
-            metadata::created_at: now,
-            mail::subject: subject_handle,
-            mail::body: body_handle,
-            mail::message_id: message_id_handle,
-            mail::from?: from_id.as_ref(),
-            mail::to*: to_ids.iter(),
-            mail::cc*: cc_ids.iter(),
-            mail::bcc*: bcc_ids.iter(),
-            mail::in_reply_to*: in_reply_ids.iter(),
-            mail::references*: reference_ids.iter(),
-            mail::attachment*: attachment_ids.iter(),
-        };
-        // sent_at + raw only apply once the message is actually
-        // transmitted (or received from elsewhere). Drafts skip
-        // both — they get added by `mark_sent` after SMTP.
-        if !as_draft {
-            let sent_at_iv = instant_interval(parsed.sent_at);
-            let raw_blob: Blob<blobencodings::RawBytes> = parsed.raw.clone().to_blob();
-            let raw_handle: FileHandle = ws.put(raw_blob);
-            change += entity! { ExclusiveId::force_ref(&entity_id) @
-                mail::sent_at: sent_at_iv,
-                mail::raw: raw_handle,
-            };
-        }
-        if parsed.is_spam {
-            change += entity! { ExclusiveId::force_ref(&entity_id) @
-                metadata::tag: &KIND_SPAM,
-            };
-        }
-
-        ws.commit(
-            change,
-            if as_draft {
-                "mail: draft"
-            } else {
-                "mail: ingest message"
-            },
-        );
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push mail: {e:?}"))?;
-
-        return Ok(entity_id);
-    }
-}
-
-/// Append the send-time facts (KIND_MESSAGE tag + sent_at + raw)
-/// to an existing draft entity. The draft entity id stays the
-/// same; this is just additional facts about it.
-fn mark_sent(
-    repo: &mut Repository<Pile>,
-    mail_branch_id: Id,
-    draft_id: Id,
-    raw_bytes: Vec<u8>,
-    sent_at: Epoch,
-) -> Result<()> {
-    let mut ws = repo
-        .pull(mail_branch_id)
-        .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-    let raw_blob: Blob<blobencodings::RawBytes> = raw_bytes.to_blob();
-    let raw_handle: FileHandle = ws.put(raw_blob);
-    let sent_iv = instant_interval(sent_at);
-    let change = entity! { ExclusiveId::force_ref(&draft_id) @
-        metadata::tag: &KIND_MESSAGE,
-        mail::sent_at: sent_iv,
-        mail::raw: raw_handle,
-    };
-    ws.commit(change, "mail: mark sent");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push mark-sent: {e:?}"))?;
-    Ok(())
-}
-
-/// Mint a decision in the decide branch linked to the given draft
-/// via `decide::about`. Returns the decision's entity id.
-fn mint_linked_decision(
-    repo: &mut Repository<Pile>,
-    decide_branch_id: Id,
-    draft_id: Id,
-    title: String,
-) -> Result<Id> {
-    let mut ws = repo
-        .pull(decide_branch_id)
-        .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
-    let decision_id = ufoid();
-    let decision_ref = decision_id.id;
-    let now = instant_interval(now_epoch());
-    let title_handle: TextHandle = ws.put(title);
-    let change = entity! { &decision_id @
-        metadata::tag: &KIND_DECISION,
-        metadata::created_at: now,
-        metadata::name: title_handle,
-        decide_attrs::about: &draft_id,
-    };
-    ws.commit(change, "mail: mint linked decision");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push decide: {e:?}"))?;
-    Ok(decision_ref)
-}
-
-// ── send / reply ──────────────────────────────────────────────────────────
-
-fn synthesize_message_id(local_part_seed: &str) -> String {
-    let hash = blake3::hash(local_part_seed.as_bytes());
-    format!(
-        "<{}-toby@trible.space>",
-        hex::encode(&hash.as_bytes()[..12])
-    )
-}
-
-/// Compose a draft: persists the draft entity in the pile (no
-/// SMTP), mints a linked decision in the decide branch, prints
-/// both ids. Sending requires resolving the decision first.
-fn cmd_draft(
-    pile: &Path,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    decide_branch_id: Id,
-    to: String,
-    subject: String,
-    body: String,
-    cc: Vec<String>,
-    bcc: Vec<String>,
-    attach: Vec<PathBuf>,
-) -> Result<()> {
-    let body_text = faculties::text_arg(&body, "body")?;
-    let config = load_config()?;
-
-    // Read each attachment off disk and store it in the Files collection
-    // (via persist_message below); the draft references them so that
-    // `mail send` re-reads and attaches them automatically.
-    let mut attachments: Vec<Attachment> = Vec::new();
-    for path in &attach {
-        let bytes =
-            fs::read(path).with_context(|| format!("read attachment {}", path.display()))?;
-        let filename = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("attachment.bin")
-            .to_string();
-        let mime = file_capability::infer_media_type(path).to_string();
-        attachments.push(Attachment {
-            filename,
-            mime,
-            bytes,
-        });
-    }
-    let files_signer = (!attachments.is_empty())
-        .then(|| load_signer(pile, None))
-        .transpose()?;
-
-    let to_raw: Vec<String> = to
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if to_raw.is_empty() {
-        bail!("no TO recipients");
-    }
-
-    let now = now_epoch();
-    let seed = format!("{}:{}:{}", config.user, subject, now.to_tai_seconds());
-    let message_id = synthesize_message_id(&seed);
-    let bare_id = message_id
-        .trim_matches(|c| c == '<' || c == '>')
-        .to_string();
-
-    let (draft_id, decision_id) = with_repo(pile, |repo| {
-        // Resolve TO/CC/BCC from relation prefixes against the relations
-        // branch. `mail draft` no longer accepts raw email strings —
-        // every recipient must be a first-class relation entity. The
-        // Address structs we synthesize below carry the relation's
-        // canonical email + label, which `resolve_or_register` (called
-        // from persist_message) then short-circuits on for the email
-        // match, so no new relation entities get minted.
-        let (to_addrs, cc_addrs, bcc_addrs) = {
-            let mut ws = repo
-                .pull(relations_branch_id)
-                .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
-            let mut resolve = |raw: &str| -> Result<Address> {
-                let id = resolve_relation_prefix(&space, raw)?;
-                let email = relation_email_required(&space, id)?;
-                let name = relation_label(&mut ws, &space, id);
-                Ok(Address { name, email })
-            };
-            let to_addrs: Vec<Address> =
-                to_raw.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
-            let cc_addrs: Vec<Address> = cc.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
-            let bcc_addrs: Vec<Address> = bcc.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
-            (to_addrs, cc_addrs, bcc_addrs)
-        };
-
-        let parsed = ParsedMail {
-            message_id: bare_id.clone(),
-            from: Some(Address {
-                name: Some(config.from_name.clone()),
-                email: config.user.clone(),
-            }),
-            to: to_addrs,
-            cc: cc_addrs,
-            bcc: bcc_addrs,
-            subject: subject.clone(),
-            body: body_text,
-            sent_at: now, // ignored by persist_message when as_draft=true
-            in_reply_to: Vec::new(),
-            references: Vec::new(),
-            is_spam: false,
-            raw: Vec::new(), // ignored by persist_message when as_draft=true
-            attachments: std::mem::take(&mut attachments),
-        };
-
-        let draft_id = persist_message(
-            repo,
-            mail_branch_id,
-            relations_branch_id,
-            files_signer.as_ref(),
-            parsed,
-            true,
-        )?;
-        let decision_id = mint_linked_decision(
-            repo,
-            decide_branch_id,
-            draft_id,
-            format!("Send: {}", subject),
-        )?;
-        Ok((draft_id, decision_id))
-    })?;
-    println!("Drafted {}", fmt_id(draft_id));
-    println!(
-        "Decision {} (deliberate with `decide pro/con/resolve`)",
-        fmt_id(decision_id)
-    );
-    Ok(())
-}
-
-fn send_via_smtp(config: &MailConfig, message: &Message) -> Result<()> {
-    let creds = Credentials::new(config.user.clone(), config.pass.clone());
-    let mailer = SmtpTransport::relay(&config.smtp_host)
-        .map_err(|e| anyhow::anyhow!("smtp relay {}: {e}", config.smtp_host))?
-        .port(config.smtp_port)
-        .credentials(creds)
-        .build();
-    mailer
-        .send(message)
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("smtp send: {e}"))
-}
-
-fn cmd_reply(
-    pile: &Path,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    decide_branch_id: Id,
-    parent_hex: String,
-    body: String,
-) -> Result<()> {
-    let body_text = faculties::text_arg(&body, "reply body")?;
-
-    // Pull parent's properties for thread headers.
-    let (_parent_id, parent_msg_id, parent_subject, parent_from, parent_references) =
-        with_repo(pile, |repo| {
-            let mut ws = repo
-                .pull(mail_branch_id)
-                .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            let parent_id = resolve_message_id(&space, &parent_hex)?;
-            let msg_id_h: Option<TextHandle> = find!(
-                h: TextHandle,
-                pattern!(&space, [{ parent_id @ mail::message_id: ?h }])
-            )
-            .next();
-            let msg_id = msg_id_h
-                .and_then(|h| read_text(&mut ws, h))
-                .ok_or_else(|| anyhow::anyhow!("parent has no message_id"))?;
-            let subject_h: Option<TextHandle> = find!(
-                h: TextHandle,
-                pattern!(&space, [{ parent_id @ mail::subject: ?h }])
-            )
-            .next();
-            let subject = subject_h
-                .and_then(|h| read_text(&mut ws, h))
-                .unwrap_or_default();
-            let from_relation: Option<Id> = find!(
-                r: Id,
-                pattern!(&space, [{ parent_id @ mail::from: ?r }])
-            )
-            .next();
-            // Relations entries live on the relations branch — pull
-            // that workspace separately rather than re-checking out
-            // the mail branch (where the entry doesn't exist).
-            let from_email: Option<String> = match from_relation {
-                Some(rid) => {
-                    let mut rws = repo
-                        .pull(relations_branch_id)
-                        .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-                    let rel_space = rws
-                        .checkout(..)
-                        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
-                    find!(
-                        e: String,
-                        pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])
-                    )
-                    .next()
-                }
-                None => None,
-            };
-            let mut refs: Vec<Id> = find!(
-                r: Id,
-                pattern!(&space, [{ parent_id @ mail::references: ?r }])
-            )
-            .collect();
-            let mut all_refs_ids: Vec<Id> = find!(
-                r: Id,
-                pattern!(&space, [{ parent_id @ mail::in_reply_to: ?r }])
-            )
-            .collect();
-            refs.append(&mut all_refs_ids);
-            // Look up the message_id strings for each referenced id so we
-            // can emit them in the References header.
-            let mut ref_strings: Vec<String> = Vec::new();
-            for r in &refs {
-                let h: Option<TextHandle> = find!(
-                    h: TextHandle,
-                    pattern!(&space, [{ r @ mail::message_id: ?h }])
-                )
-                .next();
-                if let Some(handle) = h {
-                    if let Some(s) = read_text(&mut ws, handle) {
-                        ref_strings.push(s);
-                    }
-                }
-            }
-            Ok((parent_id, msg_id, subject, from_email, ref_strings))
-        })?;
-
-    let reply_to = parent_from.ok_or_else(|| {
-        anyhow::anyhow!("parent has no resolvable From address — can't determine reply target")
-    })?;
-    let reply_subject = if parent_subject.to_lowercase().starts_with("re:") {
-        parent_subject
-    } else {
-        format!("Re: {}", parent_subject)
-    };
-
-    let config = load_config()?;
-    let seed = format!(
-        "{}:{}:{}",
-        config.user,
-        parent_msg_id,
-        now_epoch().to_tai_seconds()
-    );
-    let new_message_id = synthesize_message_id(&seed);
-    let bare_new_id = new_message_id
-        .trim_matches(|c| c == '<' || c == '>')
-        .to_string();
-
-    let now = now_epoch();
-    let parsed = ParsedMail {
-        message_id: bare_new_id.clone(),
-        from: Some(Address {
-            name: Some(config.from_name.clone()),
-            email: config.user.clone(),
-        }),
-        to: vec![Address {
-            name: None,
-            email: reply_to.clone(),
-        }],
-        cc: Vec::new(),
-        bcc: Vec::new(),
-        subject: reply_subject.clone(),
-        body: body_text,
-        sent_at: now, // ignored when as_draft=true
-        in_reply_to: vec![parent_msg_id.clone()],
-        references: parent_references,
-        is_spam: false,
-        raw: Vec::new(),
-        attachments: Vec::new(),
-    };
-    let (draft_id, decision_id) = with_repo(pile, |repo| {
-        let draft_id = persist_message(
-            repo,
-            mail_branch_id,
-            relations_branch_id,
-            None,
-            parsed,
-            true,
-        )?;
-        let decision_id = mint_linked_decision(
-            repo,
-            decide_branch_id,
-            draft_id,
-            format!("Reply: {}", reply_subject),
-        )?;
-        Ok((draft_id, decision_id))
-    })?;
-    println!(
-        "Drafted reply {} (parent {})",
-        fmt_id(draft_id),
-        parent_msg_id
-    );
-    println!(
-        "Decision {} (deliberate with `decide pro/con/resolve`)",
-        fmt_id(decision_id)
-    );
-    Ok(())
-}
-
-// ── send draft / discard / outbox ─────────────────────────────────────────
-
-/// Look up the decide-branch decision linked to a given draft via
-/// `decide::about: <draft-id>`.
-fn find_linked_decision(decide_space: &TribleSet, draft_id: Id) -> Option<Id> {
-    find!(
-        d: Id,
-        pattern!(decide_space, [{
-            ?d @
-                metadata::tag: KIND_DECISION,
-                decide_attrs::about: draft_id,
-        }])
-    )
-    .next()
-}
-
-/// True iff the decision has both finished_at AND a non-empty outcome.
-fn decision_is_resolved(ws: &mut Workspace<Pile>, space: &TribleSet, decision_id: Id) -> bool {
-    let has_finished_at = find!(
-        f: IntervalValue,
-        pattern!(space, [{ decision_id @ metadata::finished_at: ?f }])
-    )
-    .next()
-    .is_some();
-    let has_outcome = find!(
-        o: TextHandle,
-        pattern!(space, [{ decision_id @ decide_attrs::outcome: ?o }])
-    )
-    .next()
-    .and_then(|h| read_text(ws, h))
-    .map(|s| !s.trim().is_empty())
-    .unwrap_or(false);
-    has_finished_at && has_outcome
-}
-
-fn load_draft_attachments(
-    pile: &Path,
-    attachment_ids: &[Id],
-) -> Result<Vec<(String, String, Vec<u8>)>> {
-    if attachment_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let files_signer = load_signer(pile, None)?;
-    with_repo(pile, |repo| {
-        let (space, reader) =
-            file_capability::materialize_collection(repo.storage_mut(), &files_signer)?;
-        let mut out = Vec::new();
-        for &fid in attachment_ids {
-            let content_h: FileHandle =
-                find!(h: FileHandle, pattern!(&space, [{ fid @ file::content: ?h }]))
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "attachment file {fid:x} has no canonical content; rebuild the Files collection"
-                        )
-                    })?;
-            let name_h: TextHandle =
-                find!(h: TextHandle, pattern!(&space, [{ fid @ file::name: ?h }]))
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "attachment file {fid:x} has no canonical name; rebuild the Files collection"
-                        )
-                    })?;
-            let bytes: anybytes::Bytes = reader
-                .get::<anybytes::Bytes, _>(content_h)
-                .map_err(|e| anyhow::anyhow!("read attachment blob {fid:x}: {e:?}"))?;
-            let name = read_files_text(&reader, name_h)
-                .ok_or_else(|| anyhow::anyhow!("read name for attachment file {fid:x}"))?;
-            let media_type_handle =
-                file_capability::media_type_name_handle(&space, fid).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "attachment file {fid:x} has no canonical media-type entity; rebuild the Files collection"
-                    )
-                })?;
-            let media_type = read_files_text(&reader, media_type_handle)
-                .ok_or_else(|| anyhow::anyhow!("read media type for attachment file {fid:x}"))?;
-            out.push((name, media_type, bytes.as_ref().to_vec()));
-        }
-        Ok(out)
-    })
-}
-
-fn cmd_send(
-    pile: &Path,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    decide_branch_id: Id,
-    draft_hex: String,
-) -> Result<()> {
-    // Resolve the prefix once against the mail space; the rest of the
-    // function uses the full Id internally.
-    let draft_id = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        resolve_message_id(&space, &draft_hex)
-    })?;
-    let config = load_config()?;
-
-    // 1. Resolve the linked decision and check it's resolved.
-    let decision_outcome = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(decide_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
-        let decision_id = find_linked_decision(&space, draft_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no decision linked to draft {} — has it already been sent, or was \
-                 the decide branch tampered with?",
-                fmt_id(draft_id)
-            )
-        })?;
-        if !decision_is_resolved(&mut ws, &space, decision_id) {
-            bail!(
-                "draft {}'s linked decision {} is not resolved yet. \
-                 Add pros and cons via `decide pro/con {}` and then \
-                 `decide resolve {} <outcome>` before sending.",
-                fmt_id(draft_id),
-                fmt_id(decision_id),
-                fmt_id(decision_id),
-                fmt_id(decision_id),
-            );
-        }
-        let outcome_h: Option<TextHandle> = find!(
-            o: TextHandle,
-            pattern!(&space, [{ decision_id @ decide_attrs::outcome: ?o }])
-        )
-        .next();
-        let outcome = outcome_h
-            .and_then(|h| read_text(&mut ws, h))
-            .unwrap_or_default();
-        Ok(outcome)
-    })?;
-
-    // 2. Pull draft attrs from the mail branch.
-    struct DraftAttrs {
-        message_id: String,
-        subject: String,
-        body: String,
-        to_emails: Vec<String>,
-        cc_emails: Vec<String>,
-        bcc_emails: Vec<String>,
-        in_reply_to_strings: Vec<String>,
-        references_strings: Vec<String>,
-        attachment_ids: Vec<Id>,
-    }
-
-    let attrs: DraftAttrs = with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout mail: {e:?}"))?;
-        let mut rws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
-
-        let already_sent = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
-            .any(|t| t == KIND_MESSAGE);
-        if already_sent {
-            bail!("draft {} has already been sent", fmt_id(draft_id));
-        }
-
-        let is_draft = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
-            .any(|t| t == KIND_DRAFT);
-        if !is_draft {
-            bail!("no draft entity with id {}", fmt_id(draft_id));
-        }
-
-        let message_id =
-            find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::message_id: ?h }]))
-                .next()
-                .and_then(|h| read_text(&mut mws, h))
-                .ok_or_else(|| anyhow::anyhow!("draft missing message_id"))?;
-        let subject =
-            find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::subject: ?h }]))
-                .next()
-                .and_then(|h| read_text(&mut mws, h))
-                .unwrap_or_default();
-        let body = find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::body: ?h }]))
-            .next()
-            .and_then(|h| read_text(&mut mws, h))
-            .unwrap_or_default();
-
-        let resolve_emails = |ids: Vec<Id>| -> Vec<String> {
-            ids.into_iter()
-                .filter_map(|rid| {
-                    find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
-                })
-                .collect()
-        };
-        let to_ids: Vec<Id> =
-            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::to: ?r }])).collect();
-        let cc_ids: Vec<Id> =
-            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::cc: ?r }])).collect();
-        let bcc_ids: Vec<Id> =
-            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::bcc: ?r }])).collect();
-
-        let to_emails = resolve_emails(to_ids);
-        let cc_emails = resolve_emails(cc_ids);
-        let bcc_emails = resolve_emails(bcc_ids);
-        if to_emails.is_empty() {
-            bail!("draft has no resolvable TO recipients");
-        }
-
-        // Look up message_id strings for in_reply_to / references entities.
-        let irt_ids: Vec<Id> =
-            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::in_reply_to: ?r }])).collect();
-        let ref_ids: Vec<Id> =
-            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::references: ?r }])).collect();
-        let mut resolve_msg_ids = |ids: Vec<Id>| -> Vec<String> {
-            ids.into_iter()
-                .filter_map(|mid| {
-                    find!(h: TextHandle, pattern!(&mail_space, [{ mid @ mail::message_id: ?h }]))
-                        .next()
-                        .and_then(|h| read_text(&mut mws, h))
-                })
-                .collect()
-        };
-        let in_reply_to_strings = resolve_msg_ids(irt_ids);
-        let references_strings = resolve_msg_ids(ref_ids);
-
-        let attachment_ids: Vec<Id> =
-            find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::attachment: ?r }])).collect();
-
-        Ok(DraftAttrs {
-            message_id,
-            subject,
-            body,
-            to_emails,
-            cc_emails,
-            bcc_emails,
-            in_reply_to_strings,
-            references_strings,
-            attachment_ids,
-        })
-    })?;
-
-    // Only drafts carrying attachment ids need Files authority or a catalog.
-    let attachments = load_draft_attachments(pile, &attrs.attachment_ids)?;
-
-    // 3. Build RFC 5322 message and transmit.
-    let from_mb: Mailbox = format!("{} <{}>", config.from_name, config.user)
-        .parse()
-        .context("parse from address")?;
-    let mut builder = Message::builder()
-        .from(from_mb)
-        .message_id(Some(format!("<{}>", attrs.message_id)))
-        .subject(attrs.subject.clone())
-        .date(std::time::SystemTime::now());
-    for em in &attrs.to_emails {
-        let mb: Mailbox = em.parse().with_context(|| format!("parse to {em}"))?;
-        builder = builder.to(mb);
-    }
-    for em in &attrs.cc_emails {
-        let mb: Mailbox = em.parse().with_context(|| format!("parse cc {em}"))?;
-        builder = builder.cc(mb);
-    }
-    for em in &attrs.bcc_emails {
-        let mb: Mailbox = em.parse().with_context(|| format!("parse bcc {em}"))?;
-        builder = builder.bcc(mb);
-    }
-    if !attrs.in_reply_to_strings.is_empty() {
-        builder = builder.in_reply_to(
-            attrs
-                .in_reply_to_strings
-                .iter()
-                .map(|s| format!("<{}>", s))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    if !attrs.references_strings.is_empty() {
-        builder = builder.references(
-            attrs
-                .references_strings
-                .iter()
-                .map(|s| format!("<{}>", s))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    let message = if attachments.is_empty() {
-        builder
-            .header(header::ContentType::TEXT_PLAIN)
-            .body(attrs.body.clone())
-            .context("build message")?
-    } else {
-        let mut multipart = MultiPart::mixed().singlepart(
-            SinglePart::builder()
-                .header(header::ContentType::TEXT_PLAIN)
-                .body(attrs.body.clone()),
-        );
-        for (name, media_type, bytes) in &attachments {
-            let ct = header::ContentType::parse(media_type).unwrap_or_else(|_| {
-                header::ContentType::parse("application/octet-stream").unwrap()
-            });
-            multipart = multipart
-                .singlepart(lettre::message::Attachment::new(name.clone()).body(bytes.clone(), ct));
-        }
-        builder
-            .multipart(multipart)
-            .context("build multipart message")?
-    };
-
-    send_via_smtp(&config, &message)?;
-    let raw_bytes = message.formatted();
-
-    // 4. Append send-time facts to the draft entity.
-    let now = now_epoch();
-    with_repo(pile, |repo| {
-        mark_sent(repo, mail_branch_id, draft_id, raw_bytes, now)
-    })?;
-
-    println!(
-        "Sent draft {} (outcome was: {})",
-        fmt_id(draft_id),
-        decision_outcome.lines().next().unwrap_or("").trim()
-    );
-    Ok(())
-}
-
-fn cmd_discard(
-    pile: &Path,
-    mail_branch_id: Id,
-    decide_branch_id: Id,
-    draft_hex: String,
-    force: bool,
-) -> Result<()> {
-    let draft_id = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        resolve_message_id(&space, &draft_hex)
-    })?;
-    with_repo(pile, |repo| {
-        // Verify the draft exists and is still a draft (not already sent).
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let is_draft = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
-            .any(|t| t == KIND_DRAFT);
-        if !is_draft {
-            bail!("no draft with id {}", fmt_id(draft_id));
-        }
-        let already_sent = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
-            .any(|t| t == KIND_MESSAGE);
-        if already_sent {
-            bail!(
-                "draft {} has already been sent — can't discard a sent message",
-                fmt_id(draft_id)
-            );
-        }
-        drop(mws);
-
-        // Resolve the linked decision with outcome="discard".
-        let mut dws = repo
-            .pull(decide_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
-        let space = dws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
-        let decision_id = find_linked_decision(&space, draft_id)
-            .ok_or_else(|| anyhow::anyhow!("no linked decision for draft {}", fmt_id(draft_id)))?;
-        if decision_is_resolved(&mut dws, &space, decision_id) {
-            bail!("linked decision {} already resolved", fmt_id(decision_id));
-        }
-
-        if !force {
-            let pros = find!(
-                p: Id,
-                pattern!(&space, [{
-                    ?p @ metadata::tag: faculties::schemas::decide::KIND_PRO,
-                    faculties::schemas::decide::factor::about_decision: decision_id,
-                }])
-            )
-            .count();
-            let cons = find!(
-                c: Id,
-                pattern!(&space, [{
-                    ?c @ metadata::tag: faculties::schemas::decide::KIND_CON,
-                    faculties::schemas::decide::factor::about_decision: decision_id,
-                }])
-            )
-            .count();
-            if pros == 0 || cons == 0 {
-                bail!(
-                    "cannot discard without deliberation: need ≥1 pro AND ≥1 con on \
-                     decision {} (have {pros} pro, {cons} con). Add factors with \
-                     `decide pro/con {}`, or pass --force if this genuinely doesn't \
-                     merit deliberation.",
-                    fmt_id(decision_id),
-                    fmt_id(decision_id),
-                );
-            }
-        }
-
-        let outcome_text = "discard".to_string();
-        let outcome_handle: TextHandle = dws.put(outcome_text);
-        let now = instant_interval(now_epoch());
-        let change = entity! { ExclusiveId::force_ref(&decision_id) @
-            metadata::finished_at: now,
-            decide_attrs::outcome: outcome_handle,
-        };
-        dws.commit(change, "mail: discard draft");
-        repo.push(&mut dws)
-            .map_err(|e| anyhow::anyhow!("push decide: {e:?}"))?;
-        Ok(())
-    })?;
-    println!("Discarded draft {}", fmt_id(draft_id));
-    Ok(())
-}
-
-fn cmd_outbox(
-    pile: &Path,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    decide_branch_id: Id,
-) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let mut rws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let mut dws = repo
-            .pull(decide_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
-        let decide_space = dws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
-
-        // Drafts not yet sent: KIND_DRAFT tag, NOT KIND_MESSAGE.
-        let drafts: Vec<Id> = find!(
-            d: Id,
-            pattern!(&mail_space, [{ ?d @ metadata::tag: KIND_DRAFT }])
-        )
-        .filter(|d| {
-            !find!(t: Id, pattern!(&mail_space, [{ d @ metadata::tag: ?t }]))
-                .any(|t| t == KIND_MESSAGE)
-        })
-        .collect();
-
-        if drafts.is_empty() {
-            println!("(no pending drafts)");
-            return Ok(());
-        }
-
-        for did in drafts {
-            let subject =
-                find!(h: TextHandle, pattern!(&mail_space, [{ did @ mail::subject: ?h }]))
-                    .next()
-                    .and_then(|h| read_text(&mut mws, h))
-                    .unwrap_or_default();
-            let to_id: Option<Id> =
-                find!(r: Id, pattern!(&mail_space, [{ did @ mail::to: ?r }])).next();
-            let to_email = to_id
-                .and_then(|rid| {
-                    find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
-                })
-                .unwrap_or_else(|| "?".into());
-            let created = find!(c: IntervalValue, pattern!(&mail_space, [{ did @ metadata::created_at: ?c }]))
-                .next()
-                .map(|iv| unpack_interval(iv).0);
-            let created_str = created
-                .map(|e| epoch_to_chrono_utc(e).format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_else(|| "?".into());
-
-            let decision_id = find_linked_decision(&decide_space, did);
-            let decision_status = match decision_id {
-                None => "no decision".to_string(),
-                Some(decid) if decision_is_resolved(&mut dws, &decide_space, decid) => {
-                    let outcome = find!(
-                        h: TextHandle,
-                        pattern!(&decide_space, [{ decid @ decide_attrs::outcome: ?h }])
-                    )
-                    .next()
-                    .and_then(|h| read_text(&mut dws, h))
-                    .unwrap_or_default();
-                    let first = outcome.lines().next().unwrap_or("").trim();
-                    format!("resolved → {}", truncate_for_display(first, 60))
-                }
-                Some(decid) => format!("undecided ({})", fmt_id(decid)),
-            };
-            println!(
-                "  {} {} {:30} {}\n    decision: {}",
-                &fmt_id(did)[..8],
-                created_str,
-                truncate_for_display(&to_email, 30),
-                subject,
-                decision_status,
-            );
-        }
-        Ok(())
-    })
-}
-
-// ── queries ───────────────────────────────────────────────────────────────
-
-struct Row {
-    id: Id,
-    sent_at: Epoch,
-    subject: String,
-    from_email: Option<String>,
-    is_spam: bool,
-}
-
-fn collect_messages(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    relations_space: &TribleSet,
-    window: Option<(Epoch, Epoch)>,
-    spam_only: bool,
-    include_spam: bool,
-    unread_only: Option<Id>,
-) -> Vec<Row> {
-    let mut out = Vec::new();
-    let ids: Vec<Id> = find!(
-        e: Id,
-        pattern!(space, [{ ?e @ metadata::tag: KIND_MESSAGE }])
-    )
-    .collect();
-    for id in ids {
-        let sent_at_iv: Option<IntervalValue> = find!(
-            t: IntervalValue,
-            pattern!(space, [{ id @ mail::sent_at: ?t }])
-        )
-        .next();
-        let Some(iv) = sent_at_iv else { continue };
-        let (sent_at, _) = unpack_interval(iv);
-        if let Some((s, e)) = window {
-            if sent_at < s || sent_at > e {
-                continue;
-            }
-        }
-        let is_spam: bool = find!(
-            t: Id,
-            pattern!(space, [{ id @ metadata::tag: ?t }])
-        )
-        .any(|t| t == KIND_SPAM);
-        if spam_only && !is_spam {
-            continue;
-        }
-        if !spam_only && !include_spam && is_spam {
-            continue;
-        }
-        if let Some(reader_id) = unread_only {
-            if is_read(space, id, reader_id) {
-                continue;
-            }
-        }
-        let subject_h: Option<TextHandle> = find!(
-            h: TextHandle,
-            pattern!(space, [{ id @ mail::subject: ?h }])
-        )
-        .next();
-        let subject = subject_h.and_then(|h| read_text(ws, h)).unwrap_or_default();
-        let from_relation: Option<Id> = find!(
-            r: Id,
-            pattern!(space, [{ id @ mail::from: ?r }])
-        )
-        .next();
-        let from_email = from_relation.and_then(|rid| {
-            find!(
-                e: String,
-                pattern!(relations_space, [{ rid @ rel_attrs::email: ?e }])
-            )
-            .next()
-        });
-        out.push(Row {
-            id,
-            sent_at,
-            subject,
-            from_email,
-            is_spam,
-        });
-    }
-    out.sort_by_key(|r| r.sent_at.to_tai_seconds() as i128);
-    out
-}
-
-fn print_rows(rows: &[Row]) {
-    if rows.is_empty() {
-        println!("(no messages)");
-        return;
-    }
-    for r in rows {
-        let when = epoch_to_chrono_utc(r.sent_at).format("%Y-%m-%d %H:%M");
-        let from = r.from_email.as_deref().unwrap_or("?");
-        let flag = if r.is_spam { " [SPAM]" } else { "" };
-        println!(
-            "  {} {} {:30} {}{}",
-            &fmt_id(r.id)[..8],
-            when,
-            truncate_for_display(from, 30),
-            r.subject,
-            flag,
-        );
-    }
-}
-
-fn truncate_for_display(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let trimmed: String = s.chars().take(max - 1).collect();
-        format!("{trimmed}…")
-    }
-}
-
-fn cmd_list(
-    pile: &Path,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    from: Option<String>,
-    to: Option<String>,
-    spam_only: bool,
-    all: bool,
-    unread_only: bool,
-) -> Result<()> {
-    let window = match (from.as_deref(), to.as_deref()) {
-        (None, None) => None,
-        (f, t) => {
-            let start = f
-                .map(parse_iso8601)
-                .transpose()?
-                .map(chrono_to_epoch)
-                .unwrap_or_else(|| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-            let end = t
-                .map(parse_iso8601)
-                .transpose()?
-                .map(chrono_to_epoch)
-                .unwrap_or_else(|| Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0));
-            Some((start, end))
-        }
-    };
-    with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout mail: {e:?}"))?;
-        let mut rws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
-        let reader_filter = if unread_only {
-            let config = load_config()?;
-            find_self_persona(&rel_space, &config.user)
-        } else {
-            None
-        };
-        let rows = collect_messages(
-            &mut mws,
-            &mail_space,
-            &rel_space,
-            window,
-            spam_only,
-            all,
-            reader_filter,
-        );
-        print_rows(&rows);
-        Ok(())
-    })
-}
-
-fn local_day_window() -> (Epoch, Epoch) {
-    let now = Local::now();
-    let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-    let end = start + chrono::Duration::days(1);
-    let s_utc: DateTime<Utc> = Local
-        .from_local_datetime(&start)
-        .unwrap()
-        .with_timezone(&Utc);
-    let e_utc: DateTime<Utc> = Local.from_local_datetime(&end).unwrap().with_timezone(&Utc);
-    (chrono_to_epoch(s_utc), chrono_to_epoch(e_utc))
-}
-
-fn local_week_window() -> (Epoch, Epoch) {
-    let now = Local::now();
-    let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap() - chrono::Duration::days(7);
-    let end = now.date_naive().and_hms_opt(0, 0, 0).unwrap() + chrono::Duration::days(1);
-    let s_utc: DateTime<Utc> = Local
-        .from_local_datetime(&start)
-        .unwrap()
-        .with_timezone(&Utc);
-    let e_utc: DateTime<Utc> = Local.from_local_datetime(&end).unwrap().with_timezone(&Utc);
-    (chrono_to_epoch(s_utc), chrono_to_epoch(e_utc))
-}
-
-fn cmd_today(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result<()> {
-    let (s, e) = local_day_window();
-    with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|err| anyhow::anyhow!("pull mail: {err:?}"))?;
-        let mail_space = mws
-            .checkout(..)
-            .map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
-        let mut rws = repo
-            .pull(relations_branch_id)
-            .map_err(|err| anyhow::anyhow!("pull relations: {err:?}"))?;
-        let rel_space = rws
-            .checkout(..)
-            .map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
-        let rows = collect_messages(
-            &mut mws,
-            &mail_space,
-            &rel_space,
-            Some((s, e)),
-            false,
-            false,
-            None,
-        );
-        print_rows(&rows);
-        Ok(())
-    })
-}
-
-fn cmd_week(pile: &Path, mail_branch_id: Id, relations_branch_id: Id) -> Result<()> {
-    let (s, e) = local_week_window();
-    with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|err| anyhow::anyhow!("pull mail: {err:?}"))?;
-        let mail_space = mws
-            .checkout(..)
-            .map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
-        let mut rws = repo
-            .pull(relations_branch_id)
-            .map_err(|err| anyhow::anyhow!("pull relations: {err:?}"))?;
-        let rel_space = rws
-            .checkout(..)
-            .map_err(|err| anyhow::anyhow!("checkout: {err:?}"))?;
-        let rows = collect_messages(
-            &mut mws,
-            &mail_space,
-            &rel_space,
-            Some((s, e)),
-            false,
-            false,
-            None,
-        );
-        print_rows(&rows);
-        Ok(())
-    })
-}
-
-fn cmd_show(
-    pile: &Path,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    message: String,
-) -> Result<()> {
-    let resolved_id = with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = mws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let id = resolve_message_id(&space, &message)?;
-        let mut rws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-
-        let subject = find!(h: TextHandle, pattern!(&space, [{ id @ mail::subject: ?h }]))
-            .next()
-            .and_then(|h| read_text(&mut mws, h))
-            .unwrap_or_default();
-        let message_id = find!(h: TextHandle, pattern!(&space, [{ id @ mail::message_id: ?h }]))
-            .next()
-            .and_then(|h| read_text(&mut mws, h))
-            .unwrap_or_default();
-        let sent_at = find!(t: IntervalValue, pattern!(&space, [{ id @ mail::sent_at: ?t }]))
-            .next()
-            .map(unpack_interval)
-            .map(|(s, _)| s);
-        let from_relation: Option<Id> =
-            find!(r: Id, pattern!(&space, [{ id @ mail::from: ?r }])).next();
-        let from_email = from_relation.and_then(|rid| {
-            find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
-        });
-        let emails_of = |attr_rel_ids: Vec<Id>| -> Vec<String> {
-            attr_rel_ids
-                .iter()
-                .filter_map(|rid| {
-                    find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
-                })
-                .collect()
-        };
-        let to_emails: Vec<String> =
-            emails_of(find!(r: Id, pattern!(&space, [{ id @ mail::to: ?r }])).collect());
-        let cc_emails: Vec<String> =
-            emails_of(find!(r: Id, pattern!(&space, [{ id @ mail::cc: ?r }])).collect());
-        let bcc_emails: Vec<String> =
-            emails_of(find!(r: Id, pattern!(&space, [{ id @ mail::bcc: ?r }])).collect());
-        let body = find!(h: TextHandle, pattern!(&space, [{ id @ mail::body: ?h }]))
-            .next()
-            .and_then(|h| read_text(&mut mws, h))
-            .unwrap_or_default();
-        let attachments: Vec<Id> =
-            find!(a: Id, pattern!(&space, [{ id @ mail::attachment: ?a }])).collect();
-        let is_spam =
-            find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }])).any(|t| t == KIND_SPAM);
-
-        println!("message {}", fmt_id(id));
-        if !subject.is_empty() {
-            println!("  subject:    {subject}");
-        }
-        if let Some(em) = from_email {
-            println!("  from:       {em}");
-        }
-        if !to_emails.is_empty() {
-            println!("  to:         {}", to_emails.join(", "));
-        }
-        if !cc_emails.is_empty() {
-            println!("  cc:         {}", cc_emails.join(", "));
-        }
-        if !bcc_emails.is_empty() {
-            println!("  bcc:        {}", bcc_emails.join(", "));
-        }
-        if let Some(s) = sent_at {
-            println!(
-                "  sent_at:    {}",
-                epoch_to_chrono_utc(s).format("%Y-%m-%d %H:%M UTC")
-            );
-        }
-        println!("  message_id: {message_id}");
-        if is_spam {
-            println!("  status:     SPAM");
-        }
-        if !attachments.is_empty() {
-            println!("  attachments: {}", attachments.len());
-            for aid in &attachments {
-                println!("    {}", fmt_id(*aid));
-            }
-        }
-        println!("  ----");
-        for line in body.lines() {
-            println!("  {line}");
-        }
-        Ok(id)
-    })?;
-    // Auto-mark on show (opening = reading, mirrors what mail clients do).
-    // Idempotent: if a read receipt already exists for this message + the
-    // local agent, mark_read_if_unread is a no-op. Quietly skip if we
-    // can't resolve the local agent's relations entry (no MAIL_USER set
-    // yet, or no auto-registered Toby entry — the user can still mark
-    // explicitly with `mail read <id>` later).
-    if let Ok(config) = load_config() {
-        let _ = with_repo(pile, |repo| {
-            let mut rws = repo
-                .pull(relations_branch_id)
-                .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-            let rel_space = rws
-                .checkout(..)
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            if let Some(self_id) = find_self_persona(&rel_space, &config.user) {
-                mark_read_if_unread(repo, mail_branch_id, resolved_id, self_id)?;
-            }
+            fetched += 1;
             Ok(())
-        });
-    }
-    Ok(())
-}
-
-fn cmd_read(
-    pile: &Path,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    message: String,
-) -> Result<()> {
-    let config = load_config()?;
-    with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let mail_space = mws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let id = resolve_message_id(&mail_space, &message)?;
-        drop(mws);
-        let mut rws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let self_id = find_self_persona(&rel_space, &config.user).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no relations entry for {} — send or receive at least one message first \
-                 so the auto-registration mints your entry",
-                config.user
+        })
+        .with_context(|| {
+            format!(
+                "drain POP account {}; a QUIT failure after DELE is an uncertain remote deletion transaction",
+                account.address
             )
         })?;
-        let now_new = mark_read_if_unread(repo, mail_branch_id, id, self_id)?;
-        if now_new {
-            println!("Marked {} as read.", fmt_id(id));
-        } else {
-            println!("{} was already read.", fmt_id(id));
-        }
-        Ok(())
-    })
-}
-
-fn cmd_thread(
-    pile: &Path,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    message: String,
-) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = mws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let start = resolve_message_id(&space, &message)?;
-        let mut rws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-
-        // BFS over both in_reply_to and references edges, both directions
-        // (ancestors and descendants).
-        let mut visited: HashSet<Id> = HashSet::new();
-        let mut queue: Vec<Id> = vec![start];
-        while let Some(cur) = queue.pop() {
-            if !visited.insert(cur) {
-                continue;
-            }
-            // Ancestors: cur's in_reply_to + references targets.
-            for parent in find!(p: Id, pattern!(&space, [{ cur @ mail::in_reply_to: ?p }])) {
-                queue.push(parent);
-            }
-            for parent in find!(p: Id, pattern!(&space, [{ cur @ mail::references: ?p }])) {
-                queue.push(parent);
-            }
-            // Descendants: anyone whose in_reply_to or references points at cur.
-            for child in find!(c: Id, pattern!(&space, [{ ?c @ mail::in_reply_to: cur }])) {
-                queue.push(child);
-            }
-            for child in find!(c: Id, pattern!(&space, [{ ?c @ mail::references: cur }])) {
-                queue.push(child);
-            }
-        }
-        let mut ids: Vec<Id> = visited.into_iter().collect();
-        // Filter to ones that actually exist as messages in our pile —
-        // predicted-but-unfetched parents are valid GenIds but have no
-        // mail entity yet.
-        ids.retain(|id| {
-            find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }])).any(|t| t == KIND_MESSAGE)
-        });
-
-        let rows: Vec<Row> = ids
-            .into_iter()
-            .filter_map(|id| {
-                let sent_at_iv: Option<IntervalValue> = find!(
-                    t: IntervalValue,
-                    pattern!(&space, [{ id @ mail::sent_at: ?t }])
-                )
-                .next();
-                let (sent_at, _) = unpack_interval(sent_at_iv?);
-                let subject_h: Option<TextHandle> =
-                    find!(h: TextHandle, pattern!(&space, [{ id @ mail::subject: ?h }])).next();
-                let subject = subject_h
-                    .and_then(|h| read_text(&mut mws, h))
-                    .unwrap_or_default();
-                let from_relation: Option<Id> =
-                    find!(r: Id, pattern!(&space, [{ id @ mail::from: ?r }])).next();
-                let from_email = from_relation.and_then(|rid| {
-                    find!(
-                        e: String,
-                        pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])
-                    )
-                    .next()
-                });
-                let is_spam = find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }]))
-                    .any(|t| t == KIND_SPAM);
-                Some(Row {
-                    id,
-                    sent_at,
-                    subject,
-                    from_email,
-                    is_spam,
-                })
-            })
-            .collect();
-        let mut rows = rows;
-        rows.sort_by_key(|r| r.sent_at.to_tai_seconds() as i128);
-        print_rows(&rows);
-        Ok(())
-    })
-}
-
-fn cmd_search(
-    pile: &Path,
-    mail_branch_id: Id,
-    relations_branch_id: Id,
-    query: String,
-) -> Result<()> {
-    let needle = query.to_ascii_lowercase();
-    with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = mws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let mut rws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
-        let rel_space = rws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let ids: Vec<Id> =
-            find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: KIND_MESSAGE }])).collect();
-        let mut matches: Vec<Row> = Vec::new();
-        for id in ids {
-            let subject = find!(h: TextHandle, pattern!(&space, [{ id @ mail::subject: ?h }]))
-                .next()
-                .and_then(|h| read_text(&mut mws, h))
-                .unwrap_or_default();
-            let body = find!(h: TextHandle, pattern!(&space, [{ id @ mail::body: ?h }]))
-                .next()
-                .and_then(|h| read_text(&mut mws, h))
-                .unwrap_or_default();
-            if !subject.to_ascii_lowercase().contains(&needle)
-                && !body.to_ascii_lowercase().contains(&needle)
-            {
-                continue;
-            }
-            let sent_at_iv: Option<IntervalValue> = find!(
-                t: IntervalValue,
-                pattern!(&space, [{ id @ mail::sent_at: ?t }])
-            )
-            .next();
-            let (sent_at, _) =
-                unpack_interval(sent_at_iv.unwrap_or_else(|| instant_interval(now_epoch())));
-            let from_relation: Option<Id> =
-                find!(r: Id, pattern!(&space, [{ id @ mail::from: ?r }])).next();
-            let from_email = from_relation.and_then(|rid| {
-                find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
-            });
-            let is_spam = find!(t: Id, pattern!(&space, [{ id @ metadata::tag: ?t }]))
-                .any(|t| t == KIND_SPAM);
-            matches.push(Row {
-                id,
-                sent_at,
-                subject,
-                from_email,
-                is_spam,
-            });
-        }
-        matches.sort_by_key(|r| r.sent_at.to_tai_seconds() as i128);
-        print_rows(&matches);
-        Ok(())
-    })
-}
-
-fn cmd_resolve(pile: &Path, mail_branch_id: Id, prefix: String) -> Result<()> {
-    let needle = prefix.trim().to_ascii_lowercase();
-    if needle.is_empty() {
-        bail!("empty prefix");
+        println!("{}: fetched {fetched} message(s)", account.address);
     }
-    with_repo(pile, |repo| {
-        let mut mws = repo
-            .pull(mail_branch_id)
-            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
-        let space = mws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let mut matches: HashSet<Id> = HashSet::new();
-        // Resolve over both messages and drafts — they share the
-        // entity-id namespace and the user often wants either.
-        for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: KIND_MESSAGE }])) {
-            if fmt_id(id).starts_with(&needle) {
-                matches.insert(id);
-            }
-        }
-        for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: KIND_DRAFT }])) {
-            if fmt_id(id).starts_with(&needle) {
-                matches.insert(id);
-            }
-        }
-        let matches: Vec<Id> = matches.into_iter().collect();
-        match matches.len() {
-            0 => bail!("no message id starts with '{}'", needle),
-            1 => {
-                println!("{}", fmt_id(matches[0]));
-                Ok(())
-            }
-            n => bail!("{n} matches; provide a longer prefix"),
-        }
-    })
-}
-
-// ── main ──────────────────────────────────────────────────────────────────
-
-fn resolve_branch(repo: &mut Repository<Pile>, branch_name: &str) -> Result<Id> {
-    repo.ensure_branch(branch_name, None)
-        .map_err(|e| anyhow::anyhow!("ensure branch '{branch_name}': {e:?}"))
+    Ok(())
 }
 
 fn main() -> Result<()> {
-    // rust-pop3-client depends on rustls 0.23 but doesn't select a
-    // crypto provider; install one explicitly here so the lazy
-    // default-provider lookup doesn't panic on first TLS use.
-    // Idempotent — re-installing is a no-op error we ignore.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     let cli = Cli::parse();
-    let cmd = cli.command.unwrap_or(Command::Today);
+    if matches!(&cli.command, Command::MigrateLegacy) {
+        let source = freeze_source(&cli.pile).context("freeze stopped legacy Mail source")?;
+        let plan = mail_cutover::plan(&source).context("plan additive Mail migration")?;
+        let commits = mail_cutover::publish(&source, &plan, &cli.pile, cli.key.as_deref())
+            .context("publish additive Mail migration")?;
+        println!(
+            "Migrated {} authored Mail commit(s) plus {} normalization commit(s): {} old fact(s) + {} additive fact(s)",
+            plan.report().authored_commits,
+            plan.report().normalization_commits,
+            plan.report().original_facts,
+            plan.report().added_facts
+        );
+        debug_assert_eq!(
+            commits.len(),
+            plan.report().authored_commits + plan.report().normalization_commits
+        );
+        return Ok(());
+    }
 
-    let (mail_branch, relations_branch, decide_branch) = with_repo(&cli.pile, |repo| {
-        let m = resolve_branch(repo, &cli.branch)?;
-        let r = resolve_branch(repo, &cli.relations_branch)?;
-        let d = resolve_branch(repo, &cli.decide_branch)?;
-        Ok((m, r, d))
-    })?;
-
-    match cmd {
-        Command::Fetch => cmd_fetch(&cli.pile, mail_branch, relations_branch),
-        Command::Draft {
-            to,
-            subject,
-            body,
-            cc,
-            bcc,
-            attach,
-        } => cmd_draft(
-            &cli.pile,
-            mail_branch,
-            relations_branch,
-            decide_branch,
-            to,
-            subject,
-            body,
-            cc,
-            bcc,
-            attach,
-        ),
-        Command::Send { draft } => cmd_send(
-            &cli.pile,
-            mail_branch,
-            relations_branch,
-            decide_branch,
-            draft,
-        ),
-        Command::Reply { message, body } => cmd_reply(
-            &cli.pile,
-            mail_branch,
-            relations_branch,
-            decide_branch,
-            message,
-            body,
-        ),
-        Command::Discard { draft, force } => {
-            cmd_discard(&cli.pile, mail_branch, decide_branch, draft, force)
+    let storage = Storage::open(
+        &cli.pile,
+        cli.key.as_deref(),
+        Scopes::FIXED,
+        cli.secrets_identity.as_deref(),
+    )?;
+    let result = match cli.command {
+        Command::Account { command } => match command {
+            AccountCommand::Set {
+                account,
+                address,
+                display_name,
+                pop_endpoint,
+                smtp_endpoint,
+                username,
+                password,
+                credential_version,
+                secret_scope,
+                disabled,
+            } => account_set(
+                &storage,
+                account,
+                address,
+                display_name,
+                pop_endpoint,
+                smtp_endpoint,
+                username,
+                password,
+                credential_version,
+                secret_scope,
+                disabled,
+            ),
+            AccountCommand::List => account_list(&storage),
+        },
+        Command::Fetch => cmd_fetch(&storage),
+        Command::Draft(args) => cmd_draft(&storage, args),
+        Command::Reply(args) => cmd_reply(&storage, args),
+        Command::Send { draft } => cmd_send(&storage, &draft),
+        Command::Outbox => cmd_outbox(&storage),
+        Command::List { unread, spam } => cmd_list(&storage, unread, spam),
+        Command::Read { message } => cmd_read(&storage, &message),
+        Command::Show { message } => cmd_show(&storage, &message),
+        Command::Search { query } => cmd_search(&storage, &query),
+        Command::MigrateLegacy => unreachable!("migration was dispatched before opening storage"),
+    };
+    let close = storage.close();
+    match (result, close) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing Mail pile also failed: {close_error:#}")))
         }
-        Command::Outbox => cmd_outbox(&cli.pile, mail_branch, relations_branch, decide_branch),
-        Command::List {
-            from,
-            to,
-            spam,
-            all,
-            unread,
-        } => cmd_list(
-            &cli.pile,
-            mail_branch,
-            relations_branch,
-            from,
-            to,
-            spam,
-            all,
-            unread,
-        ),
-        Command::Read { message } => cmd_read(&cli.pile, mail_branch, relations_branch, message),
-        Command::Today => cmd_today(&cli.pile, mail_branch, relations_branch),
-        Command::Week => cmd_week(&cli.pile, mail_branch, relations_branch),
-        Command::Thread { message } => {
-            cmd_thread(&cli.pile, mail_branch, relations_branch, message)
-        }
-        Command::Show { message } => cmd_show(&cli.pile, mail_branch, relations_branch, message),
-        Command::Search { query } => cmd_search(&cli.pile, mail_branch, relations_branch, query),
-        Command::Resolve { prefix } => cmd_resolve(&cli.pile, mail_branch, prefix),
     }
 }
+
+// Short aliases keep declarative query clauses readable without recreating a
+// second ontology in the binary.
+use faculties::schemas::mail::{observation, projection};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::rc::Rc;
 
-    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
+    use faculties::collection_cutover::{initialize_signer, publish_fragment};
 
-    #[test]
-    fn message_entity_id_is_deterministic_and_message_id_bound() {
-        // The forward-reference contract: the id is a pure, stable function of
-        // the Message-Id, so a reference resolves to the same id the message
-        // materializes at. Whitespace is trimmed so header-quoted ids agree.
-        let a = entity_id_for_message("<abc@example.com>");
-        assert_eq!(
-            a,
-            entity_id_for_message("<abc@example.com>"),
-            "deterministic"
-        );
-        assert_eq!(
-            a,
-            entity_id_for_message("  <abc@example.com>  "),
-            "trim-invariant"
-        );
-        assert_ne!(
-            a,
-            entity_id_for_message("<other@example.com>"),
-            "message-id-bound"
-        );
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn scopes() -> Scopes {
+        Scopes {
+            mail: mail_schema::DEFAULT_SCOPE_ID,
+            files: files_schema::DEFAULT_SCOPE_ID,
+            decide: decide_schema::DEFAULT_SCOPE_ID,
+            relations: relations_schema::DEFAULT_SCOPE_ID,
+        }
+    }
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        pile: PathBuf,
+        key: PathBuf,
+        account: Id,
+        config: Id,
+        credential: Id,
+        secret_scope: Id,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let pile = directory.path().join("mail-cli.pile");
+            let key = directory.path().join("mail-cli.key");
+            File::create(&pile).unwrap();
+            initialize_signer(&pile, Some(&key)).unwrap();
+
+            let account = id(70);
+            let prepared =
+                secrets_model::prepare_identity("me", b"identity password", point_now().unwrap())
+                    .unwrap();
+            let scope =
+                secrets_model::scope_fragment(prepared.id, "mail-test", point_now().unwrap())
+                    .unwrap();
+            let mut secrets_fragment = prepared.fragment;
+            secrets_fragment += scope;
+            publish_fragment(
+                &pile,
+                Some(&key),
+                secrets_schema::DEFAULT_SCOPE_ID,
+                secrets_fragment,
+            )
+            .unwrap();
+            let signer = load_signer(&pile, Some(&key)).unwrap();
+            let mut store = open_pile_strict(&pile).unwrap();
+            let secrets_facts =
+                Collection::new(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer)
+                    .materialize()
+                    .unwrap();
+            let secrets_reader = store.reader().unwrap();
+            let secrets_catalog =
+                secrets_model::validate_catalog(&secrets_reader, &secrets_facts).unwrap();
+            let secret_scope = *secrets_catalog.scopes.keys().next().unwrap();
+            let sealed = secrets_model::seal_version(
+                &secrets_reader,
+                &secrets_catalog,
+                secret_scope,
+                &mailbox_secret_name(account),
+                b"mailbox password",
+                point_now().unwrap(),
+            )
+            .unwrap();
+            drop(secrets_reader);
+            store.close().unwrap();
+            let credential_id = sealed.secret;
+            publish_fragment(
+                &pile,
+                Some(&key),
+                secrets_schema::DEFAULT_SCOPE_ID,
+                sealed.fragment,
+            )
+            .unwrap();
+            let mut fragment = Fragment::empty();
+            let (config_fragment, config) = mail::account_config_fragment(
+                account,
+                AccountConfigInput {
+                    address: "me@example.test".into(),
+                    display_name: "Me".into(),
+                    pop_endpoint: "pop.example.test:995".into(),
+                    smtp_endpoint: "smtp.example.test:465".into(),
+                    username: "me@example.test".into(),
+                    credential: credential_id,
+                    enabled: true,
+                    predecessors: Vec::new(),
+                },
+            )
+            .unwrap();
+            fragment += config_fragment;
+            publish_fragment(&pile, Some(&key), mail_schema::DEFAULT_SCOPE_ID, fragment).unwrap();
+
+            let fixture = Self {
+                _directory: directory,
+                pile,
+                key,
+                account,
+                config,
+                credential: credential_id,
+                secret_scope,
+            };
+            let storage = fixture.storage();
+            storage.views().unwrap();
+            storage.close().unwrap();
+            fixture
+        }
+
+        fn storage(&self) -> Storage<'_> {
+            Storage::open(&self.pile, Some(&self.key), scopes(), Some("me")).unwrap()
+        }
+    }
+
+    fn raw(message_id: &str) -> Vec<u8> {
+        format!(
+            "From: Sender <sender@example.test>\r\nTo: me@example.test\r\nMessage-ID: <{message_id}>\r\nDate: Sat, 8 Aug 2026 00:00:01 +0000\r\nSubject: Hello\r\nContent-Type: multipart/mixed; boundary=test\r\n\r\n--test\r\nContent-Type: text/plain\r\n\r\nbody\r\n--test\r\nContent-Type: application/octet-stream; name=note.bin\r\nContent-Disposition: attachment; filename=note.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--test--\r\n"
+        )
+        .into_bytes()
     }
 
     #[test]
-    fn attachment_free_send_lookup_needs_neither_signer_nor_pile() {
-        let absent = std::env::temp_dir().join(format!(
-            "faculties-mail-no-files-{}-{}",
-            std::process::id(),
-            NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed)
-        ));
-        assert!(load_draft_attachments(&absent, &[]).unwrap().is_empty());
-        assert!(!absent.exists());
-    }
+    fn account_config_update_reuses_exact_secret_without_opening_it() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let before = storage.views().unwrap();
+        let secrets_before = before.secrets.facts.clone();
 
-    #[test]
-    fn attachment_closure_lands_in_native_files_before_mail_reference() {
-        let nonce = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "faculties-mail-native-files-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.pile");
-        std::fs::File::create(&path).unwrap();
-
-        let pile = Pile::open(&path).unwrap();
-        let mut repo =
-            Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
-        let mail_branch = repo.ensure_branch("mail", None).unwrap();
-        let relations_branch = repo.ensure_branch("relations", None).unwrap();
-        let files_signer = SigningKey::generate(&mut OsRng);
-        let parsed = ParsedMail {
-            message_id: "native-files@example.test".to_owned(),
-            from: None,
-            to: Vec::new(),
-            cc: Vec::new(),
-            bcc: Vec::new(),
-            subject: "attachment closure".to_owned(),
-            body: "body".to_owned(),
-            sent_at: now_epoch(),
-            in_reply_to: Vec::new(),
-            references: Vec::new(),
-            is_spam: false,
-            raw: b"raw message".to_vec(),
-            attachments: vec![Attachment {
-                filename: "proof.txt".to_owned(),
-                mime: "text/plain".to_owned(),
-                bytes: b"native closure".to_vec(),
-            }],
-        };
-
-        let message_id = persist_message(
-            &mut repo,
-            mail_branch,
-            relations_branch,
-            Some(&files_signer),
-            parsed,
+        account_set(
+            &storage,
+            Some(format!("{:x}", fixture.account)),
+            "me@example.test".into(),
+            "Renamed".into(),
+            "pop.example.test:995".into(),
+            "smtp.example.test:465".into(),
+            None,
+            None,
+            None,
+            None,
             false,
         )
         .unwrap();
-        let (files, reader) =
-            file_capability::materialize_collection(repo.storage_mut(), &files_signer).unwrap();
-        let mut mail_ws = repo.pull(mail_branch).unwrap();
-        let mail_space = mail_ws.checkout(..).unwrap().into_facts();
-        let file_id = find!(
-            attachment: Id,
-            pattern!(&mail_space, [{ message_id @ mail::attachment: ?attachment }])
-        )
-        .next()
-        .expect("mail attachment reference");
-        let content = find!(
-            handle: FileHandle,
-            pattern!(&files, [{ file_id @ file::content: ?handle }])
-        )
-        .next()
-        .expect("native Files content");
-        let bytes: anybytes::Bytes = reader.get(content).unwrap();
-        assert_eq!(bytes.as_ref(), b"native closure");
 
-        drop(mail_ws);
-        drop(reader);
-        repo.close().unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
+        let after = storage.views().unwrap();
+        assert_eq!(after.secrets.facts, secrets_before);
+        let head = match mail::account_head(&after.mail.facts, fixture.account).unwrap() {
+            Head::Unique(id) => id,
+            other => panic!("expected unique account head, got {other:?}"),
+        };
+        assert_ne!(head, fixture.config);
+        assert_eq!(
+            mail::account_config(&after.mail.facts, head)
+                .unwrap()
+                .credential,
+            fixture.credential
+        );
+    }
+
+    #[test]
+    fn supplied_password_always_seals_a_fresh_version_before_mail() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let before = storage.views().unwrap();
+        let versions_before = before.secrets_catalog.secrets.len();
+
+        account_set(
+            &storage,
+            Some(format!("{:x}", fixture.account)),
+            "me@example.test".into(),
+            "Me".into(),
+            "pop.example.test:995".into(),
+            "smtp.example.test:465".into(),
+            None,
+            Some("mailbox password".into()),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let after = storage.views().unwrap();
+        assert_eq!(after.secrets_catalog.secrets.len(), versions_before + 1);
+        let head = match mail::account_head(&after.mail.facts, fixture.account).unwrap() {
+            Head::Unique(id) => id,
+            other => panic!("expected unique account head, got {other:?}"),
+        };
+        let credential = mail::account_config(&after.mail.facts, head)
+            .unwrap()
+            .credential;
+        assert_ne!(credential, fixture.credential);
+        assert_eq!(
+            after.secrets_catalog.secrets[&credential].scope,
+            fixture.secret_scope
+        );
+    }
+
+    #[test]
+    fn interrupted_secrets_first_update_has_an_exact_repair_path() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let before = storage.views().unwrap();
+        let sealed = secrets_model::seal_version(
+            &before.secrets.reader,
+            &before.secrets_catalog,
+            fixture.secret_scope,
+            &mailbox_secret_name(fixture.account),
+            b"replacement password",
+            point_now().unwrap(),
+        )
+        .unwrap();
+        let credential = sealed.secret;
+        drop(before);
+        storage
+            .publish(
+                secrets_schema::DEFAULT_SCOPE_ID,
+                sealed.fragment,
+                "mail test: interrupted Secrets-first publication",
+            )
+            .unwrap();
+        let versions = storage.views().unwrap().secrets_catalog.secrets.len();
+
+        account_set(
+            &storage,
+            Some(format!("{:x}", fixture.account)),
+            "  me@example.test  ".into(),
+            "  Me  ".into(),
+            "  pop.example.test:995  ".into(),
+            "  smtp.example.test:465  ".into(),
+            None,
+            None,
+            Some(format!("{credential:x}")),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let after = storage.views().unwrap();
+        assert_eq!(after.secrets_catalog.secrets.len(), versions);
+        let head = match mail::account_head(&after.mail.facts, fixture.account).unwrap() {
+            Head::Unique(id) => id,
+            other => panic!("expected unique account head, got {other:?}"),
+        };
+        assert_eq!(
+            mail::account_config(&after.mail.facts, head)
+                .unwrap()
+                .credential,
+            credential
+        );
+        let mail_after_first_repair = after.mail.facts.clone();
+        drop(after);
+        account_set(
+            &storage,
+            Some(format!("{:x}", fixture.account)),
+            "  me@example.test  ".into(),
+            "  Me  ".into(),
+            "  pop.example.test:995  ".into(),
+            "  smtp.example.test:465  ".into(),
+            None,
+            None,
+            Some(format!("{credential:x}")),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(storage.views().unwrap().mail.facts, mail_after_first_repair);
+    }
+
+    #[test]
+    fn invalid_account_input_does_not_publish_the_staged_secret() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let secrets_before = storage.views().unwrap().secrets.facts.clone();
+
+        let error = account_set(
+            &storage,
+            Some(format!("{:x}", fixture.account)),
+            "   ".into(),
+            "Me".into(),
+            "pop.example.test:995".into(),
+            "smtp.example.test:465".into(),
+            None,
+            Some("replacement password".into()),
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("account address"));
+        assert_eq!(storage.views().unwrap().secrets.facts, secrets_before);
+    }
+
+    #[test]
+    fn new_account_requires_an_explicit_inner_secret_scope() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let error = account_set(
+            &storage,
+            None,
+            "other@example.test".into(),
+            "Other".into(),
+            "pop.example.test:995".into(),
+            "smtp.example.test:465".into(),
+            None,
+            Some("new password".into()),
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("--secret-scope is required"));
+
+        account_set(
+            &storage,
+            None,
+            "other@example.test".into(),
+            "Other".into(),
+            "pop.example.test:995".into(),
+            "smtp.example.test:465".into(),
+            None,
+            Some("new password".into()),
+            None,
+            Some(format!("{:x}", fixture.secret_scope)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            mail::account_anchors(&storage.views().unwrap().mail.facts).len(),
+            2
+        );
+        let views = storage.views().unwrap();
+        assert_eq!(
+            resolve_account(&views, "me@example.test").unwrap(),
+            fixture.account
+        );
+        assert_ne!(
+            resolve_account(&views, "other@example.test").unwrap(),
+            fixture.account
+        );
+    }
+
+    #[test]
+    fn fetch_skips_disabled_accounts_before_persona_or_secret_unlock() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        account_set(
+            &storage,
+            Some(format!("{:x}", fixture.account)),
+            "me@example.test".into(),
+            "Me".into(),
+            "pop.example.test:995".into(),
+            "smtp.example.test:465".into(),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        // No PERSONA or identity password is needed: disabled accounts do not
+        // participate in the all-enabled account preflight.
+        cmd_fetch(&storage).unwrap();
+    }
+
+    #[test]
+    fn explicit_secrets_identity_is_independent_of_relations_persona_namespace() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let relations_person = id(91);
+        let (person_fragment, _, _) = relations::person_fragment(
+            relations_person,
+            relations::ProfileInput {
+                label: "work-persona".into(),
+                ..relations::ProfileInput::default()
+            },
+        )
+        .unwrap();
+        storage
+            .publish(
+                storage.scopes.relations,
+                person_fragment,
+                "mail test: Relations persona",
+            )
+            .unwrap();
+
+        let vault = secrets_model::prepare_identity(
+            "mail-vault",
+            b"different identity password",
+            point_now().unwrap(),
+        )
+        .unwrap();
+        storage
+            .publish(
+                secrets_schema::DEFAULT_SCOPE_ID,
+                vault.fragment,
+                "mail test: independent Secrets identity",
+            )
+            .unwrap();
+
+        let views = storage.views().unwrap();
+        let relation = relations::resolve_person(
+            &views.relations.reader,
+            &views.relations.facts,
+            "work-persona",
+            false,
+        )
+        .unwrap()
+        .require_unique("active Relations person", "work-persona")
+        .unwrap();
+        let secret = secrets_identity(&views, Some("mail-vault")).unwrap();
+        assert_eq!(relation, relations_person);
+        assert_eq!(secret, vault.id);
+        assert_ne!(relation, secret);
+    }
+
+    #[test]
+    fn disabled_send_refuses_before_secrets_identity_or_credential_access() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        cmd_draft(
+            &storage,
+            DraftArgs {
+                account: format!("{:x}", fixture.account),
+                to: vec!["recipient@example.test".into()],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: "Disabled account".into(),
+                body: "must not send".into(),
+                attach: Vec::new(),
+            },
+        )
+        .unwrap();
+        let views = storage.views().unwrap();
+        let drafts: Vec<Id> = find!(
+            draft: Id,
+            pattern!(&views.mail.facts, [{ ?draft @ metadata::tag: &mail_schema::KIND_DRAFT_INTENT }])
+        )
+        .collect();
+        assert_eq!(drafts.len(), 1);
+        drop(views);
+
+        account_set(
+            &storage,
+            Some(format!("{:x}", fixture.account)),
+            "me@example.test".into(),
+            "Me".into(),
+            "pop.example.test:995".into(),
+            "smtp.example.test:465".into(),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        storage.close().unwrap();
+        let missing_identity_storage = Storage::open(
+            &fixture.pile,
+            Some(&fixture.key),
+            scopes(),
+            Some("identity-that-does-not-exist"),
+        )
+        .unwrap();
+        let error = cmd_send(&missing_identity_storage, &format!("{:x}", drafts[0])).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("disabled"), "{message}");
+        assert!(!message.contains("Secrets identity"), "{message}");
+    }
+
+    #[derive(Default)]
+    struct PopState {
+        events: Vec<String>,
+        marked: Vec<u32>,
+        committed: Vec<u32>,
+    }
+
+    struct FakePop {
+        state: Rc<RefCell<PopState>>,
+        items: Vec<mail::PopItem>,
+        messages: HashMap<u32, Vec<u8>>,
+        fail_dele: Option<u32>,
+        fail_quit: bool,
+        quit: bool,
+    }
+
+    impl Drop for FakePop {
+        fn drop(&mut self) {
+            if !self.quit {
+                self.state.borrow_mut().events.push("disconnect".into());
+            }
+        }
+    }
+
+    impl mail::PopTxn for FakePop {
+        fn enumerate_uidls(&mut self) -> Result<Vec<mail::PopItem>> {
+            self.state.borrow_mut().events.push("uidl".into());
+            Ok(self.items.clone())
+        }
+
+        fn retrieve_exact(&mut self, session_seq: u32) -> Result<Vec<u8>> {
+            self.state
+                .borrow_mut()
+                .events
+                .push(format!("retr:{session_seq}"));
+            self.messages
+                .get(&session_seq)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing scripted message {session_seq}"))
+        }
+
+        fn mark_delete(&mut self, session_seq: u32) -> Result<()> {
+            self.state
+                .borrow_mut()
+                .events
+                .push(format!("dele:{session_seq}"));
+            if self.fail_dele == Some(session_seq) {
+                bail!("scripted DELE rejection");
+            }
+            self.state.borrow_mut().marked.push(session_seq);
+            Ok(())
+        }
+
+        fn quit(mut self) -> Result<()> {
+            self.state.borrow_mut().events.push("quit".into());
+            if self.fail_quit {
+                bail!("scripted lost QUIT reply");
+            }
+            let marked = self.state.borrow().marked.clone();
+            self.state.borrow_mut().committed = marked;
+            self.quit = true;
+            Ok(())
+        }
+    }
+
+    fn fake_pop(state: Rc<RefCell<PopState>>, messages: Vec<(u32, &str, Vec<u8>)>) -> FakePop {
+        FakePop {
+            state,
+            items: messages
+                .iter()
+                .map(|(sequence, uidl, _)| mail::PopItem {
+                    session_seq: *sequence,
+                    uidl: (*uidl).to_owned(),
+                })
+                .collect(),
+            messages: messages
+                .into_iter()
+                .map(|(sequence, _, raw)| (sequence, raw))
+                .collect(),
+            fail_dele: None,
+            fail_quit: false,
+            quit: false,
+        }
+    }
+
+    fn publish_recording(
+        storage: &Storage<'_>,
+        state: &Rc<RefCell<PopState>>,
+        publication: &mail::SourcePublication,
+        fail_scope: Option<Id>,
+    ) -> Result<()> {
+        publish_pop_publication_with(
+            publication,
+            storage.scopes,
+            || storage.views(),
+            |scope, fragment, description| {
+                let label = if scope == storage.scopes.files {
+                    "files"
+                } else if scope == storage.scopes.mail {
+                    "mail"
+                } else {
+                    "unexpected-scope"
+                };
+                state.borrow_mut().events.push(label.into());
+                if fail_scope == Some(scope) {
+                    bail!("scripted {label} publication failure");
+                }
+                storage.publish(scope, fragment, description)
+            },
+        )
+    }
+
+    #[test]
+    fn reply_to_digest_only_wire_omits_remote_thread_headers() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let publication = mail::pop_publication(
+            fixture.account,
+            fixture.config,
+            "no-message-id",
+            b"From: Sender <sender@example.test>\r\nTo: me@example.test\r\nSubject: No remote identity\r\n\r\nbody",
+        )
+        .unwrap();
+        let wire = publication.wire;
+        publish_pop_publication_with(
+            &publication,
+            storage.scopes,
+            || storage.views(),
+            |scope, fragment, description| storage.publish(scope, fragment, description),
+        )
+        .unwrap();
+
+        cmd_reply(
+            &storage,
+            ReplyArgs {
+                message: format!("{wire:x}"),
+                account: format!("{:x}", fixture.account),
+                body: "reply without invented Message-ID".into(),
+            },
+        )
+        .unwrap();
+
+        let views = storage.views().unwrap();
+        let drafts: Vec<Id> = find!(
+            draft: Id,
+            pattern!(&views.mail.facts, [{ ?draft @ metadata::tag: &mail_schema::KIND_DRAFT_INTENT }])
+        )
+        .collect();
+        assert_eq!(drafts.len(), 1);
+        let draft = mail::draft_value(&views.mail.facts, drafts[0]).unwrap();
+        assert!(draft.in_reply_to.is_empty());
+        assert!(draft.references.is_empty());
+    }
+
+    #[test]
+    fn pop_composition_is_files_then_mail_then_dele_then_quit() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let bytes = raw("ordered@example.test");
+        let expected =
+            mail::pop_publication(fixture.account, fixture.config, "uid-1", &bytes).unwrap();
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let transaction = fake_pop(state.clone(), vec![(1, "uid-1", bytes)]);
+
+        mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| publish_recording(&storage, &state, publication, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.borrow().events,
+            ["uidl", "retr:1", "files", "mail", "dele:1", "quit"]
+        );
+        assert_eq!(state.borrow().committed, [1]);
+        let views = storage.views().unwrap();
+        assert!(fragment_is_materialized(
+            &views.files.facts,
+            &expected.files
+        ));
+        assert!(fragment_is_materialized(&views.mail.facts, &expected.mail));
+    }
+
+    #[test]
+    fn pop_publication_failures_prevent_dele_and_retry_reuses_durable_files() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let bytes = raw("files-fail@example.test");
+        let transaction = fake_pop(state.clone(), vec![(1, "uid-files", bytes)]);
+        assert!(mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| {
+                publish_recording(&storage, &state, publication, Some(storage.scopes.files))
+            }
+        )
+        .is_err());
+        assert_eq!(
+            state.borrow().events,
+            ["uidl", "retr:1", "files", "disconnect"]
+        );
+
+        let bytes = raw("mail-fail@example.test");
+        let expected =
+            mail::pop_publication(fixture.account, fixture.config, "uid-mail", &bytes).unwrap();
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let transaction = fake_pop(state.clone(), vec![(2, "uid-mail", bytes.clone())]);
+        assert!(mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| {
+                publish_recording(&storage, &state, publication, Some(storage.scopes.mail))
+            }
+        )
+        .is_err());
+        assert_eq!(
+            state.borrow().events,
+            ["uidl", "retr:2", "files", "mail", "disconnect"]
+        );
+        let views = storage.views().unwrap();
+        assert!(fragment_is_materialized(
+            &views.files.facts,
+            &expected.files
+        ));
+        assert!(!fragment_is_materialized(&views.mail.facts, &expected.mail));
+
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let transaction = fake_pop(state.clone(), vec![(2, "uid-mail", bytes)]);
+        mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| publish_recording(&storage, &state, publication, None),
+        )
+        .unwrap();
+        assert_eq!(
+            state.borrow().events,
+            ["uidl", "retr:2", "mail", "dele:2", "quit"]
+        );
+        assert_eq!(state.borrow().committed, [2]);
+    }
+
+    #[test]
+    fn dele_and_quit_failures_leave_durable_mail_without_claiming_rollback() {
+        for fail_quit in [false, true] {
+            let fixture = Fixture::new();
+            let storage = fixture.storage();
+            let bytes = raw(if fail_quit {
+                "quit-fail@example.test"
+            } else {
+                "dele-fail@example.test"
+            });
+            let uidl = if fail_quit { "uid-quit" } else { "uid-dele" };
+            let expected =
+                mail::pop_publication(fixture.account, fixture.config, uidl, &bytes).unwrap();
+            let state = Rc::new(RefCell::new(PopState::default()));
+            let mut transaction = fake_pop(state.clone(), vec![(1, uidl, bytes)]);
+            transaction.fail_dele = (!fail_quit).then_some(1);
+            transaction.fail_quit = fail_quit;
+            let error = mail::drain_pop(
+                transaction,
+                fixture.account,
+                fixture.config,
+                |publication| publish_recording(&storage, &state, publication, None),
+            )
+            .unwrap_err();
+            let views = storage.views().unwrap();
+            assert!(fragment_is_materialized(&views.mail.facts, &expected.mail));
+            assert!(state.borrow().committed.is_empty());
+            if fail_quit {
+                assert!(format!("{error:#}").contains("uncertain"));
+                assert_eq!(
+                    state.borrow().events,
+                    [
+                        "uidl",
+                        "retr:1",
+                        "files",
+                        "mail",
+                        "dele:1",
+                        "quit",
+                        "disconnect"
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    state.borrow().events,
+                    ["uidl", "retr:1", "files", "mail", "dele:1", "disconnect"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_maildrop_quits_and_late_failure_commits_no_earlier_delete() {
+        let state = Rc::new(RefCell::new(PopState::default()));
+        mail::drain_pop(
+            fake_pop(state.clone(), Vec::new()),
+            id(72),
+            id(73),
+            |_| unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(state.borrow().events, ["uidl", "quit"]);
+
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let state = Rc::new(RefCell::new(PopState::default()));
+        let transaction = fake_pop(
+            state.clone(),
+            vec![
+                (1, "uid-first", raw("first@example.test")),
+                (2, "uid-second", raw("second@example.test")),
+            ],
+        );
+        let mut seen = 0usize;
+        let error = mail::drain_pop(
+            transaction,
+            fixture.account,
+            fixture.config,
+            |publication| {
+                seen += 1;
+                if seen == 2 {
+                    state.borrow_mut().events.push("publish-2-failed".into());
+                    bail!("scripted second-message failure");
+                }
+                publish_recording(&storage, &state, publication, None)
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("second-message"));
+        assert_eq!(state.borrow().marked, [1]);
+        assert!(state.borrow().committed.is_empty());
+        assert_eq!(
+            state.borrow().events,
+            [
+                "uidl",
+                "retr:1",
+                "files",
+                "mail",
+                "dele:1",
+                "retr:2",
+                "publish-2-failed",
+                "disconnect"
+            ]
+        );
     }
 }

@@ -1,14 +1,14 @@
-= Harness Hooks: Mechanical Colony Sync (Watcher, Poll, Enforcement)
+= Harness Hooks: Mechanical Agent Sync (Watcher, Poll, Enforcement)
 
 Frontier models have no internal clock. Between turns nothing
 ticks; an agent that means to "keep watching" simply stops
-existing until something external prods it. JP watched the
-colony sit idle for an hour (2026-07-12) with every zooid
+existing until something external prods it. An operator watched a
+team sit idle for an hour with every agent
 *intending* to be responsive — that observation is why this
 layer exists. The fix is mechanical, not motivational: harness
 hooks that push, poll, and refuse to let a turn end
 unentangled. Installing them is part of standing up any new
-zooid window, alongside the
+agent window, alongside the
 [coordination recipe](wiki:45e1b9bef3ad9836536ab7bce367deb0)
 this fragment extends.
 
@@ -26,7 +26,7 @@ this fragment extends.
     hooks: it prints the same terse news `wait` would print
     and advances the persona's checkpoint, or prints *nothing*
     when quiet. Wired into a turn-boundary hook it gives a
-    busy session passive news ingestion — you hear the colony
+    busy session passive news ingestion — you hear the team
     while working, without ever blocking on it.
   + *Enforcement* — a Stop-class hook that mechanically blocks
     ending a turn while no watcher process exists for your
@@ -81,7 +81,7 @@ as JSON `additionalContext`:
 ```sh
 jq -n --arg n "$NEWS" '{"hookSpecificOutput":
   {"hookEventName":"UserPromptSubmit",
-   "additionalContext":("=== COLONY NEWS (orient poll) ===\n" + $n + "…")}}'
+   "additionalContext":("=== ORIENT NEWS (orient poll) ===\n" + $n + "…")}}'
 ```
 
 `check-watcher.sh` is the enforcement layer. If no
@@ -112,19 +112,20 @@ a long-running exec call before substantive work, retain its
 session id, poll it during long work, re-arm immediately on
 fire, and subagents must not start competing watchers.
 
-`orient_session_start.sh` pkills watchers inherited from
-older, now-unreachable Codex exec sessions (a stale watcher
-would keep advancing the persona checkpoint while its output
-is attached to a session nobody can read), then prints the
-watcher-first instruction as developer context. Codex command
-hooks are synchronous, so the hook *cannot* start the watcher
-itself — it makes ownership a mechanically checked obligation
-instead. `orient_stop.sh` allows Stop only while a watcher is
-live; absent one it emits `{"decision":"block","reason":…}`
-for exactly one automatic continuation (it greps the input
-for `"stop_hook_active": true`), then on a second failed Stop
-surfaces a visible `systemMessage` and lets the turn end —
-no infinite loop on a missing binary.
+The Codex scripts share one canonical matcher for `(persona, pile)`. It is
+independent of flag order and spelling, understands `PILE` / `PERSONA`
+environment forms, and resolves a relative pile against the process cwd.
+Session start kills only an exact matching watcher that is provably orphaned
+(a direct child of init); it preserves any watcher with a live or ambiguous
+owner. It then reports either ARMED or arm-first context. Codex command hooks
+are synchronous, so the hook *cannot* start the watcher itself — it makes
+ownership a mechanically checked obligation instead. `orient_stop.sh` uses
+the same matcher, ignores provably stale watchers, and allows Stop only while a
+matching live watcher is armed. Otherwise it emits
+`{"decision":"block","reason":…}` for exactly one automatic continuation
+(it greps the input for `"stop_hook_active": true`), then surfaces a visible
+`systemMessage` and lets the second failed Stop end — no infinite loop on a
+missing binary.
 
 Codex currently fires `UserPromptSubmit` hooks for root and
 subagents alike without exposing which one fired
@@ -136,7 +137,7 @@ root watcher. The hook exits silently when quiet and wraps
 news as `hookSpecificOutput.additionalContext` when present.
 
 *Trust caveat*: Codex treats project hooks as untrusted on
-first sight (hash-trusted). JP must "Trust all and continue"
+first sight (hash-trusted). The operator must "Trust all and continue"
 at the prompt, or review once via `/hooks`, before a new or
 *changed* hook definition runs. Silent hook inaction after an
 edit usually means the hash changed and re-trusting is due.
@@ -161,7 +162,7 @@ when missing. `pre_invocation.sh` is the poll layer: it runs
 `orient --persona <your-persona> poll` and outputs
 
 ```json
-{"injectSteps": [{"ephemeralMessage": "…NEW COLONY MESSAGES:…"}]}
+{"injectSteps": [{"ephemeralMessage": "…NEW ORIENT MESSAGES:…"}]}
 ```
 
 — news injected as an ephemeral message when there is any, a
@@ -186,7 +187,7 @@ SIGKILL on cargo-managed replacement). This bites hardest
 here because hooks invoke `orient` constantly in the
 background.
 
-== Onboarding checklist for a new zooid window
+== Onboarding checklist for a new agent window
 
   + `export PERSONA=<your-label>` (from the relations roster).
   + Confirm the project's hook files exist for *your* harness
@@ -195,8 +196,8 @@ background.
   + For Codex: trust the hooks once (`/hooks`).
   + Arm the watcher as a harness-tracked background task;
     watch the Stop hook let your first turn end.
-  + Send yourself nothing — send the colony a hello
-    (`message send colony <text>`) and see the *others* wake
+  + Send yourself nothing — send one of your Relations groups a hello
+    (`message send <group> <text>`) and see the *others* wake
     while your own watcher stays quiet. That silence is the
     attribution filter working.
 

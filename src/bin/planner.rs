@@ -1,416 +1,338 @@
-//! `planner` — calendar / event-tracking faculty.
+//! `planner` — collection-native calendar and event tracking.
 //!
-//! Stores events as RFC 5545 VEVENT-shaped tribles in the pile
-//! (see `faculties::schemas::planner`). Manual create/edit, plus
-//! `.ics` ingest so meeting invites land directly in the pile
-//! without a manual data-entry round-trip.
+//! Each mutation publishes one immutable fragment into the Planner union
+//! collection. Events are UID-derived records; cancellation is a separate
+//! monotone assertion rather than a second value for a scalar status field.
 
-use anyhow::{bail, Context, Result};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use clap::{Parser, Subcommand};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::planner::{event, note, DEFAULT_BRANCH, KIND_EVENT_ID, KIND_NOTE_ID};
-use hifitime::Epoch;
-use rand_core::OsRng;
-use rrule::{RRuleSet, Tz};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use clap::{Parser, Subcommand};
+use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::planner::{
+    self as planner_model, cancellation_fragment, event_facts, event_fragment, note_fragment,
+    read_text, EventDraft, EventRow, IntervalValue, PlannerCatalog, STATUS_CANCELLED,
+    STATUS_CONFIRMED, TRANSP_OPAQUE,
+};
+use faculties::schemas::planner::DEFAULT_SCOPE_ID;
+use hifitime::Epoch;
+use rrule::{RRuleSet, Tz};
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
-type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-
-const STATUS_CONFIRMED: &str = "CONFIRMED";
-const STATUS_TENTATIVE: &str = "TENTATIVE";
-const STATUS_CANCELLED: &str = "CANCELLED";
-const TRANSP_OPAQUE: &str = "OPAQUE";
-const TRANSP_TRANSPARENT: &str = "TRANSPARENT";
-
-// ── CLI ───────────────────────────────────────────────────────────────────
-
 #[derive(Parser)]
-#[command(version = faculties::GIT_VERSION, name = "planner", about = "Calendar / event-tracking faculty")]
+#[command(
+    version = faculties::GIT_VERSION,
+    name = "planner",
+    about = "Calendar and event-tracking faculty"
+)]
 struct Cli {
-    /// Path to the pile file
+    /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name for the planner state
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
-    /// Branch id for the planner (hex). Overrides `--branch`.
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Add an event manually. Times are ISO 8601 — date (`2026-05-15`),
-    /// datetime (`2026-05-15T14:00`), or with TZ (`2026-05-15T14:00:00+02:00`).
-    /// All-day events use date-only times and span midnight-to-midnight UTC.
+    /// Add an event manually. Times are ISO 8601 dates or datetimes.
     Add {
         /// Event title (RFC 5545 SUMMARY).
         summary: String,
-        /// Start time (ISO 8601 — date or datetime).
+        /// Start time (ISO 8601 date or datetime).
         #[arg(long)]
         from: String,
-        /// End time. Defaults to a 1-hour interval after `--from` for
-        /// timed events and 24h after for date-only events.
+        /// End time. Defaults to one hour, or one day for date-only starts.
         #[arg(long)]
         to: Option<String>,
-        /// RFC 5545 recurrence rule (e.g. `FREQ=WEEKLY;BYDAY=MO`).
+        /// RFC 5545 recurrence rule (for example `FREQ=WEEKLY;BYDAY=MO`).
         #[arg(long)]
         rrule: Option<String>,
-        /// Free-text location (room, video link, …).
+        /// Free-text location.
         #[arg(long)]
         location: Option<String>,
-        /// `tentative` / `confirmed` / `cancelled` (default `confirmed`).
+        /// `tentative`, `confirmed`, or `cancelled`.
         #[arg(long)]
         status: Option<String>,
-        /// `opaque` (default — blocks the slot) or `transparent`
-        /// (informational, doesn't block).
+        /// `opaque` (default) or `transparent`.
         #[arg(long)]
         transp: Option<String>,
-        /// Long-form description. Use @path for file input or @- for stdin.
+        /// Long-form description. Use @path or @-.
         #[arg(long)]
         description: Option<String>,
-        /// Initial note body. Use @path for file input or @- for stdin.
+        /// Initial note body. Use @path or @-.
         #[arg(long)]
         note: Option<String>,
     },
-    /// List events overlapping the given window (defaults to "all").
+    /// List events overlapping a window (defaults to all events).
     List {
-        /// Window start (ISO 8601). Default: epoch.
         #[arg(long)]
         from: Option<String>,
-        /// Window end (ISO 8601). Default: far future.
         #[arg(long)]
         to: Option<String>,
-        /// Show cancelled events too.
+        /// Include cancelled events.
         #[arg(long)]
         all: bool,
     },
-    /// Events overlapping today (local TZ).
+    /// Events overlapping today in the local timezone.
     Today,
-    /// Events overlapping the next 7 days (local TZ).
+    /// Events overlapping the next seven days in the local timezone.
     Week,
-    /// Next upcoming event from now.
+    /// Next upcoming event.
     Next,
-    /// Add a note (free-text context) to an event.
+    /// Attach an immutable note to an event.
     Note {
-        /// Full 32-char hex event id.
+        /// Event id or unambiguous hex prefix.
         id: String,
-        /// Note body. Use @path for file input or @- for stdin.
+        /// Note body. Use @path or @-.
         text: String,
     },
-    /// Show an event with all properties + notes.
+    /// Show an event and its notes.
     Show {
-        /// Full 32-char hex event id.
+        /// Event id or unambiguous hex prefix.
         id: String,
     },
-    /// Cancel an event (sets STATUS=CANCELLED; history-preserving).
+    /// Assert monotonically that an event is cancelled.
     Cancel {
-        /// Full 32-char hex event id.
+        /// Event id or unambiguous hex prefix.
         id: String,
     },
-    /// Resolve a hex prefix to a full 32-char event id.
+    /// Resolve an event-id prefix.
     Resolve { prefix: String },
-    /// Ingest one or more `.ics` calendar files. Each VEVENT becomes
-    /// an event entity (decomposed into tribles); the original UID is
-    /// preserved so re-ingesting the same file is idempotent.
-    Ingest {
-        /// One or more `.ics` files.
-        files: Vec<PathBuf>,
-    },
+    /// Ingest one or more iCalendar files atomically.
+    Ingest { files: Vec<PathBuf> },
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────
+#[derive(Clone, Copy)]
+struct PlannerStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+}
+
+struct LoadedPlanner {
+    facts: TribleSet,
+    reader: PileReader,
+    catalog: PlannerCatalog,
+}
+
+impl PlannerStorage<'_> {
+    fn with_collection<T>(
+        &self,
+        operation: impl FnOnce(&mut Collection<Pile>, &LoadedPlanner) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let result = (|| {
+            let facts = collection
+                .materialize()
+                .context("materialize Planner collection")?;
+            let reader = collection
+                .storage_mut()
+                .reader()
+                .context("open Planner blob reader")?;
+            let catalog = planner_model::validate_catalog(&reader, &facts)
+                .context("validate Planner collection")?;
+            let loaded = LoadedPlanner {
+                facts,
+                reader,
+                catalog,
+            };
+            operation(&mut collection, &loaded)
+        })();
+        finish_pile(collection.into_storage(), result)
+    }
+
+    fn with_view<T>(&self, operation: impl FnOnce(&LoadedPlanner) -> Result<T>) -> Result<T> {
+        self.with_collection(|_, loaded| operation(loaded))
+    }
+
+    fn update<T>(
+        &self,
+        description: &'static str,
+        operation: impl FnOnce(&LoadedPlanner) -> Result<(Option<Fragment>, T)>,
+    ) -> Result<T> {
+        self.with_collection(|collection, loaded| {
+            let (fragment, value) = operation(loaded)?;
+            if let Some(mut fragment) = fragment {
+                planner_model::validate_candidate(&loaded.reader, &loaded.facts, &fragment)
+                    .context("validate Planner mutation")?;
+                fragment.describe_with(entity! { metadata::description: description });
+                collection
+                    .commit(fragment)
+                    .context("commit authored Planner fragment")?;
+            }
+            Ok(value)
+        })
+    }
+
+    #[cfg(test)]
+    fn commit_count(&self) -> Result<usize> {
+        let signer = load_signer(self.pile, self.key)?;
+        let author = signer.verifying_key().to_bytes();
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = faculties::collection_cutover::discover_target(&mut pile, DEFAULT_SCOPE_ID)
+            .map(|target| {
+                target
+                    .commits()
+                    .iter()
+                    .filter(|commit| commit.public_key().raw == author)
+                    .count()
+            });
+        finish_pile(pile, result)
+    }
+}
+
+fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context("close Planner pile")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing Planner pile also failed: {close_error}")))
+        }
+    }
+}
 
 fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn epoch_to_chrono_utc(e: Epoch) -> DateTime<Utc> {
-    // hifitime Epoch -> seconds since unix epoch -> chrono UTC
-    let secs = e.to_unix_seconds();
-    Utc.timestamp_opt(secs as i64, ((secs.fract() * 1e9) as u32).min(999_999_999))
-        .single()
-        .unwrap_or_else(Utc::now)
+fn point_interval(epoch: Epoch) -> IntervalValue {
+    (epoch, epoch)
+        .try_to_inline()
+        .expect("an Epoch point is a valid interval")
 }
 
-fn chrono_to_epoch(dt: DateTime<Utc>) -> Epoch {
-    Epoch::from_unix_seconds(dt.timestamp() as f64 + dt.timestamp_subsec_nanos() as f64 * 1e-9)
+fn epoch_to_chrono_utc(epoch: Epoch) -> DateTime<Utc> {
+    let seconds = epoch.to_unix_seconds();
+    Utc.timestamp_opt(
+        seconds as i64,
+        ((seconds.fract() * 1e9) as u32).min(999_999_999),
+    )
+    .single()
+    .unwrap_or_else(Utc::now)
 }
 
-fn make_interval(start: Epoch, end: Epoch) -> IntervalValue {
-    (start, end).try_to_inline().unwrap()
-}
-
-fn unpack_interval(iv: IntervalValue) -> (Epoch, Epoch) {
-    iv.try_from_inline().unwrap()
-}
-
-/// Parse an ISO 8601 string into a UTC datetime, treating date-only
-/// inputs as midnight UTC and datetimes-without-tz as UTC.
-fn parse_iso8601(input: &str) -> Result<DateTime<Utc>> {
-    let trimmed = input.trim();
-    // Datetime with explicit offset (`+02:00`, `Z`).
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-    // Datetime without offset — assume UTC.
-    if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
-        return Ok(Utc.from_utc_datetime(&naive));
-    }
-    if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M") {
-        return Ok(Utc.from_utc_datetime(&naive));
-    }
-    // Date-only.
-    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        let naive = date.and_hms_opt(0, 0, 0).unwrap();
-        return Ok(Utc.from_utc_datetime(&naive));
-    }
-    bail!(
-        "could not parse '{}' as ISO 8601 (date `2026-05-15`, datetime `2026-05-15T14:00`, \
-         or RFC 3339 `2026-05-15T14:00:00+02:00`)",
-        trimmed
+fn chrono_to_epoch(datetime: DateTime<Utc>) -> Epoch {
+    Epoch::from_unix_seconds(
+        datetime.timestamp() as f64 + datetime.timestamp_subsec_nanos() as f64 * 1e-9,
     )
 }
 
-/// Returns true if the input parses as date-only (no time component).
-fn is_date_only(input: &str) -> bool {
-    NaiveDate::parse_from_str(input.trim(), "%Y-%m-%d").is_ok()
+fn make_interval(start: Epoch, end: Epoch) -> IntervalValue {
+    (start, end)
+        .try_to_inline()
+        .expect("ordered Epoch endpoints form an interval")
 }
 
-fn fmt_interval(iv: IntervalValue) -> String {
-    let (start, end) = unpack_interval(iv);
-    let s = epoch_to_chrono_utc(start);
-    let e = epoch_to_chrono_utc(end);
-    if s == e {
-        s.format("%Y-%m-%d %H:%M UTC").to_string()
-    } else if (e - s).num_seconds() == 86_400 && s.format("%H:%M:%S").to_string() == "00:00:00" {
-        // Single all-day window, render as a date.
-        s.format("%Y-%m-%d (all day)").to_string()
-    } else {
-        format!(
-            "{} → {}",
-            s.format("%Y-%m-%d %H:%M"),
-            e.format("%Y-%m-%d %H:%M UTC")
-        )
+fn unpack_interval(interval: IntervalValue) -> (Epoch, Epoch) {
+    interval
+        .try_from_inline()
+        .expect("validated Planner interval")
+}
+
+fn interval_key(interval: IntervalValue) -> i128 {
+    let (start, _): (i128, i128) = interval
+        .try_from_inline()
+        .expect("validated Planner interval");
+    start
+}
+
+fn parse_iso8601(input: &str) -> Result<DateTime<Utc>> {
+    let input = input.trim();
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(input) {
+        return Ok(datetime.with_timezone(&Utc));
     }
+    if let Ok(datetime) = NaiveDateTime::parse_from_str(input, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(Utc.from_utc_datetime(&datetime));
+    }
+    if let Ok(datetime) = NaiveDateTime::parse_from_str(input, "%Y-%m-%dT%H:%M") {
+        return Ok(Utc.from_utc_datetime(&datetime));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
+        return Ok(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("midnight exists")));
+    }
+    bail!("could not parse '{input}' as an ISO 8601 date, local datetime, or RFC 3339 datetime")
+}
+
+fn is_date_only(input: &str) -> bool {
+    NaiveDate::parse_from_str(input.trim(), "%Y-%m-%d").is_ok()
 }
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn parse_full_id_strict(input: &str) -> Result<Id> {
-    let trimmed = input.trim();
-    Id::from_hex(trimmed)
-        .ok_or_else(|| anyhow::anyhow!("invalid id '{}': expected 32-char hex", trimmed))
-}
-
-fn validate_short(label: &str, value: &str) -> Result<()> {
-    if value.as_bytes().len() > 32 {
-        bail!("{label} exceeds 32 bytes: {value}");
+fn fmt_interval(interval: IntervalValue) -> String {
+    let (start, end) = unpack_interval(interval);
+    let start = epoch_to_chrono_utc(start);
+    let end = epoch_to_chrono_utc(end);
+    if start == end {
+        start.format("%Y-%m-%d %H:%M UTC").to_string()
+    } else if (end - start).num_seconds() == 86_400
+        && start.format("%H:%M:%S").to_string() == "00:00:00"
+    {
+        start.format("%Y-%m-%d (all day)").to_string()
+    } else {
+        format!(
+            "{} → {}",
+            start.format("%Y-%m-%d %H:%M"),
+            end.format("%Y-%m-%d %H:%M UTC")
+        )
     }
-    if value.as_bytes().iter().any(|b| *b == 0) {
-        bail!("{label} contains NUL bytes: {value}");
+}
+
+fn resolve_event_id(input: &str, catalog: &PlannerCatalog) -> Result<Id> {
+    faculties::resolve_id_prefix(input, catalog.events.keys().copied())
+}
+
+fn normalized_status(value: Option<&str>) -> String {
+    value.unwrap_or(STATUS_CONFIRMED).to_ascii_uppercase()
+}
+
+fn normalized_transp(value: Option<&str>) -> String {
+    value.unwrap_or(TRANSP_OPAQUE).to_ascii_uppercase()
+}
+
+fn empty_event_draft(
+    uid: String,
+    summary: String,
+    time: IntervalValue,
+    status: String,
+    transp: String,
+) -> EventDraft {
+    EventDraft {
+        uid,
+        summary,
+        description: None,
+        time,
+        rrule: None,
+        rdates: BTreeSet::new(),
+        exdates: BTreeSet::new(),
+        location: None,
+        status,
+        transp,
+        attendees: BTreeSet::new(),
+        organizer: None,
+        sequence: None,
     }
-    Ok(())
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
-}
-
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
-fn resolve_branch(
-    repo: &mut Repository<Pile>,
-    branch_name: &str,
-    branch_id_hex: Option<&str>,
-) -> Result<Id> {
-    if let Some(hex) = branch_id_hex {
-        return parse_full_id_strict(hex);
-    }
-    repo.ensure_branch(branch_name, None)
-        .map_err(|e| anyhow::anyhow!("ensure branch '{branch_name}': {e:?}"))
-}
-
-// ── queries ───────────────────────────────────────────────────────────────
-
-fn all_event_ids(space: &TribleSet) -> Vec<Id> {
-    let mut ids: Vec<Id> = find!(
-        e: Id,
-        pattern!(space, [{ ?e @ metadata::tag: KIND_EVENT_ID }])
-    )
-    .collect();
-    ids.sort();
-    ids
-}
-
-fn event_summary(_ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
-    find!(s: String, pattern!(space, [{ id @ event::summary: ?s }]))
-        .next()
-        .unwrap_or_else(|| "(untitled)".to_string())
-}
-
-fn event_time(space: &TribleSet, id: Id) -> Option<IntervalValue> {
-    find!(t: IntervalValue, pattern!(space, [{ id @ event::time: ?t }])).next()
-}
-
-fn event_status(space: &TribleSet, id: Id) -> String {
-    find!(s: String, pattern!(space, [{ id @ event::status: ?s }]))
-        .next()
-        .unwrap_or_else(|| STATUS_CONFIRMED.to_string())
-}
-
-fn event_rrule(space: &TribleSet, id: Id) -> Option<String> {
-    find!(r: String, pattern!(space, [{ id @ event::rrule: ?r }])).next()
-}
-
-fn event_location(space: &TribleSet, id: Id) -> Option<String> {
-    find!(s: String, pattern!(space, [{ id @ event::location: ?s }])).next()
-}
-
-fn event_ical_uid(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    let h: TextHandle =
-        find!(h: TextHandle, pattern!(space, [{ id @ event::ical_uid: ?h }])).next()?;
-    read_text(ws, h)
-}
-
-fn event_description_handle(space: &TribleSet, id: Id) -> Option<TextHandle> {
-    find!(h: TextHandle, pattern!(space, [{ id @ event::description: ?h }])).next()
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, blobencodings::LongString>(h)
-        .ok()
-        .map(|view| view.to_string())
-}
-
-fn resolve_event_id(input: &str, space: &TribleSet) -> Result<Id> {
-    faculties::resolve_id_prefix(input, all_event_ids(space))
-}
-
-// ── recurrence expansion ──────────────────────────────────────────────────
-
-/// Expand an event's actual occurrences within `[window_start, window_end]`.
-/// Returns the per-occurrence `(start, end)` pairs in UTC.
-fn occurrences_in_window(
-    base: (Epoch, Epoch),
-    rrule_str: Option<&str>,
-    window: (Epoch, Epoch),
-) -> Vec<(Epoch, Epoch)> {
-    let (base_start, base_end) = base;
-    let duration = base_end - base_start;
-    let (win_start, win_end) = window;
-
-    // No RRULE: single occurrence; check overlap with window.
-    let Some(rrule) = rrule_str else {
-        let overlaps = !(base_end < win_start || base_start > win_end);
-        return if overlaps {
-            vec![(base_start, base_end)]
-        } else {
-            vec![]
-        };
-    };
-
-    // Build an RRuleSet from `DTSTART:...` + the rule string. The rrule
-    // crate parses this combined form. UTC throughout — caller normalizes.
-    let dtstart_chrono = epoch_to_chrono_utc(base_start);
-    let dtstart_str = dtstart_chrono.format("%Y%m%dT%H%M%SZ").to_string();
-    let combined = format!("DTSTART:{dtstart_str}\nRRULE:{rrule}");
-    let Ok(set) = combined.parse::<RRuleSet>() else {
-        return vec![]; // malformed RRULE — silently skip
-    };
-
-    let win_start_chrono = epoch_to_chrono_utc(win_start).with_timezone(&Tz::UTC);
-    let win_end_chrono = epoch_to_chrono_utc(win_end).with_timezone(&Tz::UTC);
-
-    let set = set.after(win_start_chrono).before(win_end_chrono);
-    let result = set.all(10_000);
-    result
-        .dates
-        .into_iter()
-        .map(|dt| {
-            let occ_start = chrono_to_epoch(dt.with_timezone(&Utc));
-            let occ_end = occ_start + duration;
-            (occ_start, occ_end)
-        })
-        .collect()
-}
-
-// ── kind entity (planner branch) ──────────────────────────────────────────
-
-fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let existing: HashSet<Id> = find!(
-        (kind: Id),
-        pattern!(&space, [{ ?kind @ metadata::name: _?handle }])
-    )
-    .map(|(kind,)| kind)
-    .collect();
-    let mut change = TribleSet::new();
-    let label = |id: Id| -> &'static str {
-        if id == KIND_EVENT_ID {
-            "planner-event"
-        } else {
-            "planner-note"
-        }
-    };
-    for kind in [KIND_EVENT_ID, KIND_NOTE_ID] {
-        if !existing.contains(&kind) {
-            let name = ws.put(label(kind));
-            change += entity! { ExclusiveId::force_ref(&kind) @
-                metadata::name: name,
-            };
-        }
-    }
-    Ok(change)
-}
-
-// ── add ───────────────────────────────────────────────────────────────────
-
+#[allow(clippy::too_many_arguments)]
 fn cmd_add(
-    pile: &Path,
-    _: &str,
-    branch_id: Id,
+    storage: PlannerStorage<'_>,
     summary: String,
     from: String,
     to: Option<String>,
@@ -419,113 +341,47 @@ fn cmd_add(
     status: Option<String>,
     transp: Option<String>,
     description: Option<String>,
-    note_text: Option<String>,
+    note: Option<String>,
 ) -> Result<()> {
-    if summary.as_bytes().len() > 32 {
-        bail!("summary exceeds 32 bytes (use --description for long-form text)");
-    }
-    let from_dt = parse_iso8601(&from)?;
-    let date_only = is_date_only(&from);
-    let to_dt = if let Some(t) = &to {
-        parse_iso8601(t)?
-    } else if date_only {
-        from_dt + chrono::Duration::days(1)
-    } else {
-        from_dt + chrono::Duration::hours(1)
+    let start = parse_iso8601(&from)?;
+    let end = match to {
+        Some(to) => parse_iso8601(&to)?,
+        None if is_date_only(&from) => start + chrono::Duration::days(1),
+        None => start + chrono::Duration::hours(1),
     };
-    if to_dt < from_dt {
+    if end < start {
         bail!("--to is before --from");
     }
-    let interval = make_interval(chrono_to_epoch(from_dt), chrono_to_epoch(to_dt));
-
-    if let Some(s) = &status {
-        let upper = s.to_uppercase();
-        if !matches!(
-            upper.as_str(),
-            STATUS_CONFIRMED | STATUS_TENTATIVE | STATUS_CANCELLED
-        ) {
-            bail!("--status must be one of confirmed/tentative/cancelled");
-        }
-        validate_short("status", &upper)?;
-    }
-    if let Some(t) = &transp {
-        let upper = t.to_uppercase();
-        if !matches!(upper.as_str(), TRANSP_OPAQUE | TRANSP_TRANSPARENT) {
-            bail!("--transp must be opaque or transparent");
-        }
-    }
-    if let Some(loc) = &location {
-        validate_short("location", loc)?;
-    }
-
-    let description_body = description
-        .map(|raw| faculties::text_arg(&raw, "description"))
+    let description = description
+        .map(|value| faculties::text_arg(&value, "description"))
         .transpose()?;
-    let note_body = note_text
-        .map(|raw| faculties::text_arg(&raw, "note"))
+    let note = note
+        .map(|value| faculties::text_arg(&value, "note"))
         .transpose()?;
 
-    let resolved_event_id = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+    // The random seed is only the local UID namespace. Once minted, both the
+    // UID and event identity are ordinary deterministic content-derived data.
+    let uid = format!("{:x}@triblespace", genid().id);
+    let mut draft = empty_event_draft(
+        uid,
+        summary,
+        make_interval(chrono_to_epoch(start), chrono_to_epoch(end)),
+        normalized_status(status.as_deref()),
+        normalized_transp(transp.as_deref()),
+    );
+    draft.rrule = rrule;
+    draft.location = location;
+    draft.description = description;
 
-        let event_id = ufoid();
-        let event_ref = event_id.id;
-        let now = (now_epoch(), now_epoch()).try_to_inline().unwrap();
-
-        let status_str = status
-            .as_deref()
-            .map(str::to_uppercase)
-            .unwrap_or_else(|| STATUS_CONFIRMED.to_string());
-        let transp_str = transp
-            .as_deref()
-            .map(str::to_uppercase)
-            .unwrap_or_else(|| TRANSP_OPAQUE.to_string());
-        let synth_uid = format!("{:x}@triblespace", event_ref);
-
-        let description_handle: Option<TextHandle> =
-            description_body.as_deref().map(|d| ws.put(d.to_string()));
-        let location_str = location.clone();
-        let rrule_str = rrule.clone();
-        let uid_handle: TextHandle = ws.put(synth_uid);
-
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-        change += entity! { &event_id @
-            metadata::tag: &KIND_EVENT_ID,
-            metadata::created_at: now,
-            event::summary: summary.as_str(),
-            event::time: interval,
-            event::status: status_str.as_str(),
-            event::transp: transp_str.as_str(),
-            event::ical_uid: uid_handle,
-            event::description?: description_handle.as_ref(),
-            event::location?: location_str.as_deref(),
-            event::rrule?: rrule_str.as_deref(),
-        };
-
-        if let Some(text) = note_body {
-            let note_id = ufoid();
-            let text_handle = ws.put(text);
-            change += entity! { &note_id @
-                metadata::tag: &KIND_NOTE_ID,
-                metadata::created_at: now,
-                note::note_about: &event_ref,
-                note::note_text: text_handle,
-            };
-        }
-
-        ws.commit(change, "add event");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push event: {e:?}"))?;
-        Ok(event_ref)
-    })?;
-    println!("Added event {}", fmt_id(resolved_event_id));
+    let mut fragment = event_fragment(&draft)?;
+    let event_id = fragment.root().expect("event fragment has one root");
+    if let Some(note) = note {
+        fragment += note_fragment(event_id, &note, point_interval(now_epoch()))?;
+    }
+    storage.update("add event", |_| Ok((Some(fragment), ())))?;
+    println!("Added event {}", fmt_id(event_id));
     Ok(())
 }
-
-// ── list / today / week / next ────────────────────────────────────────────
 
 struct Occurrence {
     event_id: Id,
@@ -536,50 +392,103 @@ struct Occurrence {
     location: Option<String>,
 }
 
+fn rrule_occurrences(row: &EventRow, window: (Epoch, Epoch)) -> Result<Vec<(Epoch, Epoch)>> {
+    let (base_start, base_end) = unpack_interval(row.time);
+    let duration = base_end - base_start;
+    let (window_start, window_end) = window;
+    let mut occurrences = Vec::new();
+
+    if let Some(rule) = &row.rrule {
+        let dtstart = epoch_to_chrono_utc(base_start)
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+        let combined = format!("DTSTART:{dtstart}\nRRULE:{rule}");
+        let set = combined
+            .parse::<RRuleSet>()
+            .with_context(|| format!("parse RRULE on event {}", fmt_id(row.id)))?;
+        let result = set
+            .after(epoch_to_chrono_utc(window_start).with_timezone(&Tz::UTC))
+            .before(epoch_to_chrono_utc(window_end).with_timezone(&Tz::UTC))
+            .all(10_000);
+        occurrences.extend(result.dates.into_iter().map(|datetime| {
+            let start = chrono_to_epoch(datetime.with_timezone(&Utc));
+            (start, start + duration)
+        }));
+    } else {
+        occurrences.push((base_start, base_end));
+    }
+    occurrences.extend(row.rdates.iter().copied().map(unpack_interval));
+
+    let exclusions: BTreeSet<(i128, i128)> = row
+        .exdates
+        .iter()
+        .map(|value| value.try_from_inline().expect("validated EXDATE"))
+        .collect();
+    occurrences.retain(|(start, end)| {
+        let encoded: (i128, i128) = make_interval(*start, *end)
+            .try_from_inline()
+            .expect("valid occurrence interval");
+        !exclusions.contains(&encoded) && !(*end < window_start || *start > window_end)
+    });
+    occurrences.sort_by_key(|(start, end)| {
+        let encoded: (i128, i128) = make_interval(*start, *end)
+            .try_from_inline()
+            .expect("valid occurrence interval");
+        encoded
+    });
+    occurrences.dedup_by_key(|(start, end)| {
+        let encoded: (i128, i128) = make_interval(*start, *end)
+            .try_from_inline()
+            .expect("valid occurrence interval");
+        encoded
+    });
+    Ok(occurrences)
+}
+
 fn collect_occurrences(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
+    catalog: &PlannerCatalog,
     window: (Epoch, Epoch),
     show_cancelled: bool,
-) -> Vec<Occurrence> {
-    let mut out = Vec::new();
-    for id in all_event_ids(space) {
-        let Some(time_iv) = event_time(space, id) else {
-            continue;
-        };
-        let status = event_status(space, id);
-        if !show_cancelled && status == STATUS_CANCELLED {
+) -> Result<Vec<Occurrence>> {
+    let mut occurrences = Vec::new();
+    for row in catalog.events.values() {
+        let cancelled = catalog.is_cancelled(row.id);
+        if cancelled && !show_cancelled {
             continue;
         }
-        let summary = event_summary(ws, space, id);
-        let location = event_location(space, id);
-        let rrule = event_rrule(space, id);
-        let base = unpack_interval(time_iv);
-        let occs = occurrences_in_window(base, rrule.as_deref(), window);
-        for (start, end) in occs {
-            out.push(Occurrence {
-                event_id: id,
+        for (start, end) in rrule_occurrences(row, window)? {
+            occurrences.push(Occurrence {
+                event_id: row.id,
                 start,
                 end,
-                summary: summary.clone(),
-                status: status.clone(),
-                location: location.clone(),
+                summary: row.summary.clone(),
+                status: if cancelled {
+                    STATUS_CANCELLED.to_owned()
+                } else {
+                    row.status.clone()
+                },
+                location: row.location.clone(),
             });
         }
     }
-    out.sort_by_key(|o| (o.start.to_tai_seconds() as i128, fmt_id(o.event_id)));
-    out
+    occurrences.sort_by_key(|occurrence| {
+        (
+            make_interval(occurrence.start, occurrence.end).raw,
+            occurrence.event_id,
+        )
+    });
+    Ok(occurrences)
 }
 
-fn print_occurrences(occs: &[Occurrence]) {
-    if occs.is_empty() {
+fn print_occurrences(occurrences: &[Occurrence]) {
+    if occurrences.is_empty() {
         println!("(no events)");
         return;
     }
-    for occ in occs {
-        let start = epoch_to_chrono_utc(occ.start);
-        let end = epoch_to_chrono_utc(occ.end);
-        let timestr = if (end - start).num_seconds() == 86_400
+    for occurrence in occurrences {
+        let start = epoch_to_chrono_utc(occurrence.start);
+        let end = epoch_to_chrono_utc(occurrence.end);
+        let time = if (end - start).num_seconds() == 86_400
             && start.format("%H:%M:%S").to_string() == "00:00:00"
         {
             start.format("%Y-%m-%d (all day)     ").to_string()
@@ -599,376 +508,176 @@ fn print_occurrences(occs: &[Occurrence]) {
         };
         let mut line = format!(
             "  {} {} {}",
-            &fmt_id(occ.event_id)[..8],
-            timestr,
-            occ.summary,
+            &fmt_id(occurrence.event_id)[..8],
+            time,
+            occurrence.summary
         );
-        if let Some(loc) = &occ.location {
-            line.push_str(&format!("  @ {loc}"));
+        if let Some(location) = &occurrence.location {
+            line.push_str(&format!("  @ {location}"));
         }
-        if occ.status != STATUS_CONFIRMED {
-            line.push_str(&format!("  [{}]", occ.status));
+        if occurrence.status != STATUS_CONFIRMED {
+            line.push_str(&format!("  [{}]", occurrence.status));
         }
         println!("{line}");
     }
 }
 
 fn cmd_list(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
+    storage: PlannerStorage<'_>,
     from: Option<String>,
     to: Option<String>,
     show_cancelled: bool,
 ) -> Result<()> {
-    let win_start = from
-        .map(|s| parse_iso8601(&s))
+    let start = from
+        .map(|value| parse_iso8601(&value))
         .transpose()?
-        .map(|d| chrono_to_epoch(d))
+        .map(chrono_to_epoch)
         .unwrap_or_else(|| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-    let win_end = to
-        .map(|s| parse_iso8601(&s))
+    let end = to
+        .map(|value| parse_iso8601(&value))
         .transpose()?
-        .map(|d| chrono_to_epoch(d))
+        .map(chrono_to_epoch)
         .unwrap_or_else(|| Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0));
-
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let occs = collect_occurrences(&mut ws, &space, (win_start, win_end), show_cancelled);
-        print_occurrences(&occs);
+    storage.with_view(|loaded| {
+        print_occurrences(&collect_occurrences(
+            &loaded.catalog,
+            (start, end),
+            show_cancelled,
+        )?);
         Ok(())
     })
 }
 
-fn cmd_today(pile: &Path, _branch_name: &str, branch_id: Id) -> Result<()> {
+fn local_day_window(days: i64) -> (Epoch, Epoch) {
     let now = chrono::Local::now();
-    let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-    let end = start + chrono::Duration::days(1);
-    let win_start = chrono_to_epoch(
-        now.timezone()
-            .from_local_datetime(&start)
-            .unwrap()
-            .with_timezone(&Utc),
-    );
-    let win_end = chrono_to_epoch(
-        now.timezone()
-            .from_local_datetime(&end)
-            .unwrap()
-            .with_timezone(&Utc),
-    );
+    let start = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight exists");
+    let end = start + chrono::Duration::days(days);
+    (
+        chrono_to_epoch(
+            now.timezone()
+                .from_local_datetime(&start)
+                .single()
+                .expect("local midnight is unambiguous")
+                .with_timezone(&Utc),
+        ),
+        chrono_to_epoch(
+            now.timezone()
+                .from_local_datetime(&end)
+                .single()
+                .expect("local midnight is unambiguous")
+                .with_timezone(&Utc),
+        ),
+    )
+}
 
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let occs = collect_occurrences(&mut ws, &space, (win_start, win_end), false);
-        print_occurrences(&occs);
+fn cmd_relative(storage: PlannerStorage<'_>, days: i64) -> Result<()> {
+    storage.with_view(|loaded| {
+        print_occurrences(&collect_occurrences(
+            &loaded.catalog,
+            local_day_window(days),
+            false,
+        )?);
         Ok(())
     })
 }
 
-fn cmd_week(pile: &Path, _branch_name: &str, branch_id: Id) -> Result<()> {
-    let now = chrono::Local::now();
-    let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-    let end = start + chrono::Duration::days(7);
-    let win_start = chrono_to_epoch(
-        now.timezone()
-            .from_local_datetime(&start)
-            .unwrap()
-            .with_timezone(&Utc),
-    );
-    let win_end = chrono_to_epoch(
-        now.timezone()
-            .from_local_datetime(&end)
-            .unwrap()
-            .with_timezone(&Utc),
-    );
-
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let occs = collect_occurrences(&mut ws, &space, (win_start, win_end), false);
-        print_occurrences(&occs);
-        Ok(())
-    })
-}
-
-fn cmd_next(pile: &Path, _branch_name: &str, branch_id: Id) -> Result<()> {
+fn cmd_next(storage: PlannerStorage<'_>) -> Result<()> {
     let now = now_epoch();
     let far = Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0);
-
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let occs = collect_occurrences(&mut ws, &space, (now, far), false);
-        let upcoming: Vec<_> = occs.into_iter().filter(|o| o.end >= now).take(1).collect();
-        print_occurrences(&upcoming);
+    storage.with_view(|loaded| {
+        let occurrences = collect_occurrences(&loaded.catalog, (now, far), false)?;
+        let next: Vec<_> = occurrences
+            .into_iter()
+            .filter(|occurrence| occurrence.end >= now)
+            .take(1)
+            .collect();
+        print_occurrences(&next);
         Ok(())
     })
 }
 
-// ── note / show / cancel / resolve ────────────────────────────────────────
-
-fn cmd_note(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
-    id: String,
-    text: String,
-) -> Result<()> {
-    let body = faculties::text_arg(&text, "note")?;
-    let event_ref = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let event_ref = resolve_event_id(&id, &space)?;
-
-        let note_id = ufoid();
-        let text_handle = ws.put(body);
-        let now = (now_epoch(), now_epoch()).try_to_inline().unwrap();
-
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-        change += entity! { &note_id @
-            metadata::tag: &KIND_NOTE_ID,
-            metadata::created_at: now,
-            note::note_about: &event_ref,
-            note::note_text: text_handle,
-        };
-        ws.commit(change, "add note");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push note: {e:?}"))?;
-        Ok(event_ref)
+fn cmd_note(storage: PlannerStorage<'_>, id: String, text: String) -> Result<()> {
+    let text = faculties::text_arg(&text, "note")?;
+    let event_id = storage.update("add event note", |loaded| {
+        let event_id = resolve_event_id(&id, &loaded.catalog)?;
+        let fragment = note_fragment(event_id, &text, point_interval(now_epoch()))?;
+        Ok((Some(fragment), event_id))
     })?;
-    println!("Added note to event {}", fmt_id(event_ref));
+    println!("Added note to event {}", fmt_id(event_id));
     Ok(())
 }
 
-fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let event_ref = resolve_event_id(&id, &space)?;
-
-        let summary = event_summary(&mut ws, &space, event_ref);
-        println!("event {}  {}", fmt_id(event_ref), summary);
-
-        if let Some(t) = event_time(&space, event_ref) {
-            println!("  time:     {}", fmt_interval(t));
+fn cmd_show(storage: PlannerStorage<'_>, id: String) -> Result<()> {
+    storage.with_view(|loaded| {
+        let event_id = resolve_event_id(&id, &loaded.catalog)?;
+        let row = &loaded.catalog.events[&event_id];
+        println!("event {}  {}", fmt_id(event_id), row.summary);
+        println!("  time:     {}", fmt_interval(row.time));
+        if let Some(location) = &row.location {
+            println!("  location: {location}");
         }
-        if let Some(loc) = event_location(&space, event_ref) {
-            println!("  location: {loc}");
-        }
-        let status = event_status(&space, event_ref);
+        let status = if loaded.catalog.is_cancelled(event_id) {
+            STATUS_CANCELLED
+        } else {
+            &row.status
+        };
         if status != STATUS_CONFIRMED {
             println!("  status:   {status}");
         }
-        if let Some(rr) = event_rrule(&space, event_ref) {
-            println!("  rrule:    {rr}");
+        if let Some(rrule) = &row.rrule {
+            println!("  rrule:    {rrule}");
         }
-        if let Some(uid) = event_ical_uid(&mut ws, &space, event_ref) {
-            println!("  uid:      {uid}");
-        }
-        if let Some(handle) = event_description_handle(&space, event_ref) {
-            if let Some(body) = read_text(&mut ws, handle) {
-                println!("  ----");
-                for line in body.lines() {
-                    println!("  {line}");
-                }
+        println!("  uid:      {}", read_text(&loaded.reader, row.uid)?);
+        if let Some(description) = row.description {
+            println!("  ----");
+            for line in read_text(&loaded.reader, description)?.lines() {
+                println!("  {line}");
             }
         }
 
-        let mut notes: Vec<(IntervalValue, Id)> = find!(
-            (created: IntervalValue, n: Id),
-            pattern!(&space, [{
-                ?n @
-                    metadata::tag: KIND_NOTE_ID,
-                    metadata::created_at: ?created,
-                    note::note_about: event_ref,
-            }])
-        )
-        .collect();
-        notes.sort_by_key(|(c, _)| unpack_interval(*c).0.to_tai_seconds() as i128);
-
+        let mut notes: Vec<_> = loaded.catalog.notes_for(event_id).copied().collect();
+        notes.sort_by_key(|row| (interval_key(row.created_at), row.id));
         if !notes.is_empty() {
             println!("  notes:");
-            for (created, note_id) in notes {
-                let when = unpack_interval(created).0;
-                let when_str = epoch_to_chrono_utc(when).format("%Y-%m-%d %H:%M UTC");
-                let body: Option<TextHandle> = find!(
-                    h: TextHandle,
-                    pattern!(&space, [{ note_id @ note::note_text: ?h }])
-                )
-                .next();
-                let text = body
-                    .and_then(|h| read_text(&mut ws, h))
-                    .unwrap_or_else(|| "(missing)".into());
-                println!("  - [{when_str}] {text}");
+            for note in notes {
+                let when = unpack_interval(note.created_at).0;
+                let when = epoch_to_chrono_utc(when).format("%Y-%m-%d %H:%M UTC");
+                println!("  - [{when}] {}", read_text(&loaded.reader, note.text)?);
             }
         }
-
         Ok(())
     })
 }
 
-fn cmd_cancel(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
-    let event_ref = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let event_ref = resolve_event_id(&id, &space)?;
-        let mut change = TribleSet::new();
-        change += entity! { ExclusiveId::force_ref(&event_ref) @
-            event::status: STATUS_CANCELLED,
-        };
-        ws.commit(change, "cancel event");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push cancel: {e:?}"))?;
-        Ok(event_ref)
+fn cmd_cancel(storage: PlannerStorage<'_>, id: String) -> Result<()> {
+    let (event_id, already_cancelled) = storage.update("cancel event", |loaded| {
+        let event_id = resolve_event_id(&id, &loaded.catalog)?;
+        if loaded.catalog.is_cancelled(event_id) {
+            return Ok((None, (event_id, true)));
+        }
+        Ok((Some(cancellation_fragment(event_id)), (event_id, false)))
     })?;
-    println!("Cancelled event {}", fmt_id(event_ref));
-    Ok(())
-}
-
-fn cmd_resolve(pile: &Path, _branch_name: &str, branch_id: Id, prefix: String) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let id = resolve_event_id(&prefix, &space)?;
-        println!("{}", fmt_id(id));
-        Ok(())
-    })
-}
-
-// ── ingest .ics ───────────────────────────────────────────────────────────
-
-fn cmd_ingest(pile: &Path, _branch_name: &str, branch_id: Id, files: Vec<PathBuf>) -> Result<()> {
-    if files.is_empty() {
-        bail!("no files supplied");
+    if already_cancelled {
+        println!("Event {} is already cancelled", fmt_id(event_id));
+    } else {
+        println!("Cancelled event {}", fmt_id(event_id));
     }
-    let mut total = 0usize;
-    let mut imported = 0usize;
-    let mut skipped_dup = 0usize;
-
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-
-        // Collect existing UIDs so re-ingest is idempotent. Each
-        // UID lives as a Handle<LongString> so we dereference one
-        // blob per known event.
-        let uid_handles: Vec<(Id, TextHandle)> = find!(
-            (e: Id, h: TextHandle),
-            pattern!(&space, [{ ?e @ metadata::tag: KIND_EVENT_ID, event::ical_uid: ?h }])
-        )
-        .collect();
-        let mut existing_uids: HashSet<String> = HashSet::new();
-        for (_, h) in &uid_handles {
-            if let Some(s) = read_text(&mut ws, *h) {
-                existing_uids.insert(s);
-            }
-        }
-
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-
-        for path in &files {
-            let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-            let reader = ical::IcalParser::new(&bytes[..]);
-            for cal in reader {
-                let cal = cal.with_context(|| format!("parse {}", path.display()))?;
-                for event in cal.events {
-                    total += 1;
-                    let ievt = parse_ical_event(&event)?;
-                    if let Some(uid) = ievt.uid.as_ref() {
-                        if existing_uids.contains(uid) {
-                            skipped_dup += 1;
-                            continue;
-                        }
-                    }
-                    let event_id = ufoid();
-                    let now = (now_epoch(), now_epoch()).try_to_inline().unwrap();
-                    let interval =
-                        make_interval(chrono_to_epoch(ievt.dtstart), chrono_to_epoch(ievt.dtend));
-                    let summary = ievt.summary.clone().unwrap_or_else(|| "(untitled)".into());
-                    let summary_short = truncate_for_short(&summary);
-                    let description_handle =
-                        ievt.description.as_deref().map(|d| ws.put(d.to_string()));
-                    let location_short = ievt.location.as_deref().map(truncate_for_short);
-                    let synth_uid = ievt
-                        .uid
-                        .clone()
-                        .unwrap_or_else(|| format!("{:x}@triblespace", event_id.id));
-                    let status = ievt
-                        .status
-                        .clone()
-                        .unwrap_or_else(|| STATUS_CONFIRMED.into());
-                    let transp = ievt.transp.clone().unwrap_or_else(|| TRANSP_OPAQUE.into());
-                    let uid_handle: TextHandle = ws.put(synth_uid);
-
-                    change += entity! { &event_id @
-                        metadata::tag: &KIND_EVENT_ID,
-                        metadata::created_at: now,
-                        event::summary: summary_short.as_str(),
-                        event::time: interval,
-                        event::status: status.as_str(),
-                        event::transp: transp.as_str(),
-                        event::ical_uid: uid_handle,
-                        event::description?: description_handle.as_ref(),
-                        event::location?: location_short.as_deref(),
-                        event::rrule?: ievt.rrule.as_deref(),
-                    };
-                    imported += 1;
-                }
-            }
-        }
-
-        ws.commit(change, "ingest .ics");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push ingest: {e:?}"))?;
-        Ok(())
-    })?;
-
-    println!("ingested {imported} of {total} events ({skipped_dup} duplicates skipped by UID)");
     Ok(())
 }
 
+fn cmd_resolve(storage: PlannerStorage<'_>, prefix: String) -> Result<()> {
+    storage.with_view(|loaded| {
+        println!("{}", fmt_id(resolve_event_id(&prefix, &loaded.catalog)?));
+        Ok(())
+    })
+}
+
+#[derive(Debug)]
 struct IcalEvent {
-    uid: Option<String>,
+    uid: String,
     summary: Option<String>,
     description: Option<String>,
     dtstart: DateTime<Utc>,
@@ -979,55 +688,62 @@ struct IcalEvent {
     transp: Option<String>,
 }
 
+fn set_once(slot: &mut Option<String>, field: &str, value: String) -> Result<()> {
+    if slot.is_some() {
+        bail!("VEVENT has more than one {field} property");
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
 fn parse_ical_event(event: &ical::parser::ical::component::IcalEvent) -> Result<IcalEvent> {
     let mut uid = None;
     let mut summary = None;
     let mut description = None;
-    let mut dtstart_raw = None;
-    let mut dtend_raw = None;
+    let mut dtstart = None;
+    let mut dtend = None;
     let mut location = None;
     let mut rrule = None;
     let mut status = None;
     let mut transp = None;
-    let mut dtstart_is_date = false;
+    let mut dtstart_is_date = None;
 
-    for prop in &event.properties {
-        let value = prop.value.clone().unwrap_or_default();
-        match prop.name.as_str() {
-            "UID" => uid = Some(value),
-            "SUMMARY" => summary = Some(value),
-            "DESCRIPTION" => description = Some(value),
+    for property in &event.properties {
+        let value = property.value.clone().unwrap_or_default();
+        match property.name.as_str() {
+            "UID" => set_once(&mut uid, "UID", value)?,
+            "SUMMARY" => set_once(&mut summary, "SUMMARY", value)?,
+            "DESCRIPTION" => set_once(&mut description, "DESCRIPTION", value)?,
             "DTSTART" => {
-                dtstart_is_date = prop
-                    .params
-                    .as_ref()
-                    .and_then(|ps| {
-                        ps.iter()
-                            .find(|(k, _)| k == "VALUE")
-                            .map(|(_, vs)| vs.clone())
+                set_once(&mut dtstart, "DTSTART", value)?;
+                let is_date = property.params.as_ref().is_some_and(|params| {
+                    params.iter().any(|(name, values)| {
+                        name == "VALUE" && values.iter().any(|value| value == "DATE")
                     })
-                    .map(|vs| vs.iter().any(|v| v == "DATE"))
-                    .unwrap_or(false);
-                dtstart_raw = Some(value);
+                });
+                dtstart_is_date = Some(is_date);
             }
-            "DTEND" => dtend_raw = Some(value),
-            "LOCATION" => location = Some(value),
-            "RRULE" => rrule = Some(value),
-            "STATUS" => status = Some(value),
-            "TRANSP" => transp = Some(value),
+            "DTEND" => set_once(&mut dtend, "DTEND", value)?,
+            "LOCATION" => set_once(&mut location, "LOCATION", value)?,
+            "RRULE" => set_once(&mut rrule, "RRULE", value)?,
+            "STATUS" => set_once(&mut status, "STATUS", value)?,
+            "TRANSP" => set_once(&mut transp, "TRANSP", value)?,
             _ => {}
         }
     }
 
-    let dtstart_str = dtstart_raw.ok_or_else(|| anyhow::anyhow!("VEVENT missing DTSTART"))?;
-    let dtstart = parse_ical_datetime(&dtstart_str, dtstart_is_date)?;
-    let dtend = if let Some(s) = dtend_raw {
-        parse_ical_datetime(&s, dtstart_is_date)?
-    } else if dtstart_is_date {
-        dtstart + chrono::Duration::days(1)
-    } else {
-        dtstart + chrono::Duration::hours(1)
+    let uid = uid.ok_or_else(|| anyhow!("VEVENT missing UID"))?;
+    let dtstart_raw = dtstart.ok_or_else(|| anyhow!("VEVENT missing DTSTART"))?;
+    let is_date = dtstart_is_date.unwrap_or(false);
+    let dtstart = parse_ical_datetime(&dtstart_raw, is_date)?;
+    let dtend = match dtend {
+        Some(value) => parse_ical_datetime(&value, is_date)?,
+        None if is_date => dtstart + chrono::Duration::days(1),
+        None => dtstart + chrono::Duration::hours(1),
     };
+    if dtend < dtstart {
+        bail!("VEVENT DTEND is before DTSTART");
+    }
 
     Ok(IcalEvent {
         uid,
@@ -1042,45 +758,123 @@ fn parse_ical_event(event: &ical::parser::ical::component::IcalEvent) -> Result<
     })
 }
 
-/// Parse an RFC 5545 datetime literal: `20260515T140000Z`, `20260515T140000`
-/// (floating, treated as UTC), or `20260515` (date-only, midnight UTC).
 fn parse_ical_datetime(input: &str, is_date: bool) -> Result<DateTime<Utc>> {
     let input = input.trim();
     if is_date || input.len() == 8 {
         let date = NaiveDate::parse_from_str(input, "%Y%m%d")
             .with_context(|| format!("parse date '{input}'"))?;
-        return Ok(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()));
+        return Ok(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("midnight exists")));
     }
-    if let Some(stripped) = input.strip_suffix('Z') {
-        let dt = NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S")
-            .with_context(|| format!("parse UTC datetime '{input}'"))?;
-        return Ok(Utc.from_utc_datetime(&dt));
+    if let Some(input) = input.strip_suffix('Z') {
+        let datetime = NaiveDateTime::parse_from_str(input, "%Y%m%dT%H%M%S")
+            .with_context(|| format!("parse UTC datetime '{input}Z'"))?;
+        return Ok(Utc.from_utc_datetime(&datetime));
     }
-    let dt = NaiveDateTime::parse_from_str(input, "%Y%m%dT%H%M%S")
+    let datetime = NaiveDateTime::parse_from_str(input, "%Y%m%dT%H%M%S")
         .with_context(|| format!("parse floating datetime '{input}'"))?;
-    Ok(Utc.from_utc_datetime(&dt))
+    Ok(Utc.from_utc_datetime(&datetime))
 }
 
-fn truncate_for_short(s: &str) -> String {
-    let mut out = s.replace('\n', " ");
-    while out.as_bytes().len() > 32 {
-        out.pop();
+fn truncate_short(value: &str) -> String {
+    let mut value = value.replace('\n', " ");
+    while value.len() > 32 {
+        value.pop();
     }
-    out
+    value
 }
 
-// ── main ──────────────────────────────────────────────────────────────────
+/// Stage one UID-derived import into a deterministic map. Identical records
+/// collapse; same-UID conflicts are an error independent of file order.
+fn stage_import_event(
+    loaded: &LoadedPlanner,
+    staged: &mut BTreeMap<Id, Fragment>,
+    uid: &str,
+    fragment: Fragment,
+) -> Result<bool> {
+    let id = fragment.root().expect("event fragment has one root");
+    let candidate = event_facts(fragment.facts(), id);
+    if loaded.catalog.events.contains_key(&id) {
+        if event_facts(&loaded.facts, id) == candidate {
+            return Ok(false);
+        }
+        bail!(
+            "iCalendar UID '{uid}' names event {} but its immutable fields differ from the existing event",
+            fmt_id(id)
+        );
+    }
+    if let Some(previous) = staged.get(&id) {
+        if event_facts(previous.facts(), id) == candidate {
+            return Ok(false);
+        }
+        bail!(
+            "iCalendar UID '{uid}' occurs more than once in this batch with conflicting immutable fields"
+        );
+    }
+    staged.insert(id, fragment);
+    Ok(true)
+}
+
+fn cmd_ingest(storage: PlannerStorage<'_>, files: Vec<PathBuf>) -> Result<()> {
+    if files.is_empty() {
+        bail!("no files supplied");
+    }
+    let (imported, total, duplicates) = storage.update("ingest iCalendar events", |loaded| {
+        let mut staged = BTreeMap::<Id, Fragment>::new();
+        let mut total = 0usize;
+        let mut duplicates = 0usize;
+
+        for path in &files {
+            let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            for calendar in ical::IcalParser::new(&bytes[..]) {
+                let calendar = calendar.with_context(|| format!("parse {}", path.display()))?;
+                for source in calendar.events {
+                    total += 1;
+                    let source = parse_ical_event(&source)
+                        .with_context(|| format!("parse VEVENT in {}", path.display()))?;
+                    let mut draft = empty_event_draft(
+                        source.uid.clone(),
+                        truncate_short(source.summary.as_deref().unwrap_or("(untitled)")),
+                        make_interval(
+                            chrono_to_epoch(source.dtstart),
+                            chrono_to_epoch(source.dtend),
+                        ),
+                        normalized_status(source.status.as_deref()),
+                        normalized_transp(source.transp.as_deref()),
+                    );
+                    draft.description = source.description;
+                    draft.location = source.location.as_deref().map(truncate_short);
+                    draft.rrule = source.rrule;
+                    let fragment = event_fragment(&draft)?;
+                    if !stage_import_event(loaded, &mut staged, &source.uid, fragment)? {
+                        duplicates += 1;
+                    }
+                }
+            }
+        }
+
+        let imported = staged.len();
+        let fragment = if imported == 0 {
+            None
+        } else {
+            let mut fragment = Fragment::empty();
+            for event in staged.into_values() {
+                fragment += event;
+            }
+            Some(fragment)
+        };
+        Ok((fragment, (imported, total, duplicates)))
+    })?;
+    println!("ingested {imported} of {total} events ({duplicates} exact duplicates skipped)");
+    Ok(())
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cmd = cli.command.unwrap_or(Command::Today);
-    let branch_id_hex = cli.branch_id.as_deref();
-
-    let branch_id = with_repo(&cli.pile, |repo| {
-        resolve_branch(repo, &cli.branch, branch_id_hex)
-    })?;
-
-    match cmd {
+    let storage = PlannerStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+    };
+    match cli.command.unwrap_or(Command::Today) {
         Command::Add {
             summary,
             from,
@@ -1092,9 +886,7 @@ fn main() -> Result<()> {
             description,
             note,
         } => cmd_add(
-            &cli.pile,
-            &cli.branch,
-            branch_id,
+            storage,
             summary,
             from,
             to,
@@ -1105,16 +897,218 @@ fn main() -> Result<()> {
             description,
             note,
         ),
-        Command::List { from, to, all } => {
-            cmd_list(&cli.pile, &cli.branch, branch_id, from, to, all)
+        Command::List { from, to, all } => cmd_list(storage, from, to, all),
+        Command::Today => cmd_relative(storage, 1),
+        Command::Week => cmd_relative(storage, 7),
+        Command::Next => cmd_next(storage),
+        Command::Note { id, text } => cmd_note(storage, id, text),
+        Command::Show { id } => cmd_show(storage, id),
+        Command::Cancel { id } => cmd_cancel(storage, id),
+        Command::Resolve { prefix } => cmd_resolve(storage, prefix),
+        Command::Ingest { files } => cmd_ingest(storage, files),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::File;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let serial = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "faculties-planner-live-{}-{serial}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
         }
-        Command::Today => cmd_today(&cli.pile, &cli.branch, branch_id),
-        Command::Week => cmd_week(&cli.pile, &cli.branch, branch_id),
-        Command::Next => cmd_next(&cli.pile, &cli.branch, branch_id),
-        Command::Note { id, text } => cmd_note(&cli.pile, &cli.branch, branch_id, id, text),
-        Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
-        Command::Cancel { id } => cmd_cancel(&cli.pile, &cli.branch, branch_id, id),
-        Command::Resolve { prefix } => cmd_resolve(&cli.pile, &cli.branch, branch_id, prefix),
-        Command::Ingest { files } => cmd_ingest(&cli.pile, &cli.branch, branch_id, files),
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fresh_storage(directory: &TestDirectory) -> (PathBuf, PathBuf) {
+        let pile = directory.0.join("planner.pile");
+        let key = directory.0.join("planner.key");
+        File::create(&pile).unwrap();
+        faculties::collection_cutover::initialize_signer(&pile, Some(&key)).unwrap();
+        (pile, key)
+    }
+
+    fn fixture_draft(uid: &str, summary: &str) -> EventDraft {
+        empty_event_draft(
+            uid.to_owned(),
+            summary.to_owned(),
+            make_interval(
+                Epoch::from_unix_seconds(10.0),
+                Epoch::from_unix_seconds(20.0),
+            ),
+            STATUS_CONFIRMED.to_owned(),
+            TRANSP_OPAQUE.to_owned(),
+        )
+    }
+
+    #[test]
+    fn event_and_initial_note_publish_as_one_signed_mutation() {
+        let directory = TestDirectory::new();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = PlannerStorage {
+            pile: &pile,
+            key: Some(&key),
+        };
+        let mut fragment = event_fragment(&fixture_draft("one@example", "meeting")).unwrap();
+        let event = fragment.root().unwrap();
+        fragment += note_fragment(
+            event,
+            "agenda",
+            point_interval(Epoch::from_unix_seconds(30.0)),
+        )
+        .unwrap();
+        storage
+            .update("add event", |_| Ok((Some(fragment), ())))
+            .unwrap();
+
+        assert_eq!(storage.commit_count().unwrap(), 1);
+        storage
+            .with_view(|loaded| {
+                assert_eq!(loaded.catalog.events.len(), 1);
+                assert_eq!(loaded.catalog.notes.len(), 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn same_batch_duplicate_uid_collapses_but_conflict_is_rejected() {
+        let directory = TestDirectory::new();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = PlannerStorage {
+            pile: &pile,
+            key: Some(&key),
+        };
+        storage
+            .with_view(|loaded| {
+                let mut staged = BTreeMap::new();
+                let first = event_fragment(&fixture_draft("duplicate@example", "same")).unwrap();
+                let duplicate =
+                    event_fragment(&fixture_draft("duplicate@example", "same")).unwrap();
+                let conflict =
+                    event_fragment(&fixture_draft("duplicate@example", "different")).unwrap();
+
+                assert!(
+                    stage_import_event(loaded, &mut staged, "duplicate@example", first).unwrap()
+                );
+                assert!(
+                    !stage_import_event(loaded, &mut staged, "duplicate@example", duplicate)
+                        .unwrap()
+                );
+                let error = stage_import_event(loaded, &mut staged, "duplicate@example", conflict)
+                    .unwrap_err();
+                assert!(format!("{error:#}").contains("conflicting immutable fields"));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn duplicate_scalar_ical_property_is_rejected() {
+        let bytes = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a@example\r\nUID:b@example\r\nDTSTART:20260809T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let calendars: Vec<_> = ical::IcalParser::new(&bytes[..]).collect();
+        let calendar: Vec<_> = calendars
+            .into_iter()
+            .map(|calendar| calendar.unwrap())
+            .collect();
+        let error = parse_ical_event(&calendar[0].events[0]).unwrap_err();
+        assert!(format!("{error:#}").contains("more than one UID"));
+    }
+
+    #[test]
+    fn exact_reingest_does_not_publish_another_commit() {
+        let directory = TestDirectory::new();
+        let (pile, key) = fresh_storage(&directory);
+        let ics = directory.0.join("event.ics");
+        fs::write(
+            &ics,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:stable@example\r\nSUMMARY:Stable\r\nDTSTART:20260809T120000Z\r\nDTEND:20260809T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        )
+        .unwrap();
+        let storage = PlannerStorage {
+            pile: &pile,
+            key: Some(&key),
+        };
+
+        cmd_ingest(storage, vec![ics.clone()]).unwrap();
+        let length = fs::metadata(&pile).unwrap().len();
+        cmd_ingest(storage, vec![ics]).unwrap();
+
+        assert_eq!(storage.commit_count().unwrap(), 1);
+        assert_eq!(fs::metadata(&pile).unwrap().len(), length);
+    }
+
+    #[test]
+    fn conflicting_same_batch_uid_fails_before_any_signed_commit() {
+        let directory = TestDirectory::new();
+        let (pile, key) = fresh_storage(&directory);
+        let ics = directory.0.join("conflict.ics");
+        fs::write(
+            &ics,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:fork@example\r\nSUMMARY:Left\r\nDTSTART:20260809T120000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:fork@example\r\nSUMMARY:Right\r\nDTSTART:20260809T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        )
+        .unwrap();
+        let storage = PlannerStorage {
+            pile: &pile,
+            key: Some(&key),
+        };
+
+        let error = cmd_ingest(storage, vec![ics]).unwrap_err();
+
+        assert!(format!("{error:#}").contains("conflicting immutable fields"));
+        assert_eq!(storage.commit_count().unwrap(), 0);
+        storage
+            .with_view(|loaded| {
+                assert!(loaded.catalog.events.is_empty());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn cancel_adds_one_assertion_without_mutating_baseline_status() {
+        let directory = TestDirectory::new();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = PlannerStorage {
+            pile: &pile,
+            key: Some(&key),
+        };
+        let event = event_fragment(&fixture_draft("cancel@example", "meeting")).unwrap();
+        let event_id = event.root().unwrap();
+        storage
+            .update("add event", |_| Ok((Some(event), ())))
+            .unwrap();
+
+        cmd_cancel(storage, fmt_id(event_id)).unwrap();
+        cmd_cancel(storage, fmt_id(event_id)).unwrap();
+
+        assert_eq!(storage.commit_count().unwrap(), 2);
+        storage
+            .with_view(|loaded| {
+                assert_eq!(loaded.catalog.events[&event_id].status, STATUS_CONFIRMED);
+                assert!(loaded.catalog.is_cancelled(event_id));
+                assert_eq!(loaded.catalog.cancellations.len(), 1);
+                Ok(())
+            })
+            .unwrap();
     }
 }

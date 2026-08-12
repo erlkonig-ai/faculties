@@ -16,15 +16,16 @@ read acknowledgements.
 
 == When NOT to use
 
-  - Anything reusable across multiple readers — that's a wiki
-    fragment. A message decays after the receiver acks it; a
-    fragment stays queryable.
+  - Anything reusable across multiple readers — that's a Wiki entry. An
+    acknowledgement changes inbox presentation, not the immutable message;
+    Wiki is the durable knowledge surface.
   - Long technical content — messages are conversational. If
     you're writing more than 5 lines, ask whether a fragment
     would serve better.
-  - Real-time chat — the pile is eventually-consistent across
-    relays. Messages land within seconds of a sync, but it's
-    not a chat channel.
+  - Real-time chat. Message is an append-only same-pile ledger, and the current
+    `pile net sync` transport does not yet replicate native collection records.
+    Move or concatenate complete pile state through a deployment path that
+    understands those records before expecting messages on another node.
 
 == Usage
 
@@ -42,22 +43,24 @@ message list "$PERSONA"
 message ack <message-id> "$PERSONA"
 ```
 
-The recipient handle is whatever name maps to a person/agent in
-the relations branch (`message --help` shows the
-`--relations-branch` flag for picking which branch holds those
-mappings — `relations` by default).
+The recipient handle is whatever name maps to a person or agent in the fixed
+Relations collection. Message resolves that collection through the same pile
+and durable signer as the Message collection; there is no branch selector.
 
-== Branch and storage
+== Collection and storage
 
-Messages live on branch `message` in the pile (default —
-override via `--branch`). Each message is one append-only blob;
-acknowledgements are separate appends, so the read history is its
-own audit trail.
+Messages live in one fixed, signer-owned Message collection. Each send or
+acknowledgement publishes an immutable fragment through an independent signed
+COMMIT, so the read history is its own audit trail. Commands accept an existing
+durable signing key through `--key` or `TRIBLESPACE_KEY`; ordinary reads and
+writes never create one.
 
-The pile-union for this branch is `cat`: when two pile copies
-merge, all messages from both sides survive, no overwrites. So
-sending the same message twice from different machines just
-results in two messages, never lost data.
+Pile concatenation preserves both record sets physically. Current faculty reads
+admit only COMMITs made by the pile's configured signer, so two processes share
+one logical inbox only when they intentionally share that durable collection
+identity. Foreign-signer COMMITs remain inert evidence rather than silently
+becoming trusted messages. Two distinct sends by the admitted signer remain two
+immutable messages; exact retries converge.
 
 == Cross-references
 

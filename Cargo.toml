@@ -11,8 +11,8 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "An office suite for AI agents: kanban, wiki, files, messaging, and a GORBIE-backed viewer — all persisted in a TribleSpace pile."
 authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
-homepage = "https://github.com/triblespace/faculties"
-repository = "https://github.com/triblespace/faculties"
+homepage = "https://github.com/erlkonig-ai/faculties"
+repository = "https://github.com/erlkonig-ai/faculties"
 readme = "README.md"
 keywords = ["triblespace", "ai-agent", "kanban", "wiki", "notebook"]
 categories = ["command-line-utilities", "data-structures"]
@@ -98,15 +98,15 @@ name = "teams-capture"
 path = "src/bin/teams-capture.rs"
 required-features = ["widgets"]
 
-# Status colony-board viewer.
+# Window-status board viewer.
 [[bin]]
 name = "status-capture"
 path = "src/bin/status-capture.rs"
 required-features = ["widgets"]
 
 [features]
-# `local-embed` and `widgets` are default: semantic recall is core to the being
-# knowing itself, and the GORBIE viewer is part of the normal office surface.
+# `local-embed` and `widgets` are default: semantic recall is core to knowledge
+# workflows, and the GORBIE viewer is part of the normal office surface.
 # A stock `cargo install --path faculties --bins` must ship both.
 default = ["local-embed", "widgets", "audio"]
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
@@ -120,9 +120,9 @@ web-export = []
 # Semantic similarity in `files` + `wiki similar` / `memory similar` (image+text
 # embeddings via mary's embedder). Default (see above).
 local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
-# Liora's imagination: text → image via mary's ported FLUX.2 pipeline (Burn/Metal).
+# Text-to-image generation via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux", "dep:image"]
-# Liora's voice: in-process Qwen3-TTS in the `voice` faculty (`voice say`/
+# In-process Qwen3-TTS in the `voice` faculty (`voice say`/
 # `voice shout`) via mary's ported Burn/Metal pipeline. Calls
 # `mary::speak::synthesize` directly — no separately-built binary that can
 # drift stale against the pile format (the staleness class that truncated memory
@@ -157,18 +157,22 @@ base64 = "0.22"             # teams
 blake3 = "1"                # mail (deterministic entity id from Message-Id)
 chrono = { version = "0.4.39", features = ["clock"] }  # orient
 comemo = "0.5.1"            # wiki
+ctrlc = "3.5"               # body (graceful close for kept touch loops)
 dirs = "5"                  # wiki
 dryoc = "0.8"               # secrets CLI selftest
 hex = "0.4"                 # gauge
 humantime = "2.3.0"         # orient, patience
 ical = "0.11"               # planner
 itertools = "0.14"          # wiki
+kamadak-exif = "0.6"        # posture (EXIF/TIFF tags on images)
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }  # mail (SMTP send)
 libc = "0.2"                # teams
+lopdf = { version = "0.44", default-features = false }  # posture (PDF objects + content streams)
 mailparse = "0.16"          # mail (RFC 5322 parser)
 mime = "0.3"                # shared canonical file media-type parsing
-rust-pop3-client = "0.3"    # mail (POP3 fetch, rustls-backed)
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }  # mail (crypto provider for rust-pop3-client)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }  # mail POP transport
+rustls-native-certs = "0.8" # mail POP transport (platform trust roots)
+quick-xml = "0.37"          # posture (OOXML part parsing)
 rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
@@ -181,6 +185,7 @@ tracing = "0.1"             # archive
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # archive
 typst = "0.14"              # wiki
 typst-syntax = "0.14"       # wiki
+zip = { version = "2", default-features = false, features = ["deflate"] }  # posture (OOXML is a zip of XML)
 
 # Widgets-only (optional): GORBIE viewer stack.
 GORBIE = { version = "0.18.1", default-features = false, features = ["typst", "markdown"], optional = true }
@@ -198,6 +203,9 @@ mary = { path = "../mary", default-features = false, optional = true }
 # imagine-only: the `image` crate, matching mary's flux feature, so the
 # RgbImage the pipeline returns can be `.save()`d to a PNG here.
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 # ── patches ────────────────────────────────────────────────────────────────
 # `[patch]` only takes effect from the *root* crate of a build, so mary's own

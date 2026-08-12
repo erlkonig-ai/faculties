@@ -1,193 +1,234 @@
-use anyhow::{anyhow, bail, Result};
+//! Read-only diagnostics over one immutable, authorized collection snapshot.
+//!
+//! Triage intentionally owns no branch, chain, repair protocol, or mutable
+//! workspace. Every command freezes the pile once, admits only commits signed
+//! by the local durable key, and projects the canonical faculty collections it
+//! needs from that same snapshot.
+
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+use anybytes::View;
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::triage::{
-    cog, config, context, exec, local, model_chat, reason, relations, KIND_CONTEXT_CHUNK_ID,
-    KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID, KIND_LOCAL_MESSAGE_ID,
-    KIND_LOCAL_READ_ID, KIND_MODEL_IN_PROGRESS_ID, KIND_MODEL_REQUEST_ID, KIND_MODEL_RESULT_ID,
-    KIND_PERSON_ID, KIND_REASON_EVENT_ID, REPO_CONTENT_ATTR, REPO_HEAD_ATTR, REPO_PARENT_ATTR,
+use faculties::cognition as cognition_model;
+use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::memory::{self as memory_model, ChunkContent, MemoryCatalog};
+use faculties::message as message_model;
+use faculties::relations as relations_model;
+use faculties::schemas::cognition::DEFAULT_SCOPE_ID as COGNITION_SCOPE_ID;
+use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
+use faculties::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
+use faculties::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
+use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
+use faculties::schemas::triage::cog;
+use faculties::secrets::schema as secrets_schema;
+use faculties::triage::{
+    self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
+    collect_reason_state, ExecRequestRow, ExecState, ModelChatState, ModelResultRow,
+    ReasonEventRow, ScanOptions, ScanSources, SourceView, TriageHeadspace, UnreadMessages,
+    UnreadUnavailable,
 };
 use hifitime::Epoch;
-use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, ReadError};
-use triblespace::core::repo::{BlobStoreMeta, PullError, PushResult, Repository, Workspace};
+use triblespace::core::collection::Collection;
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type Interval = Inline<inlineencodings::NsTAIInterval>;
 
 #[derive(Parser)]
 #[command(
     version = faculties::GIT_VERSION,
     name = "triage",
-    about = "Doctor-style cross-instance diagnostics for playground agent piles"
+    about = "Doctor-style diagnostics over canonical faculty collections"
 )]
 struct Cli {
-    /// Path to the pile file to inspect
+    /// Path to the pile file to inspect.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Target branch name
-    #[arg(long, default_value = "cognition")]
-    branch: String,
+    /// Existing durable signing-key file. Reads never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Full health scan with queue + loop heuristics
+    /// Full health scan with queue and loop heuristics.
     Scan {
-        /// Max recent exec attempts used for loop diagnostics
+        /// Max recent exec attempts used for loop diagnostics.
         #[arg(long, default_value_t = 40)]
         recent: usize,
-        /// Minimum repeated attempts to report as a probable loop
+        /// Minimum repeated attempts to report as a probable loop.
         #[arg(long, default_value_t = 3)]
         loop_min: usize,
-        /// Mark in-progress requests older than this as stale
+        /// Mark in-progress requests older than this as stale.
         #[arg(long, default_value_t = 15)]
         stale_min: i64,
     },
-    /// Show recent exec attempts and repeated failure patterns
+    /// Show recent exec attempts and repeated failure patterns.
     Loops {
         #[arg(long, default_value_t = 40)]
         recent: usize,
         #[arg(long, default_value_t = 3)]
         min_repeat: usize,
     },
-    /// Show an interleaved recent activity timeline (exec/model/reason)
+    /// Show an interleaved recent activity timeline (exec/model/reason).
     Timeline {
-        /// Max events to print (newest first)
+        /// Max events to print (newest first).
         #[arg(long, default_value_t = 80)]
         recent: usize,
     },
-    /// Inspect commit-chain integrity for the target branch
-    Chain,
-    /// Show memory cover structure (chunks, hierarchy, budget)
+    /// Show the complete canonical Memory frontier and context budget.
     Cover {
-        /// Show full summary text instead of truncated
-        #[arg(long, default_value_t = false)]
+        /// Show complete text instead of a one-line preview.
+        #[arg(long)]
         full: bool,
-        /// Show children indented under parents
-        #[arg(long, default_value_t = false)]
-        tree: bool,
     },
-    /// Inspect a specific memory chunk by ID prefix
+    /// Inspect every canonical Memory node or alias matching an ID prefix.
     Chunk {
-        /// Hex ID prefix of the chunk to inspect
+        /// Intrinsic node ID or historical alias prefix.
         #[arg(value_name = "ID")]
         id: String,
     },
-    /// Inspect a full turn cycle: context in, model output, command, exec result
+    /// Inspect a full turn cycle: context in, model output, command, exec result.
     Turn {
-        /// Nth most recent turn (1 = latest)
+        /// Nth most recent exec request (1 = latest).
         #[arg(long, default_value_t = 1)]
         turn: usize,
-        /// Show full content (context messages, stdout, reasoning)
-        #[arg(long, default_value_t = false)]
+        /// Show full content (context messages, stdout, reasoning).
+        #[arg(long)]
         full: bool,
     },
-    /// Show the assembled context for a recent turn
+    /// Show every assembled context recorded for a recent turn.
     Context {
-        /// Nth most recent turn (1 = latest)
+        /// Nth most recent exec request (1 = latest).
         #[arg(long, default_value_t = 1)]
         turn: usize,
-        /// Show full message content
-        #[arg(long, default_value_t = false)]
+        /// Show full message content.
+        #[arg(long)]
         full: bool,
-        /// Dump raw JSON
-        #[arg(long, default_value_t = false)]
+        /// Dump raw JSON, retaining every context candidate.
+        #[arg(long)]
         raw: bool,
     },
-    /// Repair branch-level consistency issues
-    Repair {
-        #[command(subcommand)]
-        command: RepairCommand,
-    },
 }
 
-#[derive(Subcommand)]
-enum RepairCommand {
-    /// Merge duplicate named branches into canonical config-registered IDs
-    BranchDuplicates {
-        /// Preview actions without writing changes
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-    },
+/// One canonical collection value observed through the frozen pile prefix.
+struct CollectionView {
+    facts: TribleSet,
+    reader: PileReader,
 }
 
-/// Lightweight config snapshot — only non-branch fields that triage still needs.
-#[derive(Debug, Clone, Default)]
-struct ConfigSnapshot {
-    updated_at: Option<i128>,
-    persona_id: Option<Id>,
+impl CollectionView {
+    fn source(&self) -> SourceView<'_> {
+        SourceView {
+            facts: &self.facts,
+            reader: &self.reader,
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-struct ExecRequestRow {
-    id: Id,
-    command: String,
-    requested_at: i128,
+/// One immutable pile world plus one explicit local signing identity.
+struct TriageSnapshot {
+    pile_path: PathBuf,
+    pile: RefCell<Option<Pile>>,
+    signer: SigningKey,
 }
 
-#[derive(Debug, Clone)]
-struct ExecInProgressRow {
-    about_request: Id,
-    started_at: i128,
+impl TriageSnapshot {
+    fn open(cli: &Cli) -> Result<Self> {
+        // Loading is deliberately strict: a diagnostic read must never mint a
+        // new identity, create a pile, or admit somebody else's COMMITs.
+        let signer = load_signer(&cli.pile, cli.key.as_deref())?;
+        let pile = open_pile_strict(&cli.pile)?;
+        Ok(Self {
+            pile_path: cli.pile.clone(),
+            pile: RefCell::new(Some(pile)),
+            signer,
+        })
+    }
+
+    fn view(&self, scope: Id, label: &str) -> Result<CollectionView> {
+        let mut pile = self.pile.borrow_mut();
+        let pile = pile
+            .as_mut()
+            .ok_or_else(|| anyhow!("Triage snapshot is already closed"))?;
+        let facts = Collection::new(&mut *pile, scope, self.signer.clone())
+            .materialize()
+            .with_context(|| format!("materialize {label} collection"))?;
+        let reader = pile
+            .reader()
+            .with_context(|| format!("open {label} attachment reader"))?;
+        Ok(CollectionView { facts, reader })
+    }
+
+    fn cognition(&self) -> Result<CollectionView> {
+        let view = self.view(COGNITION_SCOPE_ID, "Cognition")?;
+        cognition_model::validate_catalog(&view.reader, &view.facts)
+            .context("validate Cognition collection")?;
+        Ok(view)
+    }
+
+    fn headspace(&self) -> Result<(CollectionView, TriageHeadspace)> {
+        let secrets = self.view(secrets_schema::DEFAULT_SCOPE_ID, "Secrets")?;
+        let view = self.view(HEADSPACE_SCOPE_ID, "Headspace")?;
+        let projected = triage_model::project_headspace(view.source(), secrets.source())?;
+        Ok((view, projected))
+    }
+
+    fn memory(&self) -> Result<(CollectionView, MemoryCatalog)> {
+        let view = self.view(MEMORY_SCOPE_ID, "Memory")?;
+        let catalog = memory_model::validate_catalog(&view.reader, &view.facts)
+            .context("validate Memory collection")?;
+        Ok((view, catalog))
+    }
+
+    fn relations(&self) -> Result<CollectionView> {
+        let view = self.view(RELATIONS_SCOPE_ID, "Relations")?;
+        relations_model::validate_catalog(&view.reader, &view.facts)
+            .context("validate Relations collection")?;
+        Ok(view)
+    }
+
+    fn messages(&self, relations: &CollectionView) -> Result<CollectionView> {
+        let view = self.view(MESSAGE_SCOPE_ID, "Message")?;
+        message_model::validate_catalog(&view.reader, &view.facts, &relations.facts)
+            .context("validate Message collection")?;
+        Ok(view)
+    }
+
+    fn close(self, result: Result<()>) -> Result<()> {
+        let close = self.close_inner();
+        match (result, close) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(close_error)) => {
+                Err(error.context(format!("also failed to close Triage pile: {close_error}")))
+            }
+        }
+    }
+
+    fn close_inner(&self) -> Result<()> {
+        let Some(pile) = self.pile.borrow_mut().take() else {
+            return Ok(());
+        };
+        pile.close()
+            .with_context(|| format!("close Triage pile {}", self.pile_path.display()))
+    }
 }
 
-#[derive(Debug, Clone)]
-struct ExecResultRow {
-    id: Id,
-    about_request: Id,
-    finished_at: i128,
-    exit_code: Option<i64>,
-    stderr_text: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ExecState {
-    requests: HashMap<Id, ExecRequestRow>,
-    in_progress: Vec<ExecInProgressRow>,
-    results: Vec<ExecResultRow>,
-}
-
-#[derive(Debug, Clone)]
-struct ModelRequestRow {
-    requested_at: i128,
-}
-
-#[derive(Debug, Clone)]
-struct ModelInProgressRow {
-    about_request: Id,
-    started_at: i128,
-}
-
-#[derive(Debug, Clone)]
-struct ModelResultRow {
-    about_request: Id,
-    finished_at: i128,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ModelChatState {
-    requests: HashMap<Id, ModelRequestRow>,
-    in_progress: Vec<ModelInProgressRow>,
-    results: Vec<ModelResultRow>,
-}
-
-#[derive(Debug, Clone)]
-struct ReasonEventRow {
-    created_at: Option<i128>,
-    text: Option<String>,
-    about_turn: Option<Id>,
-    command_text: Option<String>,
+impl Drop for TriageSnapshot {
+    fn drop(&mut self) {
+        let _ = self.close_inner();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,32 +236,6 @@ struct TimelineRow {
     at: i128,
     source: &'static str,
     detail: String,
-}
-
-#[derive(Debug, Clone)]
-struct ExecAttempt {
-    request_id: Id,
-    result_id: Id,
-    finished_at: i128,
-    command: String,
-    exit_code: Option<i64>,
-    fingerprint: String,
-}
-
-#[derive(Debug, Clone)]
-struct PatternSummary {
-    command: String,
-    exit_code: Option<i64>,
-    fingerprint: String,
-    count: usize,
-    latest: i128,
-}
-
-#[derive(Debug, Clone)]
-struct LoopReport {
-    recent: Vec<ExecAttempt>,
-    top_patterns: Vec<PatternSummary>,
-    contiguous_head: Option<PatternSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,11 +247,11 @@ enum ChatRole {
 }
 
 impl std::fmt::Display for ChatRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChatRole::System => write!(f, "system"),
-            ChatRole::User => write!(f, "user"),
-            ChatRole::Assistant => write!(f, "assistant"),
+            Self::System => formatter.write_str("system"),
+            Self::User => formatter.write_str("user"),
+            Self::Assistant => formatter.write_str("assistant"),
         }
     }
 }
@@ -248,79 +263,75 @@ struct ChatMessage {
 }
 
 #[derive(Debug, Clone)]
-struct ContextChunkRow {
-    id: Id,
-    summary: Option<String>,
-    created_at: Option<i128>,
-    start_at: Option<i128>,
-    end_at: Option<i128>,
-    children: Vec<Id>,
-    about_exec_result: Option<Id>,
+struct ContextCandidate {
+    result: Id,
+    thought: Id,
+    messages: Vec<ChatMessage>,
 }
 
-#[derive(Debug, Clone)]
-struct BudgetInfo {
-    context_window_tokens: u64,
-    max_output_tokens: u64,
-    safety_margin_tokens: u64,
-    chars_per_token: u64,
-    system_prompt_chars: usize,
-    body_budget_chars: i64,
-}
-
-#[derive(Debug, Clone)]
-struct ChainIssue {
-    commit_hash: String,
-    depth_from_head: usize,
-    reason: String,
-}
-
-#[derive(Debug, Clone)]
-struct ChainReport {
-    commit_head: String,
-    checked_commits: usize,
-    issue: Option<ChainIssue>,
-}
-
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
-    lower.to_tai_duration().total_nanoseconds()
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum FrontierNode {
+    Chunk(Id),
+    Retraction(Id),
 }
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn format_age(now_key: i128, past_key: i128) -> String {
-    let delta_ns = now_key.saturating_sub(past_key);
-    let delta_s = (delta_ns / 1_000_000_000).max(0) as i64;
-    if delta_s < 60 {
-        format!("{delta_s}s")
-    } else if delta_s < 3600 {
-        format!("{}m", delta_s / 60)
-    } else if delta_s < 86_400 {
-        format!("{}h", delta_s / 3600)
+fn now_key() -> i128 {
+    triage_model::now_tai_ns()
+}
+
+fn interval_key(interval: Interval) -> i128 {
+    triage_model::interval_key(interval)
+}
+
+fn format_tai_ns(ns: i128) -> String {
+    let ns = ns.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    let epoch = Epoch::from_tai_duration(hifitime::Duration::from_truncated_nanoseconds(ns));
+    let (year, month, day, hour, minute, second, _) = epoch.to_gregorian_utc();
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+}
+
+fn format_age(now: i128, past: i128) -> String {
+    let seconds = (now.saturating_sub(past) / 1_000_000_000).max(0) as i64;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
     } else {
-        format!("{}d", delta_s / 86_400)
+        format!("{}d", seconds / 86_400)
     }
 }
 
+fn format_duration_ns(ns: i128) -> String {
+    let ns = ns.max(0);
+    let milliseconds = ns / 1_000_000;
+    if milliseconds < 1_000 {
+        format!("{milliseconds}ms")
+    } else if milliseconds < 60_000 {
+        format!("{:.2}s", milliseconds as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", milliseconds as f64 / 60_000.0)
+    }
+}
+
+fn format_exit_code(code: Option<u64>) -> String {
+    code.map(|code| code.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
 fn truncate_single_line(text: &str, max: usize) -> String {
-    let mut out = String::with_capacity(max);
+    let mut out = String::with_capacity(max + 3);
     for ch in text.chars() {
-        if out.len() >= max {
+        if out.chars().count() >= max {
             out.push_str("...");
             break;
         }
-        if ch == '\n' || ch == '\r' {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
+        out.push(if ch == '\n' || ch == '\r' { ' ' } else { ch });
     }
     out
 }
@@ -330,1089 +341,187 @@ fn first_line(text: &str) -> String {
         .find(|line| !line.trim().is_empty())
         .unwrap_or(text)
         .trim()
-        .to_string()
+        .to_owned()
 }
 
-fn format_duration_ns(delta_ns: i128) -> String {
-    let secs = (delta_ns / 1_000_000_000).max(0) as u64;
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        let m = secs / 60;
-        let s = secs % 60;
-        if s == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m {s}s")
-        }
-    } else if secs < 86_400 {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        if m == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h {m}m")
-        }
-    } else {
-        let d = secs / 86_400;
-        let h = (secs % 86_400) / 3600;
-        if h == 0 {
-            format!("{d}d")
-        } else {
-            format!("{d}d {h}h")
-        }
-    }
-}
-
-fn format_tai_ns(ns: i128) -> String {
-    let ns_i64 = ns.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-    let epoch = Epoch::from_tai_duration(hifitime::Duration::from_truncated_nanoseconds(ns_i64));
-    let (y, m, d, hh, mm, ss, _) = epoch.to_gregorian_utc();
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
-}
-
-fn u256be_to_u64(value: Inline<inlineencodings::U256BE>) -> Option<u64> {
-    let raw = value.raw;
-    if raw[..24].iter().any(|byte| *byte != 0) {
-        return None;
-    }
-    let bytes: [u8; 8] = raw[24..32].try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
-}
-
-fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
-    let view: View<str> = ws
-        .get::<View<str>, blobencodings::LongString>(handle)
-        .map_err(|e| anyhow!("load longstring: {e:?}"))?;
+fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+    let view: View<str> = reader
+        .get(handle)
+        .with_context(|| format!("read LongString {}", hex::encode(handle.raw)))?;
     Ok(view.to_string())
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        // Avoid Drop warnings on early errors.
-        let _ = pile.close();
-        return Err(match err {
-            ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
+fn at_most_one<T>(entity: Id, field: &str, values: Vec<T>) -> Result<Option<T>> {
+    let count = values.len();
+    let mut values = values.into_iter();
+    match (values.next(), count) {
+        (None, 0) => Ok(None),
+        (Some(value), 1) => Ok(Some(value)),
+        _ => bail!(
+            "Cognition entity {entity:x} has {count} values for {field}; expected at most one"
+        ),
     }
-    Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))
-}
-
-fn pull_workspace(
-    repo: &mut Repository<Pile>,
-    branch_id: Id,
-    context: &str,
-) -> Result<Workspace<Pile>> {
-    match repo.pull(branch_id) {
-        Ok(ws) => Ok(ws),
-        Err(err) => {
-            let Some(valid_length) = pull_corrupt_valid_length(&err) else {
-                return Err(anyhow!("{context}: {err:?}"));
-            };
-            Err(anyhow!(
-                "{context}: pile corrupt at byte {valid_length}: refusing to auto-repair \
-                 (a stale binary could truncate newer data). Repair the torn tail explicitly \
-                 with: trible pile amputate <pile>"
-            ))
-        }
-    }
-}
-
-fn pull_corrupt_valid_length<B: std::error::Error>(
-    err: &PullError<ReadError, ReadError, B>,
-) -> Option<usize> {
-    match err {
-        PullError::BlobReader(ReadError::CorruptPile { valid_length })
-        | PullError::BranchStorage(ReadError::CorruptPile { valid_length }) => Some(*valid_length),
-        _ => None,
-    }
-}
-
-fn find_branch_ids_by_name(pile: &mut Pile, branch_name: &str) -> Result<Vec<Id>> {
-    let name_handle = branch_name.to_owned().to_blob().get_handle();
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let iter = pile.pins().map_err(|e| anyhow!("list pins: {e:?}"))?;
-    let mut matches = Vec::new();
-    for branch_entry in iter {
-        let branch_id = branch_entry.map_err(|e| anyhow!("branch id: {e:?}"))?;
-        let Some(head) = pile
-            .head(branch_id)
-            .map_err(|e| anyhow!("branch head: {e:?}"))?
-        else {
-            continue;
-        };
-        let metadata_set: TribleSet = reader
-            .get(head)
-            .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
-        let mut names = find!(
-            handle: TextHandle,
-            pattern!(&metadata_set, [{ metadata::name: ?handle }])
-        )
-        .into_iter();
-        let Some(name) = names.next() else {
-            continue;
-        };
-        if names.next().is_some() {
-            continue;
-        }
-        if name != name_handle {
-            continue;
-        }
-        let head_ts = reader
-            .metadata(head)
-            .ok()
-            .flatten()
-            .map(|meta| meta.timestamp)
-            .unwrap_or(0);
-        matches.push((branch_id, head_ts));
-    }
-    matches.sort_by_key(|(id, ts)| (Reverse(*ts), format!("{id:x}")));
-    Ok(matches.into_iter().map(|(id, _)| id).collect())
-}
-
-fn push_workspace(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>) -> Result<()> {
-    while let Some(mut conflict) = repo
-        .try_push(ws)
-        .map_err(|e| anyhow!("push workspace: {e:?}"))?
-    {
-        conflict
-            .merge(ws)
-            .map_err(|e| anyhow!("merge workspace: {e:?}"))?;
-        *ws = conflict;
-    }
-    Ok(())
-}
-
-/// Use ensure_branch to resolve a named branch, creating it if absent.
-fn ensure_branch_id(repo: &mut Repository<Pile>, name: &str) -> Result<Id> {
-    repo.ensure_branch(name, None)
-        .map_err(|e| anyhow!("ensure branch '{name}': {e:?}"))
-}
-
-/// Resolve target branch: explicit --branch-id wins, then config branch_id,
-/// then ensure_branch by name as last resort.
-fn resolve_target_branch(repo: &mut Repository<Pile>, cli: &Cli) -> Result<Id> {
-    ensure_branch_id(repo, &cli.branch)
-}
-
-/// Load lightweight config snapshot (persona_id + updated_at) from the config branch.
-fn load_latest_config(repo: &mut Repository<Pile>) -> Result<Option<ConfigSnapshot>> {
-    let branch_id = ensure_branch_id(repo, "config")?;
-    let mut ws = pull_workspace(repo, branch_id, "pull config workspace")?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
-
-    let mut latest: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest {
-            Some((_, best)) if best >= key => {}
-            _ => latest = Some((config_id, key)),
-        }
-    }
-
-    let Some((config_id, updated_at)) = latest else {
-        return Ok(None);
-    };
-
-    let mut snapshot = ConfigSnapshot {
-        updated_at: Some(updated_at),
-        ..Default::default()
-    };
-
-    if let Some(value) = find!(
-        value: Id,
-        pattern!(&space, [{ config_id @ config::persona_id: ?value }])
-    )
-    .next()
-    {
-        snapshot.persona_id = Some(value);
-    }
-
-    Ok(Some(snapshot))
-}
-
-fn collect_exec_state(ws: &mut Workspace<Pile>, space: &TribleSet) -> Result<ExecState> {
-    let mut state = ExecState::default();
-
-    for (request_id, handle, requested_at) in find!(
-        (request_id: Id, handle: TextHandle, requested_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?request_id @
-            metadata::tag: &KIND_EXEC_REQUEST_ID,
-            exec::command_text: ?handle,
-            metadata::created_at: ?requested_at,
-        }])
-    ) {
-        state.requests.insert(
-            request_id,
-            ExecRequestRow {
-                id: request_id,
-                command: read_text(ws, handle)?,
-                requested_at: interval_key(requested_at),
-            },
-        );
-    }
-
-    for (about_request, started_at) in find!(
-        (about_request: Id, started_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            _?event_id @
-            metadata::tag: &KIND_EXEC_IN_PROGRESS_ID,
-            exec::about_request: ?about_request,
-            metadata::started_at: ?started_at,
-        }])
-    ) {
-        state.in_progress.push(ExecInProgressRow {
-            about_request,
-            started_at: interval_key(started_at),
-        });
-    }
-
-    let mut result_map: HashMap<Id, ExecResultRow> = HashMap::new();
-    for (result_id, about_request, finished_at) in find!(
-        (result_id: Id, about_request: Id, finished_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?result_id @
-            metadata::tag: &KIND_EXEC_RESULT_ID,
-            exec::about_request: ?about_request,
-            metadata::finished_at: ?finished_at,
-        }])
-    ) {
-        result_map.insert(
-            result_id,
-            ExecResultRow {
-                id: result_id,
-                about_request,
-                finished_at: interval_key(finished_at),
-                exit_code: None,
-                stderr_text: None,
-                error: None,
-            },
-        );
-    }
-
-    for (result_id, value) in find!(
-        (result_id: Id, value: Inline<inlineencodings::U256BE>),
-        pattern!(&space, [{ ?result_id @ exec::exit_code: ?value }])
-    ) {
-        if let Some(entry) = result_map.get_mut(&result_id) {
-            entry.exit_code = u256be_to_u64(value).map(|n| n as i64);
-        }
-    }
-
-    for (result_id, handle) in find!(
-        (result_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?result_id @ exec::stderr_text: ?handle }])
-    ) {
-        if let Some(entry) = result_map.get_mut(&result_id) {
-            entry.stderr_text = Some(read_text(ws, handle)?);
-        }
-    }
-
-    for (result_id, handle) in find!(
-        (result_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?result_id @ exec::error: ?handle }])
-    ) {
-        if let Some(entry) = result_map.get_mut(&result_id) {
-            entry.error = Some(read_text(ws, handle)?);
-        }
-    }
-
-    state.results = result_map.into_values().collect();
-    Ok(state)
-}
-
-fn collect_model_chat_state(ws: &mut Workspace<Pile>, space: &TribleSet) -> Result<ModelChatState> {
-    let mut state = ModelChatState::default();
-
-    for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?request_id @
-            metadata::tag: &KIND_MODEL_REQUEST_ID,
-            metadata::created_at: ?requested_at,
-        }])
-    ) {
-        state.requests.insert(
-            request_id,
-            ModelRequestRow {
-                requested_at: interval_key(requested_at),
-            },
-        );
-    }
-
-    for (about_request, started_at) in find!(
-        (about_request: Id, started_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            _?event_id @
-            metadata::tag: &KIND_MODEL_IN_PROGRESS_ID,
-            model_chat::about_request: ?about_request,
-            metadata::started_at: ?started_at,
-        }])
-    ) {
-        state.in_progress.push(ModelInProgressRow {
-            about_request,
-            started_at: interval_key(started_at),
-        });
-    }
-
-    let mut result_map: HashMap<Id, ModelResultRow> = HashMap::new();
-    for (result_id, about_request, finished_at) in find!(
-        (result_id: Id, about_request: Id, finished_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?result_id @
-            metadata::tag: &KIND_MODEL_RESULT_ID,
-            model_chat::about_request: ?about_request,
-            metadata::finished_at: ?finished_at,
-        }])
-    ) {
-        result_map.insert(
-            result_id,
-            ModelResultRow {
-                about_request,
-                finished_at: interval_key(finished_at),
-                error: None,
-            },
-        );
-    }
-
-    for (result_id, handle) in find!(
-        (result_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?result_id @ model_chat::error: ?handle }])
-    ) {
-        if let Some(entry) = result_map.get_mut(&result_id) {
-            entry.error = Some(read_text(ws, handle)?);
-        }
-    }
-
-    state.results = result_map.into_values().collect();
-    Ok(state)
-}
-
-fn collect_reason_state(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-) -> Result<Vec<ReasonEventRow>> {
-    let mut rows: HashMap<Id, ReasonEventRow> = HashMap::new();
-
-    for reason_id in find!(
-        reason_id: Id,
-        pattern!(&space, [{ ?reason_id @ metadata::tag: &KIND_REASON_EVENT_ID }])
-    ) {
-        rows.insert(
-            reason_id,
-            ReasonEventRow {
-                created_at: None,
-                text: None,
-                about_turn: None,
-                command_text: None,
-            },
-        );
-    }
-
-    for (reason_id, created_at) in find!(
-        (reason_id: Id, created_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{ ?reason_id @ metadata::created_at: ?created_at }])
-    ) {
-        if let Some(row) = rows.get_mut(&reason_id) {
-            row.created_at = Some(interval_key(created_at));
-        }
-    }
-
-    for (reason_id, handle) in find!(
-        (reason_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?reason_id @ reason::text: ?handle }])
-    ) {
-        if let Some(row) = rows.get_mut(&reason_id) {
-            row.text = Some(read_text(ws, handle)?);
-        }
-    }
-
-    for (reason_id, about_turn) in find!(
-        (reason_id: Id, about_turn: Id),
-        pattern!(&space, [{ ?reason_id @ reason::about_turn: ?about_turn }])
-    ) {
-        if let Some(row) = rows.get_mut(&reason_id) {
-            row.about_turn = Some(about_turn);
-        }
-    }
-
-    for (reason_id, handle) in find!(
-        (reason_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?reason_id @ reason::command_text: ?handle }])
-    ) {
-        if let Some(row) = rows.get_mut(&reason_id) {
-            row.command_text = Some(read_text(ws, handle)?);
-        }
-    }
-
-    let mut list: Vec<ReasonEventRow> = rows.into_values().collect();
-    list.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
-    list.reverse();
-    Ok(list)
-}
-
-fn pending_exec_count(state: &ExecState) -> usize {
-    let done: HashSet<Id> = state.results.iter().map(|row| row.about_request).collect();
-    let running: HashSet<Id> = state
-        .in_progress
-        .iter()
-        .map(|row| row.about_request)
-        .filter(|id| !done.contains(id))
-        .collect();
-    state
-        .requests
-        .keys()
-        .filter(|id| !done.contains(*id) && !running.contains(*id))
-        .count()
-}
-
-fn pending_model_count(state: &ModelChatState) -> usize {
-    let done: HashSet<Id> = state.results.iter().map(|row| row.about_request).collect();
-    let running: HashSet<Id> = state
-        .in_progress
-        .iter()
-        .map(|row| row.about_request)
-        .filter(|id| !done.contains(id))
-        .collect();
-    state
-        .requests
-        .keys()
-        .filter(|id| !done.contains(*id) && !running.contains(*id))
-        .count()
-}
-
-fn stale_exec_in_progress_count(state: &ExecState, now_key: i128, stale_ns: i128) -> usize {
-    let done: HashSet<Id> = state.results.iter().map(|row| row.about_request).collect();
-    state
-        .in_progress
-        .iter()
-        .filter(|row| !done.contains(&row.about_request))
-        .filter(|row| now_key.saturating_sub(row.started_at) >= stale_ns)
-        .count()
-}
-
-fn stale_model_in_progress_count(state: &ModelChatState, now_key: i128, stale_ns: i128) -> usize {
-    let done: HashSet<Id> = state.results.iter().map(|row| row.about_request).collect();
-    state
-        .in_progress
-        .iter()
-        .filter(|row| !done.contains(&row.about_request))
-        .filter(|row| now_key.saturating_sub(row.started_at) >= stale_ns)
-        .count()
-}
-
-fn active_exec_running_count(state: &ExecState) -> usize {
-    let done: HashSet<Id> = state.results.iter().map(|row| row.about_request).collect();
-    state
-        .in_progress
-        .iter()
-        .map(|row| row.about_request)
-        .filter(|id| !done.contains(id))
-        .collect::<HashSet<_>>()
-        .len()
-}
-
-fn active_model_running_count(state: &ModelChatState) -> usize {
-    let done: HashSet<Id> = state.results.iter().map(|row| row.about_request).collect();
-    state
-        .in_progress
-        .iter()
-        .map(|row| row.about_request)
-        .filter(|id| !done.contains(id))
-        .collect::<HashSet<_>>()
-        .len()
-}
-
-fn collect_exec_attempts(state: &ExecState, recent: usize) -> Vec<ExecAttempt> {
-    let mut rows: Vec<ExecAttempt> = state
-        .results
-        .iter()
-        .filter_map(|result| {
-            let finished_at = result.finished_at;
-            let request = state.requests.get(&result.about_request)?;
-            let command = request.command.clone();
-            let fingerprint = result
-                .error
-                .as_ref()
-                .map(|s| first_line(s))
-                .or_else(|| result.stderr_text.as_ref().map(|s| first_line(s)))
-                .unwrap_or_else(|| {
-                    if result.exit_code == Some(0) {
-                        "<ok>".to_string()
-                    } else {
-                        "<no stderr text>".to_string()
-                    }
-                });
-            Some(ExecAttempt {
-                request_id: request.id,
-                result_id: result.id,
-                finished_at,
-                command,
-                exit_code: result.exit_code,
-                fingerprint,
-            })
-        })
-        .collect();
-    rows.sort_by_key(|row| row.finished_at);
-    rows.reverse();
-    rows.truncate(recent);
-    rows
-}
-
-fn build_loop_report(state: &ExecState, recent: usize, min_repeat: usize) -> LoopReport {
-    let recent_rows = collect_exec_attempts(state, recent);
-
-    let mut by_pattern: HashMap<(String, Option<i64>, String), PatternSummary> = HashMap::new();
-    for row in &recent_rows {
-        let key = (row.command.clone(), row.exit_code, row.fingerprint.clone());
-        let entry = by_pattern.entry(key).or_insert_with(|| PatternSummary {
-            command: row.command.clone(),
-            exit_code: row.exit_code,
-            fingerprint: row.fingerprint.clone(),
-            count: 0,
-            latest: row.finished_at,
-        });
-        entry.count += 1;
-        entry.latest = entry.latest.max(row.finished_at);
-    }
-    let mut top_patterns: Vec<PatternSummary> = by_pattern.into_values().collect();
-    top_patterns.sort_by_key(|pat| (pat.count, pat.latest));
-    top_patterns.reverse();
-
-    let contiguous_head = recent_rows.first().and_then(|head| {
-        let mut count = 0usize;
-        for row in &recent_rows {
-            if row.command == head.command
-                && row.exit_code == head.exit_code
-                && row.fingerprint == head.fingerprint
-            {
-                count += 1;
-            } else {
-                break;
-            }
-        }
-        (count >= min_repeat).then_some(PatternSummary {
-            command: head.command.clone(),
-            exit_code: head.exit_code,
-            fingerprint: head.fingerprint.clone(),
-            count,
-            latest: head.finished_at,
-        })
-    });
-
-    LoopReport {
-        recent: recent_rows,
-        top_patterns,
-        contiguous_head,
-    }
-}
-
-fn pattern_is_failure(pattern: &PatternSummary) -> bool {
-    if pattern.exit_code.unwrap_or(1) != 0 {
-        return true;
-    }
-    let normalized = pattern.fingerprint.trim();
-    !normalized.is_empty() && normalized != "<ok>"
-}
-
-fn load_relation_terms(repo: &mut Repository<Pile>) -> Result<Vec<String>> {
-    let branch_id = ensure_branch_id(repo, "relations")?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout relations workspace: {e:?}"))?;
-
-    let mut terms: HashSet<String> = HashSet::new();
-    for (_person_id, handle) in find!(
-        (_person_id: Id, handle: TextHandle),
-        pattern!(&space, [{
-            ?_person_id @
-            metadata::tag: &KIND_PERSON_ID,
-            metadata::name: ?handle,
-        }])
-    ) {
-        terms.insert(read_text(&mut ws, handle)?);
-    }
-    for alias in find!(
-        alias: String,
-        pattern!(&space, [{ relations::alias: ?alias }])
-    ) {
-        terms.insert(alias);
-    }
-
-    let mut out: Vec<String> = terms.into_iter().collect();
-    out.sort();
-    Ok(out)
-}
-
-fn find_case_variant(terms: &[String], label: &str) -> Option<String> {
-    terms
-        .iter()
-        .find(|term| term.eq_ignore_ascii_case(label) && *term != label)
-        .cloned()
-}
-
-fn extract_unknown_person_label(text: &str) -> Option<String> {
-    let marker = "unknown person label '";
-    let start = text.find(marker)?;
-    let rest = &text[start + marker.len()..];
-    let end = rest.find('\'')?;
-    Some(rest[..end].to_string())
-}
-
-fn count_unread_message(repo: &mut Repository<Pile>, reader_id: Id) -> Result<Option<usize>> {
-    let branch_id = ensure_branch_id(repo, "message")?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull message workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout message workspace: {e:?}"))?;
-
-    let mut incoming: HashSet<Id> = HashSet::new();
-    for (message_id, to_id) in find!(
-        (message_id: Id, to_id: Id),
-        pattern!(&space, [{
-            ?message_id @
-            metadata::tag: &KIND_LOCAL_MESSAGE_ID,
-            local::to: ?to_id,
-        }])
-    ) {
-        if to_id == reader_id {
-            incoming.insert(message_id);
-        }
-    }
-
-    let mut read: HashSet<Id> = HashSet::new();
-    for (about_message, ack_reader) in find!(
-        (about_message: Id, ack_reader: Id),
-        pattern!(&space, [{
-            _?read_id @
-            metadata::tag: &KIND_LOCAL_READ_ID,
-            local::about_message: ?about_message,
-            local::reader: ?ack_reader,
-        }])
-    ) {
-        if ack_reader == reader_id {
-            read.insert(about_message);
-        }
-    }
-
-    Ok(Some(incoming.difference(&read).count()))
 }
 
 fn cmd_scan(
-    repo: &mut Repository<Pile>,
     cli: &Cli,
+    snapshot: &TriageSnapshot,
     recent: usize,
     loop_min: usize,
     stale_min: i64,
 ) -> Result<()> {
-    let config = load_latest_config(repo)?;
-    let branch_id = resolve_target_branch(repo, cli)?;
-    let mut ws = pull_workspace(repo, branch_id, "pull target workspace")?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout target workspace: {e:?}"))?;
-    let exec_state = collect_exec_state(&mut ws, &space)?;
-    let model_state = collect_model_chat_state(&mut ws, &space)?;
-
-    let now_key = now_epoch().to_tai_duration().total_nanoseconds();
-    let stale_ns = (stale_min.max(0) as i128) * 60 * 1_000_000_000;
-
-    let exec_pending = pending_exec_count(&exec_state);
-    let model_pending = pending_model_count(&model_state);
-    let stale_exec = stale_exec_in_progress_count(&exec_state, now_key, stale_ns);
-    let stale_model = stale_model_in_progress_count(&model_state, now_key, stale_ns);
-    let exec_running = active_exec_running_count(&exec_state);
-    let model_running = active_model_running_count(&model_state);
-    let loop_report = build_loop_report(&exec_state, recent, loop_min);
-
-    let unread_local = if let Some(persona_id) = config.as_ref().and_then(|cfg| cfg.persona_id) {
-        count_unread_message(repo, persona_id)?
-    } else {
-        None
-    };
+    let cognition = snapshot.cognition()?;
+    let headspace_view = snapshot.view(HEADSPACE_SCOPE_ID, "Headspace")?;
+    let secrets = snapshot.view(secrets_schema::DEFAULT_SCOPE_ID, "Secrets")?;
+    let relations = snapshot.relations()?;
+    let messages = snapshot.messages(&relations)?;
+    let now = now_key();
+    let stale_ns = stale_min.max(0) as i128 * 60 * 1_000_000_000;
+    let report = triage_model::project_scan(
+        ScanSources {
+            cognition: cognition.source(),
+            headspace: headspace_view.source(),
+            secrets: secrets.source(),
+            relations: relations.source(),
+            messages: messages.source(),
+        },
+        ScanOptions {
+            now,
+            stale_after_ns: stale_ns,
+            recent_attempts: recent,
+            loop_min,
+        },
+    )?;
 
     println!("Triage scan");
     println!("- pile: {}", cli.pile.display());
-    println!("- target branch: {branch_id:x}");
-    if let Some(cfg) = config.as_ref() {
-        if let Some(updated_at) = cfg.updated_at {
-            println!("- config age: {}", format_age(now_key, updated_at));
-        }
-        if let Some(persona_id) = cfg.persona_id {
-            println!("- persona id: {persona_id:x}");
-        }
+    println!("- Cognition facts: {}", cognition.facts.len());
+    let config_heads = report.headspace.config_heads();
+    let active_profile_heads = report.headspace.active_profile_heads();
+    if let Some(error) = report.headspace.unsettled_reason() {
+        println!("- Headspace active state: unresolved ({error})");
     } else {
-        println!("- config: missing");
+        let state = if config_heads.len() > 1 || active_profile_heads.len() > 1 {
+            "agreed"
+        } else {
+            "unique"
+        };
+        println!(
+            "- Headspace active state: {state} (config heads={}, profile heads={})",
+            config_heads.len(),
+            active_profile_heads.len()
+        );
     }
-
+    if let Some(persona) = report.headspace.persona_id {
+        println!("- persona id: {persona:x}");
+    }
+    if !report.relations.forked_profiles.is_empty() {
+        println!(
+            "- Relations profile forks: {}",
+            report.relations.forked_profiles.len()
+        );
+    }
     println!();
     println!("Queues");
     println!(
-        "- exec: requests={} pending={} running={} results={}",
-        exec_state.requests.len(),
-        exec_pending,
-        exec_running,
-        exec_state.results.len()
+        "- exec: requests={} pending={} running={} stale={} forked={} invalid={} done={}",
+        report.exec_queue.requests,
+        report.exec_queue.pending,
+        report.exec_queue.running,
+        report.exec_queue.stale,
+        report.exec_queue.forked,
+        report.exec_queue.invalid,
+        report.exec_queue.done
     );
     println!(
-        "- model: requests={} pending={} running={} results={}",
-        model_state.requests.len(),
-        model_pending,
-        model_running,
-        model_state.results.len()
+        "- model: requests={} pending={} running={} stale={} forked={} invalid={} done={}",
+        report.model_queue.requests,
+        report.model_queue.pending,
+        report.model_queue.running,
+        report.model_queue.stale,
+        report.model_queue.forked,
+        report.model_queue.invalid,
+        report.model_queue.done
     );
-    println!("- stale in-progress (>{stale_min}m): exec={stale_exec}, model={stale_model}");
-    match unread_local {
-        Some(count) => println!("- local unread (persona inbox): {count}"),
-        None => println!("- local unread (persona inbox): unavailable"),
+    match report.unread_messages {
+        UnreadMessages::Available { count, .. } => {
+            println!("- unread canonical inbox messages: {count}")
+        }
+        UnreadMessages::Unavailable(reason) => {
+            let reason = match reason {
+                UnreadUnavailable::HeadspaceUnsettled => "Headspace is unsettled",
+                UnreadUnavailable::PersonaNotConfigured => "no persona is configured",
+            };
+            println!("- unread canonical inbox messages: unavailable ({reason})");
+        }
     }
 
     println!();
     println!("Loop heuristics");
-    let probable_pattern = loop_report.contiguous_head.as_ref().or_else(|| {
-        loop_report
-            .top_patterns
-            .iter()
-            .find(|pat| pat.count >= loop_min && pattern_is_failure(pat))
-    });
-    if let Some(head) = probable_pattern {
+    if let Some(pattern) = report.probable_loop.as_ref() {
         println!(
             "- probable loop: {} repeated {}x (exit={}): {}",
-            truncate_single_line(&head.command, 80),
-            head.count,
-            head.exit_code
+            truncate_single_line(&pattern.command, 80),
+            pattern.count,
+            pattern
+                .exit_code
                 .map(|code| code.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            truncate_single_line(&head.fingerprint, 120)
+                .unwrap_or_else(|| "-".to_owned()),
+            truncate_single_line(&pattern.fingerprint, 120)
         );
     } else {
-        println!("- no contiguous failure loop >= {loop_min} in recent exec results");
+        println!("- no repeated failure loop >= {loop_min} in recent exec results");
     }
 
-    let recent_model_failures = collect_recent_model_failures(&model_state, recent);
+    let mut model_failures: Vec<_> = report
+        .model_state
+        .results
+        .iter()
+        .filter(|row| row.error.is_some())
+        .collect();
+    model_failures.sort_by_key(|row| (row.finished_at, row.id));
+    model_failures.reverse();
     println!();
     println!("Recent model failures");
-    if recent_model_failures.is_empty() {
-        println!("- none in recent window");
-    } else {
-        for row in recent_model_failures {
-            let age = format_age(now_key, row.finished_at);
-            let detail = row
-                .error
-                .as_deref()
-                .map(first_line)
-                .unwrap_or_else(|| "<missing error text>".to_string());
-            println!("- {age} | {}", truncate_single_line(detail.as_str(), 140));
-        }
+    if model_failures.is_empty() {
+        println!("- none");
+    }
+    for row in model_failures.into_iter().take(recent.min(5)) {
+        println!(
+            "- {} | {}",
+            format_age(now, row.finished_at),
+            truncate_single_line(row.error.as_deref().unwrap_or("<missing error>"), 140)
+        );
     }
 
     println!();
     println!("Suggested next checks");
-    if model_pending > 0 && model_state.in_progress.is_empty() {
-        println!(
-            "- Model worker might be down: pending requests exist without in-progress events."
-        );
+    for suggestion in &report.suggestions {
+        println!("- {suggestion}");
     }
-    if exec_pending > 0 && exec_state.in_progress.is_empty() {
-        println!(
-            "- Exec worker might be down: pending command requests exist without in-progress events."
-        );
-    }
-    if stale_exec > 0 || stale_model > 0 {
-        println!("- One or more workers appear stale; inspect service logs and process health.");
-    }
-    if let Some(head) = probable_pattern {
-        if let Some(label) = extract_unknown_person_label(&head.fingerprint) {
-            let terms = load_relation_terms(repo)?;
-            if let Some(case_variant) = find_case_variant(&terms, label.as_str()) {
-                println!(
-                    "- message label mismatch: '{}' failed; try '{}' or add '{}' as alias in relations.",
-                    label, case_variant, label
-                );
-            } else {
-                println!(
-                    "- message unknown label '{}': add it to relations or use a known label/id.",
-                    label
-                );
-            }
-        }
-        if head.fingerprint.contains("rust-script")
-            && head.fingerprint.contains("No such file or directory")
-        {
-            println!(
-                "- rust-script is missing in the VM: install it (or invoke faculties via `rust-script <file>` fallback)."
-            );
-        }
-        if head.fingerprint.contains("commentary: not found") {
-            println!(
-                "- command emission includes markdown fence/preamble; harden command extraction to strip wrappers."
-            );
-        }
-    }
-    if model_pending == 0
-        && exec_pending == 0
-        && stale_exec == 0
-        && stale_model == 0
-        && unread_local.unwrap_or(0) == 0
-    {
-        println!("- system looks healthy; no obvious blockers detected.");
-    }
-
     Ok(())
 }
 
-fn collect_recent_model_failures(state: &ModelChatState, recent: usize) -> Vec<ModelResultRow> {
-    let mut failures: Vec<ModelResultRow> = state
-        .results
-        .iter()
-        .filter(|row| row.error.is_some())
-        .cloned()
-        .collect();
-    failures.sort_by_key(|row| row.finished_at);
-    failures.reverse();
-    failures.into_iter().take(recent.min(5)).collect()
-}
-
-fn verify_commit_chain(
-    reader: &triblespace::core::repo::pile::PileReader,
-    start: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
-) -> ChainReport {
-    let head_hash: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
-        inlineencodings::Handle::to_hash(start);
-    let commit_head: String = head_hash.from_inline();
-
-    let mut queue: VecDeque<(
-        Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
-        usize,
-    )> = VecDeque::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    queue.push_back((start, 0));
-
-    let mut checked_commits = 0usize;
-    while let Some((commit, depth)) = queue.pop_front() {
-        let commit_hash_value: Inline<inlineencodings::Hash<inlineencodings::Blake3>> =
-            inlineencodings::Handle::to_hash(commit);
-        let commit_hash: String = commit_hash_value.from_inline();
-        if !visited.insert(commit_hash.clone()) {
-            continue;
-        }
-
-        match reader.metadata(commit) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return ChainReport {
-                    commit_head,
-                    checked_commits,
-                    issue: Some(ChainIssue {
-                        commit_hash,
-                        depth_from_head: depth,
-                        reason: "commit blob missing".to_string(),
-                    }),
-                };
-            }
-            Err(err) => {
-                return ChainReport {
-                    commit_head,
-                    checked_commits,
-                    issue: Some(ChainIssue {
-                        commit_hash,
-                        depth_from_head: depth,
-                        reason: format!("commit metadata error: {err:?}"),
-                    }),
-                };
-            }
-        }
-
-        let commit_meta: TribleSet = match reader.get(commit) {
-            Ok(meta) => meta,
-            Err(err) => {
-                return ChainReport {
-                    commit_head,
-                    checked_commits,
-                    issue: Some(ChainIssue {
-                        commit_hash,
-                        depth_from_head: depth,
-                        reason: format!("commit decode failed: {err:?}"),
-                    }),
-                };
-            }
-        };
-
-        let mut saw_content_attr = false;
-        let mut missing_content_ref = false;
-        let mut parents = Vec::new();
-        for trible in commit_meta.iter() {
-            if trible.a() == &REPO_CONTENT_ATTR {
-                saw_content_attr = true;
-                let content = *trible.v::<inlineencodings::Handle<blobencodings::SimpleArchive>>();
-                match reader.metadata(content) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => missing_content_ref = true,
-                    Err(err) => {
-                        return ChainReport {
-                            commit_head,
-                            checked_commits,
-                            issue: Some(ChainIssue {
-                                commit_hash,
-                                depth_from_head: depth,
-                                reason: format!("content metadata error: {err:?}"),
-                            }),
-                        };
-                    }
-                }
-            } else if trible.a() == &REPO_PARENT_ATTR {
-                parents.push(*trible.v::<inlineencodings::Handle<blobencodings::SimpleArchive>>());
-            }
-        }
-
-        // Commits may intentionally omit repo::content (for example merge-only
-        // commits). Only treat missing content as corruption when the commit
-        // explicitly references repo::content blobs and one of those blobs is
-        // unavailable.
-        if saw_content_attr && missing_content_ref {
-            return ChainReport {
-                commit_head,
-                checked_commits,
-                issue: Some(ChainIssue {
-                    commit_hash,
-                    depth_from_head: depth,
-                    reason: "referenced content blob missing".to_string(),
-                }),
-            };
-        }
-
-        checked_commits += 1;
-        for parent in parents {
-            queue.push_back((parent, depth + 1));
-        }
-    }
-
-    ChainReport {
-        commit_head,
-        checked_commits,
-        issue: None,
-    }
-}
-
-fn cmd_chain(repo: &mut Repository<Pile>, cli: &Cli) -> Result<()> {
-    let branch_id = resolve_target_branch(repo, cli)?;
-    let Some(branch_meta_handle) = repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|err| anyhow!("read branch metadata head: {err:?}"))?
-    else {
-        bail!("target branch {branch_id:x} has no branch metadata head");
-    };
-
-    let reader = repo
-        .storage_mut()
-        .reader()
-        .map_err(|err| anyhow!("open pile reader: {err:?}"))?;
-    let branch_meta: TribleSet = reader
-        .get(branch_meta_handle)
-        .map_err(|err| anyhow!("decode branch metadata: {err:?}"))?;
-
-    let mut branch_name = None;
-    let mut commit_head = None;
-    for trible in branch_meta.iter() {
-        if trible.a() == &metadata::name.id() {
-            let handle = *trible.v::<inlineencodings::Handle<blobencodings::LongString>>();
-            if let Ok(view) = reader.get::<View<str>, _>(handle) {
-                branch_name = Some(view.as_ref().to_string());
-            }
-        } else if trible.a() == &REPO_HEAD_ATTR {
-            commit_head =
-                Some(*trible.v::<inlineencodings::Handle<blobencodings::SimpleArchive>>());
-        }
-    }
-
-    let Some(commit_head) = commit_head else {
-        bail!("branch metadata for {branch_id:x} has no repo head");
-    };
-
-    let report = verify_commit_chain(&reader, commit_head);
-    println!("Commit-chain integrity");
-    println!("- pile: {}", cli.pile.display());
-    println!(
-        "- branch: {} ({branch_id:x})",
-        branch_name.unwrap_or_else(|| "<unnamed>".to_string())
-    );
-    println!("- current commit head: {}", report.commit_head);
-    match report.issue {
-        Some(issue) => {
-            println!("- status: broken");
-            println!("- issue: {}", issue.reason);
-            println!("- issue commit: {}", issue.commit_hash);
-            println!("- depth from head: {}", issue.depth_from_head);
-            println!(
-                "- commits verified before failure: {}",
-                report.checked_commits
-            );
-        }
-        None => {
-            println!("- status: healthy");
-            println!("- commits verified: {}", report.checked_commits);
-        }
-    }
-
-    Ok(())
-}
-
-fn cmd_loops(
-    repo: &mut Repository<Pile>,
-    cli: &Cli,
-    recent: usize,
-    min_repeat: usize,
-) -> Result<()> {
-    let branch_id = resolve_target_branch(repo, cli)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull target workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout target workspace: {e:?}"))?;
-    let exec_state = collect_exec_state(&mut ws, &space)?;
-    let report = build_loop_report(&exec_state, recent, min_repeat);
-    let now_key = now_epoch().to_tai_duration().total_nanoseconds();
-
+fn cmd_loops(snapshot: &TriageSnapshot, recent: usize, min_repeat: usize) -> Result<()> {
+    let cognition = snapshot.cognition()?;
+    let state = collect_exec_state(&cognition.reader, &cognition.facts)?;
+    let report = build_loop_report(&state, recent, min_repeat);
+    let now = now_key();
     println!("Triage loops");
-    println!("- branch: {branch_id:x}");
+    println!("- Cognition facts: {}", cognition.facts.len());
     println!("- recent attempts: {}", report.recent.len());
-
-    if let Some(head) = report.contiguous_head.as_ref() {
+    if let Some(head) = &report.contiguous_head {
         println!(
             "- contiguous head loop: {}x, exit={}, command={}",
             head.count,
             head.exit_code
                 .map(|code| code.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+                .unwrap_or_else(|| "-".to_owned()),
             truncate_single_line(&head.command, 90)
         );
     } else {
         println!("- contiguous head loop: none (threshold {min_repeat})");
     }
-
     println!();
     println!("Top patterns");
     for pattern in report.top_patterns.iter().take(5) {
@@ -1422,28 +531,26 @@ fn cmd_loops(
             pattern
                 .exit_code
                 .map(|code| code.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+                .unwrap_or_else(|| "-".to_owned()),
             truncate_single_line(&pattern.command, 70),
             truncate_single_line(&pattern.fingerprint, 80)
         );
     }
-
     println!();
     println!("Recent attempts");
-    for row in &report.recent {
+    for row in report.recent {
         println!(
             "- [{}:{}] {} | exit={} | {} | {}",
             fmt_id(row.request_id),
             fmt_id(row.result_id),
-            format_age(now_key, row.finished_at),
+            format_age(now, row.finished_at),
             row.exit_code
                 .map(|code| code.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+                .unwrap_or_else(|| "-".to_owned()),
             truncate_single_line(&row.command, 70),
             truncate_single_line(&row.fingerprint, 90)
         );
     }
-
     Ok(())
 }
 
@@ -1453,91 +560,81 @@ fn build_timeline_rows(
     reason_rows: &[ReasonEventRow],
     recent: usize,
 ) -> Vec<TimelineRow> {
-    let mut rows = Vec::<TimelineRow>::new();
-
+    let mut rows = Vec::new();
     for request in exec_state.requests.values() {
-        {
-            let (at, command) = (request.requested_at, &request.command);
+        rows.push(TimelineRow {
+            at: request.requested_at,
+            source: "exec",
+            detail: format!(
+                "[{}] {}",
+                fmt_id(request.id),
+                truncate_single_line(&request.command, 120)
+            ),
+        });
+    }
+    for result in &exec_state.results {
+        let command = exec_state
+            .requests
+            .get(&result.about_request)
+            .map(|request| request.command.as_str())
+            .unwrap_or("<missing request>");
+        let status = result
+            .error
+            .as_deref()
+            .map(|error| format!("error {}", truncate_single_line(error, 72)))
+            .or_else(|| {
+                result.stderr_text.as_deref().map(|stderr| {
+                    format!(
+                        "exit {} stderr {}",
+                        format_exit_code(result.exit_code),
+                        truncate_single_line(&first_line(stderr), 72)
+                    )
+                })
+            })
+            .unwrap_or_else(|| format!("exit {}", format_exit_code(result.exit_code)));
+        rows.push(TimelineRow {
+            at: result.finished_at,
+            source: "exec-result",
+            detail: format!(
+                "[{}:{}] {} | {status}",
+                fmt_id(result.about_request),
+                fmt_id(result.id),
+                truncate_single_line(command, 100)
+            ),
+        });
+    }
+    for request in model_state.requests.values() {
+        rows.push(TimelineRow {
+            at: request.requested_at,
+            source: "model",
+            detail: format!("[{}] request", fmt_id(request.id)),
+        });
+    }
+    for result in &model_state.results {
+        if let Some(error) = &result.error {
             rows.push(TimelineRow {
-                at,
-                source: "exec",
+                at: result.finished_at,
+                source: "model-error",
                 detail: format!(
                     "[{}] {}",
-                    fmt_id(request.id),
-                    truncate_single_line(command, 120)
+                    fmt_id(result.id),
+                    truncate_single_line(error, 130)
                 ),
             });
         }
     }
-
-    let request_commands: HashMap<Id, String> = exec_state
-        .requests
-        .values()
-        .map(|request| (request.id, request.command.clone()))
-        .collect();
-
-    for result in &exec_state.results {
-        let at = result.finished_at;
-        let command = request_commands
-            .get(&result.about_request)
-            .cloned()
-            .unwrap_or_else(|| "<missing command>".to_string());
-        let status = if let Some(error) = result.error.as_ref() {
-            format!("error {}", truncate_single_line(error, 72))
-        } else if let Some(stderr) = result.stderr_text.as_ref() {
-            let line = first_line(stderr);
-            if line == "<ok>" {
-                format!("exit {}", result.exit_code.unwrap_or(0))
-            } else {
-                format!(
-                    "exit {} stderr {}",
-                    result.exit_code.unwrap_or(-1),
-                    truncate_single_line(line.as_str(), 72)
-                )
-            }
-        } else {
-            format!("exit {}", result.exit_code.unwrap_or(-1))
-        };
-        rows.push(TimelineRow {
-            at,
-            source: "exec-result",
-            detail: format!(
-                "[{}:{}] {} | {}",
-                fmt_id(result.about_request),
-                fmt_id(result.id),
-                truncate_single_line(command.as_str(), 100),
-                status
-            ),
-        });
-    }
-
-    for (request_id, entry) in &model_state.requests {
-        rows.push(TimelineRow {
-            at: entry.requested_at,
-            source: "model",
-            detail: format!("[{}] request", fmt_id(*request_id)),
-        });
-    }
-    for result in &model_state.results {
-        if let Some(error) = result.error.as_ref() {
-            rows.push(TimelineRow {
-                at: result.finished_at,
-                source: "model-error",
-                detail: truncate_single_line(error, 130),
-            });
-        }
-    }
-
     for row in reason_rows {
-        let text = row.text.as_deref().unwrap_or("<missing>");
-        let mut detail = String::new();
-        if let Some(turn_id) = row.about_turn {
-            detail.push_str(format!("[turn {}] ", fmt_id(turn_id)).as_str());
+        let mut detail = format!("[{}] ", fmt_id(row.id));
+        if let Some(turn) = row.about_turn {
+            detail.push_str(&format!("[turn {}] ", fmt_id(turn)));
         }
-        detail.push_str(truncate_single_line(text, 120).as_str());
-        if let Some(command) = row.command_text.as_ref() {
+        detail.push_str(&truncate_single_line(
+            row.text.as_deref().unwrap_or("<missing>"),
+            120,
+        ));
+        if let Some(command) = &row.command_text {
             detail.push_str(" | ");
-            detail.push_str(truncate_single_line(command, 96).as_str());
+            detail.push_str(&truncate_single_line(command, 96));
         }
         rows.push(TimelineRow {
             at: row.created_at.unwrap_or(i128::MIN),
@@ -1545,38 +642,27 @@ fn build_timeline_rows(
             detail,
         });
     }
-
     rows.sort_by_key(|row| row.at);
     rows.reverse();
-    if rows.len() > recent {
-        rows.truncate(recent);
-    }
+    rows.truncate(recent);
     rows
 }
 
-fn cmd_timeline(repo: &mut Repository<Pile>, cli: &Cli, recent: usize) -> Result<()> {
-    let branch_id = resolve_target_branch(repo, cli)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull target workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout target workspace: {e:?}"))?;
-    let exec_state = collect_exec_state(&mut ws, &space)?;
-    let model_state = collect_model_chat_state(&mut ws, &space)?;
-    let reason_state = collect_reason_state(&mut ws, &space)?;
+fn cmd_timeline(snapshot: &TriageSnapshot, recent: usize) -> Result<()> {
+    let cognition = snapshot.cognition()?;
+    let exec_state = collect_exec_state(&cognition.reader, &cognition.facts)?;
+    let model_state = collect_model_chat_state(&cognition.reader, &cognition.facts)?;
+    let reason_state = collect_reason_state(&cognition.reader, &cognition.facts)?;
     let rows = build_timeline_rows(&exec_state, &model_state, &reason_state, recent);
-    let now_key = now_epoch().to_tai_duration().total_nanoseconds();
-
+    let now = now_key();
     println!("Triage timeline");
-    println!("- pile: {}", cli.pile.display());
-    println!("- branch: {branch_id:x}");
+    println!("- Cognition facts: {}", cognition.facts.len());
     println!("- rows: {}", rows.len());
     println!();
     for row in rows {
         println!(
             "- {:>5} {:>11} | {}",
-            format_age(now_key, row.at),
+            format_age(now, row.at),
             row.source,
             row.detail
         );
@@ -1584,1302 +670,788 @@ fn cmd_timeline(repo: &mut Repository<Pile>, cli: &Cli, recent: usize) -> Result
     Ok(())
 }
 
-#[derive(Debug)]
-struct BranchRepairOutcome {
-    name: String,
-    canonical_id: Id,
-    duplicate_ids: Vec<Id>,
-    merged_facts: usize,
-    merged_branches: usize,
-    deleted_branches: usize,
-    skipped_branches: usize,
-}
-
-fn insert_canonical_branch(
-    map: &mut HashMap<String, Id>,
-    name: &str,
-    id: Option<Id>,
-) -> Result<()> {
-    let Some(id) = id else {
-        return Ok(());
-    };
-    match map.get(name).copied() {
-        Some(existing) if existing != id => {
-            bail!("conflicting canonical ids for branch name '{name}': {existing:x} vs {id:x}");
-        }
-        _ => {
-            map.insert(name.to_owned(), id);
-            Ok(())
-        }
-    }
-}
-
-fn delete_branch(repo: &mut Repository<Pile>, branch_id: Id) -> Result<()> {
-    let mut expected = repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|err| anyhow!("read branch {branch_id:x} head: {err:?}"))?;
-    if expected.is_none() {
-        return Ok(());
-    }
-
-    for _ in 0..3 {
-        let result = repo
-            .storage_mut()
-            .update(branch_id, expected, None)
-            .map_err(|err| anyhow!("delete branch {branch_id:x}: {err:?}"))?;
-        match result {
-            PushResult::Success() => return Ok(()),
-            PushResult::Conflict(current) => {
-                if current.is_none() {
-                    return Ok(());
-                }
-                expected = current;
-            }
-        }
-    }
-    bail!("delete branch {branch_id:x}: conflict after retries")
-}
-
-fn repair_named_duplicates(
-    repo: &mut Repository<Pile>,
-    branch_name: &str,
-    canonical_id: Id,
-    dry_run: bool,
-) -> Result<BranchRepairOutcome> {
-    let duplicate_ids = find_branch_ids_by_name(repo.storage_mut(), branch_name)?
+fn memory_frontier(catalog: &MemoryCatalog) -> Vec<FrontierNode> {
+    catalog
+        .head_ids()
         .into_iter()
-        .filter(|id| *id != canonical_id)
-        .collect::<Vec<_>>();
-
-    let mut outcome = BranchRepairOutcome {
-        name: branch_name.to_owned(),
-        canonical_id,
-        duplicate_ids: duplicate_ids.clone(),
-        merged_facts: 0,
-        merged_branches: 0,
-        deleted_branches: 0,
-        skipped_branches: 0,
-    };
-    if duplicate_ids.is_empty() {
-        return Ok(outcome);
-    }
-
-    if dry_run {
-        let canonical_exists = repo
-            .storage_mut()
-            .head(canonical_id)
-            .map_err(|e| anyhow!("read canonical branch {canonical_id:x} head: {e:?}"))?
-            .is_some();
-        if !canonical_exists {
-            outcome.skipped_branches = outcome.duplicate_ids.len();
-            return Ok(outcome);
-        }
-    }
-
-    let mut canonical_ws = repo
-        .pull(canonical_id)
-        .map_err(|err| anyhow!("pull canonical branch {canonical_id:x}: {err:?}"))?;
-    let mut canonical_data = canonical_ws
-        .checkout(..)
-        .map_err(|err| anyhow!("checkout canonical branch {canonical_id:x}: {err:?}"))?
-        .into_facts();
-
-    for duplicate_id in duplicate_ids {
-        let mut duplicate_ws = match repo.pull(duplicate_id) {
-            Ok(ws) => ws,
-            Err(err) => {
-                outcome.skipped_branches += 1;
-                eprintln!(
-                    "warning: skip duplicate branch {duplicate_id:x} ({branch_name}): pull failed ({err:?})"
-                );
-                continue;
-            }
-        };
-        let duplicate_data = match duplicate_ws.checkout(..) {
-            Ok(set) => set.into_facts(),
-            Err(err) => {
-                outcome.skipped_branches += 1;
-                eprintln!(
-                    "warning: skip duplicate branch {duplicate_id:x} ({branch_name}): checkout failed ({err:?})"
-                );
-                continue;
-            }
-        };
-
-        let delta = duplicate_data.difference(&canonical_data);
-        if !delta.is_empty() {
-            outcome.merged_facts += delta.len();
-            outcome.merged_branches += 1;
-            if !dry_run {
-                canonical_ws.commit(delta.clone(), "triage repair branch duplicates");
-                push_workspace(repo, &mut canonical_ws)?;
-                canonical_data += delta;
-            }
-        }
-
-        if !dry_run {
-            match delete_branch(repo, duplicate_id) {
-                Ok(()) => outcome.deleted_branches += 1,
-                Err(err) => {
-                    outcome.skipped_branches += 1;
-                    eprintln!(
-                        "warning: failed to delete duplicate branch {duplicate_id:x} ({branch_name}): {err:#}"
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(outcome)
-}
-
-/// All well-known branch names used across the system.
-const KNOWN_BRANCH_NAMES: &[&str] = &[
-    "archive",
-    "cognition",
-    "compass",
-    "config",
-    "exec",
-    "message",
-    "media",
-    "relations",
-    "teams",
-    "web",
-    "workspace",
-];
-
-fn cmd_repair_branch_duplicates(
-    repo: &mut Repository<Pile>,
-    cli: &Cli,
-    dry_run: bool,
-) -> Result<()> {
-    let mut canonical = HashMap::<String, Id>::new();
-    for &name in KNOWN_BRANCH_NAMES {
-        let id = ensure_branch_id(repo, name)?;
-        insert_canonical_branch(&mut canonical, name, Some(id))?;
-    }
-    // Also include the target branch if it differs from the well-known names.
-    if !canonical.contains_key(cli.branch.as_str()) {
-        let id = ensure_branch_id(repo, &cli.branch)?;
-        insert_canonical_branch(&mut canonical, &cli.branch, Some(id))?;
-    }
-
-    let mut names: Vec<String> = canonical.keys().cloned().collect();
-    names.sort();
-
-    println!(
-        "Repair duplicate named branches{}",
-        if dry_run { " (dry-run)" } else { "" }
-    );
-    println!("- pile: {}", cli.pile.display());
-    println!("- canonical branch entries: {}", names.len());
-
-    let mut outcomes = Vec::new();
-    for name in names {
-        let canonical_id = canonical[&name];
-        let outcome = repair_named_duplicates(repo, name.as_str(), canonical_id, dry_run)?;
-        outcomes.push(outcome);
-    }
-
-    let touched = outcomes
-        .iter()
-        .filter(|o| !o.duplicate_ids.is_empty())
-        .count();
-    let merged_branches: usize = outcomes.iter().map(|o| o.merged_branches).sum();
-    let merged_facts: usize = outcomes.iter().map(|o| o.merged_facts).sum();
-    let deleted: usize = outcomes.iter().map(|o| o.deleted_branches).sum();
-    let skipped: usize = outcomes.iter().map(|o| o.skipped_branches).sum();
-
-    println!();
-    println!("Summary");
-    println!("- names with duplicates: {touched}");
-    println!("- merged duplicate branches: {merged_branches}");
-    println!("- merged facts: {merged_facts}");
-    if dry_run {
-        println!(
-            "- branches to delete: {}",
-            outcomes
-                .iter()
-                .map(|o| o.duplicate_ids.len())
-                .sum::<usize>()
-        );
-    } else {
-        println!("- deleted duplicate branches: {deleted}");
-    }
-    if skipped > 0 {
-        println!("- skipped branches: {skipped}");
-    }
-
-    println!();
-    println!("Details");
-    for outcome in outcomes {
-        if outcome.duplicate_ids.is_empty() {
-            continue;
-        }
-        let duplicate_list = outcome
-            .duplicate_ids
-            .iter()
-            .map(|id| format!("{id:x}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!(
-            "- {} -> {:x} | duplicates: [{}] | merged_facts={} | {}",
-            outcome.name,
-            outcome.canonical_id,
-            duplicate_list,
-            outcome.merged_facts,
-            if dry_run {
-                "would_delete=true".to_string()
+        .filter_map(|id| {
+            if catalog.chunks.contains_key(&id) {
+                Some(FrontierNode::Chunk(id))
+            } else if catalog.retractions.contains_key(&id) {
+                Some(FrontierNode::Retraction(id))
             } else {
-                format!("deleted={}", outcome.deleted_branches)
+                None
             }
-        );
-    }
-
-    Ok(())
-}
-
-fn collect_context_chunks(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-) -> Result<Vec<ContextChunkRow>> {
-    let mut chunks: HashMap<Id, ContextChunkRow> = HashMap::new();
-
-    for chunk_id in find!(
-        chunk_id: Id,
-        pattern!(&space, [{ ?chunk_id @ metadata::tag: &KIND_CONTEXT_CHUNK_ID }])
-    ) {
-        chunks.insert(
-            chunk_id,
-            ContextChunkRow {
-                id: chunk_id,
-                summary: None,
-                created_at: None,
-                start_at: None,
-                end_at: None,
-                children: Vec::new(),
-                about_exec_result: None,
-            },
-        );
-    }
-
-    for (chunk_id, handle) in find!(
-        (chunk_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?chunk_id @ context::summary: ?handle }])
-    ) {
-        if let Some(row) = chunks.get_mut(&chunk_id) {
-            row.summary = Some(read_text(ws, handle)?);
-        }
-    }
-
-    for (chunk_id, value) in find!(
-        (chunk_id: Id, value: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{ ?chunk_id @ metadata::created_at: ?value }])
-    ) {
-        if let Some(row) = chunks.get_mut(&chunk_id) {
-            row.created_at = Some(interval_key(value));
-        }
-    }
-
-    for (chunk_id, value) in find!(
-        (chunk_id: Id, value: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{ ?chunk_id @ context::start_at: ?value }])
-    ) {
-        if let Some(row) = chunks.get_mut(&chunk_id) {
-            row.start_at = Some(interval_key(value));
-        }
-    }
-
-    for (chunk_id, value) in find!(
-        (chunk_id: Id, value: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{ ?chunk_id @ context::end_at: ?value }])
-    ) {
-        if let Some(row) = chunks.get_mut(&chunk_id) {
-            row.end_at = Some(interval_key(value));
-        }
-    }
-
-    for (parent_id, child_id) in find!(
-        (parent_id: Id, child_id: Id),
-        pattern!(&space, [{ ?parent_id @ context::reference: ?child_id }])
-    ) {
-        if let Some(row) = chunks.get_mut(&parent_id) {
-            row.children.push(child_id);
-        }
-    }
-
-    for (chunk_id, exec_id) in find!(
-        (chunk_id: Id, exec_id: Id),
-        pattern!(&space, [{ ?chunk_id @ context::about_exec_result: ?exec_id }])
-    ) {
-        if let Some(row) = chunks.get_mut(&chunk_id) {
-            row.about_exec_result = Some(exec_id);
-        }
-    }
-
-    let mut list: Vec<ContextChunkRow> = chunks.into_values().collect();
-    list.sort_by_key(|row| row.start_at.unwrap_or(i128::MAX));
-    Ok(list)
-}
-
-fn find_root_chunks(chunks: &[ContextChunkRow]) -> Vec<usize> {
-    let child_ids: HashSet<Id> = chunks
-        .iter()
-        .flat_map(|c| c.children.iter().copied())
-        .collect();
-    // A root is any chunk that is not a child of another chunk
-    chunks
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| !child_ids.contains(&c.id))
-        .map(|(i, _)| i)
+        })
         .collect()
 }
 
-fn load_budget_from_config(repo: &mut Repository<Pile>) -> Result<Option<BudgetInfo>> {
-    let branch_id = ensure_branch_id(repo, "config")?;
-    let mut ws = pull_workspace(repo, branch_id, "pull config for budget")?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout config: {e:?}"))?;
-
-    // Find latest config
-    let mut latest_config: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest_config {
-            Some((_, best)) if best >= key => {}
-            _ => latest_config = Some((config_id, key)),
-        }
+fn chunk_text(reader: &PileReader, chunk: &memory_model::ChunkRow) -> Result<String> {
+    match chunk.content {
+        ChunkContent::Text(handle) => memory_model::read_text(reader, handle),
+        ChunkContent::Image(handle) => Ok(format!(
+            "<image: {} bytes>",
+            memory_model::read_image(reader, handle)?.len()
+        )),
     }
-    let Some((config_id, _)) = latest_config else {
-        return Ok(None);
-    };
-
-    // Get active model profile id
-    let mut active_profile_id: Option<Id> = None;
-    if let Some(value) = find!(
-        value: Id,
-        pattern!(&space, [{ config_id @ config::active_model_profile_id: ?value }])
-    )
-    .next()
-    {
-        active_profile_id = Some(value);
-    }
-
-    // Get system prompt length
-    let system_prompt_chars: usize = if let Some(handle) = find!(
-        handle: TextHandle,
-        pattern!(&space, [{ config_id @ config::system_prompt: ?handle }])
-    )
-    .next()
-    {
-        read_text(&mut ws, handle)?.len()
-    } else {
-        0
-    };
-
-    // Find model profile
-    let Some(profile_id) = active_profile_id else {
-        return Ok(None);
-    };
-
-    let mut context_window: u64 = 0;
-    let mut max_output: u64 = 0;
-    let mut safety_margin: u64 = 0;
-    let mut chars_per_token: u64 = 4;
-
-    if let Some(value) = find!(
-        value: Inline<inlineencodings::U256BE>,
-        pattern!(&space, [{ profile_id @ config::model_context_window_tokens: ?value }])
-    )
-    .next()
-    {
-        context_window = u256be_to_u64(value).unwrap_or(0);
-    }
-    if let Some(value) = find!(
-        value: Inline<inlineencodings::U256BE>,
-        pattern!(&space, [{ profile_id @ config::model_max_output_tokens: ?value }])
-    )
-    .next()
-    {
-        max_output = u256be_to_u64(value).unwrap_or(0);
-    }
-    if let Some(value) = find!(
-        value: Inline<inlineencodings::U256BE>,
-        pattern!(&space, [{ profile_id @ config::model_context_safety_margin_tokens: ?value }])
-    )
-    .next()
-    {
-        safety_margin = u256be_to_u64(value).unwrap_or(0);
-    }
-    if let Some(value) = find!(
-        value: Inline<inlineencodings::U256BE>,
-        pattern!(&space, [{ profile_id @ config::model_chars_per_token: ?value }])
-    )
-    .next()
-    {
-        chars_per_token = u256be_to_u64(value).unwrap_or(4).max(1);
-    }
-
-    let body_budget_chars =
-        ((context_window as i64) - (max_output as i64) - (safety_margin as i64))
-            * (chars_per_token as i64)
-            - (system_prompt_chars as i64);
-
-    Ok(Some(BudgetInfo {
-        context_window_tokens: context_window,
-        max_output_tokens: max_output,
-        safety_margin_tokens: safety_margin,
-        chars_per_token,
-        system_prompt_chars,
-        body_budget_chars,
-    }))
 }
 
-fn load_turn_context(
-    repo: &mut Repository<Pile>,
-    exec_branch_id: Id,
-    turn_offset: usize,
-) -> Result<Option<(Id, String, Vec<ChatMessage>)>> {
-    let mut ws = pull_workspace(repo, exec_branch_id, "pull exec for context")?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout exec: {e:?}"))?;
-
-    // Collect exec requests with timestamps
-    let mut requests: Vec<(Id, i128, Option<String>)> = Vec::new();
-    for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?request_id @
-            metadata::tag: &KIND_EXEC_REQUEST_ID,
-            metadata::created_at: ?requested_at,
-        }])
-    ) {
-        requests.push((request_id, interval_key(requested_at), None));
-    }
-    // Load command text
-    for (request_id, handle) in find!(
-        (request_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?request_id @ exec::command_text: ?handle }])
-    ) {
-        for entry in requests.iter_mut() {
-            if entry.0 == request_id {
-                entry.2 = Some(read_text(&mut ws, handle)?);
-                break;
-            }
-        }
-    }
-
-    requests.sort_by_key(|r| r.1);
-    requests.reverse();
-
-    if turn_offset == 0 || turn_offset > requests.len() {
-        return Ok(None);
-    }
-    let (request_id, _, command) = &requests[turn_offset - 1];
-    let request_id = *request_id;
-    let command = command.clone().unwrap_or_else(|| "<unknown>".to_string());
-
-    // Find result for this request
-    let mut result_id: Option<Id> = None;
-    for (rid, about_request) in find!(
-        (rid: Id, about_request: Id),
-        pattern!(&space, [{
-            ?rid @
-            metadata::tag: &KIND_EXEC_RESULT_ID,
-            exec::about_request: ?about_request,
-        }])
-    ) {
-        if about_request == request_id {
-            result_id = Some(rid);
-            break;
-        }
-    }
-
-    let Some(result_id) = result_id else {
-        return Ok(None);
-    };
-
-    // result -> about_thought -> thought -> context blob
-    let mut thought_id: Option<Id> = None;
-    for (rid, tid) in find!(
-        (rid: Id, tid: Id),
-        pattern!(&space, [{ ?rid @ exec::about_thought: ?tid }])
-    ) {
-        if rid == result_id {
-            thought_id = Some(tid);
-            break;
-        }
-    }
-
-    let Some(thought_id) = thought_id else {
-        return Ok(None);
-    };
-
-    // Load context blob from thought
-    let mut context_json: Option<String> = None;
-    for (tid, handle) in find!(
-        (tid: Id, handle: TextHandle),
-        pattern!(&space, [{ ?tid @ cog::context: ?handle }])
-    ) {
-        if tid == thought_id {
-            context_json = Some(read_text(&mut ws, handle)?);
-            break;
-        }
-    }
-
-    let Some(json) = context_json else {
-        return Ok(None);
-    };
-
-    let messages: Vec<ChatMessage> =
-        serde_json::from_str(&json).map_err(|e| anyhow!("parse context JSON: {e}"))?;
-
-    Ok(Some((request_id, command, messages)))
+fn format_span(chunk: &memory_model::ChunkRow) -> String {
+    let start = interval_key(chunk.start_at);
+    let end = interval_key(chunk.end_at);
+    format!(
+        "{}..{} ({})",
+        format_tai_ns(start),
+        format_tai_ns(end),
+        format_duration_ns(end.saturating_sub(start))
+    )
 }
 
-fn cmd_cover(repo: &mut Repository<Pile>, cli: &Cli, full: bool, tree: bool) -> Result<()> {
-    // Memory chunks live on the "memory" branch, not cognition.
-    let branch_id = ensure_branch_id(repo, "memory")?;
-    let mut ws = pull_workspace(repo, branch_id, "pull target for cover")?;
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-
-    let chunks = collect_context_chunks(&mut ws, &space)?;
-    let root_indices = find_root_chunks(&chunks);
-
-    let chunk_map: HashMap<Id, &ContextChunkRow> = chunks.iter().map(|c| (c.id, c)).collect();
-
-    // Compute max depth
-    fn max_depth(
-        chunk: &ContextChunkRow,
-        map: &HashMap<Id, &ContextChunkRow>,
-        depth: usize,
-    ) -> usize {
-        if chunk.children.is_empty() {
-            return depth;
-        }
-        chunk
-            .children
-            .iter()
-            .filter_map(|cid| map.get(cid))
-            .map(|child| max_depth(child, map, depth + 1))
-            .max()
-            .unwrap_or(depth)
-    }
-
-    let depth = root_indices
+fn cmd_cover(snapshot: &TriageSnapshot, full: bool) -> Result<()> {
+    let (memory, catalog) = snapshot.memory()?;
+    let (_, headspace) = snapshot.headspace()?;
+    let frontier = memory_frontier(&catalog);
+    let content_heads = frontier
         .iter()
-        .filter_map(|i| chunks.get(*i))
-        .map(|c| max_depth(c, &chunk_map, 0))
-        .max()
-        .unwrap_or(0);
-
-    println!("Memory cover");
-    println!("- pile: {}", cli.pile.display());
-    println!("- branch: {branch_id:x}");
-    println!(
-        "- chunks: {} total, {} roots, max depth {depth}",
-        chunks.len(),
-        root_indices.len()
-    );
-
-    // Budget
-    let budget = load_budget_from_config(repo)?;
-    if let Some(ref b) = budget {
-        let cover_chars: usize = chunks
-            .iter()
-            .filter_map(|c| c.summary.as_ref())
-            .map(|s| s.len())
-            .sum();
-        let fill_pct = if b.body_budget_chars > 0 {
-            (cover_chars as f64 / b.body_budget_chars as f64 * 100.0) as u32
-        } else {
-            0
-        };
-        println!();
-        println!("Budget");
-        println!(
-            "  context_window={} max_output={} safety={} chars/tok={}",
-            b.context_window_tokens, b.max_output_tokens, b.safety_margin_tokens, b.chars_per_token
-        );
-        println!(
-            "  system_prompt={} chars  body_budget={} chars",
-            b.system_prompt_chars, b.body_budget_chars
-        );
-        println!("  cover_chars={cover_chars}  fill={fill_pct}%");
+        .filter(|node| matches!(node, FrontierNode::Chunk(_)))
+        .count();
+    let retraction_heads = frontier.len() - content_heads;
+    let mut cover_chars = 0usize;
+    for node in &frontier {
+        if let FrontierNode::Chunk(id) = node {
+            cover_chars += chunk_text(&memory.reader, &catalog.chunks[id])?.len();
+        }
     }
-
-    println!();
-    if tree {
-        println!("Tree (oldest -> newest)");
-        fn print_tree(
-            chunk: &ContextChunkRow,
-            map: &HashMap<Id, &ContextChunkRow>,
-            indent: usize,
-            full: bool,
-        ) {
-            let prefix = "  ".repeat(indent);
-            let range = match (chunk.start_at, chunk.end_at) {
-                (Some(s), Some(e)) => format!(
-                    "{}..{}  ({})",
-                    format_tai_ns(s),
-                    format_tai_ns(e),
-                    format_duration_ns(e.saturating_sub(s))
-                ),
-                (Some(s), None) => format!("{}..?", format_tai_ns(s)),
-                _ => "?..?".to_string(),
-            };
-            let children_label = if chunk.children.is_empty() {
-                "leaf".to_string()
-            } else {
-                format!("{} children", chunk.children.len())
-            };
-            let summary = chunk.summary.as_deref().unwrap_or("<no summary>");
-            let summary_text = if full {
-                summary.to_string()
-            } else {
-                truncate_single_line(summary, 60)
-            };
-            println!(
-                "{prefix}{}  {range}  {children_label}  \"{summary_text}\"",
-                fmt_id(chunk.id)
-            );
-            let mut sorted_children: Vec<&ContextChunkRow> = chunk
-                .children
-                .iter()
-                .filter_map(|cid| map.get(cid).copied())
-                .collect();
-            sorted_children.sort_by_key(|c| c.start_at.unwrap_or(i128::MAX));
-            for child in sorted_children {
-                print_tree(child, map, indent + 1, full);
-            }
-        }
-        for &idx in &root_indices {
-            if let Some(chunk) = chunks.get(idx) {
-                print_tree(chunk, &chunk_map, 1, full);
-            }
-        }
+    let budget = headspace.budget()?;
+    let fill = if budget.body_budget_chars > 0 {
+        cover_chars as f64 / budget.body_budget_chars as f64 * 100.0
     } else {
-        println!("Roots (oldest -> newest)");
-        for &idx in &root_indices {
-            if let Some(chunk) = chunks.get(idx) {
-                let range = match (chunk.start_at, chunk.end_at) {
-                    (Some(s), Some(e)) => format!(
-                        "{}..{}  ({})",
-                        format_tai_ns(s),
-                        format_tai_ns(e),
-                        format_duration_ns(e.saturating_sub(s))
-                    ),
-                    (Some(s), None) => format!("{}..?", format_tai_ns(s)),
-                    _ => "?..?".to_string(),
-                };
-                let children_label = if chunk.children.is_empty() {
-                    "leaf".to_string()
-                } else {
-                    format!("{} children", chunk.children.len())
-                };
-                let summary = chunk.summary.as_deref().unwrap_or("<no summary>");
-                let summary_text = if full {
-                    summary.to_string()
-                } else {
-                    truncate_single_line(summary, 60)
-                };
+        0.0
+    };
+    println!("Memory cover");
+    println!("- Memory facts: {}", memory.facts.len());
+    println!(
+        "- catalog: {} chunks, {} retractions",
+        catalog.chunks.len(),
+        catalog.retractions.len()
+    );
+    println!(
+        "- complete frontier: {} content, {} retraction",
+        content_heads, retraction_heads
+    );
+    println!();
+    println!("Budget");
+    println!(
+        "- context={} output={} safety={} chars/token={}",
+        budget.context_window_tokens,
+        budget.max_output_tokens,
+        budget.safety_margin_tokens,
+        budget.chars_per_token
+    );
+    println!(
+        "- system={} chars body={} chars cover={} chars fill={fill:.1}%",
+        budget.system_prompt_chars, budget.body_budget_chars, cover_chars
+    );
+    println!();
+    println!("Frontier (canonical ID order; no clock arbitration)");
+    if frontier.is_empty() {
+        println!("- empty");
+    }
+    for node in frontier {
+        match node {
+            FrontierNode::Chunk(id) => {
+                let chunk = &catalog.chunks[&id];
+                let text = chunk_text(&memory.reader, chunk)?;
                 println!(
-                    "  {}  {range}  {children_label}  \"{summary_text}\"",
-                    fmt_id(chunk.id)
+                    "- content {} | {} | {} predecessor(s) | {}",
+                    fmt_id(id),
+                    format_span(chunk),
+                    chunk.predecessors.len(),
+                    if full {
+                        text
+                    } else {
+                        truncate_single_line(&text, 100)
+                    }
+                );
+            }
+            FrontierNode::Retraction(id) => {
+                let row = &catalog.retractions[&id];
+                let reason = row
+                    .reason
+                    .map(|handle| memory_model::read_text(&memory.reader, handle))
+                    .transpose()?
+                    .unwrap_or_else(|| "<no reason>".to_owned());
+                println!(
+                    "- retraction {} | {} predecessor(s) | {}",
+                    fmt_id(id),
+                    row.predecessors.len(),
+                    if full {
+                        reason
+                    } else {
+                        truncate_single_line(&reason, 100)
+                    }
                 );
             }
         }
     }
-
     Ok(())
 }
 
-fn cmd_chunk(repo: &mut Repository<Pile>, _cli: &Cli, id_prefix_str: &str) -> Result<()> {
-    let branch_id = ensure_branch_id(repo, "memory")?;
-    let mut ws = pull_workspace(repo, branch_id, "pull target for chunk")?;
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-
-    let chunks = collect_context_chunks(&mut ws, &space)?;
-    let prefix = id_prefix_str.to_uppercase();
-
-    let matches: Vec<&ContextChunkRow> = chunks
-        .iter()
-        .filter(|c| format!("{:X}", c.id).starts_with(&prefix))
+fn matching_memory_nodes(catalog: &MemoryCatalog, prefix: &str) -> BTreeSet<Id> {
+    let prefix = prefix.trim().to_ascii_uppercase();
+    let mut matches: BTreeSet<Id> = catalog
+        .node_ids()
+        .into_iter()
+        .filter(|id| format!("{id:X}").starts_with(&prefix))
         .collect();
-
-    if matches.is_empty() {
-        bail!("no chunk found matching prefix '{id_prefix_str}'");
-    }
-    if matches.len() > 1 {
-        println!(
-            "Ambiguous prefix '{id_prefix_str}' matches {} chunks:",
-            matches.len()
-        );
-        for c in &matches {
-            let range = match (c.start_at, c.end_at) {
-                (Some(s), Some(e)) => format!("{}..{}", format_tai_ns(s), format_tai_ns(e)),
-                _ => "?..?".to_string(),
-            };
-            println!("  {:X}  {range}", c.id);
-        }
-        return Ok(());
-    }
-
-    let chunk = matches[0];
-    let chunk_map: HashMap<Id, &ContextChunkRow> = chunks.iter().map(|c| (c.id, c)).collect();
-
-    println!("Chunk {:X}", chunk.id);
-    match (chunk.start_at, chunk.end_at) {
-        (Some(s), Some(e)) => {
-            println!(
-                "  range: {}..{}  ({})",
-                format_tai_ns(s),
-                format_tai_ns(e),
-                format_duration_ns(e.saturating_sub(s))
-            );
-        }
-        (Some(s), None) => println!("  range: {}..?", format_tai_ns(s)),
-        _ => println!("  range: unknown"),
-    }
-    if let Some(created) = chunk.created_at {
-        println!("  created: {}", format_tai_ns(created));
-    }
-    if let Some(exec_id) = chunk.about_exec_result {
-        println!("  origin: exec:{}", fmt_id(exec_id));
-    }
-    println!("  children: {}", chunk.children.len());
-
-    println!();
-    println!("Summary:");
-    match chunk.summary.as_deref() {
-        Some(text) => {
-            for line in text.lines() {
-                println!("  {line}");
-            }
-        }
-        None => println!("  <no summary>"),
-    }
-
-    if !chunk.children.is_empty() {
-        println!();
-        println!("Children:");
-        let mut sorted_children: Vec<&ContextChunkRow> = chunk
-            .children
+    for chunk in catalog.chunks.values() {
+        if chunk
+            .aliases
             .iter()
-            .filter_map(|cid| chunk_map.get(cid).copied())
-            .collect();
-        sorted_children.sort_by_key(|c| c.start_at.unwrap_or(i128::MAX));
-        for child in sorted_children {
-            let range = match (child.start_at, child.end_at) {
-                (Some(s), Some(e)) => format!(
-                    "{}..{}  ({})",
-                    format_tai_ns(s),
-                    format_tai_ns(e),
-                    format_duration_ns(e.saturating_sub(s))
-                ),
-                _ => "?..?".to_string(),
-            };
-            let kind = if child.children.is_empty() {
-                "leaf"
-            } else {
-                "node"
-            };
-            let summary = child.summary.as_deref().unwrap_or("<no summary>");
-            println!(
-                "  {}  {range}  {kind}  \"{}\"",
-                fmt_id(child.id),
-                truncate_single_line(summary, 60)
-            );
+            .any(|alias| format!("{alias:X}").starts_with(&prefix))
+        {
+            matches.insert(chunk.id);
         }
     }
+    matches
+}
 
+fn print_ids(label: &str, ids: impl IntoIterator<Item = Id>) {
+    let ids: Vec<_> = ids.into_iter().collect();
+    if !ids.is_empty() {
+        println!(
+            "  {label}: {}",
+            ids.iter()
+                .map(|id| fmt_id(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+fn print_observations(observations: &BTreeSet<Interval>) {
+    if !observations.is_empty() {
+        println!("  observations:");
+        for observation in observations {
+            println!("    - {}", format_tai_ns(interval_key(*observation)));
+        }
+    }
+}
+
+fn cmd_chunk(snapshot: &TriageSnapshot, prefix: &str) -> Result<()> {
+    let (memory, catalog) = snapshot.memory()?;
+    let matches = matching_memory_nodes(&catalog, prefix);
+    if matches.is_empty() {
+        bail!("no canonical Memory node or alias matches prefix '{prefix}'");
+    }
+    let heads: BTreeSet<Id> = catalog.head_ids().into_iter().collect();
+    println!(
+        "Memory match set for '{prefix}' ({} node(s))",
+        matches.len()
+    );
+    for (index, id) in matches.into_iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        if let Some(chunk) = catalog.chunks.get(&id) {
+            println!("Chunk {}", fmt_id(id));
+            println!("  frontier: {}", heads.contains(&id));
+            println!("  span: {}", format_span(chunk));
+            print_ids("predecessors", chunk.predecessors.iter().copied());
+            print_ids("references", chunk.references.iter().copied());
+            print_ids("aliases", chunk.aliases.iter().copied());
+            if let Some(exec) = chunk.about_exec_result {
+                println!("  about exec result: {}", fmt_id(exec));
+            }
+            if let Some(message) = chunk.about_archive_message {
+                println!("  about archive message: {}", fmt_id(message));
+            }
+            if let Some(lens) = chunk.lens {
+                println!("  lens: {}", memory_model::read_text(&memory.reader, lens)?);
+            }
+            print_observations(&chunk.observed_at);
+            println!("  content:");
+            for line in chunk_text(&memory.reader, chunk)?.lines() {
+                println!("    {line}");
+            }
+        } else {
+            let row = &catalog.retractions[&id];
+            println!("Retraction {}", fmt_id(id));
+            println!("  frontier: {}", heads.contains(&id));
+            print_ids("predecessors", row.predecessors.iter().copied());
+            print_observations(&row.observed_at);
+            let reason = row
+                .reason
+                .map(|handle| memory_model::read_text(&memory.reader, handle))
+                .transpose()?
+                .unwrap_or_else(|| "<no reason>".to_owned());
+            println!("  reason: {reason}");
+        }
+    }
     Ok(())
 }
 
-fn cmd_turn(repo: &mut Repository<Pile>, cli: &Cli, turn_offset: usize, full: bool) -> Result<()> {
-    let branch_id = resolve_target_branch(repo, cli)?;
-    let mut ws = pull_workspace(repo, branch_id, "pull target for turn")?;
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-
-    // Collect exec requests with timestamps
-    let mut requests: Vec<(Id, i128, Option<String>)> = Vec::new();
-    for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(&space, [{
-            ?request_id @
-            metadata::tag: &KIND_EXEC_REQUEST_ID,
-            metadata::created_at: ?requested_at,
-        }])
-    ) {
-        requests.push((request_id, interval_key(requested_at), None));
+fn select_request(state: &ExecState, turn: usize) -> Result<&ExecRequestRow> {
+    if turn == 0 {
+        bail!("turn is one-based");
     }
-    for (request_id, handle) in find!(
-        (request_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?request_id @ exec::command_text: ?handle }])
-    ) {
-        for entry in requests.iter_mut() {
-            if entry.0 == request_id {
-                entry.2 = Some(read_text(&mut ws, handle)?);
-                break;
+    let mut requests: Vec<_> = state.requests.values().collect();
+    requests.sort_by_key(|request| (request.requested_at, request.id));
+    requests.reverse();
+    requests.get(turn - 1).copied().ok_or_else(|| {
+        anyhow!(
+            "turn #{turn} not found; only {} request(s) exist",
+            requests.len()
+        )
+    })
+}
+
+fn contexts_for_turn(
+    reader: &PileReader,
+    space: &TribleSet,
+    exec_state: &ExecState,
+    request: Id,
+) -> Result<Vec<ContextCandidate>> {
+    let mut pairs = BTreeSet::new();
+    for result in exec_state
+        .results
+        .iter()
+        .filter(|result| result.about_request == request)
+    {
+        if let Some(thought) = result.about_thought {
+            pairs.insert((result.id, thought));
+        }
+    }
+    let mut contexts = Vec::new();
+    for (result, thought) in pairs {
+        let handle = at_most_one(
+            thought,
+            "cog::context",
+            find!(value: TextHandle, pattern!(space, [{ thought @ cog::context: ?value }]))
+                .collect(),
+        )?;
+        if let Some(handle) = handle {
+            let json = read_text(reader, handle)?;
+            let messages = serde_json::from_str(&json)
+                .with_context(|| format!("parse context JSON for thought {thought:x}"))?;
+            contexts.push(ContextCandidate {
+                result,
+                thought,
+                messages,
+            });
+        }
+    }
+    Ok(contexts)
+}
+
+fn print_model_result(row: &ModelResultRow, full: bool) {
+    println!("  Model result {}", fmt_id(row.id));
+    println!("    finished: {}", format_tai_ns(row.finished_at));
+    if let Some(error) = &row.error {
+        println!(
+            "    error: {}",
+            if full {
+                error.clone()
+            } else {
+                truncate_single_line(error, 120)
+            }
+        );
+    }
+    if row.input_tokens.is_some() || row.output_tokens.is_some() {
+        let token = |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |n| n.to_string());
+        println!(
+            "    tokens: in={} out={} cache_create={} cache_read={}",
+            token(row.input_tokens),
+            token(row.output_tokens),
+            token(row.cache_creation_input_tokens),
+            token(row.cache_read_input_tokens)
+        );
+    }
+    for (label, text) in [
+        ("reasoning", row.reasoning_text.as_ref()),
+        ("output", row.output_text.as_ref()),
+    ] {
+        if let Some(text) = text {
+            if full {
+                println!("    {label} ({} chars):", text.len());
+                for line in text.lines() {
+                    println!("      {line}");
+                }
+            } else {
+                println!(
+                    "    {label}: {} chars \"{}\"",
+                    text.len(),
+                    truncate_single_line(text, 80)
+                );
             }
         }
     }
-    requests.sort_by_key(|r| r.1);
-    requests.reverse();
+}
 
-    if turn_offset == 0 || turn_offset > requests.len() {
-        bail!(
-            "turn #{turn_offset} not found ({} total turns)",
-            requests.len()
-        );
-    }
-    let (request_id, requested_at, command) = &requests[turn_offset - 1];
-    let request_id = *request_id;
-    let requested_at = *requested_at;
-    let command = command.clone().unwrap_or_else(|| "<unknown>".to_string());
-
-    let now_key = now_epoch().to_tai_duration().total_nanoseconds();
-
-    println!("Turn #{turn_offset}");
-    println!("- request: {}", fmt_id(request_id));
+fn cmd_turn(snapshot: &TriageSnapshot, turn: usize, full: bool) -> Result<()> {
+    let cognition = snapshot.cognition()?;
+    let exec_state = collect_exec_state(&cognition.reader, &cognition.facts)?;
+    let model_state = collect_model_chat_state(&cognition.reader, &cognition.facts)?;
+    let request = select_request(&exec_state, turn)?;
+    let now = now_key();
+    println!("Turn #{turn}");
+    println!("- Cognition facts: {}", cognition.facts.len());
+    println!("- request: {}", fmt_id(request.id));
     println!(
         "- requested: {} ({})",
-        format_tai_ns(requested_at),
-        format_age(now_key, requested_at)
+        format_tai_ns(request.requested_at),
+        format_age(now, request.requested_at)
     );
     println!(
         "- command: {}",
         if full {
-            command.clone()
+            request.command.clone()
         } else {
-            truncate_single_line(&command, 100)
+            truncate_single_line(&request.command, 100)
         }
     );
 
-    // Find exec result for this request
-    let mut result_id: Option<Id> = None;
-    for (rid, about_request) in find!(
-        (rid: Id, about_request: Id),
-        pattern!(&space, [{
-            ?rid @
-            metadata::tag: &KIND_EXEC_RESULT_ID,
-            exec::about_request: ?about_request,
-        }])
-    ) {
-        if about_request == request_id {
-            result_id = Some(rid);
-            break;
+    let mut results: Vec<_> = exec_state
+        .results
+        .iter()
+        .filter(|result| result.about_request == request.id)
+        .collect();
+    results.sort_by_key(|result| (result.finished_at, result.id));
+    if results.is_empty() {
+        println!();
+        println!("Exec results: none (turn may still be in progress)");
+        return Ok(());
+    }
+    println!();
+    println!("Exec results ({})", results.len());
+    for result in results {
+        println!("- result {}", fmt_id(result.id));
+        println!(
+            "  exit: {}",
+            result
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".to_owned())
+        );
+        println!(
+            "  finished: {} (latency {})",
+            format_tai_ns(result.finished_at),
+            format_duration_ns(result.finished_at.saturating_sub(request.requested_at))
+        );
+        for (label, text) in [
+            ("error", result.error.as_ref()),
+            ("stderr", result.stderr_text.as_ref()),
+            ("stdout", result.stdout_text.as_ref()),
+        ] {
+            if let Some(text) = text {
+                if full {
+                    println!("  {label} ({} chars):", text.len());
+                    for line in text.lines() {
+                        println!("    {line}");
+                    }
+                } else {
+                    println!("  {label}: {}", truncate_single_line(text, 120));
+                }
+            }
+        }
+        if let Some(thought) = result.about_thought {
+            println!("  thought: {}", fmt_id(thought));
+            let mut model_requests: Vec<_> = model_state
+                .requests
+                .values()
+                .filter(|candidate| candidate.about_thought == Some(thought))
+                .collect();
+            model_requests.sort_by_key(|candidate| (candidate.requested_at, candidate.id));
+            for model_request in model_requests {
+                println!("  Model request {}", fmt_id(model_request.id));
+                let mut model_results: Vec<_> = model_state
+                    .results
+                    .iter()
+                    .filter(|candidate| candidate.about_request == model_request.id)
+                    .collect();
+                model_results.sort_by_key(|candidate| (candidate.finished_at, candidate.id));
+                for model_result in model_results {
+                    print_model_result(model_result, full);
+                }
+            }
         }
     }
 
-    // Exec result details
-    if let Some(rid) = result_id {
-        let mut exit_code: Option<i64> = None;
-        let mut finished_at: Option<i128> = None;
-        let mut stdout_text: Option<String> = None;
-        let mut stderr_text: Option<String> = None;
-        let mut error_text: Option<String> = None;
-
-        if let Some(value) = find!(
-            value: Inline<inlineencodings::U256BE>,
-            pattern!(&space, [{ rid @ exec::exit_code: ?value }])
-        )
-        .next()
-        {
-            exit_code = u256be_to_u64(value).map(|n| n as i64);
-        }
-        if let Some(value) = find!(
-            value: Inline<inlineencodings::NsTAIInterval>,
-            pattern!(&space, [{ rid @ metadata::finished_at: ?value }])
-        )
-        .next()
-        {
-            finished_at = Some(interval_key(value));
-        }
-        if let Some(handle) = find!(
-            handle: TextHandle,
-            pattern!(&space, [{ rid @ exec::stdout_text: ?handle }])
-        )
-        .next()
-        {
-            stdout_text = Some(read_text(&mut ws, handle)?);
-        }
-        if let Some(handle) = find!(
-            handle: TextHandle,
-            pattern!(&space, [{ rid @ exec::stderr_text: ?handle }])
-        )
-        .next()
-        {
-            stderr_text = Some(read_text(&mut ws, handle)?);
-        }
-        if let Some(handle) = find!(
-            handle: TextHandle,
-            pattern!(&space, [{ rid @ exec::error: ?handle }])
-        )
-        .next()
-        {
-            error_text = Some(read_text(&mut ws, handle)?);
-        }
-
-        println!();
-        println!("Exec result [{}]", fmt_id(rid));
+    let contexts = contexts_for_turn(&cognition.reader, &cognition.facts, &exec_state, request.id)?;
+    println!();
+    println!("Context candidates ({})", contexts.len());
+    for candidate in contexts {
+        let chars: usize = candidate
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum();
         println!(
-            "- exit: {}",
-            exit_code
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "-".to_string())
+            "- result {} thought {}: {} messages, {} chars",
+            fmt_id(candidate.result),
+            fmt_id(candidate.thought),
+            candidate.messages.len(),
+            chars
         );
-        if let Some(at) = finished_at {
-            let latency = at.saturating_sub(requested_at);
-            println!(
-                "- finished: {} (latency {})",
-                format_tai_ns(at),
-                format_duration_ns(latency)
-            );
-        }
-        if let Some(ref err) = error_text {
-            println!(
-                "- error: {}",
-                if full {
-                    err.clone()
-                } else {
-                    truncate_single_line(err, 120)
-                }
-            );
-        }
-        if let Some(ref stderr) = stderr_text {
-            let display = if full {
-                stderr.clone()
-            } else {
-                truncate_single_line(stderr, 120)
-            };
-            if display != "<ok>" && !display.is_empty() {
-                println!("- stderr: {display}");
-            }
-        }
-        if let Some(ref stdout) = stdout_text {
+        for (index, message) in candidate.messages.iter().enumerate() {
             if full {
-                println!("- stdout ({} chars):", stdout.len());
-                for line in stdout.lines() {
+                println!(
+                    "  #{index} [{}] ({} chars)",
+                    message.role,
+                    message.content.len()
+                );
+                for line in message.content.lines() {
                     println!("    {line}");
                 }
             } else {
                 println!(
-                    "- stdout: {} chars \"{}\"",
-                    stdout.len(),
-                    truncate_single_line(stdout, 80)
+                    "  #{index} [{:<9}] ({:>5} chars) \"{}\"",
+                    message.role.to_string(),
+                    message.content.len(),
+                    truncate_single_line(&message.content, 60)
                 );
             }
         }
-
-        // Find thought via exec result -> about_thought
-        let thought_id: Option<Id> = find!(
-            tid: Id,
-            pattern!(&space, [{ &rid @ exec::about_thought: ?tid }])
-        )
-        .next();
-
-        // Find model result via: thought -> model request -> model result
-        let model_result_id: Option<Id> = thought_id
-            .and_then(|tid| {
-                find!(
-                    mreq: Id,
-                    pattern!(&space, [{
-                        ?mreq @
-                        metadata::tag: &KIND_MODEL_REQUEST_ID,
-                        model_chat::about_thought: &tid,
-                    }])
-                )
-                .next()
-            })
-            .and_then(|mreq_id| {
-                find!(
-                    mid: Id,
-                    pattern!(&space, [{
-                        ?mid @
-                        metadata::tag: &KIND_MODEL_RESULT_ID,
-                        model_chat::about_request: &mreq_id,
-                    }])
-                )
-                .next()
-            });
-
-        if let Some(mid) = model_result_id {
-            let output_text: Option<String> = find!(
-                handle: TextHandle,
-                pattern!(&space, [{ &mid @ model_chat::output_text: ?handle }])
-            )
-            .next()
-            .map(|h| read_text(&mut ws, h))
-            .transpose()?;
-
-            let reasoning_text: Option<String> = find!(
-                handle: TextHandle,
-                pattern!(&space, [{ &mid @ model_chat::reasoning_text: ?handle }])
-            )
-            .next()
-            .map(|h| read_text(&mut ws, h))
-            .transpose()?;
-
-            let model_error: Option<String> = find!(
-                handle: TextHandle,
-                pattern!(&space, [{ &mid @ model_chat::error: ?handle }])
-            )
-            .next()
-            .map(|h| read_text(&mut ws, h))
-            .transpose()?;
-
-            let model_finished: Option<i128> = find!(
-                value: Inline<inlineencodings::NsTAIInterval>,
-                pattern!(&space, [{ &mid @ metadata::finished_at: ?value }])
-            )
-            .next()
-            .map(interval_key);
-
-            let input_tokens: Option<u64> = find!(
-                value: Inline<inlineencodings::U256BE>,
-                pattern!(&space, [{ &mid @ model_chat::input_tokens: ?value }])
-            )
-            .next()
-            .and_then(u256be_to_u64);
-
-            let output_tokens: Option<u64> = find!(
-                value: Inline<inlineencodings::U256BE>,
-                pattern!(&space, [{ &mid @ model_chat::output_tokens: ?value }])
-            )
-            .next()
-            .and_then(u256be_to_u64);
-
-            let cache_creation_tokens: Option<u64> = find!(
-                value: Inline<inlineencodings::U256BE>,
-                pattern!(&space, [{ &mid @ model_chat::cache_creation_input_tokens: ?value }])
-            )
-            .next()
-            .and_then(u256be_to_u64);
-
-            let cache_read_tokens: Option<u64> = find!(
-                value: Inline<inlineencodings::U256BE>,
-                pattern!(&space, [{ &mid @ model_chat::cache_read_input_tokens: ?value }])
-            )
-            .next()
-            .and_then(u256be_to_u64);
-
-            println!();
-            println!("Model result [{}]", fmt_id(mid));
-            if let Some(at) = model_finished {
-                println!("- finished: {}", format_tai_ns(at));
-            }
-            if let Some(ref err) = model_error {
-                println!(
-                    "- error: {}",
-                    if full {
-                        err.clone()
-                    } else {
-                        truncate_single_line(err, 120)
-                    }
-                );
-            }
-            if input_tokens.is_some() || output_tokens.is_some() {
-                let f = |v: Option<u64>| -> String { v.map_or("-".into(), |n| n.to_string()) };
-                println!(
-                    "- tokens: in={} out={} cache_create={} cache_read={}",
-                    f(input_tokens),
-                    f(output_tokens),
-                    f(cache_creation_tokens),
-                    f(cache_read_tokens)
-                );
-            }
-            if let Some(ref reasoning) = reasoning_text {
-                if full {
-                    println!("- reasoning ({} chars):", reasoning.len());
-                    for line in reasoning.lines() {
-                        println!("    {line}");
-                    }
-                } else {
-                    println!(
-                        "- reasoning: {} chars \"{}\"",
-                        reasoning.len(),
-                        truncate_single_line(reasoning, 80)
-                    );
-                }
-            }
-            if let Some(ref output) = output_text {
-                if full {
-                    println!("- output ({} chars):", output.len());
-                    for line in output.lines() {
-                        println!("    {line}");
-                    }
-                } else {
-                    println!(
-                        "- output: {} chars \"{}\"",
-                        output.len(),
-                        truncate_single_line(output, 80)
-                    );
-                }
-            }
-        } else {
-            println!();
-            println!("Model result: not found");
-        }
-
-        // Context summary
-        if let Some(tid) = thought_id {
-            let context_json: Option<String> = if let Some(handle) = find!(
-                handle: TextHandle,
-                pattern!(&space, [{ tid @ cog::context: ?handle }])
-            )
-            .next()
-            {
-                Some(read_text(&mut ws, handle)?)
-            } else {
-                None
-            };
-            if let Some(ref json) = context_json {
-                let messages: Vec<ChatMessage> = serde_json::from_str(json).unwrap_or_default();
-                let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
-                println!();
-                println!(
-                    "Context ({} messages, {} chars)",
-                    messages.len(),
-                    total_chars
-                );
-                if full {
-                    for (i, msg) in messages.iter().enumerate() {
-                        println!("  #{i:<3} [{}] ({} chars)", msg.role, msg.content.len());
-                        for line in msg.content.lines() {
-                            println!("    {line}");
-                        }
-                    }
-                } else {
-                    for (i, msg) in messages.iter().enumerate() {
-                        println!(
-                            "  #{i:<3} [{:<9}] ({:>5} chars) \"{}\"",
-                            msg.role.to_string(),
-                            msg.content.len(),
-                            truncate_single_line(&msg.content, 60)
-                        );
-                    }
-                }
-            }
-        }
-    } else {
-        println!();
-        println!("Exec result: not found (turn may still be in progress)");
     }
-
     Ok(())
 }
 
-fn cmd_context(
-    repo: &mut Repository<Pile>,
-    cli: &Cli,
-    turn: usize,
-    full: bool,
-    raw: bool,
-) -> Result<()> {
-    let branch_id = resolve_target_branch(repo, cli)?;
-
-    let result = load_turn_context(repo, branch_id, turn)?;
-    let Some((request_id, command, messages)) = result else {
-        if turn > 1 {
-            bail!("turn #{turn} not found (not enough turns or no context recorded)");
-        } else {
-            bail!("no turn context found (no exec results with thought/context chain)");
-        }
-    };
-
+fn cmd_context(snapshot: &TriageSnapshot, turn: usize, full: bool, raw: bool) -> Result<()> {
+    let cognition = snapshot.cognition()?;
+    let (_, headspace) = snapshot.headspace()?;
+    let exec_state = collect_exec_state(&cognition.reader, &cognition.facts)?;
+    let request = select_request(&exec_state, turn)?;
+    let contexts = contexts_for_turn(&cognition.reader, &cognition.facts, &exec_state, request.id)?;
+    if contexts.is_empty() {
+        bail!("turn #{turn} has no recorded context candidate");
+    }
     if raw {
-        let json = serde_json::to_string_pretty(&messages)
-            .map_err(|e| anyhow!("serialize context: {e}"))?;
-        println!("{json}");
+        let values: Vec<_> = contexts
+            .iter()
+            .map(|candidate| {
+                serde_json::json!({
+                    "result": fmt_id(candidate.result),
+                    "thought": fmt_id(candidate.thought),
+                    "messages": candidate.messages,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&values)?);
         return Ok(());
     }
-
-    let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
-
-    let budget = load_budget_from_config(repo)?;
-    let fill_str = if let Some(ref b) = budget {
-        if b.body_budget_chars > 0 {
-            let pct = (total_chars as f64 / b.body_budget_chars as f64 * 100.0) as u32;
-            format!("  fill={pct}%")
+    println!("Contexts for turn #{turn} [{}]", fmt_id(request.id));
+    println!("- Cognition facts: {}", cognition.facts.len());
+    println!("- command: {}", truncate_single_line(&request.command, 60));
+    println!("- candidates: {}", contexts.len());
+    for candidate in contexts {
+        let chars: usize = candidate
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum();
+        let budget = headspace.budget()?;
+        let fill = if budget.body_budget_chars > 0 {
+            chars as f64 / budget.body_budget_chars as f64 * 100.0
         } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
-    println!(
-        "Context for turn #{turn} [{}] ({})",
-        fmt_id(request_id),
-        truncate_single_line(&command, 60)
-    );
-    println!("- messages: {}", messages.len());
-    println!("- estimated chars: {total_chars}{fill_str}");
-    println!();
-
-    for (i, msg) in messages.iter().enumerate() {
-        let role_str = format!("[{}]", msg.role);
-        if full {
-            println!("  #{i:<3} {role_str:<12} ({} chars)", msg.content.len());
-            for line in msg.content.lines() {
-                println!("    {line}");
+            0.0
+        };
+        println!();
+        println!(
+            "Result {} / thought {}: {} messages, {} chars, fill={fill:.1}%",
+            fmt_id(candidate.result),
+            fmt_id(candidate.thought),
+            candidate.messages.len(),
+            chars
+        );
+        for (index, message) in candidate.messages.iter().enumerate() {
+            if full {
+                println!(
+                    "  #{index} [{}] ({} chars)",
+                    message.role,
+                    message.content.len()
+                );
+                for line in message.content.lines() {
+                    println!("    {line}");
+                }
+            } else {
+                println!(
+                    "  #{index} [{:<9}] ({:>5} chars) \"{}\"",
+                    message.role.to_string(),
+                    message.content.len(),
+                    truncate_single_line(&message.content, 70)
+                );
             }
-            println!();
-        } else {
-            println!(
-                "  #{i:<3} {role_str:<12} ({:>5} chars) \"{}\"",
-                msg.content.len(),
-                truncate_single_line(&msg.content, 70)
-            );
         }
     }
-
     Ok(())
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    let Some(command) = cli.command.as_ref() else {
+    let Some(command) = &cli.command else {
         let mut command = Cli::command();
         command.print_help()?;
         println!();
         return Ok(());
     };
-
-    let mut repo = open_repo(&cli.pile)?;
-    let command_result = match command {
+    let snapshot = TriageSnapshot::open(&cli)?;
+    let result = match command {
         Command::Scan {
             recent,
             loop_min,
             stale_min,
-        } => cmd_scan(&mut repo, &cli, *recent, *loop_min, *stale_min),
-        Command::Loops { recent, min_repeat } => cmd_loops(&mut repo, &cli, *recent, *min_repeat),
-        Command::Timeline { recent } => cmd_timeline(&mut repo, &cli, *recent),
-        Command::Chain => cmd_chain(&mut repo, &cli),
-        Command::Turn { turn, full } => cmd_turn(&mut repo, &cli, *turn, *full),
-        Command::Cover { full, tree } => cmd_cover(&mut repo, &cli, *full, *tree),
-        Command::Chunk { id } => cmd_chunk(&mut repo, &cli, id.as_str()),
-        Command::Context { turn, full, raw } => cmd_context(&mut repo, &cli, *turn, *full, *raw),
-        Command::Repair { command } => match command {
-            RepairCommand::BranchDuplicates { dry_run } => {
-                cmd_repair_branch_duplicates(&mut repo, &cli, *dry_run)
-            }
-        },
+        } => cmd_scan(&cli, &snapshot, *recent, *loop_min, *stale_min),
+        Command::Loops { recent, min_repeat } => cmd_loops(&snapshot, *recent, *min_repeat),
+        Command::Timeline { recent } => cmd_timeline(&snapshot, *recent),
+        Command::Cover { full } => cmd_cover(&snapshot, *full),
+        Command::Chunk { id } => cmd_chunk(&snapshot, id),
+        Command::Turn { turn, full } => cmd_turn(&snapshot, *turn, *full),
+        Command::Context { turn, full, raw } => cmd_context(&snapshot, *turn, *full, *raw),
     };
-    let close_result = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    command_result?;
-    close_result?;
-    Ok(())
+    snapshot.close(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
+
+    use ed25519_dalek::SigningKey;
+    use faculties::collection_cutover::initialize_signer;
+    use faculties::headspace::{self, Resolution};
+    use faculties::memory::{ChunkDraft, ChunkDraftContent, RetractionDraft};
+    use faculties::schemas::triage::{exec, KIND_EXEC_REQUEST_ID};
+    use triblespace::core::metadata;
+    use triblespace::core::repo::{Repository, Workspace};
+    use triblespace::macros::entity;
+
+    fn test_id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn point(seconds: f64) -> Interval {
+        let at = Epoch::from_tai_seconds(seconds);
+        (at, at).try_to_inline().unwrap()
+    }
+
+    fn exec_request(id: Id, command: &str, at: f64) -> Fragment {
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
+            exec::command_text: command.to_owned(),
+            metadata::created_at: point(at),
+        }
+    }
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        pile: PathBuf,
+        key: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let pile = directory.path().join("triage.pile");
+            let key = directory.path().join("triage.key");
+            File::create(&pile).unwrap();
+            initialize_signer(&pile, Some(&key)).unwrap();
+            Self {
+                _directory: directory,
+                pile,
+                key,
+            }
+        }
+
+        fn publish(&self, scope: Id, fragment: Fragment) {
+            let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
+            let pile = open_pile_strict(&self.pile).unwrap();
+            let mut collection = Collection::new(pile, scope, signer);
+            collection.commit(fragment).unwrap();
+            collection.into_storage().close().unwrap();
+        }
+
+        fn cli(&self, command: Command) -> Cli {
+            Cli {
+                pile: self.pile.clone(),
+                key: Some(self.key.clone()),
+                command: Some(command),
+            }
+        }
+
+        fn snapshot(&self) -> TriageSnapshot {
+            TriageSnapshot::open(&self.cli(Command::Loops {
+                recent: 1,
+                min_repeat: 1,
+            }))
+            .unwrap()
+        }
+    }
+
+    fn push_legacy_branch(pile_path: &Path, name: &str, fragment: Fragment) {
+        let pile = open_pile_strict(pile_path).unwrap();
+        let mut repository =
+            Repository::new(pile, SigningKey::from_bytes(&[0x77; 32]), Fragment::empty()).unwrap();
+        let branch = *repository.create_branch(name, None).unwrap();
+        let mut workspace: Workspace<_> = repository.pull(branch).unwrap();
+        workspace.commit(fragment, "legacy shadow");
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+    }
+
+    #[test]
+    fn same_named_legacy_branch_cannot_shadow_collection_data() {
+        let fixture = Fixture::new();
+        let canonical = test_id(0x11);
+        let legacy = test_id(0x12);
+        fixture.publish(
+            COGNITION_SCOPE_ID,
+            exec_request(canonical, "canonical collection", 10.0),
+        );
+        push_legacy_branch(
+            &fixture.pile,
+            "cognition",
+            exec_request(legacy, "legacy branch", 20.0),
+        );
+
+        let snapshot = fixture.snapshot();
+        let cognition = snapshot.cognition().unwrap();
+        let state = collect_exec_state(&cognition.reader, &cognition.facts).unwrap();
+
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(state.requests[&canonical].command, "canonical collection");
+        assert!(!state.requests.contains_key(&legacy));
+    }
+
+    fn chunk(text: &str, predecessors: impl IntoIterator<Item = Id>, start: f64) -> (Fragment, Id) {
+        memory_model::chunk_fragment(ChunkDraft {
+            content: ChunkDraftContent::Text(text.to_owned()),
+            start_at: point(start),
+            end_at: point(start + 1.0),
+            lens: None,
+            references: BTreeSet::new(),
+            about_exec_result: None,
+            about_archive_message: None,
+            predecessors: predecessors.into_iter().collect(),
+            observed_at: BTreeSet::from([point(start + 2.0)]),
+            aliases: BTreeSet::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn memory_frontier_keeps_forks_and_retractions_visible() {
+        let fixture = Fixture::new();
+        let (genesis, genesis_id) = chunk("genesis", [], 10.0);
+        fixture.publish(MEMORY_SCOPE_ID, genesis);
+        let (left, left_id) = chunk("left", [genesis_id], 20.0);
+        let (right, right_id) = chunk("right", [genesis_id], 30.0);
+        fixture.publish(MEMORY_SCOPE_ID, left);
+        fixture.publish(MEMORY_SCOPE_ID, right);
+        let (retraction, retraction_id) = memory_model::retraction_fragment(RetractionDraft {
+            reason: Some("withdraw left".to_owned()),
+            predecessors: BTreeSet::from([left_id]),
+            observed_at: BTreeSet::from([point(40.0)]),
+        })
+        .unwrap();
+        fixture.publish(MEMORY_SCOPE_ID, retraction);
+
+        let (view, catalog) = fixture.snapshot().memory().unwrap();
+        assert!(!view.facts.is_empty());
+        assert_eq!(
+            memory_frontier(&catalog)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                FrontierNode::Chunk(right_id),
+                FrontierNode::Retraction(retraction_id),
+            ])
+        );
+        assert!(!catalog.is_live(left_id));
+        assert!(catalog.is_live(right_id));
+    }
+
+    #[test]
+    fn headspace_profile_fork_is_reported_instead_of_arbitrated() {
+        let fixture = Fixture::new();
+        let anchor = test_id(0x51);
+        let profile = headspace::default_profile(anchor, "triage");
+        let config = headspace::default_config(anchor);
+        let (genesis, profile_head, _) =
+            headspace::add_profile_fragment(&profile, &config, &[]).unwrap();
+        fixture.publish(HEADSPACE_SCOPE_ID, genesis);
+
+        let mut left = profile.clone();
+        left.model = "left".to_owned();
+        let mut right = profile;
+        right.model = "right".to_owned();
+        fixture.publish(
+            HEADSPACE_SCOPE_ID,
+            headspace::profile_snapshot_fragment(&left, &[profile_head])
+                .unwrap()
+                .0,
+        );
+        fixture.publish(
+            HEADSPACE_SCOPE_ID,
+            headspace::profile_snapshot_fragment(&right, &[profile_head])
+                .unwrap()
+                .0,
+        );
+
+        let (_, projected) = fixture.snapshot().headspace().unwrap();
+        assert!(projected.budget.is_none());
+        assert!(matches!(
+            projected.active_profile,
+            Some(Resolution::Forked(_))
+        ));
+        assert!(projected.unsettled_reason().unwrap().contains("forked"));
+    }
+
+    #[test]
+    fn missing_exact_headspace_secret_is_a_visible_catalog_error() {
+        let fixture = Fixture::new();
+        let anchor = test_id(0x61);
+        let mut profile = headspace::default_profile(anchor, "private");
+        profile.model_secret_version = Some(test_id(0x62));
+        let config = headspace::default_config(anchor);
+        fixture.publish(
+            HEADSPACE_SCOPE_ID,
+            headspace::add_profile_fragment(&profile, &config, &[])
+                .unwrap()
+                .0,
+        );
+
+        let error = match fixture.snapshot().headspace() {
+            Ok(_) => panic!("missing exact secret unexpectedly validated"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("missing exact model Secrets version"));
+    }
+
+    #[test]
+    fn read_snapshot_never_appends_to_the_pile() {
+        let fixture = Fixture::new();
+        fixture.publish(
+            COGNITION_SCOPE_ID,
+            exec_request(test_id(0x71), "read only", 10.0),
+        );
+        let before = std::fs::metadata(&fixture.pile).unwrap().len();
+        let snapshot = fixture.snapshot();
+        snapshot.cognition().unwrap();
+        snapshot.close(Ok(())).unwrap();
+        let after = std::fs::metadata(&fixture.pile).unwrap().len();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn retired_branch_commands_and_selector_are_not_cli_surface() {
+        assert!(
+            Cli::try_parse_from(["triage", "--pile", "x", "--branch", "cognition", "scan"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["triage", "--pile", "x", "chain"]).is_err());
+        assert!(Cli::try_parse_from(["triage", "--pile", "x", "repair"]).is_err());
+        assert!(Cli::try_parse_from(["triage", "--pile", "x", "migrate-legacy"]).is_err());
+    }
 }

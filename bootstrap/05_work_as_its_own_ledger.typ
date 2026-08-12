@@ -22,8 +22,9 @@ step? If separate, redesign until it's not.
     "log that I started this".
   - `files add <path>` *is* the archive step. The handle is
     the citation.
-  - Pile commits *are* the version history. No separate
-    snapshotting.
+  - Signed collection COMMITs *are* the publication history. Domain facts
+    carry any meaningful revision or supersession relationship; there is no
+    separate snapshot log to maintain.
 
 == The corollary: don't write throwaway markdown
 
@@ -40,9 +41,9 @@ itself is enough.
 
 == Further reading
 
-The bootstrap-pile design conversation walking through how this
+The portable-bootstrap design conversation walking through how this
 principle drives the onboarding system itself lives in the
-project that ships this pile (search for "Bootstrap Pile" in
+project that ships this importer (search for "portable bootstrap" in
 the local pile, or in the `faculties` repo's design notes).
 
 Next stop: [Recipe: Research Workflow](wiki:999d2565f2e3af57fa5cfe2ed507d450).

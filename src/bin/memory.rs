@@ -1,38 +1,42 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
-use ed25519_dalek::SigningKey;
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::schemas::embeddings::DEFAULT_SCOPE_ID as EMBEDDINGS_SCOPE_ID;
+#[cfg(feature = "local-embed")]
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::memory::{
-    archive_import_schema, archive_schema, comb, ctx, search_index, DEFAULT_ARCHIVE_BRANCH,
-    DEFAULT_COGNITION_BRANCH, DEFAULT_MEMORY_BRANCH, KIND_ARCHIVE_MESSAGE, KIND_CHUNK_ID,
-    KIND_EXEC_RESULT, KIND_RETRACTION, KIND_SEARCH_INDEX,
+    archive_schema as legacy_archive_schema, ctx, DEFAULT_COMB_SCOPE_ID,
+    DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID,
 };
+use faculties::schemas::{blockdag as archive_schema, cognition as cognition_schema};
 // The context-cover renderer and its chunk accessors live in the lib module
 // `faculties::memory_cover` so `orient wake` can assemble the same cover
 // in-process. Re-import the pieces this binary still uses elsewhere.
 use faculties::memory_cover::{
     all_chunk_ids, chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_span_str,
     chunk_start_at, chunk_summary_handle, collect_chunk_spans, epoch_end_from_interval,
-    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch,
-    latest_search_index, superseded_ids, CoverOpts, DEFAULT_SIM_THRESHOLD,
+    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch, superseded_ids,
+    CoverOpts, DEFAULT_SIM_THRESHOLD,
 };
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
+use faculties::{
+    blockdag::{self, CatalogValidation},
+    cognition as cognition_model, comb as comb_model, memory as memory_model, memory_cutover,
+};
 use hifitime::Epoch;
-use rand_core::OsRng;
 use triblespace::core::blob::Bytes;
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
-use triblespace_search::bm25::BM25Builder;
-use triblespace_search::succinct::SuccinctBM25Index;
-use triblespace_search::tokens::hash_tokens;
 
 #[derive(Parser)]
 #[command(
@@ -42,13 +46,13 @@ use triblespace_search::tokens::hash_tokens;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--chars N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded+un-lexically-scorable chunks are kept (fail-open) with a stderr warning.\n  \
+             memory context [<budget>] [--chars N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
              memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
              memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
              memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
              memory cover reset [--session KEY]   — rewind the cursor to 0 (does NOT regenerate the stored cover)\n  \
              memory density [<grain>]        — find where the hierarchy is BUSHY (many flat leaf-children under one span, no intermediate arc summary) vs balanced vs coarse; worst-first\n  \
-             memory search <query>           — lexical (BM25) search over chunk summaries (build/refresh with `memory index`)\n  \
+             memory search <query>           — exact lexical (BM25) search rebuilt from the frozen Memory view\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
              memory import-tokenizer <json>   — one-time: seed the nomic model pile from a tokenizer.json (provenance blob + canonical tokenizer GRAPH), so the embedder is fully pile-loaded (no HF cache) [needs --features local-embed]\n  \
              memory ingest-tokenizer          — one-time: build the canonical tokenizer GRAPH from the tokenizer.json blob already in the model pile (append-only, idempotent) [needs --features local-embed]\n  \
@@ -61,6 +65,7 @@ use triblespace_search::tokens::hash_tokens;
              memory supersede <new> <old>     — mark an existing chunk as replacing another (old leaves all views)\n  \
              memory retract <id> [reason]      — retire a mistaken/duplicate chunk with NO replacement (invisible tombstone; target leaves all views, nothing new shows up as a memory)\n  \
              memory retractions               — audit surface: list retractions (what was retracted, and why)\n  \
+             memory migrate-legacy            — additively publish the frozen legacy memory branch as native commits (stop every legacy writer first)\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
              memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
@@ -71,12 +76,240 @@ struct Cli {
     /// Path to the pile file to use.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Optional explicit branch id (hex) to read chunks from (defaults to cognition branch).
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     /// One or more time ranges / id prefixes to show, or `turn <turn-id>`, or `create [<from>..<to>] <summary>`.
     #[arg(value_name = "ID", trailing_var_arg = true, allow_hyphen_values = true)]
     ids: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct MemoryStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+}
+
+struct CollectionView {
+    facts: TribleSet,
+    reader: PileReader,
+}
+
+struct LoadedMemory {
+    memory: CollectionView,
+    catalog: memory_model::MemoryCatalog,
+}
+
+struct LoadedContext {
+    memory: LoadedMemory,
+    embeddings: CollectionView,
+}
+
+struct LoadedComb {
+    memory: LoadedMemory,
+    comb_catalog: comb_model::CombCatalog,
+}
+
+struct LoadedProvenance {
+    memory: LoadedMemory,
+    cognition: CollectionView,
+    archive: CollectionView,
+}
+
+impl MemoryStorage<'_> {
+    fn materialize_scope(
+        pile: &mut Pile,
+        signer: &ed25519_dalek::SigningKey,
+        scope: Id,
+        label: &str,
+    ) -> Result<TribleSet> {
+        let mut collection = Collection::new(&mut *pile, scope, signer.clone());
+        collection
+            .materialize()
+            .with_context(|| format!("materialize authored {label} collection"))
+    }
+
+    fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+        let close = pile.close();
+        match (result, close) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(anyhow!("close pile: {error}")),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(close_error)) => {
+                Err(error.context(format!("closing pile also failed: {close_error}")))
+            }
+        }
+    }
+
+    fn load_memory_from_pile(
+        pile: &mut Pile,
+        signer: &ed25519_dalek::SigningKey,
+    ) -> Result<LoadedMemory> {
+        let materialized = Self::materialize_scope(pile, signer, MEMORY_SCOPE_ID, "Memory")?;
+        let reader = pile.reader().context("open Memory blob reader")?;
+        let catalog = memory_model::validate_catalog(&reader, &materialized)
+            .context("validate Memory collection")?;
+        // The collection remains an exact additive ledger.  Ordinary Memory
+        // commands consume its canonical projection so preserved random-id
+        // legacy rows and rebuildable exhaust cannot leak back into covers,
+        // searches, or direct chunk enumeration.
+        let nodes = catalog.node_ids();
+        let mut facts = TribleSet::new();
+        for fact in materialized.iter().filter(|fact| nodes.contains(fact.e())) {
+            facts.insert(fact);
+        }
+        let memory = CollectionView { facts, reader };
+        Ok(LoadedMemory { memory, catalog })
+    }
+
+    /// Freeze canonical Memory alone for ordinary commands.
+    fn load(&self) -> Result<LoadedMemory> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = Self::load_memory_from_pile(&mut pile, &signer);
+        Self::finish_pile(pile, result)
+    }
+
+    /// Freeze Memory and shared Embeddings from one snapshot for semantic or
+    /// context-cover reads.
+    fn load_context(&self, with_embeddings: bool) -> Result<LoadedContext> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = (|| {
+            let memory = Self::load_memory_from_pile(&mut pile, &signer)?;
+            let facts = if with_embeddings {
+                Self::materialize_scope(
+                    &mut pile,
+                    &signer,
+                    EMBEDDINGS_SCOPE_ID,
+                    "shared Embeddings",
+                )?
+            } else {
+                TribleSet::new()
+            };
+            let embeddings = CollectionView {
+                facts,
+                reader: memory.memory.reader.clone(),
+            };
+            Ok(LoadedContext { memory, embeddings })
+        })();
+        Self::finish_pile(pile, result)
+    }
+
+    /// Freeze Memory and Comb together for cursor transitions.
+    fn load_comb(&self) -> Result<LoadedComb> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = (|| {
+            let memory = Self::load_memory_from_pile(&mut pile, &signer)?;
+            let facts = Self::materialize_scope(&mut pile, &signer, DEFAULT_COMB_SCOPE_ID, "Comb")?;
+            let comb = CollectionView {
+                facts,
+                reader: memory.memory.reader.clone(),
+            };
+            let comb_catalog =
+                comb_model::load_catalog(&comb.facts).context("validate Comb collection")?;
+            Ok(LoadedComb {
+                memory,
+                comb_catalog,
+            })
+        })();
+        Self::finish_pile(pile, result)
+    }
+
+    /// Freeze Memory, Cognition, and Archive from exactly one pile snapshot
+    /// for a coherent cross-scope provenance read.
+    fn load_provenance(&self) -> Result<LoadedProvenance> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = (|| {
+            let memory = Self::load_memory_from_pile(&mut pile, &signer)?;
+            let cognition_facts = Self::materialize_scope(
+                &mut pile,
+                &signer,
+                cognition_schema::DEFAULT_SCOPE_ID,
+                "Cognition",
+            )?;
+            let archive_facts = Self::materialize_scope(
+                &mut pile,
+                &signer,
+                archive_schema::DEFAULT_SCOPE_ID,
+                "Archive",
+            )?;
+            let reader = memory.memory.reader.clone();
+            match blockdag::validate_catalog(&reader, &archive_facts)
+                .context("validate Archive collection for Memory provenance")?
+            {
+                CatalogValidation::Accepted => {}
+                CatalogValidation::Pending { missing } => bail!(
+                    "Archive collection is missing {} attachment blob(s)",
+                    missing.len()
+                ),
+                CatalogValidation::Rejected(reason) => {
+                    bail!("Archive collection is invalid: {reason}")
+                }
+            }
+            Ok(LoadedProvenance {
+                memory,
+                cognition: CollectionView {
+                    facts: cognition_facts,
+                    reader: reader.clone(),
+                },
+                archive: CollectionView {
+                    facts: archive_facts,
+                    reader,
+                },
+            })
+        })();
+        Self::finish_pile(pile, result)
+    }
+
+    fn publish_memory(&self, _loaded: &LoadedMemory, fragment: Fragment) -> Result<()> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = (|| {
+            let current = Self::materialize_scope(&mut pile, &signer, MEMORY_SCOPE_ID, "Memory")?;
+            let reader = pile.reader().context("open Memory mutation reader")?;
+            memory_model::validate_candidate(&reader, &current, &fragment)
+                .context("validate Memory mutation")?;
+            let mut collection = Collection::new(&mut pile, MEMORY_SCOPE_ID, signer.clone());
+            collection
+                .commit(fragment)
+                .context("commit authored Memory fragment")?;
+            Ok(())
+        })();
+        Self::finish_pile(pile, result)
+    }
+
+    #[cfg(feature = "local-embed")]
+    fn publish_embeddings(&self, fragment: Fragment) -> Result<()> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, EMBEDDINGS_SCOPE_ID, signer);
+        let result = collection
+            .commit(fragment)
+            .context("commit authored embedding observations")
+            .map(|_| ());
+        Self::finish_pile(collection.into_storage(), result)
+    }
+
+    fn publish_comb(&self, loaded: &LoadedComb, fragment: Fragment) -> Result<()> {
+        let _ = loaded;
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = (|| {
+            let mut candidate =
+                Self::materialize_scope(&mut pile, &signer, DEFAULT_COMB_SCOPE_ID, "Comb")?;
+            candidate += fragment.facts().clone();
+            comb_model::load_catalog(&candidate).context("validate Comb mutation")?;
+            let mut collection = Collection::new(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.clone());
+            collection
+                .commit(fragment)
+                .context("commit authored Comb cursor")?;
+            Ok(())
+        })();
+        Self::finish_pile(pile, result)
+    }
 }
 
 // ── on-demand chunk queries ───────────────────────────────────────────
@@ -84,9 +317,9 @@ struct Cli {
 
 /// One-line render of a chunk for list/similar output: the summary's first
 /// line, or a wordless-image marker, or empty.
-fn chunk_oneline(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
+fn chunk_oneline(reader: &PileReader, space: &TribleSet, id: Id) -> String {
     if let Some(h) = chunk_summary_handle(space, id) {
-        return ws
+        return reader
             .get::<View<str>, LongString>(h)
             .ok()
             .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
@@ -98,14 +331,10 @@ fn chunk_oneline(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String 
     String::new()
 }
 
-/// Outgoing references of a chunk: ctx::reference facts (renamed from the
-/// legacy `child` attribute — same id, so old tree edges read as references)
-/// plus the ancient left/right binary-tree remnants.
+/// Outgoing contextual references of a canonical chunk.
 fn chunk_references(space: &TribleSet, id: Id) -> Vec<Id> {
-    let mut children: Vec<Id> = Vec::new();
-    children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::reference: ?c }])));
-    children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::left: ?c }])));
-    children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::right: ?c }])));
+    let mut children: Vec<Id> =
+        find!(c: Id, pattern!(space, [{ id @ ctx::reference: ?c }])).collect();
     // Sort referenced chunks by their start_at time.
     let superseded = superseded_ids(space);
     children.retain(|child_id| !superseded.contains(child_id));
@@ -120,10 +349,6 @@ fn chunk_references(space: &TribleSet, id: Id) -> Vec<Id> {
 
 fn chunk_about_exec_result(space: &TribleSet, id: Id) -> Option<Id> {
     find!(v: Id, pattern!(space, [{ id @ ctx::about_exec_result: ?v }])).next()
-}
-
-fn chunk_about_archive_message(space: &TribleSet, id: Id) -> Option<Id> {
-    find!(v: Id, pattern!(space, [{ id @ ctx::about_archive_message: ?v }])).next()
 }
 
 // ---------------------------------------------------------------------------
@@ -212,125 +437,37 @@ fn find_chunk_by_time_range(space: &TribleSet, query_start: Epoch, query_end: Ep
     best.map(|(id, _)| id)
 }
 
-// ── BM25 search over chunk summaries ─────────────────────────────────
-// Index entities are rebuild-and-replace: `memory index` mints a fresh
-// (KIND_SEARCH_INDEX, blob handle, indexed_at) entity; `memory search`
-// reads the latest by timestamp. Superseded chunks are excluded at
-// build time, and again at query time in case the index is stale.
+// ── exact BM25 search over the frozen Memory collection ───────────────
 
-fn now_interval() -> Result<Inline<NsTAIInterval>> {
-    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-    (now, now)
-        .try_to_inline()
-        .map_err(|e| anyhow!("encode timestamp: {e:?}"))
-}
-
-fn cmd_index(pile_path: &Path) -> Result<()> {
-    with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout memory branch")?;
-
-        let superseded = superseded_ids(&space);
-        let mut builder: BM25Builder = BM25Builder::new();
-        let mut indexed = 0usize;
-        for chunk in find!(id: Id, pattern!(&space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])) {
-            if superseded.contains(&chunk) {
-                continue;
-            }
-            let Some(handle) = chunk_summary_handle(&space, chunk) else {
-                continue;
-            };
-            let summary: View<str> = ws.get(handle).context("read chunk summary")?;
-            builder.insert(&chunk, hash_tokens(summary.as_ref()));
-            indexed += 1;
-        }
-        let idx = builder.build();
-        let handle = ws.put(&idx);
-        let at = now_interval()?;
-        let mut change = TribleSet::new();
-        change += entity! { _ @
-            metadata::tag: &KIND_SEARCH_INDEX,
-            search_index::index: handle,
-            search_index::indexed_at: at,
-        };
-        ws.commit(change, "memory index");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push failed: {e:?}"))?;
-        println!(
-            "indexed {indexed} chunk summaries ({} superseded excluded)",
-            superseded.len()
-        );
-        Ok(())
-    })
-}
-
-fn cmd_search(pile_path: &Path, args: &[String]) -> Result<()> {
+fn cmd_search(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     if args.is_empty() {
         bail!("usage: memory search <query words...>");
     }
     let query = args.join(" ");
-    with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout memory branch")?;
+    let loaded = storage.load()?;
+    let mut rows: Vec<(Id, f32)> = faculties::memory_cover::lexical_relevance_scores(
+        &loaded.memory.facts,
+        &loaded.memory.reader,
+        &query,
+    )?
+    .into_iter()
+    .collect();
+    rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let Some((handle, _at)) = latest_search_index(&space) else {
-            bail!("no search index on this pile yet — run `memory index` first");
-        };
-        let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
-
-        let superseded = superseded_ids(&space);
-        // One scored postings walk over the whole index — never score
-        // per-doc (that re-walks postings per match and goes quadratic
-        // on common terms). The index only contains chunk docs by
-        // construction; superseded is re-filtered here in case chunks
-        // were superseded after the index was built.
-        let mut rows: Vec<(Id, f32)> = idx
-            .query_multi(&hash_tokens(&query))
-            .into_iter()
-            .filter_map(|(doc, score)| {
-                let id: Id = doc.try_from_inline().ok()?;
-                (!superseded.contains(&id)).then_some((id, score))
-            })
-            .collect();
-        rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Staleness hint: the index is rebuild-and-replace, so chunks
-        // written since the last `memory index` aren't searchable yet.
-        let live = find!(id: Id, pattern!(&space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }]))
-            .filter(|id| !superseded.contains(id))
-            .count();
-        if live > idx.doc_count() {
-            eprintln!(
-                "note: {} chunk(s) newer than the index — run `memory index` to refresh",
-                live - idx.doc_count()
-            );
-        }
-
-        if rows.is_empty() {
-            println!("no matches.");
-            return Ok(());
-        }
-        for (chunk, score) in rows.into_iter().take(10) {
-            let summary = chunk_oneline(&mut ws, &space, chunk);
-            println!("{score:6.2}  {chunk:x}  {summary}");
-        }
-        Ok(())
-    })
+    if rows.is_empty() {
+        println!("no matches.");
+        return Ok(());
+    }
+    for (chunk, score) in rows.into_iter().take(10) {
+        let summary = chunk_oneline(&loaded.memory.reader, &loaded.memory.facts, chunk);
+        println!("{score:6.2}  {chunk:x}  {summary}");
+    }
+    Ok(())
 }
 
-// ── semantic embedding seam (nomic + shared HNSW, behind `local-embed`) ─────
-// Mirrors the BM25 index/search pair, but in the shared multimodal space:
-// `memory embed` is the build step (embed each chunk summary once with
+// ── semantic embedding seam (nomic shared-space observations) ───────────────
+// Unlike exact BM25, semantic retrieval needs a durable shared-space
+// observation: `memory embed` embeds each chunk summary once with
 // nomic-embed-text, store the 768-d vector as exhaust under the chunk's id),
 // `memory similar` is the query (embed the query, nearest over stored vectors).
 // Where BM25 matches tokens, this matches MEANING — a paraphrase with no shared
@@ -392,10 +529,10 @@ fn cmd_ingest_tokenizer(_args: &[String]) -> Result<()> {
 }
 
 /// `memory embed` — embed every live chunk summary that lacks a vector and
-/// store it as exhaust. Idempotent (re-running only embeds chunks added since),
-/// like the rebuild-and-replace BM25 index but per-chunk content-addressed.
+/// store it as an observation in the shared Embeddings collection. Idempotent:
+/// re-running only embeds live chunks absent from the frozen observation set.
 #[cfg(feature = "local-embed")]
-fn cmd_embed(pile_path: &Path) -> Result<()> {
+fn cmd_embed(storage: MemoryStorage<'_>) -> Result<()> {
     use mary::embed::LocalEmbedder;
 
     // What a chunk embeds FROM: its summary prose (nomic-text) or its raw image
@@ -406,103 +543,92 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
         Image(Inline<Handle<RawBytes>>),
     }
 
-    with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout memory branch")?;
+    let loaded = storage.load_context(true)?;
+    let space = &loaded.memory.memory.facts;
+    let mut todo: Vec<(Id, Src)> = Vec::new();
+    for chunk in loaded.memory.catalog.live_chunk_ids() {
+        if chunk_embedding_handle(&loaded.embeddings.facts, chunk)?.is_some() {
+            continue;
+        }
+        // An image chunk is wordless — route it to vision; otherwise embed
+        // its summary with text. (A validated chunk has exactly one.)
+        if let Some(h) = chunk_image_handle(space, chunk) {
+            todo.push((chunk, Src::Image(h)));
+        } else if let Some(h) = chunk_summary_handle(space, chunk) {
+            todo.push((chunk, Src::Text(h)));
+        }
+    }
+    if todo.is_empty() {
+        println!("all live chunks already embedded.");
+        return Ok(());
+    }
+    let total = todo.len();
 
-        let superseded = superseded_ids(&space);
-        let mut todo: Vec<(Id, Src)> = Vec::new();
-        for chunk in all_chunk_ids(&space) {
-            if superseded.contains(&chunk) {
-                continue;
+    // Load each model once, lazily — a pile with only text memories never
+    // pays for the vision weights, and vice versa.
+    let mut text_emb: Option<mary::embed::NomicTextEmbedder<_>> = None;
+    let mut vision_emb: Option<mary::embed::NomicVisionEmbedder<_>> = None;
+    let mut n_text = 0usize;
+    let mut n_image = 0usize;
+    let mut fragment = Fragment::empty();
+    for (i, (chunk, src)) in todo.into_iter().enumerate() {
+        let v = match src {
+            Src::Text(sh) => {
+                let summary: View<str> = loaded
+                    .memory
+                    .memory
+                    .reader
+                    .get(sh)
+                    .context("read chunk summary")?;
+                let emb = match &text_emb {
+                    Some(e) => e,
+                    None => {
+                        eprintln!("memory: loading nomic-embed-text (once)…");
+                        text_emb = Some(nomic::load_text_embedder()?);
+                        text_emb.as_ref().unwrap()
+                    }
+                };
+                n_text += 1;
+                l2_normalize(
+                    emb.embed_document(summary.as_ref())
+                        .map_err(|e| anyhow!("embed chunk {chunk:x}: {e:?}"))?,
+                )
             }
-            if chunk_embedding_handle(&space, chunk).is_some() {
-                continue;
+            Src::Image(ih) => {
+                let bytes: Bytes = loaded
+                    .memory
+                    .memory
+                    .reader
+                    .get(ih)
+                    .context("read image bytes")?;
+                let emb = match &vision_emb {
+                    Some(e) => e,
+                    None => {
+                        eprintln!("memory: loading nomic-embed-vision (once)…");
+                        vision_emb = Some(nomic::load_vision_embedder()?);
+                        vision_emb.as_ref().unwrap()
+                    }
+                };
+                n_image += 1;
+                l2_normalize(
+                    emb.embed_image(bytes.as_ref())
+                        .map_err(|e| anyhow!("embed image chunk {chunk:x}: {e:?}"))?,
+                )
             }
-            // An image chunk is wordless — route it to vision; otherwise embed
-            // its summary with text. (A chunk has one or the other.)
-            if let Some(h) = chunk_image_handle(&space, chunk) {
-                todo.push((chunk, Src::Image(h)));
-            } else if let Some(h) = chunk_summary_handle(&space, chunk) {
-                todo.push((chunk, Src::Text(h)));
-            }
+        };
+        let handle = fragment.put::<Embedding768, _>(v);
+        fragment += entity! { triblespace::core::id::ExclusiveId::force_ref(&chunk) @ embeddings::attr::embedding: handle };
+        if (i + 1) % 25 == 0 || i + 1 == total {
+            eprintln!("  embedded {}/{total}", i + 1);
         }
-        if todo.is_empty() {
-            println!("all live chunks already embedded.");
-            return Ok(());
-        }
-        let total = todo.len();
-
-        // Load each model once, lazily — a pile with only text memories never
-        // pays for the vision weights, and vice versa.
-        let mut text_emb: Option<mary::embed::NomicTextEmbedder<_>> = None;
-        let mut vision_emb: Option<mary::embed::NomicVisionEmbedder<_>> = None;
-        let mut n_text = 0usize;
-        let mut n_image = 0usize;
-        let mut change = TribleSet::new();
-        for (i, (chunk, src)) in todo.into_iter().enumerate() {
-            let v = match src {
-                Src::Text(sh) => {
-                    let summary: View<str> = ws.get(sh).context("read chunk summary")?;
-                    let emb = match &text_emb {
-                        Some(e) => e,
-                        None => {
-                            eprintln!("memory: loading nomic-embed-text (once)…");
-                            text_emb = Some(nomic::load_text_embedder()?);
-                            text_emb.as_ref().unwrap()
-                        }
-                    };
-                    n_text += 1;
-                    l2_normalize(
-                        emb.embed_document(summary.as_ref())
-                            .map_err(|e| anyhow!("embed chunk {chunk:x}: {e:?}"))?,
-                    )
-                }
-                Src::Image(ih) => {
-                    let bytes: Bytes = ws.get(ih).context("read image bytes")?;
-                    let emb = match &vision_emb {
-                        Some(e) => e,
-                        None => {
-                            eprintln!("memory: loading nomic-embed-vision (once)…");
-                            vision_emb = Some(nomic::load_vision_embedder()?);
-                            vision_emb.as_ref().unwrap()
-                        }
-                    };
-                    n_image += 1;
-                    l2_normalize(
-                        emb.embed_image(bytes.as_ref())
-                            .map_err(|e| anyhow!("embed image chunk {chunk:x}: {e:?}"))?,
-                    )
-                }
-            };
-            let handle = ws.put::<Embedding768, _>(v);
-            change += entity! { triblespace::core::id::ExclusiveId::force_ref(&chunk) @ embeddings::attr::embedding: handle };
-            if (i + 1) % 25 == 0 || i + 1 == total {
-                eprintln!("  embedded {}/{total}", i + 1);
-            }
-        }
-        ws.commit(change, "memory embed");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push failed: {e:?}"))?;
-        // Refresh the persisted HNSW segment so `memory similar` queries the
-        // graph instead of rebuilding it. Best-effort: the segment is soft
-        // state (recomputable from the commit chain), so a failure here warns
-        // but doesn't fail the embed.
-        if let Err(e) = embeddings::refresh_index(repo, branch_id) {
-            eprintln!("memory: warning: HNSW index refresh failed (similar will fall back): {e:#}");
-        }
-        println!("embedded {n_text} text + {n_image} image chunk(s) into the shared nomic space.");
-        Ok(())
-    })
+    }
+    storage.publish_embeddings(fragment)?;
+    println!("embedded {n_text} text + {n_image} image chunk(s) into the shared nomic space.");
+    Ok(())
 }
 
 #[cfg(not(feature = "local-embed"))]
-fn cmd_embed(_pile_path: &Path) -> Result<()> {
+fn cmd_embed(_storage: MemoryStorage<'_>) -> Result<()> {
     bail!("`memory embed` needs the local embedder — rebuild with `--features local-embed`");
 }
 
@@ -510,7 +636,7 @@ fn cmd_embed(_pile_path: &Path) -> Result<()> {
 /// nomic space. Matches by meaning, not tokens (the semantic complement to
 /// `memory search`). Reads stored vectors only; `memory embed` builds them.
 #[cfg(feature = "local-embed")]
-fn cmd_similar(pile_path: &Path, args: &[String]) -> Result<()> {
+fn cmd_similar(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     if args.is_empty() {
         bail!("usage: memory similar <query words...>");
     }
@@ -522,105 +648,57 @@ fn cmd_similar(pile_path: &Path, args: &[String]) -> Result<()> {
             .map_err(|e| anyhow!("embed query: {e:?}"))?,
     );
 
-    with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-        let expected_head = ws.head();
-        let space = ws.checkout(..).context("checkout memory branch")?;
-
-        let superseded = superseded_ids(&space);
-
-        // FAST PATH: attach the persisted HNSW segment(s) from the branch head
-        // and query them — no read-all-blobs, no rebuild. The checkout above
-        // stays only to map result handles → chunk ids (tribles, no blob
-        // reads) and to render, not to gather every embedding.
-        let ranked: Vec<(f32, Id)> = match embeddings::nearest_via_index(
-            repo.storage_mut(),
-            branch_id,
-            expected_head,
-            &qv,
-            0.0,
-        )? {
-            Some(rows) => {
-                // Build handle→id over LIVE chunks (a trible query per chunk,
-                // no blob fetch), then translate the ranked candidate handles.
-                let mut by_handle: std::collections::HashMap<[u8; 32], Id> =
-                    std::collections::HashMap::new();
-                for chunk in all_chunk_ids(&space) {
-                    if superseded.contains(&chunk) {
-                        continue;
-                    }
-                    if let Some(h) = chunk_embedding_handle(&space, chunk) {
-                        by_handle.insert(h.raw, chunk);
-                    }
-                }
-                rows.into_iter()
-                    .filter_map(|(cos, raw)| by_handle.get(&raw).map(|id| (cos, *id)))
-                    .collect()
+    let loaded = storage.load_context(true)?;
+    let space = &loaded.memory.memory.facts;
+    let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
+    for chunk in loaded.memory.catalog.live_chunk_ids() {
+        if let Some(h) = chunk_embedding_handle(&loaded.embeddings.facts, chunk)? {
+            let v: View<[f32]> = loaded
+                .embeddings
+                .reader
+                .get(h)
+                .map_err(|e| anyhow!("read embedding: {e:?}"))?;
+            pairs.push((chunk, v.as_ref().to_vec()));
+        }
+    }
+    if pairs.is_empty() {
+        bail!("no chunk embeddings on this pile yet — run `memory embed` first");
+    }
+    if pairs.len() < loaded.memory.catalog.live_chunk_ids().len() {
+        eprintln!(
+            "note: {} live chunk(s) not yet embedded — run `memory embed` to refresh",
+            loaded.memory.catalog.live_chunk_ids().len() - pairs.len()
+        );
+    }
+    let ranked = embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow!("nearest: {e:?}"))?;
+    if ranked.is_empty() {
+        println!("no matches.");
+        return Ok(());
+    }
+    for (cos, chunk) in ranked.into_iter().take(10) {
+        let span = match (chunk_start_at(space, chunk), chunk_end_at(space, chunk)) {
+            (Some(s), Some(e)) => {
+                let (s, _): (Epoch, Epoch) = s.try_from_inline().unwrap();
+                let (e, _): (Epoch, Epoch) = e.try_from_inline().unwrap();
+                format_time_range(s, e)
             }
-            // FALLBACK: no HNSW segment yet (e.g. embedded before this landed).
-            // Gather all pairs and rebuild once, as before.
-            None => {
-                let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
-                let mut live = 0usize;
-                for chunk in all_chunk_ids(&space) {
-                    if superseded.contains(&chunk) {
-                        continue;
-                    }
-                    live += 1;
-                    if let Some(h) = chunk_embedding_handle(&space, chunk) {
-                        let v: View<[f32]> =
-                            ws.get(h).map_err(|e| anyhow!("read embedding: {e:?}"))?;
-                        pairs.push((chunk, v.as_ref().to_vec()));
-                    }
-                }
-                if pairs.is_empty() {
-                    bail!("no chunk embeddings on this pile yet — run `memory embed` first");
-                }
-                if pairs.len() < live {
-                    eprintln!(
-                        "note: {} live chunk(s) not yet embedded — run `memory embed` to refresh",
-                        live - pairs.len()
-                    );
-                }
-                embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow!("nearest: {e:?}"))?
-            }
+            _ => "?".to_string(),
         };
-        if ranked.is_empty() {
-            println!("no matches.");
-            return Ok(());
-        }
-        for (cos, chunk) in ranked.into_iter().take(10) {
-            let span = match (chunk_start_at(&space, chunk), chunk_end_at(&space, chunk)) {
-                (Some(s), Some(e)) => {
-                    let (s, _): (Epoch, Epoch) = s.try_from_inline().unwrap();
-                    let (e, _): (Epoch, Epoch) = e.try_from_inline().unwrap();
-                    format_time_range(s, e)
-                }
-                _ => "?".to_string(),
-            };
-            let summary = chunk_oneline(&mut ws, &space, chunk);
-            // Image memories: export the blob to a path the caller can Read,
-            // so a Claude-Code reader (no auto-injected blobs) can actually see it.
-            let img_line = match chunk_image_handle(&space, chunk) {
-                Some(h) => match materialize_image(&mut ws, chunk, h) {
-                    Ok(path) => format!("\n        → {} (Read this path to view)", path.display()),
-                    Err(e) => format!("\n        (image export failed: {e})"),
-                },
-                None => String::new(),
-            };
-            println!("{cos:6.3}  {chunk:x}  {span}\n        {summary}{img_line}");
-        }
-        Ok(())
-    })
+        let summary = chunk_oneline(&loaded.memory.memory.reader, space, chunk);
+        let img_line = match chunk_image_handle(space, chunk) {
+            Some(h) => match materialize_image(&loaded.memory.memory.reader, chunk, h) {
+                Ok(path) => format!("\n        → {} (Read this path to view)", path.display()),
+                Err(e) => format!("\n        (image export failed: {e})"),
+            },
+            None => String::new(),
+        };
+        println!("{cos:6.3}  {chunk:x}  {span}\n        {summary}{img_line}");
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "local-embed"))]
-fn cmd_similar(_pile_path: &Path, _args: &[String]) -> Result<()> {
+fn cmd_similar(_storage: MemoryStorage<'_>, _args: &[String]) -> Result<()> {
     bail!("`memory similar` needs the local embedder — rebuild with `--features local-embed`");
 }
 
@@ -632,49 +710,50 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     }
+    let storage = MemoryStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+    };
 
     // Dispatch to subcommand handlers.
     if cli.ids.first().is_some_and(|value| value == "create") {
-        return cmd_create(&cli.pile, &cli.ids[1..]);
+        return cmd_create(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "image") {
-        return cmd_image(&cli.pile, &cli.ids[1..]);
+        return cmd_image(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "meta") {
-        return cmd_meta(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+        return cmd_meta(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "respan") {
-        return cmd_respan(&cli.pile, &cli.ids[1..]);
+        return cmd_respan(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "supersede") {
-        return cmd_supersede(&cli.pile, &cli.ids[1..]);
+        return cmd_supersede(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "retract") {
-        return cmd_retract(&cli.pile, &cli.ids[1..]);
+        return cmd_retract(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "retractions") {
-        return cmd_retractions(&cli.pile, &cli.ids[1..]);
+        return cmd_retractions(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "provenance") {
-        return cmd_provenance(&cli.pile, &cli.ids[1..]);
+        return cmd_provenance(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "consolidate") {
-        return cmd_consolidate(&cli.pile, &cli.ids[1..]);
+        return cmd_consolidate(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "replay") {
-        return cmd_replay(&cli.pile, &cli.ids[1..]);
-    }
-    if cli.ids.first().is_some_and(|value| value == "index") {
-        return cmd_index(&cli.pile);
+        return cmd_replay(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "search") {
-        return cmd_search(&cli.pile, &cli.ids[1..]);
+        return cmd_search(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "embed") {
-        return cmd_embed(&cli.pile);
+        return cmd_embed(storage);
     }
     if cli.ids.first().is_some_and(|value| value == "similar") {
-        return cmd_similar(&cli.pile, &cli.ids[1..]);
+        return cmd_similar(storage, &cli.ids[1..]);
     }
     if cli
         .ids
@@ -691,75 +770,106 @@ fn main() -> Result<()> {
         return cmd_ingest_tokenizer(&cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "context") {
-        return cmd_context(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+        return cmd_context(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "cover") {
-        return cmd_cover(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+        return cmd_cover(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "lens") {
-        return cmd_lens(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+        return cmd_lens(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "list") {
-        return cmd_list(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+        return cmd_list(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "check") {
-        return cmd_check(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+        return cmd_check(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "density") {
-        return cmd_density(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+        return cmd_density(storage, &cli.ids[1..]);
+    }
+    if cli
+        .ids
+        .first()
+        .is_some_and(|value| value == "migrate-legacy")
+    {
+        if cli.ids.len() != 1 {
+            bail!("usage: memory migrate-legacy");
+        }
+        return cmd_migrate_legacy(storage);
     }
 
-    let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref())?;
-    with_repo(&cli.pile, |repo| {
-        let branch_id = match explicit_branch_id {
-            Some(id) => id,
-            None => repo
-                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
-        };
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout branch")?;
-
-        if cli.ids.first().is_some_and(|value| value == "turn") {
-            if cli.ids.len() != 2 {
-                bail!("usage: memory turn <turn-id>");
-            }
-            return print_turn_facets(&mut ws, &space, &cli.ids[1]);
+    let loaded = storage.load()?;
+    if cli.ids.first().is_some_and(|value| value == "turn") {
+        if cli.ids.len() != 2 {
+            bail!("usage: memory turn <turn-id>");
         }
+        return print_turn_facets(&loaded.memory.reader, &loaded.memory.facts, &cli.ids[1]);
+    }
 
-        let mut first = true;
-        for raw in &cli.ids {
-            let chunk_id = if raw.contains("..") {
-                let (start, end) = parse_time_range(raw)?;
-                find_chunk_by_time_range(&space, start, end)
-                    .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
-            } else {
-                match resolve_chunk_id(&space, raw) {
-                    Ok(id) => id,
-                    Err(err) => {
-                        return Err(invalid_memory_id_error(raw, err));
-                    }
+    let mut first = true;
+    for raw in &cli.ids {
+        let chunk_id = if raw.contains("..") {
+            let (start, end) = parse_time_range(raw)?;
+            find_chunk_by_time_range(&loaded.memory.facts, start, end)
+                .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
+        } else {
+            match resolve_chunk_id(&loaded, raw) {
+                Ok(id) => id,
+                Err(err) => {
+                    return Err(invalid_memory_id_error(raw, err));
                 }
-            };
-            if !first {
-                println!();
             }
-            first = false;
-            print_chunk(&mut ws, &space, chunk_id)?;
+        };
+        if !first {
+            println!();
         }
+        first = false;
+        print_chunk(&loaded.memory.reader, &loaded.memory.facts, chunk_id)?;
+    }
+    Ok(())
+}
 
-        Ok(())
-    })
+fn cmd_migrate_legacy(storage: MemoryStorage<'_>) -> Result<()> {
+    // Migration deliberately freezes and closes the old repository first,
+    // then performs preflight, publication, and verification through one
+    // native target open. No legacy pin is changed or consumed.
+    let source = freeze_source(storage.pile).context("freeze legacy Memory source")?;
+    let plan = memory_cutover::plan(&source)?;
+    let published = memory_cutover::publish(&source, &plan, storage.pile, storage.key)?;
+    let report = plan.report();
+    println!(
+        "migrated {} authored Memory commit{}: {} preserved facts + {} canonical shadow facts = {} total planned facts in scope {:X}",
+        published.len(),
+        if published.len() == 1 { "" } else { "s" },
+        report.preserved_facts,
+        report.canonical_facts,
+        report.output_facts,
+        MEMORY_SCOPE_ID,
+    );
+    println!(
+        "{} intrinsic nodes, {} legacy aliases, {} byte-exact cross-scope reference{}; legacy branch retained",
+        report.canonical_nodes,
+        report.legacy_aliases,
+        report.cross_scope_references,
+        if report.cross_scope_references == 1 { "" } else { "s" },
+    );
+    if report.omitted_search_entities != 0 || report.omitted_embedding_facts != 0 {
+        println!(
+            "preserved {} historical search-index entit{} and {} embedding fact{} as exact legacy exhaust; neither enters the canonical Memory projection",
+            report.omitted_search_entities,
+            if report.omitted_search_entities == 1 { "y" } else { "ies" },
+            report.omitted_embedding_facts,
+            if report.omitted_embedding_facts == 1 { "" } else { "s" },
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // create subcommand
 // ---------------------------------------------------------------------------
 
-fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
+fn cmd_create(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // A help flag must never be minted as memory content — print usage and stop
     // before any parsing, so `memory create --help` explains itself instead of
     // storing the literal "--help" as a chunk.
@@ -841,20 +951,26 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         bail!("summary text is required: memory create [<from>..<to>] <summary...>");
     }
 
-    with_repo(pile_path, |repo| {
-        let range = match explicit_range {
-            Some(range) => range,
-            None => {
-                let now = Epoch::now()
-                    .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-                (now, now)
-            }
-        };
-        let chunk_id = create_chunk(repo, &summary_text, range, lens.as_deref())?;
-        println!("range: {}", format_time_range(range.0, range.1));
-        println!("id: {chunk_id:x}");
-        Ok(())
-    })
+    let range = match explicit_range {
+        Some(range) => range,
+        None => {
+            let now =
+                Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+            (now, now)
+        }
+    };
+    let loaded = storage.load()?;
+    let chunk_id = create_chunk(
+        storage,
+        &loaded,
+        &summary_text,
+        range,
+        lens.as_deref(),
+        range.1,
+    )?;
+    println!("range: {}", format_time_range(range.0, range.1));
+    println!("id: {chunk_id:x}");
+    Ok(())
 }
 
 /// The chunk-creation core, shared by `create` and `consolidate`.
@@ -866,60 +982,38 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
 /// the given range is stored as typed. Chunks carry no persona or author —
 /// the memory belongs to the one being; only cursors are session-scoped.
 fn create_chunk(
-    repo: &mut Repository<Pile>,
+    storage: MemoryStorage<'_>,
+    loaded: &LoadedMemory,
     summary_text: &str,
     range: (Epoch, Epoch),
     lens: Option<&str>,
+    observed_at: Epoch,
 ) -> Result<Id> {
-    let branch_id = repo
-        .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-        .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-
     let hard_refs = scan_hard_references(summary_text);
-    let mut reference_ids: Vec<Id> = Vec::new();
-    if !hard_refs.is_empty() {
-        let catalog = {
-            let mut ws = repo
-                .pull(branch_id)
-                .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-            ws.checkout(..).context("checkout memory branch")?
-        };
-        for hex in &hard_refs {
-            let target = resolve_chunk_id(&catalog, hex)
-                .map_err(|e| anyhow!("hard reference (memory:{hex}): {e}"))?;
-            reference_ids.push(target);
-        }
+    let mut reference_ids = BTreeSet::new();
+    for hex in &hard_refs {
+        let target = resolve_chunk_id(loaded, hex)
+            .map_err(|e| anyhow!("hard reference (memory:{hex}): {e}"))?;
+        reference_ids.insert(target);
     }
 
     let start_at: Inline<NsTAIInterval> = (range.0, range.0).try_to_inline().unwrap();
     let end_at: Inline<NsTAIInterval> = (range.1, range.1).try_to_inline().unwrap();
-
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull memory branch for write: {e:?}"))?;
-    let summary_handle = ws.put(summary_text.to_owned());
-    let lens_handle = lens.map(|theme| ws.put(theme.to_owned()));
-    let chunk_id = ufoid();
-    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-    let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
-
-    let mut change = TribleSet::new();
-    change += entity! { &chunk_id @
-        metadata::tag: KIND_CHUNK_ID,
-        ctx::summary: summary_handle,
-        metadata::created_at: created_at,
-        ctx::start_at: start_at,
-        ctx::end_at: end_at,
-        ctx::reference*: reference_ids.iter(),
-    };
-    if let Some(h) = lens_handle {
-        change += entity! { &chunk_id @ ctx::lens: h };
-    }
-
-    ws.commit(change, "memory create");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow!("push failed: {e:?}"))?;
-    Ok(*chunk_id)
+    let observed_at: Inline<NsTAIInterval> = (observed_at, observed_at).try_to_inline().unwrap();
+    let (fragment, chunk_id) = memory_model::chunk_fragment(memory_model::ChunkDraft {
+        content: memory_model::ChunkDraftContent::Text(summary_text.to_owned()),
+        start_at,
+        end_at,
+        lens: lens.map(str::to_owned),
+        references: reference_ids,
+        about_exec_result: None,
+        about_archive_message: None,
+        predecessors: BTreeSet::new(),
+        observed_at: BTreeSet::from([observed_at]),
+        aliases: BTreeSet::new(),
+    })?;
+    storage.publish_memory(loaded, fragment)?;
+    Ok(chunk_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -934,7 +1028,7 @@ fn create_chunk(
 /// `memory embed` (via nomic-VISION, co-embedded with nomic-text), and it ranks
 /// in `memory similar` by MEANING beside text memories. Reference it from prose
 /// like any chunk: `[caption](memory:<hex>)`.
-fn cmd_image(pile_path: &Path, args: &[String]) -> Result<()> {
+fn cmd_image(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     if args.len() != 2 {
         bail!(
             "usage: memory image <when> <image-path>\n\
@@ -961,16 +1055,15 @@ fn cmd_image(pile_path: &Path, args: &[String]) -> Result<()> {
         bail!("image file is empty: {}", image_path.display());
     }
 
-    with_repo(pile_path, |repo| {
-        let chunk_id = create_image_chunk(repo, &bytes, range)?;
-        println!("range: {}", format_time_range(range.0, range.1));
-        println!("id: {chunk_id:x}");
-        println!(
-            "({} image bytes stored; run `memory embed` to place it in the shared nomic space)",
-            bytes.len()
-        );
-        Ok(())
-    })
+    let loaded = storage.load()?;
+    let chunk_id = create_image_chunk(storage, &loaded, &bytes, range)?;
+    println!("range: {}", format_time_range(range.0, range.1));
+    println!("id: {chunk_id:x}");
+    println!(
+        "({} image bytes stored; run `memory embed` to place it in the shared nomic space)",
+        bytes.len()
+    );
+    Ok(())
 }
 
 /// Store image bytes as a blob and create a wordless image chunk at `range`.
@@ -979,45 +1072,34 @@ fn cmd_image(pile_path: &Path, args: &[String]) -> Result<()> {
 /// to text chunks by time, and `[caption](memory:<hex>)` references still point
 /// at it like any chunk.
 fn create_image_chunk(
-    repo: &mut Repository<Pile>,
+    storage: MemoryStorage<'_>,
+    loaded: &LoadedMemory,
     bytes: &[u8],
     range: (Epoch, Epoch),
 ) -> Result<Id> {
-    let branch_id = repo
-        .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-        .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-
     let start_at: Inline<NsTAIInterval> = (range.0, range.0).try_to_inline().unwrap();
     let end_at: Inline<NsTAIInterval> = (range.1, range.1).try_to_inline().unwrap();
-
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull memory branch for write: {e:?}"))?;
-    let image_handle = ws.put::<RawBytes, _>(bytes.to_vec());
-    let chunk_id = ufoid();
-    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-    let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
-
-    let mut change = TribleSet::new();
-    change += entity! { &chunk_id @
-        metadata::tag: KIND_CHUNK_ID,
-        ctx::image: image_handle,
-        metadata::created_at: created_at,
-        ctx::start_at: start_at,
-        ctx::end_at: end_at,
-    };
-
-    ws.commit(change, "memory image");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow!("push failed: {e:?}"))?;
-    Ok(*chunk_id)
+    let observed_at: Inline<NsTAIInterval> = (range.1, range.1).try_to_inline().unwrap();
+    let (fragment, chunk_id) = memory_model::chunk_fragment(memory_model::ChunkDraft {
+        content: memory_model::ChunkDraftContent::Image(bytes.to_vec()),
+        start_at,
+        end_at,
+        lens: None,
+        references: BTreeSet::new(),
+        about_exec_result: None,
+        about_archive_message: None,
+        predecessors: BTreeSet::new(),
+        observed_at: BTreeSet::from([observed_at]),
+        aliases: BTreeSet::new(),
+    })?;
+    storage.publish_memory(loaded, fragment)?;
+    Ok(chunk_id)
 }
 
 // ---------------------------------------------------------------------------
 // consolidate + replay — the comb verbs
 // ---------------------------------------------------------------------------
 
-const COMB_STATE_BRANCH: &str = "comb-state";
 const CONSOLIDATE_STREAM: &str = "consolidate-edge";
 const MEMORY_REPLAY_STREAM: &str = "memory-replay";
 
@@ -1025,44 +1107,40 @@ fn comb_persona() -> Result<String> {
     std::env::var("PERSONA").map_err(|_| {
         anyhow!(
             "no persona: set $PERSONA.\n\
-             Cursors are session bookkeeping — no zooid is defaulted as \
+             Cursors are session bookkeeping — no agent is defaulted as \
              \"the\" rememberer; the memories themselves belong to the one \
-             being and are never persona-scoped."
+             enduring memory stream and are never persona-scoped."
         )
     })
 }
 
-fn comb_catalog(repo: &mut Repository<Pile>) -> Result<(Id, TribleSet)> {
-    let branch_id = repo
-        .ensure_branch(COMB_STATE_BRANCH, None)
-        .map_err(|e| anyhow!("ensure comb-state branch: {e:?}"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull comb-state branch: {e:?}"))?;
-    let catalog = ws
-        .checkout(..)
-        .context("checkout comb-state branch")?
-        .into_facts();
-    Ok((branch_id, catalog))
-}
-
 fn comb_advance(
-    repo: &mut Repository<Pile>,
-    branch_id: Id,
+    storage: MemoryStorage<'_>,
+    loaded: &LoadedComb,
     stream: &str,
     persona: &str,
     position: Option<Epoch>,
     grain: Option<&str>,
 ) -> Result<()> {
     let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-    let change = comb::advance_change(stream, persona, position, grain, now);
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull comb-state for write: {e:?}"))?;
-    ws.commit(change, "comb cursor");
-    repo.push(&mut ws)
-        .map_err(|e| anyhow!("push failed: {e:?}"))?;
-    Ok(())
+    let position = position.map(|value| (value, value).try_to_inline().unwrap());
+    let observed_at = (now, now).try_to_inline().unwrap();
+    let predecessors = loaded
+        .comb_catalog
+        .resolution(stream, persona)
+        .map(comb_model::CursorResolution::head_ids)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let (fragment, _) = comb_model::cursor_fragment(comb_model::CursorDraft {
+        stream: stream.to_owned(),
+        persona: persona.to_owned(),
+        position,
+        grain: grain.map(str::to_owned),
+        predecessors,
+        observed_at: BTreeSet::from([observed_at]),
+    })?;
+    storage.publish_comb(loaded, fragment)
 }
 
 /// `memory consolidate start <ts> | stop | <ts> <summary...>`
@@ -1072,7 +1150,7 @@ fn comb_advance(
 /// boundary is chosen in hindsight (you pass the timestamp where the shift
 /// happened, typically copied from replay output; the shift-signaling
 /// message becomes the next chunk's opening).
-fn cmd_consolidate(pile_path: &Path, args: &[String]) -> Result<()> {
+fn cmd_consolidate(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let persona = comb_persona()?;
     if args.is_empty() {
         bail!(
@@ -1081,68 +1159,83 @@ fn cmd_consolidate(pile_path: &Path, args: &[String]) -> Result<()> {
              \x20      memory consolidate <YYYY-MM-DDTHH:MM:SS> <summary...>"
         );
     }
-    with_repo(pile_path, |repo| {
-        let (comb_branch, catalog) = comb_catalog(repo)?;
-        match args[0].as_str() {
-            "start" => {
-                let Some(raw) = args.get(1) else {
-                    bail!("usage: memory consolidate start <YYYY-MM-DDTHH:MM:SS>");
-                };
-                let edge = parse_tai_timestamp(raw)?;
-                comb_advance(
-                    repo,
-                    comb_branch,
-                    CONSOLIDATE_STREAM,
-                    &persona,
-                    Some(edge),
-                    None,
-                )?;
-                println!("consolidation edge set to {raw} (persona {persona})");
-                Ok(())
-            }
-            "stop" => {
-                comb_advance(repo, comb_branch, CONSOLIDATE_STREAM, &persona, None, None)?;
-                println!("consolidation stopped (persona {persona})");
-                Ok(())
-            }
-            _ => {
-                let until = parse_tai_timestamp(&args[0])?;
-                let summary = args[1..].join(" ");
-                if summary.is_empty() {
-                    bail!("summary required: memory consolidate <ts> <summary...>");
-                }
-                let Some((Some(edge_key), _)) =
-                    comb::latest(&catalog, CONSOLIDATE_STREAM, &persona)
-                else {
-                    bail!(
-                        "no open consolidation edge for persona {persona}: \
-                         use `memory consolidate start <ts>`"
-                    );
-                };
-                let edge = key_to_epoch(edge_key);
-                if until.to_tai_duration().total_nanoseconds() <= edge_key {
-                    bail!(
-                        "consolidate target {} is not after the open edge {}",
-                        args[0],
-                        fmt_epoch(edge)
-                    );
-                }
-                let chunk_id = create_chunk(repo, &summary, (edge, until), None)?;
-                comb_advance(
-                    repo,
-                    comb_branch,
-                    CONSOLIDATE_STREAM,
-                    &persona,
-                    Some(until),
-                    None,
-                )?;
-                println!("range: {}", format_time_range(edge, until));
-                println!("id: {chunk_id:x}");
-                println!("edge → {}", args[0]);
-                Ok(())
-            }
+    let loaded = storage.load_comb()?;
+    match args[0].as_str() {
+        "start" => {
+            let Some(raw) = args.get(1) else {
+                bail!("usage: memory consolidate start <YYYY-MM-DDTHH:MM:SS>");
+            };
+            let edge = parse_tai_timestamp(raw)?;
+            comb_advance(
+                storage,
+                &loaded,
+                CONSOLIDATE_STREAM,
+                &persona,
+                Some(edge),
+                None,
+            )?;
+            println!("consolidation edge set to {raw} (persona {persona})");
+            Ok(())
         }
-    })
+        "stop" => {
+            comb_advance(storage, &loaded, CONSOLIDATE_STREAM, &persona, None, None)?;
+            println!("consolidation stopped (persona {persona})");
+            Ok(())
+        }
+        _ => {
+            let until = parse_tai_timestamp(&args[0])?;
+            let summary = args[1..].join(" ");
+            if summary.is_empty() {
+                bail!("summary required: memory consolidate <ts> <summary...>");
+            }
+            let Some(resolution) = loaded.comb_catalog.resolution(CONSOLIDATE_STREAM, &persona)
+            else {
+                bail!(
+                    "no open consolidation edge for persona {persona}: \
+                         use `memory consolidate start <ts>`"
+                );
+            };
+            let state = resolution.settled_state()?;
+            let Some(position) = state.position else {
+                bail!(
+                    "no open consolidation edge for persona {persona}: \
+                         use `memory consolidate start <ts>`"
+                );
+            };
+            let edge_key = interval_key(position);
+            let edge = key_to_epoch(edge_key);
+            if until.to_tai_duration().total_nanoseconds() <= edge_key {
+                bail!(
+                    "consolidate target {} is not after the open edge {}",
+                    args[0],
+                    fmt_epoch(edge)
+                );
+            }
+            // The boundary timestamp is a deterministic observation for
+            // this automatic write, so retrying a half-completed
+            // Memory-then-Comb publication yields the same Memory data.
+            let chunk_id = create_chunk(
+                storage,
+                &loaded.memory,
+                &summary,
+                (edge, until),
+                None,
+                until,
+            )?;
+            comb_advance(
+                storage,
+                &loaded,
+                CONSOLIDATE_STREAM,
+                &persona,
+                Some(until),
+                None,
+            )?;
+            println!("range: {}", format_time_range(edge, until));
+            println!("id: {chunk_id:x}");
+            println!("edge → {}", args[0]);
+            Ok(())
+        }
+    }
 }
 
 /// Parse a grain like "90m", "2h", "1d", "4w" into nanoseconds.
@@ -1159,191 +1252,271 @@ fn parse_grain(s: &str) -> Result<i128> {
     Ok(n * ns_per)
 }
 
+/// Preserve a replay time-coordinate as the atomic batch boundary.  A caller
+/// asking for `requested` rows gets at least that many, plus every remaining
+/// row with the same start coordinate as the nominal final row.
+fn replay_take_count(batch: &[(i128, i128, Id)], requested: usize) -> usize {
+    if requested == 0 || batch.is_empty() {
+        return 0;
+    }
+    let nominal_take = requested.min(batch.len());
+    let boundary_start = batch[nominal_take - 1].0;
+    batch
+        .iter()
+        .take_while(|(start, _, _)| *start <= boundary_start)
+        .count()
+}
+
 /// `memory replay start <grain> [<from>] | stop | [<count>]`
 ///
 /// Streams the memory itself, chronologically, at a zoom level: maximal
 /// non-superseded chunks whose span-width fits the grain. This is how upper
 /// layers get written — replay the layer below, consolidate up. Reads ALL
 /// chunks regardless of which session wrote them: one being, one memory.
-fn cmd_replay(pile_path: &Path, args: &[String]) -> Result<()> {
+fn cmd_replay(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let persona = comb_persona()?;
-    with_repo(pile_path, |repo| {
-        let (comb_branch, comb_cat) = comb_catalog(repo)?;
-        match args.first().map(String::as_str) {
-            Some("start") => {
-                let Some(grain_raw) = args.get(1) else {
-                    bail!("usage: memory replay start <grain e.g. 2h/1d/4w> [<from-ts>]");
-                };
-                parse_grain(grain_raw)?;
-                let from = match args.get(2) {
-                    Some(raw) => parse_tai_timestamp(raw)?,
-                    None => Epoch::from_gregorian_tai(1970, 1, 1, 0, 0, 0, 0),
-                };
-                let position = from - hifitime::Duration::from_total_nanoseconds(1);
-                comb_advance(
-                    repo,
-                    comb_branch,
-                    MEMORY_REPLAY_STREAM,
-                    &persona,
-                    Some(position),
-                    Some(grain_raw),
-                )?;
-                println!("memory replay started at grain {grain_raw} (persona {persona})");
-                Ok(())
-            }
-            Some("stop") => {
-                comb_advance(
-                    repo,
-                    comb_branch,
-                    MEMORY_REPLAY_STREAM,
-                    &persona,
-                    None,
-                    None,
-                )?;
-                println!("memory replay stopped (persona {persona})");
-                Ok(())
-            }
-            other => {
-                let count: usize = match other {
-                    None => 5,
-                    Some(raw) => raw
-                        .parse()
-                        .with_context(|| format!("expected a batch count, got `{raw}`"))?,
-                };
-                let Some((Some(position_key), Some(grain_raw))) =
-                    comb::latest(&comb_cat, MEMORY_REPLAY_STREAM, &persona)
-                else {
-                    bail!(
-                        "no active memory replay for persona {persona}: \
-                         use `memory replay start <grain> [<from>]`"
-                    );
-                };
-                let grain_ns = parse_grain(&grain_raw)?;
-
-                let memory_branch = repo
-                    .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-                    .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-                let mut ws = repo
-                    .pull(memory_branch)
-                    .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-                let space = ws.checkout(..).context("checkout memory branch")?;
-
-                // Chunks at this zoom: width fits the grain, not superseded,
-                // and maximal among grain-fitting chunks (not contained in a
-                // wider one that also fits — that one IS this zoom's voice).
-                let superseded = superseded_ids(&space);
-                let mut fitting: Vec<(i128, i128, Id)> = Vec::new();
-                for chunk_id in all_chunk_ids(&space) {
-                    if superseded.contains(&chunk_id) {
-                        continue;
-                    }
-                    let (Some(s), Some(e)) = (
-                        chunk_start_at(&space, chunk_id),
-                        chunk_end_at(&space, chunk_id),
-                    ) else {
-                        continue;
-                    };
-                    let (sk, ek) = (interval_key(s), interval_key(e));
-                    if ek - sk <= grain_ns {
-                        fitting.push((sk, ek, chunk_id));
-                    }
-                }
-                let maximal: Vec<(i128, i128, Id)> = fitting
-                    .iter()
-                    .filter(|(sk, ek, id)| {
-                        !fitting.iter().any(|(osk, oek, oid)| {
-                            oid != id && osk <= sk && oek >= ek && (oek - osk) > (ek - sk)
-                        })
-                    })
-                    .copied()
-                    .collect();
-
-                let mut batch: Vec<(i128, i128, Id)> = maximal
-                    .into_iter()
-                    .filter(|(sk, _, _)| *sk > position_key)
-                    .collect();
-                batch.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-                let total = batch.len();
-                if total == 0 {
-                    println!(
-                        "memory replay complete at grain {grain_raw}: nothing after the cursor."
-                    );
-                    return Ok(());
-                }
-                let take = count.min(total);
-                let mut last_start = position_key;
-                for (sk, ek, chunk_id) in batch.iter().take(take) {
-                    let summary = match chunk_summary_handle(&space, *chunk_id) {
-                        Some(handle) => {
-                            let view: View<str> = ws.get(handle).context("read chunk summary")?;
-                            view.trim_end().to_string()
-                        }
-                        None => String::new(),
-                    };
-                    println!(
-                        "── {} ({:x})",
-                        format_time_range(key_to_epoch(*sk), key_to_epoch(*ek)),
-                        chunk_id
-                    );
-                    println!("{summary}");
-                    println!();
-                    last_start = *sk;
-                }
-                comb_advance(
-                    repo,
-                    comb_branch,
-                    MEMORY_REPLAY_STREAM,
-                    &persona,
-                    Some(key_to_epoch(last_start)),
-                    Some(&grain_raw),
-                )?;
-                println!(
-                    "— batch: {take} chunk(s) at grain {grain_raw}; {} remaining",
-                    total - take
-                );
-                Ok(())
-            }
+    let loaded = storage.load_comb()?;
+    match args.first().map(String::as_str) {
+        Some("start") => {
+            let Some(grain_raw) = args.get(1) else {
+                bail!("usage: memory replay start <grain e.g. 2h/1d/4w> [<from-ts>]");
+            };
+            parse_grain(grain_raw)?;
+            let from = match args.get(2) {
+                Some(raw) => parse_tai_timestamp(raw)?,
+                None => Epoch::from_gregorian_tai(1970, 1, 1, 0, 0, 0, 0),
+            };
+            let position = from - hifitime::Duration::from_total_nanoseconds(1);
+            comb_advance(
+                storage,
+                &loaded,
+                MEMORY_REPLAY_STREAM,
+                &persona,
+                Some(position),
+                Some(grain_raw),
+            )?;
+            println!("memory replay started at grain {grain_raw} (persona {persona})");
+            Ok(())
         }
-    })
+        Some("stop") => {
+            comb_advance(storage, &loaded, MEMORY_REPLAY_STREAM, &persona, None, None)?;
+            println!("memory replay stopped (persona {persona})");
+            Ok(())
+        }
+        other => {
+            let count: usize = match other {
+                None => 5,
+                Some(raw) => raw
+                    .parse()
+                    .with_context(|| format!("expected a batch count, got `{raw}`"))?,
+            };
+            if count == 0 {
+                bail!("memory replay batch count must be greater than zero");
+            }
+            let Some(resolution) = loaded
+                .comb_catalog
+                .resolution(MEMORY_REPLAY_STREAM, &persona)
+            else {
+                bail!(
+                    "no active memory replay for persona {persona}: \
+                         use `memory replay start <grain> [<from>]`"
+                );
+            };
+            let state = resolution.settled_state()?;
+            let (Some(position), Some(grain_raw)) = (state.position, state.grain.as_deref()) else {
+                bail!(
+                    "no active memory replay for persona {persona}: \
+                         use `memory replay start <grain> [<from>]`"
+                );
+            };
+            let position_key = interval_key(position);
+            let grain_ns = parse_grain(grain_raw)?;
+            let space = &loaded.memory.memory.facts;
+
+            // Chunks at this zoom: width fits the grain, not superseded,
+            // and maximal among grain-fitting chunks (not contained in a
+            // wider one that also fits — that one IS this zoom's voice).
+            let mut fitting: Vec<(i128, i128, Id)> = Vec::new();
+            for chunk_id in loaded.memory.catalog.live_chunk_ids() {
+                let (Some(s), Some(e)) = (
+                    chunk_start_at(space, chunk_id),
+                    chunk_end_at(space, chunk_id),
+                ) else {
+                    continue;
+                };
+                let (sk, ek) = (interval_key(s), interval_key(e));
+                if ek - sk <= grain_ns {
+                    fitting.push((sk, ek, chunk_id));
+                }
+            }
+            let maximal: Vec<(i128, i128, Id)> = fitting
+                .iter()
+                .filter(|(sk, ek, id)| {
+                    !fitting.iter().any(|(osk, oek, oid)| {
+                        oid != id && osk <= sk && oek >= ek && (oek - osk) > (ek - sk)
+                    })
+                })
+                .copied()
+                .collect();
+
+            let mut batch: Vec<(i128, i128, Id)> = maximal
+                .into_iter()
+                .filter(|(sk, _, _)| *sk > position_key)
+                .collect();
+            batch.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            let total = batch.len();
+            if total == 0 {
+                println!("memory replay complete at grain {grain_raw}: nothing after the cursor.");
+                return Ok(());
+            }
+            let take = replay_take_count(&batch, count);
+            let mut last_start = position_key;
+            for (sk, ek, chunk_id) in batch.iter().take(take) {
+                let summary = match chunk_summary_handle(space, *chunk_id) {
+                    Some(handle) => {
+                        let view: View<str> = loaded
+                            .memory
+                            .memory
+                            .reader
+                            .get(handle)
+                            .context("read chunk summary")?;
+                        view.trim_end().to_string()
+                    }
+                    None => String::new(),
+                };
+                println!(
+                    "── {} ({:x})",
+                    format_time_range(key_to_epoch(*sk), key_to_epoch(*ek)),
+                    chunk_id
+                );
+                println!("{summary}");
+                println!();
+                last_start = *sk;
+            }
+            comb_advance(
+                storage,
+                &loaded,
+                MEMORY_REPLAY_STREAM,
+                &persona,
+                Some(key_to_epoch(last_start)),
+                Some(grain_raw),
+            )?;
+            println!(
+                "— batch: {take} chunk(s) at grain {grain_raw}; {} remaining",
+                total - take
+            );
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // supersede subcommand
 // ---------------------------------------------------------------------------
 
-/// Assert that an existing chunk replaces another. The superseded chunk
-/// leaves all views (covers, trees) but stays resolvable by id.
-fn cmd_supersede(pile_path: &Path, args: &[String]) -> Result<()> {
+fn point_now() -> Inline<NsTAIInterval> {
+    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    (now, now).try_to_inline().unwrap()
+}
+
+fn chunk_draft_from_row(
+    loaded: &LoadedMemory,
+    row: &memory_model::ChunkRow,
+    start_at: Inline<NsTAIInterval>,
+    end_at: Inline<NsTAIInterval>,
+    predecessors: BTreeSet<Id>,
+) -> Result<memory_model::ChunkDraft> {
+    let content = match row.content {
+        memory_model::ChunkContent::Text(handle) => memory_model::ChunkDraftContent::Text(
+            memory_model::read_text(&loaded.memory.reader, handle)
+                .with_context(|| format!("read Memory chunk {:x} summary", row.id))?,
+        ),
+        memory_model::ChunkContent::Image(handle) => memory_model::ChunkDraftContent::Image(
+            memory_model::read_image(&loaded.memory.reader, handle)
+                .with_context(|| format!("read Memory chunk {:x} image", row.id))?
+                .to_vec(),
+        ),
+    };
+    let lens = row
+        .lens
+        .map(|handle| memory_model::read_text(&loaded.memory.reader, handle))
+        .transpose()
+        .with_context(|| format!("read Memory chunk {:x} lens", row.id))?;
+    Ok(memory_model::ChunkDraft {
+        content,
+        start_at,
+        end_at,
+        lens,
+        references: row.references.clone(),
+        about_exec_result: row.about_exec_result,
+        about_archive_message: row.about_archive_message,
+        predecessors,
+        observed_at: BTreeSet::from([point_now()]),
+        aliases: BTreeSet::new(),
+    })
+}
+
+fn descends_from(catalog: &memory_model::MemoryCatalog, node: Id, ancestor: Id) -> bool {
+    let mut pending = vec![node];
+    let mut seen = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        let predecessors = catalog
+            .chunks
+            .get(&current)
+            .map(|row| &row.predecessors)
+            .or_else(|| {
+                catalog
+                    .retractions
+                    .get(&current)
+                    .map(|row| &row.predecessors)
+            });
+        for predecessor in predecessors.into_iter().flatten() {
+            if *predecessor == ancestor {
+                return true;
+            }
+            pending.push(*predecessor);
+        }
+    }
+    false
+}
+
+/// Reconcile two revisions by copying `new`'s complete state into a fresh
+/// intrinsic join which names both histories. If `new` already contains
+/// `old` in its ancestry the operation is already satisfied and is a no-op.
+fn cmd_supersede(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     if args.len() != 2 {
         bail!("usage: memory supersede <new-id> <old-id>");
     }
-    with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout memory branch")?;
-
-        let new = resolve_chunk_id(&space, &args[0])
-            .map_err(|e| anyhow!("new chunk {}: {e}", args[0]))?;
-        let old = resolve_chunk_id(&space, &args[1])
-            .map_err(|e| anyhow!("old chunk {}: {e}", args[1]))?;
-        if new == old {
-            bail!("a chunk cannot supersede itself");
-        }
-        let new_entity = new
-            .acquire()
-            .unwrap_or_else(|| triblespace::core::id::ExclusiveId::force(new));
-        let mut change = TribleSet::new();
-        change += entity! { &new_entity @ ctx::supersedes: old };
-        ws.commit(change, "memory supersede");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push failed: {e:?}"))?;
-        println!("{new:x} supersedes {old:x}");
-        Ok(())
-    })
+    let loaded = storage.load()?;
+    let new =
+        resolve_chunk_id(&loaded, &args[0]).map_err(|e| anyhow!("new chunk {}: {e}", args[0]))?;
+    let old =
+        resolve_chunk_id(&loaded, &args[1]).map_err(|e| anyhow!("old chunk {}: {e}", args[1]))?;
+    if new == old || descends_from(&loaded.catalog, new, old) {
+        println!("{new:x} already descends from {old:x}; no change");
+        return Ok(());
+    }
+    if descends_from(&loaded.catalog, old, new) {
+        bail!(
+            "old chunk {old:x} already descends from new chunk {new:x}; \
+             refusing a backwards reconciliation"
+        );
+    }
+    let row = &loaded.catalog.chunks[&new];
+    let draft = chunk_draft_from_row(
+        &loaded,
+        row,
+        row.start_at,
+        row.end_at,
+        BTreeSet::from([new, old]),
+    )?;
+    let (fragment, joined) = memory_model::chunk_fragment(draft)?;
+    storage.publish_memory(&loaded, fragment)?;
+    println!("{joined:x} joins {new:x} and {old:x}");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,56 +1532,27 @@ fn cmd_supersede(pile_path: &Path, args: &[String]) -> Result<()> {
 /// ingests, where `supersede` would otherwise force a bogus replacement chunk
 /// that then shows up as a memory of its own. Nothing is destroyed: the retired
 /// chunk's own facts survive for direct-id / provenance lookup.
-fn cmd_retract(pile_path: &Path, args: &[String]) -> Result<()> {
+fn cmd_retract(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     if args.is_empty() {
         bail!("usage: memory retract <id> [reason...]");
     }
     let reason = args[1..].join(" ");
-    with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout memory branch")?;
+    let loaded = storage.load()?;
+    let old = resolve_chunk_id(&loaded, &args[0]).map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
+    let (fragment, retraction) =
+        memory_model::retraction_fragment(memory_model::RetractionDraft {
+            reason: (!reason.is_empty()).then_some(reason.clone()),
+            predecessors: BTreeSet::from([old]),
+            observed_at: BTreeSet::from([point_now()]),
+        })?;
+    storage.publish_memory(&loaded, fragment)?;
 
-        let old =
-            resolve_chunk_id(&space, &args[0]).map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
-
-        let tombstone = ufoid();
-        let mut change = TribleSet::new();
-        // Tagged KIND_RETRACTION (not KIND_CHUNK_ID) so it never enumerates as a
-        // chunk, yet retractions stay queryable as a class. The reason, if given,
-        // rides along as the tombstone's summary — recoverable, never in a view.
-        if reason.is_empty() {
-            change += entity! { &tombstone @
-                metadata::tag: KIND_RETRACTION,
-                ctx::supersedes: old,
-            };
-        } else {
-            let reason_handle = ws.put(reason.clone());
-            change += entity! { &tombstone @
-                metadata::tag: KIND_RETRACTION,
-                ctx::supersedes: old,
-                ctx::summary: reason_handle,
-            };
-        }
-
-        ws.commit(change, "memory retract");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push failed: {e:?}"))?;
-
-        if reason.is_empty() {
-            println!("retracted {old:x} (retraction {:x})", tombstone.id);
-        } else {
-            println!(
-                "retracted {old:x} — {reason} (retraction {:x})",
-                tombstone.id
-            );
-        }
-        Ok(())
-    })
+    if reason.is_empty() {
+        println!("retracted {old:x} (retraction {retraction:x})");
+    } else {
+        println!("retracted {old:x} — {reason} (retraction {retraction:x})");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,53 +1563,33 @@ fn cmd_retract(pile_path: &Path, args: &[String]) -> Result<()> {
 /// chunk(s) it retracts, and the recorded reason. Retracted chunks are gone from
 /// covers/trees/recall but never lost — what was walked back, and why, is always
 /// answerable here.
-fn cmd_retractions(pile_path: &Path, _args: &[String]) -> Result<()> {
-    with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout memory branch")?;
-
-        let retractions: Vec<Id> =
-            find!(r: Id, pattern!(&space, [{ ?r @ metadata::tag: &KIND_RETRACTION }])).collect();
-        if retractions.is_empty() {
-            println!("no retractions.");
-            return Ok(());
+fn cmd_retractions(storage: MemoryStorage<'_>, _args: &[String]) -> Result<()> {
+    let loaded = storage.load()?;
+    if loaded.catalog.retractions.is_empty() {
+        println!("no retractions.");
+        return Ok(());
+    }
+    for row in loaded.catalog.retractions.values() {
+        let reason = row
+            .reason
+            .map(|handle| memory_model::read_text(&loaded.memory.reader, handle))
+            .transpose()?
+            .unwrap_or_else(|| "(no reason recorded)".to_string());
+        println!("retraction {:x} — {reason}", row.id);
+        for target in &row.predecessors {
+            println!("    -> retracted {target:x}");
         }
-        for r in retractions {
-            let targets: Vec<Id> =
-                find!(old: Id, pattern!(&space, [{ r @ ctx::supersedes: ?old }])).collect();
-            let reason = match chunk_summary_handle(&space, r) {
-                Some(handle) => {
-                    let s: View<str> = ws.get(handle).context("read retraction reason")?;
-                    s.as_ref().to_string()
-                }
-                None => "(no reason recorded)".to_string(),
-            };
-            println!("retraction {r:x} — {reason}");
-            for t in &targets {
-                println!("    -> retracted {t:x}");
-            }
-        }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // respan subcommand
 // ---------------------------------------------------------------------------
 
-/// Correct a chunk's time span. Appends a new chunk with the same summary
-/// (content-addressed handle reused) and the corrected explicit range, plus a
-/// `supersedes` fact pointing at the old chunk. Covers and trees exclude
-/// superseded chunks; direct id lookup still shows them (history inspection).
-/// Child edges are NOT copied: a span correction usually exists precisely
-/// because link-inferred children dragged the span wrong — re-link explicitly
-/// if the new chunk should keep them.
-fn cmd_respan(pile_path: &Path, args: &[String]) -> Result<()> {
+/// Correct a chunk's time span while preserving every other component of its
+/// state: text or image, lens, contextual references, and provenance links.
+fn cmd_respan(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     if args.len() != 2 || !args[1].contains("..") {
         bail!(
             "usage: memory respan <id> <from>..<to>\n\
@@ -1476,45 +1600,18 @@ fn cmd_respan(pile_path: &Path, args: &[String]) -> Result<()> {
     }
     let (range_start, range_end) = parse_time_range(&args[1])?;
 
-    with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout memory branch")?;
+    let loaded = storage.load()?;
+    let old = resolve_chunk_id(&loaded, &args[0]).map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
+    let row = &loaded.catalog.chunks[&old];
+    let start_at: Inline<NsTAIInterval> = (range_start, range_start).try_to_inline().unwrap();
+    let end_at: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
+    let draft = chunk_draft_from_row(&loaded, row, start_at, end_at, BTreeSet::from([old]))?;
+    let (fragment, new_chunk) = memory_model::chunk_fragment(draft)?;
+    storage.publish_memory(&loaded, fragment)?;
 
-        let old =
-            resolve_chunk_id(&space, &args[0]).map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
-        let summary_handle = chunk_summary_handle(&space, old)
-            .ok_or_else(|| anyhow!("chunk {old:x} has no summary"))?;
-
-        let start_at: Inline<NsTAIInterval> = (range_start, range_start).try_to_inline().unwrap();
-        let end_at: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
-        let now =
-            Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-        let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
-
-        let new_chunk = ufoid();
-        let mut change = TribleSet::new();
-        change += entity! { &new_chunk @
-            metadata::tag: KIND_CHUNK_ID,
-            ctx::summary: summary_handle,
-            metadata::created_at: created_at,
-            ctx::start_at: start_at,
-            ctx::end_at: end_at,
-            ctx::supersedes: old,
-        };
-
-        ws.commit(change, "memory respan");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push failed: {e:?}"))?;
-
-        println!("range: {}", format_time_range(range_start, range_end));
-        println!("id: {:x} (supersedes {old:x})", new_chunk.id);
-        Ok(())
-    })
+    println!("range: {}", format_time_range(range_start, range_end));
+    println!("id: {new_chunk:x} (supersedes {old:x})");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,81 +1640,66 @@ fn humanize_ns(ns: i128) -> String {
 /// theme substring: print the full text of the matching lens narratives. Lens
 /// chunks are deliberately outside the temporal cover, so they can overlap each
 /// other and the spine freely.
-fn cmd_lens(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
-    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
+fn cmd_lens(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let filter = args.first().map(|s| s.to_lowercase());
-    with_repo(pile_path, |repo| {
-        let branch_id = match explicit_branch_id {
-            Some(id) => id,
-            None => repo
-                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
+    let loaded = storage.load()?;
+    let space = &loaded.memory.facts;
+    let mut lenses: Vec<(String, i128, i128, Id)> = Vec::new();
+    for id in loaded.catalog.live_chunk_ids() {
+        let Some(lh) = chunk_lens_handle(space, id) else {
+            continue;
         };
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout branch")?;
+        let theme: String = loaded
+            .memory
+            .reader
+            .get::<View<str>, LongString>(lh)
+            .context("read lens theme")?
+            .as_ref()
+            .to_string();
+        let (Some(s), Some(e)) = (chunk_start_at(space, id), chunk_end_at(space, id)) else {
+            continue;
+        };
+        lenses.push((theme, interval_key(s), interval_key(e), id));
+    }
+    if let Some(t) = &filter {
+        lenses.retain(|(theme, _, _, _)| theme.to_lowercase().contains(t.as_str()));
+    }
+    lenses.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-        let superseded = superseded_ids(&space);
-        let mut lenses: Vec<(String, i128, i128, Id)> = Vec::new();
-        for id in all_chunk_ids(&space) {
-            if superseded.contains(&id) {
-                continue;
-            }
-            let Some(lh) = chunk_lens_handle(&space, id) else {
-                continue;
-            };
-            let theme: String = ws
-                .get::<View<str>, LongString>(lh)
-                .context("read lens theme")?
-                .as_ref()
-                .to_string();
-            let (Some(s), Some(e)) = (chunk_start_at(&space, id), chunk_end_at(&space, id)) else {
-                continue;
-            };
-            lenses.push((theme, interval_key(s), interval_key(e), id));
-        }
-        if let Some(t) = &filter {
-            lenses.retain(|(theme, _, _, _)| theme.to_lowercase().contains(t.as_str()));
-        }
-        lenses.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    if lenses.is_empty() {
+        println!(
+            "no lens memories{} — create one with `memory create --lens <theme> <from>..<to> <summary>`",
+            filter.map(|t| format!(" matching \"{t}\"")).unwrap_or_default()
+        );
+        return Ok(());
+    }
 
-        if lenses.is_empty() {
+    if filter.is_some() {
+        for (theme, s, e, id) in &lenses {
             println!(
-                "no lens memories{} — create one with `memory create --lens <theme> <from>..<to> <summary>`",
-                filter.map(|t| format!(" matching \"{t}\"")).unwrap_or_default()
+                "\n## [{theme}] {}  ({id:x})",
+                format_time_range(key_to_epoch(*s), key_to_epoch(*e))
             );
-            return Ok(());
-        }
-
-        if filter.is_some() {
-            // Full narratives for the matched theme(s).
-            for (theme, s, e, id) in &lenses {
-                println!(
-                    "\n## [{theme}] {}  ({id:x})",
-                    format_time_range(key_to_epoch(*s), key_to_epoch(*e))
-                );
-                if let Some(h) = chunk_summary_handle(&space, *id) {
-                    let summary: View<str> = ws.get(h).context("read lens summary")?;
-                    println!("{}", summary.trim_end());
-                }
-            }
-        } else {
-            // One line per lens.
-            println!("{} lens memor(ies):", lenses.len());
-            for (theme, s, e, id) in &lenses {
-                let first = chunk_summary_handle(&space, *id)
-                    .and_then(|h| ws.get::<View<str>, LongString>(h).ok())
-                    .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
-                    .unwrap_or_default();
-                println!(
-                    "  [{theme}] {}  ({id:x})  {first}",
-                    format_time_range(key_to_epoch(*s), key_to_epoch(*e))
-                );
+            if let Some(h) = chunk_summary_handle(space, *id) {
+                let summary: View<str> =
+                    loaded.memory.reader.get(h).context("read lens summary")?;
+                println!("{}", summary.trim_end());
             }
         }
-        Ok(())
-    })
+    } else {
+        println!("{} lens memor(ies):", lenses.len());
+        for (theme, s, e, id) in &lenses {
+            let first = chunk_summary_handle(space, *id)
+                .and_then(|h| loaded.memory.reader.get::<View<str>, LongString>(h).ok())
+                .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
+                .unwrap_or_default();
+            println!(
+                "  [{theme}] {}  ({id:x})  {first}",
+                format_time_range(key_to_epoch(*s), key_to_epoch(*e))
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `memory list [<grain>]` — show the SHAPE of the memory as time-ranges only,
@@ -1626,89 +1708,74 @@ fn cmd_lens(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
 /// same layer `replay <grain>` would stream. Without a grain, prints every
 /// non-superseded chunk as a containment outline: indentation expresses how
 /// wider ranges cover narrower ones.
-fn cmd_list(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
-    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
+fn cmd_list(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let grain: Option<(String, i128)> = match args.first() {
         Some(raw) => Some((raw.clone(), parse_grain(raw)?)),
         None => None,
     };
-    with_repo(pile_path, |repo| {
-        let branch_id = match explicit_branch_id {
-            Some(id) => id,
-            None => repo
-                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
-        };
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout branch")?;
+    let loaded = storage.load()?;
+    let mut chunks = collect_chunk_spans(&loaded.memory.facts);
+    if chunks.is_empty() {
+        println!("no memory chunks");
+        return Ok(());
+    }
 
-        let mut chunks = collect_chunk_spans(&space);
-        if chunks.is_empty() {
-            println!("no memory chunks on branch {branch_id:x}");
-            return Ok(());
-        }
-
-        match grain {
-            Some((raw, grain_ns)) => {
-                // The layer at this zoom: width <= grain, maximal among fitting
-                // (not contained in a wider chunk that also fits) — matches `replay`.
-                let fitting: Vec<(i128, i128, Id)> = chunks
-                    .iter()
-                    .copied()
-                    .filter(|(s, e, _)| e - s <= grain_ns)
-                    .collect();
-                let mut layer: Vec<(i128, i128, Id)> = fitting
-                    .iter()
-                    .copied()
-                    .filter(|(s, e, id)| {
-                        !fitting.iter().any(|(os, oe, oid)| {
-                            oid != id && os <= s && oe >= e && (oe - os) > (e - s)
-                        })
-                    })
-                    .collect();
-                layer.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-                println!(
-                    "layer at grain {raw}: {} chunk(s) of {} total",
-                    layer.len(),
-                    chunks.len()
-                );
-                for (s, e, id) in &layer {
-                    println!(
-                        "  {}  [{}]  ({:x})",
-                        format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
-                        humanize_ns(e - s),
-                        id
-                    );
-                }
-            }
-            None => {
-                // Containment outline: containers before contained; indent by
-                // how many strictly-wider chunks contain this one.
-                chunks.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-                println!(
-                    "{} chunk(s) on branch {branch_id:x} (indent = containment by time range)",
-                    chunks.len()
-                );
-                for (s, e, id) in &chunks {
-                    let depth = chunks
+    match grain {
+        Some((raw, grain_ns)) => {
+            // The layer at this zoom: width <= grain, maximal among fitting
+            // (not contained in a wider chunk that also fits) — matches `replay`.
+            let fitting: Vec<(i128, i128, Id)> = chunks
+                .iter()
+                .copied()
+                .filter(|(s, e, _)| e - s <= grain_ns)
+                .collect();
+            let mut layer: Vec<(i128, i128, Id)> = fitting
+                .iter()
+                .copied()
+                .filter(|(s, e, id)| {
+                    !fitting
                         .iter()
-                        .filter(|(os, oe, oid)| {
-                            oid != id && os <= s && oe >= e && (oe - os) > (e - s)
-                        })
-                        .count();
-                    let indent = "  ".repeat(depth + 1);
-                    println!(
-                        "{indent}{}  ({:x})",
-                        format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
-                        id
-                    );
-                }
+                        .any(|(os, oe, oid)| oid != id && os <= s && oe >= e && (oe - os) > (e - s))
+                })
+                .collect();
+            layer.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            println!(
+                "layer at grain {raw}: {} chunk(s) of {} total",
+                layer.len(),
+                chunks.len()
+            );
+            for (s, e, id) in &layer {
+                println!(
+                    "  {}  [{}]  ({:x})",
+                    format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
+                    humanize_ns(e - s),
+                    id
+                );
             }
         }
-        Ok(())
-    })
+        None => {
+            // Containment outline: containers before contained; indent by
+            // how many strictly-wider chunks contain this one.
+            chunks.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            println!(
+                "{} chunk(s) (indent = containment by time range)",
+                chunks.len()
+            );
+            for (s, e, id) in &chunks {
+                let depth = chunks
+                    .iter()
+                    .filter(|(os, oe, oid)| oid != id && os <= s && oe >= e && (oe - os) > (e - s))
+                    .count();
+                let indent = "  ".repeat(depth + 1);
+                println!(
+                    "{indent}{}  ({:x})",
+                    format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
+                    id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `memory context [<budget-chars>]` — the antichain cover over ALL of my
@@ -1722,7 +1789,7 @@ fn cmd_list(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
 /// faculty is called by an already-running agent. So when even the coarsest cover
 /// overflows the budget, it ERRORS with instructions for raising a coarser apex
 /// rather than dropping memories: the caller is right there to fix it.
-fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // Parse `[<budget>] [--chars N] [--about <query words...>]`. The budget is a
     // CHARACTER count: a bare number, `--chars N`, or (as an alias) `--tokens N`
     // all set it directly — there is no separate token estimate anymore (the old
@@ -1803,21 +1870,19 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
         }
     }
 
-    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
-
-    with_repo(pile_path, |repo| {
-        let cover = build_context_cover(
-            repo,
-            explicit_branch_id,
-            budget_chars,
-            about.as_deref(),
-            filter_q.as_deref(),
-            remove_q.as_deref(),
-            sim_threshold,
-        )?;
-        print!("{cover}");
-        Ok(())
-    })
+    let needs_embeddings = cfg!(feature = "local-embed")
+        && (about.is_some() || filter_q.is_some() || remove_q.is_some());
+    let loaded = storage.load_context(needs_embeddings)?;
+    let cover = build_context_cover(
+        &loaded,
+        budget_chars,
+        about.as_deref(),
+        filter_q.as_deref(),
+        remove_q.as_deref(),
+        sim_threshold,
+    )?;
+    print!("{cover}");
+    Ok(())
 }
 
 /// Build the context-cover TEXT — exactly what `memory context` prints to
@@ -1825,35 +1890,18 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
 /// `cover start` (which stores it for cursor-chunked reading), so the cover
 /// semantics — antichain completeness, the character budget, the
 /// `--about`/`--filter`/`--remove` composition — live in one place and the two
-/// callers can never drift.
-///
-/// The render itself lives in `faculties::memory_cover::render_cover`, shared
-/// with `orient wake`; this wrapper only resolves + pulls + checks out the
-/// memory branch and hands the checked-out space to it.
+/// callers can never drift. Memory and Embeddings were materialized during
+/// the same open-pile read held by `loaded`.
 fn build_context_cover(
-    repo: &mut Repository<Pile>,
-    explicit_branch_id: Option<Id>,
+    loaded: &LoadedContext,
     budget_chars: usize,
     about: Option<&str>,
     filter_q: Option<&str>,
     remove_q: Option<&str>,
     sim_threshold: f32,
 ) -> Result<String> {
-    let branch_id = match explicit_branch_id {
-        Some(id) => id,
-        None => repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
-    };
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-    let space = ws.checkout(..).context("checkout branch")?;
-
-    // Preserve the branch-qualified empty message byte-for-byte (the shared
-    // renderer has no branch id, so it can only say "no memory chunks").
-    if collect_chunk_spans(&space).is_empty() {
-        return Ok(format!("no memory chunks on branch {branch_id:x}\n"));
+    if collect_chunk_spans(&loaded.memory.memory.facts).is_empty() {
+        return Ok("no memory chunks\n".to_string());
     }
 
     let opts = CoverOpts {
@@ -1863,7 +1911,12 @@ fn build_context_cover(
         remove: remove_q.map(str::to_string),
         sim_threshold,
     };
-    faculties::memory_cover::render_cover(&space, &mut ws, &opts)
+    faculties::memory_cover::render_cover(
+        &loaded.memory.memory.facts,
+        &loaded.embeddings.facts,
+        &loaded.memory.memory.reader,
+        &opts,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1923,7 +1976,7 @@ fn cover_session_dir(key: &str) -> Result<PathBuf> {
 
 /// How many chunks a cover of `total_chars` splits into at `chunk_chars`.
 fn cover_chunk_count(total_chars: usize, chunk_chars: usize) -> usize {
-    (total_chars + chunk_chars - 1) / chunk_chars
+    total_chars.div_ceil(chunk_chars)
 }
 
 /// Byte index of the `chars`-th character of `text` (`text.len()` past the
@@ -2072,7 +2125,7 @@ fn cover_reset_cursor(dir: &Path) -> Result<usize> {
 /// `memory cover start|continue|status|reset` — the cursor state machine a
 /// harness hook drives to force complete ingestion of the context cover:
 /// reset (or start) on session start, block turn-end until `status` exits 0.
-fn cmd_cover(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+fn cmd_cover(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let usage = "usage: memory cover start [--chars N] [--chunk-chars M] [--session KEY]\n\
                  \x20      memory cover continue [--session KEY]\n\
                  \x20      memory cover status [--session KEY]\n\
@@ -2122,18 +2175,15 @@ fn cmd_cover(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> 
 
     match verb {
         "start" => {
-            let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
-            let cover = with_repo(pile_path, |repo| {
-                build_context_cover(
-                    repo,
-                    explicit_branch_id,
-                    budget_chars,
-                    None,
-                    None,
-                    None,
-                    DEFAULT_SIM_THRESHOLD,
-                )
-            })?;
+            let loaded = storage.load_context(false)?;
+            let cover = build_context_cover(
+                &loaded,
+                budget_chars,
+                None,
+                None,
+                None,
+                DEFAULT_SIM_THRESHOLD,
+            )?;
             let now =
                 Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
             let (chunks, total) = cover_write_state(&dir, &cover, chunk_chars, fmt_epoch(now))?;
@@ -2190,77 +2240,64 @@ fn cmd_cover(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> 
 }
 
 /// the fine edge; `check 13w` finds regions with no coarse cover).
-fn cmd_check(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+fn cmd_check(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let Some(grain_raw) = args.first() else {
         bail!("usage: memory check <grain e.g. 1d/4w/13w>");
     };
     let grain_ns = parse_grain(grain_raw)?;
-    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
-    with_repo(pile_path, |repo| {
-        let branch_id = match explicit_branch_id {
-            Some(id) => id,
-            None => repo
-                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
-        };
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout branch")?;
+    let loaded = storage.load()?;
+    let all = collect_chunk_spans(&loaded.memory.facts);
+    if all.is_empty() {
+        println!("no memory chunks");
+        return Ok(());
+    }
+    let global_start = all.iter().map(|(s, _, _)| *s).min().unwrap();
+    let global_end = all.iter().map(|(_, e, _)| *e).max().unwrap();
 
-        let all = collect_chunk_spans(&space);
-        if all.is_empty() {
-            println!("no memory chunks on branch {branch_id:x}");
-            return Ok(());
-        }
-        let global_start = all.iter().map(|(s, _, _)| *s).min().unwrap();
-        let global_end = all.iter().map(|(_, e, _)| *e).max().unwrap();
+    // Coverage at this zoom: intervals of chunks with width <= grain.
+    let mut covering: Vec<(i128, i128)> = all
+        .iter()
+        .filter(|(s, e, _)| e - s <= grain_ns)
+        .map(|(s, e, _)| (*s, *e))
+        .collect();
+    covering.sort_by_key(|(s, _)| *s);
 
-        // Coverage at this zoom: intervals of chunks with width <= grain.
-        let mut covering: Vec<(i128, i128)> = all
-            .iter()
-            .filter(|(s, e, _)| e - s <= grain_ns)
-            .map(|(s, e, _)| (*s, *e))
-            .collect();
-        covering.sort_by_key(|(s, _)| *s);
+    // Sweep for holes in [global_start, global_end].
+    let mut gaps: Vec<(i128, i128)> = Vec::new();
+    let mut cursor = global_start;
+    for (s, e) in &covering {
+        if *s > cursor {
+            gaps.push((cursor, *s));
+        }
+        if *e > cursor {
+            cursor = *e;
+        }
+    }
+    if cursor < global_end {
+        gaps.push((cursor, global_end));
+    }
+    // A gap only matters at coarseness G if it is at least G wide; smaller
+    // holes are below this zoom's resolution (you'd see them at a finer grain).
+    gaps.retain(|(s, e)| e - s >= grain_ns);
 
-        // Sweep for holes in [global_start, global_end].
-        let mut gaps: Vec<(i128, i128)> = Vec::new();
-        let mut cursor = global_start;
-        for (s, e) in &covering {
-            if *s > cursor {
-                gaps.push((cursor, *s));
-            }
-            if *e > cursor {
-                cursor = *e;
-            }
+    println!(
+        "extent {}  ({} chunk(s) of width <= {grain_raw})",
+        format_time_range(key_to_epoch(global_start), key_to_epoch(global_end)),
+        covering.len()
+    );
+    if gaps.is_empty() {
+        println!("OK no gaps >= {grain_raw} — coverage is contiguous at this zoom");
+    } else {
+        println!("{} gap(s) at grain {grain_raw}:", gaps.len());
+        for (s, e) in &gaps {
+            println!(
+                "  GAP {}  ({})",
+                format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
+                humanize_ns(e - s)
+            );
         }
-        if cursor < global_end {
-            gaps.push((cursor, global_end));
-        }
-        // A gap only matters at coarseness G if it is at least G wide; smaller
-        // holes are below this zoom's resolution (you'd see them at a finer grain).
-        gaps.retain(|(s, e)| e - s >= grain_ns);
-
-        println!(
-            "extent {}  ({} chunk(s) of width <= {grain_raw})",
-            format_time_range(key_to_epoch(global_start), key_to_epoch(global_end)),
-            covering.len()
-        );
-        if gaps.is_empty() {
-            println!("OK no gaps >= {grain_raw} — coverage is contiguous at this zoom");
-        } else {
-            println!("{} gap(s) at grain {grain_raw}:", gaps.len());
-            for (s, e) in &gaps {
-                println!(
-                    "  GAP {}  ({})",
-                    format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
-                    humanize_ns(e - s)
-                );
-            }
-        }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 /// `memory density [<grain>]` — inspection tooling that finds where the
@@ -2273,7 +2310,7 @@ fn cmd_check(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> 
 /// (comb the leaves into arcs). This command only points at where to comb —
 /// it writes nothing. Optional `<grain>`: restrict the report to spans of width
 /// <= grain (zoom the analysis to e.g. day- vs week-level structure).
-fn cmd_density(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+fn cmd_density(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // Threshold for the BUSHY flag: this many direct leaf-children with no
     // intermediate arc make a span expensive to expand in the cover.
     const BUSHY_LEAVES: usize = 5;
@@ -2281,315 +2318,307 @@ fn cmd_density(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
         Some(raw) => Some(parse_grain(raw)?),
         None => None,
     };
-    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
-    with_repo(pile_path, |repo| {
-        let branch_id = match explicit_branch_id {
-            Some(id) => id,
-            None => repo
-                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
-        };
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout branch")?;
+    let loaded = storage.load()?;
+    let spans = collect_chunk_spans(&loaded.memory.facts);
+    if spans.is_empty() {
+        println!("no memory chunks");
+        return Ok(());
+    }
+    let n = spans.len();
 
-        let spans = collect_chunk_spans(&space);
-        if spans.is_empty() {
-            println!("no memory chunks on branch {branch_id:x}");
-            return Ok(());
-        }
-        let n = spans.len();
-
-        // Same containment hierarchy cmd_context builds: a chunk's parent is the
-        // tightest strictly-wider chunk that spans it (time-range subsumption).
-        let strict_contains = |a: usize, b: usize| -> bool {
-            spans[a].0 <= spans[b].0
-                && spans[a].1 >= spans[b].1
-                && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
-        };
-        let width = |i: usize| spans[i].1 - spans[i].0;
-        let mut parent: Vec<Option<usize>> = vec![None; n];
-        for i in 0..n {
-            let mut best: Option<usize> = None;
-            for j in 0..n {
-                if j != i && strict_contains(j, i) {
-                    best = Some(match best {
-                        Some(b) if width(b) <= width(j) => b,
-                        _ => j,
-                    });
-                }
-            }
-            parent[i] = best;
-        }
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for i in 0..n {
-            if let Some(p) = parent[i] {
-                children[p].push(i);
+    // Same containment hierarchy cmd_context builds: a chunk's parent is the
+    // tightest strictly-wider chunk that spans it (time-range subsumption).
+    let strict_contains = |a: usize, b: usize| -> bool {
+        spans[a].0 <= spans[b].0
+            && spans[a].1 >= spans[b].1
+            && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
+    };
+    let width = |i: usize| spans[i].1 - spans[i].0;
+    let mut parent: Vec<Option<usize>> = vec![None; n];
+    for (i, parent_slot) in parent.iter_mut().enumerate() {
+        let mut best: Option<usize> = None;
+        for j in 0..n {
+            if j != i && strict_contains(j, i) {
+                best = Some(match best {
+                    Some(b) if width(b) <= width(j) => b,
+                    _ => j,
+                });
             }
         }
-
-        // Subtree depth (leaves = 0) and size, computed narrow→wide so children
-        // are finished before their parent.
-        let mut depth = vec![0usize; n];
-        let mut subtree = vec![1usize; n];
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| width(i));
-        for &i in &order {
-            if let Some(p) = parent[i] {
-                depth[p] = depth[p].max(depth[i] + 1);
-                subtree[p] += subtree[i];
-            }
+        *parent_slot = best;
+    }
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, parent) in parent.iter().copied().enumerate() {
+        if let Some(p) = parent {
+            children[p].push(i);
         }
-        let leaf_kids = |i: usize| {
-            children[i]
-                .iter()
-                .filter(|&&c| children[c].is_empty())
-                .count()
-        };
+    }
 
-        // Non-leaf spans (forks worth inspecting: >= 2 children), optionally
-        // restricted to a coarseness zoom.
-        let mut forks: Vec<usize> = (0..n)
-            .filter(|&i| children[i].len() >= 2)
-            .filter(|&i| grain_ns.map_or(true, |g| width(i) <= g))
-            .collect();
+    // Subtree depth (leaves = 0) and size, computed narrow→wide so children
+    // are finished before their parent.
+    let mut depth = vec![0usize; n];
+    let mut subtree = vec![1usize; n];
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| width(i));
+    for &i in &order {
+        if let Some(p) = parent[i] {
+            depth[p] = depth[p].max(depth[i] + 1);
+            subtree[p] += subtree[i];
+        }
+    }
+    let leaf_kids = |i: usize| {
+        children[i]
+            .iter()
+            .filter(|&&c| children[c].is_empty())
+            .count()
+    };
 
-        // Classify each fork: BUSHY (many flat leaves, no comb) / coarse (few
-        // children) / balanced (the rest — already has intermediate arcs).
-        let classify = |i: usize| -> &'static str {
-            if leaf_kids(i) >= BUSHY_LEAVES {
-                "BUSHY"
-            } else if children[i].len() <= 3 {
-                "coarse"
-            } else {
-                "balanced"
-            }
-        };
+    // Non-leaf spans (forks worth inspecting: >= 2 children), optionally
+    // restricted to a coarseness zoom.
+    let mut forks: Vec<usize> = (0..n)
+        .filter(|&i| children[i].len() >= 2)
+        .filter(|&i| grain_ns.is_none_or(|g| width(i) <= g))
+        .collect();
 
-        let total_forks = forks.len();
-        let bushy_count = forks.iter().filter(|&&i| classify(i) == "BUSHY").count();
-        println!(
-            "memory density — {n} chunk(s), {total_forks} fork(s) (>=2 children) on branch {branch_id:x}{}",
-            grain_ns.map(|_| format!(" of width <= {}", args[0])).unwrap_or_default(),
-        );
-        println!(
+    // Classify each fork: BUSHY (many flat leaves, no comb) / coarse (few
+    // children) / balanced (the rest — already has intermediate arcs).
+    let classify = |i: usize| -> &'static str {
+        if leaf_kids(i) >= BUSHY_LEAVES {
+            "BUSHY"
+        } else if children[i].len() <= 3 {
+            "coarse"
+        } else {
+            "balanced"
+        }
+    };
+
+    let total_forks = forks.len();
+    let bushy_count = forks.iter().filter(|&&i| classify(i) == "BUSHY").count();
+    println!(
+        "memory density — {n} chunk(s), {total_forks} fork(s) (>=2 children){}",
+        grain_ns
+            .map(|_| format!(" of width <= {}", args[0]))
+            .unwrap_or_default(),
+    );
+    println!(
             "  BUSHY = >= {BUSHY_LEAVES} direct leaf-children with no intermediate arc (expensive to expand → comb leaves into arcs); {bushy_count} found"
         );
-        if forks.is_empty() {
-            println!("  (no forks at this zoom)");
-            return Ok(());
-        }
+    if forks.is_empty() {
+        println!("  (no forks at this zoom)");
+        return Ok(());
+    }
 
-        // Bushiest first: by direct leaf-children desc, then recency (end) desc.
-        // Shallow subtrees with many leaves are the worst — splitting them dumps
-        // every leaf into the cover at once.
-        forks.sort_by(|&a, &b| {
-            leaf_kids(b)
-                .cmp(&leaf_kids(a))
-                .then(spans[b].1.cmp(&spans[a].1))
-        });
-        let render = |i: usize| -> String {
-            format!(
-                "{:8} {}  ({:x})  children={} leaf={} depth={} subtree={}",
-                classify(i),
-                format_time_range(key_to_epoch(spans[i].0), key_to_epoch(spans[i].1)),
-                spans[i].2,
-                children[i].len(),
-                leaf_kids(i),
-                depth[i],
-                subtree[i],
-            )
-        };
+    // Bushiest first: by direct leaf-children desc, then recency (end) desc.
+    // Shallow subtrees with many leaves are the worst — splitting them dumps
+    // every leaf into the cover at once.
+    forks.sort_by(|&a, &b| {
+        leaf_kids(b)
+            .cmp(&leaf_kids(a))
+            .then(spans[b].1.cmp(&spans[a].1))
+    });
+    let render = |i: usize| -> String {
+        format!(
+            "{:8} {}  ({:x})  children={} leaf={} depth={} subtree={}",
+            classify(i),
+            format_time_range(key_to_epoch(spans[i].0), key_to_epoch(spans[i].1)),
+            spans[i].2,
+            children[i].len(),
+            leaf_kids(i),
+            depth[i],
+            subtree[i],
+        )
+    };
 
-        println!("\nBushiest forks (worst first):");
-        for &i in forks.iter().take(15) {
+    println!("\nBushiest forks (worst first):");
+    for &i in forks.iter().take(15) {
+        println!("  {}", render(i));
+    }
+
+    // The recent edge: forks STARTING in the last 14 days, newest first —
+    // local structure at the now-end (today's sessions), where chunks are
+    // most likely hanging flat and uncombed. (Start-based, so the 2024-rooted
+    // apex — whose own fan-out shows in the worst-first list above — doesn't
+    // crowd out the genuinely recent forks here.)
+    let newest_end = spans.iter().map(|(_, e, _)| *e).max().unwrap();
+    let recent_cutoff = newest_end - parse_grain("2w").unwrap_or(0);
+    let mut recent: Vec<usize> = forks
+        .iter()
+        .copied()
+        .filter(|&i| spans[i].0 >= recent_cutoff)
+        .collect();
+    recent.sort_by(|&a, &b| spans[b].1.cmp(&spans[a].1));
+    println!("\nRecent edge (forks starting within 2w, newest first):");
+    if recent.is_empty() {
+        println!("  (none)");
+    } else {
+        for &i in &recent {
             println!("  {}", render(i));
         }
-
-        // The recent edge: forks STARTING in the last 14 days, newest first —
-        // local structure at the now-end (today's sessions), where chunks are
-        // most likely hanging flat and uncombed. (Start-based, so the 2024-rooted
-        // apex — whose own fan-out shows in the worst-first list above — doesn't
-        // crowd out the genuinely recent forks here.)
-        let newest_end = spans.iter().map(|(_, e, _)| *e).max().unwrap();
-        let recent_cutoff = newest_end - parse_grain("2w").unwrap_or(0);
-        let mut recent: Vec<usize> = forks
-            .iter()
-            .copied()
-            .filter(|&i| spans[i].0 >= recent_cutoff)
-            .collect();
-        recent.sort_by(|&a, &b| spans[b].1.cmp(&spans[a].1));
-        println!("\nRecent edge (forks starting within 2w, newest first):");
-        if recent.is_empty() {
-            println!("  (none)");
-        } else {
-            for &i in &recent {
-                println!("  {}", render(i));
-            }
-        }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
-fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         bail!("usage: memory meta <id>");
     }
+    let loaded = storage.load_provenance()?;
+    let memory = &loaded.memory;
+    let space = &memory.memory.facts;
+    let raw = &args[0];
+    let chunk_id = if raw.contains("..") {
+        let (start, end) = parse_time_range(raw)?;
+        find_chunk_by_time_range(space, start, end)
+            .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
+    } else {
+        resolve_chunk_id(memory, raw).map_err(|e| invalid_memory_id_error(raw, e))?
+    };
 
-    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
-
-    with_repo(pile_path, |repo| {
-        let branch_id = match explicit_branch_id {
-            Some(id) => id,
-            None => repo
-                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
-        };
-
-        // Load memory branch.
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout branch")?;
-
-        // Resolve chunk (time range or hex fallback).
-        let raw = &args[0];
-        let chunk_id = if raw.contains("..") {
-            let (start, end) = parse_time_range(raw)?;
-            find_chunk_by_time_range(&space, start, end)
-                .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
-        } else {
-            resolve_chunk_id(&space, raw).map_err(|e| invalid_memory_id_error(raw, e))?
-        };
-
-        // Print structural metadata.
-        if let (Some(start_v), Some(end_v)) = (
-            chunk_start_at(&space, chunk_id),
-            chunk_end_at(&space, chunk_id),
-        ) {
-            let range =
-                format_time_range(epoch_from_interval(start_v), epoch_end_from_interval(end_v));
-            println!("range: {}", range);
-        }
-        println!("id: {:x}", chunk_id);
-
-        // References, both directions. Outgoing includes legacy left/right
-        // remnants and is supersede-filtered + time-sorted; shown with the
-        // target's span (the address the prose would use) and id.
-        let outgoing = chunk_references(&space, chunk_id);
-        if !outgoing.is_empty() {
-            let refs: Vec<String> = outgoing
+    if let (Some(start_v), Some(end_v)) = (
+        chunk_start_at(space, chunk_id),
+        chunk_end_at(space, chunk_id),
+    ) {
+        println!(
+            "range: {}",
+            format_time_range(epoch_from_interval(start_v), epoch_end_from_interval(end_v))
+        );
+    }
+    println!("id: {chunk_id:x}");
+    println!("live: {}", memory.catalog.is_live(chunk_id));
+    let row = &memory.catalog.chunks[&chunk_id];
+    if !row.predecessors.is_empty() {
+        println!(
+            "supersedes: {}",
+            row.predecessors
                 .iter()
-                .map(
-                    |cid| match (chunk_start_at(&space, *cid), chunk_end_at(&space, *cid)) {
-                        (Some(s), Some(e)) => format!(
-                            "{} ({:x})",
-                            format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)),
-                            cid
-                        ),
-                        _ => format!("{cid:x}"),
-                    },
-                )
-                .collect();
-            println!("references: {}", refs.join(", "));
-        }
-        let superseded_set = superseded_ids(&space);
-        let incoming: Vec<Id> = find!(s: Id, pattern!(&space, [{ ?s @ ctx::reference: chunk_id }]))
-            .filter(|s| !superseded_set.contains(s))
+                .map(|id| format!("{id:x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let outgoing = chunk_references(space, chunk_id);
+    if !outgoing.is_empty() {
+        let refs: Vec<String> = outgoing
+            .iter()
+            .map(
+                |cid| match (chunk_start_at(space, *cid), chunk_end_at(space, *cid)) {
+                    (Some(s), Some(e)) => format!(
+                        "{} ({:x})",
+                        format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)),
+                        cid
+                    ),
+                    _ => format!("{cid:x}"),
+                },
+            )
             .collect();
-        if !incoming.is_empty() {
-            let ids: Vec<String> = incoming.iter().map(|s| format!("{s:x}")).collect();
-            println!("referenced_by: {}", ids.join(", "));
-        }
-
-        if let Some(exec_id) = chunk_about_exec_result(&space, chunk_id) {
-            println!("about_exec_result: {exec_id:x}");
-        }
-
-        if let Some(archive_id) = chunk_about_archive_message(&space, chunk_id) {
-            println!("about_archive_message: {archive_id:x}");
-            print_archive_meta(repo, &mut ws, archive_id)?;
-        }
-
-        Ok(())
-    })
+        println!("references: {}", refs.join(", "));
+    }
+    let incoming: Vec<Id> = find!(s: Id, pattern!(space, [{ ?s @ ctx::reference: chunk_id }]))
+        .filter(|id| memory.catalog.is_live(*id))
+        .collect();
+    if !incoming.is_empty() {
+        println!(
+            "referenced_by: {}",
+            incoming
+                .iter()
+                .map(|id| format!("{id:x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if let Some(exec_id) = row.about_exec_result {
+        println!("about_exec_result: {exec_id:x}");
+    }
+    if let Some(archive_id) = row.about_archive_message {
+        println!("about_archive_message: {archive_id:x}");
+        print_archive_meta(&loaded.archive.reader, &loaded.archive.facts, archive_id)?;
+    }
+    Ok(())
 }
 
-fn print_archive_meta(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
-    archive_msg_id: Id,
-) -> Result<()> {
-    let archive_branch_id = match repo.ensure_branch(DEFAULT_ARCHIVE_BRANCH, None) {
-        Ok(id) => id,
-        Err(_) => return Ok(()),
-    };
-
-    // Pull archive branch.
-    let archive_catalog = match repo.pull(archive_branch_id) {
-        Ok(mut archive_ws) => match archive_ws.checkout(..) {
-            Ok(cat) => cat,
-            Err(_) => return Ok(()),
-        },
-        Err(_) => return Ok(()),
-    };
-
-    // Author (as id prefix).
-    if let Some((author_id,)) = find!(
-        (author_id: Id),
-        pattern!(&archive_catalog, [{
-            archive_msg_id @
-            archive_schema::author: ?author_id,
+fn print_archive_meta(reader: &PileReader, archive: &TribleSet, archive_msg_id: Id) -> Result<()> {
+    let mut native_projection = false;
+    if let Some((block,)) = find!(
+        (block: Id),
+        pattern!(archive, [{
+            archive_msg_id @ archive_schema::source_projection::projects_to: ?block,
         }])
     )
     .next()
     {
-        // Try to resolve author name.
-        let author_name: Option<String> = find!(
-            (name: Inline<Handle<LongString>>),
-            pattern!(&archive_catalog, [{
-                archive_msg_id @
-                archive_schema::author_name: ?name,
-            }])
+        native_projection = true;
+        println!("  projects_to: {block:x}");
+    }
+    if let Some((author,)) = find!(
+        (author: Id),
+        pattern!(archive, [{
+            archive_msg_id @ archive_schema::source_projection::author: ?author,
+        }])
+    )
+    .next()
+    {
+        native_projection = true;
+        println!("  author: {author:x}");
+    }
+    if let Some((handle,)) = find!(
+        (handle: Inline<Handle<LongString>>),
+        pattern!(archive, [{
+            archive_msg_id @ archive_schema::source_projection::raw_author: ?handle,
+        }])
+    )
+    .next()
+    {
+        native_projection = true;
+        let value: View<str> = reader.get(handle).context("read Archive raw author")?;
+        println!("  raw_author: {}", value.as_ref());
+    }
+    if let Some((namespace,)) = find!(
+        (namespace: Id),
+        pattern!(archive, [{
+            archive_msg_id @ archive_schema::source_projection::source_namespace: ?namespace,
+        }])
+    )
+    .next()
+    {
+        native_projection = true;
+        println!("  source_namespace: {namespace:x}");
+    }
+    if let Some((handle,)) = find!(
+        (handle: Inline<Handle<LongString>>),
+        pattern!(archive, [{
+            archive_msg_id @ archive_schema::source_projection::source_locator: ?handle,
+        }])
+    )
+    .next()
+    {
+        native_projection = true;
+        let value: View<str> = reader.get(handle).context("read Archive source locator")?;
+        println!("  source_locator: {}", value.as_ref());
+    }
+
+    // Additive Archive migration deliberately retains the old message entity
+    // id.  A historical Memory link therefore remains meaningful even when it
+    // predates the canonical source-projection id and has no remap table.
+    if !native_projection {
+        if let Some(author) = find!(
+            author: Id,
+            pattern!(archive, [{ archive_msg_id @ legacy_archive_schema::author: ?author }])
         )
         .next()
-        .and_then(|(name_handle,)| {
-            ws.get::<View<str>, LongString>(name_handle)
-                .ok()
-                .map(|v| v.as_ref().to_string())
-        });
-        match author_name {
-            Some(name) => println!("  author: {} ({:x})", name, author_id),
-            None => println!("  author: {:x}", author_id),
+        {
+            println!("  legacy_author: {author:x}");
         }
-    }
-
-    // Source format.
-    if let Some((fmt,)) = find!(
-        (fmt: String),
-        pattern!(&archive_catalog, [{
-            archive_msg_id @
-            archive_import_schema::source_format: ?fmt,
-        }])
-    )
-    .next()
-    {
-        println!("  source_format: {}", fmt);
-    }
-
-    // Source conversation id.
-    if let Some((conv_handle,)) = find!(
-        (conv: Inline<Handle<LongString>>),
-        pattern!(&archive_catalog, [{
-            archive_msg_id @
-            archive_import_schema::source_conversation_id: ?conv,
-        }])
-    )
-    .next()
-    {
-        if let Ok(view) = ws.get::<View<str>, LongString>(conv_handle) {
-            println!("  conversation: {}", view.as_ref());
+        if let Some(handle) = find!(
+            handle: Inline<Handle<LongString>>,
+            pattern!(archive, [{ archive_msg_id @ legacy_archive_schema::author_name: ?handle }])
+        )
+        .next()
+        {
+            let value: View<str> = reader
+                .get(handle)
+                .context("read legacy Archive author name")?;
+            println!("  legacy_author_name: {}", value.as_ref());
         }
     }
 
@@ -2670,34 +2699,8 @@ fn extract_references(text: &str) -> Vec<(String, String)> {
     refs
 }
 
-/// Find all exec results whose finished_at falls within the given time range,
-/// sorted chronologically.
-fn find_execs_in_range(
-    catalog: &TribleSet,
-    query_start: Epoch,
-    query_end: Epoch,
-) -> Vec<(Id, Inline<NsTAIInterval>)> {
-    let qs = query_start.to_tai_duration().total_nanoseconds();
-    let qe = query_end.to_tai_duration().total_nanoseconds();
-    let mut out: Vec<(Id, Inline<NsTAIInterval>, i128)> = find!(
-        (result_id: Id, finished_at: Inline<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?result_id @
-            metadata::tag: &KIND_EXEC_RESULT,
-            metadata::finished_at: ?finished_at,
-        }])
-    )
-    .filter_map(|(id, t)| {
-        let k = interval_key(t);
-        (k >= qs && k <= qe).then_some((id, t, k))
-    })
-    .collect();
-    out.sort_by_key(|(_, _, k)| *k);
-    out.into_iter().map(|(id, t, _)| (id, t)).collect()
-}
-
-/// Find all archive messages whose created_at falls within the given time range,
-/// sorted chronologically.
+/// Find all canonical Archive source projections whose own timestamp (or the
+/// projected block timestamp when source time is absent) falls in the range.
 fn find_archive_in_range(
     catalog: &TribleSet,
     query_start: Epoch,
@@ -2705,106 +2708,104 @@ fn find_archive_in_range(
 ) -> Vec<(Id, Inline<NsTAIInterval>)> {
     let qs = query_start.to_tai_duration().total_nanoseconds();
     let qe = query_end.to_tai_duration().total_nanoseconds();
-    let mut out: Vec<(Id, Inline<NsTAIInterval>, i128)> = find!(
-        (msg_id: Id, created_at: Inline<NsTAIInterval>),
+    let projections: BTreeSet<Id> = find!(
+        id: Id,
         pattern!(catalog, [{
-            ?msg_id @
-            metadata::tag: &KIND_ARCHIVE_MESSAGE,
-            metadata::created_at: ?created_at,
+            ?id @ metadata::tag: &archive_schema::source_projection::KIND,
         }])
     )
-    .filter_map(|(id, t)| {
-        let k = interval_key(t);
-        (k >= qs && k <= qe).then_some((id, t, k))
-    })
     .collect();
+    let mut out = Vec::new();
+    for id in projections {
+        let source_time = find!(
+            value: Inline<NsTAIInterval>,
+            pattern!(catalog, [{
+                id @ archive_schema::source_projection::source_timestamp: ?value,
+            }])
+        )
+        .next();
+        let time = source_time.or_else(|| {
+            let block = find!(
+                value: Id,
+                pattern!(catalog, [{
+                    id @ archive_schema::source_projection::projects_to: ?value,
+                }])
+            )
+            .next()?;
+            find!(
+                value: Inline<NsTAIInterval>,
+                pattern!(catalog, [{ block @ archive_schema::block::timestamp: ?value }])
+            )
+            .next()
+        });
+        let Some(t) = time else {
+            continue;
+        };
+        let k = interval_key(t);
+        if k >= qs && k <= qe {
+            out.push((id, t, k));
+        }
+    }
     out.sort_by_key(|(_, _, k)| *k);
     out.into_iter().map(|(id, t, _)| (id, t)).collect()
 }
 
 /// Resolve provenance for a memory chunk by time-range query — find all
-/// exec results (cognition branch) and archive messages (archive branch)
+/// exec results (Cognition collection) and Archive source projections
 /// whose timestamps fall within the chunk's `[start_at, end_at]` interval.
 /// This is the loose-coupling alternative to chunk-side `about_exec_result`
 /// / `about_archive_message` attributes: associations emerge from temporal
 /// overlap at read-time, so importing archive data after a chunk was written
 /// automatically associates it with that chunk.
-fn cmd_provenance(pile_path: &Path, args: &[String]) -> Result<()> {
+fn cmd_provenance(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let Some(chunk_arg) = args.first() else {
         bail!("usage: memory provenance <chunk-id>");
     };
 
-    with_repo(pile_path, |repo| {
-        let memory_branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
-        let memory_catalog = {
-            let mut ws = repo
-                .pull(memory_branch_id)
-                .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-            ws.checkout(..).context("checkout memory branch")?
-        };
+    let loaded = storage.load_provenance()?;
+    let memory_catalog = &loaded.memory.memory.facts;
+    let chunk_id = resolve_chunk_id(&loaded.memory, chunk_arg)
+        .map_err(|e| anyhow!("resolve chunk id `{chunk_arg}`: {e}"))?;
 
-        let chunk_id = resolve_chunk_id(&memory_catalog, chunk_arg)
-            .map_err(|e| anyhow!("resolve chunk id `{chunk_arg}`: {e}"))?;
+    let start_at = chunk_start_at(memory_catalog, chunk_id)
+        .ok_or_else(|| anyhow!("chunk {chunk_id:x} has no start_at"))?;
+    let end_at = chunk_end_at(memory_catalog, chunk_id)
+        .ok_or_else(|| anyhow!("chunk {chunk_id:x} has no end_at"))?;
+    let (start_epoch, _): (Epoch, Epoch) = start_at.try_from_inline().unwrap();
+    let (_, end_epoch): (Epoch, Epoch) = end_at.try_from_inline().unwrap();
 
-        let start_at = chunk_start_at(&memory_catalog, chunk_id)
-            .ok_or_else(|| anyhow!("chunk {chunk_id:x} has no start_at"))?;
-        let end_at = chunk_end_at(&memory_catalog, chunk_id)
-            .ok_or_else(|| anyhow!("chunk {chunk_id:x} has no end_at"))?;
-        let (start_epoch, _): (Epoch, Epoch) = start_at.try_from_inline().unwrap();
-        let (_, end_epoch): (Epoch, Epoch) = end_at.try_from_inline().unwrap();
+    println!("chunk: {chunk_id:x}");
+    println!(
+        "range: {}..{}",
+        fmt_epoch(start_epoch),
+        fmt_epoch(end_epoch),
+    );
 
-        println!("chunk: {chunk_id:x}");
-        println!(
-            "range: {}..{}",
-            fmt_epoch(start_epoch),
-            fmt_epoch(end_epoch),
-        );
+    let execs =
+        cognition_model::exec_results_in_range(&loaded.cognition.facts, start_epoch, end_epoch);
+    println!("\ncognition exec results in range: {}", execs.len());
+    for (id, t) in execs {
+        let (epoch, _): (Epoch, Epoch) = t.try_from_inline().unwrap();
+        println!("  {id:x}  {}", fmt_epoch(epoch));
+    }
 
-        // Cognition branch.
-        if let Ok(exec_bid) = repo.ensure_branch(DEFAULT_COGNITION_BRANCH, None) {
-            if let Some(catalog) = repo
-                .pull(exec_bid)
-                .ok()
-                .and_then(|mut ws| ws.checkout(..).ok())
-            {
-                let execs = find_execs_in_range(&catalog, start_epoch, end_epoch);
-                println!("\ncognition exec results in range: {}", execs.len());
-                for (id, t) in execs {
-                    let (epoch, _): (Epoch, Epoch) = t.try_from_inline().unwrap();
-                    println!("  {id:x}  {}", fmt_epoch(epoch));
-                }
-            }
-        }
+    let projections = find_archive_in_range(&loaded.archive.facts, start_epoch, end_epoch);
+    println!("\narchive projections in range: {}", projections.len());
+    for (id, t) in projections {
+        let (epoch, _): (Epoch, Epoch) = t.try_from_inline().unwrap();
+        println!("  {id:x}  {}", fmt_epoch(epoch));
+    }
 
-        // Archive branch.
-        if let Ok(archive_bid) = repo.ensure_branch(DEFAULT_ARCHIVE_BRANCH, None) {
-            if let Some(catalog) = repo
-                .pull(archive_bid)
-                .ok()
-                .and_then(|mut ws| ws.checkout(..).ok())
-            {
-                let msgs = find_archive_in_range(&catalog, start_epoch, end_epoch);
-                println!("\narchive messages in range: {}", msgs.len());
-                for (id, t) in msgs {
-                    let (epoch, _): (Epoch, Epoch) = t.try_from_inline().unwrap();
-                    println!("  {id:x}  {}", fmt_epoch(epoch));
-                }
-            }
-        }
-
-        Ok(())
-    })
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // show / turn subcommands
 // ---------------------------------------------------------------------------
 
-fn print_chunk(ws: &mut Workspace<Pile>, space: &TribleSet, chunk_id: Id) -> Result<()> {
+fn print_chunk(reader: &PileReader, space: &TribleSet, chunk_id: Id) -> Result<()> {
     if let Some(handle) = chunk_summary_handle(space, chunk_id) {
-        let summary: View<str> = ws.get(handle).context("read chunk summary")?;
+        let summary: View<str> = reader.get(handle).context("read chunk summary")?;
         print!("{}", summary.trim_end());
         println!();
         return Ok(());
@@ -2813,7 +2814,7 @@ fn print_chunk(ws: &mut Workspace<Pile>, space: &TribleSet, chunk_id: Id) -> Res
     // crash, and export the blob so a Claude-Code reader can Read it to see it.
     if let Some(h) = chunk_image_handle(space, chunk_id) {
         let span = chunk_span_str(space, chunk_id);
-        match materialize_image(ws, chunk_id, h) {
+        match materialize_image(reader, chunk_id, h) {
             Ok(path) => println!(
                 "[image memory @ {span}] → {} (Read this path to view)",
                 path.display()
@@ -2829,19 +2830,33 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn resolve_chunk_id(space: &TribleSet, raw: &str) -> Result<Id> {
+fn resolve_chunk_id(loaded: &LoadedMemory, raw: &str) -> Result<Id> {
     let prefix = normalize_prefix(raw)?;
+    let space = &loaded.memory.facts;
 
-    let mut chunk_matches = Vec::new();
-    for chunk_id in all_chunk_ids(space) {
+    // Intrinsic ids and historical aliases are both stable names for one
+    // immutable revision.  Resolve them into target ids before deciding
+    // ambiguity, so an intrinsic id that is also recorded as its own alias
+    // still denotes one chunk.
+    let mut chunk_matches = BTreeSet::new();
+    for chunk_id in loaded.catalog.chunks.keys().copied() {
         if id_starts_with(chunk_id, prefix.as_str()) {
-            chunk_matches.push(chunk_id);
+            chunk_matches.insert(chunk_id);
+        }
+    }
+    for row in loaded.catalog.chunks.values() {
+        if row
+            .aliases
+            .iter()
+            .any(|alias| id_starts_with(*alias, prefix.as_str()))
+        {
+            chunk_matches.insert(row.id);
         }
     }
     match chunk_matches.len() {
-        1 => return Ok(chunk_matches[0]),
+        1 => return Ok(*chunk_matches.first().expect("one chunk match")),
         n if n > 1 => {
-            bail!("multiple chunk ids match prefix '{prefix}' (use a longer prefix)")
+            bail!("multiple chunk ids or aliases match prefix '{prefix}' (use a longer prefix)")
         }
         _ => {}
     }
@@ -2857,7 +2872,7 @@ fn resolve_chunk_id(space: &TribleSet, raw: &str) -> Result<Id> {
     bail!("no chunk id matches prefix '{prefix}'")
 }
 
-fn print_turn_facets(ws: &mut Workspace<Pile>, space: &TribleSet, raw: &str) -> Result<()> {
+fn print_turn_facets(reader: &PileReader, space: &TribleSet, raw: &str) -> Result<()> {
     let prefix = normalize_prefix(raw)?;
     let mut turn_matches = Vec::new();
     for chunk_id in all_chunk_ids(space) {
@@ -2867,9 +2882,8 @@ fn print_turn_facets(ws: &mut Workspace<Pile>, space: &TribleSet, raw: &str) -> 
             }
         }
     }
-    match turn_matches.len() {
-        0 => bail!("no turn_id matches prefix '{prefix}'"),
-        _ => {}
+    if turn_matches.is_empty() {
+        bail!("no turn_id matches prefix '{prefix}'");
     }
 
     turn_matches.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -2917,7 +2931,7 @@ fn print_turn_facets(ws: &mut Workspace<Pile>, space: &TribleSet, raw: &str) -> 
         if i > 0 {
             println!();
         }
-        print_chunk(ws, space, *chunk_id)?;
+        print_chunk(reader, space, *chunk_id)?;
     }
 
     Ok(())
@@ -2951,29 +2965,17 @@ fn id_starts_with(id: Id, prefix: &str) -> bool {
     format!("{id:x}").starts_with(prefix)
 }
 
-fn parse_optional_hex_id(raw: Option<&str>) -> Result<Option<Id>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let id = Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid id {trimmed}"))?;
-    Ok(Some(id))
-}
-
 /// Export an image memory's blob to a temp file and return the path. The
 /// Claude-Code environment can't auto-inject pile blobs — a reader has to call
 /// the Read tool on a file path — so when a wordless image memory surfaces we
 /// drop its bytes at `/tmp/mem_img/<hex>.<ext>` and print the path. No embedder
 /// needed; this is pure blob → disk. Extension is sniffed from the magic bytes.
 fn materialize_image(
-    ws: &mut Workspace<Pile>,
+    reader: &PileReader,
     chunk_id: Id,
     handle: Inline<Handle<RawBytes>>,
 ) -> Result<PathBuf> {
-    let bytes: Bytes = ws.get(handle).context("read image bytes")?;
+    let bytes: Bytes = reader.get(handle).context("read image bytes")?;
     let b = bytes.as_ref();
     let dir = Path::new("/tmp/mem_img");
     std::fs::create_dir_all(dir).context("create /tmp/mem_img")?;
@@ -2999,60 +3001,297 @@ fn sniff_image_ext(b: &[u8]) -> &'static str {
     }
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-    Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))
-}
-
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::File;
 
-    struct TestPile(PathBuf);
+    use ed25519_dalek::SigningKey;
+    use triblespace::core::repo::Repository;
+
+    struct TestPile {
+        pile: PathBuf,
+        key: PathBuf,
+    }
 
     impl TestPile {
         fn new() -> Self {
-            let path =
+            let pile =
                 std::env::temp_dir().join(format!("faculties-memory-cover-{}.pile", ufoid().id));
-            File::create(&path).expect("create test pile");
-            Self(path)
+            let key = pile.with_extension("key");
+            File::create(&pile).expect("create test pile");
+            faculties::collection_cutover::initialize_signer(&pile, Some(&key))
+                .expect("initialize test signer");
+            Self { pile, key }
         }
 
-        fn path(&self) -> &Path {
-            &self.0
+        fn storage(&self) -> MemoryStorage<'_> {
+            MemoryStorage {
+                pile: &self.pile,
+                key: Some(&self.key),
+            }
         }
     }
 
     impl Drop for TestPile {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(&self.pile);
+            let _ = std::fs::remove_file(&self.key);
         }
+    }
+
+    fn point(raw: &str) -> Inline<NsTAIInterval> {
+        let epoch = parse_tai_timestamp(raw).unwrap();
+        (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    fn publish_chunk(storage: MemoryStorage<'_>, draft: memory_model::ChunkDraft) -> Id {
+        let loaded = storage.load().expect("load Memory collection");
+        let (fragment, id) = memory_model::chunk_fragment(draft).expect("build Memory chunk");
+        storage
+            .publish_memory(&loaded, fragment)
+            .expect("publish Memory chunk");
+        id
+    }
+
+    #[test]
+    fn migrate_legacy_command_is_additive_and_replayable() {
+        let pile = TestPile::new();
+        let legacy_signer = SigningKey::from_bytes(&[0xA5; 32]);
+        let legacy_id = Id::new([0xA6; 16]).unwrap();
+        let legacy_store = open_pile_strict(&pile.pile).unwrap();
+        let mut repository =
+            Repository::new(legacy_store, legacy_signer, Fragment::empty()).unwrap();
+        let branch = *repository
+            .create_branch(faculties::schemas::memory::LEGACY_MEMORY_BRANCH_NAME, None)
+            .unwrap();
+        let mut workspace = repository.pull(branch).unwrap();
+        let mut legacy = Fragment::empty();
+        let summary = legacy.put::<LongString, _>("legacy CLI memory".to_owned());
+        legacy += entity! { ExclusiveId::force_ref(&legacy_id) @
+            metadata::tag: &faculties::schemas::memory::KIND_CHUNK_ID,
+            ctx::summary: summary,
+            ctx::start_at: point("2026-02-01T00:00:00"),
+            ctx::end_at: point("2026-02-01T01:00:00"),
+            metadata::created_at: point("2026-02-01T01:00:00"),
+        };
+        workspace.commit(legacy, "legacy CLI event");
+        repository.push(&mut workspace).unwrap();
+        repository.close().unwrap();
+
+        let storage = pile.storage();
+        cmd_migrate_legacy(storage).unwrap();
+        let loaded = storage.load().unwrap();
+        assert_eq!(loaded.catalog.chunks.len(), 1);
+        assert_eq!(loaded.catalog.alias_targets(legacy_id).len(), 1);
+        drop(loaded);
+
+        let length = std::fs::metadata(&pile.pile).unwrap().len();
+        cmd_migrate_legacy(storage).unwrap();
+        assert_eq!(std::fs::metadata(&pile.pile).unwrap().len(), length);
+    }
+
+    fn text_draft(summary: &str, start: &str, end: &str) -> memory_model::ChunkDraft {
+        memory_model::ChunkDraft {
+            content: memory_model::ChunkDraftContent::Text(summary.to_owned()),
+            start_at: point(start),
+            end_at: point(end),
+            lens: None,
+            references: BTreeSet::new(),
+            about_exec_result: None,
+            about_archive_message: None,
+            predecessors: BTreeSet::new(),
+            observed_at: BTreeSet::from([point(end)]),
+            aliases: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn replay_batch_never_splits_one_start_coordinate() {
+        let ids: Vec<Id> = (1u8..=5).map(|byte| Id::new([byte; 16]).unwrap()).collect();
+        let batch = vec![
+            (10, 11, ids[0]),
+            (20, 24, ids[1]),
+            (20, 23, ids[2]),
+            (20, 22, ids[3]),
+            (30, 31, ids[4]),
+        ];
+        assert_eq!(replay_take_count(&batch, 0), 0);
+        assert_eq!(replay_take_count(&batch, 1), 1);
+        assert_eq!(replay_take_count(&batch, 2), 4);
+        assert_eq!(replay_take_count(&batch, 3), 4);
+        assert_eq!(replay_take_count(&batch, 5), 5);
+        assert_eq!(replay_take_count(&batch, 99), 5);
+    }
+
+    #[test]
+    fn supersede_joins_unrelated_heads_without_losing_new_state() {
+        let pile = TestPile::new();
+        let storage = pile.storage();
+        let reference = publish_chunk(
+            storage,
+            text_draft(
+                "referenced context",
+                "2026-01-01T00:00:00",
+                "2026-01-01T01:00:00",
+            ),
+        );
+        let old = publish_chunk(
+            storage,
+            text_draft(
+                "older competing recollection",
+                "2026-01-02T00:00:00",
+                "2026-01-02T01:00:00",
+            ),
+        );
+        let exec = Id::new([0xE1; 16]).unwrap();
+        let archive = Id::new([0xA1; 16]).unwrap();
+        let mut rich = text_draft(
+            "new state with every optional field",
+            "2026-01-03T00:00:00",
+            "2026-01-03T01:00:00",
+        );
+        rich.lens = Some("integration".to_string());
+        rich.references.insert(reference);
+        rich.about_exec_result = Some(exec);
+        rich.about_archive_message = Some(archive);
+        let new = publish_chunk(storage, rich);
+
+        cmd_supersede(storage, &[format!("{new:x}"), format!("{old:x}")])
+            .expect("join unrelated revisions");
+        let after = storage.load().expect("load joined Memory collection");
+        let source = &after.catalog.chunks[&new];
+        let joined = after
+            .catalog
+            .chunks
+            .values()
+            .find(|row| row.predecessors == BTreeSet::from([new, old]))
+            .expect("fresh join revision");
+        assert_ne!(joined.id, new);
+        assert_ne!(joined.id, old);
+        assert_eq!(joined.content, source.content);
+        assert_eq!(joined.start_at, source.start_at);
+        assert_eq!(joined.end_at, source.end_at);
+        assert_eq!(joined.lens, source.lens);
+        assert_eq!(joined.references, source.references);
+        assert_eq!(joined.about_exec_result, source.about_exec_result);
+        assert_eq!(joined.about_archive_message, source.about_archive_message);
+
+        let pile_len = std::fs::metadata(&pile.pile).unwrap().len();
+        let joined_id = joined.id;
+        drop(after);
+        cmd_supersede(storage, &[format!("{joined_id:x}"), format!("{old:x}")])
+            .expect("already-descended join is idempotent");
+        assert_eq!(
+            std::fs::metadata(&pile.pile).unwrap().len(),
+            pile_len,
+            "no-op supersede must not publish another root"
+        );
+        let error = cmd_supersede(storage, &[format!("{old:x}"), format!("{joined_id:x}")])
+            .expect_err("a descendant cannot be named beside its own ancestor");
+        assert!(error.to_string().contains("backwards reconciliation"));
+        assert_eq!(std::fs::metadata(&pile.pile).unwrap().len(), pile_len);
+    }
+
+    #[test]
+    fn respan_preserves_content_lens_references_and_provenance() {
+        let pile = TestPile::new();
+        let storage = pile.storage();
+        let reference = publish_chunk(
+            storage,
+            text_draft("reference", "2026-02-01T00:00:00", "2026-02-01T01:00:00"),
+        );
+        let mut rich = text_draft(
+            "state whose span needs correction",
+            "2026-02-02T00:00:00",
+            "2026-02-02T01:00:00",
+        );
+        rich.lens = Some("correction".to_string());
+        rich.references.insert(reference);
+        rich.about_exec_result = Some(Id::new([0xE2; 16]).unwrap());
+        rich.about_archive_message = Some(Id::new([0xA2; 16]).unwrap());
+        let old = publish_chunk(storage, rich);
+
+        cmd_respan(
+            storage,
+            &[
+                format!("{old:x}"),
+                "2026-02-03T00:00:00..2026-02-03T02:00:00".to_string(),
+            ],
+        )
+        .expect("respan rich revision");
+        let after = storage.load().unwrap();
+        let source = &after.catalog.chunks[&old];
+        let corrected = after
+            .catalog
+            .chunks
+            .values()
+            .find(|row| row.predecessors == BTreeSet::from([old]))
+            .expect("corrected revision");
+        assert_eq!(corrected.content, source.content);
+        assert_eq!(corrected.lens, source.lens);
+        assert_eq!(corrected.references, source.references);
+        assert_eq!(corrected.about_exec_result, source.about_exec_result);
+        assert_eq!(
+            corrected.about_archive_message,
+            source.about_archive_message
+        );
+        assert_eq!(corrected.start_at, point("2026-02-03T00:00:00"));
+        assert_eq!(corrected.end_at, point("2026-02-03T02:00:00"));
+    }
+
+    #[test]
+    fn historical_aliases_resolve_to_their_exact_intrinsic_revision() {
+        let pile = TestPile::new();
+        let storage = pile.storage();
+        let alias = Id::new([0x71; 16]).unwrap();
+        let mut draft = text_draft(
+            "migrated revision",
+            "2026-03-01T00:00:00",
+            "2026-03-01T01:00:00",
+        );
+        draft.aliases.insert(alias);
+        let intrinsic = publish_chunk(storage, draft);
+        let loaded = storage.load().unwrap();
+        assert_eq!(
+            resolve_chunk_id(&loaded, &format!("{alias:x}")).unwrap(),
+            intrinsic
+        );
+        assert_eq!(
+            resolve_chunk_id(&loaded, &format!("{alias:x}")[..12]).unwrap(),
+            intrinsic
+        );
+    }
+
+    #[test]
+    fn lexical_search_is_rebuilt_from_the_frozen_memory_view() {
+        let pile = TestPile::new();
+        let storage = pile.storage();
+        let matching = publish_chunk(
+            storage,
+            text_draft(
+                "cobalt narwhal migration",
+                "2026-04-01T00:00:00",
+                "2026-04-01T01:00:00",
+            ),
+        );
+        let unrelated = publish_chunk(
+            storage,
+            text_draft(
+                "violet orchard",
+                "2026-04-02T00:00:00",
+                "2026-04-02T01:00:00",
+            ),
+        );
+        let loaded = storage.load().unwrap();
+        let scores = faculties::memory_cover::lexical_relevance_scores(
+            &loaded.memory.facts,
+            &loaded.memory.reader,
+            "cobalt narwhal",
+        )
+        .unwrap();
+        assert!(scores.get(&matching).copied().unwrap_or_default() > 0.0);
+        assert_eq!(scores.get(&unrelated), None);
     }
 
     /// A fresh cover-state dir under the system temp dir, removed on drop —
@@ -3178,33 +3417,58 @@ mod tests {
     #[test]
     fn cover_start_generates_the_context_cover_from_a_pile() {
         let pile = TestPile::new();
+        let storage = pile.storage();
         // Seed a coarse apex over two fine day-chunks — the shape the
         // antichain cover splits when the budget allows.
-        with_repo(pile.path(), |repo| {
-            let apex = (
-                parse_tai_timestamp("2026-01-01T00:00:00")?,
-                parse_tai_timestamp("2026-01-03T00:00:00")?,
-            );
-            create_chunk(repo, "apex: two days of cover-cursor work", apex, None)?;
-            let day1 = (
-                parse_tai_timestamp("2026-01-01T00:00:00")?,
-                parse_tai_timestamp("2026-01-02T00:00:00")?,
-            );
-            create_chunk(repo, "day one: built the state machine", day1, None)?;
-            let day2 = (
-                parse_tai_timestamp("2026-01-02T00:00:00")?,
-                parse_tai_timestamp("2026-01-03T00:00:00")?,
-            );
-            create_chunk(repo, "day two: wired the hooks", day2, None)?;
-            Ok(())
-        })
-        .expect("seed pile");
+        let apex = (
+            parse_tai_timestamp("2026-01-01T00:00:00").unwrap(),
+            parse_tai_timestamp("2026-01-03T00:00:00").unwrap(),
+        );
+        let loaded = storage.load().expect("load empty collections");
+        create_chunk(
+            storage,
+            &loaded,
+            "apex: two days of cover-cursor work",
+            apex,
+            None,
+            apex.1,
+        )
+        .expect("create apex");
+        let day1 = (
+            parse_tai_timestamp("2026-01-01T00:00:00").unwrap(),
+            parse_tai_timestamp("2026-01-02T00:00:00").unwrap(),
+        );
+        let loaded = storage.load().expect("reload after apex");
+        create_chunk(
+            storage,
+            &loaded,
+            "day one: built the state machine",
+            day1,
+            None,
+            day1.1,
+        )
+        .expect("create day one");
+        let day2 = (
+            parse_tai_timestamp("2026-01-02T00:00:00").unwrap(),
+            parse_tai_timestamp("2026-01-03T00:00:00").unwrap(),
+        );
+        let loaded = storage.load().expect("reload after day one");
+        create_chunk(
+            storage,
+            &loaded,
+            "day two: wired the hooks",
+            day2,
+            None,
+            day2.1,
+        )
+        .expect("create day two");
 
         // The exact text `memory context --chars 10000` would print.
-        let cover = with_repo(pile.path(), |repo| {
-            build_context_cover(repo, None, 10_000, None, None, None, DEFAULT_SIM_THRESHOLD)
-        })
-        .expect("build context cover");
+        let loaded = storage
+            .load_context(false)
+            .expect("load seeded collections");
+        let cover = build_context_cover(&loaded, 10_000, None, None, None, DEFAULT_SIM_THRESHOLD)
+            .expect("build context cover");
         // The status header now goes to stderr, not into the returned/ingested
         // cover text (prefix-stability + ranges-are-the-drill-key de-noise).
         assert!(!cover.contains("memory context — "));

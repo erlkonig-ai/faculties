@@ -1,19 +1,19 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
 use faculties::schemas::compass::{
-    board, latest_status_event, DEFAULT_STATUSES, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
-    KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
+    board, latest_status_event, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
-use faculties::schemas::relations::{active_person_ids, relations as rel_attrs, KIND_PERSON_ID};
+use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
+use faculties::{compass, compass_cutover, relations};
 use hifitime::Epoch;
-use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
 use triblespace_paths::{PathExpr, PathIndex, Step};
 
@@ -25,12 +25,9 @@ struct Cli {
     /// Path to the pile file to use
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name for the board
-    #[arg(long, default_value = "compass")]
-    branch: String,
-    /// Branch id for the board (hex). Overrides config.
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     /// Acting persona (relations label or 32-char hex id). When set,
     /// status and note events record who made them — the audit trail gains the
     /// actor, and `orient wait` watchers can absorb their own edits.
@@ -79,7 +76,7 @@ enum Command {
         id: String,
         #[arg(help = "Note text. Use @path for file input or @- for stdin.")]
         note: String,
-        /// Short note tag (repeatable). Persona or colony tags request
+        /// Short note tag (repeatable). Relations person or group tags request
         /// attention through Orient without assigning workflow semantics.
         #[arg(long)]
         tag: Vec<String>,
@@ -118,6 +115,9 @@ enum Command {
         /// Hex prefix to search for
         prefix: String,
     },
+    /// Additively publish the frozen legacy `compass` branch as native
+    /// collection commits. Stop every legacy Compass writer before running.
+    MigrateLegacy,
 }
 
 // ── on-demand board queries ───────────────────────────────────────────
@@ -218,46 +218,73 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        // Avoid Drop warnings on early errors.
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
+#[derive(Clone, Copy)]
+struct CompassStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
 }
 
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
+impl CompassStorage<'_> {
+    fn with_pile<T>(
+        &self,
+        f: impl FnOnce(&mut Pile, &ed25519_dalek::SigningKey) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = f(&mut pile, &signer);
+        let close = pile.close();
+        match (result, close) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(close_error)) => {
+                Err(error.context(format!("closing pile also failed: {close_error}")))
+            }
         }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
     }
-    result
+
+    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileReader) -> Result<T>) -> Result<T> {
+        self.with_pile(|pile, signer| {
+            let (facts, reader) = compass::materialize_collection(pile, signer)?;
+            f(&facts, &reader)
+        })
+    }
+
+    /// Build and publish one complete user action against one known-prefix
+    /// view. `None` is a genuine no-op and writes no collection record.
+    fn update<T>(
+        &self,
+        persona: Option<&str>,
+        f: impl FnOnce(&TribleSet, &PileReader, Option<Id>) -> Result<(Option<Fragment>, T)>,
+    ) -> Result<T> {
+        self.with_pile(|pile, signer| {
+            let (facts, reader) = compass::materialize_collection(pile, signer)?;
+            let by = if let Some(persona) = persona {
+                let relation_facts =
+                    Collection::new(&mut *pile, RELATIONS_SCOPE_ID, signer.clone())
+                        .materialize()
+                        .context("materialize Relations collection for Compass persona")?;
+                relations::validate_catalog(&reader, &relation_facts)
+                    .context("validate Relations collection for Compass persona")?;
+                Some(resolve_persona_id(&relation_facts, &reader, persona)?)
+            } else {
+                None
+            };
+            let (fragment, value) = f(&facts, &reader, by)?;
+            if let Some(fragment) = fragment {
+                compass::validate_candidate(&reader, &facts, &fragment)
+                    .context("validate Compass action before publication")?;
+                compass::commit_collection(pile, signer, fragment)?;
+            }
+            Ok(value)
+        })
+    }
 }
 
-fn task_title(ws: &mut Workspace<Pile>, space: &TribleSet, task_id: Id) -> String {
+fn task_title(reader: &PileReader, space: &TribleSet, task_id: Id) -> String {
     find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
         .next()
-        .and_then(|h| read_text(ws, h).ok())
+        .and_then(|h| read_text(reader, h).ok())
         .unwrap_or_default()
 }
 
@@ -307,11 +334,8 @@ fn all_note_ids(space: &TribleSet) -> Vec<Id> {
     .collect()
 }
 
-fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
-    let view: View<str> = ws
-        .get::<View<str>, blobencodings::LongString>(handle)
-        .map_err(|e| anyhow::anyhow!("load longstring: {e:?}"))?;
-    Ok(view.to_string())
+fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+    compass::read_text(reader, handle)
 }
 
 /// Parse a full 32-char hex ID. Returns a helpful error pointing to `compass resolve` on failure.
@@ -334,54 +358,7 @@ fn resolve_note_id(input: &str, space: &TribleSet) -> Result<Id> {
 
 /// Compute active priority edges from the space.
 fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
-    let mut latest: HashMap<(Id, Id), (i128, bool)> = HashMap::new();
-    for (higher, lower, at) in find!(
-        (higher: Id, lower: Id, at: IntervalValue),
-        pattern!(space, [{
-            _?evt @
-            metadata::tag: &KIND_PRIORITIZE_ID,
-            board::higher: ?higher,
-            board::lower: ?lower,
-            metadata::created_at: ?at,
-        }])
-    ) {
-        let key = interval_key(at);
-        latest
-            .entry((higher, lower))
-            .and_modify(|(cur_key, cur_active)| {
-                if key > *cur_key {
-                    *cur_key = key;
-                    *cur_active = true;
-                }
-            })
-            .or_insert((key, true));
-    }
-    for (higher, lower, at) in find!(
-        (higher: Id, lower: Id, at: IntervalValue),
-        pattern!(space, [{
-            _?evt @
-            metadata::tag: &KIND_DEPRIORITIZE_ID,
-            board::higher: ?higher,
-            board::lower: ?lower,
-            metadata::created_at: ?at,
-        }])
-    ) {
-        let key = interval_key(at);
-        latest
-            .entry((higher, lower))
-            .and_modify(|(cur_key, cur_active)| {
-                if key > *cur_key {
-                    *cur_key = key;
-                    *cur_active = false;
-                }
-            })
-            .or_insert((key, false));
-    }
-    latest
-        .into_iter()
-        .filter(|(_, (_, active))| *active)
-        .map(|(k, _)| k)
-        .collect()
+    compass::active_priority_edges(space).into_iter().collect()
 }
 
 fn parent_paths(space: &TribleSet) -> Result<PathIndex> {
@@ -422,12 +399,12 @@ fn note_tags(space: &TribleSet, note_id: Id) -> Vec<String> {
     tags
 }
 
-fn note_references(ws: &mut Workspace<Pile>, space: &TribleSet, note_id: Id) -> Vec<String> {
+fn note_references(reader: &PileReader, space: &TribleSet, note_id: Id) -> Vec<String> {
     let mut references: Vec<String> = find!(
         handle: TextHandle,
         pattern!(space, [{ note_id @ board::reference: ?handle }])
     )
-    .filter_map(|handle| read_text(ws, handle).ok())
+    .filter_map(|handle| read_text(reader, handle).ok())
     .collect();
     references.sort();
     references.dedup();
@@ -509,7 +486,7 @@ fn priority_ranks(task_ids: &[Id], edges: &HashSet<(Id, Id)>) -> HashMap<Id, usi
 }
 
 fn render_board(
-    ws: &mut Workspace<Pile>,
+    reader: &PileReader,
     space: &TribleSet,
     status_filter: &[String],
     tag_filter: &[String],
@@ -544,7 +521,7 @@ fn render_board(
             continue;
         }
 
-        let title = task_title(ws, space, task_id);
+        let title = task_title(reader, space, task_id);
         let created_at = task_created_at(space, task_id);
         let notes = note_count(space, task_id);
         let parent = task_parent(space, task_id);
@@ -734,93 +711,15 @@ fn order_rows(rows: Vec<TaskRow>, priority_edges: &HashSet<(Id, Id)>) -> Vec<(Ta
     ordered
 }
 
-fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
-    let existing: HashSet<Id> = find!(
-        (kind: Id),
-        pattern!(&space, [{ ?kind @ metadata::name: _?handle }])
-    )
-    .map(|(kind,)| kind)
-    .collect();
-
-    let mut change = TribleSet::new();
-    for (id, label) in KIND_SPECS {
-        if existing.contains(&id) {
-            continue;
-        }
-        let name_handle = label.to_owned().to_blob().get_handle();
-        change += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_handle };
-    }
-    Ok(change)
-}
-
-fn relations_workspace(repo: &mut Repository<Pile>) -> Result<Workspace<Pile>> {
-    let relations_branch_id = repo
-        .ensure_branch("relations", None)
-        .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
-    repo.pull(relations_branch_id)
-        .map_err(|e| anyhow::anyhow!("pull relations workspace: {e:?}"))
-}
-
-/// Resolve a relations person inside an explicit eligibility set. Persona
-/// attribution is cooperative (the flag is still a claim), but it may not be
-/// an arbitrary Id.
-fn resolve_person_in(
-    space: &TribleSet,
-    eligible_people: &HashSet<Id>,
-    input: &str,
-    eligibility: &str,
-) -> Result<Id> {
-    let trimmed = input.trim();
-    if let Some(id) = Id::from_hex(trimmed) {
-        if eligible_people.contains(&id) {
-            return Ok(id);
-        }
-        bail!("persona '{trimmed}' is not {eligibility}");
-    }
-    let key = trimmed.to_ascii_lowercase();
-    let matches: Vec<Id> = find!(
-        person_id: Id,
-        pattern!(space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
-    )
-    .filter(|&person_id| {
-        eligible_people.contains(&person_id)
-            && (exists!(pattern!(space, [{ person_id @ rel_attrs::label_norm: key.as_str() }]))
-                || exists!(pattern!(space, [{ person_id @ rel_attrs::alias_norm: key.as_str() }])))
-    })
-    .collect();
-    match matches.len() {
-        0 => bail!("unknown persona label '{trimmed}' ({eligibility}; try the hex id)"),
-        1 => Ok(matches[0]),
-        _ => bail!("multiple relations entries match persona label '{trimmed}'"),
-    }
-}
-
-/// Strictly resolve a live relations person for a new action or assignment.
-fn resolve_active_person(
-    space: &TribleSet,
-    active_people: &HashSet<Id>,
-    input: &str,
-) -> Result<Id> {
-    resolve_person_in(space, active_people, input, "an active relations person")
-}
-
-/// Resolve the acting persona (relations label or 32-char hex id).
-fn resolve_persona_id(repo: &mut Repository<Pile>, input: &str) -> Result<Id> {
-    let mut ws = relations_workspace(repo)?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
-    let active = active_person_ids(&space);
-    resolve_active_person(&space, &active, input)
+/// Resolve one active Relations person for attribution. The flag remains a
+/// cooperative authorship claim, but it cannot name an unknown or retired
+/// anchor.
+fn resolve_persona_id(space: &TribleSet, reader: &PileReader, input: &str) -> Result<Id> {
+    relations::resolve_person(reader, space, input, false)?.require_unique("persona", input)
 }
 
 fn cmd_add(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
+    storage: CompassStorage<'_>,
     title: String,
     status: String,
     parent: Option<String>,
@@ -828,74 +727,36 @@ fn cmd_add(
     note: Option<String>,
     persona: Option<&str>,
 ) -> Result<()> {
-    let status = normalize_status(status);
-    let tags: Vec<String> = tags.into_iter().map(|t| t.trim().to_string()).collect();
-    validate_short("status", &status)?;
-    for tag in &tags {
-        validate_short("tag", tag)?;
-    }
-
-    let (task_ref, note_ref) = with_repo(pile, |repo| {
-        let by_id = persona.map(|p| resolve_persona_id(repo, p)).transpose()?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+    let status = compass::canonical_status(status)?;
+    let tags = compass::canonical_tags(tags)?;
+    let (task_ref, note_ref) = storage.update(persona, |space, _reader, by_id| {
         let parent_id = match parent.as_deref() {
-            Some(p) => {
-                let space = ws
-                    .checkout(..)
-                    .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-                Some(resolve_task_id(p, &space)?)
-            }
+            Some(parent) => Some(resolve_task_id(parent, space)?),
             None => None,
         };
-        let task_id = ufoid();
-        let task_ref = task_id.id;
+        let task_ref = genid().id;
         let now = epoch_interval(now_epoch());
-        let title_handle = ws.put(title);
-
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-        change += entity! { &task_id @
-            metadata::tag: &KIND_GOAL_ID,
-            board::title: title_handle,
-            metadata::created_at: now,
-            board::parent?: parent_id.as_ref(),
-            board::tag*: tags.iter().map(|tag| tag.as_str()),
-        };
-
-        let status_id = ufoid();
-        change += entity! { &status_id @
-            metadata::tag: &KIND_STATUS_ID,
-            board::task: &task_ref,
-            board::status: status.as_str(),
-            board::by?: by_id.as_ref(),
-            metadata::created_at: now,
-        };
+        let mut change = compass::kind_catalog_fragment();
+        change += compass::goal_fragment(task_ref, title, tags, parent_id, now)?;
+        change += compass::status_fragment(task_ref, status, by_id, now)?;
 
         let mut note_ref = None;
         if let Some(note) = note {
-            let note_id = ufoid();
-            note_ref = Some(note_id.id);
-            let reference_handles: Vec<TextHandle> = extract_reference_values(&note)
-                .into_iter()
-                .map(|reference| ws.put(reference))
-                .collect();
-            let note_handle = ws.put(note);
-            change += entity! { &note_id @
-                metadata::tag: &KIND_NOTE_ID,
-                board::task: &task_ref,
-                board::note: note_handle,
-                board::by?: by_id.as_ref(),
-                board::reference*: reference_handles.iter(),
-                metadata::created_at: now,
-            };
+            let note_id = genid().id;
+            let references = extract_reference_values(&note);
+            change += compass::note_fragment(
+                note_id,
+                task_ref,
+                note,
+                vec![],
+                references,
+                vec![],
+                by_id,
+                now,
+            )?;
+            note_ref = Some(note_id);
         }
-
-        ws.commit(change, "add goal");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push goal: {e:?}"))?;
-        Ok((task_ref, note_ref))
+        Ok((Some(change), (task_ref, note_ref)))
     })?;
     println!("Added goal {:x}", task_ref);
     if let Some(note_ref) = note_ref {
@@ -905,9 +766,7 @@ fn cmd_add(
 }
 
 fn cmd_list(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
+    storage: CompassStorage<'_>,
     status_filter: Vec<String>,
     tag_filter: Vec<String>,
     show_done: bool,
@@ -917,69 +776,32 @@ fn cmd_list(
         validate_short("status", status)?;
     }
 
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        render_board(&mut ws, &space, &status_filter, &tag_filter, show_done);
+    storage.with_view(|space, reader| {
+        render_board(reader, space, &status_filter, &tag_filter, show_done);
         Ok(())
     })
 }
 
 fn cmd_move(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
+    storage: CompassStorage<'_>,
     id: String,
     status: String,
     persona: Option<&str>,
 ) -> Result<()> {
-    let status = normalize_status(status);
-    validate_short("status", &status)?;
-    let resolved = with_repo(pile, |repo| {
-        let by_id = persona.map(|p| resolve_persona_id(repo, p)).transpose()?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        loop {
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-            let task_id = resolve_task_id(&id, &space)?;
-            let now = epoch_interval(now_epoch());
-
-            let status_id = ufoid();
-            let mut change = TribleSet::new();
-            change += ensure_kind_entities(&mut ws)?;
-            change += entity! { &status_id @
-                metadata::tag: &KIND_STATUS_ID,
-                board::task: &task_id,
-                board::status: status.as_str(),
-                board::by?: by_id.as_ref(),
-                metadata::created_at: now,
-            };
-
-            ws.commit(change, "move goal");
-            match repo
-                .try_push(&mut ws)
-                .map_err(|e| anyhow::anyhow!("push status: {e:?}"))?
-            {
-                None => return Ok(task_id),
-                Some(conflict) => ws = conflict,
-            }
-        }
+    let status = compass::canonical_status(status)?;
+    let rendered_status = status.clone();
+    let resolved = storage.update(persona, |space, _reader, by_id| {
+        let task_id = resolve_task_id(&id, space)?;
+        let mut change = compass::kind_catalog_fragment();
+        change += compass::status_fragment(task_id, status, by_id, epoch_interval(now_epoch()))?;
+        Ok((Some(change), task_id))
     })?;
-    println!("Moved goal {:x} to {}", resolved, status);
+    println!("Moved goal {:x} to {}", resolved, rendered_status);
     Ok(())
 }
 
 fn cmd_note(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
+    storage: CompassStorage<'_>,
     id: String,
     note: String,
     tags: Vec<String>,
@@ -987,10 +809,7 @@ fn cmd_note(
     supersedes: Vec<String>,
     persona: Option<&str>,
 ) -> Result<()> {
-    let tags: Vec<String> = tags.into_iter().map(|tag| tag.trim().to_string()).collect();
-    for tag in &tags {
-        validate_short("tag", tag)?;
-    }
+    let tags = compass::canonical_tags(tags)?;
     if let Some(reference) = references
         .iter()
         .find(|reference| reference.trim().is_empty())
@@ -1001,83 +820,58 @@ fn cmd_note(
     references.sort();
     references.dedup();
 
-    let (task_id, note_id) = with_repo(pile, |repo| {
-        let by_id = persona.map(|p| resolve_persona_id(repo, p)).transpose()?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let task_id = resolve_task_id(&id, &space)?;
+    let (task_id, note_id) = storage.update(persona, |space, _reader, by_id| {
+        let task_id = resolve_task_id(&id, space)?;
         let superseded_ids: Vec<Id> = supersedes
             .iter()
-            .map(|input| resolve_note_id(input, &space))
+            .map(|input| resolve_note_id(input, space))
             .collect::<Result<_>>()?;
         let now = epoch_interval(now_epoch());
-
-        let note_id = ufoid();
-        let note_ref = note_id.id;
-        let note_handle = ws.put(note);
-        let reference_handles: Vec<TextHandle> = references
-            .into_iter()
-            .map(|reference| ws.put(reference))
-            .collect();
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-        change += entity! { &note_id @
-            metadata::tag: &KIND_NOTE_ID,
-            board::task: &task_id,
-            board::note: note_handle,
-            board::by?: by_id.as_ref(),
-            board::tag*: tags.iter().map(|tag| tag.as_str()),
-            board::reference*: reference_handles.iter(),
-            metadata::supersedes*: superseded_ids.iter(),
-            metadata::created_at: now,
-        };
-
-        ws.commit(change, "add goal note");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push note: {e:?}"))?;
-        Ok((task_id, note_ref))
+        let note_id = genid().id;
+        let mut change = compass::kind_catalog_fragment();
+        change += compass::note_fragment(
+            note_id,
+            task_id,
+            note,
+            tags,
+            references,
+            superseded_ids,
+            by_id,
+            now,
+        )?;
+        Ok((Some(change), (task_id, note_id)))
     })?;
     println!("Added note {:x} to goal {:x}", note_id, task_id);
     Ok(())
 }
 
-fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let task_id = resolve_task_id(&id, &space)?;
+fn cmd_show(storage: CompassStorage<'_>, id: String) -> Result<()> {
+    storage.with_view(|space, reader| {
+        let task_id = resolve_task_id(&id, space)?;
 
-        let title = task_title(&mut ws, &space, task_id);
+        let title = task_title(reader, space, task_id);
         if title.is_empty() {
             bail!("goal missing");
         }
 
         println!("Goal {:x}", task_id);
         println!("Title: {}", title);
-        if let Some(created) = task_created_at(&space, task_id) {
+        if let Some(created) = task_created_at(space, task_id) {
             println!("Created: {}", format_interval(created));
         }
 
-        if let Some((status, at)) = task_latest_status(&space, task_id) {
+        if let Some((status, at)) = task_latest_status(space, task_id) {
             println!("Status: {} (since {})", status, format_interval(at));
         }
 
-        let tags = task_tags(&space, task_id);
+        let tags = task_tags(space, task_id);
         if !tags.is_empty() {
             println!("Tags: {}", tags.join(", "));
         }
 
-        if let Some(parent_id) = task_parent(&space, task_id) {
+        if let Some(parent_id) = task_parent(space, task_id) {
             let parent_hex = fmt_id(parent_id);
-            let parent_title = task_title(&mut ws, &space, parent_id);
+            let parent_title = task_title(reader, space, parent_id);
             if parent_title.is_empty() {
                 println!("Parent: {parent_hex}");
             } else {
@@ -1088,7 +882,7 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
         // Status history for this task.
         let mut history: Vec<(i128, Id, String, String, Option<Id>)> = find!(
             (event: Id, status: String, at: IntervalValue),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?event @
                 metadata::tag: &KIND_STATUS_ID,
                 board::task: &task_id,
@@ -1102,7 +896,7 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
                 event,
                 format_interval(at),
                 status,
-                event_actor(&space, event),
+                event_actor(space, event),
             )
         })
         .collect();
@@ -1121,7 +915,7 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
         // Notes for this task.
         let mut notes: Vec<NoteRow> = find!(
             (note_id: Id, note_handle: TextHandle, at: IntervalValue),
-            pattern!(&space, [{
+            pattern!(space, [{
                 ?note_id @
                 metadata::tag: &KIND_NOTE_ID,
                 board::task: &task_id,
@@ -1130,15 +924,15 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
             }])
         )
         .filter_map(|(note_id, handle, at)| {
-            read_text(&mut ws, handle).ok().map(|text| NoteRow {
+            read_text(reader, handle).ok().map(|text| NoteRow {
                 id: note_id,
                 text,
                 sort_key: interval_key(at),
                 at: format_interval(at),
-                by: event_actor(&space, note_id),
-                tags: note_tags(&space, note_id),
-                references: note_references(&mut ws, &space, note_id),
-                supersedes: note_supersedes(&space, note_id),
+                by: event_actor(space, note_id),
+                tags: note_tags(space, note_id),
+                references: note_references(reader, space, note_id),
+                supersedes: note_supersedes(space, note_id),
             })
         })
         .collect();
@@ -1202,36 +996,28 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
 }
 
 fn cmd_prioritize(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
+    storage: CompassStorage<'_>,
     higher_input: String,
     lower_input: String,
 ) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let higher_id = resolve_task_id(&higher_input, &space)?;
-        let lower_id = resolve_task_id(&lower_input, &space)?;
+    let (higher_title, lower_title) = storage.update(None, |space, reader, _| {
+        let higher_id = resolve_task_id(&higher_input, space)?;
+        let lower_id = resolve_task_id(&lower_input, space)?;
 
         if higher_id == lower_id {
             bail!("cannot prioritize a goal over itself");
         }
 
         // Build full edge set (explicit + implicit child→parent)
-        let mut edges = active_priority_edges(&space);
-        for id in all_goal_ids(&space) {
-            if let Some(parent) = task_parent(&space, id) {
+        let mut edges = active_priority_edges(space);
+        for id in all_goal_ids(space) {
+            if let Some(parent) = task_parent(space, id) {
                 edges.insert((id, parent));
             }
         }
 
         if would_create_cycle(&edges, higher_id, lower_id) {
-            let paths = parent_paths(&space)?;
+            let paths = parent_paths(space)?;
             if is_ancestor(&paths, higher_id, lower_id) || is_ancestor(&paths, lower_id, higher_id)
             {
                 bail!("children are implicitly prioritized over their parents");
@@ -1239,92 +1025,103 @@ fn cmd_prioritize(
             bail!("would create a priority cycle");
         }
 
-        let now = epoch_interval(now_epoch());
-        let evt_id = ufoid();
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-        change += entity! { &evt_id @
-            metadata::tag: &KIND_PRIORITIZE_ID,
-            board::higher: &higher_id,
-            board::lower: &lower_id,
-            metadata::created_at: now,
-        };
-
-        ws.commit(change, "prioritize goal");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-
-        let h_title = task_title(&mut ws, &space, higher_id);
-        let l_title = task_title(&mut ws, &space, lower_id);
-        println!(
-            "{} > {}",
-            if h_title.is_empty() { "?" } else { &h_title },
-            if l_title.is_empty() { "?" } else { &l_title }
-        );
-        Ok(())
-    })
+        let mut change = compass::kind_catalog_fragment();
+        change +=
+            compass::priority_fragment(higher_id, lower_id, true, epoch_interval(now_epoch()));
+        Ok((
+            Some(change),
+            (
+                task_title(reader, space, higher_id),
+                task_title(reader, space, lower_id),
+            ),
+        ))
+    })?;
+    println!(
+        "{} > {}",
+        if higher_title.is_empty() {
+            "?"
+        } else {
+            &higher_title
+        },
+        if lower_title.is_empty() {
+            "?"
+        } else {
+            &lower_title
+        }
+    );
+    Ok(())
 }
 
 fn cmd_deprioritize(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
+    storage: CompassStorage<'_>,
     higher_input: String,
     lower_input: String,
 ) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let higher_id = resolve_task_id(&higher_input, &space)?;
-        let lower_id = resolve_task_id(&lower_input, &space)?;
+    let (higher_title, lower_title) = storage.update(None, |space, reader, _| {
+        let higher_id = resolve_task_id(&higher_input, space)?;
+        let lower_id = resolve_task_id(&lower_input, space)?;
 
-        let edges = active_priority_edges(&space);
+        let edges = active_priority_edges(space);
         if !edges.contains(&(higher_id, lower_id)) {
             bail!("no active priority relationship between these goals");
         }
 
-        let now = epoch_interval(now_epoch());
-        let evt_id = ufoid();
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-        change += entity! { &evt_id @
-            metadata::tag: &KIND_DEPRIORITIZE_ID,
-            board::higher: &higher_id,
-            board::lower: &lower_id,
-            metadata::created_at: now,
-        };
+        let mut change = compass::kind_catalog_fragment();
+        change +=
+            compass::priority_fragment(higher_id, lower_id, false, epoch_interval(now_epoch()));
+        Ok((
+            Some(change),
+            (
+                task_title(reader, space, higher_id),
+                task_title(reader, space, lower_id),
+            ),
+        ))
+    })?;
+    println!(
+        "Removed: {} > {}",
+        if higher_title.is_empty() {
+            "?"
+        } else {
+            &higher_title
+        },
+        if lower_title.is_empty() {
+            "?"
+        } else {
+            &lower_title
+        }
+    );
+    Ok(())
+}
 
-        ws.commit(change, "deprioritize goal");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-
-        let h_title = task_title(&mut ws, &space, higher_id);
-        let l_title = task_title(&mut ws, &space, lower_id);
-        println!(
-            "Removed: {} > {}",
-            if h_title.is_empty() { "?" } else { &h_title },
-            if l_title.is_empty() { "?" } else { &l_title }
-        );
+fn cmd_resolve(storage: CompassStorage<'_>, prefix: String) -> Result<()> {
+    storage.with_view(|space, _reader| {
+        let id = resolve_task_id(&prefix, space)?;
+        println!("{:x}", id);
         Ok(())
     })
 }
 
-fn cmd_resolve(pile: &Path, _branch_name: &str, branch_id: Id, prefix: String) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let id = resolve_task_id(&prefix, &space)?;
-        println!("{:x}", id);
-        Ok(())
-    })
+fn cmd_migrate_legacy(storage: CompassStorage<'_>) -> Result<()> {
+    load_signer(storage.pile, storage.key)?;
+    let existing = storage.with_view(|facts, _| Ok(facts.clone()))?;
+    let source = freeze_source(storage.pile).context("freeze legacy Compass source")?;
+    let plan = compass_cutover::plan(&source)?;
+    let mut expected = existing;
+    expected += plan.original_facts().clone();
+
+    let commits = compass_cutover::publish(&source, &plan, storage.pile, storage.key)?;
+    let actual = storage.with_view(|facts, _| Ok(facts.clone()))?;
+    if actual != expected {
+        bail!("Compass migration result is not prior native value union legacy facts");
+    }
+    println!(
+        "migrated {} authored Compass commit{} ({} facts)",
+        commits.len(),
+        if commits.len() == 1 { "" } else { "s" },
+        plan.report().facts,
+    );
+    println!("legacy branch retained; native commands no longer consult it");
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -1335,14 +1132,10 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
-    let branch_id = with_repo(&cli.pile, |repo| {
-        if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"));
-        }
-        repo.ensure_branch(&cli.branch, None)
-            .map_err(|e| anyhow::anyhow!("ensure branch '{}': {e:?}", cli.branch))
-    })?;
+    let storage = CompassStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+    };
 
     match cmd {
         Command::Add {
@@ -1358,9 +1151,7 @@ fn main() -> Result<()> {
                 .map(|value| faculties::text_arg(value, "goal note"))
                 .transpose()?;
             cmd_add(
-                &cli.pile,
-                &cli.branch,
-                branch_id,
+                storage,
                 title,
                 status,
                 parent,
@@ -1369,17 +1160,8 @@ fn main() -> Result<()> {
                 cli.persona.as_deref(),
             )
         }
-        Command::List { status, tag, all } => {
-            cmd_list(&cli.pile, &cli.branch, branch_id, status, tag, all)
-        }
-        Command::Move { id, status } => cmd_move(
-            &cli.pile,
-            &cli.branch,
-            branch_id,
-            id,
-            status,
-            cli.persona.as_deref(),
-        ),
+        Command::List { status, tag, all } => cmd_list(storage, status, tag, all),
+        Command::Move { id, status } => cmd_move(storage, id, status, cli.persona.as_deref()),
         Command::Note {
             id,
             note,
@@ -1389,9 +1171,7 @@ fn main() -> Result<()> {
         } => {
             let note = faculties::text_arg(&note, "goal note")?;
             cmd_note(
-                &cli.pile,
-                &cli.branch,
-                branch_id,
+                storage,
                 id,
                 note,
                 tag,
@@ -1400,20 +1180,42 @@ fn main() -> Result<()> {
                 cli.persona.as_deref(),
             )
         }
-        Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
-        Command::Prioritize { higher, over } => {
-            cmd_prioritize(&cli.pile, &cli.branch, branch_id, higher, over)
-        }
-        Command::Deprioritize { higher, over } => {
-            cmd_deprioritize(&cli.pile, &cli.branch, branch_id, higher, over)
-        }
-        Command::Resolve { prefix } => cmd_resolve(&cli.pile, &cli.branch, branch_id, prefix),
+        Command::Show { id } => cmd_show(storage, id),
+        Command::Prioritize { higher, over } => cmd_prioritize(storage, higher, over),
+        Command::Deprioritize { higher, over } => cmd_deprioritize(storage, higher, over),
+        Command::Resolve { prefix } => cmd_resolve(storage, prefix),
+        Command::MigrateLegacy => cmd_migrate_legacy(storage),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faculties::collection_cutover::initialize_signer;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let serial = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "faculties-compass-cli-{}-{serial}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn parent_paths_preserve_reflexive_and_transitive_ancestry() {
@@ -1446,5 +1248,49 @@ mod tests {
     #[test]
     fn dangling_markdown_link_is_not_a_reference_or_a_panic() {
         assert!(extract_reference_values("unfinished ](").is_empty());
+    }
+
+    #[test]
+    fn native_actions_accumulate_and_reads_do_not_write() {
+        let directory = TestDirectory::new();
+        let pile = directory.0.join("compass.pile");
+        let key = directory.0.join("compass.key");
+        std::fs::File::create(&pile).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let storage = CompassStorage {
+            pile: &pile,
+            key: Some(&key),
+        };
+
+        cmd_add(
+            storage,
+            "A native goal".to_owned(),
+            "todo".to_owned(),
+            None,
+            vec!["test".to_owned()],
+            Some("first note".to_owned()),
+            None,
+        )
+        .unwrap();
+        let goal = storage
+            .with_view(|facts, _| Ok(*compass::goal_ids(facts).iter().next().unwrap()))
+            .unwrap();
+
+        let before = std::fs::metadata(&pile).unwrap().len();
+        cmd_list(storage, vec![], vec![], true).unwrap();
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), before);
+
+        cmd_move(storage, format!("{goal:x}"), "doing".to_owned(), None).unwrap();
+        storage
+            .with_view(|facts, _| {
+                assert_eq!(
+                    latest_status_event(facts, goal)
+                        .map(|(_, value, _)| value)
+                        .as_deref(),
+                    Some("doing")
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 }

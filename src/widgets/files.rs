@@ -1,6 +1,6 @@
 //! Read-only GORBIE-embeddable viewer for the `files` faculty.
 //!
-//! The Files collection can hold tens of thousands of intrinsic file records
+//! The files branch can hold tens of thousands of intrinsic file records
 //! backed by content-addressed blobs — far too many to render as cards. This widget
 //! instead focuses on **imports** (`KIND_IMPORT` entities), which
 //! are the meaningful "I brought a file/directory in at this time"
@@ -23,10 +23,10 @@
 //!
 //! ```ignore
 //! let mut panel = FilesViewer::default();
-//! panel.render(ctx, files_view);
+//! panel.render(ctx, files_ws);
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc};
 use hifitime::Epoch;
@@ -36,20 +36,11 @@ use GORBIE::themes::colorhash;
 
 use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
-use triblespace::prelude::View;
+use triblespace::prelude::blobencodings::RawBytes;
 
-use crate::schemas::files::{file as file_attrs, KIND_IMPORT};
-use crate::widgets::storage::{FilesRevision, FilesView};
-
-type TextHandle = Inline<Handle<LongString>>;
-type FileHandle = Inline<Handle<RawBytes>>;
+use crate::files::{FilesCatalog, NodeRecord};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 /// Cap on the number of import cards rendered. Older imports remain
 /// in the pile; the `files imports` CLI is the right tool for long
@@ -93,9 +84,9 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 #[derive(Clone, Debug)]
 struct ImportRow {
     id: Id,
-    imported_at: Option<DateTime<Utc>>,
-    source_path: Option<String>,
-    root: Option<Id>,
+    imported_at: DateTime<Utc>,
+    source_path: String,
+    root: Id,
     tags: Vec<String>,
     /// True when another import already exists for the same
     /// `source_path` — likely a re-ingest of the same artefact.
@@ -105,143 +96,89 @@ struct ImportRow {
 }
 
 struct FilesLive {
-    cached_revision: FilesRevision,
+    cached_revision: DatasetRevision,
     imports: Vec<ImportRow>,
     total: usize,
-    /// Retained fact space so click-time actions (opening a card's
-    /// root file/directory) can resolve names/content/children
-    /// without a re-checkout. TribleSet is six PATCH root pointers —
-    /// keeping it is cheap.
-    space: TribleSet,
+    catalog: Option<FilesCatalog>,
+    diagnostic: Option<String>,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl FilesLive {
-    fn refresh(view: FilesView<'_>) -> Self {
-        let space = view.facts.clone();
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        match Self::load(dataset) {
+            Ok(live) => live,
+            Err(error) => FilesLive {
+                cached_revision: dataset.revision,
+                imports: Vec::new(),
+                total: 0,
+                catalog: None,
+                diagnostic: Some(format!("Files projection is invalid: {error:#}")),
+            },
+        }
+    }
 
-        let mut by_id: HashMap<Id, ImportRow> = HashMap::new();
-
-        // Enumerate KIND_IMPORT entities + their imported_at (we want
-        // to sort by it). The Inline<NsTAIInterval> projects as a
-        // (Epoch, Epoch) tuple in 0.44.
-        for (id,) in find!(
-            (id: Id,),
-            pattern!(&space, [{ ?id @ metadata::tag: KIND_IMPORT }])
-        ) {
-            by_id.insert(
-                id,
-                ImportRow {
-                    id,
-                    imported_at: None,
-                    source_path: None,
-                    root: None,
-                    tags: Vec::new(),
+    fn load(dataset: DatasetView<'_>) -> anyhow::Result<Self> {
+        let catalog = crate::files::load_catalog(dataset.reader, dataset.facts)?;
+        let mut imports = catalog
+            .imports()
+            .map(|record| {
+                Ok(ImportRow {
+                    id: record.id,
+                    imported_at: epoch_to_chrono(record.imported_at)?,
+                    source_path: record.source_path.clone(),
+                    root: record.root,
+                    tags: record.tags.clone(),
                     is_reimport: false,
-                },
-            );
-        }
-        let total = by_id.len();
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let total = imports.len();
 
-        // imported_at time interval.
-        for (id, range) in find!(
-            (id: Id, t: (Epoch, Epoch)),
-            pattern!(&space, [{ ?id @ file_attrs::imported_at: ?t }])
-        ) {
-            if let Some(row) = by_id.get_mut(&id) {
-                let (start, _end) = range;
-                row.imported_at = Some(epoch_to_chrono(start));
-            }
+        // Re-import is a set property. No traversal order establishes which
+        // import was "first" or which one supersedes another.
+        let mut path_counts = BTreeMap::<&str, usize>::new();
+        for row in &imports {
+            *path_counts.entry(&row.source_path).or_insert(0) += 1;
         }
-
-        // Source path — a Handle<LongString>, dereferenced via the collection
-        // reader on
-        // demand. Reading text per import is cheap because there's
-        // usually a handful of imports per pile (vs. tens of
-        // thousands of files).
-        let path_rows: Vec<(Id, TextHandle)> = find!(
-            (id: Id, h: TextHandle),
-            pattern!(&space, [{ ?id @ file_attrs::source_path: ?h }])
-        )
-        .collect();
-        for (id, h) in path_rows {
-            if let Some(row) = by_id.get_mut(&id) {
-                row.source_path = read_text(view, h);
-            }
-        }
-
-        // Root file/directory entity pointer.
-        for (id, root) in find!(
-            (id: Id, r: Id),
-            pattern!(&space, [{ ?id @ file_attrs::root: ?r }])
-        ) {
-            if let Some(row) = by_id.get_mut(&id) {
-                row.root = Some(root);
-            }
-        }
-
-        // Tags (multi-valued ShortString). Each import can carry
-        // any number, and we collect them all to render as chips.
-        for (id, tag) in find!(
-            (id: Id, t: String),
-            pattern!(&space, [{ ?id @ file_attrs::tag: ?t }])
-        ) {
-            if let Some(row) = by_id.get_mut(&id) {
-                row.tags.push(tag);
-            }
-        }
-        for row in by_id.values_mut() {
-            row.tags.sort();
-            row.tags.dedup();
-        }
-
-        // Mark re-imports — same source_path as another import. A
-        // single-pass HashSet is enough; we don't care which one
-        // was first, just that any duplicate exists.
-        let mut path_counts: HashMap<&str, usize> = HashMap::new();
-        for row in by_id.values() {
-            if let Some(p) = row.source_path.as_deref() {
-                *path_counts.entry(p).or_insert(0) += 1;
-            }
-        }
-        let dup_paths: HashSet<String> = path_counts
+        let duplicate_paths = path_counts
             .into_iter()
-            .filter_map(|(p, c)| (c > 1).then(|| p.to_string()))
-            .collect();
-        for row in by_id.values_mut() {
-            if let Some(p) = row.source_path.as_deref() {
-                row.is_reimport = dup_paths.contains(p);
-            }
+            .filter_map(|(path, count)| (count > 1).then_some(path.to_owned()))
+            .collect::<BTreeSet<_>>();
+        for row in &mut imports {
+            row.is_reimport = duplicate_paths.contains(&row.source_path);
         }
 
-        // Sort newest first, then clamp to MAX_IMPORTS so a long
-        // history doesn't blow up the card count.
-        let mut imports: Vec<ImportRow> = by_id.into_values().collect();
+        // Time orders independent import cards for presentation only; it
+        // never arbitrates competing values because the catalog rejected
+        // those before this point.
         imports.sort_by(|a, b| b.imported_at.cmp(&a.imported_at).then(b.id.cmp(&a.id)));
         imports.truncate(MAX_IMPORTS);
 
-        FilesLive {
-            cached_revision: view.revision,
+        Ok(FilesLive {
+            cached_revision: dataset.revision,
             imports,
             total,
-            space,
-        }
+            catalog: Some(catalog),
+            diagnostic: None,
+        })
     }
 }
 
-fn epoch_to_chrono(e: Epoch) -> DateTime<Utc> {
+fn epoch_to_chrono(e: Epoch) -> anyhow::Result<DateTime<Utc>> {
     let secs = e.to_unix_seconds();
-    Utc.timestamp_opt(secs as i64, ((secs.fract() * 1e9) as u32).min(999_999_999))
+    if !secs.is_finite() {
+        anyhow::bail!("Files timestamp is not finite");
+    }
+    let whole = secs.floor();
+    if whole < i64::MIN as f64 || whole > i64::MAX as f64 {
+        anyhow::bail!("Files timestamp is outside the displayable UTC range");
+    }
+    let nanos = ((secs - whole) * 1e9).round().clamp(0.0, 999_999_999.0) as u32;
+    Utc.timestamp_opt(whole as i64, nanos)
         .single()
-        .unwrap_or_else(Utc::now)
-}
-
-fn read_text(view: FilesView<'_>, h: TextHandle) -> Option<String> {
-    view.reader.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+        .ok_or_else(|| anyhow::anyhow!("Files timestamp is outside the displayable UTC range"))
 }
 
 fn id_hex(id: Id) -> String {
@@ -315,20 +252,20 @@ impl FilesViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, view: FilesView<'_>) {
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_revision != view.revision,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(FilesLive::refresh(view));
+            self.live = Some(FilesLive::refresh(dataset));
         }
 
         // Click-time action: open the import's root file/directory.
         // The card's OPEN button only sets this request; the actual
         // blob extraction happens after the section closure ends, when
         // the immutable `live` borrow has been released and we can use
-        // collection reader for blob reads again.
+        // the dataset reader for blob reads again.
         let mut open_root: Option<Id> = None;
 
         ctx.section("Files", |ctx| {
@@ -337,12 +274,16 @@ impl FilesViewer {
             };
 
             ctx.grid(|g| {
+                if let Some(diagnostic) = &live.diagnostic {
+                    g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
+                    return;
+                }
                 let shown = live.imports.len();
                 let now = Utc::now();
                 let newest_age = live
                     .imports
                     .first()
-                    .and_then(|r| r.imported_at)
+                    .map(|r| r.imported_at)
                     .map(|t| age_label(now, t));
 
                 g.full(|ctx| {
@@ -400,7 +341,9 @@ impl FilesViewer {
 
         if let Some(root) = open_root {
             if let Some(live) = self.live.as_ref() {
-                open_entity(view, &live.space, root);
+                if let Some(catalog) = live.catalog.as_ref() {
+                    open_entity(dataset, catalog, root);
+                }
             }
         }
     }
@@ -411,13 +354,13 @@ impl FilesViewer {
 /// result — same flow the wiki widget uses for `files:` links, but
 /// extended to handle directory roots by recursing through
 /// `file::children`. Best-effort: errors log to stderr.
-fn open_entity(view: FilesView<'_>, space: &TribleSet, entity_id: Id) {
+fn open_entity(dataset: DatasetView<'_>, catalog: &FilesCatalog, entity_id: Id) {
     let tmp_dir = std::env::temp_dir().join("faculties-files");
     if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
         eprintln!("[files] mkdir {}: {e}", tmp_dir.display());
         return;
     }
-    match extract_tree(view, space, entity_id, &tmp_dir, 0) {
+    match extract_tree(dataset, catalog, entity_id, &tmp_dir, 0) {
         Ok(path) => {
             eprintln!("[files] opening: {}", path.display());
             let _ = std::process::Command::new("open").arg(&path).spawn();
@@ -433,8 +376,8 @@ fn open_entity(view: FilesView<'_>, space: &TribleSet, entity_id: Id) {
 /// as a cycle guard — the files faculty never writes cyclic trees,
 /// but a corrupted pile shouldn't be able to hang the viewer.
 fn extract_tree(
-    view: FilesView<'_>,
-    space: &TribleSet,
+    dataset: DatasetView<'_>,
+    catalog: &FilesCatalog,
     entity_id: Id,
     dest: &std::path::Path,
     depth: u32,
@@ -443,53 +386,32 @@ fn extract_tree(
         return Err(format!("max depth exceeded at {}", id_hex(entity_id)));
     }
 
-    let name = find!(
-        h: TextHandle,
-        pattern!(space, [{ entity_id @ file_attrs::name: ?h }])
-    )
-    .next()
-    .and_then(|h| read_text(view, h))
-    .unwrap_or_else(|| short_hex_name(entity_id));
-
-    // File leaf: has a content blob.
-    if let Some(content) = find!(
-        h: FileHandle,
-        pattern!(space, [{ entity_id @ file_attrs::content: ?h }])
-    )
-    .next()
+    match catalog
+        .node(entity_id)
+        .ok_or_else(|| format!("unknown Files node {}", id_hex(entity_id)))?
     {
-        let blob: Blob<RawBytes> = view
-            .reader
-            .get(content)
-            .map_err(|e| format!("get blob for {name}: {e:?}"))?;
-        let path = dest.join(&name);
-        std::fs::write(&path, &*blob.bytes).map_err(|e| format!("write {name}: {e}"))?;
-        return Ok(path);
-    }
-
-    // Directory: create and recurse. An entity with neither content
-    // nor children still materialises as an empty directory — that's
-    // the honest representation of what's in the pile.
-    let dir = dest.join(&name);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {name}: {e}"))?;
-    let children: Vec<Id> = find!(
-        c: Id,
-        pattern!(space, [{ entity_id @ file_attrs::children: ?c }])
-    )
-    .collect();
-    for child in children {
-        // Best-effort per child: one unreadable blob shouldn't kill
-        // the rest of the tree.
-        if let Err(e) = extract_tree(view, space, child, &dir, depth + 1) {
-            eprintln!("[files] skipping child: {e}");
+        NodeRecord::File(file) => {
+            let blob: Blob<RawBytes> = dataset
+                .reader
+                .get(file.content)
+                .map_err(|e| format!("get blob for {}: {e:?}", file.name))?;
+            let path = dest.join(&file.name);
+            std::fs::write(&path, &*blob.bytes).map_err(|e| format!("write {}: {e}", file.name))?;
+            Ok(path)
+        }
+        NodeRecord::Directory(directory) => {
+            let dir = dest.join(&directory.name);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", directory.name))?;
+            for child in &directory.children {
+                // Residency and structure were validated atomically. A later
+                // OS write failure remains local to that child.
+                if let Err(e) = extract_tree(dataset, catalog, *child, &dir, depth + 1) {
+                    eprintln!("[files] skipping child: {e}");
+                }
+            }
+            Ok(dir)
         }
     }
-    Ok(dir)
-}
-
-fn short_hex_name(id: Id) -> String {
-    let s = format!("{id:x}");
-    s.chars().take(8).collect()
 }
 
 // ── Import card ──────────────────────────────────────────────────────
@@ -536,26 +458,23 @@ fn render_import_card(
                     ui.spacing_mut().item_spacing.y = 2.0;
 
                     ui.horizontal(|ui| {
-                        let header = match row.imported_at {
-                            Some(t) => {
-                                format!("{} · {}", format_date(t.date_naive()), format_time(t),)
-                            }
-                            None => "(no timestamp)".to_string(),
-                        };
+                        let header = format!(
+                            "{} · {}",
+                            format_date(row.imported_at.date_naive()),
+                            format_time(row.imported_at),
+                        );
                         ui.label(
                             egui::RichText::new(header)
                                 .monospace()
                                 .strong()
                                 .color(text_on_accent),
                         );
-                        if let Some(t) = row.imported_at {
-                            ui.label(
-                                egui::RichText::new(format!("· {}", age_label(now, t)))
-                                    .monospace()
-                                    .small()
-                                    .color(text_on_accent),
-                            );
-                        }
+                        ui.label(
+                            egui::RichText::new(format!("· {}", age_label(now, row.imported_at)))
+                                .monospace()
+                                .small()
+                                .color(text_on_accent),
+                        );
                         if row.is_reimport {
                             ui.label(
                                 egui::RichText::new("· RE-IMPORT")
@@ -572,34 +491,30 @@ fn render_import_card(
                         // wiki widget's files:-link behaviour.
                         // `Align::Min` cross-axis: Center would feed
                         // the frame-delayed cell-sizing loop.
-                        if row.root.is_some() {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                let btn = ui.add(
-                                    egui::Button::new(
-                                        egui::RichText::new("OPEN \u{2197}") // ↗
-                                            .monospace()
-                                            .small()
-                                            .strong(),
-                                    )
-                                    .min_size(egui::vec2(56.0, 18.0)),
-                                );
-                                if btn.clicked() {
-                                    *open_root = row.root;
-                                }
-                            });
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            let btn = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new("OPEN \u{2197}") // ↗
+                                        .monospace()
+                                        .small()
+                                        .strong(),
+                                )
+                                .min_size(egui::vec2(56.0, 18.0)),
+                            );
+                            if btn.clicked() {
+                                *open_root = Some(row.root);
+                            }
+                        });
                     });
 
                     // Source path is the most useful identifier for
                     // an import — emphasise it as the card title.
-                    if let Some(path) = row.source_path.as_ref() {
-                        ui.label(
-                            egui::RichText::new(shorten_path(path))
-                                .monospace()
-                                .size(14.0)
-                                .color(text_on_accent),
-                        );
-                    }
+                    ui.label(
+                        egui::RichText::new(shorten_path(&row.source_path))
+                            .monospace()
+                            .size(14.0)
+                            .color(text_on_accent),
+                    );
                 });
 
             // ── Body: tags + ids ──
@@ -620,14 +535,12 @@ fn render_import_card(
                     // shortened heading but with every component
                     // visible (useful when the leading tmp/var/folders
                     // bit matters).
-                    if let Some(path) = row.source_path.as_ref() {
-                        ui.label(
-                            egui::RichText::new(path)
-                                .monospace()
-                                .small()
-                                .color(body_muted),
-                        );
-                    }
+                    ui.label(
+                        egui::RichText::new(&row.source_path)
+                            .monospace()
+                            .small()
+                            .color(body_muted),
+                    );
 
                     if !row.tags.is_empty() {
                         ui.horizontal_wrapped(|ui| {
@@ -641,10 +554,7 @@ fn render_import_card(
                     // Two ids at the bottom: the import entity itself
                     // and its root file/directory pointer. Mono small
                     // so they stay reachable without dominating.
-                    let mut footer = format!("IMPORT {}", id_hex(row.id));
-                    if let Some(r) = row.root {
-                        footer.push_str(&format!(" · ROOT {}", id_hex(r)));
-                    }
+                    let footer = format!("IMPORT {} · ROOT {}", id_hex(row.id), id_hex(row.root));
                     ui.label(
                         egui::RichText::new(footer)
                             .monospace()
@@ -669,6 +579,27 @@ fn render_tag_chip(ui: &mut egui::Ui, label: &str) {
                     .small()
                     .strong()
                     .color(text),
+            );
+        });
+}
+
+fn render_diagnostic(ui: &mut egui::Ui, diagnostic: &str) {
+    let color = ui.visuals().error_fg_color;
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            28,
+        ))
+        .stroke(egui::Stroke::new(1.0, color))
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(diagnostic)
+                    .monospace()
+                    .small()
+                    .color(color),
             );
         });
 }

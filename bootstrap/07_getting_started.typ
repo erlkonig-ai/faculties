@@ -4,6 +4,11 @@ Welcome. You're an AI agent landing in this workspace for the
 first time. This fragment walks you through orienting yourself
 and starting to do work.
 
+Re-running the same portable-bootstrap generation is an exact replay. A later
+generation advances only the recognizable imported source strand of each
+onboarding entry; edits you made remain visible as frontier forks and must be
+reconciled explicitly.
+
 == Step 1: orient your environment (10 min)
 
   + `ls $(dirname $(which wiki))` — see what faculties exist
@@ -95,13 +100,13 @@ fragments by id and title. The set covers two shapes:
   - [Recipe: Multi-Agent Coordination](wiki:45e1b9bef3ad9836536ab7bce367deb0) — relations +
     message + orient + compass for two-agent handoffs
     without race conditions or silent drops
-  - [Harness Hooks: Mechanical Colony Sync](wiki:5c86df3dcd5994de2967483fca7170ac) — watcher +
+  - [Harness Hooks: Mechanical Agent Sync](wiki:5c86df3dcd5994de2967483fca7170ac) — watcher +
     poll + turn-end enforcement per harness (Claude Code,
     Codex, Antigravity); models have no internal clock, so
     coordination is hook-enforced, not remembered
   - [Recipe: Auth Setup for a Multi-Agent Team](wiki:d06247b9d9183721e47a2940806e5d7f) — `trible
-    team` + `pile net` for bootstrapping capability auth
-    across two machines so the relay accepts both peers
+    team` + `pile net` capability auth for the current legacy-head/blob
+    transport; native collection-record transport remains unfinished
 
 *Substrate concepts* — the in-depth "why does this work"
 layer. Not needed for day-one productivity; read when you
@@ -109,17 +114,17 @@ want to understand what's underneath the faculties:
 
   - [Substrate 1/4: What Is a Trible](wiki:4e19893b36bf37d471bb9ea968edac20) — 64-byte
     content-addressable facts
-  - [Substrate 2/4: The Pile](wiki:5232ea531fedfcb17bf15e88c3d52a36) — one append-only file,
-    nothing ever deleted
-  - [Substrate 3/4: Monotonic Merge](wiki:5cc10e2b0263008b261cf8a1ef30bd8c) — why N peers sync
-    without conflicts, by construction
+  - [Substrate 2/4: The Pile](wiki:5232ea531fedfcb17bf15e88c3d52a36) — append-only publication,
+    explicit conservative retention and repair
+  - [Substrate 3/4: Monotonic Merge](wiki:5cc10e2b0263008b261cf8a1ef30bd8c) — why independently
+    extended native pile states converge once exchanged
   - [Substrate 4/4: The Architecture — Zero Sync Code](wiki:6e5f38bdfd589cd0359bf668d1af9841)
     — agents, faculties, workspace, substrate: why no faculty
     contains sync code
 
 Read the foundations in any order; each stands alone. Tool
 Selection is the densest if you want a single-page reference.
-For "where was I?" at session start, run `orient show`
-before reading anything.
+At session start or after compaction, run `orient wake` to recover the whole
+self. Use `orient show` for the smaller mid-session situation snapshot.
 
 Next stop: [How Faculties Work](wiki:25e8f009e33207755109f19f7a68dff5).

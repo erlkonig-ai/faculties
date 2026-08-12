@@ -1,13 +1,11 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::reason::{reason_schema, DEFAULT_BRANCH, KIND_REASON_ID};
+use faculties::cognition;
 use hifitime::Epoch;
-use rand_core::OsRng;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
-use triblespace::core::repo::Repository;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -20,12 +18,10 @@ struct Cli {
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Target branch name for reason events.
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
-    /// Target branch id for reason events (hex). Overrides ensure_branch.
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it;
+    /// initialize explicitly with `trible pile signing-key init <pile>`.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     /// Turn id to annotate (hex). Defaults to $TURN_ID.
     #[arg(long)]
     turn_id: Option<String>,
@@ -39,12 +35,7 @@ struct Cli {
     )]
     text: Option<String>,
     /// Optional command to run after logging the reason (pass after `--`).
-    #[arg(
-        value_name = "COMMAND",
-        trailing_var_arg = true,
-        allow_hyphen_values = true,
-        last = true
-    )]
+    #[arg(value_name = "COMMAND", allow_hyphen_values = true, last = true)]
     command: Vec<String>,
 }
 
@@ -70,83 +61,55 @@ fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
     Ok(Some(id))
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))
+#[derive(Clone, Copy)]
+struct ReasonStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
 }
 
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
+fn publish_reason(
+    storage: ReasonStorage<'_>,
+    turn_id: Option<Id>,
+    worker_id: Option<Id>,
+    text: &str,
+    command_text: Option<&str>,
+    created_at: Inline<inlineencodings::NsTAIInterval>,
+) -> Result<(Id, CollectionCommit)> {
+    let (event_id, event) =
+        described_reason_fragment(turn_id, worker_id, text, command_text, created_at);
+    let commit = cognition::publish_event(storage.pile, storage.key, event)?;
+    Ok((event_id, commit))
 }
 
-fn resolve_branch_id(
-    repo: &mut Repository<Pile>,
-    explicit_hex: Option<&str>,
-    branch_name: &str,
-) -> Result<Id> {
-    if let Some(hex) = explicit_hex {
-        return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
-    }
-    if let Ok(hex) = std::env::var("TRIBLESPACE_BRANCH_ID") {
-        return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID"));
-    }
-    repo.ensure_branch(branch_name, None)
-        .map_err(|e| anyhow!("ensure {branch_name} branch: {e:?}"))
+fn described_reason_fragment(
+    turn_id: Option<Id>,
+    worker_id: Option<Id>,
+    text: &str,
+    command_text: Option<&str>,
+    created_at: Inline<inlineencodings::NsTAIInterval>,
+) -> (Id, Fragment) {
+    let mut event = cognition::reason_fragment(turn_id, worker_id, text, command_text, created_at);
+    let event_id = event.root().expect("reason event has one intrinsic root");
+    event.describe_with(entity! { metadata::description: "reason".to_owned() });
+    (event_id, event)
 }
 
 fn append_reason(
-    pile: &Path,
-    branch_id: Id,
+    storage: ReasonStorage<'_>,
     turn_id: Option<Id>,
     worker_id: Option<Id>,
     text: &str,
     command_text: Option<&str>,
 ) -> Result<Id> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-
-        let reason_id = ufoid();
-        let now = epoch_interval(now_epoch());
-        let text_handle = ws.put(text.to_string());
-        let command_handle = command_text.map(|cmd| ws.put(cmd.to_string()));
-        let change = entity! { &reason_id @
-            metadata::tag: &KIND_REASON_ID,
-            reason_schema::text: text_handle,
-            metadata::created_at: now,
-            reason_schema::about_turn?: turn_id,
-            reason_schema::worker?: worker_id,
-            reason_schema::command_text?: command_handle,
-        };
-        ws.commit(change, "reason");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push reason: {e:?}"))?;
-        Ok(*reason_id)
-    })
+    publish_reason(
+        storage,
+        turn_id,
+        worker_id,
+        text,
+        command_text,
+        epoch_interval(now_epoch()),
+    )
+    .map(|(event, _)| event)
 }
 
 fn shell_quote(word: &str) -> String {
@@ -179,7 +142,6 @@ fn run_command(command: &[String]) -> Result<i32> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let pile_path = cli.pile.clone();
 
     let Some(text_raw) = cli.text.as_ref() else {
         let mut cmd = Cli::command();
@@ -192,10 +154,6 @@ fn main() -> Result<()> {
     let env_turn_id = std::env::var("TURN_ID").ok();
     let env_worker_id = std::env::var("WORKER_ID").ok();
 
-    let branch_id = with_repo(&pile_path, |repo| {
-        resolve_branch_id(repo, cli.branch_id.as_deref(), &cli.branch)
-    })?;
-
     let turn_id =
         parse_optional_hex_id(cli.turn_id.as_deref().or(env_turn_id.as_deref()), "turn id")?;
     let worker_id = parse_optional_hex_id(
@@ -207,24 +165,200 @@ fn main() -> Result<()> {
         bail!("reason text is empty");
     }
 
+    let storage = ReasonStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+    };
+
     if cli.command.is_empty() {
-        let reason_id = append_reason(&pile_path, branch_id, turn_id, worker_id, &text, None)?;
+        let reason_id = append_reason(storage, turn_id, worker_id, &text, None)?;
         println!("reason_id: {reason_id:x}");
         return Ok(());
     }
 
     let command_text = render_command(&cli.command);
-    let reason_id = append_reason(&pile_path, branch_id, turn_id, worker_id, &text, None)?;
-    let action_event_id = append_reason(
-        &pile_path,
-        branch_id,
+    let created_at = epoch_interval(now_epoch());
+    let (reason_id, reason_event) =
+        described_reason_fragment(turn_id, worker_id, &text, None, created_at);
+    let (action_event_id, action_event) = described_reason_fragment(
         turn_id,
         worker_id,
         command_text.as_str(),
         Some(command_text.as_str()),
-    )?;
+        created_at,
+    );
+    cognition::publish_events(storage.pile, storage.key, [reason_event, action_event])?;
     eprintln!("reason_id: {reason_id:x}");
     eprintln!("reason_action_id: {action_event_id:x}");
     let exit_code = run_command(&cli.command)?;
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use anybytes::View;
+    use ed25519_dalek::SigningKey;
+    use faculties::collection_cutover::{initialize_signer, load_signer, open_pile_strict};
+    use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
+    use faculties::schemas::reason::{reason_schema, KIND_REASON_ID};
+    use std::fs::File;
+    use triblespace::core::collection::Collection;
+    use triblespace::core::repo::BlobStore;
+    use triblespace::core::repo::{PinStore, Repository};
+
+    type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    fn test_id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn at_unix(seconds: f64) -> Inline<inlineencodings::NsTAIInterval> {
+        epoch_interval(Epoch::from_unix_seconds(seconds))
+    }
+
+    fn pin_head(
+        pile_path: &Path,
+        branch: Id,
+    ) -> Inline<inlineencodings::Handle<blobencodings::SimpleArchive>> {
+        let mut pile = open_pile_strict(pile_path).unwrap();
+        let head = pile.head(branch).unwrap().unwrap();
+        pile.close().unwrap();
+        head
+    }
+
+    #[test]
+    fn exact_reason_event_is_one_intrinsic_idempotent_commit_and_keeps_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("reason.pile");
+        let key_path = directory.path().join("reason.key");
+        File::create(&pile_path).unwrap();
+
+        let pile = open_pile_strict(&pile_path).unwrap();
+        let mut repository =
+            Repository::new(pile, SigningKey::from_bytes(&[0x61; 32]), Fragment::empty()).unwrap();
+        let legacy_branch = *repository.create_branch("cognition", None).unwrap();
+        repository.close().unwrap();
+        let legacy_pin = pin_head(&pile_path, legacy_branch);
+
+        initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let storage = ReasonStorage {
+            pile: &pile_path,
+            key: Some(&key_path),
+        };
+        let turn = test_id(0x72);
+        let worker = test_id(0x73);
+        let created = at_unix(42.0);
+        let expected = cognition::reason_fragment(
+            Some(turn),
+            Some(worker),
+            "choose the narrowest next constraint",
+            Some("cargo test --lib"),
+            created,
+        );
+        let expected_id = expected.root().unwrap();
+
+        let (event_id, first_commit) = publish_reason(
+            storage,
+            Some(turn),
+            Some(worker),
+            "choose the narrowest next constraint",
+            Some("cargo test --lib"),
+            created,
+        )
+        .unwrap();
+        let length_after_first = std::fs::metadata(&pile_path).unwrap().len();
+        let (replayed_id, replayed_commit) = publish_reason(
+            storage,
+            Some(turn),
+            Some(worker),
+            "choose the narrowest next constraint",
+            Some("cargo test --lib"),
+            created,
+        )
+        .unwrap();
+
+        assert_eq!(event_id, expected_id);
+        assert_eq!(replayed_id, event_id);
+        assert_eq!(replayed_commit, first_commit);
+        assert_eq!(
+            std::fs::metadata(&pile_path).unwrap().len(),
+            length_after_first
+        );
+        assert_eq!(pin_head(&pile_path, legacy_branch), legacy_pin);
+
+        let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
+        let pile = open_pile_strict(&pile_path).unwrap();
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let facts = collection.materialize().unwrap();
+        assert_eq!(facts, expected.into_facts());
+        let reader = collection.storage_mut().reader().unwrap();
+        cognition::validate_catalog(&reader, &facts).unwrap();
+
+        let (text, command, found_turn, found_worker) = find!(
+            (text: TextHandle, command: TextHandle, turn: Id, worker: Id),
+            pattern!(&facts, [{ event_id @
+                metadata::tag: KIND_REASON_ID,
+                reason_schema::text: ?text,
+                reason_schema::command_text: ?command,
+                reason_schema::about_turn: ?turn,
+                reason_schema::worker: ?worker,
+            }])
+        )
+        .next()
+        .unwrap();
+        assert_eq!(found_turn, turn);
+        assert_eq!(found_worker, worker);
+        assert_eq!(
+            &*reader.get::<View<str>, _>(text).unwrap(),
+            "choose the narrowest next constraint"
+        );
+        assert_eq!(
+            &*reader.get::<View<str>, _>(command).unwrap(),
+            "cargo test --lib"
+        );
+        collection.into_storage().close().unwrap();
+    }
+
+    #[test]
+    fn missing_signer_fails_before_touching_pile() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("reason.pile");
+        let key_path = directory.path().join("missing.key");
+        File::create(&pile_path).unwrap();
+        let before = std::fs::metadata(&pile_path).unwrap().len();
+
+        let error = publish_reason(
+            ReasonStorage {
+                pile: &pile_path,
+                key: Some(&key_path),
+            },
+            None,
+            None,
+            "must not land",
+            None,
+            at_unix(43.0),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("load durable signing key"));
+        assert!(!key_path.exists());
+        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
+    }
+
+    #[test]
+    fn permanent_cli_has_no_scope_or_branch_selector() {
+        let command = Cli::command();
+        for forbidden in ["scope", "branch", "branch_id"] {
+            assert!(!command
+                .get_arguments()
+                .any(|argument| argument.get_id() == forbidden));
+        }
+    }
 }

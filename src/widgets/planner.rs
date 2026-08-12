@@ -23,7 +23,7 @@
 //!
 //! ```ignore
 //! let mut panel = PlannerViewer::default();
-//! panel.render(ctx, planner_ws, relations_ws.as_mut());
+//! panel.render(ctx, planner_view, relations_view);
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -37,21 +37,10 @@ use hifitime::Epoch;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
+use crate::planner as planner_model;
+use crate::relations::{self, Head, ProfileInput, ProfileView};
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
-
-use crate::schemas::planner::{event, note, KIND_EVENT_ID, KIND_NOTE_ID};
-use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
-
-type TextHandle = Inline<Handle<LongString>>;
 
 // ── Palette ──────────────────────────────────────────────────────────
 
@@ -110,11 +99,10 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 
 // ── Time helpers ─────────────────────────────────────────────────────
 
-fn epoch_to_chrono(e: Epoch) -> DateTime<Utc> {
+fn epoch_to_chrono(e: Epoch) -> Option<DateTime<Utc>> {
     let secs = e.to_unix_seconds();
     Utc.timestamp_opt(secs as i64, ((secs.fract() * 1e9) as u32).min(999_999_999))
         .single()
-        .unwrap_or_else(Utc::now)
 }
 
 fn current_week_monday() -> NaiveDate {
@@ -206,6 +194,18 @@ struct Person {
 }
 
 impl Person {
+    fn from_profile(mut profile: ProfileInput) -> Self {
+        profile.emails.sort();
+        profile.emails.dedup();
+        Self {
+            alias: Some(profile.label),
+            first_name: profile.first_name,
+            last_name: profile.last_name,
+            display_name: profile.display_name,
+            email: profile.emails.into_iter().next(),
+        }
+    }
+
     fn display(&self, id: Id) -> String {
         if let Some(a) = self.alias.as_ref() {
             if !a.is_empty() {
@@ -237,45 +237,32 @@ impl Person {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 struct PlannerLive {
-    cached_head: Option<CommitHandle>,
-    relations_cached_head: Option<CommitHandle>,
+    cached_revision: DatasetRevision,
+    relations_cached_revision: Option<DatasetRevision>,
     events: Vec<EventRow>,
     people: HashMap<Id, Person>,
+    diagnostics: Vec<String>,
 }
 
 impl PlannerLive {
-    fn refresh(ws: &mut Workspace<Pile>, relations_ws: Option<&mut Workspace<Pile>>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[planner] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-
-        let (relations_cached_head, people) = match relations_ws {
-            Some(rws) => {
-                let head = rws.head();
-                let rspace = rws
-                    .checkout(..)
-                    .map(|co| co.into_facts())
-                    .unwrap_or_else(|e| {
-                        eprintln!("[planner] relations checkout: {e:?}");
-                        TribleSet::new()
-                    });
-                (head, build_people(&rspace, rws))
+    fn refresh(view: DatasetView<'_>, relations: Option<DatasetView<'_>>) -> Self {
+        let (relations_cached_revision, people, mut diagnostics) = match relations {
+            Some(relations) => {
+                let (people, diagnostics) = build_people(relations);
+                (Some(relations.revision), people, diagnostics)
             }
-            None => (None, HashMap::new()),
+            None => (None, HashMap::new(), Vec::new()),
         };
 
-        let events = collect_events(ws, &space);
+        let (events, planner_diagnostics) = collect_events(view);
+        diagnostics.extend(planner_diagnostics);
 
         PlannerLive {
-            cached_head,
-            relations_cached_head,
+            cached_revision: view.revision,
+            relations_cached_revision,
             events,
             people,
+            diagnostics,
         }
     }
 
@@ -287,185 +274,140 @@ impl PlannerLive {
     }
 }
 
-fn collect_events(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<EventRow> {
-    let mut by_id: HashMap<Id, EventRow> = HashMap::new();
+fn collect_events(view: DatasetView<'_>) -> (Vec<EventRow>, Vec<String>) {
+    let catalog = match planner_model::validate_catalog(view.reader, view.facts) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![format!("Planner catalog is invalid: {error:#}")],
+            );
+        }
+    };
+    let mut diagnostics = Vec::new();
+    let mut events = Vec::new();
 
-    for (id,) in find!(
-        (e: Id,),
-        pattern!(space, [{ ?e @ metadata::tag: KIND_EVENT_ID }])
-    ) {
-        by_id.insert(
-            id,
-            EventRow {
-                summary: String::new(),
-                start: Utc::now(),
-                end: Utc::now(),
-                location: None,
-                status: EventStatus::Confirmed,
-                rrule: None,
-                attendees: Vec::new(),
-                organizer: None,
-                notes: Vec::new(),
+    for row in catalog.events.values() {
+        let (start, end): (Epoch, Epoch) = match row.time.try_from_inline() {
+            Ok(interval) => interval,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "Planner event {:x} has an invalid time interval: {error:?}",
+                    row.id
+                ));
+                continue;
+            }
+        };
+        let Some(start) = epoch_to_chrono(start) else {
+            diagnostics.push(format!(
+                "Planner event {:x} starts outside the displayable calendar range",
+                row.id
+            ));
+            continue;
+        };
+        let Some(end) = epoch_to_chrono(end) else {
+            diagnostics.push(format!(
+                "Planner event {:x} ends outside the displayable calendar range",
+                row.id
+            ));
+            continue;
+        };
+
+        let mut notes: Vec<_> = catalog.notes_for(row.id).collect();
+        notes.sort_by(|left, right| {
+            left.created_at
+                .raw
+                .cmp(&right.created_at.raw)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let notes = notes
+            .into_iter()
+            .filter_map(
+                |note| match planner_model::read_text(view.reader, note.text) {
+                    Ok(text) => Some(text),
+                    Err(error) => {
+                        diagnostics.push(format!(
+                            "Planner note {:x} is unavailable: {error:#}",
+                            note.id
+                        ));
+                        None
+                    }
+                },
+            )
+            .collect();
+
+        events.push(EventRow {
+            summary: row.summary.clone(),
+            start,
+            end,
+            location: row.location.clone(),
+            status: if catalog.is_cancelled(row.id) {
+                EventStatus::Cancelled
+            } else {
+                EventStatus::parse(&row.status)
             },
-        );
+            rrule: row.rrule.clone(),
+            attendees: row.attendees.iter().copied().collect(),
+            organizer: row.organizer,
+            notes,
+        });
     }
+    events.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.summary.cmp(&right.summary))
+    });
+    (events, diagnostics)
+}
 
-    for (id, s) in find!(
-        (e: Id, s: String),
-        pattern!(space, [{ ?e @ event::summary: ?s }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.summary = s;
-        }
-    }
-
-    for (id, range) in find!(
-        (e: Id, t: (Epoch, Epoch)),
-        pattern!(space, [{ ?e @ event::time: ?t }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            let (s, end) = range;
-            row.start = epoch_to_chrono(s);
-            row.end = epoch_to_chrono(end);
-        }
-    }
-
-    for (id, s) in find!(
-        (e: Id, s: String),
-        pattern!(space, [{ ?e @ event::location: ?s }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.location = Some(s);
-        }
-    }
-
-    for (id, s) in find!(
-        (e: Id, s: String),
-        pattern!(space, [{ ?e @ event::status: ?s }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.status = EventStatus::parse(&s);
-        }
-    }
-
-    for (id, s) in find!(
-        (e: Id, s: String),
-        pattern!(space, [{ ?e @ event::rrule: ?s }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.rrule = Some(s);
-        }
-    }
-
-    for (id, pid) in find!(
-        (e: Id, p: Id),
-        pattern!(space, [{ ?e @ event::attendee: ?p }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.attendees.push(pid);
-        }
-    }
-
-    for (id, pid) in find!(
-        (e: Id, p: Id),
-        pattern!(space, [{ ?e @ event::organizer: ?p }])
-    ) {
-        if let Some(row) = by_id.get_mut(&id) {
-            row.organizer = Some(pid);
-        }
-    }
-
-    let note_rows: Vec<(Id, Id, TextHandle)> = find!(
-        (n: Id, e: Id, h: TextHandle),
-        pattern!(space, [{
-            ?n @
-            metadata::tag: KIND_NOTE_ID,
-            note::note_about: ?e,
-            note::note_text: ?h,
-        }])
-    )
-    .collect();
-    for (_, eid, h) in note_rows {
-        if let Some(row) = by_id.get_mut(&eid) {
-            if let Some(text) = read_text(ws, h) {
-                row.notes.push(text);
+fn build_people(relations_view: DatasetView<'_>) -> (HashMap<Id, Person>, Vec<String>) {
+    let mut people = HashMap::new();
+    let mut diagnostics = Vec::new();
+    for (person, view) in
+        relations::person_profile_views(relations_view.reader, relations_view.facts)
+    {
+        match view {
+            ProfileView::Current { value, .. } => {
+                people.insert(person, Person::from_profile(value));
+            }
+            ProfileView::Forked(heads) => diagnostics.push(format!(
+                "Relations profile {person:x} is forked across {}",
+                heads
+                    .iter()
+                    .map(|id| format!("{id:x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            ProfileView::Invalid(error) => {
+                diagnostics.push(format!("Relations profile {person:x} is invalid: {error}"));
             }
         }
-    }
 
-    let mut events: Vec<EventRow> = by_id.into_values().collect();
-    events.sort_by_key(|e| e.start);
-    events
-}
-
-fn build_people(rspace: &TribleSet, rws: &mut Workspace<Pile>) -> HashMap<Id, Person> {
-    let person_ids: Vec<Id> = find!(
-        (pid: Id,),
-        pattern!(rspace, [{ ?pid @ metadata::tag: KIND_PERSON_ID }])
-    )
-    .map(|(pid,)| pid)
-    .collect();
-
-    let mut people: HashMap<Id, Person> = person_ids
-        .into_iter()
-        .map(|p| (p, Person::default()))
-        .collect();
-
-    for (pid, alias) in find!(
-        (p: Id, a: String),
-        pattern!(rspace, [{ ?p @ rel::alias: ?a }])
-    ) {
-        if let Some(p) = people.get_mut(&pid) {
-            p.alias = Some(alias);
+        match relations::lifecycle_head(relations_view.facts, person) {
+            Ok(Head::Unique(snapshot)) => {
+                if let Err(error) = relations::lifecycle_snapshot(relations_view.facts, snapshot) {
+                    diagnostics.push(format!(
+                        "Relations lifecycle {person:x} is invalid: {error}"
+                    ));
+                }
+            }
+            Ok(Head::Forked(heads)) => diagnostics.push(format!(
+                "Relations lifecycle {person:x} is forked across {}",
+                heads
+                    .iter()
+                    .map(|id| format!("{id:x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Ok(Head::Missing) => diagnostics.push(format!(
+                "Relations person {person:x} has no lifecycle snapshot"
+            )),
+            Err(error) => diagnostics.push(format!(
+                "Relations lifecycle {person:x} is invalid: {error}"
+            )),
         }
     }
-    let first_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::first_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in first_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.first_name = read_text(rws, h);
-        }
-    }
-    let last_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::last_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in last_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.last_name = read_text(rws, h);
-        }
-    }
-    let display_rows: Vec<(Id, TextHandle)> = find!(
-        (p: Id, h: TextHandle),
-        pattern!(rspace, [{ ?p @ rel::display_name: ?h }])
-    )
-    .collect();
-    for (pid, h) in display_rows {
-        if let Some(p) = people.get_mut(&pid) {
-            p.display_name = read_text(rws, h);
-        }
-    }
-    for (pid, e) in find!(
-        (p: Id, e: String),
-        pattern!(rspace, [{ ?p @ rel::email: ?e }])
-    ) {
-        if let Some(p) = people.get_mut(&pid) {
-            p.email = Some(e);
-        }
-    }
-
-    people
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+    (people, diagnostics)
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -488,20 +430,19 @@ impl PlannerViewer {
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        ws: &mut Workspace<Pile>,
-        mut relations_ws: Option<&mut Workspace<Pile>>,
+        view: DatasetView<'_>,
+        relations: Option<DatasetView<'_>>,
     ) {
-        let head = ws.head();
-        let rhead = relations_ws.as_ref().and_then(|w| w.head());
+        let revision = view.revision;
+        let relations_revision = relations.map(|view| view.revision);
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head || l.relations_cached_head != rhead,
+            Some(l) => {
+                l.cached_revision != revision || l.relations_cached_revision != relations_revision
+            }
         };
         if need_refresh {
-            self.live = Some(PlannerLive::refresh(
-                ws,
-                relations_ws.as_mut().map(|w| &mut **w),
-            ));
+            self.live = Some(PlannerLive::refresh(view, relations));
         }
 
         ctx.section("Planner", |ctx| {
@@ -512,6 +453,10 @@ impl PlannerViewer {
             ctx.grid(|g| {
                 let monday = current_week_monday();
                 let today = Utc::now().date_naive();
+
+                for diagnostic in &live.diagnostics {
+                    g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
+                }
 
                 // Header line — week-of label + event count.
                 g.full(|ctx| {
@@ -1163,4 +1108,59 @@ fn render_attendee_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32, is_
                     .color(text),
             );
         });
+}
+
+fn render_diagnostic(ui: &mut egui::Ui, message: &str) {
+    let accent = egui::Color32::from_rgb(0xe6, 0x32, 0x46);
+    egui::Frame::NONE
+        .fill(accent.gamma_multiply(0.12))
+        .stroke(egui::Stroke::new(1.0, accent))
+        .corner_radius(egui::CornerRadius::ZERO)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(format!("⚠ {message}"))
+                    .monospace()
+                    .small()
+                    .color(ui.visuals().text_color()),
+            );
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_relation_profile_drives_planner_display_name() {
+        let person = Person::from_profile(ProfileInput {
+            label: "Bulti".to_owned(),
+            emails: vec![
+                "z@example.invalid".to_owned(),
+                "a@example.invalid".to_owned(),
+            ],
+            ..ProfileInput::default()
+        });
+        let id = Id::new([1; 16]).unwrap();
+
+        assert_eq!(person.display(id), "Bulti");
+        assert_eq!(person.email.as_deref(), Some("a@example.invalid"));
+    }
+
+    #[test]
+    fn canonical_cancellation_overrides_baseline_display_status() {
+        assert_eq!(
+            EventStatus::parse(planner_model::STATUS_CONFIRMED),
+            EventStatus::Confirmed
+        );
+        assert_eq!(
+            EventStatus::parse(planner_model::STATUS_TENTATIVE),
+            EventStatus::Tentative
+        );
+        assert_eq!(
+            EventStatus::parse(planner_model::STATUS_CANCELLED),
+            EventStatus::Cancelled
+        );
+    }
 }

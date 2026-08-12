@@ -13,18 +13,19 @@ to query the web, `fetch` to pull and clean a single URL.
   - Provider APIs (Tavily / Exa) extract clean
     text/markdown from cluttered HTML, which beats raw scraping
     for downstream processing.
-  - The pile branch becomes a queryable history: "have I
+  - The Web collection becomes a queryable history: "have I
     already pulled this URL? what did it say?" answered without
     re-fetching.
 
 == Usage
 
 ```sh
-# Provider key in env (Tavily example)
-export TAVILY_API_KEY=tvly-...
-
-# Search
+# Search using the exact credential version selected through Headspace.
 web search "succinct hash array mapped trie"
+
+# Or override one invocation explicitly (use @path or @- to avoid shell history).
+web --tavily-api-key @/secure/path/tavily.key search \
+  "succinct hash array mapped trie"
 
 # Fetch a URL (clean markdown when the provider supports it)
 web fetch https://arxiv.org/abs/2305.12345
@@ -55,14 +56,16 @@ the durable-archive step. Use the right one for each job.
     SPA-heavy pages may return shells.
   - Bulk crawling — the provider cost adds up; `wget`/`curl` +
     files is cheaper at volume.
-  - Anything you've already pulled this session — check the
-    pile's web events branch first.
+  - Bulk history inspection. The current `web` CLI is an action surface and has
+    no list/history subcommand; build a domain query before relying on stored
+    events for duplicate avoidance.
 
-== Branch and storage
+== Collection and storage
 
-Each `search` and `fetch` records an event on the pile's web
-branch (configurable via `--branch-id`). Events accrete; nothing
-is overwritten. Querying "what did I fetch about X" is a wiki-
-or pattern-style query against the branch.
+Unless `--no-store` is set, each `search` and `fetch` publishes an immutable
+event into one fixed, signer-owned Web collection. There is no branch selector
+or mutable head. Events accrete; nothing is overwritten. Runtime credentials
+come from exact Secrets versions selected through Headspace, or from explicit
+per-invocation overrides; they are not stored in the public event facts.
 
 Next stop: [Tool Selection: Faculties First](wiki:f4aff48fff04f313552f5b32244f9873).

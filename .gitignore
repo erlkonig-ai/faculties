@@ -1,12 +1,6 @@
 /target
-Cargo.lock
 
 # Piles are user data — don't commit. `self.pile` is the conventional
 # name; contributors may also create demo.pile, test.pile, etc.
 *.pile
 *.pile.bak-*
-
-# Exception: bootstrap.pile is the curated onboarding substrate that
-# new agents `cat` into their fresh self.pile. Sources live in
-# `bootstrap/` and the pile regenerates via `bootstrap/build.sh`.
-!bootstrap.pile

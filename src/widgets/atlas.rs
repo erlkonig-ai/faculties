@@ -20,23 +20,14 @@
 //! panel.render(ctx, atlas_ws);
 //! ```
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
+use crate::atlas::AtlasEntry;
+use crate::widgets::storage::{DatasetRevision, DatasetView};
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CommitHandle, Workspace};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::View;
-
-type TextHandle = Inline<Handle<LongString>>;
 
 // ── Palette ──────────────────────────────────────────────────────────
 
@@ -72,125 +63,50 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 
 // ── Row struct ───────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
-struct AtlasRow {
-    id: Id,
-    name: String,
-    description: Option<String>,
-    /// Tag ids attached to this entity. Each is itself a catalog
-    /// entry — resolved at render time so the chip shows the
-    /// tag's name (or the short id when the tag has no name).
-    tags: Vec<Id>,
-    /// Number of other entities that carry this entity as a tag.
-    /// Roughly "how many things am I a category for".
-    member_count: usize,
-}
-
-impl AtlasRow {
-    fn sort_key(&self) -> String {
-        self.name.to_lowercase()
-    }
-}
-
 struct AtlasLive {
-    cached_head: Option<CommitHandle>,
-    entries: Vec<AtlasRow>,
-    /// Name lookup keyed by entity id — used to resolve tag chips.
-    /// Same data as `entries` but indexed for O(1) chip rendering.
-    name_by_id: HashMap<Id, String>,
+    cached_revision: DatasetRevision,
+    entries: Vec<AtlasEntry>,
+    /// All name variants keyed by entity id, used to resolve tag chips
+    /// without manufacturing a preferred label.
+    names_by_id: BTreeMap<Id, Vec<String>>,
+    diagnostic: Option<String>,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl AtlasLive {
-    fn refresh(ws: &mut Workspace<Pile>) -> Self {
-        let space = ws
-            .checkout(..)
-            .map(|co| co.into_facts())
-            .unwrap_or_else(|e| {
-                eprintln!("[atlas] checkout: {e:?}");
-                TribleSet::new()
-            });
-        let cached_head = ws.head();
-
-        // All entities with a metadata::name. The query gives us
-        // (entity_id, name_handle) pairs; we deref the handle to a
-        // string on demand. metadata::name is the catalog's
-        // discriminator — anything named is a catalog entry.
-        let name_rows: Vec<(Id, TextHandle)> = find!(
-            (id: Id, h: TextHandle),
-            pattern!(&space, [{ ?id @ metadata::name: ?h }])
-        )
-        .collect();
-
-        let mut entries: HashMap<Id, AtlasRow> = HashMap::new();
-        let mut name_by_id: HashMap<Id, String> = HashMap::new();
-        for (id, h) in name_rows {
-            let name = read_text(ws, h).unwrap_or_else(|| short_id(id));
-            name_by_id.insert(id, name.clone());
-            entries.insert(
-                id,
-                AtlasRow {
-                    id,
-                    name,
-                    description: None,
-                    tags: Vec::new(),
-                    member_count: 0,
-                },
-            );
-        }
-
-        // Descriptions for the same entries.
-        let desc_rows: Vec<(Id, TextHandle)> = find!(
-            (id: Id, h: TextHandle),
-            pattern!(&space, [{ ?id @ metadata::description: ?h }])
-        )
-        .collect();
-        for (id, h) in desc_rows {
-            if let Some(row) = entries.get_mut(&id) {
-                row.description = read_text(ws, h);
+    fn refresh(dataset: DatasetView<'_>) -> Self {
+        match crate::atlas::load_catalog(dataset.reader, dataset.facts) {
+            Ok(catalog) => {
+                let mut entries = catalog.entries().cloned().collect::<Vec<_>>();
+                entries.sort_by(|left, right| {
+                    atlas_sort_key(left)
+                        .cmp(&atlas_sort_key(right))
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                let names_by_id = entries
+                    .iter()
+                    .map(|entry| (entry.id, entry.names.clone()))
+                    .collect();
+                AtlasLive {
+                    cached_revision: dataset.revision,
+                    entries,
+                    names_by_id,
+                    diagnostic: None,
+                }
             }
-        }
-
-        // Tag attachments — entity carries `metadata::tag: tag_id`.
-        // We collect both (so each entry knows its own tags) and
-        // count the reverse: how many entities reference this
-        // entity as a tag.
-        let mut member_counts: HashMap<Id, usize> = HashMap::new();
-        for (entity_id, tag_id) in find!(
-            (id: Id, t: Id),
-            pattern!(&space, [{ ?id @ metadata::tag: ?t }])
-        ) {
-            if let Some(row) = entries.get_mut(&entity_id) {
-                row.tags.push(tag_id);
-            }
-            *member_counts.entry(tag_id).or_insert(0) += 1;
-        }
-        for row in entries.values_mut() {
-            row.tags.sort_by_key(|t| {
-                let bytes: &[u8] = t.as_ref();
-                bytes.to_vec()
-            });
-            row.tags.dedup();
-            row.member_count = member_counts.get(&row.id).copied().unwrap_or(0);
-        }
-
-        let mut entries: Vec<AtlasRow> = entries.into_values().collect();
-        entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-
-        AtlasLive {
-            cached_head,
-            entries,
-            name_by_id,
+            Err(error) => AtlasLive {
+                cached_revision: dataset.revision,
+                entries: Vec::new(),
+                names_by_id: BTreeMap::new(),
+                diagnostic: Some(format!("Atlas projection is invalid: {error:#}")),
+            },
         }
     }
 }
 
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, LongString>(h).ok().map(|v| {
-        let s: &str = v.as_ref();
-        s.to_string()
-    })
+fn atlas_sort_key(entry: &AtlasEntry) -> Vec<String> {
+    entry.names.iter().map(|name| name.to_lowercase()).collect()
 }
 
 fn id_hex(id: Id) -> String {
@@ -202,14 +118,18 @@ fn short_id(id: Id) -> String {
     s.chars().take(8).collect()
 }
 
-fn entry_matches_search(entry: &AtlasRow, needle: &str) -> bool {
-    if entry.name.to_lowercase().contains(needle) {
+fn entry_matches_search(entry: &AtlasEntry, needle: &str) -> bool {
+    if entry
+        .names
+        .iter()
+        .any(|name| name.to_lowercase().contains(needle))
+    {
         return true;
     }
     if entry
-        .description
-        .as_deref()
-        .map_or(false, |d| d.to_lowercase().contains(needle))
+        .descriptions
+        .iter()
+        .any(|description| description.to_lowercase().contains(needle))
     {
         return true;
     }
@@ -236,14 +156,13 @@ impl AtlasViewer {
         Self::default()
     }
 
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile>) {
-        let head = ws.head();
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.live.as_ref() {
             None => true,
-            Some(l) => l.cached_head != head,
+            Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            self.live = Some(AtlasLive::refresh(ws));
+            self.live = Some(AtlasLive::refresh(dataset));
         }
 
         ctx.section("Atlas", |ctx| {
@@ -254,7 +173,7 @@ impl AtlasViewer {
             let mut search = ctx.search();
             let needle = search.query().to_lowercase();
             let search_active = !needle.is_empty();
-            let visible: Vec<&AtlasRow> = if search_active {
+            let visible: Vec<&AtlasEntry> = if search_active {
                 live.entries
                     .iter()
                     .filter(|e| entry_matches_search(e, &needle))
@@ -264,6 +183,10 @@ impl AtlasViewer {
             };
 
             ctx.grid(|g| {
+                if let Some(diagnostic) = &live.diagnostic {
+                    g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
+                    return;
+                }
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
                     let total = live.entries.len();
@@ -319,7 +242,7 @@ impl AtlasViewer {
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
-                        render_entry_card(ui, entry, &live.name_by_id, &needle, is_focused);
+                        render_entry_card(ui, entry, &live.names_by_id, &needle, is_focused);
                         if let Some(info) = match_info {
                             if info.should_scroll_to {
                                 let post_y = ui.cursor().min.y;
@@ -341,8 +264,8 @@ impl AtlasViewer {
 
 fn render_entry_card(
     ui: &mut egui::Ui,
-    entry: &AtlasRow,
-    name_by_id: &HashMap<Id, String>,
+    entry: &AtlasEntry,
+    names_by_id: &BTreeMap<Id, Vec<String>>,
     search_needle: &str,
     focused: bool,
 ) {
@@ -383,10 +306,10 @@ fn render_entry_card(
                     ui.set_min_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 2.0;
 
-                    ui.horizontal(|ui| {
+                    for name in &entry.names {
                         GORBIE::search::highlight_label(
                             ui,
-                            &entry.name,
+                            name,
                             search_needle,
                             egui::TextFormat {
                                 font_id: egui::FontId::new(16.0, egui::FontFamily::Proportional),
@@ -395,9 +318,15 @@ fn render_entry_card(
                             },
                             focused,
                         );
-                    });
+                    }
 
                     let mut meta = Vec::new();
+                    if entry.names.len() > 1 {
+                        meta.push(format!("{} NAME VARIANTS", entry.names.len()));
+                    }
+                    if entry.descriptions.len() > 1 {
+                        meta.push(format!("{} DESCRIPTION VARIANTS", entry.descriptions.len()));
+                    }
                     if !entry.tags.is_empty() {
                         meta.push(format!(
                             "{} TAG{}",
@@ -405,11 +334,11 @@ fn render_entry_card(
                             if entry.tags.len() == 1 { "" } else { "S" }
                         ));
                     }
-                    if entry.member_count > 0 {
+                    if !entry.members.is_empty() {
                         meta.push(format!(
                             "{} MEMBER{}",
-                            entry.member_count,
-                            if entry.member_count == 1 { "" } else { "S" }
+                            entry.members.len(),
+                            if entry.members.len() == 1 { "" } else { "S" }
                         ));
                     }
                     if !meta.is_empty() {
@@ -436,10 +365,23 @@ fn render_entry_card(
                     ui.set_min_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 4.0;
 
-                    if let Some(desc) = entry.description.as_ref() {
+                    for (index, description) in entry.descriptions.iter().enumerate() {
+                        if entry.descriptions.len() > 1 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "DESCRIPTION VARIANT {} / {}",
+                                    index + 1,
+                                    entry.descriptions.len()
+                                ))
+                                .monospace()
+                                .small()
+                                .strong()
+                                .color(body_muted),
+                            );
+                        }
                         GORBIE::search::highlight_label(
                             ui,
-                            desc,
+                            description,
                             search_needle,
                             egui::TextFormat {
                                 font_id: egui::TextStyle::Body.resolve(ui.style()),
@@ -454,9 +396,9 @@ fn render_entry_card(
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                             for tag_id in &entry.tags {
-                                let label = name_by_id
+                                let label = names_by_id
                                     .get(tag_id)
-                                    .cloned()
+                                    .map(|names| names.join(" / "))
                                     .unwrap_or_else(|| short_id(*tag_id));
                                 render_tag_chip(ui, &label);
                             }
@@ -487,6 +429,27 @@ fn render_tag_chip(ui: &mut egui::Ui, label: &str) {
                     .small()
                     .strong()
                     .color(text),
+            );
+        });
+}
+
+fn render_diagnostic(ui: &mut egui::Ui, diagnostic: &str) {
+    let color = ui.visuals().error_fg_color;
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            28,
+        ))
+        .stroke(egui::Stroke::new(1.0, color))
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(diagnostic)
+                    .monospace()
+                    .small()
+                    .color(color),
             );
         });
 }

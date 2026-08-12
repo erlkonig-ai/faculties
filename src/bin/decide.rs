@@ -1,723 +1,735 @@
-//! `decide` — deliberation primitive.
-//!
-//! Append-only pros/cons tracking with a resolution step that itself
-//! enforces "≥1 pro AND ≥1 con" (with `--force` as the explicit
-//! bypass). Downstream faculties gate their high-stakes actions on
-//! the *existence* of a resolved decision — the deliberation rule
-//! lives here, the trust contract is "is it resolved?" lives there.
+//! `decide` — a fork-visible deliberation ledger over one union collection.
 
-use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::decide::{
-    decide as decide_attrs, factor, DEFAULT_BRANCH, KIND_CON, KIND_DECISION, KIND_PRO,
-};
-use hifitime::Epoch;
-use rand_core::OsRng;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{CommandFactory, Parser, Subcommand};
+use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::decide::{
+    self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
+};
+use faculties::schemas::decide::DEFAULT_SCOPE_ID;
+use hifitime::Epoch;
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
 
-type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-
-// ── CLI ───────────────────────────────────────────────────────────────────
-
 #[derive(Parser)]
-#[command(version = faculties::GIT_VERSION, name = "decide", about = "Deliberation primitive — pros, cons, resolution")]
+#[command(
+    version = faculties::GIT_VERSION,
+    name = "decide",
+    about = "A fork-visible TribleSpace deliberation ledger"
+)]
 struct Cli {
+    /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Propose a new decision. Title is required; optional context
-    /// (long-form description) and `--about <entity-id>` (link to
-    /// whatever the decision is concerned with — a mail draft, a
-    /// compass goal, anything).
+    /// Propose a stable decision with one immutable genesis.
     Propose {
-        /// Short one-liner naming the decision.
+        #[arg(help = "Decision title. Use @path for file input or @- for stdin.")]
         title: String,
-        /// Optional long-form context. Use @path for file input or @- for stdin.
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Optional context. Use @path for file input or @- for stdin."
+        )]
         context: Option<String>,
-        /// Optional pointer to the entity this decision is about.
-        #[arg(long)]
-        about: Option<String>,
+        /// Optional exact 32-character id of the entity this concerns.
+        #[arg(long, value_parser = parse_id_arg)]
+        about: Option<Id>,
     },
-    /// Add a "for" factor — a reason to take the decided action.
+    /// Add one independent pro factor while the decision is unresolved.
     Pro {
-        /// Full 32-char hex decision id.
         decision: String,
-        /// Factor text. Use @path for file input or @- for stdin.
+        #[arg(help = "Factor text. Use @path for file input or @- for stdin.")]
         text: String,
     },
-    /// Add an "against" factor — a reason not to, or a risk.
+    /// Add one independent con factor while the decision is unresolved.
     Con {
-        /// Full 32-char hex decision id.
         decision: String,
-        /// Factor text. Use @path for file input or @- for stdin.
+        #[arg(help = "Factor text. Use @path for file input or @- for stdin.")]
         text: String,
     },
-    /// Resolve a decision with a free-form outcome.
-    ///
-    /// Refuses unless the decision has ≥1 pro AND ≥1 con factor.
-    /// Use `--force` to bypass — a resolved decision with missing
-    /// factors is by definition forced, no further flag is recorded.
+    /// Resolve an open decision. Ordinary resolution is allowed only while its
+    /// resolution track is Missing.
     Resolve {
-        /// Full 32-char hex decision id.
         decision: String,
-        /// Free-form outcome text. Use @path for file input or @- for stdin.
+        #[arg(help = "Outcome text. Use @path for file input or @- for stdin.")]
         outcome: String,
-        /// Bypass the ≥1 pro AND ≥1 con check. The absence of
-        /// factors is the trace of the bypass; review forced
-        /// resolutions later with `decide list --forced`.
+        /// Explicitly bypass the pro-and-con evidence gate.
         #[arg(long)]
         force: bool,
     },
-    /// List unresolved decisions (most recent first).
+    /// Reconcile a genuinely divergent resolution fork, citing every current
+    /// head. Agreement is already semantically resolved and cannot use this.
+    Reconcile {
+        decision: String,
+        #[arg(help = "Reconciled outcome. Use @path for file input or @- for stdin.")]
+        outcome: String,
+        /// Explicitly bypass the pro-and-con evidence gate.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List unresolved and diagnostically unsettled decisions.
     List {
-        /// Include resolved decisions too.
+        /// Include uniquely resolved and agreeing decisions too.
         #[arg(long)]
         all: bool,
-        /// Show only decisions resolved with `--force` (no factors).
+        /// Show only semantically resolved decisions whose explicit forced bit
+        /// is true.
         #[arg(long)]
         forced: bool,
     },
-    /// Show one decision with pros, cons, and outcome.
-    Show {
-        /// Full 32-char hex decision id.
-        decision: String,
-    },
-    /// Resolve a hex prefix to a full 32-char decision id.
+    /// Show one decision, factors, and every live resolution head.
+    Show { decision: String },
+    /// Resolve an unambiguous decision id prefix.
     ResolveId { prefix: String },
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────
-
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
+#[derive(Clone, Copy)]
+struct DecideStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
 }
 
-fn instant_interval(at: Epoch) -> IntervalValue {
-    (at, at).try_to_inline().unwrap()
+struct CollectionView {
+    facts: TribleSet,
+    reader: PileReader,
 }
 
-fn unpack_interval(iv: IntervalValue) -> (Epoch, Epoch) {
-    iv.try_from_inline().unwrap()
+impl DecideStorage<'_> {
+    fn with_collection<T>(
+        &self,
+        operation: impl FnOnce(&mut Collection<Pile>, &CollectionView) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let result = (|| {
+            let facts = collection
+                .materialize()
+                .context("materialize authored Decide collection")?;
+            let reader = collection
+                .storage_mut()
+                .reader()
+                .context("open Decide attachment reader")?;
+            decide::validate_catalog(&reader, &facts)
+                .context("validate authored Decide collection")?;
+            operation(&mut collection, &CollectionView { facts, reader })
+        })();
+        finish_pile(collection.into_storage(), result)
+    }
+
+    fn with_view<T>(&self, operation: impl FnOnce(&CollectionView) -> Result<T>) -> Result<T> {
+        self.with_collection(|_, view| operation(view))
+    }
+
+    fn update<T>(
+        &self,
+        description: &'static str,
+        operation: impl FnOnce(&CollectionView) -> Result<(Fragment, T)>,
+    ) -> Result<T> {
+        self.with_collection(|collection, view| {
+            let (mut fragment, value) = operation(view)?;
+            decide::validate_catalog_union(&view.reader, &view.facts, &fragment)
+                .context("preflight authored Decide union")?;
+            fragment.describe_with(entity! { metadata::description: description });
+            collection
+                .commit(fragment)
+                .context("commit authored Decide fragment")?;
+            Ok(value)
+        })
+    }
+}
+
+fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context("close Decide pile")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing Decide pile also failed: {close_error}")))
+        }
+    }
+}
+
+fn parse_id_arg(raw: &str) -> std::result::Result<Id, String> {
+    Id::from_hex(raw.trim()).ok_or_else(|| format!("invalid id '{raw}'"))
 }
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-/// Resolve a decision id, accepting either a full 32-char hex or a
-/// shorter prefix. Scans `KIND_DECISION` entities for matches.
-fn resolve_decision_id(space: &TribleSet, input: &str) -> Result<Id> {
-    let candidates = find!(d: Id, pattern!(space, [{ ?d @ metadata::tag: KIND_DECISION }]));
-    faculties::resolve_id_prefix(input, candidates)
+fn now_epoch() -> Result<Epoch> {
+    Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))
 }
 
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile =
-        Pile::open(path).map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
+fn epoch_interval(epoch: Epoch) -> IntervalValue {
+    (epoch, epoch)
+        .try_to_inline()
+        .expect("valid point interval")
+}
+
+fn interval_key(interval: IntervalValue) -> i128 {
+    let (lower, _): (i128, i128) = interval
+        .try_from_inline()
+        .expect("validated point interval");
+    lower
+}
+
+fn format_interval(interval: IntervalValue) -> String {
+    let (lower, _): (Epoch, Epoch) = interval
+        .try_from_inline()
+        .expect("validated point interval");
+    format!("{lower}")
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_owned()
+    } else {
+        format!(
+            "{}…",
+            value
+                .chars()
+                .take(max.saturating_sub(1))
+                .collect::<String>()
+        )
     }
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
 }
 
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
+fn resolve_decision(input: &str, facts: &TribleSet) -> Result<Id> {
+    faculties::resolve_id_prefix(input, decide::decision_anchors(facts))
+}
+
+fn ensure_missing(state: &Resolution, action: &str, decision: Id) -> Result<()> {
+    match state {
+        Resolution::Missing => Ok(()),
+        Resolution::Unique(snapshot) => {
+            bail!(
+                "decision {decision:x} is already resolved at head {:x}; cannot {action}",
+                snapshot.id
+            )
         }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
-fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
-    ws.get::<View<str>, blobencodings::LongString>(h)
-        .ok()
-        .map(|view| view.to_string())
-}
-
-// ── queries ───────────────────────────────────────────────────────────────
-
-fn count_factors(space: &TribleSet, decision_id: Id, factor_kind: Id) -> usize {
-    find!(
-        f: Id,
-        pattern!(space, [{
-            ?f @
-                metadata::tag: factor_kind,
-                factor::about_decision: decision_id,
-        }])
-    )
-    .count()
-}
-
-/// A resolved decision has BOTH `metadata::finished_at` and a
-/// non-empty `decide::outcome`. We treat absence-of-either as
-/// "still open."
-fn is_resolved(ws: &mut Workspace<Pile>, space: &TribleSet, decision_id: Id) -> bool {
-    let has_finished_at = find!(
-        f: IntervalValue,
-        pattern!(space, [{ decision_id @ metadata::finished_at: ?f }])
-    )
-    .next()
-    .is_some();
-    let has_outcome = find!(
-        o: TextHandle,
-        pattern!(space, [{ decision_id @ decide_attrs::outcome: ?o }])
-    )
-    .next()
-    .and_then(|h| read_text(ws, h))
-    .map(|s| !s.trim().is_empty())
-    .unwrap_or(false);
-    has_finished_at && has_outcome
-}
-
-fn decision_title(ws: &mut Workspace<Pile>, space: &TribleSet, decision_id: Id) -> String {
-    find!(
-        h: TextHandle,
-        pattern!(space, [{ decision_id @ metadata::name: ?h }])
-    )
-    .next()
-    .and_then(|h| read_text(ws, h))
-    .unwrap_or_else(|| "(untitled)".into())
-}
-
-fn decision_created_at(space: &TribleSet, decision_id: Id) -> Option<Epoch> {
-    find!(
-        c: IntervalValue,
-        pattern!(space, [{ decision_id @ metadata::created_at: ?c }])
-    )
-    .next()
-    .map(|iv| unpack_interval(iv).0)
-}
-
-// ── kind entities ─────────────────────────────────────────────────────────
-
-fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let existing: HashSet<Id> = find!(
-        (k: Id),
-        pattern!(&space, [{ ?k @ metadata::name: _?handle }])
-    )
-    .map(|(k,)| k)
-    .collect();
-    let mut change = TribleSet::new();
-    let label = |id: Id| -> &'static str {
-        if id == KIND_DECISION {
-            "decide-decision"
-        } else if id == KIND_PRO {
-            "decide-pro"
-        } else {
-            "decide-con"
-        }
-    };
-    for kind in [KIND_DECISION, KIND_PRO, KIND_CON] {
-        if !existing.contains(&kind) {
-            let name = ws.put(label(kind));
-            change += entity! { ExclusiveId::force_ref(&kind) @
-                metadata::name: name,
-            };
+        Resolution::Agreed(snapshots) => bail!(
+            "decision {decision:x} is already resolved by {} agreeing heads; cannot {action}",
+            snapshots.len()
+        ),
+        Resolution::Forked(snapshots) => bail!(
+            "decision {decision:x} has {} divergent resolution heads; use `decide reconcile`",
+            snapshots.len()
+        ),
+        Resolution::Invalid(reason) => {
+            bail!("decision {decision:x} resolution is invalid: {reason}")
         }
     }
-    Ok(change)
 }
 
-// ── commands ──────────────────────────────────────────────────────────────
+fn reconciliation_heads(state: Resolution, decision: Id) -> Result<Vec<Id>> {
+    match state {
+        Resolution::Forked(snapshots) => {
+            Ok(snapshots.into_iter().map(|snapshot| snapshot.id).collect())
+        }
+        Resolution::Missing => bail!("decision {decision:x} is unresolved; use `decide resolve`"),
+        Resolution::Unique(snapshot) => bail!(
+            "decision {decision:x} has one closed resolution head {:x}; there is no fork to reconcile",
+            snapshot.id
+        ),
+        Resolution::Agreed(snapshots) => bail!(
+            "decision {decision:x} is already semantically resolved by {} agreeing heads",
+            snapshots.len()
+        ),
+        Resolution::Invalid(reason) => bail!("decision {decision:x} resolution is invalid: {reason}"),
+    }
+}
+
+fn evidence(facts: &TribleSet, decision: Id, forced: bool) -> Result<Vec<Id>> {
+    let factors = decide::factors_for_decision(facts, decision)?;
+    let pros = factors
+        .iter()
+        .filter(|factor| factor.side == FactorSide::Pro)
+        .count();
+    let cons = factors
+        .iter()
+        .filter(|factor| factor.side == FactorSide::Con)
+        .count();
+    if !forced && (pros == 0 || cons == 0) {
+        bail!(
+            "cannot resolve without force: exact evidence needs at least one pro and one con (have {pros} pro, {cons} con)"
+        );
+    }
+    Ok(factors.into_iter().map(|factor| factor.id).collect())
+}
 
 fn cmd_propose(
-    pile: &Path,
-    branch_id: Id,
+    storage: DecideStorage<'_>,
     title: String,
     context: Option<String>,
-    about: Option<String>,
+    about: Option<Id>,
 ) -> Result<()> {
-    if title.trim().is_empty() {
-        bail!("title must not be empty");
-    }
-    // `about` can reference any entity across faculties (a compass goal,
-    // a mail draft, a wiki fragment, etc.); we don't have a single
-    // KIND to scope a prefix search against, so it stays strict — pass
-    // a full 32-char id.
-    let about_id = about
-        .as_deref()
-        .map(|raw| {
-            Id::from_hex(raw.trim()).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "invalid --about id '{}': expected a full 32-char hex id \
-                     (cross-faculty linker, no prefix expansion)",
-                    raw.trim()
-                )
-            })
-        })
-        .transpose()?;
-    let context_text = context
-        .as_deref()
-        .map(|s| faculties::text_arg(s, "context"))
-        .transpose()?;
-
-    let decision_ref = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let decision_id = ufoid();
-        let decision_ref = decision_id.id;
-        let now = instant_interval(now_epoch());
-        let title_handle = ws.put(title.clone());
-        let context_handle: Option<TextHandle> =
-            context_text.as_deref().map(|c| ws.put(c.to_string()));
-
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-        change += entity! { &decision_id @
-            metadata::tag: &KIND_DECISION,
-            metadata::created_at: now,
-            metadata::name: title_handle,
-            metadata::description?: context_handle.as_ref(),
-            decide_attrs::about?: about_id.as_ref(),
-        };
-        ws.commit(change, "decide: propose");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        Ok(decision_ref)
+    let decision_id = genid().id;
+    storage.update("propose Decide decision", |_| {
+        let (fragment, _) = decide::decision_fragment(
+            decision_id,
+            title,
+            context,
+            about,
+            epoch_interval(now_epoch()?),
+        )?;
+        Ok((fragment, ()))
     })?;
-    println!("Proposed decision {}", fmt_id(decision_ref));
+    println!("Proposed decision {decision_id:x}");
     Ok(())
 }
 
 fn cmd_factor(
-    pile: &Path,
-    branch_id: Id,
-    decision_hex: String,
+    storage: DecideStorage<'_>,
+    input: String,
     text: String,
-    kind: Id,
+    side: FactorSide,
 ) -> Result<()> {
-    let body = faculties::text_arg(&text, "factor text")?;
-    if body.trim().is_empty() {
-        bail!("factor text must not be empty");
-    }
-    let decision_id = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        // Sanity-check the decision exists and isn't already resolved.
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let decision_id = resolve_decision_id(&space, &decision_hex)?;
-        let exists = find!(
-            d: Id,
-            pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
-        )
-        .any(|d| d == decision_id);
-        if !exists {
-            bail!("no decision with id {decision_id:x}");
-        }
-        if is_resolved(&mut ws, &space, decision_id) {
-            bail!(
-                "decision {decision_id:x} is already resolved — append a new \
-                 decision to reconsider instead of mutating a closed one"
-            );
-        }
-
-        let factor_id = ufoid();
-        let now = instant_interval(now_epoch());
-        let body_handle: TextHandle = ws.put(body.clone());
-        let mut change = TribleSet::new();
-        change += ensure_kind_entities(&mut ws)?;
-        change += entity! { &factor_id @
-            metadata::tag: &kind,
-            metadata::created_at: now,
-            metadata::name: body_handle,
-            factor::about_decision: &decision_id,
-        };
-        ws.commit(
-            change,
-            if kind == KIND_PRO {
-                "decide: pro"
-            } else {
-                "decide: con"
-            },
-        );
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        Ok(decision_id)
+    let description = match side {
+        FactorSide::Pro => "add Decide pro factor",
+        FactorSide::Con => "add Decide con factor",
+    };
+    let (decision_id, factor_id) = storage.update(description, |view| {
+        let decision_id = resolve_decision(&input, &view.facts)?;
+        ensure_missing(
+            &decide::resolution(&view.facts, decision_id),
+            "add a factor",
+            decision_id,
+        )?;
+        let (fragment, factor_id) = decide::factor_fragment(
+            genid().id,
+            decision_id,
+            side,
+            text,
+            epoch_interval(now_epoch()?),
+        )?;
+        Ok((fragment, (decision_id, factor_id)))
     })?;
-    let side = if kind == KIND_PRO { "pro" } else { "con" };
-    println!("Added {side} to decision {}", fmt_id(decision_id));
+    println!(
+        "Added {} factor {factor_id:x} to {decision_id:x}",
+        side.label()
+    );
     Ok(())
 }
 
 fn cmd_resolve(
-    pile: &Path,
-    branch_id: Id,
-    decision_hex: String,
+    storage: DecideStorage<'_>,
+    input: String,
     outcome: String,
-    force: bool,
+    forced: bool,
 ) -> Result<()> {
-    let outcome_text = faculties::text_arg(&outcome, "outcome")?;
-    if outcome_text.trim().is_empty() {
-        bail!("outcome must not be empty (use @- to pipe in stdin)");
-    }
-    let decision_id = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let decision_id = resolve_decision_id(&space, &decision_hex)?;
-        let exists = find!(
-            d: Id,
-            pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
-        )
-        .any(|d| d == decision_id);
-        if !exists {
-            bail!("no decision with id {decision_id:x}");
-        }
-        if is_resolved(&mut ws, &space, decision_id) {
-            bail!("decision {decision_id:x} is already resolved");
-        }
-
-        // The deliberation gate. `--force` bypasses; absence of
-        // factors is the trace.
-        if !force {
-            let pros = count_factors(&space, decision_id, KIND_PRO);
-            let cons = count_factors(&space, decision_id, KIND_CON);
-            if pros == 0 || cons == 0 {
-                bail!(
-                    "cannot resolve: needs ≥1 pro AND ≥1 con (have {pros} pro, {cons} con). \
-                     Add factors with `decide pro <id>` / `decide con <id>`, or pass --force \
-                     if this genuinely doesn't merit deliberation."
-                );
-            }
-        }
-
-        let now = instant_interval(now_epoch());
-        let outcome_handle: TextHandle = ws.put(outcome_text.clone());
-        let mut change = TribleSet::new();
-        change += entity! { ExclusiveId::force_ref(&decision_id) @
-            metadata::finished_at: now,
-            decide_attrs::outcome: outcome_handle,
-        };
-        ws.commit(change, "decide: resolve");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        Ok(decision_id)
+    let (decision_id, snapshot_id) = storage.update("resolve Decide decision", |view| {
+        let decision_id = resolve_decision(&input, &view.facts)?;
+        ensure_missing(
+            &decide::resolution(&view.facts, decision_id),
+            "resolve it again",
+            decision_id,
+        )?;
+        let evidence = evidence(&view.facts, decision_id, forced)?;
+        let (fragment, snapshot_id) = decide::resolution_fragment(
+            decision_id,
+            outcome,
+            forced,
+            &evidence,
+            &[],
+            epoch_interval(now_epoch()?),
+        )?;
+        Ok((fragment, (decision_id, snapshot_id)))
     })?;
-    println!("Resolved decision {}", fmt_id(decision_id));
+    println!("Resolved decision {decision_id:x} at {snapshot_id:x}");
+    if forced {
+        println!("Resolution is explicitly forced");
+    }
     Ok(())
 }
 
+fn cmd_reconcile(
+    storage: DecideStorage<'_>,
+    input: String,
+    outcome: String,
+    forced: bool,
+) -> Result<()> {
+    let (decision_id, snapshot_id, predecessors) =
+        storage.update("reconcile Decide resolution fork", |view| {
+            let decision_id = resolve_decision(&input, &view.facts)?;
+            let predecessors =
+                reconciliation_heads(decide::resolution(&view.facts, decision_id), decision_id)?;
+            let evidence = evidence(&view.facts, decision_id, forced)?;
+            let (fragment, snapshot_id) = decide::resolution_fragment(
+                decision_id,
+                outcome,
+                forced,
+                &evidence,
+                &predecessors,
+                epoch_interval(now_epoch()?),
+            )?;
+            Ok((fragment, (decision_id, snapshot_id, predecessors)))
+        })?;
+    println!(
+        "Reconciled {} resolution heads for {decision_id:x} at {snapshot_id:x}",
+        predecessors.len()
+    );
+    if forced {
+        println!("Reconciliation is explicitly forced");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
 struct DecisionRow {
     id: Id,
-    title: String,
-    created_at: Option<Epoch>,
-    resolved: bool,
+    genesis: DecisionGenesis,
     pros: usize,
     cons: usize,
-    outcome_preview: Option<String>,
+    resolution: Resolution,
 }
 
-fn collect_decisions(ws: &mut Workspace<Pile>, space: &TribleSet) -> Vec<DecisionRow> {
-    let ids: Vec<Id> = find!(
-        d: Id,
-        pattern!(space, [{ ?d @ metadata::tag: KIND_DECISION }])
-    )
-    .collect();
-    let mut rows: Vec<DecisionRow> = ids
-        .into_iter()
-        .map(|id| {
-            let title = decision_title(ws, space, id);
-            let created_at = decision_created_at(space, id);
-            let resolved = is_resolved(ws, space, id);
-            let pros = count_factors(space, id, KIND_PRO);
-            let cons = count_factors(space, id, KIND_CON);
-            let outcome_preview = if resolved {
-                find!(
-                    h: TextHandle,
-                    pattern!(space, [{ id @ decide_attrs::outcome: ?h }])
-                )
-                .next()
-                .and_then(|h| read_text(ws, h))
-                .map(|s| s.lines().next().unwrap_or("").trim().to_string())
-            } else {
-                None
-            };
-            DecisionRow {
-                id,
-                title,
-                created_at,
-                resolved,
-                pros,
-                cons,
-                outcome_preview,
-            }
-        })
-        .collect();
-    rows.sort_by_key(|r| {
-        std::cmp::Reverse(
-            r.created_at
-                .map(|e| e.to_tai_seconds() as i128)
-                .unwrap_or(0),
-        )
-    });
-    rows
+fn collect_decisions(view: &CollectionView) -> Result<Vec<DecisionRow>> {
+    let mut rows = Vec::new();
+    for id in decide::decision_anchors(&view.facts) {
+        let genesis = decide::genesis_for_decision(&view.facts, id)?
+            .ok_or_else(|| anyhow!("decision {id:x} has no genesis"))?;
+        let factors = decide::factors_for_decision(&view.facts, id)?;
+        rows.push(DecisionRow {
+            id,
+            genesis,
+            pros: factors
+                .iter()
+                .filter(|factor| factor.side == FactorSide::Pro)
+                .count(),
+            cons: factors
+                .iter()
+                .filter(|factor| factor.side == FactorSide::Con)
+                .count(),
+            resolution: decide::resolution(&view.facts, id),
+        });
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse((interval_key(row.genesis.created_at), row.id)));
+    Ok(rows)
 }
 
-fn cmd_list(pile: &Path, branch_id: Id, all: bool, forced_only: bool) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let rows = collect_decisions(&mut ws, &space);
-        let filtered: Vec<&DecisionRow> = rows
+fn common_snapshot(resolution: &Resolution) -> Option<&ResolutionSnapshot> {
+    match resolution {
+        Resolution::Unique(snapshot) => Some(snapshot),
+        Resolution::Agreed(snapshots) => snapshots.first(),
+        Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
+    }
+}
+
+fn list_status(resolution: &Resolution) -> String {
+    match resolution {
+        Resolution::Missing => "open".to_owned(),
+        Resolution::Unique(snapshot) if snapshot.forced => "resolved [forced]".to_owned(),
+        Resolution::Unique(_) => "resolved".to_owned(),
+        Resolution::Agreed(snapshots) if snapshots[0].forced => {
+            format!("resolved [forced agreement: {} heads]", snapshots.len())
+        }
+        Resolution::Agreed(snapshots) => {
+            format!("resolved [agreement: {} heads]", snapshots.len())
+        }
+        Resolution::Forked(snapshots) => format!("FORKED: {} divergent heads", snapshots.len()),
+        Resolution::Invalid(reason) => format!("INVALID: {reason}"),
+    }
+}
+
+fn cmd_list(storage: DecideStorage<'_>, all: bool, forced_only: bool) -> Result<()> {
+    storage.with_view(|view| {
+        let rows = collect_decisions(view)?;
+        let rows: Vec<_> = rows
             .iter()
-            .filter(|r| {
+            .filter(|row| {
                 if forced_only {
-                    r.resolved && (r.pros == 0 || r.cons == 0)
+                    common_snapshot(&row.resolution).is_some_and(|snapshot| snapshot.forced)
                 } else if all {
                     true
                 } else {
-                    !r.resolved
+                    matches!(
+                        row.resolution,
+                        Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_)
+                    )
                 }
             })
             .collect();
-        if filtered.is_empty() {
+        if rows.is_empty() {
             println!("(no decisions)");
-        } else {
-            for r in filtered {
-                let status = if r.resolved {
-                    if r.pros == 0 || r.cons == 0 {
-                        "resolved [forced]"
-                    } else {
-                        "resolved"
-                    }
-                } else {
-                    "open"
-                };
-                print!(
-                    "  {} [{status}] +{}/-{} {}",
-                    &fmt_id(r.id)[..8],
-                    r.pros,
-                    r.cons,
-                    r.title,
-                );
-                if let Some(o) = &r.outcome_preview {
-                    print!("  → {}", truncate(o, 60));
-                }
-                println!();
+            return Ok(());
+        }
+        for row in rows {
+            let title = decide::read_text(&view.reader, row.genesis.title)?;
+            print!(
+                "  {} [{}] +{}/-{} {}",
+                &fmt_id(row.id)[..8],
+                list_status(&row.resolution),
+                row.pros,
+                row.cons,
+                title
+            );
+            if let Some(snapshot) = common_snapshot(&row.resolution) {
+                let outcome = decide::read_text(&view.reader, snapshot.outcome)?;
+                print!("  → {}", truncate(outcome.lines().next().unwrap_or(""), 60));
             }
+            println!();
         }
         Ok(())
     })
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let trimmed: String = s.chars().take(max - 1).collect();
-        format!("{trimmed}…")
-    }
+fn print_factor(view: &CollectionView, factor: &FactorRecord) -> Result<()> {
+    let text = decide::read_text(&view.reader, factor.text)?;
+    let sign = match factor.side {
+        FactorSide::Pro => '+',
+        FactorSide::Con => '-',
+    };
+    println!(
+        "    {sign} [{}] {} ({})",
+        fmt_id(factor.id),
+        text,
+        format_interval(factor.created_at)
+    );
+    Ok(())
 }
 
-fn cmd_show(pile: &Path, branch_id: Id, decision_hex: String) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let decision_id = resolve_decision_id(&space, &decision_hex)?;
-
-        let title = decision_title(&mut ws, &space, decision_id);
-        println!("decision {}", fmt_id(decision_id));
-        println!("  title:   {title}");
-        let context_handle: Option<TextHandle> = find!(
-            h: TextHandle,
-            pattern!(&space, [{ decision_id @ metadata::description: ?h }])
-        )
-        .next();
-        if let Some(h) = context_handle {
-            if let Some(c) = read_text(&mut ws, h) {
-                println!("  context:");
-                for line in c.lines() {
-                    println!("    {line}");
-                }
-            }
+fn print_snapshot(
+    view: &CollectionView,
+    snapshot: &ResolutionSnapshot,
+    indent: &str,
+) -> Result<()> {
+    let outcome = decide::read_text(&view.reader, snapshot.outcome)?;
+    println!("{indent}head {}", fmt_id(snapshot.id));
+    println!("{indent}  forced: {}", snapshot.forced);
+    println!(
+        "{indent}  finished: {}",
+        format_interval(snapshot.finished_at)
+    );
+    println!(
+        "{indent}  evidence: {}",
+        if snapshot.evidence.is_empty() {
+            "(none)".to_owned()
+        } else {
+            snapshot
+                .evidence
+                .iter()
+                .map(|id| fmt_id(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
         }
-        let about: Option<Id> = find!(
-            a: Id,
-            pattern!(&space, [{ decision_id @ decide_attrs::about: ?a }])
-        )
-        .next();
-        if let Some(a) = about {
-            println!("  about:   {}", fmt_id(a));
-        }
+    );
+    if !snapshot.predecessors.is_empty() {
+        println!(
+            "{indent}  supersedes: {}",
+            snapshot
+                .predecessors
+                .iter()
+                .map(|id| fmt_id(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("{indent}  outcome:");
+    for line in outcome.lines() {
+        println!("{indent}    {line}");
+    }
+    Ok(())
+}
 
-        let pros: Vec<Id> = find!(
-            p: Id,
-            pattern!(&space, [{
-                ?p @ metadata::tag: KIND_PRO, factor::about_decision: decision_id
-            }])
-        )
-        .collect();
-        let cons: Vec<Id> = find!(
-            c: Id,
-            pattern!(&space, [{
-                ?c @ metadata::tag: KIND_CON, factor::about_decision: decision_id
-            }])
-        )
-        .collect();
-
-        println!("  pros ({}):", pros.len());
-        for p in pros {
-            let text = find!(
-                h: TextHandle,
-                pattern!(&space, [{ p @ metadata::name: ?h }])
-            )
-            .next()
-            .and_then(|h| read_text(&mut ws, h))
-            .unwrap_or_default();
-            println!("    + {text}");
-        }
-        println!("  cons ({}):", cons.len());
-        for c in cons {
-            let text = find!(
-                h: TextHandle,
-                pattern!(&space, [{ c @ metadata::name: ?h }])
-            )
-            .next()
-            .and_then(|h| read_text(&mut ws, h))
-            .unwrap_or_default();
-            println!("    - {text}");
-        }
-
-        if is_resolved(&mut ws, &space, decision_id) {
-            let outcome = find!(
-                h: TextHandle,
-                pattern!(&space, [{ decision_id @ decide_attrs::outcome: ?h }])
-            )
-            .next()
-            .and_then(|h| read_text(&mut ws, h))
-            .unwrap_or_default();
-            println!("  outcome:");
-            for line in outcome.lines() {
+fn cmd_show(storage: DecideStorage<'_>, input: String) -> Result<()> {
+    storage.with_view(|view| {
+        let decision_id = resolve_decision(&input, &view.facts)?;
+        let genesis = decide::genesis_for_decision(&view.facts, decision_id)?
+            .ok_or_else(|| anyhow!("decision {decision_id:x} has no genesis"))?;
+        println!("decision {decision_id:x}");
+        println!(
+            "  title: {}",
+            decide::read_text(&view.reader, genesis.title)?
+        );
+        println!("  created: {}", format_interval(genesis.created_at));
+        if let Some(context) = genesis.context {
+            println!("  context:");
+            for line in decide::read_text(&view.reader, context)?.lines() {
                 println!("    {line}");
             }
-        } else {
-            println!("  outcome: (unresolved)");
+        }
+        if let Some(about) = genesis.about {
+            println!("  about: {about:x}");
+        }
+
+        let factors = decide::factors_for_decision(&view.facts, decision_id)?;
+        let pros: Vec<_> = factors
+            .iter()
+            .filter(|factor| factor.side == FactorSide::Pro)
+            .collect();
+        let cons: Vec<_> = factors
+            .iter()
+            .filter(|factor| factor.side == FactorSide::Con)
+            .collect();
+        println!("  pros ({}):", pros.len());
+        for factor in pros {
+            print_factor(view, factor)?;
+        }
+        println!("  cons ({}):", cons.len());
+        for factor in cons {
+            print_factor(view, factor)?;
+        }
+
+        match decide::resolution(&view.facts, decision_id) {
+            Resolution::Missing => println!("  resolution: MISSING (open)"),
+            Resolution::Unique(snapshot) => {
+                println!("  resolution: UNIQUE");
+                print_snapshot(view, &snapshot, "    ")?;
+            }
+            Resolution::Agreed(snapshots) => {
+                println!(
+                    "  resolution: AGREED ({} concurrent heads; all remain join obligations)",
+                    snapshots.len()
+                );
+                for snapshot in snapshots {
+                    print_snapshot(view, &snapshot, "    ")?;
+                }
+            }
+            Resolution::Forked(snapshots) => {
+                println!(
+                    "  resolution: FORKED ({} divergent heads; no outcome selected)",
+                    snapshots.len()
+                );
+                for snapshot in snapshots {
+                    print_snapshot(view, &snapshot, "    ")?;
+                }
+            }
+            Resolution::Invalid(reason) => println!("  resolution: INVALID ({reason})"),
         }
         Ok(())
     })
 }
 
-fn cmd_resolve_id(pile: &Path, branch_id: Id, prefix: String) -> Result<()> {
-    let needle = prefix.trim().to_ascii_lowercase();
-    if needle.is_empty() {
-        bail!("empty prefix");
-    }
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let matches: Vec<Id> = find!(
-            d: Id,
-            pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
-        )
-        .filter(|d| fmt_id(*d).starts_with(&needle))
-        .collect();
-        match matches.len() {
-            0 => bail!("no decision id starts with '{}'", needle),
-            1 => {
-                println!("{}", fmt_id(matches[0]));
-                Ok(())
-            }
-            n => bail!("{n} matches; provide a longer prefix"),
-        }
+fn cmd_resolve_id(storage: DecideStorage<'_>, prefix: String) -> Result<()> {
+    storage.with_view(|view| {
+        println!("{:x}", resolve_decision(&prefix, &view.facts)?);
+        Ok(())
     })
 }
-
-// ── main ──────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cmd = cli.command.unwrap_or(Command::List {
-        all: false,
-        forced: false,
-    });
-    let branch_id_hex = cli.branch_id.as_deref();
-    let branch_id = with_repo(&cli.pile, |repo| {
-        if let Some(hex) = branch_id_hex {
-            // Branch ids aren't enumerable by content kind, so no prefix
-            // expansion — pass a full 32-char hex.
-            Id::from_hex(hex.trim()).ok_or_else(|| {
-                anyhow::anyhow!("invalid --branch-id '{}': expected 32-char hex", hex.trim())
-            })
-        } else {
-            repo.ensure_branch(&cli.branch, None)
-                .map_err(|e| anyhow::anyhow!("ensure branch '{}': {e:?}", cli.branch))
-        }
-    })?;
-
-    match cmd {
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+    let storage = DecideStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+    };
+    match command {
         Command::Propose {
             title,
             context,
             about,
-        } => cmd_propose(&cli.pile, branch_id, title, context, about),
-        Command::Pro { decision, text } => {
-            cmd_factor(&cli.pile, branch_id, decision, text, KIND_PRO)
-        }
-        Command::Con { decision, text } => {
-            cmd_factor(&cli.pile, branch_id, decision, text, KIND_CON)
-        }
+        } => cmd_propose(
+            storage,
+            faculties::text_arg(&title, "decision title")?,
+            context
+                .as_deref()
+                .map(|value| faculties::text_arg(value, "decision context"))
+                .transpose()?,
+            about,
+        ),
+        Command::Pro { decision, text } => cmd_factor(
+            storage,
+            decision,
+            faculties::text_arg(&text, "pro factor")?,
+            FactorSide::Pro,
+        ),
+        Command::Con { decision, text } => cmd_factor(
+            storage,
+            decision,
+            faculties::text_arg(&text, "con factor")?,
+            FactorSide::Con,
+        ),
         Command::Resolve {
             decision,
             outcome,
             force,
-        } => cmd_resolve(&cli.pile, branch_id, decision, outcome, force),
-        Command::List { all, forced } => cmd_list(&cli.pile, branch_id, all, forced),
-        Command::Show { decision } => cmd_show(&cli.pile, branch_id, decision),
-        Command::ResolveId { prefix } => cmd_resolve_id(&cli.pile, branch_id, prefix),
+        } => cmd_resolve(
+            storage,
+            decision,
+            faculties::text_arg(&outcome, "resolution outcome")?,
+            force,
+        ),
+        Command::Reconcile {
+            decision,
+            outcome,
+            force,
+        } => cmd_reconcile(
+            storage,
+            decision,
+            faculties::text_arg(&outcome, "reconciled outcome")?,
+            force,
+        ),
+        Command::List { all, forced } => cmd_list(storage, all, forced),
+        Command::Show { decision } => cmd_show(storage, decision),
+        Command::ResolveId { prefix } => cmd_resolve_id(storage, prefix),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(id: Id, outcome: decide::TextHandle, forced: bool) -> ResolutionSnapshot {
+        ResolutionSnapshot {
+            id,
+            decision: genid().id,
+            outcome,
+            forced,
+            evidence: Vec::new(),
+            predecessors: Vec::new(),
+            finished_at: epoch_interval(Epoch::from_unix_seconds(1.0)),
+        }
+    }
+
+    #[test]
+    fn ordinary_actions_accept_only_missing_resolution() {
+        let decision = genid().id;
+        assert!(ensure_missing(&Resolution::Missing, "act", decision).is_ok());
+        assert!(ensure_missing(&Resolution::Invalid("bad".into()), "act", decision).is_err());
+    }
+
+    #[test]
+    fn reconciliation_accepts_only_genuine_forks_and_keeps_every_head() {
+        let decision = genid().id;
+        let first = genid().id;
+        let second = genid().id;
+        let handle = Inline::new([0x11; 32]);
+        let heads = reconciliation_heads(
+            Resolution::Forked(vec![
+                snapshot(first, handle, false),
+                snapshot(second, handle, true),
+            ]),
+            decision,
+        )
+        .unwrap();
+        assert_eq!(heads, vec![first, second]);
+        assert!(reconciliation_heads(
+            Resolution::Agreed(vec![
+                snapshot(first, handle, false),
+                snapshot(second, handle, false),
+            ]),
+            decision,
+        )
+        .is_err());
     }
 }

@@ -32,14 +32,66 @@ pub fn model_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".cache/faculties/models")
 }
 
+pub mod activation_cutover;
+pub mod archive_bm25;
+pub mod archive_claude_code;
+pub mod archive_collection;
+pub mod archive_cutover;
+pub mod atlas;
+pub mod atlas_cutover;
+pub mod blockdag;
+pub mod body;
+pub mod body_cutover;
+pub mod bootstrap;
+pub mod cognition;
+pub mod cognition_cutover;
 pub mod collection_cutover;
+pub mod comb;
+pub mod comb_cutover;
+pub mod compass;
+pub mod compass_cutover;
+pub mod decide;
+pub mod decide_cutover;
+pub mod discord;
+pub mod discord_cutover;
+pub mod disposable_cutover;
 pub mod files;
 pub mod files_cutover;
+pub mod habit_cutover;
+pub mod habits;
+pub mod headspace;
+pub mod headspace_cutover;
+pub mod mail;
+pub mod mail_cutover;
+pub mod mail_pop;
+pub mod memory;
 pub mod memory_cover;
+pub mod memory_cutover;
+pub mod message;
+pub mod message_cutover;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
+pub mod orient;
+pub mod orient_cutover;
+pub mod planner;
+pub mod planner_cutover;
+pub mod posture_cutover;
+pub mod relations;
+pub mod relations_cutover;
 pub mod schemas;
+pub mod secrets_cutover;
+pub mod status;
+pub mod status_cutover;
+pub mod teams;
+pub mod teams_cutover;
 pub mod tokens;
+pub mod triage;
+pub mod voice;
+pub mod voice_cutover;
+pub mod web_cutover;
+pub mod wiki;
+pub mod wiki_additive;
+pub mod wiki_cutover;
 
 #[cfg(test)]
 mod attribute_id_preservation_tests;
@@ -82,7 +134,7 @@ pub fn text_arg(raw: &str, label: &str) -> anyhow::Result<String> {
 }
 
 /// The `secrets` faculty's capability + envelope-encryption core, re-exported so
-/// faculties consumers can reach it as `faculties::secrets::SecretsRepo`. It
+/// faculties consumers can reach it as `faculties::secrets`. It
 /// lives in the standalone `faculties-secrets` crate so other consumers can use
 /// the same implementation without pulling the mary/GORBIE/egui stack.
 pub use faculties_secrets as secrets;

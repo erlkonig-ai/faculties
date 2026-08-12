@@ -9,31 +9,33 @@
 //! character budget, the `--about`/`--filter`/`--remove` composition — live in
 //! exactly one place.
 //!
-//! Everything below is the post-checkout half of what used to be
-//! `build_context_cover` in `memory.rs`: the caller does the branch
-//! resolution / pull / checkout, then hands us the already-checked-out `space`
-//! and `&mut ws` plus the parsed [`CoverOpts`]; we return the cover TEXT.
+//! Callers hand this module canonical Memory and shared Embeddings collection
+//! views frozen from one pile snapshot, plus the Memory attachment reader and
+//! parsed [`CoverOpts`]. The result is the cover text.
 
+#[cfg(feature = "local-embed")]
+use std::collections::BTreeSet;
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "local-embed")]
+use anyhow::anyhow;
+use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
 
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Workspace;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
-use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
+use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;
 
 #[cfg(feature = "local-embed")]
 use crate::nomic;
 #[cfg(feature = "local-embed")]
 use crate::schemas::embeddings::{self, Embedding768};
-use crate::schemas::memory::{ctx, search_index, KIND_CHUNK_ID, KIND_SEARCH_INDEX};
+use crate::schemas::memory::{ctx, KIND_CHUNK_ID};
 
 // ---------------------------------------------------------------------------
 // on-demand chunk queries — moved here from memory.rs so the render is
@@ -83,17 +85,27 @@ pub fn all_chunk_ids(space: &TribleSet) -> Vec<Id> {
 /// covers and trees exclude superseded chunks (read-side policy), while
 /// direct id lookup still resolves them for history inspection.
 pub fn superseded_ids(space: &TribleSet) -> HashSet<Id> {
-    find!(old: Id, pattern!(space, [{ _ @ ctx::supersedes: ?old }])).collect()
+    find!(old: Id, pattern!(space, [{ _ @ metadata::supersedes: ?old }])).collect()
 }
 
 /// The stored shared-space embedding handle for a chunk, if it has been embedded.
 #[cfg(feature = "local-embed")]
-pub fn chunk_embedding_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<Embedding768>>> {
-    find!(
+pub fn chunk_embedding_handle(
+    embeddings_space: &TribleSet,
+    id: Id,
+) -> Result<Option<Inline<Handle<Embedding768>>>> {
+    let mut handles: BTreeSet<_> = find!(
         h: Inline<Handle<Embedding768>>,
-        pattern!(space, [{ id @ embeddings::attr::embedding: ?h }])
+        pattern!(embeddings_space, [{ id @ embeddings::attr::embedding: ?h }])
     )
-    .next()
+    .collect();
+    if handles.len() > 1 {
+        bail!(
+            "shared Embeddings collection has {} observations for Memory chunk {id:x}; expected at most one",
+            handles.len()
+        );
+    }
+    Ok(handles.pop_first())
 }
 
 // ---------------------------------------------------------------------------
@@ -132,22 +144,6 @@ pub fn key_to_epoch(key: i128) -> Epoch {
     Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(key))
 }
 
-/// Latest (handle, indexed_at) search-index entity, if any.
-pub fn latest_search_index(
-    space: &TribleSet,
-) -> Option<(Inline<Handle<SuccinctBM25Blob>>, Inline<NsTAIInterval>)> {
-    find!(
-        (h: Inline<Handle<SuccinctBM25Blob>>, at: Inline<NsTAIInterval>),
-        pattern!(space, [{
-            _?e @
-            metadata::tag: &KIND_SEARCH_INDEX,
-            search_index::index: ?h,
-            search_index::indexed_at: ?at,
-        }])
-    )
-    .max_by_key(|(_, at)| interval_key(*at))
-}
-
 /// L2-normalize so dot-product == cosine downstream (the shared `nearest` core
 /// and `put_embedding` both assume unit vectors; nomic's raw output is not
 /// guaranteed normalized).
@@ -166,7 +162,7 @@ pub fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
 // cover helpers
 // ---------------------------------------------------------------------------
 
-/// Load the non-superseded chunks of the memory branch as `(start_key, end_key, id)`.
+/// Load the non-superseded chunks of canonical Memory as `(start_key, end_key, id)`.
 /// Chunks missing a start/end interval are skipped. Shared by `list` and `check`.
 pub fn collect_chunk_spans(space: &TribleSet) -> Vec<(i128, i128, Id)> {
     let superseded = superseded_ids(space);
@@ -196,8 +192,8 @@ pub const IMAGE_CHUNK_CHAR_COST: usize = 64;
 /// Character-cost of a chunk (its budget weight), loaded lazily and cached by
 /// span index. Cost is the summary's exact character count, so the budget and
 /// the per-chunk weights are in the same, unambiguous CHARACTER units.
-pub fn context_chunk_cost(
-    ws: &mut Workspace<Pile>,
+pub fn context_chunk_cost<B: BlobStoreGet>(
+    ws: &B,
     space: &TribleSet,
     spans: &[(i128, i128, Id)],
     cache: &mut [Option<usize>],
@@ -228,38 +224,56 @@ pub fn context_chunk_cost(
 /// matched cluster. Override per call with `--sim-threshold <f>`.
 pub const DEFAULT_SIM_THRESHOLD: f32 = 0.55;
 
+/// Rebuild the exact lexical view from the frozen canonical Memory facts.
+/// BM25 is query-time machinery, not durable journal state: there is no stale
+/// index entity to arbitrate and every live text revision visible in `space`
+/// participates in this one scored postings walk.
+pub fn lexical_relevance_scores<B: BlobStoreGet>(
+    space: &TribleSet,
+    reader: &B,
+    query: &str,
+) -> Result<HashMap<Id, f32>> {
+    let superseded = superseded_ids(space);
+    let mut builder = BM25Builder::new();
+    for chunk in all_chunk_ids(space) {
+        if superseded.contains(&chunk) {
+            continue;
+        }
+        let Some(handle) = chunk_summary_handle(space, chunk) else {
+            continue;
+        };
+        let summary: View<str> = reader
+            .get(handle)
+            .with_context(|| format!("read Memory chunk {chunk:x} for lexical search"))?;
+        builder.insert(chunk, hash_tokens(summary.as_ref()));
+    }
+    Ok(builder
+        .build()
+        .query_multi(&hash_tokens(query))
+        .into_iter()
+        .filter_map(|(doc, score)| Some((doc.try_from_inline().ok()?, score)))
+        .collect())
+}
+
 /// Per-chunk relevance scores for `memory context --about`: SEMANTIC (nomic
 /// cosine over the stored shared-space embeddings) when they exist, else LEXICAL
 /// (BM25). Both are non-negative; the cover propagates subtree maxima over them,
 /// so a node is worth descending into iff some memory beneath it is relevant.
-pub fn about_relevance_scores(
+pub fn about_relevance_scores<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    embeddings_space: &TribleSet,
+    reader: &B,
     query: &str,
 ) -> Result<HashMap<Id, f32>> {
     #[cfg(feature = "local-embed")]
     {
-        if let Some(scores) = semantic_about_scores(space, ws, query)? {
+        if let Some(scores) = semantic_about_scores(space, embeddings_space, reader, query)? {
             return Ok(scores);
         }
     }
-    // Lexical fallback (BM25) — used without `local-embed`, or before any
-    // `memory embed` has populated the semantic space.
-    let Some((handle, _)) = latest_search_index(space) else {
-        bail!(
-            "no relevance source for --about: build one with `memory embed` (semantic, preferred) \
-             or `memory index` (lexical BM25)"
-        );
-    };
-    let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
-    Ok(idx
-        .query_multi(&hash_tokens(query))
-        .into_iter()
-        .filter_map(|(doc, score)| {
-            let id: Id = doc.try_from_inline().ok()?;
-            Some((id, score))
-        })
-        .collect())
+    #[cfg(not(feature = "local-embed"))]
+    let _ = embeddings_space;
+    lexical_relevance_scores(space, reader, query)
 }
 
 /// Semantic relevance via nomic: embed the query, cosine it against every stored
@@ -267,14 +281,15 @@ pub fn about_relevance_scores(
 /// BM25). Negative cosines clamp to 0 so "unrelated" is uniform and subtree-max
 /// stays meaningful (matching BM25's non-negative scores).
 #[cfg(feature = "local-embed")]
-pub fn semantic_about_scores(
+pub fn semantic_about_scores<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    embeddings_space: &TribleSet,
+    reader: &B,
     query: &str,
 ) -> Result<Option<HashMap<Id, f32>>> {
     let mut handles: Vec<(Id, Inline<Handle<Embedding768>>)> = Vec::new();
     for chunk in all_chunk_ids(space) {
-        if let Some(h) = chunk_embedding_handle(space, chunk) {
+        if let Some(h) = chunk_embedding_handle(embeddings_space, chunk)? {
             handles.push((chunk, h));
         }
     }
@@ -289,7 +304,9 @@ pub fn semantic_about_scores(
     );
     let mut scores = HashMap::new();
     for (chunk, h) in handles {
-        let v: View<[f32]> = ws.get(h).map_err(|e| anyhow!("read embedding: {e:?}"))?;
+        let v: View<[f32]> = reader
+            .get(h)
+            .map_err(|e| anyhow!("read embedding: {e:?}"))?;
         let cos: f32 = qv.iter().zip(v.as_ref().iter()).map(|(a, b)| a * b).sum();
         scores.insert(chunk, cos.max(0.0));
     }
@@ -311,34 +328,28 @@ pub fn semantic_about_scores(
 /// `universe` is the exact set of chunks that can appear in the cover (non-
 /// superseded, non-lens — what `collect_chunk_spans` selects), so the unscorable
 /// warning never lists chunks that could never surface anyway.
-pub fn eligibility_scores(
+pub fn eligibility_scores<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    embeddings_space: &TribleSet,
+    reader: &B,
     query: &str,
     universe: &[Id],
 ) -> Result<(HashMap<Id, f32>, Vec<Id>)> {
     #[cfg(feature = "local-embed")]
     {
-        if let Some(res) = semantic_eligibility_scores(space, ws, query, universe)? {
+        if let Some(res) =
+            semantic_eligibility_scores(space, embeddings_space, reader, query, universe)?
+        {
             return Ok(res);
         }
     }
+    #[cfg(not(feature = "local-embed"))]
+    let _ = embeddings_space;
     // Pure lexical fallback (no embeddings on the pile yet, or built without
     // `local-embed`): BM25 normalized to a fraction of the top score. Every chunk
     // gets an explicit score — those absent from the postings scored a genuine 0
     // ("no match"), so nothing here is *unscorable*.
-    let Some((handle, _)) = latest_search_index(space) else {
-        bail!(
-            "no relevance source for --filter/--remove: build one with `memory embed` \
-             (semantic, preferred) or `memory index` (lexical BM25)"
-        );
-    };
-    let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
-    let raw: HashMap<Id, f32> = idx
-        .query_multi(&hash_tokens(query))
-        .into_iter()
-        .filter_map(|(doc, score)| Some((doc.try_from_inline().ok()?, score)))
-        .collect();
+    let raw = lexical_relevance_scores(space, reader, query)?;
     let max = raw.values().copied().fold(0.0_f32, f32::max).max(1e-6);
     let scores = universe
         .iter()
@@ -348,21 +359,22 @@ pub fn eligibility_scores(
 }
 
 /// Semantic half of [`eligibility_scores`]: nomic cosine over stored chunk
-/// embeddings. Unembedded chunks fall back to a positive lexical (BM25) score if
-/// the index has one; otherwise they are reported UNSCORABLE so the caller can
-/// keep them (fail-open) and warn — the honest, guardrail-safe behavior. Returns
-/// `None` when no chunk is embedded at all (caller drops to pure lexical).
+/// embeddings. Unembedded text chunks fall back to exact lexical BM25,
+/// including an explicit zero for no token match. Wordless images without an
+/// embedding remain unscorable, so the caller keeps them fail-open and warns.
+/// Returns `None` when no chunk is embedded at all (pure lexical fallback).
 #[cfg(feature = "local-embed")]
-pub fn semantic_eligibility_scores(
+pub fn semantic_eligibility_scores<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    embeddings_space: &TribleSet,
+    reader: &B,
     query: &str,
     universe: &[Id],
 ) -> Result<Option<(HashMap<Id, f32>, Vec<Id>)>> {
     let mut embedded: Vec<(Id, Inline<Handle<Embedding768>>)> = Vec::new();
     let mut unembedded: Vec<Id> = Vec::new();
     for &chunk in universe {
-        match chunk_embedding_handle(space, chunk) {
+        match chunk_embedding_handle(embeddings_space, chunk)? {
             Some(h) => embedded.push((chunk, h)),
             None => unembedded.push(chunk),
         }
@@ -378,34 +390,29 @@ pub fn semantic_eligibility_scores(
     );
     let mut scores = HashMap::new();
     for (chunk, h) in embedded {
-        let v: View<[f32]> = ws.get(h).map_err(|e| anyhow!("read embedding: {e:?}"))?;
+        let v: View<[f32]> = reader
+            .get(h)
+            .map_err(|e| anyhow!("read embedding: {e:?}"))?;
         let cos: f32 = qv.iter().zip(v.as_ref().iter()).map(|(a, b)| a * b).sum();
         scores.insert(chunk, cos.max(0.0));
     }
-    // Unembedded chunks: try a positive lexical score; else mark unscorable.
-    let lexical: Option<(HashMap<Id, f32>, f32)> =
-        if let Some((handle, _)) = latest_search_index(space) {
-            let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
-            let raw: HashMap<Id, f32> = idx
-                .query_multi(&hash_tokens(query))
-                .into_iter()
-                .filter_map(|(doc, score)| Some((doc.try_from_inline().ok()?, score)))
-                .collect();
-            let max = raw.values().copied().fold(0.0_f32, f32::max).max(1e-6);
-            Some((raw, max))
-        } else {
-            None
-        };
+    // Unembedded text chunks still have an exact lexical score. Wordless
+    // images have neither modality and remain honestly unscorable.
+    let lexical = lexical_relevance_scores(space, reader, query)?;
+    let lexical_max = lexical.values().copied().fold(0.0_f32, f32::max).max(1e-6);
     let mut unscorable = Vec::new();
     for chunk in unembedded {
-        match lexical
-            .as_ref()
-            .and_then(|(raw, max)| raw.get(&chunk).map(|s| s / max))
-        {
-            Some(s) if s > 0.0 => {
-                scores.insert(chunk, s);
-            }
-            _ => unscorable.push(chunk),
+        if chunk_summary_handle(space, chunk).is_some() {
+            scores.insert(
+                chunk,
+                lexical
+                    .get(&chunk)
+                    .copied()
+                    .map(|score| score / lexical_max)
+                    .unwrap_or(0.0),
+            );
+        } else {
+            unscorable.push(chunk);
         }
     }
     Ok(Some((scores, unscorable)))
@@ -439,20 +446,118 @@ impl CoverOpts {
     }
 }
 
-/// Render the context-cover TEXT from an already-checked-out memory `space`
-/// (and its `&mut ws`, needed to read summaries / embeddings / the search
-/// index) — the antichain cover over ALL memories, coarse → fine, fit to
+/// Render the context-cover text from canonical Memory and shared Embeddings
+/// views, using `reader` for their attachment blobs. The result is the
+/// antichain cover over all memories, coarse → fine, fit to
 /// `opts.budget_chars` characters.
-///
-/// This is the post-checkout half of the old `build_context_cover`: the caller
-/// resolves + pulls + checks out the memory branch, then hands the result here.
 ///
 /// Completeness is invariant — a memory is never dropped to fit. If even the
 /// coarsest cover (all roots) overflows the budget, this ERRORS with
 /// instructions for raising a coarser apex rather than silently losing the past.
-pub fn render_cover(
+/// Containment forest over chunk spans: each chunk's tightest strict container,
+/// the children that induces, and the roots with no container at all.
+///
+/// Shared by [`render_cover`] and [`cover_headroom`] so the two cannot disagree
+/// about what a root is — the roots ARE the coarsest possible cover, so a
+/// headroom figure computed from a different notion of root would report safety
+/// the cover does not have.
+fn containment_forest(
+    spans: &[(i128, i128, Id)],
+) -> (Vec<Option<usize>>, Vec<Vec<usize>>, Vec<usize>) {
+    let n = spans.len();
+    let strict_contains = |a: usize, b: usize| -> bool {
+        spans[a].0 <= spans[b].0
+            && spans[a].1 >= spans[b].1
+            && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
+    };
+    let width = |i: usize| spans[i].1 - spans[i].0;
+    let mut parent: Vec<Option<usize>> = vec![None; n];
+    for (i, parent_slot) in parent.iter_mut().enumerate() {
+        let mut best: Option<usize> = None;
+        for j in 0..n {
+            if j != i && strict_contains(j, i) {
+                best = Some(match best {
+                    Some(b) if width(b) <= width(j) => b,
+                    _ => j,
+                });
+            }
+        }
+        *parent_slot = best;
+    }
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, parent) in parent.iter().copied().enumerate() {
+        match parent {
+            Some(p) => children[p].push(i),
+            None => roots.push(i),
+        }
+    }
+    (parent, children, roots)
+}
+
+/// How close the coarsest possible cover is to the budget.
+///
+/// `render_cover` refuses when the roots alone overflow, which is correct but
+/// only observable once it has already happened — and it happens to EVERY reader
+/// at once, because the roots grow silently as top-level chunks accumulate
+/// without a coarser parent. On 2026-08-09 the whole wake ritual returned nothing
+/// at 805,092 characters against an 800,000 budget: it had crossed by 0.6% and
+/// nothing had ever reported the approach. This makes the approach readable while
+/// the cover still works.
+#[derive(Clone, Copy, Debug)]
+pub struct CoverHeadroom {
+    /// Top-level chunks with no coarser parent. These are the coarsest cover.
+    pub roots: usize,
+    /// Characters the coarsest cover needs.
+    pub used: usize,
+    /// Characters allowed.
+    pub budget: usize,
+}
+
+impl CoverHeadroom {
+    /// Characters to spare, saturating at zero once the cover is impossible.
+    pub fn spare(&self) -> usize {
+        self.budget.saturating_sub(self.used)
+    }
+
+    /// True once no in-budget cover exists — i.e. `render_cover` now fails.
+    pub fn exhausted(&self) -> bool {
+        self.used > self.budget
+    }
+
+    /// Fraction of the budget still free, 0.0 when exhausted.
+    pub fn spare_fraction(&self) -> f64 {
+        if self.budget == 0 {
+            return 0.0;
+        }
+        self.spare() as f64 / self.budget as f64
+    }
+}
+
+/// Compute [`CoverHeadroom`] without rendering a cover.
+pub fn cover_headroom<B: BlobStoreGet>(
     space: &TribleSet,
-    ws: &mut Workspace<Pile>,
+    ws: &B,
+    budget_chars: usize,
+) -> Result<CoverHeadroom> {
+    let spans = collect_chunk_spans(space);
+    let (_, _, roots) = containment_forest(&spans);
+    let mut cost_cache: Vec<Option<usize>> = vec![None; spans.len()];
+    let mut used = 0usize;
+    for &i in &roots {
+        used = used.saturating_add(context_chunk_cost(ws, space, &spans, &mut cost_cache, i)?);
+    }
+    Ok(CoverHeadroom {
+        roots: roots.len(),
+        used,
+        budget: budget_chars,
+    })
+}
+
+pub fn render_cover<B: BlobStoreGet>(
+    space: &TribleSet,
+    embeddings_space: &TribleSet,
+    reader: &B,
     opts: &CoverOpts,
 ) -> Result<String> {
     use std::fmt::Write as _;
@@ -473,33 +578,13 @@ pub fn render_cover(
 
     // Containment is time-range subsumption (the only hierarchy): a chunk's
     // immediate parent is the *tightest* strictly-wider chunk that spans it.
+    let (parent, children, mut roots) = containment_forest(&spans);
     let strict_contains = |a: usize, b: usize| -> bool {
         spans[a].0 <= spans[b].0
             && spans[a].1 >= spans[b].1
             && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
     };
     let width = |i: usize| spans[i].1 - spans[i].0;
-    let mut parent: Vec<Option<usize>> = vec![None; n];
-    for i in 0..n {
-        let mut best: Option<usize> = None;
-        for j in 0..n {
-            if j != i && strict_contains(j, i) {
-                best = Some(match best {
-                    Some(b) if width(b) <= width(j) => b,
-                    _ => j,
-                });
-            }
-        }
-        parent[i] = best;
-    }
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut roots: Vec<usize> = Vec::new();
-    for i in 0..n {
-        match parent[i] {
-            Some(p) => children[p].push(i),
-            None => roots.push(i),
-        }
-    }
 
     // Eligibility gates. `--filter` keeps only chunks whose positive
     // similarity to its query is ABOVE the threshold; `--remove` drops chunks
@@ -511,11 +596,23 @@ pub fn render_cover(
     // selected cover below). Both compose with each other and with `--about`.
     let universe: Vec<Id> = spans.iter().map(|s| s.2).collect();
     let filter_elig = match filter_q {
-        Some(q) => Some(eligibility_scores(space, ws, q, &universe)?),
+        Some(q) => Some(eligibility_scores(
+            space,
+            embeddings_space,
+            reader,
+            q,
+            &universe,
+        )?),
         None => None,
     };
     let remove_elig = match remove_q {
-        Some(q) => Some(eligibility_scores(space, ws, q, &universe)?),
+        Some(q) => Some(eligibility_scores(
+            space,
+            embeddings_space,
+            reader,
+            q,
+            &universe,
+        )?),
         None => None,
     };
     // Fail-open honesty: unembedded, un-lexically-scorable chunks can't be
@@ -536,14 +633,12 @@ pub fn render_cover(
     }
     let eligible = |id: Id| -> bool {
         if let Some((scores, _)) = &filter_elig {
-            match scores.get(&id) {
-                Some(v) => {
-                    if *v <= sim_threshold {
-                        return false;
-                    }
+            if let Some(v) = scores.get(&id) {
+                if *v <= sim_threshold {
+                    return false;
                 }
-                None => {} // unscorable → fail-open KEEP (warned above)
             }
+            // unscorable → fail-open KEEP (warned above)
         }
         if let Some((scores, _)) = &remove_elig {
             if let Some(v) = scores.get(&id) {
@@ -564,7 +659,7 @@ pub fn render_cover(
     // coarse (otherwise a filtered cover would surface little detail).
     let relevance: Vec<f32> = if about.is_some() || filter_q.is_some() {
         let scores: HashMap<Id, f32> = if let Some(query) = about {
-            about_relevance_scores(space, ws, query)?
+            about_relevance_scores(space, embeddings_space, reader, query)?
         } else {
             filter_elig.as_ref().unwrap().0.clone()
         };
@@ -599,7 +694,13 @@ pub fn render_cover(
     let mut cost_cache: Vec<Option<usize>> = vec![None; n];
     let mut used = 0usize;
     for &i in &roots {
-        used = used.saturating_add(context_chunk_cost(ws, space, &spans, &mut cost_cache, i)?);
+        used = used.saturating_add(context_chunk_cost(
+            reader,
+            space,
+            &spans,
+            &mut cost_cache,
+            i,
+        )?);
     }
     if used > budget_chars {
         let earliest = roots.iter().map(|&i| spans[i].0).min().unwrap();
@@ -631,22 +732,21 @@ pub fn render_cover(
         let mut best: Option<usize> = None; // position in `cover`
         let mut best_extra = 0usize;
         let mut best_key: Option<(f32, i128, i128, usize, Id)> = None;
-        for pos in 0..cover.len() {
-            let i = cover[pos];
+        for (pos, &i) in cover.iter().enumerate() {
             if children[i].len() < 2 {
                 continue;
             }
             let mut kids_cost = 0usize;
             for &k in &children[i] {
                 kids_cost = kids_cost.saturating_add(context_chunk_cost(
-                    ws,
+                    reader,
                     space,
                     &spans,
                     &mut cost_cache,
                     k,
                 )?);
             }
-            let pcost = context_chunk_cost(ws, space, &spans, &mut cost_cache, i)?;
+            let pcost = context_chunk_cost(reader, space, &spans, &mut cost_cache, i)?;
             let extra = kids_cost.saturating_sub(pcost);
             if extra > remaining {
                 continue;
@@ -697,7 +797,13 @@ pub fn render_cover(
         // Recompute the character tally honestly over what actually survived.
         used = 0;
         for &i in &cover {
-            used = used.saturating_add(context_chunk_cost(ws, space, &spans, &mut cost_cache, i)?);
+            used = used.saturating_add(context_chunk_cost(
+                reader,
+                space,
+                &spans,
+                &mut cost_cache,
+                i,
+            )?);
         }
     }
 
@@ -746,11 +852,105 @@ pub fn render_cover(
             format_time_range(key_to_epoch(s), key_to_epoch(e)),
         )?;
         if let Some(handle) = chunk_summary_handle(space, id) {
-            let summary: View<str> = ws.get(handle).context("read chunk summary")?;
+            let summary: View<str> = reader.get(handle).context("read chunk summary")?;
             writeln!(out, "{}", summary.trim_end())?;
         } else if chunk_image_handle(space, id).is_some() {
             writeln!(out, "[image memory @ {}]", chunk_span_str(space, id))?;
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use super::*;
+    use triblespace::macros::id_hex;
+
+    const A: Id = id_hex!("C1000000000000000000000000000001");
+    const B: Id = id_hex!("C1000000000000000000000000000002");
+    const C: Id = id_hex!("C1000000000000000000000000000003");
+
+    /// A chunk strictly inside another is not a root; only the container is.
+    #[test]
+    fn nesting_yields_one_root() {
+        let spans = vec![(0i128, 100i128, A), (10, 20, B), (30, 40, C)];
+        let (_, _, roots) = containment_forest(&spans);
+        assert_eq!(roots, vec![0]);
+    }
+
+    /// The shape that broke wake: an apex that stops short, and later chunks
+    /// that OVERLAP its tail without being contained by it. Overlap is not
+    /// containment, so both are roots and the coarsest cover is the sum of
+    /// both — which is how the roots grew unnoticed until they overflowed.
+    #[test]
+    fn overlap_is_not_containment() {
+        // apex 0..100; a chunk 90..150 overlaps its tail but escapes it.
+        let spans = vec![(0i128, 100i128, A), (90, 150, B)];
+        let (parent, _, roots) = containment_forest(&spans);
+        assert_eq!(parent, vec![None, None], "neither contains the other");
+        assert_eq!(roots.len(), 2, "both are top-level, so both cost budget");
+    }
+
+    /// Extending the apex over the escaping chunk re-parents it — the fix.
+    #[test]
+    fn a_wider_apex_adopts_the_orphan() {
+        let spans = vec![(0i128, 100i128, A), (90, 150, B), (0, 200, C)];
+        let (parent, _, roots) = containment_forest(&spans);
+        assert_eq!(roots, vec![2], "the wide apex is the only root");
+        assert_eq!(parent[0], Some(2));
+        assert_eq!(parent[1], Some(2));
+    }
+
+    #[test]
+    fn headroom_arithmetic() {
+        let ok = CoverHeadroom {
+            roots: 2,
+            used: 700_000,
+            budget: 800_000,
+        };
+        assert!(!ok.exhausted());
+        assert_eq!(ok.spare(), 100_000);
+        assert!((ok.spare_fraction() - 0.125).abs() < 1e-9);
+
+        // the real numbers from the 2026-08-09 outage
+        let dead = CoverHeadroom {
+            roots: 722,
+            used: 805_092,
+            budget: 800_000,
+        };
+        assert!(
+            dead.exhausted(),
+            "this is the state in which wake returns nothing"
+        );
+        assert_eq!(dead.spare(), 0, "spare saturates rather than underflowing");
+        assert_eq!(dead.spare_fraction(), 0.0);
+
+        // and the state that should have warned, well before it died
+        let thin = CoverHeadroom {
+            roots: 700,
+            used: 799_000,
+            budget: 800_000,
+        };
+        assert!(!thin.exhausted());
+        assert!(
+            thin.spare_fraction() < 0.15,
+            "warning threshold would fire here"
+        );
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn competing_shared_embedding_observations_are_ambiguous() {
+        let chunk = Id::new([0x61; 16]).unwrap();
+        let mut fragment = Fragment::empty();
+        let first = fragment.put::<Embedding768, _>(vec![0.0; 768]);
+        let second = fragment.put::<Embedding768, _>(vec![1.0; 768]);
+        fragment += entity! {
+            triblespace::core::id::ExclusiveId::force_ref(&chunk) @
+            embeddings::attr::embedding: first,
+            embeddings::attr::embedding: second,
+        };
+        let error = chunk_embedding_handle(fragment.facts(), chunk).unwrap_err();
+        assert!(error.to_string().contains("expected at most one"));
+    }
 }

@@ -5,19 +5,22 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::web::{config_schema, web_schema, CONFIG_BRANCH_ID, CONFIG_KIND_ID};
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::headspace;
+use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
+use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
+use faculties::secrets::{self as secrets_model, schema as secrets_schema};
+use faculties::web_cutover;
 use hifitime::Epoch;
-use rand_core::OsRng;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::json;
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStore;
+use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,16 +33,21 @@ enum Provider {
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "web", about = "Web search/browsing faculty (Tavily/Exa)")]
 struct Cli {
-    /// Path to the pile file to use.
+    /// Existing pile file. Reads and writes never create it.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch id to store web events into (hex). Overrides ensure_branch/env branch id.
-    #[arg(long)]
-    branch_id: Option<String>,
-    /// Override Tavily API key (otherwise loaded from config.tavily_api_key). Use @path for file input or @- for stdin.
+    /// Existing durable collection signer. Ordinary commands never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Secrets identity used to decrypt exact Headspace credential versions.
+    #[arg(long, env = "SECRETS_IDENTITY")]
+    secrets_identity: Option<String>,
+    /// Override the exact Tavily credential referenced by Headspace. Use
+    /// @path for file input or @- for stdin.
     #[arg(long)]
     tavily_api_key: Option<String>,
-    /// Override Exa API key (otherwise loaded from config.exa_api_key). Use @path for file input or @- for stdin.
+    /// Override the exact Exa credential referenced by Headspace. Use @path
+    /// for file input or @- for stdin.
     #[arg(long)]
     exa_api_key: Option<String>,
     /// Do not write events to the pile; only print results.
@@ -69,6 +77,9 @@ enum Command {
         #[arg(long, default_value_t = 12_000)]
         max_characters: usize,
     },
+    /// Additively publish the stopped legacy `web` branch into the fixed
+    /// native Web collection. Stop every legacy Web writer first.
+    MigrateLegacy,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,14 +88,11 @@ struct ApiKeys {
     exa: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
-struct ConfigSnapshot {
-    tavily_api_key: Option<String>,
-    exa_api_key: Option<String>,
+fn main() -> Result<()> {
+    run(Cli::parse())
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<()> {
     let Some(cmd) = cli.command.as_ref() else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -92,8 +100,20 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let config = load_config_snapshot(&cli.pile)?;
-    let keys = resolve_api_keys(&cli, &config)?;
+    if matches!(cmd, Command::MigrateLegacy) {
+        return migrate_legacy(&cli);
+    }
+
+    let storage = WebStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
+        secrets_identity: cli.secrets_identity.as_deref(),
+    };
+    let requested_provider = match cmd {
+        Command::Search { provider, .. } | Command::Fetch { provider, .. } => *provider,
+        Command::MigrateLegacy => unreachable!("handled before credential resolution"),
+    };
+    let keys = resolve_api_keys(&cli, storage, requested_provider)?;
 
     match cmd {
         Command::Search {
@@ -102,34 +122,48 @@ fn main() -> Result<()> {
             provider,
         } => {
             let query = load_value_or_file(query, "search query")?;
-            cmd_search(&cli, keys, *provider, &query, *max_results)
+            cmd_search(&cli, storage, keys, *provider, &query, *max_results)
         }
         Command::Fetch {
             url,
             provider,
             max_characters,
-        } => cmd_fetch(&cli, keys, *provider, url, *max_characters),
+        } => cmd_fetch(&cli, storage, keys, *provider, url, *max_characters),
+        Command::MigrateLegacy => unreachable!("handled before credential resolution"),
     }
 }
 
-fn resolve_api_keys(cli: &Cli, config: &ConfigSnapshot) -> Result<ApiKeys> {
-    let tavily = cli
+fn resolve_api_keys(
+    cli: &Cli,
+    storage: WebStorage<'_>,
+    requested_provider: Provider,
+) -> Result<ApiKeys> {
+    let mut tavily = cli
         .tavily_api_key
         .as_deref()
         .map(|value| load_value_or_file_trimmed(value, "tavily api key"))
-        .transpose()?
-        .or_else(|| config.tavily_api_key.clone());
-    let exa = cli
+        .transpose()?;
+    let mut exa = cli
         .exa_api_key
         .as_deref()
         .map(|value| load_value_or_file_trimmed(value, "exa api key"))
-        .transpose()?
-        .or_else(|| config.exa_api_key.clone());
+        .transpose()?;
+    let needs_headspace = match requested_provider {
+        Provider::Auto => tavily.is_none() || exa.is_none(),
+        Provider::Tavily => tavily.is_none(),
+        Provider::Exa => exa.is_none(),
+    };
+    if needs_headspace {
+        let configured = storage.open_web_secrets()?;
+        tavily = tavily.or(configured.tavily);
+        exa = exa.or(configured.exa);
+    }
     Ok(ApiKeys { tavily, exa })
 }
 
 fn cmd_search(
     cli: &Cli,
+    storage: WebStorage<'_>,
     keys: ApiKeys,
     provider: Provider,
     query: &str,
@@ -151,15 +185,18 @@ fn cmd_search(
 
     print_search_results(provider, query, &results);
 
-    if cli.no_store {
-        return Ok(());
+    if !cli.no_store {
+        storage.store(
+            search_fragment(provider, query, &results)?,
+            "web search observation",
+        )?;
     }
-    let branch_id = resolve_branch_id(cli)?;
-    store_search(cli, branch_id, provider, query, &results)
+    Ok(())
 }
 
 fn cmd_fetch(
     cli: &Cli,
+    storage: WebStorage<'_>,
     keys: ApiKeys,
     provider: Provider,
     url: &str,
@@ -182,21 +219,27 @@ fn cmd_fetch(
     if cli.no_store {
         return Ok(());
     }
-    let branch_id = resolve_branch_id(cli)?;
-    store_fetch(cli, branch_id, provider, url, &content)
+    storage.store(
+        fetch_fragment(provider, url, &content),
+        "web fetch observation",
+    )
 }
 
 fn choose_provider(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
     match provider {
         Provider::Tavily => {
             if keys.tavily.is_none() {
-                bail!("no Tavily API key configured");
+                bail!(
+                    "no Tavily credential available (attach an exact Headspace secret or pass --tavily-api-key)"
+                );
             }
             Ok(Provider::Tavily)
         }
         Provider::Exa => {
             if keys.exa.is_none() {
-                bail!("no Exa API key configured");
+                bail!(
+                    "no Exa credential available (attach an exact Headspace secret or pass --exa-api-key)"
+                );
             }
             Ok(Provider::Exa)
         }
@@ -206,7 +249,9 @@ fn choose_provider(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
             } else if keys.exa.is_some() {
                 Ok(Provider::Exa)
             } else {
-                bail!("no web provider configured (set config.tavily_api_key and/or config.exa_api_key)");
+                bail!(
+                    "no Web provider credential is referenced by Headspace or explicitly supplied"
+                );
             }
         }
     }
@@ -220,113 +265,138 @@ fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider>
             } else if keys.tavily.is_some() {
                 Ok(Provider::Tavily)
             } else {
-                bail!("no web provider configured (set config.tavily_api_key and/or config.exa_api_key)");
+                bail!(
+                    "no Web provider credential is referenced by Headspace or explicitly supplied"
+                );
             }
         }
         other => choose_provider(other, keys),
     }
 }
 
-fn load_config_snapshot(pile_path: &Path) -> Result<ConfigSnapshot> {
-    let debug = std::env::var_os("PLAYGROUND_WEB_DEBUG").is_some();
-    with_repo(pile_path, |repo| {
-        let snapshot = if repo
-            .storage_mut()
-            .head(CONFIG_BRANCH_ID)
-            .map_err(|e| anyhow!("config branch head: {e:?}"))?
-            .is_none()
-        {
-            ConfigSnapshot::default()
-        } else {
-            let mut ws = repo
-                .pull(CONFIG_BRANCH_ID)
-                .map_err(|e| anyhow!("pull config: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow!("checkout config: {e:?}"))?;
-            match latest_config_id(&space)? {
-                Some(config_id) => {
-                    if debug {
-                        eprintln!("[web] latest config id: {config_id:x}");
-                    }
-                    ConfigSnapshot {
-                        tavily_api_key: load_string_attr(
-                            &mut ws,
-                            &space,
-                            config_id,
-                            &config_schema::tavily_api_key,
-                        )?,
-                        exa_api_key: load_string_attr(
-                            &mut ws,
-                            &space,
-                            config_id,
-                            &config_schema::exa_api_key,
-                        )?,
-                    }
-                }
-                None => ConfigSnapshot::default(),
-            }
-        };
-        Ok(snapshot)
-    })
+#[derive(Clone, Copy)]
+struct WebStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+    secrets_identity: Option<&'a str>,
 }
 
-fn resolve_branch_id(cli: &Cli) -> Result<Id> {
-    with_repo(&cli.pile, |repo| {
-        if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
-        }
-        if let Ok(hex) = std::env::var("TRIBLESPACE_BRANCH_ID") {
-            return Id::from_hex(hex.trim())
-                .ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID"));
-        }
-        repo.ensure_branch("web", None)
-            .map_err(|e| anyhow!("ensure web branch: {e:?}"))
-    })
+struct CollectionView {
+    facts: TribleSet,
+    reader: PileReader,
 }
 
-fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
-    let mut latest: Option<(Id, Inline<NsTAIInterval>)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(space, [{
-            ?config_id @
-            metadata::tag: CONFIG_KIND_ID,
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest {
-            Some((_, cur)) if interval_key(cur) >= key => {}
-            _ => latest = Some((config_id, updated_at)),
-        }
+impl WebStorage<'_> {
+    fn materialize(
+        &self,
+        pile: &mut Pile,
+        signer: &SigningKey,
+        scope: Id,
+        label: &str,
+    ) -> Result<CollectionView> {
+        let facts = Collection::new(&mut *pile, scope, signer.clone())
+            .materialize()
+            .with_context(|| format!("materialize {label} collection"))?;
+        let reader = pile
+            .reader()
+            .with_context(|| format!("open {label} attachment reader"))?;
+        Ok(CollectionView { facts, reader })
     }
-    Ok(latest.map(|(id, _)| id))
+
+    /// Resolve Headspace once and decrypt exactly the credential versions it
+    /// names. Labels and timestamps never participate in runtime selection.
+    fn open_web_secrets(&self) -> Result<ApiKeys> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = (|| {
+            let secrets = self.materialize(
+                &mut pile,
+                &signer,
+                secrets_schema::DEFAULT_SCOPE_ID,
+                "Secrets",
+            )?;
+            let secrets_catalog = secrets_model::validate_catalog(&secrets.reader, &secrets.facts)
+                .context("validate Secrets collection")?;
+            let headspace =
+                self.materialize(&mut pile, &signer, HEADSPACE_SCOPE_ID, "Headspace")?;
+            let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
+                .context("validate Headspace collection")?;
+            headspace::validate_secret_references(&catalog, &secrets_catalog)
+                .context("validate exact Headspace credential references")?;
+            let (config, _) = headspace::settled_active(&catalog)
+                .context("resolve active Headspace configuration")?;
+            if config.tavily_secret_version.is_none() && config.exa_secret_version.is_none() {
+                return Ok(ApiKeys::default());
+            }
+
+            let selector = self
+                .secrets_identity
+                .map(str::to_owned)
+                .or_else(|| std::env::var("PERSONA").ok())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "set --secrets-identity/SECRETS_IDENTITY (or PERSONA) to decrypt Web credentials"
+                    )
+                })?;
+            let identity =
+                secrets_model::resolve_identity(&secrets.reader, &secrets_catalog, &selector)
+                    .with_context(|| format!("resolve Secrets identity {selector:?}"))?;
+            let password =
+                faculties::secrets::password::read("unlock the selected Secrets identity")?;
+            let opened = headspace::open_active_secrets(
+                &catalog,
+                &secrets.reader,
+                &secrets_catalog,
+                identity,
+                &password,
+            )?;
+            Ok(ApiKeys {
+                tavily: opened.tavily_api_key,
+                exa: opened.exa_api_key,
+            })
+        })();
+        finish_pile(pile, result, "credential read")
+    }
+
+    fn store(&self, mut fragment: Fragment, description: &'static str) -> Result<()> {
+        let signer = load_signer(self.pile, self.key)?;
+        fragment.describe_with(entity! { metadata::description: description });
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let result = collection
+            .commit(fragment)
+            .context("commit Web observation")
+            .map(|_| ());
+        finish_pile(collection.into_storage(), result, "observation write")
+    }
 }
 
-fn interval_key(value: Inline<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = value.try_from_inline().unwrap();
-    lower.to_tai_duration().total_nanoseconds()
+fn migrate_legacy(cli: &Cli) -> Result<()> {
+    load_signer(&cli.pile, cli.key.as_deref())?;
+    let source = freeze_source(&cli.pile).context("freeze legacy Web source")?;
+    let plan = web_cutover::plan(&source).context("plan legacy Web cutover")?;
+    let commits = web_cutover::publish(&source, &plan, &cli.pile, cli.key.as_deref())?;
+    println!(
+        "Migrated {} authored Web commits ({} facts, {} authored empty, {} contentless merges) into {} native commits.",
+        plan.report().authored_commits,
+        plan.report().facts,
+        plan.report().authored_empty_commits,
+        plan.report().contentless_merges,
+        commits.len(),
+    );
+    Ok(())
 }
 
-fn load_string_attr(
-    ws: &mut Workspace<Pile>,
-    space: &TribleSet,
-    entity: Id,
-    attr: &Attribute<Handle<LongString>>,
-) -> Result<Option<String>> {
-    let handle = match find!(
-        (handle: Inline<Handle<LongString>>),
-        pattern!(space, [{ entity @ attr: ?handle }])
-    )
-    .into_iter()
-    .next()
-    {
-        Some((handle,)) => handle,
-        None => return Ok(None),
-    };
-    let view: View<str> = ws.get(handle).context("read config string")?;
-    Ok(Some(view.to_string()))
+fn finish_pile<T>(pile: Pile, result: Result<T>, operation: &str) -> Result<T> {
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context(format!("close Web pile after {operation}"))),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => Err(error.context(format!(
+            "closing Web pile after {operation} also failed: {close_error}"
+        ))),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -337,11 +407,7 @@ struct SearchResult {
 }
 
 fn print_search_results(provider: Provider, query: &str, results: &[SearchResult]) {
-    let provider_name = match provider {
-        Provider::Tavily => "tavily",
-        Provider::Exa => "exa",
-        Provider::Auto => "auto",
-    };
+    let provider_name = provider_name(provider);
     println!("provider: {provider_name}");
     println!("query: {query}");
     println!("results: {}", results.len());
@@ -360,124 +426,66 @@ fn print_search_results(provider: Provider, query: &str, results: &[SearchResult
     }
 }
 
-fn store_search(
-    cli: &Cli,
-    branch_id: Id,
-    provider: Provider,
-    query: &str,
-    results: &[SearchResult],
-) -> Result<()> {
-    with_repo(&cli.pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull web ws: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
-
-        let provider_str = match provider {
-            Provider::Tavily => "tavily",
-            Provider::Exa => "exa",
-            Provider::Auto => "auto",
-        };
-        let created_at = epoch_interval(now_epoch());
-        let query_handle = ws.put(query.to_string());
-
-        let mut change = TribleSet::new();
-        let mut result_ids = Vec::with_capacity(results.len());
-
-        for r in results {
-            let url_handle = ws.put(r.url.clone());
-            let title_handle = r
-                .title
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|title| ws.put(title.to_string()));
-            let snippet_handle = r
-                .snippet
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|snippet| ws.put(snippet.to_string()));
-            let result_fragment = entity! { _ @
-                metadata::tag: &web_schema::kind_result,
-                web_schema::url: url_handle,
-                web_schema::title?: title_handle,
-                web_schema::snippet?: snippet_handle,
-            };
-            let result_id = result_fragment
-                .root()
-                .ok_or_else(|| anyhow!("result fragment missing root export"))?;
-            result_ids.push(result_id);
-            change += result_fragment;
-        }
-        change += entity! { _ @
-            metadata::tag: &web_schema::kind_search,
-            web_schema::query: query_handle,
-            web_schema::provider: provider_str,
-            metadata::created_at: created_at,
-            web_schema::result*: result_ids,
-        };
-
-        let delta = change.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(delta, "web search");
-            push_workspace(repo, &mut ws).context("push web search")?;
-        }
-
-        Ok(())
-    })
-}
-
-fn store_fetch(
-    cli: &Cli,
-    branch_id: Id,
-    provider: Provider,
-    url: &str,
-    content: &str,
-) -> Result<()> {
-    with_repo(&cli.pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull web ws: {e:?}"))?;
-        let catalog = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
-
-        let provider_str = match provider {
-            Provider::Tavily => "tavily",
-            Provider::Exa => "exa",
-            Provider::Auto => "auto",
-        };
-        let created_at = epoch_interval(now_epoch());
-        let url_handle = ws.put(url.to_string());
-        let content_handle = ws.put(content.to_string());
-
-        let fetch_fragment = entity! { _ @
-            metadata::tag: &web_schema::kind_fetch,
-            web_schema::provider: provider_str,
-            metadata::created_at: created_at,
-            web_schema::url: url_handle,
-            web_schema::content: content_handle,
-        };
-
-        let delta = fetch_fragment.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(delta, "web fetch");
-            push_workspace(repo, &mut ws).context("push web fetch")?;
-        }
-
-        Ok(())
-    })
-}
-
-fn push_workspace(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>) -> Result<()> {
-    while let Some(mut conflict) = repo.try_push(ws).map_err(|e| anyhow!("push: {e:?}"))? {
-        conflict
-            .merge(ws)
-            .map_err(|e| anyhow!("merge conflict: {e:?}"))?;
-        *ws = conflict;
+fn provider_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Tavily => "tavily",
+        Provider::Exa => "exa",
+        Provider::Auto => "auto",
     }
-    Ok(())
+}
+
+fn search_fragment(provider: Provider, query: &str, results: &[SearchResult]) -> Result<Fragment> {
+    let mut fragment = Fragment::empty();
+    let query_handle = fragment.put(query.to_owned());
+    let mut result_ids = Vec::with_capacity(results.len());
+
+    for result in results {
+        let url_handle = fragment.put(result.url.clone());
+        let title_handle = result
+            .title
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| fragment.put(value.to_owned()));
+        let snippet_handle = result
+            .snippet
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| fragment.put(value.to_owned()));
+        let result_fragment = entity! { _ @
+            metadata::tag: &web_schema::kind_result,
+            web_schema::url: url_handle,
+            web_schema::title?: title_handle,
+            web_schema::snippet?: snippet_handle,
+        };
+        result_ids.push(
+            result_fragment
+                .root()
+                .ok_or_else(|| anyhow!("Web result fragment has no intrinsic root"))?,
+        );
+        fragment += result_fragment;
+    }
+    fragment += entity! { _ @
+        metadata::tag: &web_schema::kind_search,
+        web_schema::query: query_handle,
+        web_schema::provider: provider_name(provider),
+        metadata::created_at: epoch_interval(now_epoch()),
+        web_schema::result*: result_ids,
+    };
+    Ok(fragment)
+}
+
+fn fetch_fragment(provider: Provider, url: &str, content: &str) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let url = fragment.put(url.to_owned());
+    let content = fragment.put(content.to_owned());
+    fragment += entity! { _ @
+        metadata::tag: &web_schema::kind_fetch,
+        web_schema::provider: provider_name(provider),
+        metadata::created_at: epoch_interval(now_epoch()),
+        web_schema::url: url,
+        web_schema::content: content,
+    };
+    fragment
 }
 
 fn now_epoch() -> Epoch {
@@ -674,41 +682,6 @@ fn exa_contents(
     Ok(first.text)
 }
 
-// --- Pile helpers ---
-
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        // Avoid Drop warnings on early errors.
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))
-}
-
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     if let Some(path) = raw.strip_prefix('@') {
         if path == "-" {
@@ -725,4 +698,138 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 
 fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
     Ok(load_value_or_file(raw, label)?.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use triblespace::macros::{find, pattern};
+
+    use super::*;
+    use faculties::collection_cutover::initialize_signer;
+
+    #[test]
+    fn cli_exposes_one_fixed_collection_without_legacy_coordinates() {
+        let command = Cli::command();
+        command.clone().debug_assert();
+        let arguments = command
+            .get_arguments()
+            .map(|argument| argument.get_id().as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(arguments.contains("key"));
+        assert!(arguments.contains("secrets_identity"));
+        assert!(!arguments.contains("branch_id"));
+        assert!(!arguments.contains("scope"));
+        assert!(command
+            .get_subcommands()
+            .any(|subcommand| subcommand.get_name() == "migrate-legacy"));
+    }
+
+    #[test]
+    fn explicit_provider_override_does_not_require_headspace_or_a_pile() {
+        let missing = PathBuf::from("/definitely/not/a/web-test.pile");
+        let cli = Cli {
+            pile: missing.clone(),
+            key: None,
+            secrets_identity: None,
+            tavily_api_key: Some(" explicit-tavily-key ".to_owned()),
+            exa_api_key: None,
+            no_store: true,
+            command: None,
+        };
+        let keys = resolve_api_keys(
+            &cli,
+            WebStorage {
+                pile: &missing,
+                key: None,
+                secrets_identity: None,
+            },
+            Provider::Tavily,
+        )
+        .unwrap();
+        assert_eq!(keys.tavily.as_deref(), Some("explicit-tavily-key"));
+        assert!(keys.exa.is_none());
+    }
+
+    #[test]
+    fn search_fragment_composes_results_into_one_commit_payload() {
+        let fragment = search_fragment(
+            Provider::Tavily,
+            "canonical collections",
+            &[
+                SearchResult {
+                    url: "https://one.test".to_owned(),
+                    title: Some("one".to_owned()),
+                    snippet: None,
+                },
+                SearchResult {
+                    url: "https://two.test".to_owned(),
+                    title: None,
+                    snippet: Some("two".to_owned()),
+                },
+            ],
+        )
+        .unwrap();
+
+        let facts = fragment.facts();
+        let result_entities = find!(
+            (entity: Id),
+            pattern!(facts, [{ ?entity @ metadata::tag: web_schema::kind_result }])
+        )
+        .collect::<Vec<_>>();
+        let searches = find!(
+            (entity: Id, result: Id),
+            pattern!(facts, [{
+                ?entity @
+                metadata::tag: web_schema::kind_search,
+                web_schema::result: ?result,
+            }])
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(result_entities.len(), 2);
+        assert_eq!(searches.len(), 2);
+        assert_eq!(
+            searches
+                .iter()
+                .map(|(entity, _)| *entity)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn storage_publishes_directly_to_the_native_web_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("web.pile");
+        let key_path = directory.path().join("web.key");
+        File::create(&pile_path).unwrap();
+        initialize_signer(&pile_path, Some(&key_path)).unwrap();
+
+        WebStorage {
+            pile: &pile_path,
+            key: Some(&key_path),
+            secrets_identity: None,
+        }
+        .store(
+            fetch_fragment(Provider::Exa, "https://example.test", "body"),
+            "test Web observation",
+        )
+        .unwrap();
+
+        let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
+        let pile = open_pile_strict(&pile_path).unwrap();
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let facts = collection.materialize().unwrap();
+        assert_eq!(
+            find!(
+                (entity: Id),
+                pattern!(&facts, [{ ?entity @ metadata::tag: web_schema::kind_fetch }])
+            )
+            .count(),
+            1
+        );
+        collection.into_storage().close().unwrap();
+    }
 }

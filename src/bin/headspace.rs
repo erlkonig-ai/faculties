@@ -1,76 +1,92 @@
-use std::collections::HashMap;
-use std::fs;
-use std::io::Read;
+//! headspace — fork-visible agent configuration backed by exact Secrets versions.
+
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::headspace::{
-    playground_config, CONFIG_BRANCH, DEFAULT_AUTHOR, DEFAULT_AUTHOR_ROLE, DEFAULT_BASE_URL,
-    DEFAULT_BRANCH, DEFAULT_CHARS_PER_TOKEN, DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
-    DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MODEL, DEFAULT_POLL_MS,
-    DEFAULT_STREAM, DEFAULT_SYSTEM_PROMPT, KIND_CONFIG_ID, KIND_MODEL_PROFILE_ID,
-};
+use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::headspace::{self, Catalog, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
+use faculties::headspace_cutover;
+use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
+use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
 use hifitime::Epoch;
-use rand_core::OsRng;
+use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
+use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     version = faculties::GIT_VERSION,
     name = "headspace",
     bin_name = "headspace",
-    about = "Manage active headspace (profile/model/reasoning)."
+    about = "Manage fork-visible Headspace configuration and model profiles."
 )]
 struct Cli {
-    /// Path to the pile file to use
+    /// Existing pile file. Reads and writes never create it.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
+    /// Existing durable collection signer. Ordinary commands never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
+    /// Secrets identity used only when decrypting exact credential versions.
+    #[arg(long, env = "SECRETS_IDENTITY")]
+    secrets_identity: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand)]
 enum Command {
-    /// Show active headspace settings and available profiles
+    /// Show the resolved active Headspace and available profiles.
     Show {
+        /// Decrypt the exact referenced credential versions.
         #[arg(long, default_value_t = false)]
         show_secrets: bool,
     },
-    /// List available profiles
+    /// List profile anchors and their current resolution.
     List,
-    /// Switch active profile by id or name
+    /// Switch the active profile by anchor id or settled profile name.
     Use {
         #[arg(value_name = "PROFILE")]
         profile: String,
     },
-    /// Add a new profile and make it active
+    /// Author a fresh profile anchor and activate it in one signed COMMIT.
     Add(AddArgs),
-    /// Set one field on the active profile
+    /// Set one non-secret field on the resolved active profile.
     Set {
         #[arg(value_enum, value_name = "FIELD")]
         field: SetField,
-        #[arg(
-            value_name = "VALUE",
-            help = "Value to set. Use @path for file input or @- for stdin."
-        )]
+        #[arg(value_name = "VALUE", help = "Literal value, @path, or @- for stdin.")]
         value: String,
     },
-    /// Clear one optional field on the active profile
+    /// Clear one optional non-secret field on the active profile.
     Unset {
         #[arg(value_enum, value_name = "FIELD")]
         field: UnsetField,
     },
+    /// Manage an exact immutable Secrets reference.
+    Secret {
+        #[arg(value_enum)]
+        role: SecretRole,
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+    /// Choose an existing complete snapshot and join every live head on its track.
+    Reconcile {
+        #[arg(value_name = "SNAPSHOT")]
+        snapshot: String,
+    },
+    /// Additively publish the stopped legacy config branch into the fixed
+    /// native Headspace collection. Stop every old config writer first.
+    MigrateLegacy,
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Args)]
 struct AddArgs {
     #[arg(value_name = "NAME")]
     name: String,
@@ -78,8 +94,9 @@ struct AddArgs {
     model: Option<String>,
     #[arg(long = "base-url")]
     base_url: Option<String>,
-    #[arg(long = "api-key")]
-    api_key: Option<String>,
+    /// Exact existing Secrets version for the new profile's model credential.
+    #[arg(long)]
+    model_secret_version: Option<String>,
     #[arg(long = "reasoning-effort")]
     reasoning_effort: Option<String>,
     #[arg(long)]
@@ -99,7 +116,6 @@ struct AddArgs {
 enum SetField {
     Model,
     BaseUrl,
-    ApiKey,
     ReasoningEffort,
     Stream,
     ContextWindowTokens,
@@ -111,54 +127,143 @@ enum SetField {
 #[derive(ValueEnum, Debug, Clone, Copy)]
 #[value(rename_all = "kebab-case")]
 enum UnsetField {
-    ApiKey,
     ReasoningEffort,
 }
 
-#[derive(Clone, Debug)]
-struct Config {
-    pile_path: PathBuf,
-    model: ModelConfig,
-    model_profile_id: Option<Id>,
-    model_profile_name: String,
-    tavily_api_key: Option<String>,
-    exa_api_key: Option<String>,
-    exec: ExecConfig,
-    system_prompt: String,
-    branch: String,
-    author: String,
-    author_role: String,
-    persona_id: Option<Id>,
-    poll_ms: u64,
+#[derive(ValueEnum, Debug, Clone, Copy, Eq, PartialEq)]
+#[value(rename_all = "kebab-case")]
+enum SecretRole {
+    Model,
+    Tavily,
+    Exa,
 }
 
-#[derive(Clone, Debug)]
-struct ModelConfig {
-    model: String,
-    base_url: String,
-    api_key: Option<String>,
-    reasoning_effort: Option<String>,
-    stream: bool,
-    context_window_tokens: u64,
-    max_output_tokens: u64,
-    context_safety_margin_tokens: u64,
-    chars_per_token: u64,
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Point the role at an exact existing version, or seal one version first.
+    Set(SecretSetArgs),
+    /// Remove the role's exact credential reference in a complete successor.
+    Unset,
 }
 
-#[derive(Clone, Debug)]
-struct ExecConfig {
-    default_cwd: Option<PathBuf>,
-    sandbox_profile: Option<Id>,
+#[derive(Args)]
+struct SecretSetArgs {
+    /// Plaintext credential as a literal, @path, or @-.
+    #[arg(long, conflicts_with = "version", required_unless_present = "version")]
+    value: Option<String>,
+    /// Exact existing Secrets version. This repairs an interrupted Secrets-first update.
+    #[arg(long, conflicts_with = "value", required_unless_present = "value")]
+    version: Option<String>,
+    /// Secrets scope receiving a newly sealed value. An existing unique
+    /// reference defaults to its version's scope.
+    #[arg(long, conflicts_with = "version")]
+    secret_scope: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-struct ModelProfileSummary {
-    id: Id,
-    name: String,
+struct CollectionView {
+    facts: TribleSet,
+    reader: PileReader,
+}
+
+struct Views {
+    headspace: CollectionView,
+    catalog: Catalog,
+    secrets: CollectionView,
+    secrets_catalog: SecretsCatalog,
+}
+
+struct Storage<'a> {
+    pile_path: &'a Path,
+    pile: RefCell<Option<Pile>>,
+    signer: SigningKey,
+    secrets_identity: Option<&'a str>,
+}
+
+impl Storage<'_> {
+    fn open<'a>(
+        pile_path: &'a Path,
+        key: Option<&Path>,
+        secrets_identity: Option<&'a str>,
+    ) -> Result<Storage<'a>> {
+        // Authority is resolved before touching storage. A missing signer can
+        // neither create a pile nor append a descriptor.
+        let signer = load_signer(pile_path, key)?;
+        let pile = open_pile_strict(pile_path)?;
+        Ok(Storage {
+            pile_path,
+            pile: RefCell::new(Some(pile)),
+            signer,
+            secrets_identity,
+        })
+    }
+
+    fn materialize(&self, scope: Id, label: &str) -> Result<CollectionView> {
+        let mut pile = self.pile.borrow_mut();
+        let pile = pile
+            .as_mut()
+            .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
+        let facts = Collection::new(&mut *pile, scope, self.signer.clone())
+            .materialize()
+            .with_context(|| format!("materialize {label} collection"))?;
+        let reader = pile
+            .reader()
+            .with_context(|| format!("open {label} attachment reader"))?;
+        Ok(CollectionView { facts, reader })
+    }
+
+    fn views(&self) -> Result<Views> {
+        let secrets = self.materialize(secrets_schema::DEFAULT_SCOPE_ID, "Secrets")?;
+        let secrets_catalog = secrets_model::validate_catalog(&secrets.reader, &secrets.facts)
+            .context("validate Secrets collection")?;
+        let headspace = self.materialize(DEFAULT_SCOPE_ID, "Headspace")?;
+        let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
+            .context("validate Headspace collection")?;
+        headspace::validate_secret_references(&catalog, &secrets_catalog)
+            .context("validate exact Headspace credential references")?;
+        Ok(Views {
+            headspace,
+            catalog,
+            secrets,
+            secrets_catalog,
+        })
+    }
+
+    fn publish(&self, scope: Id, mut fragment: Fragment, description: &str) -> Result<()> {
+        fragment.describe_with(entity! { metadata::description: description.to_owned() });
+        let mut pile = self.pile.borrow_mut();
+        let pile = pile
+            .as_mut()
+            .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
+        Collection::new(&mut *pile, scope, self.signer.clone())
+            .commit(fragment)
+            .with_context(|| format!("commit collection {scope:x}"))?;
+        Ok(())
+    }
+
+    fn close(self) -> Result<()> {
+        self.close_inner()
+    }
+
+    fn close_inner(&self) -> Result<()> {
+        let Some(pile) = self.pile.borrow_mut().take() else {
+            return Ok(());
+        };
+        pile.close()
+            .with_context(|| format!("close Headspace pile {}", self.pile_path.display()))
+    }
+}
+
+impl Drop for Storage<'_> {
+    fn drop(&mut self) {
+        let _ = self.close_inner();
+    }
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    run(Cli::parse())
+}
+
+fn run(cli: Cli) -> Result<()> {
     let Some(command) = cli.command.as_ref() else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -166,816 +271,740 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
+    if matches!(command, Command::MigrateLegacy) {
+        return migrate_legacy(&cli);
+    }
+
+    let storage = Storage::open(
+        &cli.pile,
+        cli.key.as_deref(),
+        cli.secrets_identity.as_deref(),
+    )?;
+    let result = dispatch(&storage, command);
+    let close = storage.close();
+    match (result, close) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => Err(error.context(format!(
+            "closing Headspace storage also failed: {close_error}"
+        ))),
+    }
+}
+
+fn dispatch(storage: &Storage<'_>, command: &Command) -> Result<()> {
     match command {
         Command::Show { show_secrets } => {
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, *show_secrets)?;
-        }
-        Command::List => {
-            let config = load_config(cli.pile.as_path())?;
-            print_profile_list(&config)?;
-        }
-        Command::Use { profile } => {
-            let mut config = load_config(cli.pile.as_path())?;
-            let profile_id = resolve_profile_selector(cli.pile.as_path(), profile.as_str())?;
-            let Some((model, name)) = load_model_profile(cli.pile.as_path(), profile_id)? else {
-                return Err(anyhow!("unknown profile {profile_id:x}"));
+            let views = storage.views()?;
+            let opened = if *show_secrets {
+                open_display_secrets(storage, &views)?
+            } else {
+                None
             };
-            config.model_profile_id = Some(profile_id);
-            config.model_profile_name = name;
-            config.model = model;
-            store_config_to_pile(config)?;
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, false)?;
+            print_headspace(&views.catalog, opened.as_ref())
         }
-        Command::Add(args) => {
-            let mut config = load_config(cli.pile.as_path())?;
-            config.model_profile_id = Some(*genid());
-            config.model_profile_name = args.name.clone();
-            apply_add_overrides(&mut config, args)?;
-            store_config_to_pile(config)?;
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, false)?;
-        }
-        Command::Set { field, value } => {
-            let mut config = load_config(cli.pile.as_path())?;
-            apply_set(&mut config, *field, value.as_str())?;
-            store_config_to_pile(config)?;
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, false)?;
-        }
-        Command::Unset { field } => {
-            let mut config = load_config(cli.pile.as_path())?;
-            apply_unset(&mut config, *field)?;
-            store_config_to_pile(config)?;
-            let config = load_config(cli.pile.as_path())?;
-            print_headspace(&config, false)?;
-        }
+        Command::List => print_profile_list(&storage.views()?.catalog),
+        Command::Use { profile } => use_profile(storage, profile),
+        Command::Add(args) => add_profile(storage, args),
+        Command::Set { field, value } => set_profile_field(storage, *field, value),
+        Command::Unset { field } => unset_profile_field(storage, *field),
+        Command::Secret { role, command } => match command {
+            SecretCommand::Set(args) => set_secret(storage, *role, args),
+            SecretCommand::Unset => unset_secret(storage, *role),
+        },
+        Command::Reconcile { snapshot } => reconcile(storage, snapshot),
+        Command::MigrateLegacy => unreachable!("migration is dispatched before storage opens"),
     }
-
-    Ok(())
 }
 
-fn apply_add_overrides(config: &mut Config, args: &AddArgs) -> Result<()> {
+fn settled_config(catalog: &Catalog) -> Result<Option<&ConfigValue>> {
+    catalog.config.settled_value("Headspace config")
+}
+
+fn require_profile(catalog: &Catalog, anchor: Id) -> Result<&ProfileValue> {
+    catalog
+        .profiles
+        .get(&anchor)
+        .ok_or_else(|| anyhow!("unknown profile {anchor:x}"))?
+        .settled_value(&format!("profile {anchor:x}"))?
+        .ok_or_else(|| anyhow!("profile {anchor:x} has no snapshot"))
+}
+
+fn resolve_profile_selector(catalog: &Catalog, raw: &str) -> Result<Id> {
+    if let Some(id) = Id::from_hex(raw.trim()) {
+        if catalog.profiles.contains_key(&id) {
+            return Ok(id);
+        }
+        bail!("unknown profile {id:x}");
+    }
+    let needle = raw.trim().to_ascii_lowercase();
+    let mut matches = Vec::new();
+    for (&anchor, resolution) in &catalog.profiles {
+        let profile = match resolution {
+            Resolution::Unique(snapshot) => Some(&snapshot.value),
+            Resolution::Agreed(snapshots) => snapshots.first().map(|snapshot| &snapshot.value),
+            Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
+        };
+        if profile.is_some_and(|profile| profile.name.to_ascii_lowercase() == needle) {
+            matches.push(anchor);
+        }
+    }
+    match matches.as_slice() {
+        [] => bail!("unknown profile {raw:?}"),
+        [id] => Ok(*id),
+        _ => bail!("profile name {raw:?} is ambiguous; use the full anchor id"),
+    }
+}
+
+fn parse_exact_secret(views: &Views, raw: &str, label: &str) -> Result<Id> {
+    let id = Id::from_hex(raw.trim())
+        .ok_or_else(|| anyhow!("{label} requires one exact 32-hex Secrets version id"))?;
+    if !views.secrets_catalog.secrets.contains_key(&id) {
+        bail!("unknown exact Secrets version {id:x}");
+    }
+    Ok(id)
+}
+
+fn preflight_headspace(
+    views: &Views,
+    fragment: &Fragment,
+    secrets: &SecretsCatalog,
+) -> Result<Catalog> {
+    let candidate = headspace::validate_catalog_union(
+        &views.headspace.reader,
+        &views.headspace.facts,
+        fragment,
+    )
+    .context("validate Headspace successor")?;
+    headspace::validate_secret_references(&candidate, secrets)
+        .context("validate successor's exact Secrets references")?;
+    Ok(candidate)
+}
+
+fn publish_headspace(
+    storage: &Storage<'_>,
+    views: &Views,
+    fragment: Fragment,
+    description: &str,
+) -> Result<()> {
+    preflight_headspace(views, &fragment, &views.secrets_catalog)?;
+    storage.publish(DEFAULT_SCOPE_ID, fragment, description)
+}
+
+fn use_profile(storage: &Storage<'_>, selector: &str) -> Result<()> {
+    let views = storage.views()?;
+    let anchor = resolve_profile_selector(&views.catalog, selector)?;
+    require_profile(&views.catalog, anchor)?;
+    let existing = settled_config(&views.catalog)?;
+    if existing.is_some_and(|config| config.active_profile == anchor) {
+        return print_headspace(&views.catalog, None);
+    }
+    let mut config = existing
+        .cloned()
+        .unwrap_or_else(|| headspace::default_config(anchor));
+    config.active_profile = anchor;
+    let fragment =
+        headspace::config_snapshot_fragment(&config, &views.catalog.config.head_ids())?.0;
+    publish_headspace(
+        storage,
+        &views,
+        fragment,
+        "headspace: switch active profile",
+    )?;
+    print_reloaded(storage)
+}
+
+fn add_profile(storage: &Storage<'_>, args: &AddArgs) -> Result<()> {
+    let views = storage.views()?;
+    let anchor = genid().id;
+    let mut profile = match settled_config(&views.catalog)? {
+        Some(config) => require_profile(&views.catalog, config.active_profile)?.clone(),
+        None => headspace::default_profile(anchor, args.name.clone()),
+    };
+    profile.anchor = anchor;
+    profile.name = args.name.clone();
     if let Some(value) = args.model.as_deref() {
-        config.model.model = value.to_string();
+        profile.model = value.to_owned();
     }
     if let Some(value) = args.base_url.as_deref() {
-        config.model.base_url = value.to_string();
+        profile.base_url = value.to_owned();
     }
-    if let Some(value) = args.api_key.as_deref() {
-        config.model.api_key = Some(value.trim().to_string());
+    if let Some(value) = args.model_secret_version.as_deref() {
+        profile.model_secret_version =
+            Some(parse_exact_secret(&views, value, "--model-secret-version")?);
     }
     if let Some(value) = args.reasoning_effort.as_deref() {
-        config.model.reasoning_effort = Some(value.trim().to_string());
+        profile.reasoning_effort = Some(value.trim().to_owned());
     }
     if let Some(value) = args.stream {
-        config.model.stream = value;
+        profile.stream = value;
     }
     if let Some(value) = args.context_window_tokens {
-        config.model.context_window_tokens = value;
+        profile.context_window_tokens = value;
     }
     if let Some(value) = args.max_output_tokens {
-        config.model.max_output_tokens = value;
+        profile.max_output_tokens = value;
     }
     if let Some(value) = args.context_safety_margin_tokens {
-        config.model.context_safety_margin_tokens = value;
+        profile.context_safety_margin_tokens = value;
     }
     if let Some(value) = args.chars_per_token {
-        config.model.chars_per_token = value;
+        profile.chars_per_token = value;
     }
-    Ok(())
+
+    let mut config = settled_config(&views.catalog)?
+        .cloned()
+        .unwrap_or_else(|| headspace::default_config(anchor));
+    config.active_profile = anchor;
+    let fragment =
+        headspace::add_profile_fragment(&profile, &config, &views.catalog.config.head_ids())?.0;
+    publish_headspace(
+        storage,
+        &views,
+        fragment,
+        "headspace: add and activate profile",
+    )?;
+    print_reloaded(storage)
 }
 
-fn apply_set(config: &mut Config, field: SetField, value: &str) -> Result<()> {
+fn set_profile_field(storage: &Storage<'_>, field: SetField, raw: &str) -> Result<()> {
+    let views = storage.views()?;
+    let config = settled_config(&views.catalog)?
+        .ok_or_else(|| anyhow!("Headspace has no active configuration; add a profile first"))?;
+    let current = require_profile(&views.catalog, config.active_profile)?;
+    let mut changed = current.clone();
     match field {
-        SetField::Model => config.model.model = load_value_or_file(value, "model_name")?,
-        SetField::BaseUrl => config.model.base_url = load_value_or_file(value, "model_base_url")?,
-        SetField::ApiKey => {
-            config.model.api_key = Some(load_value_or_file_trimmed(value, "model_api_key")?)
-        }
+        SetField::Model => changed.model = faculties::text_arg(raw, "model name")?,
+        SetField::BaseUrl => changed.base_url = faculties::text_arg(raw, "model base URL")?,
         SetField::ReasoningEffort => {
-            config.model.reasoning_effort =
-                Some(load_value_or_file_trimmed(value, "model_reasoning_effort")?)
+            changed.reasoning_effort = Some(
+                faculties::text_arg(raw, "model reasoning effort")?
+                    .trim()
+                    .to_owned(),
+            )
         }
-        SetField::Stream => config.model.stream = parse_bool(value, "model_stream")?,
+        SetField::Stream => changed.stream = parse_bool(raw, "model_stream")?,
         SetField::ContextWindowTokens => {
-            config.model.context_window_tokens = parse_u64(value, "model_context_window_tokens")?
+            changed.context_window_tokens = parse_u64(raw, "model_context_window_tokens")?
         }
         SetField::MaxOutputTokens => {
-            config.model.max_output_tokens = parse_u64(value, "model_max_output_tokens")?
+            changed.max_output_tokens = parse_u64(raw, "model_max_output_tokens")?
         }
         SetField::PromptSafetyMarginTokens => {
-            config.model.context_safety_margin_tokens =
-                parse_u64(value, "model_context_safety_margin_tokens")?
+            changed.context_safety_margin_tokens =
+                parse_u64(raw, "model_context_safety_margin_tokens")?
         }
         SetField::PromptCharsPerToken => {
-            config.model.chars_per_token = parse_u64(value, "model_chars_per_token")?
+            changed.chars_per_token = parse_u64(raw, "model_chars_per_token")?
         }
     }
-    Ok(())
+    if changed == *current {
+        return print_headspace(&views.catalog, None);
+    }
+    let fragment = headspace::profile_snapshot_fragment(
+        &changed,
+        &views.catalog.profiles[&config.active_profile].head_ids(),
+    )?
+    .0;
+    publish_headspace(storage, &views, fragment, "headspace: update profile")?;
+    print_reloaded(storage)
 }
 
-fn apply_unset(config: &mut Config, field: UnsetField) -> Result<()> {
+fn unset_profile_field(storage: &Storage<'_>, field: UnsetField) -> Result<()> {
+    let views = storage.views()?;
+    let config = settled_config(&views.catalog)?
+        .ok_or_else(|| anyhow!("Headspace has no active configuration; add a profile first"))?;
+    let current = require_profile(&views.catalog, config.active_profile)?;
+    let mut changed = current.clone();
     match field {
-        UnsetField::ApiKey => config.model.api_key = None,
-        UnsetField::ReasoningEffort => config.model.reasoning_effort = None,
+        UnsetField::ReasoningEffort => changed.reasoning_effort = None,
     }
+    if changed == *current {
+        return print_headspace(&views.catalog, None);
+    }
+    let fragment = headspace::profile_snapshot_fragment(
+        &changed,
+        &views.catalog.profiles[&config.active_profile].head_ids(),
+    )?
+    .0;
+    publish_headspace(storage, &views, fragment, "headspace: unset profile field")?;
+    print_reloaded(storage)
+}
+
+fn secret_label(role: SecretRole, profile: Id) -> String {
+    match role {
+        SecretRole::Model => format!("hs/model/{}", URL_SAFE_NO_PAD.encode(profile.raw())),
+        SecretRole::Tavily => "hs/tavily".to_owned(),
+        SecretRole::Exa => "hs/exa".to_owned(),
+    }
+}
+
+fn point_now() -> Result<secrets_model::IntervalValue> {
+    let now = Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))?;
+    (now, now)
+        .try_to_inline()
+        .map_err(|error| anyhow!("encode current clock: {error:?}"))
+}
+
+struct SecretSuccessor {
+    fragment: Fragment,
+    current: Option<Id>,
+}
+
+fn secret_successor(
+    catalog: &Catalog,
+    role: SecretRole,
+    replacement: Option<Id>,
+) -> Result<SecretSuccessor> {
+    let (config, profile) = headspace::settled_active(catalog)?;
+    match role {
+        SecretRole::Model => {
+            let mut changed = profile.clone();
+            let current = changed.model_secret_version;
+            changed.model_secret_version = replacement;
+            Ok(SecretSuccessor {
+                fragment: headspace::profile_snapshot_fragment(
+                    &changed,
+                    &catalog.profiles[&config.active_profile].head_ids(),
+                )?
+                .0,
+                current,
+            })
+        }
+        SecretRole::Tavily | SecretRole::Exa => {
+            let mut changed = config.clone();
+            let current = match role {
+                SecretRole::Tavily => changed.tavily_secret_version,
+                SecretRole::Exa => changed.exa_secret_version,
+                SecretRole::Model => unreachable!(),
+            };
+            match role {
+                SecretRole::Tavily => changed.tavily_secret_version = replacement,
+                SecretRole::Exa => changed.exa_secret_version = replacement,
+                SecretRole::Model => unreachable!(),
+            }
+            Ok(SecretSuccessor {
+                fragment: headspace::config_snapshot_fragment(
+                    &changed,
+                    &catalog.config.head_ids(),
+                )?
+                .0,
+                current,
+            })
+        }
+    }
+}
+
+fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> Result<()> {
+    let mut views = storage.views()?;
+    let current = secret_successor(&views.catalog, role, None)?.current;
+    let explicit = args
+        .version
+        .as_deref()
+        .map(|value| parse_exact_secret(&views, value, "--version"))
+        .transpose()?;
+
+    let (secret, staged) = match (args.value.as_deref(), explicit) {
+        (None, Some(secret)) => (secret, None),
+        (Some(raw), None) => {
+            let plaintext = faculties::text_arg(raw, "credential")?;
+            let plaintext = plaintext.trim();
+            if plaintext.is_empty() || plaintext.bytes().any(|byte| byte == 0) {
+                bail!("credential is empty or contains NUL");
+            }
+            let scope = match args.secret_scope.as_deref() {
+                Some(selector) => secrets_model::resolve_scope(
+                    &views.secrets.reader,
+                    &views.secrets_catalog,
+                    selector,
+                )?,
+                None => current
+                    .and_then(|id| views.secrets_catalog.secrets.get(&id))
+                    .map(|row| row.scope)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "--secret-scope is required when the role has no unique predecessor version"
+                        )
+                    })?,
+            };
+            let profile = headspace::settled_active(&views.catalog)?.0.active_profile;
+            let sealed = secrets_model::seal_version(
+                &views.secrets.reader,
+                &views.secrets_catalog,
+                scope,
+                &secret_label(role, profile),
+                plaintext.as_bytes(),
+                point_now()?,
+            )
+            .context("seal Headspace credential version")?;
+            let secret = sealed.secret;
+            let candidate = secrets_model::validate_candidate(
+                &views.secrets.reader,
+                &views.secrets.facts,
+                &sealed.fragment,
+            )
+            .context("validate staged Headspace credential")?;
+            (secret, Some((sealed.fragment, candidate)))
+        }
+        _ => unreachable!("clap requires exactly one of --value or --version"),
+    };
+
+    if current == Some(secret) && staged.is_none() {
+        println!("{role:?} already references exact Secrets version {secret:x}");
+        return Ok(());
+    }
+
+    let successor = secret_successor(&views.catalog, role, Some(secret))?;
+    let candidate_secrets = staged
+        .as_ref()
+        .map(|(_, catalog)| catalog)
+        .unwrap_or(&views.secrets_catalog);
+    preflight_headspace(&views, &successor.fragment, candidate_secrets)?;
+
+    if let Some((secret_fragment, _)) = staged {
+        storage.publish(
+            secrets_schema::DEFAULT_SCOPE_ID,
+            secret_fragment,
+            "headspace: credential version",
+        )?;
+        eprintln!(
+            "Published exact credential {secret:x}; if Headspace publication is interrupted, retry with: headspace secret {} set --version {secret:x}",
+            role_name(role)
+        );
+        // Refresh through the same open pile before authoring the referencing
+        // edge. Failure leaves a harmless orphan version, never a dangling
+        // Headspace snapshot.
+        views = storage.views()?;
+        if !views.secrets_catalog.secrets.contains_key(&secret) {
+            bail!("published exact Secrets version {secret:x} did not materialize");
+        }
+        let repaired = secret_successor(&views.catalog, role, Some(secret))?;
+        preflight_headspace(&views, &repaired.fragment, &views.secrets_catalog)?;
+        storage.publish(
+            DEFAULT_SCOPE_ID,
+            repaired.fragment,
+            "headspace: exact credential reference",
+        )?;
+    } else {
+        storage.publish(
+            DEFAULT_SCOPE_ID,
+            successor.fragment,
+            "headspace: exact credential reference",
+        )?;
+    }
+    println!("{role:?} credential version {secret:x}");
     Ok(())
 }
 
-fn resolve_profile_selector(pile_path: &Path, raw: &str) -> Result<Id> {
-    if let Ok(id) = parse_hex_id(raw, "profile_id") {
-        return Ok(id);
+fn unset_secret(storage: &Storage<'_>, role: SecretRole) -> Result<()> {
+    let views = storage.views()?;
+    let successor = secret_successor(&views.catalog, role, None)?;
+    if successor.current.is_none() {
+        println!("{role:?} credential is already unset");
+        return Ok(());
     }
+    publish_headspace(
+        storage,
+        &views,
+        successor.fragment,
+        "headspace: unset exact credential reference",
+    )?;
+    println!("{role:?} credential unset");
+    Ok(())
+}
 
-    let needle = raw.trim().to_lowercase();
-    let profiles = list_model_profiles(pile_path)?;
-    let mut matches = profiles
-        .into_iter()
-        .filter(|profile| profile.name.to_lowercase() == needle);
-    let Some(first) = matches.next() else {
-        return Err(anyhow!("unknown profile '{raw}'"));
+fn role_name(role: SecretRole) -> &'static str {
+    match role {
+        SecretRole::Model => "model",
+        SecretRole::Tavily => "tavily",
+        SecretRole::Exa => "exa",
+    }
+}
+
+fn reconcile(storage: &Storage<'_>, raw: &str) -> Result<()> {
+    let views = storage.views()?;
+    let chosen = faculties::resolve_id_prefix(raw, views.catalog.snapshot_ids())?;
+    let Some((fragment, _)) = views.catalog.reconcile_fragment(chosen)? else {
+        return print_headspace(&views.catalog, None);
     };
-    if matches.next().is_some() {
-        return Err(anyhow!("profile name '{raw}' is ambiguous; use the hex id"));
+    publish_headspace(
+        storage,
+        &views,
+        fragment,
+        "headspace: reconcile snapshot track",
+    )?;
+    print_reloaded(storage)
+}
+
+fn resolve_secrets_identity(storage: &Storage<'_>, views: &Views) -> Result<Id> {
+    let selector = match storage.secrets_identity {
+        Some(value) => value.to_owned(),
+        None => std::env::var("PERSONA")
+            .context("set --secrets-identity/SECRETS_IDENTITY when it differs from PERSONA")?,
+    };
+    secrets_model::resolve_identity(&views.secrets.reader, &views.secrets_catalog, &selector)
+        .with_context(|| format!("resolve Secrets identity {selector:?}"))
+}
+
+fn open_display_secrets(storage: &Storage<'_>, views: &Views) -> Result<Option<OpenedSecrets>> {
+    let (config, profile) = match headspace::settled_active(&views.catalog) {
+        Ok(value) => value,
+        Err(_) if matches!(views.catalog.config, Resolution::Missing) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if profile.model_secret_version.is_none()
+        && config.tavily_secret_version.is_none()
+        && config.exa_secret_version.is_none()
+    {
+        return Ok(None);
     }
-    Ok(first.id)
+    let identity = resolve_secrets_identity(storage, views)?;
+    let password = faculties::secrets::password::read("unlock the selected Secrets identity")?;
+    headspace::open_active_secrets(
+        &views.catalog,
+        &views.secrets.reader,
+        &views.secrets_catalog,
+        identity,
+        &password,
+    )
+    .map(Some)
 }
 
-fn format_option_quoted(value: Option<&str>) -> String {
-    value
-        .map(|v| format!("\"{v}\""))
-        .unwrap_or_else(|| "null".to_string())
+fn print_reloaded(storage: &Storage<'_>) -> Result<()> {
+    let views = storage.views()?;
+    print_headspace(&views.catalog, None)
 }
 
-fn redact_option(value: Option<&str>) -> String {
-    match value {
-        Some(_) => "\"<redacted>\"".to_string(),
-        None => "null".to_string(),
-    }
-}
-
-fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
+fn print_headspace(catalog: &Catalog, opened: Option<&OpenedSecrets>) -> Result<()> {
     println!("active:");
-    println!(
-        "  profile_id = {}",
-        config
-            .model_profile_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
+    let Some(config) = settled_config(catalog)? else {
+        let profile = headspace::default_profile(Id::new([1; 16]).unwrap(), "default");
+        print_profile(None, &profile, None);
+        println!("  tavily_secret_version = null");
+        println!("  tavily_api_key = null");
+        println!("  exa_secret_version = null");
+        println!("  exa_api_key = null");
+        println!();
+        println!("profiles:");
+        return print_profile_list(catalog);
+    };
+    let profile = require_profile(catalog, config.active_profile)?;
+    print_profile(
+        Some(config.active_profile),
+        profile,
+        opened.and_then(|value| value.model_api_key.as_deref()),
     );
-    println!("  profile_name = \"{}\"", config.model_profile_name);
-    println!("  model = \"{}\"", config.model.model);
-    println!("  base_url = \"{}\"", config.model.base_url);
-    println!(
-        "  api_key = {}",
-        if show_secrets {
-            format_option_quoted(config.model.api_key.as_deref())
-        } else {
-            redact_option(config.model.api_key.as_deref())
-        }
+    print_secret_line(
+        "tavily",
+        config.tavily_secret_version,
+        opened.and_then(|value| value.tavily_api_key.as_deref()),
     );
-    println!(
-        "  reasoning_effort = {}",
-        format_option_quoted(config.model.reasoning_effort.as_deref())
+    print_secret_line(
+        "exa",
+        config.exa_secret_version,
+        opened.and_then(|value| value.exa_api_key.as_deref()),
     );
-    println!("  stream = {}", config.model.stream);
-    println!(
-        "  context_window_tokens = {}",
-        config.model.context_window_tokens
-    );
-    println!("  max_output_tokens = {}", config.model.max_output_tokens);
-    println!(
-        "  context_safety_margin_tokens = {}",
-        config.model.context_safety_margin_tokens
-    );
-    println!("  chars_per_token = {}", config.model.chars_per_token);
     println!();
     println!("profiles:");
-    print_profile_list(config)
+    print_profile_list(catalog)
 }
 
-fn print_profile_list(config: &Config) -> Result<()> {
-    let profiles = list_model_profiles(config.pile_path.as_path())?;
-    for profile in profiles {
-        let active = (config.model_profile_id == Some(profile.id)).then_some("*");
-        let active = active.unwrap_or(" ");
-        println!("{active} {}\t{:x}", profile.name, profile.id);
-    }
-    Ok(())
-}
-
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
-    (epoch, epoch).try_to_inline().unwrap()
-}
-
-fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
-    lower.to_tai_duration().total_nanoseconds()
-}
-
-fn push_workspace(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>) -> Result<()> {
-    while let Some(mut conflict) = repo
-        .try_push(ws)
-        .map_err(|err| anyhow!("push workspace: {err:?}"))?
-    {
-        conflict
-            .merge(ws)
-            .map_err(|err| anyhow!("merge workspace: {err:?}"))?;
-        *ws = conflict;
-    }
-    Ok(())
-}
-
-fn close_repo(repo: Repository<Pile>) -> Result<()> {
-    repo.into_storage().close().context("close pile")
-}
-
-fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile>, Id)> {
-    let mut pile = Pile::open(pile_path).context("open pile")?;
-    if let Err(err) = pile.refresh() {
-        let close_res = pile.close().context("close pile after refresh failure");
-        if let Err(close_err) = close_res {
-            eprintln!("warning: failed to close pile cleanly: {close_err:#}");
-        }
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                pile_path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", pile_path.display()),
-        });
-    }
-
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))?;
-    let branch_id = repo
-        .ensure_branch(CONFIG_BRANCH, None)
-        .map_err(|e| anyhow!("ensure config branch: {e:?}"))?;
-    Ok((repo, branch_id))
-}
-
-fn load_config(pile_path: &Path) -> Result<Config> {
-    let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Config> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout config workspace")?;
-
-        let config = if let Some(config) = load_latest_config(&mut ws, &catalog, pile_path)? {
-            config
-        } else {
-            default_config(pile_path.to_path_buf())
-        };
-
-        Ok(config)
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
-}
-
-fn store_config_to_pile(config: Config) -> Result<()> {
-    let (mut repo, branch_id) = open_config_repo(config.pile_path.as_path())?;
-    let result = (|| -> Result<()> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        store_config(&mut ws, &config).context("store config")?;
-        push_workspace(&mut repo, &mut ws).context("push config")?;
-        Ok(())
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
-}
-
-fn list_model_profiles(pile_path: &Path) -> Result<Vec<ModelProfileSummary>> {
-    let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Vec<ModelProfileSummary>> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout config workspace")?;
-
-        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-        for (entry_id, profile_id, updated_at) in find!(
-            (entry_id: Id, profile_id: Id, updated_at: Inline<NsTAIInterval>),
-            pattern!(&catalog, [{
-                ?entry_id @
-                metadata::tag: KIND_MODEL_PROFILE_ID,
-                metadata::updated_at: ?updated_at,
-                playground_config::model_profile_id: ?profile_id,
-            }])
-        ) {
-            let key = interval_key(updated_at);
-            latest
-                .entry(profile_id)
-                .and_modify(|slot| {
-                    if key > slot.1 {
-                        *slot = (entry_id, key);
-                    }
-                })
-                .or_insert((entry_id, key));
-        }
-
-        let mut profiles = Vec::new();
-        for (profile_id, (entry_id, _updated_key)) in latest {
-            let name = load_string_attr(&mut ws, &catalog, entry_id, &metadata::name)?
-                .unwrap_or_else(|| format!("profile-{profile_id:x}"));
-            profiles.push(ModelProfileSummary {
-                id: profile_id,
-                name,
-            });
-        }
-        profiles.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-        Ok(profiles)
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
-}
-
-fn load_model_profile(pile_path: &Path, profile_id: Id) -> Result<Option<(ModelConfig, String)>> {
-    let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Option<(ModelConfig, String)>> {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
-        let catalog = ws.checkout(..).context("checkout config workspace")?;
-        load_latest_model_profile(&mut ws, &catalog, profile_id)
-    })();
-
-    if let Err(err) = close_repo(repo).context("close config pile") {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-
-    result
-}
-
-fn load_latest_config(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    pile_path: &Path,
-) -> Result<Option<Config>> {
-    let mut latest: Option<(Id, i128)> = None;
-
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?config_id @
-            metadata::tag: KIND_CONFIG_ID,
-            metadata::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest {
-            Some((current_id, current_key))
-                if current_key > key || (current_key == key && current_id >= config_id) => {}
-            _ => latest = Some((config_id, key)),
-        }
-    }
-
-    let Some((config_id, _)) = latest else {
-        return Ok(None);
-    };
-
-    let mut config = default_config(pile_path.to_path_buf());
-
-    if let Some(prompt) =
-        load_string_attr(ws, catalog, config_id, &playground_config::system_prompt)?
-    {
-        config.system_prompt = prompt;
-    }
-    if let Some(branch) = load_string_attr(ws, catalog, config_id, &playground_config::branch)? {
-        config.branch = branch;
-    }
-    if let Some(author) = load_string_attr(ws, catalog, config_id, &playground_config::author)? {
-        config.author = author;
-    }
-    if let Some(role) = load_string_attr(ws, catalog, config_id, &playground_config::author_role)? {
-        config.author_role = role;
-    }
-    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::persona_id) {
-        config.persona_id = Some(id);
-    }
-    if let Some(id) = load_id_attr(
-        catalog,
-        config_id,
-        &playground_config::active_model_profile_id,
-    ) {
-        config.model_profile_id = Some(id);
-    }
-    if let Some(model) = load_string_attr(ws, catalog, config_id, &playground_config::model_name)? {
-        config.model.model = model;
-    }
-    if let Some(url) = load_string_attr(ws, catalog, config_id, &playground_config::model_base_url)?
-    {
-        config.model.base_url = url;
-    }
-    if let Some(effort) = load_string_attr(
-        ws,
-        catalog,
-        config_id,
-        &playground_config::model_reasoning_effort,
-    )? {
-        config.model.reasoning_effort = Some(effort);
-    }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::model_api_key)?
-    {
-        config.model.api_key = Some(key);
-    }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::tavily_api_key)?
-    {
-        config.tavily_api_key = Some(key);
-    }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::exa_api_key)? {
-        config.exa_api_key = Some(key);
-    }
-    if let Some(cwd) =
-        load_string_attr(ws, catalog, config_id, &playground_config::exec_default_cwd)?
-    {
-        config.exec.default_cwd = Some(PathBuf::from(cwd));
-    }
-
-    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::exec_sandbox_profile) {
-        config.exec.sandbox_profile = Some(id);
-    }
-    if let Some(poll_ms) =
-        load_u256_attr(catalog, config_id, &playground_config::poll_ms).and_then(u256be_to_u64)
-    {
-        config.poll_ms = poll_ms;
-    }
-    if let Some(stream) =
-        load_u256_attr(catalog, config_id, &playground_config::model_stream).and_then(u256be_to_u64)
-    {
-        config.model.stream = stream != 0;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        config_id,
-        &playground_config::model_context_window_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.model.context_window_tokens = tokens;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        config_id,
-        &playground_config::model_max_output_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.model.max_output_tokens = tokens;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        config_id,
-        &playground_config::model_context_safety_margin_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.model.context_safety_margin_tokens = tokens;
-    }
-    if let Some(chars) = load_u256_attr(
-        catalog,
-        config_id,
-        &playground_config::model_chars_per_token,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.model.chars_per_token = chars;
-    }
-    if let Some(profile_id) = config.model_profile_id {
-        if let Some((model, name)) = load_latest_model_profile(ws, catalog, profile_id)? {
-            config.model = model;
-            config.model_profile_name = name;
-        }
-    }
-
-    Ok(Some(config))
-}
-
-fn load_latest_model_profile(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    profile_id: Id,
-) -> Result<Option<(ModelConfig, String)>> {
-    let mut latest: Option<(Id, i128)> = None;
-
-    for (entry_id, updated_at) in find!(
-        (entry_id: Id, updated_at: Inline<NsTAIInterval>),
-        pattern!(catalog, [{
-            ?entry_id @
-            metadata::tag: KIND_MODEL_PROFILE_ID,
-            metadata::updated_at: ?updated_at,
-            playground_config::model_profile_id: profile_id,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest {
-            Some((current_id, current_key))
-                if current_key > key || (current_key == key && current_id >= entry_id) => {}
-            _ => latest = Some((entry_id, key)),
-        }
-    }
-
-    let Some((entry_id, _)) = latest else {
-        return Ok(None);
-    };
-
-    let mut mc = ModelConfig::default();
-    if let Some(model) = load_string_attr(ws, catalog, entry_id, &playground_config::model_name)? {
-        mc.model = model;
-    }
-    if let Some(url) = load_string_attr(ws, catalog, entry_id, &playground_config::model_base_url)?
-    {
-        mc.base_url = url;
-    }
-    if let Some(effort) = load_string_attr(
-        ws,
-        catalog,
-        entry_id,
-        &playground_config::model_reasoning_effort,
-    )? {
-        mc.reasoning_effort = Some(effort);
-    }
-    if let Some(key) = load_string_attr(ws, catalog, entry_id, &playground_config::model_api_key)? {
-        mc.api_key = Some(key);
-    }
-    if let Some(stream) =
-        load_u256_attr(catalog, entry_id, &playground_config::model_stream).and_then(u256be_to_u64)
-    {
-        mc.stream = stream != 0;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        entry_id,
-        &playground_config::model_context_window_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        mc.context_window_tokens = tokens;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        entry_id,
-        &playground_config::model_max_output_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        mc.max_output_tokens = tokens;
-    }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        entry_id,
-        &playground_config::model_context_safety_margin_tokens,
-    )
-    .and_then(u256be_to_u64)
-    {
-        mc.context_safety_margin_tokens = tokens;
-    }
-    if let Some(chars) =
-        load_u256_attr(catalog, entry_id, &playground_config::model_chars_per_token)
-            .and_then(u256be_to_u64)
-    {
-        mc.chars_per_token = chars;
-    }
-    let name = load_string_attr(ws, catalog, entry_id, &metadata::name)?
-        .unwrap_or_else(|| format!("profile-{profile_id:x}"));
-    Ok(Some((mc, name)))
-}
-
-fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
-    let now = epoch_interval(now_epoch());
-    let config_id = ufoid();
-    let profile_id = config
-        .model_profile_id
-        .ok_or_else(|| anyhow!("config missing active model profile id"))?;
-
-    let system_prompt = ws.put(config.system_prompt.clone());
-    let branch = ws.put(config.branch.clone());
-    let author = ws.put(config.author.clone());
-    let author_role = ws.put(config.author_role.clone());
-    let poll_ms: Inline<U256BE> = config.poll_ms.to_inline();
-
-    let mut change = TribleSet::new();
-    change += entity! { &config_id @
-        metadata::tag: KIND_CONFIG_ID,
-        metadata::updated_at: now,
-        playground_config::system_prompt: system_prompt,
-        playground_config::branch: branch,
-        playground_config::author: author,
-        playground_config::author_role: author_role,
-        playground_config::poll_ms: poll_ms,
-        playground_config::active_model_profile_id: profile_id,
-    };
-
-    if let Some(id) = config.persona_id {
-        change += entity! { &config_id @ playground_config::persona_id: id };
-    }
-    if let Some(key) = config.tavily_api_key.as_ref() {
-        let handle = ws.put(key.clone());
-        change += entity! { &config_id @ playground_config::tavily_api_key: handle };
-    }
-    if let Some(key) = config.exa_api_key.as_ref() {
-        let handle = ws.put(key.clone());
-        change += entity! { &config_id @ playground_config::exa_api_key: handle };
-    }
-    if let Some(cwd) = config.exec.default_cwd.as_ref() {
-        let handle = ws.put(cwd.to_string_lossy().to_string());
-        change += entity! { &config_id @ playground_config::exec_default_cwd: handle };
-    }
-    if let Some(profile) = config.exec.sandbox_profile {
-        change += entity! { &config_id @ playground_config::exec_sandbox_profile: profile };
-    }
-
-    let profile_entry_id = ufoid();
-    let profile_name = ws.put(config.model_profile_name.clone());
-    let model_name_handle = ws.put(config.model.model.clone());
-    let model_base_url = ws.put(config.model.base_url.clone());
-    let model_stream: Inline<U256BE> = if config.model.stream { 1u64 } else { 0u64 }.to_inline();
-    let model_context_window_tokens: Inline<U256BE> =
-        config.model.context_window_tokens.to_inline();
-    let model_max_output_tokens: Inline<U256BE> = config.model.max_output_tokens.to_inline();
-    let model_context_safety_margin_tokens: Inline<U256BE> =
-        config.model.context_safety_margin_tokens.to_inline();
-    let model_chars_per_token: Inline<U256BE> = config.model.chars_per_token.to_inline();
-
-    change += entity! { &profile_entry_id @
-        metadata::tag: KIND_MODEL_PROFILE_ID,
-        metadata::updated_at: now,
-        playground_config::model_profile_id: profile_id,
-        metadata::name: profile_name,
-        playground_config::model_name: model_name_handle,
-        playground_config::model_base_url: model_base_url,
-        playground_config::model_stream: model_stream,
-        playground_config::model_context_window_tokens: model_context_window_tokens,
-        playground_config::model_max_output_tokens: model_max_output_tokens,
-        playground_config::model_context_safety_margin_tokens: model_context_safety_margin_tokens,
-        playground_config::model_chars_per_token: model_chars_per_token,
-    };
-
-    if let Some(key) = config.model.api_key.as_ref() {
-        let handle = ws.put(key.clone());
-        change += entity! { &profile_entry_id @ playground_config::model_api_key: handle };
-    }
-    if let Some(effort) = config.model.reasoning_effort.as_ref() {
-        let handle = ws.put(effort.clone());
-        change += entity! { &profile_entry_id @ playground_config::model_reasoning_effort: handle };
-    }
-
-    ws.commit(change, "playground config");
-    Ok(())
-}
-
-fn load_string_attr(
-    ws: &mut Workspace<Pile>,
-    catalog: &TribleSet,
-    entity_id: Id,
-    attr: &Attribute<Handle<LongString>>,
-) -> Result<Option<String>> {
-    let mut handles = find!(
-        (handle: Inline<Handle<LongString>>),
-        pattern!(catalog, [{ entity_id @ attr: ?handle }])
+fn print_profile(anchor: Option<Id>, profile: &ProfileValue, opened: Option<&str>) {
+    println!(
+        "  profile_id = {}",
+        anchor
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_owned())
     );
+    println!("  profile_name = \"{}\"", profile.name);
+    println!("  model = \"{}\"", profile.model);
+    println!("  base_url = \"{}\"", profile.base_url);
+    print_secret_line("model", profile.model_secret_version, opened);
+    println!(
+        "  reasoning_effort = {}",
+        profile
+            .reasoning_effort
+            .as_deref()
+            .map(|value| format!("\"{value}\""))
+            .unwrap_or_else(|| "null".to_owned())
+    );
+    println!("  stream = {}", profile.stream);
+    println!(
+        "  context_window_tokens = {}",
+        profile.context_window_tokens
+    );
+    println!("  max_output_tokens = {}", profile.max_output_tokens);
+    println!(
+        "  context_safety_margin_tokens = {}",
+        profile.context_safety_margin_tokens
+    );
+    println!("  chars_per_token = {}", profile.chars_per_token);
+}
 
-    let Some((handle,)) = handles.next() else {
-        return Ok(None);
+fn print_secret_line(role: &str, version: Option<Id>, opened: Option<&str>) {
+    println!(
+        "  {role}_secret_version = {}",
+        version
+            .map(|id| format!("\"{id:x}\""))
+            .unwrap_or_else(|| "null".to_owned())
+    );
+    println!(
+        "  {role}_api_key = {}",
+        match (version, opened) {
+            (None, _) => "null".to_owned(),
+            (Some(_), Some(value)) => format!("\"{value}\""),
+            (Some(_), None) => "\"<redacted>\"".to_owned(),
+        }
+    );
+}
+
+fn print_profile_list(catalog: &Catalog) -> Result<()> {
+    let active = match &catalog.config {
+        Resolution::Unique(snapshot) => Some(snapshot.value.active_profile),
+        Resolution::Agreed(snapshots) => snapshots
+            .first()
+            .map(|snapshot| snapshot.value.active_profile),
+        Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
     };
-    if handles.next().is_some() {
-        let attr_id = attr.id();
-        return Err(anyhow!(
-            "entity {entity_id:x} has multiple values for attribute {attr_id:x}"
-        ));
+    match &catalog.config {
+        Resolution::Missing => println!("config\t<missing>"),
+        Resolution::Unique(snapshot) => println!(
+            "config\t{:x}\tactive={:x}",
+            snapshot.id, snapshot.value.active_profile
+        ),
+        Resolution::Agreed(snapshots) => println!(
+            "config\t<agreed:{}>\theads={}",
+            snapshots.len(),
+            format_snapshot_ids(snapshots.iter().map(|snapshot| snapshot.id))
+        ),
+        Resolution::Forked(snapshots) => {
+            println!(
+                "config\t<forked:{}>\theads={}",
+                snapshots.len(),
+                format_snapshot_ids(snapshots.iter().map(|snapshot| snapshot.id))
+            );
+            for snapshot in snapshots {
+                println!(
+                    "  head\t{:x}\tactive={:x}",
+                    snapshot.id, snapshot.value.active_profile
+                );
+            }
+        }
+        Resolution::Invalid(error) => println!("config\t<invalid>\t{error}"),
     }
 
-    let view: View<str> = ws.get(handle).context("read config text")?;
-    Ok(Some(view.as_ref().to_string()))
-}
-
-fn load_id_attr(catalog: &TribleSet, entity_id: Id, attr: &Attribute<GenId>) -> Option<Id> {
-    find!(
-        value: Id,
-        pattern!(catalog, [{ entity_id @ attr: ?value }])
-    )
-    .next()
-}
-
-fn load_u256_attr(
-    catalog: &TribleSet,
-    entity_id: Id,
-    attr: &Attribute<U256BE>,
-) -> Option<Inline<U256BE>> {
-    find!(
-        value: Inline<U256BE>,
-        pattern!(catalog, [{ entity_id @ attr: ?value }])
-    )
-    .next()
-}
-
-fn u256be_to_u64(value: Inline<U256BE>) -> Option<u64> {
-    let raw = value.raw;
-    if raw[..24].iter().any(|byte| *byte != 0) {
-        return None;
-    }
-    let bytes: [u8; 8] = raw[24..32].try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
-}
-
-impl Default for ExecConfig {
-    fn default() -> Self {
-        Self {
-            default_cwd: Some(PathBuf::from("/workspace")),
-            sandbox_profile: None,
+    let mut rows = Vec::new();
+    for (&anchor, resolution) in &catalog.profiles {
+        let marker = if active == Some(anchor) { '*' } else { ' ' };
+        match resolution {
+            Resolution::Unique(snapshot) => rows.push((
+                snapshot.value.name.to_ascii_lowercase(),
+                format!(
+                    "{marker} {}\t{anchor:x}\tsnapshot={:x}",
+                    snapshot.value.name, snapshot.id
+                ),
+            )),
+            Resolution::Agreed(snapshots) => {
+                let profile = &snapshots[0].value;
+                rows.push((
+                    profile.name.to_ascii_lowercase(),
+                    format!(
+                        "{marker} {}\t{anchor:x}\t[agreed:{}]\theads={}",
+                        profile.name,
+                        snapshots.len(),
+                        format_snapshot_ids(snapshots.iter().map(|snapshot| snapshot.id))
+                    ),
+                ));
+            }
+            Resolution::Forked(snapshots) => {
+                let names: BTreeSet<_> = snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.value.name.as_str())
+                    .collect();
+                rows.push((
+                    String::new(),
+                    format!(
+                        "! <forked:{}>\t{anchor:x}\theads={}\t{}",
+                        snapshots.len(),
+                        format_snapshot_ids(snapshots.iter().map(|snapshot| snapshot.id)),
+                        names.into_iter().collect::<Vec<_>>().join(" | ")
+                    ),
+                ));
+            }
+            Resolution::Missing => rows.push((String::new(), format!("! <missing>\t{anchor:x}"))),
+            Resolution::Invalid(error) => {
+                rows.push((String::new(), format!("! <invalid>\t{anchor:x}\t{error}")))
+            }
         }
     }
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            model: DEFAULT_MODEL.to_string(),
-            base_url: DEFAULT_BASE_URL.to_string(),
-            api_key: None,
-            reasoning_effort: None,
-            stream: DEFAULT_STREAM,
-            context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-            context_safety_margin_tokens: DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
-            chars_per_token: DEFAULT_CHARS_PER_TOKEN,
-        }
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, row) in rows {
+        println!("{row}");
     }
+    Ok(())
 }
 
-fn default_config(pile_path: PathBuf) -> Config {
-    Config {
-        pile_path,
-        model: ModelConfig::default(),
-        model_profile_id: None,
-        model_profile_name: "default".to_string(),
-        tavily_api_key: None,
-        exa_api_key: None,
-        exec: ExecConfig::default(),
-        system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-        branch: DEFAULT_BRANCH.to_string(),
-        author: DEFAULT_AUTHOR.to_string(),
-        author_role: DEFAULT_AUTHOR_ROLE.to_string(),
-        persona_id: None,
-        poll_ms: DEFAULT_POLL_MS,
+fn format_snapshot_ids(ids: impl IntoIterator<Item = Id>) -> String {
+    ids.into_iter()
+        .map(|id| format!("{id:x}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn migrate_legacy(cli: &Cli) -> Result<()> {
+    // Missing authority must fail before opening or growing the pile.
+    load_signer(&cli.pile, cli.key.as_deref())?;
+    let before = load_exact_facts(cli)?;
+    let source = freeze_source(&cli.pile)
+        .context("freeze legacy config source; every old config writer must be stopped")?;
+    let fingerprint = source.fingerprint();
+    let plan = headspace_cutover::plan(&source)?;
+    let mut expected = before;
+    expected += plan.original_facts().clone();
+
+    let commits = headspace_cutover::publish(&source, &plan, &cli.pile, cli.key.as_deref())?;
+    let refreshed = freeze_source(&cli.pile)?;
+    if refreshed.fingerprint() != fingerprint {
+        bail!(
+            "legacy config pins changed during migration; published commits are replay-safe, stop every writer and retry"
+        );
     }
-}
-
-fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
-    let raw = raw.trim();
-    Id::from_hex(raw).ok_or_else(|| anyhow!("invalid {label} {raw}"))
-}
-
-fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
-    if let Some(path) = raw.strip_prefix('@') {
-        if path == "-" {
-            let mut value = String::new();
-            std::io::stdin()
-                .read_to_string(&mut value)
-                .with_context(|| format!("read {label} from stdin"))?;
-            return Ok(value);
-        }
-        return fs::read_to_string(path).with_context(|| format!("read {label} from {}", path));
+    let actual = load_exact_facts(cli)?;
+    if actual != expected {
+        bail!("Headspace migration result is not prior native value union exact legacy facts");
     }
-    Ok(raw.to_string())
+
+    println!(
+        "Migrated {} authored config commit{} ({} authored empty, {} verified contentless merge{}): {} exact legacy facts",
+        commits.len(),
+        if commits.len() == 1 { "" } else { "s" },
+        plan.report().authored_empty_commits,
+        plan.report().contentless_merges,
+        if plan.report().contentless_merges == 1 { "" } else { "s" },
+        plan.report().unique_facts,
+    );
+    println!(
+        "Legacy plaintext remains inert evidence. Re-supply credentials into Secrets, add a native profile/config, verify consumers, then stop using the old writer."
+    );
+    Ok(())
 }
 
-fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
-    Ok(load_value_or_file(raw, label)?.trim().to_string())
+fn load_exact_facts(cli: &Cli) -> Result<TribleSet> {
+    let storage = Storage::open(
+        &cli.pile,
+        cli.key.as_deref(),
+        cli.secrets_identity.as_deref(),
+    )?;
+    let result = storage.views().map(|views| views.headspace.facts);
+    let close = storage.close();
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => Err(error.context(format!(
+            "closing migration preflight also failed: {close_error}"
+        ))),
+    }
 }
 
 fn parse_u64(raw: &str, label: &str) -> Result<u64> {
@@ -987,6 +1016,210 @@ fn parse_bool(raw: &str, label: &str) -> Result<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),
-        _ => Err(anyhow!("invalid {label} {raw} (expected true/false)")),
+        _ => bail!("invalid {label} {raw} (expected true/false)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::File;
+
+    use faculties::collection_cutover::{initialize_signer, open_pile_strict};
+    use triblespace::core::repo::BlobStore;
+
+    fn cli(pile: &Path, key: &Path, command: Command) -> Cli {
+        Cli {
+            pile: pile.to_owned(),
+            key: Some(key.to_owned()),
+            secrets_identity: None,
+            command: Some(command),
+        }
+    }
+
+    fn add(name: &str) -> Command {
+        Command::Add(AddArgs {
+            name: name.to_owned(),
+            model: None,
+            base_url: None,
+            model_secret_version: None,
+            reasoning_effort: None,
+            stream: None,
+            context_window_tokens: None,
+            max_output_tokens: None,
+            context_safety_margin_tokens: None,
+            chars_per_token: None,
+        })
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("headspace.pile");
+        let key = directory.path().join("headspace.key");
+        File::create(&pile).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        (directory, pile, key)
+    }
+
+    fn views<'a>(pile: &'a Path, key: &'a Path) -> (Storage<'a>, Views) {
+        let storage = Storage::open(pile, Some(key), None).unwrap();
+        let views = storage.views().unwrap();
+        (storage, views)
+    }
+
+    #[test]
+    fn missing_signer_does_not_grow_the_pile() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("headspace.pile");
+        File::create(&pile).unwrap();
+        let before = std::fs::metadata(&pile).unwrap().len();
+        assert!(Storage::open(&pile, None, None).is_err());
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), before);
+    }
+
+    #[test]
+    fn add_use_and_idempotent_profile_set_advance_only_intended_tracks() {
+        let (_directory, pile, key) = fixture();
+        run(cli(&pile, &key, add("first"))).unwrap();
+        let (storage, first) = views(&pile, &key);
+        let first_anchor = settled_config(&first.catalog)
+            .unwrap()
+            .unwrap()
+            .active_profile;
+        storage.close().unwrap();
+
+        run(cli(&pile, &key, add("second"))).unwrap();
+        run(cli(
+            &pile,
+            &key,
+            Command::Use {
+                profile: format!("{first_anchor:x}"),
+            },
+        ))
+        .unwrap();
+        run(cli(
+            &pile,
+            &key,
+            Command::Set {
+                field: SetField::Model,
+                value: "changed".to_owned(),
+            },
+        ))
+        .unwrap();
+        let (storage, before) = views(&pile, &key);
+        let snapshots = before.catalog.snapshot_ids().len();
+        storage.close().unwrap();
+
+        run(cli(
+            &pile,
+            &key,
+            Command::Set {
+                field: SetField::Model,
+                value: "changed".to_owned(),
+            },
+        ))
+        .unwrap();
+        let (storage, after) = views(&pile, &key);
+        assert_eq!(after.catalog.snapshot_ids().len(), snapshots);
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn interrupted_secrets_first_publication_repairs_by_exact_version_id() {
+        let (_directory, pile, key) = fixture();
+        run(cli(&pile, &key, add("default"))).unwrap();
+
+        let signer = load_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        let password = b"identity password";
+        let identity =
+            secrets_model::prepare_identity("me", password, point_now().unwrap()).unwrap();
+        let scope_fragment =
+            secrets_model::scope_fragment(identity.id, "headspace-test", point_now().unwrap())
+                .unwrap();
+        let scope = scope_fragment.root().unwrap();
+        let mut foundation = identity.fragment;
+        foundation += scope_fragment;
+        Collection::new(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
+            .commit(foundation)
+            .unwrap();
+        let secrets_facts =
+            Collection::new(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
+                .materialize()
+                .unwrap();
+        let reader = store.reader().unwrap();
+        let catalog = secrets_model::validate_catalog(&reader, &secrets_facts).unwrap();
+        let sealed = secrets_model::seal_version(
+            &reader,
+            &catalog,
+            scope,
+            "hs/model/interrupted",
+            b"exact",
+            point_now().unwrap(),
+        )
+        .unwrap();
+        let version = sealed.secret;
+        Collection::new(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer)
+            .commit(sealed.fragment)
+            .unwrap();
+        store.close().unwrap();
+
+        // Deterministic second half after a crash between collection commits.
+        run(cli(
+            &pile,
+            &key,
+            Command::Secret {
+                role: SecretRole::Model,
+                command: SecretCommand::Set(SecretSetArgs {
+                    value: None,
+                    version: Some(format!("{version:x}")),
+                    secret_scope: None,
+                }),
+            },
+        ))
+        .unwrap();
+        let (storage, repaired) = views(&pile, &key);
+        assert_eq!(repaired.secrets_catalog.secrets.len(), 1);
+        let (_, profile) = headspace::settled_active(&repaired.catalog).unwrap();
+        assert_eq!(profile.model_secret_version, Some(version));
+        storage.close().unwrap();
+
+        run(cli(
+            &pile,
+            &key,
+            Command::Secret {
+                role: SecretRole::Model,
+                command: SecretCommand::Set(SecretSetArgs {
+                    value: None,
+                    version: Some(format!("{version:x}")),
+                    secret_scope: None,
+                }),
+            },
+        ))
+        .unwrap();
+        let (storage, replay) = views(&pile, &key);
+        assert_eq!(replay.secrets_catalog.secrets.len(), 1);
+        assert_eq!(
+            headspace::settled_active(&replay.catalog)
+                .unwrap()
+                .1
+                .model_secret_version,
+            Some(version)
+        );
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn permanent_cli_exposes_no_collection_scope_branch_head_or_cas_knobs() {
+        let command = Cli::command();
+        for forbidden in ["scope", "branch", "branch_id", "head", "cas", "repair"] {
+            assert!(!command
+                .get_arguments()
+                .any(|argument| argument.get_id() == forbidden));
+        }
+        assert!(command
+            .get_arguments()
+            .any(|argument| argument.get_id() == "key"));
     }
 }

@@ -8,23 +8,26 @@ registry.
 
 == Why a separate faculty
 
-The pile branch model means each kind of state lives on its own
-branch. Relations stay on `relations`; messages on
-`message`; goals on `compass`. Faculties that need
-people-references read from `relations` without owning the data.
+Each kind of state lives in its own fixed, signer-owned collection. Relations,
+Message, and Compass therefore retain separate semantics while sharing one
+pile. Faculties that need people-references materialize Relations without
+claiming those facts as their own schema.
 
-That separation matters when piles merge: two agents independently
-adding a person record for "alice" produce content-addressed
-duplicates the lint pass can deduplicate; if relations were
-inlined into message each merge would risk inconsistent
-addressee data.
+That separation matters when admitted facts merge. Two `relations add alice`
+operations under the same durable signer mint distinct stable person anchors;
+the read model preserves the ambiguity instead of silently choosing one by
+label. Record an explicit same-person or distinct-person identity verdict when
+you know the relationship, and reconcile concurrent profile frontiers
+explicitly when needed. A concatenated foreign-signer COMMIT is retained
+physically but is not admitted into this collection view. Message can therefore
+reject an ambiguous addressee rather than inheriting inconsistent contact data.
 
 == Usage
 
 ```sh
 # Add a person
-relations add jp --first-name "Jan-Paul" --last-name "Bultmann" \
-  --display-name "JP" --affinity "user / project lead"
+relations add operator --first-name "Ada" --last-name "Example" \
+  --display-name "Ada" --affinity "user / project lead"
 
 # Add an alias
 relations add codex --display-name "Codex subagent" --alias "data-plane"
@@ -33,23 +36,24 @@ relations add codex --display-name "Codex subagent" --alias "data-plane"
 relations list
 
 # Show one (label, alias, or hex id all work)
-relations show jp
+relations show operator
 
 # Update
-relations set jp --note "Project lead. Prefers async over sync."
+relations set operator --note "Project lead. Prefers async over sync."
 ```
 
 The label is the short form you'll type at faculty-call sites:
-`message send jp "..."` resolves "jp" via the
+`message send operator "..."` resolves "operator" via the
 relations registry.
 
 == Conventions
 
-  - Labels are lowercase, short, alphanumeric. Stable across
-    sessions — once chosen, don't rename.
+  - Labels are lowercase, short, and easy to type. A profile update may rename
+    one, but address by exact person id when durable identity matters and treat
+    an old label as unavailable unless retained explicitly as an alias.
   - Display names are for UI rendering (GORBIE, log lines).
-  - Aliases let you address the same entity by multiple
-    short forms (`alice`, `bob`, `alice-web`).
+  - Aliases let you address the same person by multiple short forms
+    (`ada`, `ada-example`, `operator`).
   - Notes are free-form; affinity is the one-liner ("user",
     "team member", "external collaborator").
 
@@ -65,8 +69,8 @@ relations registry.
 
   - "Local Messages: Agent-to-Agent Direct Messaging" — the
     primary consumer of the relations registry
-  - "Compass Goals Workflow" — goals can be assigned to a
-    relations label (some compass workflows use this for
-    multi-agent kanban)
+  - "Compass Goals Workflow" — `$PERSONA` attributes actions to a Relations
+    person, while tags can request a person's or group's attention; neither is
+    an exclusive assignment lock
 
 Next stop: [Web: Search and Fetch Through Provider APIs](wiki:abe651f605c823085d861f296d9f9907).

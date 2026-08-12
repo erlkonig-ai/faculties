@@ -24,15 +24,22 @@ trible team invite --pile shared.pile \
   --key founder.key \
   --invitee <invitee-pubkey> --scope read
 
-# Invitee runs the relay, with the issued cap as their credential:
+# Make the issued capability blob and its ancestor closure available to the
+# invitee. A running issuer daemon pushes them to the invitee daemon through
+# `OP_DELIVER_CAP`; for an offline handoff, transfer and import a pile snapshot
+# that contains that closure. The printed handle alone is not the capability.
+
+# Invitee connects to the current legacy-head/blob sync transport with the
+# now-local issued cap as their credential. Native collection-record transport
+# is a separate integration boundary and is not claimed by this command yet.
 TRIBLE_TEAM_ROOT=<pubkey> TRIBLE_TEAM_CAP=<issued-sig> \
 trible pile net sync ./self.pile \
-  --peers <founder-node-id> --topic team-graph
+  --peers <founder-node-id>
 
 # Audit at any time:
 trible team list --pile shared.pile
-# Lists each cap (issuer → subject, scope, expiry) sorted by
-# soonest-to-expire first, plus revocations.
+# Lists each stored cap (issuer → subject, scope, expiry) sorted by
+# soonest-to-expire first.
 ```
 
 == Diagnostics
@@ -51,23 +58,22 @@ Use this when a connection is being rejected and you want to
 double-check what your side is presenting before debugging the
 relay.
 
-== When to revoke
+== Ending renewal
 
-  - Lost credentials (laptop with `invitee.key` stolen).
-  - Member leaves the team.
-  - Compromised cap (e.g. you accidentally pasted
-    `TRIBLE_TEAM_CAP` into a public channel).
+Capabilities are short-lived. Issuing or approving one also creates a local
+renewal-policy entry; ending that policy lets the peer's capability chain
+expire naturally. There is no misleading global revoke assertion that
+promises to erase a capability another node has already observed.
 
 ```sh
-trible team revoke --pile shared.pile \
-  --team-root-secret <hex> \
-  --target <pubkey-of-revoked-member>
+trible team list-issued --pile shared.pile
+trible team retract --pile shared.pile --entry <renewal-entry-id>
 ```
 
-Revocations cascade transitively: revoking a member's pubkey
-also invalidates every cap that member issued downstream.
-The relay picks up new revocations on the next snapshot
-refresh — no restart.
+The running daemon observes that local decision on its next tick and stops
+renewing the selected `(subject, scope)` grant. Existing signed caps remain
+valid only until their bounded expiry. Treat loss of an active signing key as a
+credential incident during that remaining window.
 
 == When NOT to use this
 

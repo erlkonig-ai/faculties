@@ -9,10 +9,11 @@ downloaded papers.
 
   - The pile is the single source of truth — putting an artefact
     in `/tmp` means it's gone next session.
-  - Content-addressing means the same bytes always hash to the
-    same handle. Two agents with the same paper in their files
-    branch can cite the same `files:<hash>` and the cite resolves
-    on either side.
+  - Content-addressing means the same bytes always hash to the same handle.
+    Two agents can therefore cite the same `files:<hash>` token. Resolution
+    still requires the referenced blob and an admitted Files fact in the
+    current signer-owned collection; the token does not grant or transport
+    either one by itself.
   - Wiki fragments cite files by handle, not by path; an
     archived file is durable across machines, sessions, and
     pile renames.

@@ -1,649 +1,636 @@
+//! A read-only research-quality lens over Wiki's canonical revision DAG.
 //!
-//! Research quality gauge: reads wiki tag metadata to measure research health.
-//! Pure read-only lens on existing data — no writes, no new schemas.
+//! Every metric is explicit about its unit: logical entries or current
+//! frontier states. Forks are evidence, never rows to settle by clock or
+//! iteration order. Links are reproduced from admitted content and legacy
+//! selectors resolve through the same revision/legacy-selector model as the
+//! Wiki CLI.
 
-use anyhow::Result;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::gauge::{wiki, WIKI_BRANCH_NAME};
-use hifitime::Epoch;
-use rand_core::OsRng;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use triblespace::core::metadata;
-use triblespace::core::repo::Workspace;
+use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::schemas::wiki::extract_link_targets;
+use faculties::wiki::{self as wiki_model, WikiCatalog};
+use triblespace::core::collection::Collection;
+use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::*;
 
-type Lower = i128;
-
-// ── CLI ─────────────────────────────────────────────────────────────────
 #[derive(Parser)]
 #[command(
     version = faculties::GIT_VERSION,
     name = "gauge",
-    about = "Research quality gauge — reads wiki tag metadata"
+    about = "Research-quality metrics over Wiki entries and complete DAG frontiers"
 )]
 struct Cli {
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads never create one.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Show research health metrics
+enum Command {
+    /// Show entry, frontier, tag, link, and orphan metrics.
     Health,
-    /// Count fragments by tag
+    /// Count tags both by current state occurrence and by logical entry.
     Tags,
-    /// Show the published/refuted ratio over time
+    /// Show current published/refuted states without settling forks.
     Quality,
-    /// Show most-linked fragments (knowledge hubs)
+    /// Show entries with the most unambiguously resolved incoming links.
     Hubs {
-        /// Number of top hubs to show
         #[arg(short, long, default_value = "15")]
         top: usize,
     },
-    /// Find fragments citing audit-warned or refuted hubs (contamination scan)
+    /// Find entries whose current states cite refuted or audit-warned entries.
     Risk,
-    /// Show how metrics change over time (buckets by creation date)
-    Drift,
-    /// List orphan fragments (no outgoing links)
+    /// List entries for which every current state has zero outgoing links.
     Orphans {
-        /// Number to show
         #[arg(short, long, default_value = "20")]
         top: usize,
-        /// Print fragment IDs only (one per line, pipe-friendly)
+        /// Print one stable entry selector per line.
         #[arg(long)]
         ids: bool,
     },
 }
 
+#[derive(Clone, Debug)]
+struct State {
+    revision: Id,
+    title: String,
+    tags: BTreeSet<String>,
+    links: Vec<Id>,
+}
+
+#[derive(Clone, Debug)]
+struct Entry {
+    label: Id,
+    states: Vec<State>,
+    active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LinkResolution {
+    Missing,
+    Unique(usize),
+    Ambiguous(Vec<usize>),
+}
+
+#[derive(Debug)]
+struct GaugeModel {
+    entries: Vec<Entry>,
+    selectors: BTreeMap<Id, BTreeSet<usize>>,
+}
+
+impl GaugeModel {
+    fn load(catalog: &WikiCatalog, reader: &PileReader) -> Result<Self> {
+        let records = catalog.revisions.all_entries();
+        let mut entries = Vec::with_capacity(records.len());
+        let mut selectors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
+
+        for (index, entry) in records.iter().enumerate() {
+            let label = *entry
+                .legacy_fragments
+                .first()
+                .or(entry.roots.first())
+                .expect("admitted Wiki entry has a root");
+            let mut states = Vec::with_capacity(entry.frontier.len());
+            for revision in &entry.frontier {
+                let title = wiki_model::read_text(reader, revision.title)?;
+                let content = wiki_model::read_text(reader, revision.content)?;
+                let tags = revision
+                    .tags
+                    .iter()
+                    .map(|tag| tag_name(catalog, reader, *tag))
+                    .collect::<Result<BTreeSet<_>>>()?;
+                let links = extract_link_targets(&content)
+                    .into_iter()
+                    .filter_map(|raw| Id::from_hex(&raw))
+                    .collect();
+                states.push(State {
+                    revision: revision.id,
+                    title,
+                    tags,
+                    links,
+                });
+            }
+            for revision in &entry.members {
+                selectors.entry(*revision).or_default().insert(index);
+            }
+            for fragment in &entry.legacy_fragments {
+                selectors.entry(*fragment).or_default().insert(index);
+            }
+            let active = entry.frontier.iter().any(|revision| {
+                !revision
+                    .tags
+                    .contains(&faculties::schemas::wiki::TAG_ARCHIVED_ID)
+            });
+            entries.push(Entry {
+                label,
+                states,
+                active,
+            });
+        }
+
+        Ok(Self { entries, selectors })
+    }
+
+    fn resolve(&self, target: Id) -> LinkResolution {
+        match self.selectors.get(&target) {
+            None => LinkResolution::Missing,
+            Some(entries) if entries.len() == 1 => {
+                LinkResolution::Unique(*entries.first().expect("one entry"))
+            }
+            Some(entries) => LinkResolution::Ambiguous(entries.iter().copied().collect()),
+        }
+    }
+
+    fn state_count(&self) -> usize {
+        self.active_entries().map(|entry| entry.states.len()).sum()
+    }
+
+    fn active_entries(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.iter().filter(|entry| entry.active)
+    }
+
+    fn active_count(&self) -> usize {
+        self.active_entries().count()
+    }
+}
+
+fn tag_name(catalog: &WikiCatalog, reader: &PileReader, id: Id) -> Result<String> {
+    match catalog.tag_names.get(&id) {
+        Some(handle) => wiki_model::read_text(reader, *handle),
+        None => Ok(format!("{id:x}")),
+    }
+}
+
+fn entry_title(entry: &Entry) -> String {
+    let titles: BTreeSet<&str> = entry
+        .states
+        .iter()
+        .map(|state| state.title.as_str())
+        .collect();
+    if titles.len() == 1 {
+        titles.first().expect("one title").to_string()
+    } else {
+        format!(
+            "FORK: {}",
+            titles.into_iter().collect::<Vec<_>>().join(" | ")
+        )
+    }
+}
+
+fn short(value: &str, chars: usize) -> String {
+    value.chars().take(chars).collect()
+}
+
+fn fraction(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        100.0 * numerator as f64 / denominator as f64
+    }
+}
+
+fn link_census(model: &GaugeModel) -> (usize, usize, usize, usize) {
+    let mut total = 0;
+    let mut resolved = 0;
+    let mut ambiguous = 0;
+    let mut missing = 0;
+    for state in model.active_entries().flat_map(|entry| &entry.states) {
+        for &target in &state.links {
+            total += 1;
+            match model.resolve(target) {
+                LinkResolution::Unique(_) => resolved += 1,
+                LinkResolution::Ambiguous(_) => ambiguous += 1,
+                LinkResolution::Missing => missing += 1,
+            }
+        }
+    }
+    (total, resolved, ambiguous, missing)
+}
+
+fn cmd_health(model: &GaugeModel) {
+    let states = model.state_count();
+    let forks = model
+        .active_entries()
+        .filter(|entry| entry.states.len() > 1)
+        .count();
+    let unanimous_orphans = model
+        .active_entries()
+        .filter(|entry| entry.states.iter().all(|state| state.links.is_empty()))
+        .count();
+    let mixed_orphans = model
+        .active_entries()
+        .filter(|entry| {
+            entry.states.iter().any(|state| state.links.is_empty())
+                && entry.states.iter().any(|state| !state.links.is_empty())
+        })
+        .count();
+    let (links, resolved, ambiguous, missing) = link_census(model);
+
+    println!("=== GAUGE: Research Health ===\n");
+    println!("Logical entries:       {}", model.active_count());
+    println!("Current states:        {states}");
+    println!("Forked entries:        {forks}");
+    println!("Outgoing references:   {links}");
+    println!("  resolved uniquely:   {resolved}");
+    println!("  ambiguous selector:  {ambiguous}");
+    println!("  unresolved selector: {missing}");
+    println!(
+        "Unanimous orphans:     {unanimous_orphans} ({:.0}% of entries)",
+        fraction(unanimous_orphans, model.active_count())
+    );
+    println!("Mixed orphan forks:    {mixed_orphans}");
+}
+
+fn tag_counts(model: &GaugeModel) -> BTreeMap<String, (usize, usize)> {
+    let mut counts = BTreeMap::new();
+    for entry in model.active_entries() {
+        let mut entry_tags = BTreeSet::new();
+        for state in &entry.states {
+            for tag in &state.tags {
+                counts.entry(tag.clone()).or_insert((0, 0)).0 += 1;
+                entry_tags.insert(tag.clone());
+            }
+        }
+        for tag in entry_tags {
+            counts.entry(tag).or_insert((0, 0)).1 += 1;
+        }
+    }
+    counts
+}
+
+fn cmd_tags(model: &GaugeModel) {
+    let mut rows: Vec<_> = tag_counts(model).into_iter().collect();
+    rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    println!("=== GAUGE: Current Tag Evidence ===\n");
+    println!("{:<27} {:>8} {:>8}", "tag", "states", "entries");
+    for (tag, (states, entries)) in rows {
+        println!("{tag:<27} {states:>8} {entries:>8}");
+    }
+}
+
+fn cmd_quality(model: &GaugeModel) {
+    println!("=== GAUGE: Published / Refuted Frontier States ===\n");
+    let mut count = 0;
+    for entry in model.active_entries() {
+        for state in &entry.states {
+            let statuses: Vec<&str> = ["published", "refuted"]
+                .into_iter()
+                .filter(|tag| state.tags.contains(*tag))
+                .collect();
+            if statuses.is_empty() {
+                continue;
+            }
+            count += 1;
+            let fork = if entry.states.len() > 1 {
+                " [fork]"
+            } else {
+                ""
+            };
+            println!(
+                "[{}] {} — revision {:x}{fork}",
+                statuses.join(", "),
+                short(&state.title, 65),
+                state.revision
+            );
+        }
+    }
+    if count == 0 {
+        println!("No current frontier state is tagged published or refuted.");
+    }
+}
+
+fn cmd_hubs(model: &GaugeModel, top: usize) {
+    let mut incoming = vec![0usize; model.entries.len()];
+    let mut ambiguous = 0;
+    let mut missing = 0;
+    for state in model.active_entries().flat_map(|entry| &entry.states) {
+        for &target in &state.links {
+            match model.resolve(target) {
+                LinkResolution::Unique(entry) => incoming[entry] += 1,
+                LinkResolution::Ambiguous(_) => ambiguous += 1,
+                LinkResolution::Missing => missing += 1,
+            }
+        }
+    }
+    let mut rows: Vec<_> = incoming.into_iter().enumerate().collect();
+    rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    println!("=== GAUGE: Knowledge Hubs ===\n");
+    for (index, count) in rows
+        .into_iter()
+        .filter(|(index, count)| model.entries[*index].active && *count > 0)
+        .take(top)
+    {
+        println!(
+            "{count:>4} <- {} [wiki:{:x}]",
+            short(&entry_title(&model.entries[index]), 65),
+            model.entries[index].label
+        );
+    }
+    println!("\nExcluded ambiguous references: {ambiguous}");
+    println!("Excluded unresolved references: {missing}");
+}
+
+fn cmd_risk(model: &GaugeModel) {
+    let flagged: BTreeSet<usize> = model
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.active
+                && entry.states.iter().any(|state| {
+                    state.tags.contains("refuted") || state.tags.contains("audit-warning")
+                })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    println!("=== GAUGE: Risk Scan ===\n");
+    if flagged.is_empty() {
+        println!("No current entry frontier contains refuted or audit-warning evidence.");
+        return;
+    }
+
+    for (index, entry) in model
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.active)
+    {
+        if flagged.contains(&index) {
+            continue;
+        }
+        let mut risks = BTreeSet::new();
+        for state in &entry.states {
+            for &target in &state.links {
+                match model.resolve(target) {
+                    LinkResolution::Unique(target) if flagged.contains(&target) => {
+                        risks.insert(format!(
+                            "wiki:{:x} {}",
+                            model.entries[target].label,
+                            short(&entry_title(&model.entries[target]), 45)
+                        ));
+                    }
+                    LinkResolution::Ambiguous(candidates)
+                        if candidates
+                            .iter()
+                            .any(|candidate| flagged.contains(candidate)) =>
+                    {
+                        let choices = candidates
+                            .into_iter()
+                            .map(|candidate| format!("wiki:{:x}", model.entries[candidate].label))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        risks.insert(format!(
+                            "ambiguous selector wiki:{target:x}; candidates: {choices}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !risks.is_empty() {
+            println!(
+                "{} [wiki:{:x}]",
+                short(&entry_title(entry), 65),
+                entry.label
+            );
+            for risk in risks {
+                println!("  cites -> {risk}");
+            }
+        }
+    }
+}
+
+fn cmd_orphans(model: &GaugeModel, top: usize, ids: bool) {
+    let mut rows: Vec<&Entry> = model
+        .active_entries()
+        .filter(|entry| entry.states.iter().all(|state| state.links.is_empty()))
+        .collect();
+    rows.sort_by_key(|entry| (entry_title(entry).to_lowercase(), entry.label));
+    if ids {
+        for entry in rows.into_iter().take(top) {
+            println!("{:x}", entry.label);
+        }
+        return;
+    }
+    println!("=== GAUGE: Unanimous Orphan Entries ===\n");
+    println!(
+        "{} / {} entries have no outgoing link in any current state\n",
+        rows.len(),
+        model.active_count()
+    );
+    for entry in rows.into_iter().take(top) {
+        let fork = if entry.states.len() > 1 {
+            " [fork]"
+        } else {
+            ""
+        };
+        println!(
+            "{} [wiki:{:x}]{fork}",
+            short(&entry_title(entry), 65),
+            entry.label
+        );
+    }
+}
+
+fn with_model<T>(
+    pile_path: &Path,
+    key_path: Option<&Path>,
+    operation: impl FnOnce(&GaugeModel) -> Result<T>,
+) -> Result<T> {
+    let signer = load_signer(pile_path, key_path)?;
+    let mut pile = open_pile_strict(pile_path)?;
+    let result = (|| {
+        let facts = Collection::new(
+            &mut pile,
+            faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer,
+        )
+        .materialize()
+        .context("materialize Wiki collection")?;
+        let reader = pile.reader().context("open Wiki attachment reader")?;
+        let catalog =
+            wiki_model::validate_catalog(&reader, &facts).context("validate Wiki collection")?;
+        let model = GaugeModel::load(&catalog, &reader)?;
+        operation(&model)
+    })();
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context("close Gauge pile")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing Gauge pile also failed: {close_error}")))
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if cli.command.is_none() {
+    let Some(command) = cli.command else {
         Cli::command().print_help()?;
+        println!();
         return Ok(());
-    }
-
-    let mut pile = Pile::open(&cli.pile)?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                cli.pile.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", cli.pile.display()),
-        });
-    }
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())?;
-
-    let bid = if let Some(hex_str) = &cli.branch_id {
-        let raw = hex::decode(hex_str)?;
-        Id::new(
-            raw.try_into()
-                .map_err(|_| anyhow::anyhow!("bad branch id"))?,
-        )
-        .ok_or_else(|| anyhow::anyhow!("nil branch id"))?
-    } else {
-        repo.ensure_branch(WIKI_BRANCH_NAME, None)
-            .map_err(|e| anyhow::anyhow!("ensure wiki branch: {e:?}"))?
     };
 
-    let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-
-    match cli.command.unwrap() {
-        Commands::Health => cmd_health(&space, &mut ws),
-        Commands::Tags => cmd_tags(&space, &mut ws),
-        Commands::Quality => cmd_quality(&space, &mut ws),
-        Commands::Hubs { top } => cmd_hubs(&space, &mut ws, top),
-        Commands::Risk => cmd_risk(&space, &mut ws),
-        Commands::Drift => cmd_drift(&space, &mut ws),
-        Commands::Orphans { top, ids } => cmd_orphans(&space, &mut ws, top, ids),
-    }
+    with_model(&cli.pile, cli.key.as_deref(), |model| {
+        match command {
+            Command::Health => cmd_health(model),
+            Command::Tags => cmd_tags(model),
+            Command::Quality => cmd_quality(model),
+            Command::Hubs { top } => cmd_hubs(model, top),
+            Command::Risk => cmd_risk(model),
+            Command::Orphans { top, ids } => cmd_orphans(model, top, ids),
+        }
+        Ok(())
+    })
 }
 
-// ── helpers (borrowed from wiki.rs pattern) ─────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
 
-fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
-    let mut best: HashMap<Id, (Id, Lower)> = HashMap::new();
-    for (vid, frag, (lower, _upper)) in find!(
-        (vid: Id, frag: Id, ts: (Epoch, Epoch)),
-        pattern!(space, [{
-            ?vid @
-            wiki::fragment: ?frag,
-            metadata::created_at: ?ts,
-        }])
-    ) {
-        let ts = lower.to_tai_duration().total_nanoseconds();
-        best.entry(frag)
-            .and_modify(|(old_vid, old_ts)| {
-                if ts > *old_ts {
-                    *old_vid = vid;
-                    *old_ts = ts;
-                }
-            })
-            .or_insert((vid, ts));
-    }
-    best
-}
+    use faculties::collection_cutover::initialize_signer;
+    use faculties::schemas::wiki::TAG_ARCHIVED_ID;
+    use faculties::wiki::{author_record, revision_record, tag_record, RevisionDraft};
+    use hifitime::Epoch;
 
-fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
-    find!(
-        tag: Id,
-        pattern!(space, [{ &vid @ metadata::tag: ?tag }])
-    )
-    .collect()
-}
-
-fn tag_name(space: &TribleSet, ws: &mut Workspace<Pile>, tag_id: Id) -> String {
-    let results: Vec<_> = find!(
-        h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
-        pattern!(space, [{ &tag_id @ metadata::name: ?h }])
-    )
-    .collect();
-    if let Some(handle) = results.into_iter().next() {
-        if let Ok(view) = ws.get::<View<str>, _>(handle) {
-            let s: &str = view.as_ref();
-            return s.to_string();
-        }
-    }
-    format!("{:?}", tag_id)
-}
-
-// ── commands ────────────────────────────────────────────────────────────
-
-fn cmd_health(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
-    let latest = latest_versions(space);
-    let total = latest.len();
-
-    let mut tag_counts: HashMap<String, usize> = HashMap::new();
-    let mut orphan_count = 0usize;
-    let mut link_count = 0usize;
-
-    for (_frag, (vid, _ts)) in &latest {
-        let tags = tags_of(space, *vid);
-        for tag_id in &tags {
-            let name = tag_name(space, ws, *tag_id);
-            *tag_counts.entry(name).or_insert(0) += 1;
-        }
-
-        // Count outgoing links
-        let links: Vec<Id> = find!(
-            target: Id,
-            pattern!(space, [{ vid @ wiki::links_to: ?target }])
-        )
-        .collect();
-        if links.is_empty() {
-            orphan_count += 1;
-        }
-        link_count += links.len();
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        pile: PathBuf,
+        key: PathBuf,
     }
 
-    let published = tag_counts.get("published").copied().unwrap_or(0);
-    let refuted = tag_counts.get("refuted").copied().unwrap_or(0);
-    let preprint = tag_counts.get("preprint").copied().unwrap_or(0);
-    let hypothesis = tag_counts.get("hypothesis").copied().unwrap_or(0);
-    let evidence = tag_counts.get("evidence").copied().unwrap_or(0);
-    let review = tag_counts.get("review").copied().unwrap_or(0);
-    let synthesis = tag_counts.get("synthesis").copied().unwrap_or(0);
-    let prediction = tag_counts.get("prediction").copied().unwrap_or(0);
-    let finding = tag_counts.get("finding").copied().unwrap_or(0);
-    let audit_warning = tag_counts.get("audit-warning").copied().unwrap_or(0);
-
-    println!("=== GAUGE: Research Health ===");
-    println!();
-    println!("Versions: {total}");
-    println!(
-        "Links: {link_count} ({:.1} per version)",
-        link_count as f64 / total as f64
-    );
-    println!(
-        "Orphans: {orphan_count} ({:.0}%)",
-        100.0 * orphan_count as f64 / total as f64
-    );
-    println!();
-    println!("--- Epistemic Status ---");
-    println!("  Published:      {published:>4}");
-    println!("  Refuted:        {refuted:>4}");
-    println!("  Preprint:       {preprint:>4}");
-    println!("  Audit-warning:  {audit_warning:>4}");
-    println!();
-    println!("--- Content Type ---");
-    println!("  Synthesis:      {synthesis:>4}");
-    println!("  Hypothesis:     {hypothesis:>4}");
-    println!("  Evidence:        {evidence:>4}");
-    println!("  Finding:         {finding:>4}");
-    println!("  Review:          {review:>4}");
-    println!("  Prediction:      {prediction:>4}");
-    println!();
-    println!("--- Ratios ---");
-    if published + refuted > 0 {
-        println!(
-            "  Survival rate:  {:.0}% ({published} published / {} tested)",
-            100.0 * published as f64 / (published + refuted) as f64,
-            published + refuted
-        );
-    }
-    if synthesis > 0 {
-        println!(
-            "  Theory grounding: {:.1}% ({published} published / {synthesis} synthesis)",
-            100.0 * published as f64 / synthesis as f64
-        );
-    }
-    if hypothesis > 0 {
-        let tested = evidence + finding;
-        println!(
-            "  Hypothesis coverage: {tested} evidence+findings / {hypothesis} hypotheses ({:.0}%)",
-            100.0 * tested as f64 / hypothesis as f64
-        );
-    }
-    if prediction > 0 {
-        println!("  Predictions: {prediction} made ({refuted} refuted, track outcomes!)");
-    }
-    if review > 0 {
-        println!(
-            "  Review density: {:.1} reviews per published finding",
-            review as f64 / published.max(1) as f64
-        );
-    }
-    println!();
-    Ok(())
-}
-
-fn cmd_tags(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
-    let latest = latest_versions(space);
-    let mut tag_counts: HashMap<String, usize> = HashMap::new();
-
-    for (_frag, (vid, _ts)) in &latest {
-        let tags = tags_of(space, *vid);
-        for tag_id in &tags {
-            let name = tag_name(space, ws, *tag_id);
-            *tag_counts.entry(name).or_insert(0) += 1;
-        }
-    }
-
-    let mut sorted: Vec<_> = tag_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-
-    println!("=== GAUGE: Tag Counts ===");
-    println!();
-    for (name, count) in sorted {
-        println!("  {name:<25} {count:>4}");
-    }
-    println!();
-    Ok(())
-}
-
-fn cmd_quality(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
-    let latest = latest_versions(space);
-    let mut published_frags = Vec::new();
-    let mut refuted_frags = Vec::new();
-
-    for (_frag, (vid, _ts)) in &latest {
-        let tags = tags_of(space, *vid);
-        let tag_names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
-
-        // Get title
-        let title: String = find!(
-            h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
-            pattern!(space, [{ vid @ wiki::title: ?h }])
-        )
-        .next()
-        .and_then(|h| ws.get::<View<str>, _>(h).ok())
-        .map(|v| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        })
-        .unwrap_or_else(|| "untitled".to_string());
-
-        let short_title: String = title.chars().take(60).collect();
-
-        if tag_names.iter().any(|t| t == "published") {
-            published_frags.push(short_title.clone());
-        }
-        if tag_names.iter().any(|t| t == "refuted") {
-            refuted_frags.push(short_title);
-        }
-    }
-
-    println!("=== GAUGE: Quality Assessment ===");
-    println!();
-    println!("PUBLISHED ({}):", published_frags.len());
-    for t in &published_frags {
-        println!("  + {t}");
-    }
-    println!();
-    println!("REFUTED ({}):", refuted_frags.len());
-    for t in &refuted_frags {
-        println!("  - {t}");
-    }
-    println!();
-    if !published_frags.is_empty() || !refuted_frags.is_empty() {
-        let total = published_frags.len() + refuted_frags.len();
-        println!(
-            "Survival: {}/{} ({:.0}%)",
-            published_frags.len(),
-            total,
-            100.0 * published_frags.len() as f64 / total as f64
-        );
-    }
-    println!();
-    Ok(())
-}
-
-fn cmd_hubs(space: &TribleSet, ws: &mut Workspace<Pile>, top: usize) -> Result<()> {
-    let latest = latest_versions(space);
-
-    // Build version->fragment and fragment->title maps
-    let vid_to_frag: HashMap<Id, Id> = latest
-        .iter()
-        .map(|(frag, (vid, _))| (*vid, *frag))
-        .collect();
-    let frag_to_vid: HashMap<Id, Id> = latest
-        .iter()
-        .map(|(frag, (vid, _))| (*frag, *vid))
-        .collect();
-
-    // Count incoming links per target (could be version or fragment ID)
-    let mut incoming: HashMap<Id, usize> = HashMap::new();
-    for (_frag, (vid, _ts)) in &latest {
-        let targets: Vec<Id> = find!(
-            target: Id,
-            pattern!(space, [{ vid @ wiki::links_to: ?target }])
-        )
-        .collect();
-        for target in targets {
-            // Normalize: if target is a version, map to its fragment
-            let canonical = vid_to_frag.get(&target).copied().unwrap_or(target);
-            *incoming.entry(canonical).or_insert(0) += 1;
-        }
-    }
-
-    // Sort by incoming count
-    let mut sorted: Vec<_> = incoming.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-
-    println!("=== GAUGE: Knowledge Hubs (most-linked fragments) ===");
-    println!();
-    for (id, count) in sorted.into_iter().take(top) {
-        // Try title from the fragment's latest version, or from the ID directly
-        let lookup_vid = frag_to_vid.get(&id).copied().unwrap_or(id);
-        let title: String = find!(
-            h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
-            pattern!(space, [{ &lookup_vid @ wiki::title: ?h }])
-        )
-        .next()
-        .and_then(|h| ws.get::<View<str>, _>(h).ok())
-        .map(|v| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        })
-        .unwrap_or_else(|| format!("(unknown {:X?})", &id[..4]));
-
-        let short: String = title.chars().take(65).collect();
-        println!("  {count:>3} links <- {short}");
-    }
-    println!();
-    Ok(())
-}
-
-fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
-    let latest = latest_versions(space);
-
-    // Find all audit-warned and refuted fragment IDs
-    let mut flagged: HashMap<Id, (String, Vec<String>)> = HashMap::new(); // frag -> (title, [tags])
-    for (frag, (vid, _ts)) in &latest {
-        let tags = tags_of(space, *vid);
-        let tag_names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
-        if tag_names
-            .iter()
-            .any(|t| t == "refuted" || t == "audit-warning")
-        {
-            let title: String = find!(
-                h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
-                pattern!(space, [{ vid @ wiki::title: ?h }])
-            )
-            .next()
-            .and_then(|h| ws.get::<View<str>, _>(h).ok())
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
-            .unwrap_or_else(|| "untitled".to_string());
-            let risk_tags: Vec<String> = tag_names
-                .into_iter()
-                .filter(|t| t == "refuted" || t == "audit-warning")
-                .collect();
-            flagged.insert(*frag, (title, risk_tags));
-        }
-    }
-
-    if flagged.is_empty() {
-        println!("No audit-warned or refuted fragments found.");
-        return Ok(());
-    }
-
-    // Build version->fragment map
-    let vid_to_frag: HashMap<Id, Id> = latest
-        .iter()
-        .map(|(frag, (vid, _))| (*vid, *frag))
-        .collect();
-
-    // For each non-flagged fragment, check if it links to any flagged fragment
-    println!("=== GAUGE: Risk Scan — Fragments Citing Flagged Sources ===");
-    println!();
-
-    println!("Flagged sources ({}):", flagged.len());
-    for (_frag, (title, tags)) in &flagged {
-        let short: String = title.chars().take(55).collect();
-        println!("  [{tags}] {short}", tags = tags.join(", "));
-    }
-    println!();
-
-    let mut contaminated: Vec<(String, Vec<String>)> = Vec::new(); // (title, [flagged sources cited])
-    for (frag, (vid, _ts)) in &latest {
-        if flagged.contains_key(frag) {
-            continue;
-        } // skip the flagged ones themselves
-
-        let targets: Vec<Id> = find!(
-            target: Id,
-            pattern!(space, [{ vid @ wiki::links_to: ?target }])
-        )
-        .collect();
-
-        let mut cited_flagged: Vec<String> = Vec::new();
-        for target in &targets {
-            // Normalize to fragment ID
-            let canonical = vid_to_frag.get(target).copied().unwrap_or(*target);
-            if let Some((flagged_title, _)) = flagged.get(&canonical) {
-                let short: String = flagged_title.chars().take(30).collect();
-                cited_flagged.push(short);
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let pile = directory.path().join("gauge.pile");
+            let key = directory.path().join("gauge.key");
+            File::create(&pile).unwrap();
+            initialize_signer(&pile, Some(&key)).unwrap();
+            Self {
+                _directory: directory,
+                pile,
+                key,
             }
         }
 
-        if !cited_flagged.is_empty() {
-            let title: String = find!(
-                h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
-                pattern!(space, [{ vid @ wiki::title: ?h }])
+        fn publish(&self, fragment: Fragment) {
+            let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
+            let mut pile = open_pile_strict(&self.pile).unwrap();
+            Collection::new(
+                &mut pile,
+                faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+                signer,
             )
-            .next()
-            .and_then(|h| ws.get::<View<str>, _>(h).ok())
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
+            .commit(fragment)
+            .unwrap();
+            pile.close().unwrap();
+        }
+
+        fn with_model(&self, operation: impl FnOnce(&GaugeModel)) {
+            super::with_model(&self.pile, Some(&self.key), |model| {
+                operation(model);
+                Ok(())
             })
-            .unwrap_or_else(|| "untitled".to_string());
-            contaminated.push((title, cited_flagged));
+            .unwrap();
         }
     }
 
-    contaminated.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-
-    println!(
-        "Potentially contaminated fragments ({}):",
-        contaminated.len()
-    );
-    for (title, sources) in &contaminated {
-        let short: String = title.chars().take(55).collect();
-        println!("  {short}");
-        for src in sources {
-            println!("    cites -> {src}");
-        }
+    fn authored_at(seconds: f64) -> Inline<inlineencodings::NsTAIInterval> {
+        let epoch = Epoch::from_tai_seconds(seconds);
+        (epoch, epoch).try_to_inline().unwrap()
     }
-    println!();
 
-    Ok(())
+    fn revision(
+        author: Id,
+        title: &str,
+        content: &str,
+        tags: BTreeSet<Id>,
+        predecessors: BTreeSet<Id>,
+    ) -> (Fragment, Id) {
+        revision_record(RevisionDraft {
+            title: title.to_owned(),
+            content: content.to_owned(),
+            tags,
+            predecessors,
+            author,
+            authored_at: authored_at(1.0),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn model_keeps_forks_and_resolves_every_revision_to_the_entry() {
+        let fixture = Fixture::new();
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (tag, published, _) = tag_record("published").unwrap();
+        let (root_fragment, root) =
+            revision(author, "root", "root", BTreeSet::new(), BTreeSet::new());
+        let (left_fragment, left) = revision(
+            author,
+            "fork",
+            "#link(\"wiki:11111111111111111111111111111111\")[x]",
+            BTreeSet::from([published]),
+            BTreeSet::from([root]),
+        );
+        let (right_fragment, right) = revision(
+            author,
+            "fork",
+            "#link(\"wiki:11111111111111111111111111111111\")[x]",
+            BTreeSet::new(),
+            BTreeSet::from([root]),
+        );
+        fixture.publish(author_fragment + tag + root_fragment + left_fragment + right_fragment);
+
+        fixture.with_model(|model| {
+            assert_eq!(model.entries.len(), 1);
+            assert_eq!(model.entries[0].states.len(), 2);
+            assert_eq!(model.resolve(root), LinkResolution::Unique(0));
+            assert_eq!(model.resolve(left), LinkResolution::Unique(0));
+            assert_eq!(model.resolve(right), LinkResolution::Unique(0));
+            assert!(model.entries[0]
+                .states
+                .iter()
+                .any(|state| state.tags.contains("published")));
+        });
+    }
+
+    #[test]
+    fn archived_only_entries_are_not_gauged() {
+        let fixture = Fixture::new();
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (tag, _, _) = tag_record("archived").unwrap();
+        let (revision, _) = revision(
+            author,
+            "retired",
+            "body",
+            BTreeSet::from([TAG_ARCHIVED_ID]),
+            BTreeSet::new(),
+        );
+        fixture.publish(author_fragment + tag + revision);
+        fixture.with_model(|model| {
+            assert_eq!(
+                model.entries.len(),
+                1,
+                "selector resolution retains history"
+            );
+            assert_eq!(
+                model.active_count(),
+                0,
+                "metrics hide archived-only entries"
+            );
+        });
+    }
 }
-
-fn cmd_orphans(
-    space: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    top: usize,
-    ids_only: bool,
-) -> Result<()> {
-    let latest = latest_versions(space);
-    let mut orphans: Vec<(Id, String, Vec<String>)> = Vec::new();
-
-    for (frag, (vid, _ts)) in &latest {
-        let links: Vec<Id> = find!(
-            target: Id,
-            pattern!(space, [{ vid @ wiki::links_to: ?target }])
-        )
-        .collect();
-
-        if links.is_empty() {
-            let title: String = find!(
-                h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
-                pattern!(space, [{ vid @ wiki::title: ?h }])
-            )
-            .next()
-            .and_then(|h| ws.get::<View<str>, _>(h).ok())
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
-            .unwrap_or_else(|| "untitled".to_string());
-
-            let tags = tags_of(space, *vid);
-            let tag_names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
-
-            orphans.push((*frag, title, tag_names));
-        }
-    }
-
-    // Sort alphabetically for browsability
-    orphans.sort_by(|a, b| a.1.cmp(&b.1));
-
-    if ids_only {
-        for (frag, _, _) in orphans.iter().take(top) {
-            println!("{}", hex::encode(**frag));
-        }
-        return Ok(());
-    }
-
-    println!("=== GAUGE: Orphan Fragments (no outgoing links) ===");
-    println!();
-    println!(
-        "Total orphans: {} / {} ({:.0}%)",
-        orphans.len(),
-        latest.len(),
-        100.0 * orphans.len() as f64 / latest.len() as f64
-    );
-    println!();
-    for (_, title, tags) in orphans.iter().take(top) {
-        let short: String = title.chars().take(60).collect();
-        let tag_str: String = tags
-            .iter()
-            .filter(|t| *t != "version" && *t != "typst" && *t != "markdown")
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  {short}");
-        if !tag_str.is_empty() {
-            println!("    [{tag_str}]");
-        }
-    }
-    if orphans.len() > top {
-        println!("  ... and {} more", orphans.len() - top);
-    }
-    println!();
-    Ok(())
-}
-
-fn cmd_drift(space: &TribleSet, ws: &mut Workspace<Pile>) -> Result<()> {
-    let latest = latest_versions(space);
-
-    // Bucket fragments by date (YYYY-MM)
-    let mut buckets: std::collections::BTreeMap<String, HashMap<String, usize>> =
-        std::collections::BTreeMap::new();
-
-    for (_frag, (vid, ts_ns)) in &latest {
-        // Convert TAI nanoseconds to approximate date
-        let epoch =
-            Epoch::from_tai_duration(hifitime::Duration::from_parts(0, (*ts_ns).max(0) as u64));
-        let (year, month, _, _, _, _, _) = epoch.to_gregorian_utc();
-
-        // Skip obviously broken dates (far future)
-        if year > 2030 || year < 2020 {
-            continue;
-        }
-
-        let bucket = format!("{year:04}-{month:02}");
-
-        let tags = tags_of(space, *vid);
-        let tag_names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
-
-        let entry = buckets.entry(bucket).or_insert_with(HashMap::new);
-        *entry.entry("total".to_string()).or_insert(0) += 1;
-
-        for name in &tag_names {
-            match name.as_str() {
-                "published" | "refuted" | "preprint" | "hypothesis" | "evidence" | "review"
-                | "synthesis" | "finding" | "prediction" | "audit-warning" | "experiment" => {
-                    *entry.entry(name.clone()).or_insert(0) += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    println!("=== GAUGE: Research Drift Over Time ===");
-    println!();
-    println!(
-        "{:<10} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
-        "Month", "Total", "Synth", "Evid", "Hypo", "Rev", "Pub", "Ref", "Pred"
-    );
-    println!("{}", "-".repeat(75));
-
-    for (month, counts) in &buckets {
-        let total = counts.get("total").copied().unwrap_or(0);
-        let synth = counts.get("synthesis").copied().unwrap_or(0);
-        let evid = counts.get("evidence").copied().unwrap_or(0);
-        let hypo = counts.get("hypothesis").copied().unwrap_or(0);
-        let rev = counts.get("review").copied().unwrap_or(0);
-        let publ = counts.get("published").copied().unwrap_or(0);
-        let refut = counts.get("refuted").copied().unwrap_or(0);
-        let pred = counts.get("prediction").copied().unwrap_or(0);
-
-        println!("{month:<10} {total:>5} {synth:>5} {evid:>5} {hypo:>5} {rev:>5} {publ:>5} {refut:>5} {pred:>5}");
-    }
-    println!();
-
-    Ok(())
-}
-
-// Note: future additions planned:
-// - `gauge orphans` — list fragments with zero incoming/outgoing links
-// - `gauge hubs` — list most-linked fragments (foundational knowledge)
-// - `gauge trend` — compare metrics across time windows
-// - `gauge provenance` — once wiki::source_turn is added, trace quality back to model invocations

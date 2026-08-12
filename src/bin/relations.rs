@@ -1,1379 +1,994 @@
-use anyhow::{anyhow, bail, Result};
-use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
-use faculties::schemas::relations::{
-    group, group_snapshot_fragment, head_members, head_snapshot_of, relations, resolve_group_head,
-    GroupHead, DEFAULT_BRANCH, KIND_GROUP, KIND_PERSON_ID, KIND_RETIRE_ID, KIND_UNRETIRE_ID,
-};
-use hifitime::Epoch;
-use rand_core::OsRng;
-use std::collections::{HashMap, HashSet};
+//! `relations` — authored people, addressable groups, and explicit identity
+//! adjudication in one union-only native collection.
+//!
+//! Stable person/group anchors never accumulate mutable scalar facts. Every
+//! change publishes one intrinsic full-state snapshot with explicit
+//! predecessors. Concurrent publications therefore become visible forks;
+//! reconciliation is another monotonic child, never deletion, a mutable head,
+//! or clock-based arbitration.
+
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
-use triblespace::macros::{find, pattern};
+
+use anyhow::{bail, Context, Result};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::relations::{
+    self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
+};
+use faculties::schemas::relations::DEFAULT_SCOPE_ID;
+use hifitime::Epoch;
+use triblespace::core::collection::Collection;
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-
 #[derive(Parser)]
-#[command(version = faculties::GIT_VERSION, name = "relations", about = "Relationship/contacts faculty")]
+#[command(
+    version = faculties::GIT_VERSION,
+    name = "relations",
+    about = "Authored people, groups, and identity verdicts"
+)]
 struct Cli {
-    /// Path to the pile file to use
+    /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch name for relations data
-    #[arg(long, default_value = DEFAULT_BRANCH)]
-    branch: String,
-    /// Branch id for relations data (hex). Overrides ensure_branch.
-    #[arg(long)]
-    branch_id: Option<String>,
+    /// Existing durable signing-key file. Reads and writes never create it.
+    #[arg(long, env = "TRIBLESPACE_KEY")]
+    key: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Add a person
+    /// Add a stable person anchor with an initial profile and active lifecycle.
     Add {
-        /// Canonical short label
+        /// Canonical human-facing label.
         label: String,
-        /// Explicit person id (hex)
+        /// Exact stable person id. Omit to mint a fresh anchor.
+        #[arg(long, value_parser = parse_id_arg)]
+        id: Option<Id>,
+        /// Additive provenance label (repeatable).
         #[arg(long)]
-        id: Option<String>,
-        /// First name
-        #[arg(long)]
-        first_name: Option<String>,
-        /// Last name
-        #[arg(long)]
-        last_name: Option<String>,
-        /// Display name
-        #[arg(long)]
-        display_name: Option<String>,
-        /// Affinity / relationship note (short)
-        #[arg(long)]
-        affinity: Option<String>,
-        /// Note (long)
-        #[arg(long)]
-        note: Option<String>,
-        /// Alias (repeatable)
-        #[arg(long)]
-        alias: Vec<String>,
-        /// Teams user id (GUID)
-        #[arg(long)]
-        teams_user_id: Option<String>,
-        /// Email address
-        #[arg(long)]
-        email: Option<String>,
-        /// Phone number
-        #[arg(long)]
-        phone: Option<String>,
-        /// Company / organisation
-        #[arg(long)]
-        company: Option<String>,
-        /// Role / job title
-        #[arg(long)]
-        position: Option<String>,
-        /// Provenance ("summit" | "card" | "mail" | …)
-        #[arg(long)]
-        source: Option<String>,
-        /// Create even if a relation with this label, alias, or email
-        /// already exists. Without this flag, `relations add` refuses
-        /// to mint a duplicate person entity — protects the knowledge
-        /// base from accidental forks when the same person gets touched
-        /// by multiple faculties (mail autoregister, manual add, etc.).
-        #[arg(long)]
-        force: bool,
+        source: Vec<String>,
+        #[command(flatten)]
+        profile: NewProfileArgs,
     },
-    /// Update a person
+    /// Replace selected fields of one current profile snapshot.
     Set {
-        /// Person id (hex)
-        id: String,
-        /// New canonical short label
+        /// Person label, alias, exact id, or id prefix.
+        person: String,
+        /// Additive provenance label (repeatable; does not alter profile identity).
         #[arg(long)]
-        label: Option<String>,
-        /// First name
-        #[arg(long)]
-        first_name: Option<String>,
-        /// Last name
-        #[arg(long)]
-        last_name: Option<String>,
-        /// Display name
-        #[arg(long)]
-        display_name: Option<String>,
-        /// Affinity / relationship note (short)
-        #[arg(long)]
-        affinity: Option<String>,
-        /// Note (long)
-        #[arg(long)]
-        note: Option<String>,
-        /// Alias (repeatable)
-        #[arg(long)]
-        alias: Vec<String>,
-        /// Teams user id (GUID)
-        #[arg(long)]
-        teams_user_id: Option<String>,
-        /// Email address
-        #[arg(long)]
-        email: Option<String>,
-        /// Phone number
-        #[arg(long)]
-        phone: Option<String>,
-        /// Company / organisation
-        #[arg(long)]
-        company: Option<String>,
-        /// Role / job title
-        #[arg(long)]
-        position: Option<String>,
-        /// Provenance ("summit" | "card" | "mail" | …)
-        #[arg(long)]
-        source: Option<String>,
+        source: Vec<String>,
+        #[command(flatten)]
+        patch: ProfilePatchArgs,
     },
-    /// List people
+    /// Collapse concurrent profile heads into one explicit successor.
+    Reconcile {
+        /// Person label, alias, exact id, or id prefix.
+        person: String,
+        /// Fork head whose full profile is the base. Optional only when every
+        /// current head has the same semantic profile value.
+        #[arg(long)]
+        base: Option<String>,
+        #[command(flatten)]
+        patch: ProfilePatchArgs,
+    },
+    /// List person anchors and their current state.
     List {
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Include soft-retired relations (default hides them)
+        /// Include settled retired people.
         #[arg(long)]
         all: bool,
-        /// Show ONLY soft-retired relations
+        /// Show only settled retired people.
         #[arg(long, conflicts_with = "all")]
         retired: bool,
     },
-    /// Show a person
-    Show { id: String },
-    /// Soft-retire a relation (label or id). Append-only: the person
-    /// entity is never deleted — an "unretire"/"restore" reverses it and
-    /// the entry stays recoverable in the pile. Default `list` hides it.
-    Retire {
-        /// Person label, alias, or id (hex / prefix)
+    /// Show one person, including all heads when a track is forked.
+    Show {
+        /// Person label, alias, exact id, or id prefix.
         person: String,
     },
-    /// Un-retire (restore) a soft-retired relation (label or id).
+    /// Publish a retired lifecycle successor (also reconciles a lifecycle fork).
+    Retire { person: String },
+    /// Publish an active lifecycle successor (also reconciles a lifecycle fork).
     #[command(alias = "restore")]
-    Unretire {
-        /// Person label, alias, or id (hex / prefix)
-        person: String,
-    },
-    /// Manage groups (addressable sets of people, e.g. the colony)
+    Unretire { person: String },
+    /// Manage addressable exact-member groups.
     Group {
         #[command(subcommand)]
-        command: GroupCmd,
+        command: GroupCommand,
+    },
+    /// Record and inspect explicit same-person/distinct-person verdicts.
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+}
+
+#[derive(Args, Clone, Default)]
+struct NewProfileArgs {
+    #[arg(long)]
+    alias: Vec<String>,
+    #[arg(long)]
+    affinity: Vec<String>,
+    #[arg(long)]
+    first_name: Option<String>,
+    #[arg(long)]
+    last_name: Option<String>,
+    #[arg(long)]
+    display_name: Option<String>,
+    #[arg(long)]
+    note: Option<String>,
+    #[arg(long)]
+    teams_user_id: Vec<String>,
+    #[arg(long)]
+    email: Vec<String>,
+    #[arg(long)]
+    phone: Vec<String>,
+    #[arg(long)]
+    company: Option<String>,
+    #[arg(long)]
+    position: Option<String>,
+    #[arg(long)]
+    profile_url: Vec<String>,
+}
+
+impl NewProfileArgs {
+    fn into_profile(self, label: String) -> ProfileInput {
+        ProfileInput {
+            label,
+            aliases: self.alias,
+            affinities: self.affinity,
+            first_name: self.first_name,
+            last_name: self.last_name,
+            display_name: self.display_name,
+            note: self.note,
+            teams_user_ids: self.teams_user_id,
+            emails: self.email,
+            phones: self.phone,
+            company: self.company,
+            position: self.position,
+            profile_urls: self.profile_url,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ValueEnum)]
+enum ProfileField {
+    Aliases,
+    Affinities,
+    FirstName,
+    LastName,
+    DisplayName,
+    Note,
+    TeamsUserIds,
+    Emails,
+    Phones,
+    Company,
+    Position,
+    ProfileUrls,
+}
+
+#[derive(Args, Clone, Default)]
+struct ProfilePatchArgs {
+    #[arg(long)]
+    label: Option<String>,
+    /// Replace the complete alias set (repeat for multiple values).
+    #[arg(long)]
+    alias: Vec<String>,
+    /// Replace the complete affinity set (repeat for multiple values).
+    #[arg(long)]
+    affinity: Vec<String>,
+    #[arg(long)]
+    first_name: Option<String>,
+    #[arg(long)]
+    last_name: Option<String>,
+    #[arg(long)]
+    display_name: Option<String>,
+    #[arg(long)]
+    note: Option<String>,
+    /// Replace the complete Teams-id set (repeat for multiple values).
+    #[arg(long)]
+    teams_user_id: Vec<String>,
+    /// Replace the complete email set (repeat for multiple values).
+    #[arg(long)]
+    email: Vec<String>,
+    /// Replace the complete phone set (repeat for multiple values).
+    #[arg(long)]
+    phone: Vec<String>,
+    #[arg(long)]
+    company: Option<String>,
+    #[arg(long)]
+    position: Option<String>,
+    /// Replace the complete profile-URL set (repeat for multiple values).
+    #[arg(long)]
+    profile_url: Vec<String>,
+    /// Clear one field or complete repeated field. Repeat as needed.
+    #[arg(long, value_enum)]
+    clear: Vec<ProfileField>,
+}
+
+#[derive(Subcommand)]
+enum GroupCommand {
+    Create {
+        name: String,
+    },
+    Add {
+        group: String,
+        person: String,
+    },
+    Remove {
+        group: String,
+        person: String,
+    },
+    Rename {
+        group: String,
+        name: String,
+    },
+    /// Collapse all heads, taking the union of their exact member anchors.
+    Reconcile {
+        group: String,
+        /// Required only when concurrent heads disagree on the name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    List,
+    Show {
+        group: String,
     },
 }
 
 #[derive(Subcommand)]
-enum GroupCmd {
-    /// Create a group
-    Create {
-        /// Canonical short label (e.g. "colony", "embodiment")
-        name: String,
+enum IdentityCommand {
+    /// Resolve the current verdict for an unordered person pair.
+    Resolve {
+        first: String,
+        second: String,
+        #[arg(
+            long,
+            conflicts_with = "distinct",
+            required_unless_present = "distinct"
+        )]
+        same: bool,
+        #[arg(long, conflicts_with = "same", required_unless_present = "same")]
+        distinct: bool,
     },
-    /// Add a person to a group
-    Add {
-        /// Group label or id
-        group: String,
-        /// Person label or id
-        person: String,
-    },
-    /// Remove a person from a group
-    Remove {
-        /// Group label or id
-        group: String,
-        /// Person label or id
-        person: String,
-    },
-    /// Rename a group
-    Rename {
-        /// Group label or id
-        group: String,
-        /// New canonical short label
-        name: String,
-    },
-    /// One-time: give legacy anchor-direct groups their initial snapshot.
-    Migrate,
-    /// Heal a forked group: mint one child superseding every concurrent head,
-    /// carrying the UNION of their members (edit down afterward if intended).
-    Reconcile {
-        /// Group label or id
-        group: String,
-        /// Name for the reconciled head. Required only when concurrent renames
-        /// left the fork heads with different names; otherwise inherited.
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// List groups and their members
+    /// List canonical person pairs and every live verdict head.
     List,
-    /// Show a group's members
-    Show {
-        /// Group label or id
-        group: String,
-    },
+}
+
+#[derive(Clone, Copy)]
+struct RelationsStorage<'a> {
+    pile: &'a Path,
+    key: Option<&'a Path>,
+}
+
+impl RelationsStorage<'_> {
+    fn with_collection<T>(&self, f: impl FnOnce(&mut Collection<Pile>) -> Result<T>) -> Result<T> {
+        // Reads and writes share the same durable authority. Ordinary CLI
+        // commands never mint a key or substitute an ephemeral identity.
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let result = f(&mut collection);
+        let close = collection.into_storage().close();
+        match (result, close) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(close_error)) => {
+                Err(error.context(format!("closing pile also failed: {close_error}")))
+            }
+        }
+    }
+
+    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileReader) -> Result<T>) -> Result<T> {
+        self.with_collection(|collection| {
+            let facts = collection
+                .materialize()
+                .context("materialize authored Relations collection")?;
+            let reader = collection
+                .storage_mut()
+                .reader()
+                .context("open Relations blob reader")?;
+            relations::validate_catalog(&reader, &facts)
+                .context("validate authored Relations collection")?;
+            f(&facts, &reader)
+        })
+    }
+
+    /// Build and preflight one update against the exact known collection
+    /// union. `None` is a genuine no-op and writes no collection record.
+    fn update<T>(
+        &self,
+        f: impl FnOnce(&TribleSet, &PileReader) -> Result<(Option<Fragment>, T)>,
+    ) -> Result<T> {
+        self.with_collection(|collection| {
+            let facts = collection
+                .materialize()
+                .context("materialize authored Relations collection")?;
+            let reader = collection
+                .storage_mut()
+                .reader()
+                .context("open Relations blob reader")?;
+            relations::validate_catalog(&reader, &facts)
+                .context("validate authored Relations collection")?;
+            let (fragment, result) = f(&facts, &reader)?;
+            if let Some(fragment) = fragment {
+                relations::validate_catalog_union(&reader, &facts, &fragment)
+                    .context("preflight authored Relations union")?;
+                collection
+                    .commit(fragment)
+                    .context("commit authored Relations fragment")?;
+            }
+            Ok(result)
+        })
+    }
+}
+
+fn parse_id_arg(raw: &str) -> std::result::Result<Id, String> {
+    Id::from_hex(raw.trim()).ok_or_else(|| format!("invalid id '{raw}'"))
 }
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
+fn now_observation() -> relations::ObservedAt {
+    let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
+    (now, now).try_to_inline().expect("current epoch is inline")
 }
 
-fn epoch_interval(epoch: Epoch) -> IntervalValue {
-    (epoch, epoch).try_to_inline().unwrap()
-}
-
-fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
-    lower
-}
-
-/// People currently soft-retired: the latest retire/unretire event per
-/// person wins (retire => retired, unretire => active). Monotonic and
-/// invertible — mirrors compass prioritize/deprioritize. Default views
-/// exclude these; `--all`/`--retired` reveal them.
-fn retired_person_ids(space: &TribleSet) -> HashSet<Id> {
-    let mut latest: HashMap<Id, (i128, bool)> = HashMap::new();
-    for (person, at) in find!(
-        (person: Id, at: IntervalValue),
-        pattern!(space, [{
-            _?evt @
-            metadata::tag: &KIND_RETIRE_ID,
-            relations::subject: ?person,
-            metadata::created_at: ?at,
-        }])
-    ) {
-        let key = interval_key(at);
-        latest
-            .entry(person)
-            .and_modify(|(cur_key, cur_retired)| {
-                if key >= *cur_key {
-                    *cur_key = key;
-                    *cur_retired = true;
-                }
-            })
-            .or_insert((key, true));
+fn resolve_person_anchor(
+    reader: &PileReader,
+    facts: &TribleSet,
+    selector: &str,
+    include_retired: bool,
+) -> Result<Id> {
+    match relations::resolve_person(reader, facts, selector, include_retired)? {
+        SelectorOutcome::Unique(id) => Ok(id),
+        // Reconciliation operations may deliberately address the one stable
+        // anchor whose profile/lifecycle happens to have several heads.
+        SelectorOutcome::Forked(ids) if ids.len() == 1 => Ok(ids[0]),
+        outcome => outcome.require_unique("person", selector),
     }
-    for (person, at) in find!(
-        (person: Id, at: IntervalValue),
-        pattern!(space, [{
-            _?evt @
-            metadata::tag: &KIND_UNRETIRE_ID,
-            relations::subject: ?person,
-            metadata::created_at: ?at,
-        }])
-    ) {
-        let key = interval_key(at);
-        latest
-            .entry(person)
-            .and_modify(|(cur_key, cur_retired)| {
-                if key > *cur_key {
-                    *cur_key = key;
-                    *cur_retired = false;
-                }
-            })
-            .or_insert((key, false));
-    }
-    latest
-        .into_iter()
-        .filter(|(_, (_, retired))| *retired)
-        .map(|(id, _)| id)
-        .collect()
 }
 
-fn normalize_label(label: &str) -> Result<String> {
-    let trimmed = label.trim();
-    if trimmed.is_empty() {
-        bail!("label is empty");
+fn resolve_group_anchor(reader: &PileReader, facts: &TribleSet, selector: &str) -> Result<Id> {
+    match relations::resolve_group(reader, facts, selector)? {
+        SelectorOutcome::Unique(id) => Ok(id),
+        SelectorOutcome::Forked(ids) if ids.len() == 1 => Ok(ids[0]),
+        outcome => outcome.require_unique("group", selector),
     }
-    validate_short(trimmed, "label")?;
-    Ok(trimmed.to_string())
 }
 
-/// ShortString fields live inline in the 32-byte value slot; anything
-/// longer must go in `--note` (LongString). Bail with the limit named
-/// instead of panicking in the encoder.
-fn validate_short(value: &str, field: &str) -> Result<()> {
-    let len = value.len();
-    if len > 32 {
+fn head_ids(head: Head, subject: &str) -> Result<Vec<Id>> {
+    match head {
+        Head::Missing => bail!("{subject} has no snapshot"),
+        Head::Unique(id) => Ok(vec![id]),
+        Head::Forked(ids) => Ok(ids),
+    }
+}
+
+fn resolve_head_selector(raw: &str, heads: &[Id], label: &str) -> Result<Id> {
+    let raw = raw.trim().to_ascii_lowercase();
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) || raw.len() > 32 {
+        bail!("invalid {label} head selector '{raw}'");
+    }
+    let matches: Vec<Id> = heads
+        .iter()
+        .copied()
+        .filter(|id| format!("{id:x}").starts_with(&raw))
+        .collect();
+    match matches.as_slice() {
+        [] => bail!("'{raw}' is not a current {label} head"),
+        [id] => Ok(*id),
+        _ => bail!("'{raw}' matches multiple current {label} heads"),
+    }
+}
+
+fn replacement_conflict(
+    clears: &HashSet<ProfileField>,
+    field: ProfileField,
+    replacement_present: bool,
+) -> Result<()> {
+    if clears.contains(&field) && replacement_present {
         bail!(
-            "{field} is {len} bytes but ShortString fields hold at most 32 — \
-             shorten it or move the detail into --note"
+            "--clear {} conflicts with its replacement option",
+            field.to_possible_value().expect("value enum").get_name()
         );
-    }
-    if value.bytes().any(|b| b == 0) {
-        bail!("{field} contains a NUL byte");
     }
     Ok(())
 }
 
-fn normalize_lookup_key(value: &str) -> Result<String> {
-    Ok(normalize_label(value)?.to_ascii_lowercase())
-}
+fn apply_profile_patch(input: &mut ProfileInput, patch: ProfilePatchArgs) -> Result<bool> {
+    let before = input.clone();
+    let clears: HashSet<ProfileField> = patch.clear.into_iter().collect();
 
-fn normalize_aliases(aliases: Vec<String>) -> Vec<String> {
-    aliases
-        .into_iter()
-        .map(|alias| alias.trim().to_string())
-        .filter(|alias| !alias.is_empty())
-        .collect()
-}
+    replacement_conflict(&clears, ProfileField::Aliases, !patch.alias.is_empty())?;
+    replacement_conflict(
+        &clears,
+        ProfileField::Affinities,
+        !patch.affinity.is_empty(),
+    )?;
+    replacement_conflict(&clears, ProfileField::FirstName, patch.first_name.is_some())?;
+    replacement_conflict(&clears, ProfileField::LastName, patch.last_name.is_some())?;
+    replacement_conflict(
+        &clears,
+        ProfileField::DisplayName,
+        patch.display_name.is_some(),
+    )?;
+    replacement_conflict(&clears, ProfileField::Note, patch.note.is_some())?;
+    replacement_conflict(
+        &clears,
+        ProfileField::TeamsUserIds,
+        !patch.teams_user_id.is_empty(),
+    )?;
+    replacement_conflict(&clears, ProfileField::Emails, !patch.email.is_empty())?;
+    replacement_conflict(&clears, ProfileField::Phones, !patch.phone.is_empty())?;
+    replacement_conflict(&clears, ProfileField::Company, patch.company.is_some())?;
+    replacement_conflict(&clears, ProfileField::Position, patch.position.is_some())?;
+    replacement_conflict(
+        &clears,
+        ProfileField::ProfileUrls,
+        !patch.profile_url.is_empty(),
+    )?;
 
-fn normalize_alias_lookup_keys(aliases: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for alias in aliases {
-        let key = alias.trim().to_ascii_lowercase();
-        if key.is_empty() || !seen.insert(key.clone()) {
-            continue;
-        }
-        out.push(key);
+    if let Some(value) = patch.label {
+        input.label = value;
     }
-    out
-}
-
-fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("{label} is empty");
+    if clears.contains(&ProfileField::Aliases) {
+        input.aliases.clear();
+    } else if !patch.alias.is_empty() {
+        input.aliases = patch.alias;
     }
-    Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))
-}
-
-fn resolve_person_id(space: &TribleSet, raw: &str) -> Result<Id> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("person id is empty");
+    if clears.contains(&ProfileField::Affinities) {
+        input.affinities.clear();
+    } else if !patch.affinity.is_empty() {
+        input.affinities = patch.affinity;
     }
 
-    let prefix = trimmed.to_lowercase();
-    if !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("person id must be hex (got '{trimmed}')");
-    }
-
-    if prefix.len() == 32 {
-        let id = Id::from_hex(&prefix).ok_or_else(|| anyhow!("invalid person id {trimmed}"))?;
-        for (person_id,) in find!(
-            (person_id: Id),
-            pattern!(&space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
-        ) {
-            if person_id == id {
-                return Ok(id);
+    macro_rules! scalar {
+        ($field:ident, $variant:ident, $value:expr) => {
+            if clears.contains(&ProfileField::$variant) {
+                input.$field = None;
+            } else if let Some(value) = $value {
+                input.$field = Some(value);
             }
-        }
-        bail!("unknown person id {trimmed}");
+        };
     }
+    scalar!(first_name, FirstName, patch.first_name);
+    scalar!(last_name, LastName, patch.last_name);
+    scalar!(display_name, DisplayName, patch.display_name);
+    scalar!(note, Note, patch.note);
+    scalar!(company, Company, patch.company);
+    scalar!(position, Position, patch.position);
 
-    let mut matches = Vec::new();
-    for (person_id,) in find!(
-        (person_id: Id),
-        pattern!(&space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
-    ) {
-        let hex = format!("{person_id:x}");
-        if hex.starts_with(&prefix) {
-            matches.push(person_id);
-        }
+    macro_rules! repeated {
+        ($field:ident, $variant:ident, $value:expr) => {
+            if clears.contains(&ProfileField::$variant) {
+                input.$field.clear();
+            } else if !$value.is_empty() {
+                input.$field = $value;
+            }
+        };
     }
-
-    match matches.len() {
-        0 => bail!("no person id matches prefix '{trimmed}'"),
-        1 => Ok(matches[0]),
-        _ => bail!("multiple people match id prefix '{trimmed}'"),
-    }
-}
-
-fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
-    let view: View<str> = ws
-        .get(handle)
-        .map_err(|e| anyhow!("load longstring: {e:?}"))?;
-    Ok(view.to_string())
-}
-
-fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        // Avoid Drop warnings on early errors.
-        let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
-    }
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))
-}
-
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile>) -> Result<T>) -> Result<T> {
-    let mut repo = open_repo(pile)?;
-    let result = f(&mut repo);
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
-    result
-}
-
-fn ensure_kind_entities(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-    let existing: HashMap<Id, TextHandle> = find!(
-        (kind: Id, name: TextHandle),
-        pattern!(&space, [{ ?kind @ metadata::name: ?name }])
-    )
-    .into_iter()
-    .collect();
-    let mut change = TribleSet::new();
-    if !existing.contains_key(&KIND_PERSON_ID) {
-        let name_handle = "person".to_owned().to_blob().get_handle();
-        change += entity! { ExclusiveId::force_ref(&KIND_PERSON_ID) @ metadata::name: name_handle };
-    }
-    Ok(change)
-}
-
-// ── on-demand person queries ─────────────────────────────────────────
-
-fn person_label(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    find!(h: TextHandle, pattern!(space, [{ id @ metadata::name: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-}
-
-fn person_first_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    find!(h: TextHandle, pattern!(space, [{ id @ relations::first_name: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-}
-
-fn person_last_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    find!(h: TextHandle, pattern!(space, [{ id @ relations::last_name: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-}
-
-fn person_display_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    find!(h: TextHandle, pattern!(space, [{ id @ relations::display_name: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-}
-
-fn person_affinity(space: &TribleSet, id: Id) -> Option<String> {
-    find!(v: String, pattern!(space, [{ id @ relations::affinity: ?v }])).next()
-}
-
-fn person_note(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    find!(h: TextHandle, pattern!(space, [{ id @ metadata::description: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-}
-
-fn person_teams_user_id(space: &TribleSet, id: Id) -> Option<String> {
-    find!(v: String, pattern!(space, [{ id @ relations::teams_user_id: ?v }])).next()
-}
-
-fn person_email(space: &TribleSet, id: Id) -> Option<String> {
-    find!(v: String, pattern!(space, [{ id @ relations::email: ?v }])).next()
-}
-
-fn person_phone(space: &TribleSet, id: Id) -> Option<String> {
-    find!(v: String, pattern!(space, [{ id @ relations::phone: ?v }])).next()
-}
-
-fn person_aliases(space: &TribleSet, id: Id) -> Vec<String> {
-    find!(v: String, pattern!(space, [{ id @ relations::alias: ?v }])).collect()
-}
-
-fn person_company(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    find!(h: TextHandle, pattern!(space, [{ id @ relations::company: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-}
-
-fn person_position(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    find!(h: TextHandle, pattern!(space, [{ id @ relations::position: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-}
-
-fn person_profile_url(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
-    find!(h: TextHandle, pattern!(space, [{ id @ relations::profile_url: ?h }]))
-        .next()
-        .and_then(|h| read_text(ws, h).ok())
-}
-
-fn person_sources(space: &TribleSet, id: Id) -> Vec<String> {
-    find!(v: String, pattern!(space, [{ id @ relations::source: ?v }])).collect()
-}
-
-fn person_same_as(space: &TribleSet, id: Id) -> Vec<Id> {
-    find!(o: Id, pattern!(space, [{ id @ relations::same_as: ?o }])).collect()
-}
-
-fn all_person_ids(space: &TribleSet) -> Vec<Id> {
-    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])).collect()
-}
-
-fn find_people_by_lookup_key(space: &TribleSet, key: &str) -> HashSet<Id> {
-    find!(
-        person_id: Id,
-        pattern!(space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
-    )
-    .filter(|&person_id| {
-        exists!(pattern!(space, [{ person_id @ relations::label_norm: key }]))
-            || exists!(pattern!(space, [{ person_id @ relations::alias_norm: key }]))
-    })
-    .collect()
-}
-
-/// Find people whose `email` attribute matches `email_norm` (case-folded
-/// comparison). Used by `relations add` to refuse minting a duplicate
-/// person entity when the same email already lives on another relation —
-/// otherwise mail autoregister + manual add ends up forking the same
-/// person across two ids.
-fn find_people_by_email_norm(space: &TribleSet, email_norm: &str) -> HashSet<Id> {
-    find!(
-        (person_id: Id, email: String),
-        pattern!(space, [{ ?person_id @
-            metadata::tag: &KIND_PERSON_ID,
-            relations::email: ?email,
-        }])
-    )
-    .filter(|(_, email)| email.to_ascii_lowercase() == email_norm)
-    .map(|(id, _)| id)
-    .collect()
+    repeated!(teams_user_ids, TeamsUserIds, patch.teams_user_id);
+    repeated!(emails, Emails, patch.email);
+    repeated!(phones, Phones, patch.phone);
+    repeated!(profile_urls, ProfileUrls, patch.profile_url);
+    Ok(*input != before)
 }
 
 fn cmd_add(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
+    storage: RelationsStorage<'_>,
     label: String,
-    id: Option<String>,
-    first_name: Option<String>,
-    last_name: Option<String>,
-    display_name: Option<String>,
-    affinity: Option<String>,
-    note: Option<String>,
-    aliases: Vec<String>,
-    teams_user_id: Option<String>,
-    email: Option<String>,
-    phone: Option<String>,
-    company: Option<String>,
-    position: Option<String>,
-    source: Option<String>,
-    force: bool,
+    id: Option<Id>,
+    source: Vec<String>,
+    profile: NewProfileArgs,
 ) -> Result<()> {
-    let label = normalize_label(&label)?;
-    let label_lookup = normalize_lookup_key(&label)?;
-    for (value, field) in [
-        (affinity.as_deref(), "affinity"),
-        (teams_user_id.as_deref(), "teams-user-id"),
-        (email.as_deref(), "email"),
-    ] {
-        if let Some(v) = value {
-            validate_short(v, field)?;
-        }
-    }
-    for alias in &aliases {
-        validate_short(alias, "alias")?;
-    }
-    let person_id = match id {
-        Some(raw) => parse_hex_id(&raw, "person id")?,
-        None => ufoid().id,
-    };
-    let email_norm = email
-        .as_deref()
-        .map(|e| e.trim().to_ascii_lowercase())
-        .filter(|e| !e.is_empty());
-
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let mut change = ensure_kind_entities(&mut ws)?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-
-        let aliases = normalize_aliases(aliases);
-        let alias_lookup = normalize_alias_lookup_keys(&aliases);
-
-        if !force {
-            for existing in find_people_by_lookup_key(&space, &label_lookup) {
-                if existing != person_id {
-                    bail!(
-                        "label/alias '{label_lookup}' already belongs to relation {} \
-                         — use `relations set {} --label '{label}' …` to update it, \
-                         or pass --force to mint a duplicate",
-                        fmt_id(existing),
-                        fmt_id(existing),
-                    );
-                }
-            }
-            for key in &alias_lookup {
-                for existing in find_people_by_lookup_key(&space, key) {
-                    if existing != person_id {
-                        bail!(
-                            "label/alias '{key}' already belongs to relation {} \
-                             — use `relations set {} --alias '{key}' …` to update it, \
-                             or pass --force to mint a duplicate",
-                            fmt_id(existing),
-                            fmt_id(existing),
-                        );
-                    }
-                }
-            }
-            if let Some(email_norm) = &email_norm {
-                for existing in find_people_by_email_norm(&space, email_norm) {
-                    if existing != person_id {
-                        bail!(
-                            "email '{email_norm}' already belongs to relation {} \
-                             — use `relations set {} --label '{label}' …` \
-                             to attach this label to the existing entry, \
-                             or pass --force to mint a duplicate",
-                            fmt_id(existing),
-                            fmt_id(existing),
-                        );
-                    }
-                }
-            }
-        }
-
-        if let Some(s) = source.as_deref() {
-            validate_short(s, "source")?;
-        }
-        if let Some(p) = phone.as_deref() {
-            validate_short(p, "phone")?;
-        }
-        let label_handle = ws.put(label.clone());
-        let display_name_handle = display_name.map(|value| ws.put(value));
-        let first_name_handle = first_name.map(|value| ws.put(value));
-        let last_name_handle = last_name.map(|value| ws.put(value));
-        let note_handle = note.map(|value| ws.put(value));
-        let company_handle = company.map(|value| ws.put(value));
-        let position_handle = position.map(|value| ws.put(value));
-        change += entity! { ExclusiveId::force_ref(&person_id) @
-            metadata::tag: &KIND_PERSON_ID,
-            metadata::name: label_handle,
-            relations::label_norm: label_lookup.as_str(),
-            relations::display_name?: display_name_handle,
-            relations::first_name?: first_name_handle,
-            relations::last_name?: last_name_handle,
-            relations::affinity?: affinity,
-            metadata::description?: note_handle,
-            relations::teams_user_id?: teams_user_id,
-            relations::email?: email,
-            relations::phone?: phone,
-            relations::company?: company_handle,
-            relations::position?: position_handle,
-            relations::source?: source,
-            relations::alias*: aliases.iter().map(String::as_str),
-            relations::alias_norm*: alias_lookup.iter().map(String::as_str),
-        };
-
-        ws.commit(change, "relations add");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push person: {e:?}"))?;
-        Ok(())
-    })?;
-    println!("Added {} ({label}).", format!("{person_id:x}"));
+    let person = id.unwrap_or_else(|| genid().id);
+    let (mut fragment, profile_id, lifecycle_id) =
+        relations::person_fragment(person, profile.into_profile(label))?;
+    fragment += relations::person_provenance_fragment(person, source, &[now_observation()])?;
+    storage.update(|_, _| Ok((Some(fragment), ())))?;
+    println!("person: {}", fmt_id(person));
+    println!("profile: {}", fmt_id(profile_id));
+    println!("lifecycle: {}", fmt_id(lifecycle_id));
     Ok(())
 }
 
 fn cmd_set(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
-    id: String,
-    label: Option<String>,
-    first_name: Option<String>,
-    last_name: Option<String>,
-    display_name: Option<String>,
-    affinity: Option<String>,
-    note: Option<String>,
-    aliases: Vec<String>,
-    teams_user_id: Option<String>,
-    email: Option<String>,
-    phone: Option<String>,
-    company: Option<String>,
-    position: Option<String>,
-    source: Option<String>,
+    storage: RelationsStorage<'_>,
+    person: String,
+    source: Vec<String>,
+    patch: ProfilePatchArgs,
 ) -> Result<()> {
-    let label = label.map(|l| normalize_label(&l)).transpose()?;
-    let label_lookup = label.as_deref().map(normalize_lookup_key).transpose()?;
-    for (value, field) in [
-        (affinity.as_deref(), "affinity"),
-        (teams_user_id.as_deref(), "teams-user-id"),
-        (email.as_deref(), "email"),
-        (phone.as_deref(), "phone"),
-        (source.as_deref(), "source"),
-    ] {
-        if let Some(v) = value {
-            validate_short(v, field)?;
+    let (person, old, new, provenance_added) = storage.update(|facts, reader| {
+        let person = resolve_person_anchor(reader, facts, &person, true)?;
+        let current = relations::current_profile(facts, person)?;
+        let mut value = relations::profile_input(reader, &current)?;
+        let changed = apply_profile_patch(&mut value, patch)?;
+
+        let mut fragment = Fragment::empty();
+        let new = if changed {
+            let profile = relations::profile_fragment(person, value, &[current.id])?;
+            let id = profile.root().expect("profile snapshot root");
+            fragment += profile;
+            Some(id)
+        } else {
+            None
+        };
+        let provenance_added = !source.is_empty();
+        if provenance_added {
+            fragment += relations::person_provenance_fragment(person, source, &[])?;
         }
-    }
-    for alias in &aliases {
-        validate_short(alias, "alias")?;
-    }
-
-    let person_id = with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let mut change = ensure_kind_entities(&mut ws)?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-
-        let person_id = resolve_person_id(&space, &id)?;
-
-        let aliases = normalize_aliases(aliases);
-        let alias_lookup = normalize_alias_lookup_keys(&aliases);
-
-        if let Some(key) = label_lookup.as_deref() {
-            for existing in find_people_by_lookup_key(&space, key) {
-                if existing != person_id {
-                    bail!(
-                        "lookup key '{key}' already belongs to person {}",
-                        fmt_id(existing)
-                    );
-                }
-            }
-        }
-        for key in &alias_lookup {
-            for existing in find_people_by_lookup_key(&space, key) {
-                if existing != person_id {
-                    bail!(
-                        "lookup key '{key}' already belongs to person {}",
-                        fmt_id(existing)
-                    );
-                }
-            }
-        }
-
-        let label_handle = label.map(|value| ws.put(value));
-        let display_name_handle = display_name.map(|value| ws.put(value));
-        let first_name_handle = first_name.map(|value| ws.put(value));
-        let last_name_handle = last_name.map(|value| ws.put(value));
-        let note_handle = note.map(|value| ws.put(value));
-        let company_handle = company.map(|value| ws.put(value));
-        let position_handle = position.map(|value| ws.put(value));
-        let has_updates = label_handle.is_some()
-            || label_lookup.is_some()
-            || display_name_handle.is_some()
-            || first_name_handle.is_some()
-            || last_name_handle.is_some()
-            || affinity.is_some()
-            || note_handle.is_some()
-            || teams_user_id.is_some()
-            || email.is_some()
-            || phone.is_some()
-            || company_handle.is_some()
-            || position_handle.is_some()
-            || source.is_some()
-            || !aliases.is_empty();
-
-        if has_updates {
-            change += entity! { ExclusiveId::force_ref(&person_id) @
-                metadata::name?: label_handle,
-                relations::label_norm?: label_lookup.as_deref(),
-                relations::display_name?: display_name_handle,
-                relations::first_name?: first_name_handle,
-                relations::last_name?: last_name_handle,
-                relations::affinity?: affinity,
-                metadata::description?: note_handle,
-                relations::teams_user_id?: teams_user_id,
-                relations::email?: email,
-                relations::phone?: phone,
-                relations::company?: company_handle,
-                relations::position?: position_handle,
-                relations::source?: source,
-                relations::alias*: aliases.iter().map(String::as_str),
-                relations::alias_norm*: alias_lookup.iter().map(String::as_str),
-            };
-        }
-
-        if !change.is_empty() {
-            ws.commit(change, "relations set");
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push person: {e:?}"))?;
-        }
-        Ok(person_id)
+        let publish = (!fragment.facts().is_empty()).then_some(fragment);
+        Ok((publish, (person, current.id, new, provenance_added)))
     })?;
-    println!("Updated {}.", format!("{person_id:x}"));
+    match new {
+        Some(new) => {
+            println!("profile: {} -> {}", fmt_id(old), fmt_id(new));
+            if provenance_added {
+                println!("Added provenance for {}.", fmt_id(person));
+            }
+        }
+        None if provenance_added => println!("Added provenance for {}.", fmt_id(person)),
+        None => println!("No profile change for {}.", fmt_id(person)),
+    }
     Ok(())
 }
 
+fn cmd_reconcile_profile(
+    storage: RelationsStorage<'_>,
+    person_selector: String,
+    base: Option<String>,
+    patch: ProfilePatchArgs,
+) -> Result<()> {
+    enum Outcome {
+        Settled(Id),
+        Reconciled { heads: usize, successor: Id },
+    }
+    let outcome = storage.update(|facts, reader| {
+        let person = resolve_person_anchor(reader, facts, &person_selector, true)?;
+        let heads = head_ids(relations::profile_head(facts, person)?, "person profile")?;
+        let snapshots: Vec<(ProfileSnapshot, ProfileInput)> = heads
+            .iter()
+            .map(|&id| {
+                let snapshot = relations::profile_snapshot(facts, id)?;
+                let input = relations::profile_input(reader, &snapshot)?;
+                Ok((snapshot, input))
+            })
+            .collect::<Result<_>>()?;
+        let base_id = if let Some(base) = base {
+            resolve_head_selector(&base, &heads, "profile")?
+        } else {
+            let first = &snapshots[0].1;
+            if snapshots.iter().skip(1).any(|(_, value)| value != first) {
+                bail!("profile heads disagree; choose the intended value with --base <head>");
+            }
+            snapshots[0].0.id
+        };
+        let mut value = snapshots
+            .iter()
+            .find(|(snapshot, _)| snapshot.id == base_id)
+            .map(|(_, value)| value.clone())
+            .expect("selected current head");
+        let changed = apply_profile_patch(&mut value, patch)?;
+        if heads.len() == 1 && !changed {
+            return Ok((None, Outcome::Settled(base_id)));
+        }
+        let fragment = relations::profile_fragment(person, value, &heads)?;
+        let successor = fragment.root().expect("profile snapshot root");
+        Ok((
+            Some(fragment),
+            Outcome::Reconciled {
+                heads: heads.len(),
+                successor,
+            },
+        ))
+    })?;
+    match outcome {
+        Outcome::Settled(id) => println!("Profile {} is already settled.", fmt_id(id)),
+        Outcome::Reconciled { heads, successor } => {
+            println!("profile: {heads} heads -> {}", fmt_id(successor))
+        }
+    }
+    Ok(())
+}
+
+fn lifecycle_state(facts: &TribleSet, person: Id) -> Result<(Vec<Id>, Option<bool>)> {
+    match relations::lifecycle_head(facts, person)? {
+        Head::Missing => bail!("person {} has no lifecycle", fmt_id(person)),
+        Head::Unique(id) => Ok((
+            vec![id],
+            Some(relations::lifecycle_snapshot(facts, id)?.retired),
+        )),
+        Head::Forked(ids) => Ok((ids, None)),
+    }
+}
+
+fn cmd_set_retired(storage: RelationsStorage<'_>, selector: String, retired: bool) -> Result<()> {
+    enum Outcome {
+        Unchanged(Id),
+        Changed { person: Id, successor: Id },
+    }
+    let outcome = storage.update(|facts, reader| {
+        let person = resolve_person_anchor(reader, facts, &selector, true)?;
+        let (heads, current) = lifecycle_state(facts, person)?;
+        if current == Some(retired) {
+            return Ok((None, Outcome::Unchanged(person)));
+        }
+        let fragment = relations::lifecycle_fragment(person, retired, &heads);
+        let successor = fragment.root().expect("lifecycle snapshot root");
+        Ok((Some(fragment), Outcome::Changed { person, successor }))
+    })?;
+    match outcome {
+        Outcome::Unchanged(person) => println!(
+            "{} is already {}.",
+            fmt_id(person),
+            if retired { "retired" } else { "active" }
+        ),
+        Outcome::Changed { person, successor } => println!(
+            "{}: {} ({})",
+            if retired { "retired" } else { "active" },
+            fmt_id(person),
+            fmt_id(successor)
+        ),
+    }
+    Ok(())
+}
+
+fn print_values(label: &str, values: &[String]) {
+    for value in values {
+        println!("{label}: {value}");
+    }
+}
+
+fn print_profile(id: Id, input: &ProfileInput) {
+    println!("profile: {}", fmt_id(id));
+    println!("label: {}", input.label);
+    print_values("alias", &input.aliases);
+    print_values("affinity", &input.affinities);
+    if let Some(value) = &input.first_name {
+        println!("first_name: {value}");
+    }
+    if let Some(value) = &input.last_name {
+        println!("last_name: {value}");
+    }
+    if let Some(value) = &input.display_name {
+        println!("display_name: {value}");
+    }
+    if let Some(value) = &input.company {
+        println!("company: {value}");
+    }
+    if let Some(value) = &input.position {
+        println!("position: {value}");
+    }
+    print_values("teams_user_id", &input.teams_user_ids);
+    print_values("email", &input.emails);
+    print_values("phone", &input.phones);
+    print_values("profile_url", &input.profile_urls);
+    if let Some(value) = &input.note {
+        println!("note:\n{value}");
+    }
+}
+
+fn cmd_show(storage: RelationsStorage<'_>, selector: String) -> Result<()> {
+    storage.with_view(|facts, reader| {
+        let person = resolve_person_anchor(reader, facts, &selector, true)?;
+        println!("person: {}", fmt_id(person));
+        print_values("source", &relations::person_sources(facts, person)?);
+        let observations = relations::creation_observations(facts, person);
+        if !observations.is_empty() {
+            println!("creation_observations: {}", observations.len());
+        }
+        match relations::profile_head(facts, person)? {
+            Head::Missing => println!("profile: missing"),
+            Head::Unique(id) => {
+                let snapshot = relations::profile_snapshot(facts, id)?;
+                print_profile(id, &relations::profile_input(reader, &snapshot)?);
+            }
+            Head::Forked(ids) => {
+                println!("profile_fork: {} heads", ids.len());
+                for id in ids {
+                    let snapshot = relations::profile_snapshot(facts, id)?;
+                    print_profile(id, &relations::profile_input(reader, &snapshot)?);
+                }
+            }
+        }
+        match relations::lifecycle_head(facts, person)? {
+            Head::Missing => println!("lifecycle: missing"),
+            Head::Unique(id) => println!(
+                "retired: {}\nlifecycle: {}",
+                relations::lifecycle_snapshot(facts, id)?.retired,
+                fmt_id(id)
+            ),
+            Head::Forked(ids) => {
+                println!("lifecycle_fork: {} heads", ids.len());
+                for id in ids {
+                    println!(
+                        "- {} retired={}",
+                        fmt_id(id),
+                        relations::lifecycle_snapshot(facts, id)?.retired
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 fn cmd_list(
-    pile: &Path,
-    _branch_name: &str,
-    branch_id: Id,
+    storage: RelationsStorage<'_>,
     limit: usize,
     all: bool,
     retired_only: bool,
 ) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-
-        let retired = retired_person_ids(&space);
-        let mut ids: Vec<(Option<String>, Id)> = all_person_ids(&space)
-            .into_iter()
-            .filter(|id| {
-                if retired_only {
-                    retired.contains(id)
-                } else {
-                    all || !retired.contains(id)
-                }
-            })
-            .map(|id| (person_label(&mut ws, &space, id), id))
-            .collect();
-        ids.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-        if ids.is_empty() {
-            println!("No people.");
-        } else {
-            for (label, id) in ids.into_iter().take(limit) {
-                let label = label.as_deref().unwrap_or("<unnamed>");
-                let mut line = format!("[{}] {}", fmt_id(id), label);
-                if all && retired.contains(&id) {
-                    line.push_str(" (retired)");
-                }
-                let first = person_first_name(&mut ws, &space, id);
-                let last = person_last_name(&mut ws, &space, id);
-                let fallback_name = match (&first, &last) {
-                    (Some(f), Some(l)) => Some(format!("{f} {l}")),
-                    (Some(f), None) => Some(f.clone()),
-                    (None, Some(l)) => Some(l.clone()),
-                    (None, None) => None,
-                };
-                let display = person_display_name(&mut ws, &space, id).or(fallback_name);
-                if let Some(display) = display {
-                    line.push_str(&format!(" ({display})"));
-                }
-                if let Some(affinity) = person_affinity(&space, id) {
-                    line.push_str(&format!(" [{affinity}]"));
-                }
-                println!("{line}");
-            }
-        }
-        Ok(())
-    })
-}
-
-fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        let person_id = resolve_person_id(&space, &id)?;
-
-        println!("id: {:x}", person_id);
-        if retired_person_ids(&space).contains(&person_id) {
-            println!("retired: true");
-        }
-        if let Some(label) = person_label(&mut ws, &space, person_id) {
-            println!("label: {label}");
-        }
-        if let Some(first) = person_first_name(&mut ws, &space, person_id) {
-            println!("first_name: {first}");
-        }
-        if let Some(last) = person_last_name(&mut ws, &space, person_id) {
-            println!("last_name: {last}");
-        }
-        if let Some(display) = person_display_name(&mut ws, &space, person_id) {
-            println!("display_name: {display}");
-        }
-        if let Some(affinity) = person_affinity(&space, person_id) {
-            println!("affinity: {affinity}");
-        }
-        if let Some(value) = person_teams_user_id(&space, person_id) {
-            println!("teams_user_id: {value}");
-        }
-        if let Some(value) = person_email(&space, person_id) {
-            println!("email: {value}");
-        }
-        if let Some(value) = person_phone(&space, person_id) {
-            println!("phone: {value}");
-        }
-        if let Some(value) = person_position(&mut ws, &space, person_id) {
-            println!("position: {value}");
-        }
-        if let Some(value) = person_company(&mut ws, &space, person_id) {
-            println!("company: {value}");
-        }
-        if let Some(value) = person_profile_url(&mut ws, &space, person_id) {
-            println!("profile_url: {value}");
-        }
-        let sources = person_sources(&space, person_id);
-        if !sources.is_empty() {
-            println!("source: {}", sources.join(", "));
-        }
-        let same_as = person_same_as(&space, person_id);
-        if !same_as.is_empty() {
-            println!("same_as:");
-            for other in same_as {
-                println!("- {}", fmt_id(other));
-            }
-        }
-        let aliases = person_aliases(&space, person_id);
-        if !aliases.is_empty() {
-            println!("aliases:");
-            for alias in aliases {
-                println!("- {alias}");
-            }
-        }
-        if let Some(note) = person_note(&mut ws, &space, person_id) {
-            println!("note:");
-            println!("{note}");
-        }
-
-        Ok(())
-    })
-}
-
-/// Soft-retire (or restore) a relation by appending a retirement event.
-/// `retired = true` appends a `KIND_RETIRE_ID` event; `false` appends a
-/// `KIND_UNRETIRE_ID` event. Latest event by timestamp wins — see
-/// `retired_person_ids`. The person entity is never mutated or deleted.
-fn cmd_set_retired(
-    pile: &Path,
-    branch_id: Id,
-    person: String,
-    retired: bool,
-) -> Result<(Id, Option<String>, bool)> {
-    with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        let person_id = resolve_member_id(&space, &person)?;
-        let label = person_label(&mut ws, &space, person_id);
-
-        // No-op if already in the requested state — keeps the ledger free
-        // of redundant events (and gives the caller a clear "already X").
-        if retired_person_ids(&space).contains(&person_id) == retired {
-            return Ok((person_id, label, false));
-        }
-
-        let now = epoch_interval(now_epoch());
-        let evt_id = ufoid();
-        let kind = if retired {
-            &KIND_RETIRE_ID
-        } else {
-            &KIND_UNRETIRE_ID
-        };
-        let mut change = TribleSet::new();
-        change += entity! { &evt_id @
-            metadata::tag: kind,
-            relations::subject: &person_id,
-            metadata::created_at: now,
-        };
-        ws.commit(
-            change,
-            if retired {
-                "relations retire"
-            } else {
-                "relations unretire"
-            },
-        );
-        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
-        Ok((person_id, label, true))
-    })
-}
-
-fn cmd_retire(pile: &Path, branch_id: Id, person: String) -> Result<()> {
-    let (id, label, changed) = cmd_set_retired(pile, branch_id, person, true)?;
-    let label = label.as_deref().unwrap_or("<unnamed>");
-    if changed {
-        println!("Retired {} ({label}).", fmt_id(id));
-    } else {
-        println!("{} ({label}) is already retired.", fmt_id(id));
-    }
-    Ok(())
-}
-
-fn cmd_unretire(pile: &Path, branch_id: Id, person: String) -> Result<()> {
-    let (id, label, changed) = cmd_set_retired(pile, branch_id, person, false)?;
-    let label = label.as_deref().unwrap_or("<unnamed>");
-    if changed {
-        println!("Restored {} ({label}).", fmt_id(id));
-    } else {
-        println!("{} ({label}) is not retired.", fmt_id(id));
-    }
-    Ok(())
-}
-
-// ── groups ──────────────────────────────────────────────────────────────────
-
-fn resolve_group_id(space: &TribleSet, raw: &str) -> Result<Id> {
-    let trimmed = raw.trim();
-    if trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        if let Some(id) = Id::from_hex(&trimmed.to_lowercase()) {
-            if exists!(pattern!(space, [{ id @ metadata::tag: &KIND_GROUP }])) {
-                return Ok(id);
-            }
-        }
-    }
-    let key = normalize_lookup_key(trimmed)?;
-    // Name lookup resolves through the head snapshot: an anchor matches when
-    // its current (un-superseded) snapshot carries this label_norm. A rename
-    // supersedes the old name, so only the current name resolves.
-    let mut matches: Vec<Id> =
-        find!(gid: Id, pattern!(space, [{ ?gid @ metadata::tag: &KIND_GROUP }]))
-            .filter(|&gid| {
-                head_snapshot_of(space, gid).is_some_and(|head| {
-                    exists!(pattern!(space, [{ head @ relations::label_norm: key.as_str() }]))
-                })
-            })
-            .collect();
-    matches.sort();
-    matches.dedup();
-    match matches.len() {
-        0 => bail!("no group matches '{raw}'"),
-        1 => Ok(matches[0]),
-        _ => bail!("multiple groups match '{raw}'"),
-    }
-}
-
-fn group_members(space: &TribleSet, group_id: Id) -> Vec<Id> {
-    // Current members = the members of the anchor's head snapshot.
-    let mut members: Vec<Id> = head_members(space, group_id).into_iter().collect();
-    members.sort();
-    members
-}
-
-/// Resolve a person by hex id (or prefix) OR by label/alias — `group add`
-/// takes either, unlike `resolve_person_id` which is hex-only.
-fn resolve_member_id(space: &TribleSet, raw: &str) -> Result<Id> {
-    let trimmed = raw.trim();
-    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        return resolve_person_id(space, trimmed);
-    }
-    let key = normalize_lookup_key(trimmed)?;
-    let mut matches: Vec<Id> = find_people_by_lookup_key(space, &key).into_iter().collect();
-    matches.sort();
-    matches.dedup();
-    match matches.len() {
-        0 => bail!("no person matches '{raw}'"),
-        1 => Ok(matches[0]),
-        _ => bail!("multiple people match '{raw}'"),
-    }
-}
-
-/// Mint a new group snapshot carrying the full `{name, label_norm, members}`
-/// state, superseding `prior` (the previous head, if any). Returns the change
-/// to commit and the new snapshot id. Every group edit (add/remove/rename,
-/// and migration) goes through here so a snapshot is always a complete state.
-/// The group's unique head snapshot + its members, failing CLOSED on a
-/// Missing/Forked/Invalid group so no edit is built on an ambiguous state.
-fn require_unique_head(space: &TribleSet, gid: Id) -> Result<(Id, Vec<Id>)> {
-    match resolve_group_head(space, gid) {
-        GroupHead::Unique(head) => {
-            let mut members: Vec<Id> = head_members(space, gid).into_iter().collect();
-            members.sort();
-            Ok((head, members))
-        }
-        GroupHead::Missing => bail!(
-            "group {} has no snapshot yet; run `relations group migrate`",
-            fmt_id(gid)
-        ),
-        GroupHead::Forked(heads) => bail!(
-            "group {} has {} concurrent heads (forked); reconcile before editing",
-            fmt_id(gid),
-            heads.len()
-        ),
-        GroupHead::Invalid(reason) => {
-            bail!("group {} is invalid ({reason}); cannot edit", fmt_id(gid))
-        }
-    }
-}
-
-fn mint_group_snapshot(
-    ws: &mut Workspace<Pile>,
-    anchor: Id,
-    members: &[Id],
-    label: &str,
-    key: &str,
-    predecessors: &[Id],
-) -> (TribleSet, Id) {
-    let label_handle = ws.put(label.to_string());
-    // Intrinsic content-sealed snapshot: id = hash of {anchor, name handle,
-    // sorted members, sorted predecessor heads} — built through the single
-    // `group_snapshot_fragment` authority the on-read validator also uses, so
-    // mint and validation can never disagree. Identical content dedups; a
-    // supersedes cycle is structurally impossible (an id depends on its
-    // predecessors). label_norm + created_at are derived/exhaust and added as
-    // separate facts outside the sealed identity.
-    let sealed = group_snapshot_fragment(anchor, label_handle, members, predecessors);
-    let snap = sealed
-        .root()
-        .expect("a group snapshot fragment has one intrinsic root");
-    let now = epoch_interval(now_epoch());
-    let mut change = TribleSet::new();
-    change += sealed;
-    change += entity! { ExclusiveId::force_ref(&snap) @
-        relations::label_norm: key,
-        metadata::created_at: now,
-    };
-    (change, snap)
-}
-
-fn cmd_group_create(pile: &Path, branch_id: Id, name: String) -> Result<()> {
-    let label = normalize_label(&name)?;
-    let key = normalize_lookup_key(&name)?;
-    let group_id = with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        if let Ok(existing) = resolve_group_id(&space, &name) {
-            bail!("group '{label}' already exists ({})", fmt_id(existing));
-        }
-        // Stable extrinsic anchor: pure identity. Name/members live on
-        // intrinsic snapshots, so the current state is always the anchor's
-        // unique head snapshot. A fresh group gets snapshot-0 (its name, no
-        // members, no predecessors).
-        let gid = ufoid().id;
-        let mut change = TribleSet::new();
-        change += entity! { ExclusiveId::force_ref(&gid) @ metadata::tag: &KIND_GROUP };
-        let (snap_change, _) = mint_group_snapshot(&mut ws, gid, &[], &label, &key, &[]);
-        change += snap_change;
-        ws.commit(change, "relations group create");
-        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
-        Ok(gid)
-    })?;
-    println!("Created group {} ({label}).", fmt_id(group_id));
-    Ok(())
-}
-
-fn cmd_group_add(pile: &Path, branch_id: Id, group: String, person: String) -> Result<()> {
-    let (gid, pid, added) = with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        let gid = resolve_group_id(&space, &group)?;
-        let pid = resolve_member_id(&space, &person)?;
-        let (head, mut members) = require_unique_head(&space, gid)?;
-        if members.contains(&pid) {
-            return Ok((gid, pid, false));
-        }
-        members.push(pid);
-        members.sort();
-        let name = person_label(&mut ws, &space, head)
-            .ok_or_else(|| anyhow!("group {} head snapshot has no name", fmt_id(gid)))?;
-        let label = normalize_label(&name)?;
-        let key = normalize_lookup_key(&name)?;
-        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &[head]);
-        ws.commit(change, "relations group add");
-        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
-        Ok((gid, pid, true))
-    })?;
-    if added {
-        println!("Added {} to group {}.", fmt_id(pid), fmt_id(gid));
-    } else {
-        println!("{} already in group {}.", fmt_id(pid), fmt_id(gid));
-    }
-    Ok(())
-}
-
-fn cmd_group_remove(pile: &Path, branch_id: Id, group: String, person: String) -> Result<()> {
-    let (gid, pid, removed) = with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        let gid = resolve_group_id(&space, &group)?;
-        let pid = resolve_member_id(&space, &person)?;
-        let (head, mut members) = require_unique_head(&space, gid)?;
-        if !members.contains(&pid) {
-            return Ok((gid, pid, false));
-        }
-        members.retain(|&m| m != pid);
-        let name = person_label(&mut ws, &space, head)
-            .ok_or_else(|| anyhow!("group {} head snapshot has no name", fmt_id(gid)))?;
-        let label = normalize_label(&name)?;
-        let key = normalize_lookup_key(&name)?;
-        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &[head]);
-        ws.commit(change, "relations group remove");
-        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
-        Ok((gid, pid, true))
-    })?;
-    if removed {
-        println!("Removed {} from group {}.", fmt_id(pid), fmt_id(gid));
-    } else {
-        println!("{} is not in group {}.", fmt_id(pid), fmt_id(gid));
-    }
-    Ok(())
-}
-
-fn cmd_group_rename(pile: &Path, branch_id: Id, group: String, name: String) -> Result<()> {
-    let label = normalize_label(&name)?;
-    let key = normalize_lookup_key(&name)?;
-    let gid = with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        let gid = resolve_group_id(&space, &group)?;
-        if let Ok(other) = resolve_group_id(&space, &name) {
-            if other != gid {
-                bail!("group '{label}' already exists ({})", fmt_id(other));
-            }
-        }
-        let (head, members) = require_unique_head(&space, gid)?;
-        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &[head]);
-        ws.commit(change, "relations group rename");
-        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
-        Ok(gid)
-    })?;
-    println!("Renamed group {} to {label}.", fmt_id(gid));
-    Ok(())
-}
-
-fn cmd_group_migrate(pile: &Path, branch_id: Id) -> Result<()> {
-    let migrated = with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        let anchors: Vec<Id> =
-            find!(gid: Id, pattern!(&space, [{ ?gid @ metadata::tag: &KIND_GROUP }])).collect();
-        let mut change = TribleSet::new();
-        let mut count = 0usize;
-        for gid in anchors {
-            // Only a legacy anchor-direct group (no snapshots at all => Missing)
-            // needs snapshot-0. Groups that already have any snapshot
-            // (Unique/Forked/Invalid) are left untouched.
-            if !matches!(resolve_group_head(&space, gid), GroupHead::Missing) {
+    storage.with_view(|facts, reader| {
+        let mut rows = Vec::new();
+        for person in relations::person_anchors(facts) {
+            let lifecycle = relations::lifecycle_head(facts, person)?;
+            let retired = match &lifecycle {
+                Head::Unique(id) => Some(relations::lifecycle_snapshot(facts, *id)?.retired),
+                Head::Missing | Head::Forked(_) => None,
+            };
+            if retired_only && retired != Some(true) {
                 continue;
             }
-            let mut members: Vec<Id> =
-                find!(m: Id, pattern!(&space, [{ gid @ group::member: ?m }])).collect();
-            members.sort();
-            members.dedup();
-            let name = person_label(&mut ws, &space, gid)
-                .ok_or_else(|| anyhow!("legacy group {} has no name to migrate", fmt_id(gid)))?;
-            let label = normalize_label(&name)?;
-            let key = normalize_lookup_key(&name)?;
-            let (snapshot, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &[]);
-            change += snapshot;
-            count += 1;
+            if !all && !retired_only && retired == Some(true) {
+                continue;
+            }
+            let profile = relations::profile_head(facts, person)?;
+            let (label, marker) = match profile {
+                Head::Unique(id) => {
+                    let snapshot = relations::profile_snapshot(facts, id)?;
+                    (relations::read_text(reader, snapshot.label)?, String::new())
+                }
+                Head::Forked(ids) => (
+                    "<forked profile>".to_owned(),
+                    format!(" [profile fork: {} heads]", ids.len()),
+                ),
+                Head::Missing => ("<missing profile>".to_owned(), " [invalid]".to_owned()),
+            };
+            let lifecycle_marker = match lifecycle {
+                Head::Forked(ids) => format!(" [lifecycle fork: {} heads]", ids.len()),
+                _ if retired == Some(true) => " [retired]".to_owned(),
+                _ => String::new(),
+            };
+            rows.push((
+                relations::lookup_key(&label),
+                person,
+                label,
+                marker,
+                lifecycle_marker,
+            ));
         }
-        if count > 0 {
-            ws.commit(change, "relations migrate groups to snapshots");
-            repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+        rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        if rows.is_empty() {
+            println!("No people.");
         }
-        Ok(count)
+        for (_, person, label, marker, lifecycle) in rows.into_iter().take(limit) {
+            println!("[{}] {label}{marker}{lifecycle}", fmt_id(person));
+        }
+        Ok(())
+    })
+}
+
+fn cmd_group_create(storage: RelationsStorage<'_>, name: String) -> Result<()> {
+    let (group, snapshot) = storage.update(|facts, reader| {
+        match relations::resolve_group(reader, facts, &name)? {
+            SelectorOutcome::Missing => {}
+            outcome => {
+                let existing = outcome.require_unique("group", &name)?;
+                bail!("group '{}' already resolves to {}", name, fmt_id(existing));
+            }
+        }
+        let group = genid().id;
+        let (mut fragment, snapshot) = relations::group_create_fragment(group, name)?;
+        fragment += relations::group_provenance_fragment(group, &[now_observation()]);
+        Ok((Some(fragment), (group, snapshot)))
     })?;
-    println!("Migrated {migrated} legacy group(s) to snapshot form.");
+    println!("group: {}\nsnapshot: {}", fmt_id(group), fmt_id(snapshot));
+    Ok(())
+}
+
+fn cmd_group_add(
+    storage: RelationsStorage<'_>,
+    group_selector: String,
+    person_selector: String,
+) -> Result<()> {
+    enum Outcome {
+        Already(Id),
+        Changed { old: Id, new: Id },
+    }
+    let outcome = storage.update(|facts, reader| {
+        let group = resolve_group_anchor(reader, facts, &group_selector)?;
+        let person = resolve_person_anchor(reader, facts, &person_selector, true)?;
+        let current = relations::current_group(facts, group)?;
+        let identities = IdentityComponents::from_facts(facts)?;
+        for &member in &current.members {
+            if identities.equivalent(person, member)? {
+                return Ok((None, Outcome::Already(person)));
+            }
+        }
+        let mut members = current.members.clone();
+        members.push(person);
+        let name = relations::read_text(reader, current.name)?;
+        let old = current.id;
+        let fragment = relations::group_snapshot_fragment(group, name, &members, &[old])?;
+        let new = fragment.root().expect("group snapshot root");
+        Ok((Some(fragment), Outcome::Changed { old, new }))
+    })?;
+    match outcome {
+        Outcome::Already(person) => {
+            println!("{} is already represented in the group.", fmt_id(person))
+        }
+        Outcome::Changed { old, new } => {
+            println!("snapshot: {} -> {}", fmt_id(old), fmt_id(new))
+        }
+    }
+    Ok(())
+}
+
+fn cmd_group_remove(
+    storage: RelationsStorage<'_>,
+    group_selector: String,
+    person_selector: String,
+) -> Result<()> {
+    enum Outcome {
+        Absent(Id),
+        Changed { old: Id, new: Id },
+    }
+    let outcome = storage.update(|facts, reader| {
+        let group = resolve_group_anchor(reader, facts, &group_selector)?;
+        let person = resolve_person_anchor(reader, facts, &person_selector, true)?;
+        let current = relations::current_group(facts, group)?;
+        let identities = IdentityComponents::from_facts(facts)?;
+        let mut members = Vec::new();
+        for member in current.members.iter().copied() {
+            if !identities.equivalent(person, member)? {
+                members.push(member);
+            }
+        }
+        if members.len() == current.members.len() {
+            return Ok((None, Outcome::Absent(person)));
+        }
+        let name = relations::read_text(reader, current.name)?;
+        let old = current.id;
+        let fragment = relations::group_snapshot_fragment(group, name, &members, &[old])?;
+        let new = fragment.root().expect("group snapshot root");
+        Ok((Some(fragment), Outcome::Changed { old, new }))
+    })?;
+    match outcome {
+        Outcome::Absent(person) => {
+            println!("{} is not represented in the group.", fmt_id(person))
+        }
+        Outcome::Changed { old, new } => {
+            println!("snapshot: {} -> {}", fmt_id(old), fmt_id(new))
+        }
+    }
+    Ok(())
+}
+
+fn cmd_group_rename(
+    storage: RelationsStorage<'_>,
+    group_selector: String,
+    name: String,
+) -> Result<()> {
+    enum Outcome {
+        Unchanged(String),
+        Changed { old: Id, new: Id },
+    }
+    let outcome = storage.update(|facts, reader| {
+        let group = resolve_group_anchor(reader, facts, &group_selector)?;
+        let current = relations::current_group(facts, group)?;
+        let old_name = relations::read_text(reader, current.name)?;
+        if old_name.trim() == name.trim() {
+            return Ok((None, Outcome::Unchanged(old_name)));
+        }
+        let old = current.id;
+        let fragment = relations::group_snapshot_fragment(group, name, &current.members, &[old])?;
+        let new = fragment.root().expect("group snapshot root");
+        Ok((Some(fragment), Outcome::Changed { old, new }))
+    })?;
+    match outcome {
+        Outcome::Unchanged(name) => println!("Group is already named {name}."),
+        Outcome::Changed { old, new } => {
+            println!("snapshot: {} -> {}", fmt_id(old), fmt_id(new))
+        }
+    }
     Ok(())
 }
 
 fn cmd_group_reconcile(
-    pile: &Path,
-    branch_id: Id,
-    group: String,
-    name: Option<String>,
+    storage: RelationsStorage<'_>,
+    selector: String,
+    explicit_name: Option<String>,
 ) -> Result<()> {
-    let (gid, healed) = with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        let gid = resolve_group_id(&space, &group)?;
-        let heads = match resolve_group_head(&space, gid) {
-            GroupHead::Forked(heads) => heads,
-            GroupHead::Unique(_) => return Ok((gid, false)),
-            GroupHead::Missing => bail!(
-                "group {} has no snapshot yet; run `relations group migrate`",
-                fmt_id(gid)
-            ),
-            GroupHead::Invalid(reason) => bail!(
-                "group {} is invalid ({reason}); a corrupt snapshot graph cannot be reconciled",
-                fmt_id(gid)
-            ),
-        };
-        // The UNION of every fork head's members: reconciliation drops no member
-        // silently. Prune afterward with `group remove` if that was intended.
-        let mut members: Vec<Id> = Vec::new();
-        for &head in &heads {
-            members.extend(find!(m: Id, pattern!(&space, [{ head @ group::member: ?m }])));
+    enum Outcome {
+        Settled(Id),
+        Reconciled { heads: usize, successor: Id },
+    }
+    let outcome = storage.update(|facts, reader| {
+        let group = resolve_group_anchor(reader, facts, &selector)?;
+        let heads = head_ids(relations::group_head(facts, group)?, "group")?;
+        if heads.len() == 1 && explicit_name.is_none() {
+            return Ok((None, Outcome::Settled(heads[0])));
         }
-        members.sort();
-        members.dedup();
-        // Name selection is EXPLICIT, never a silent content-hash pick. If the
-        // fork heads agree on a name we adopt it; if concurrent renames diverged
-        // we refuse until the operator chooses with `--name`.
-        let chosen_name = match &name {
-            Some(explicit) => explicit.clone(),
-            None => {
-                let mut names: Vec<String> = Vec::new();
-                for &head in &heads {
-                    match person_label(&mut ws, &space, head) {
-                        Some(n) => names.push(n),
-                        None => bail!("fork head {} has no name", fmt_id(head)),
-                    }
-                }
-                names.sort();
-                names.dedup();
-                match names.as_slice() {
-                    [single] => single.clone(),
-                    _ => bail!(
-                        "group {} fork heads disagree on name ({}); pass --name <name> to choose",
-                        fmt_id(gid),
-                        names.join(", ")
-                    ),
-                }
+        if heads.len() == 1 {
+            bail!("group has one head; use `relations group rename` to change its name");
+        }
+        let snapshots: Vec<GroupSnapshot> = heads
+            .iter()
+            .map(|&id| relations::group_snapshot(facts, id))
+            .collect::<Result<_>>()?;
+        let name = if let Some(name) = explicit_name {
+            name
+        } else {
+            let names: BTreeSet<String> = snapshots
+                .iter()
+                .map(|snapshot| relations::read_text(reader, snapshot.name))
+                .collect::<Result<_>>()?;
+            if names.len() != 1 {
+                bail!("group heads disagree on the name; provide --name");
             }
+            names.into_iter().next().expect("one name")
         };
-        let label = normalize_label(&chosen_name)?;
-        let key = normalize_lookup_key(&chosen_name)?;
-        // One intrinsic child superseding EVERY head => a single un-superseded head.
-        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &heads);
-        ws.commit(change, "relations group reconcile");
-        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
-        Ok((gid, true))
+        // The core helper is the single authority for the multi-parent join:
+        // every immediate predecessor member is retained.
+        let fragment = relations::reconcile_group_fragment(facts, group, name, &heads)?;
+        let successor = fragment.root().expect("group snapshot root");
+        Ok((
+            Some(fragment),
+            Outcome::Reconciled {
+                heads: heads.len(),
+                successor,
+            },
+        ))
     })?;
-    if healed {
-        println!(
-            "Reconciled forked group {} into a single head.",
-            fmt_id(gid)
-        );
-    } else {
-        println!("Group {} is not forked; nothing to reconcile.", fmt_id(gid));
+    match outcome {
+        Outcome::Settled(id) => println!("Group is already settled at {}.", fmt_id(id)),
+        Outcome::Reconciled { heads, successor } => {
+            println!("group: {heads} heads -> {}", fmt_id(successor))
+        }
     }
     Ok(())
 }
 
-fn cmd_group_list(pile: &Path, branch_id: Id) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        let mut groups: Vec<Id> =
-            find!(gid: Id, pattern!(&space, [{ ?gid @ metadata::tag: &KIND_GROUP }])).collect();
-        groups.sort();
-        groups.dedup();
-        if groups.is_empty() {
-            println!("No groups.");
-            return Ok(());
-        }
-        for gid in groups {
-            // Surface anomalies rather than reporting a broken group as an
-            // empty one: an unmigrated legacy group, a fork, or a corrupt
-            // snapshot must be VISIBLE so it gets reconciled, not silently
-            // dropped from delivery/gating.
-            match resolve_group_head(&space, gid) {
-                GroupHead::Unique(head) => {
-                    let label = person_label(&mut ws, &space, head).unwrap_or_else(|| fmt_id(gid));
-                    let members = group_members(&space, gid);
-                    println!("[{}] {label} — {} member(s)", fmt_id(gid), members.len());
-                }
-                GroupHead::Missing => println!(
-                    "[{}] !! unmigrated legacy group — run `relations group migrate`",
-                    fmt_id(gid)
-                ),
-                GroupHead::Forked(heads) => println!(
-                    "[{}] !! FORKED across {} heads — reconcile before use",
-                    fmt_id(gid),
-                    heads.len()
-                ),
-                GroupHead::Invalid(reason) => {
-                    println!("[{}] !! INVALID: {reason}", fmt_id(gid))
+fn print_group_snapshot(
+    reader: &PileReader,
+    facts: &TribleSet,
+    snapshot: GroupSnapshot,
+) -> Result<()> {
+    println!("snapshot: {}", fmt_id(snapshot.id));
+    println!("name: {}", relations::read_text(reader, snapshot.name)?);
+    for member in snapshot.members {
+        let label = relations::current_profile(facts, member)
+            .and_then(|profile| relations::read_text(reader, profile.label))
+            .unwrap_or_else(|_| "<unsettled profile>".to_owned());
+        println!("member: {} {label}", fmt_id(member));
+    }
+    Ok(())
+}
+
+fn cmd_group_show(storage: RelationsStorage<'_>, selector: String) -> Result<()> {
+    storage.with_view(|facts, reader| {
+        let group = resolve_group_anchor(reader, facts, &selector)?;
+        println!("group: {}", fmt_id(group));
+        match relations::group_head(facts, group)? {
+            Head::Missing => println!("snapshot: missing"),
+            Head::Unique(id) => {
+                print_group_snapshot(reader, facts, relations::group_snapshot(facts, id)?)?
+            }
+            Head::Forked(ids) => {
+                println!("group_fork: {} heads", ids.len());
+                for id in ids {
+                    print_group_snapshot(reader, facts, relations::group_snapshot(facts, id)?)?;
                 }
             }
         }
@@ -1381,37 +996,142 @@ fn cmd_group_list(pile: &Path, branch_id: Id) -> Result<()> {
     })
 }
 
-fn cmd_group_show(pile: &Path, branch_id: Id, group: String) -> Result<()> {
-    with_repo(pile, |repo| {
-        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-        let gid = resolve_group_id(&space, &group)?;
-        // Anomalies are surfaced explicitly: a broken group must never look
-        // like a healthy empty one.
-        let head = match resolve_group_head(&space, gid) {
-            GroupHead::Unique(head) => head,
-            GroupHead::Missing => bail!(
-                "group {} is an unmigrated legacy group — run `relations group migrate`",
-                fmt_id(gid)
-            ),
-            GroupHead::Forked(heads) => bail!(
-                "group {} is FORKED across {} concurrent heads — reconcile before use",
-                fmt_id(gid),
-                heads.len()
-            ),
-            GroupHead::Invalid(reason) => {
-                bail!("group {} is INVALID: {reason}", fmt_id(gid))
+fn cmd_group_list(storage: RelationsStorage<'_>) -> Result<()> {
+    storage.with_view(|facts, reader| {
+        let mut rows = Vec::new();
+        for group in relations::group_anchors(facts) {
+            match relations::group_head(facts, group)? {
+                Head::Unique(id) => {
+                    let snapshot = relations::group_snapshot(facts, id)?;
+                    rows.push((
+                        relations::read_text(reader, snapshot.name)?,
+                        group,
+                        format!("{} members", snapshot.members.len()),
+                    ));
+                }
+                Head::Forked(ids) => rows.push((
+                    "<forked group>".to_owned(),
+                    group,
+                    format!("fork: {} heads", ids.len()),
+                )),
+                Head::Missing => {
+                    rows.push(("<missing group>".to_owned(), group, "invalid".to_owned()))
+                }
             }
-        };
-        let label = person_label(&mut ws, &space, head).unwrap_or_else(|| fmt_id(gid));
-        println!("group: {label} ({})", fmt_id(gid));
-        let members = group_members(&space, gid);
-        if members.is_empty() {
-            println!("- (no members)");
         }
-        for m in members {
-            let mlabel = person_label(&mut ws, &space, m).unwrap_or_else(|| fmt_id(m));
-            println!("- {mlabel} ({})", fmt_id(m));
+        rows.sort_by(|left, right| {
+            relations::lookup_key(&left.0)
+                .cmp(&relations::lookup_key(&right.0))
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        if rows.is_empty() {
+            println!("No groups.");
+        }
+        for (name, group, state) in rows {
+            println!("[{}] {name} ({state})", fmt_id(group));
+        }
+        Ok(())
+    })
+}
+
+fn cmd_identity_resolve(
+    storage: RelationsStorage<'_>,
+    first: String,
+    second: String,
+    same: bool,
+) -> Result<()> {
+    enum Outcome {
+        Settled(Id),
+        Changed {
+            first: Id,
+            second: Id,
+            successor: Id,
+        },
+    }
+    let outcome = storage.update(|facts, reader| {
+        let first = resolve_person_anchor(reader, facts, &first, true)?;
+        let second = resolve_person_anchor(reader, facts, &second, true)?;
+        if first == second {
+            bail!("an identity verdict requires two different person anchors");
+        }
+        let predecessors = match relations::identity_head(facts, first, second)? {
+            Head::Missing => Vec::new(),
+            Head::Unique(id) => {
+                if relations::identity_verdict(facts, id)?.same == same {
+                    return Ok((None, Outcome::Settled(id)));
+                }
+                vec![id]
+            }
+            Head::Forked(ids) => ids,
+        };
+        let fragment = relations::identity_verdict_fragment(first, second, same, &predecessors)?;
+        let successor = fragment.root().expect("identity verdict root");
+        Ok((
+            Some(fragment),
+            Outcome::Changed {
+                first,
+                second,
+                successor,
+            },
+        ))
+    })?;
+    match outcome {
+        Outcome::Settled(id) => println!("Identity verdict is already settled at {}.", fmt_id(id)),
+        Outcome::Changed {
+            first,
+            second,
+            successor,
+        } => println!(
+            "identity: {} {} {} ({})",
+            fmt_id(first),
+            if same { "same-as" } else { "distinct-from" },
+            fmt_id(second),
+            fmt_id(successor)
+        ),
+    }
+    Ok(())
+}
+
+fn cmd_identity_list(storage: RelationsStorage<'_>) -> Result<()> {
+    storage.with_view(|facts, _| {
+        let heads = relations::identity_heads(facts)?;
+        if heads.is_empty() {
+            println!("No identity verdicts.");
+        }
+        for ((low, high), head) in heads {
+            match head {
+                Head::Missing => unreachable!("listed pair has a verdict"),
+                Head::Unique(id) => println!(
+                    "{} {} {} [{}]",
+                    fmt_id(low),
+                    if relations::identity_verdict(facts, id)?.same {
+                        "same-as"
+                    } else {
+                        "distinct-from"
+                    },
+                    fmt_id(high),
+                    fmt_id(id)
+                ),
+                Head::Forked(ids) => {
+                    println!(
+                        "{} ? {} [fork: {} heads]",
+                        fmt_id(low),
+                        fmt_id(high),
+                        ids.len()
+                    );
+                    for id in ids {
+                        println!(
+                            "- {} {}",
+                            fmt_id(id),
+                            if relations::identity_verdict(facts, id)?.same {
+                                "same-as"
+                            } else {
+                                "distinct-from"
+                            }
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     })
@@ -1419,398 +1139,155 @@ fn cmd_group_show(pile: &Path, branch_id: Id, group: String) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let Some(cmd) = cli.command else {
-        let mut command = Cli::command();
-        command.print_help()?;
-        println!();
-        return Ok(());
+    let storage = RelationsStorage {
+        pile: &cli.pile,
+        key: cli.key.as_deref(),
     };
-    let branch_id = with_repo(&cli.pile, |repo| {
-        if let Some(hex) = cli.branch_id.as_deref() {
-            return Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
-        }
-        repo.ensure_branch(&cli.branch, None)
-            .map_err(|e| anyhow!("ensure relations branch: {e:?}"))
-    })?;
 
-    match cmd {
-        Command::Add {
+    match cli.command {
+        None => {
+            Cli::command().print_help().ok();
+            println!();
+        }
+        Some(Command::Add {
             label,
             id,
-            first_name,
-            last_name,
-            display_name,
-            affinity,
-            note,
-            alias,
-            teams_user_id,
-            email,
-            phone,
-            company,
-            position,
             source,
-            force,
-        } => cmd_add(
-            &cli.pile,
-            &cli.branch,
-            branch_id,
-            label,
-            id,
-            first_name,
-            last_name,
-            display_name,
-            affinity,
-            note,
-            alias,
-            teams_user_id,
-            email,
-            phone,
-            company,
-            position,
+            profile,
+        }) => cmd_add(storage, label, id, source, profile)?,
+        Some(Command::Set {
+            person,
             source,
-            force,
-        ),
-        Command::Set {
-            id,
-            label,
-            first_name,
-            last_name,
-            display_name,
-            affinity,
-            note,
-            alias,
-            teams_user_id,
-            email,
-            phone,
-            company,
-            position,
-            source,
-        } => cmd_set(
-            &cli.pile,
-            &cli.branch,
-            branch_id,
-            id,
-            label,
-            first_name,
-            last_name,
-            display_name,
-            affinity,
-            note,
-            alias,
-            teams_user_id,
-            email,
-            phone,
-            company,
-            position,
-            source,
-        ),
-        Command::List {
+            patch,
+        }) => cmd_set(storage, person, source, patch)?,
+        Some(Command::Reconcile {
+            person,
+            base,
+            patch,
+        }) => cmd_reconcile_profile(storage, person, base, patch)?,
+        Some(Command::List {
             limit,
             all,
             retired,
-        } => cmd_list(&cli.pile, &cli.branch, branch_id, limit, all, retired),
-        Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
-        Command::Retire { person } => cmd_retire(&cli.pile, branch_id, person),
-        Command::Unretire { person } => cmd_unretire(&cli.pile, branch_id, person),
-        Command::Group { command } => match command {
-            GroupCmd::Create { name } => cmd_group_create(&cli.pile, branch_id, name),
-            GroupCmd::Add { group, person } => cmd_group_add(&cli.pile, branch_id, group, person),
-            GroupCmd::Remove { group, person } => {
-                cmd_group_remove(&cli.pile, branch_id, group, person)
-            }
-            GroupCmd::Rename { group, name } => cmd_group_rename(&cli.pile, branch_id, group, name),
-            GroupCmd::Migrate => cmd_group_migrate(&cli.pile, branch_id),
-            GroupCmd::Reconcile { group, name } => {
-                cmd_group_reconcile(&cli.pile, branch_id, group, name)
-            }
-            GroupCmd::List => cmd_group_list(&cli.pile, branch_id),
-            GroupCmd::Show { group } => cmd_group_show(&cli.pile, branch_id, group),
+        }) => cmd_list(storage, limit, all, retired)?,
+        Some(Command::Show { person }) => cmd_show(storage, person)?,
+        Some(Command::Retire { person }) => cmd_set_retired(storage, person, true)?,
+        Some(Command::Unretire { person }) => cmd_set_retired(storage, person, false)?,
+        Some(Command::Group { command }) => match command {
+            GroupCommand::Create { name } => cmd_group_create(storage, name)?,
+            GroupCommand::Add { group, person } => cmd_group_add(storage, group, person)?,
+            GroupCommand::Remove { group, person } => cmd_group_remove(storage, group, person)?,
+            GroupCommand::Rename { group, name } => cmd_group_rename(storage, group, name)?,
+            GroupCommand::Reconcile { group, name } => cmd_group_reconcile(storage, group, name)?,
+            GroupCommand::List => cmd_group_list(storage)?,
+            GroupCommand::Show { group } => cmd_group_show(storage, group)?,
+        },
+        Some(Command::Identity { command }) => match command {
+            IdentityCommand::Resolve {
+                first,
+                second,
+                same,
+                distinct: _,
+            } => cmd_identity_resolve(storage, first, second, same)?,
+            IdentityCommand::List => cmd_identity_list(storage)?,
         },
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
+    use faculties::collection_cutover::initialize_signer;
+    use std::fs;
 
-    struct TestPile(PathBuf);
-
-    impl TestPile {
-        fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("faculties-relations-{}.pile", ufoid().id));
-            File::create(&path).expect("create test pile");
-            Self(path)
+    fn profile(label: &str) -> ProfileInput {
+        ProfileInput {
+            label: label.to_owned(),
+            aliases: vec!["old alias".to_owned()],
+            emails: vec!["old@example.test".to_owned()],
+            first_name: Some("Ada".to_owned()),
+            ..ProfileInput::default()
         }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestPile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    fn sorted(mut v: Vec<Id>) -> Vec<Id> {
-        v.sort();
-        v
-    }
-
-    fn branch(pile: &Path) -> Id {
-        with_repo(pile, |repo| {
-            repo.ensure_branch(DEFAULT_BRANCH, None)
-                .map_err(|e| anyhow!("ensure branch: {e:?}"))
-        })
-        .expect("ensure relations branch")
-    }
-
-    fn seed_person(pile: &Path, branch_id: Id, id: Id, name: &str) {
-        with_repo(pile, |repo| {
-            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-            let handle = ws.put(name.to_string());
-            let mut change = TribleSet::new();
-            change += entity! { ExclusiveId::force_ref(&id) @
-                metadata::tag: &KIND_PERSON_ID,
-                metadata::name: handle,
-            };
-            ws.commit(change, "seed person");
-            repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
-            Ok(())
-        })
-        .expect("seed person");
-    }
-
-    /// Seed a legacy anchor-direct group: name + members live DIRECTLY on the
-    /// anchor (the pre-snapshot model), with no snapshot entity at all. This is
-    /// exactly the shape `group migrate` must promote.
-    fn seed_legacy_group(
-        pile: &Path,
-        branch_id: Id,
-        anchor: Id,
-        name: Option<&str>,
-        members: &[Id],
-    ) {
-        with_repo(pile, |repo| {
-            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-            let mut change = TribleSet::new();
-            change += entity! { ExclusiveId::force_ref(&anchor) @ metadata::tag: &KIND_GROUP };
-            if let Some(name) = name {
-                let handle = ws.put(name.to_string());
-                change += entity! { ExclusiveId::force_ref(&anchor) @ metadata::name: handle };
-            }
-            for m in members {
-                change += entity! { ExclusiveId::force_ref(&anchor) @ group::member: m };
-            }
-            ws.commit(change, "seed legacy group");
-            repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
-            Ok(())
-        })
-        .expect("seed legacy group");
-    }
-
-    fn head(pile: &Path, branch_id: Id, anchor: Id) -> GroupHead {
-        with_repo(pile, |repo| {
-            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-            let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-            Ok(resolve_group_head(&space, anchor))
-        })
-        .expect("read head")
-    }
-
-    fn members(pile: &Path, branch_id: Id, anchor: Id) -> Vec<Id> {
-        with_repo(pile, |repo| {
-            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-            let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-            Ok(group_members(&space, anchor))
-        })
-        .expect("read members")
-    }
-
-    fn resolve(pile: &Path, branch_id: Id, name: &str) -> Result<Id> {
-        with_repo(pile, |repo| {
-            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-            let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-            resolve_group_id(&space, name)
-        })
     }
 
     #[test]
-    fn migrate_promotes_legacy_groups_and_is_idempotent() {
-        let pile = TestPile::new();
-        let b = branch(pile.path());
-        let mut anchors = Vec::new();
-        for i in 0..4 {
-            let anchor = ufoid().id;
-            let m1 = ufoid().id;
-            let m2 = ufoid().id;
-            seed_legacy_group(
-                pile.path(),
-                b,
-                anchor,
-                Some(&format!("group-{i}")),
-                &[m1, m2],
-            );
-            anchors.push((anchor, sorted(vec![m1, m2])));
-        }
-        // Before migration each is a VISIBLE unmigrated legacy group (Missing),
-        // not a healthy-looking empty one.
-        for (anchor, _) in &anchors {
-            assert_eq!(head(pile.path(), b, *anchor), GroupHead::Missing);
-        }
-        cmd_group_migrate(pile.path(), b).expect("migrate");
-        let heads: Vec<Id> = anchors
-            .iter()
-            .map(|(anchor, want)| match head(pile.path(), b, *anchor) {
-                GroupHead::Unique(h) => {
-                    assert_eq!(&members(pile.path(), b, *anchor), want);
-                    h
+    fn profile_patch_preserves_unspecified_and_replaces_sets() {
+        let mut value = profile("ada");
+        let changed = apply_profile_patch(
+            &mut value,
+            ProfilePatchArgs {
+                alias: vec!["Countess".to_owned(), "Enchantress".to_owned()],
+                company: Some("Analytical Engines".to_owned()),
+                ..ProfilePatchArgs::default()
+            },
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(value.first_name.as_deref(), Some("Ada"));
+        assert_eq!(value.emails, vec!["old@example.test"]);
+        assert_eq!(value.aliases, vec!["Countess", "Enchantress"]);
+        assert_eq!(value.company.as_deref(), Some("Analytical Engines"));
+    }
+
+    #[test]
+    fn profile_patch_clear_is_explicit_and_conflicts_with_replacement() {
+        let mut value = profile("ada");
+        apply_profile_patch(
+            &mut value,
+            ProfilePatchArgs {
+                clear: vec![ProfileField::FirstName, ProfileField::Emails],
+                ..ProfilePatchArgs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(value.first_name, None);
+        assert!(value.emails.is_empty());
+
+        let error = apply_profile_patch(
+            &mut value,
+            ProfilePatchArgs {
+                email: vec!["new@example.test".to_owned()],
+                clear: vec![ProfileField::Emails],
+                ..ProfilePatchArgs::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn native_collection_updates_expose_profile_forks() {
+        let nonce = format!("{}-{}", std::process::id(), genid().id);
+        let directory = std::env::temp_dir().join(format!("faculties-relations-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        let pile = directory.join("relations.pile");
+        let key = directory.join("relations.key");
+        fs::File::create(&pile).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let storage = RelationsStorage {
+            pile: &pile,
+            key: Some(&key),
+        };
+
+        let person = genid().id;
+        let (fragment, initial, _) = relations::person_fragment(person, profile("Ada")).unwrap();
+        storage.update(|_, _| Ok((Some(fragment), ()))).unwrap();
+
+        let left = relations::profile_fragment(person, profile("Ada Left"), &[initial]).unwrap();
+        let right = relations::profile_fragment(person, profile("Ada Right"), &[initial]).unwrap();
+        storage.update(|_, _| Ok((Some(left), ()))).unwrap();
+        storage.update(|_, _| Ok((Some(right), ()))).unwrap();
+
+        storage
+            .with_view(|facts, _| {
+                match relations::profile_head(facts, person)? {
+                    Head::Forked(heads) => assert_eq!(heads.len(), 2),
+                    other => panic!("expected visible fork, got {other:?}"),
                 }
-                other => panic!("expected Unique after migrate, got {other:?}"),
+                Ok(())
             })
-            .collect();
-        // Idempotent: a second migration re-mints nothing; every head is byte
-        // -identical (migrate only touches Missing groups).
-        cmd_group_migrate(pile.path(), b).expect("migrate idempotent");
-        for ((anchor, _), h) in anchors.iter().zip(heads) {
-            assert_eq!(head(pile.path(), b, *anchor), GroupHead::Unique(h));
-        }
-    }
-
-    #[test]
-    fn migrate_empty_legacy_group_yields_unique_empty_head() {
-        let pile = TestPile::new();
-        let b = branch(pile.path());
-        let anchor = ufoid().id;
-        seed_legacy_group(pile.path(), b, anchor, Some("empty"), &[]);
-        cmd_group_migrate(pile.path(), b).expect("migrate");
-        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
-        assert!(members(pile.path(), b, anchor).is_empty());
-    }
-
-    #[test]
-    fn migrate_malformed_legacy_group_without_name_fails_visible() {
-        let pile = TestPile::new();
-        let b = branch(pile.path());
-        let anchor = ufoid().id;
-        seed_legacy_group(pile.path(), b, anchor, None, &[ufoid().id]);
-        // Fails LOUDLY rather than silently minting a nameless snapshot.
-        let err = cmd_group_migrate(pile.path(), b).unwrap_err();
-        assert!(
-            err.to_string().contains("no name"),
-            "unexpected error: {err}"
-        );
-        // Still visibly un-migrated (Missing), never a healthy zero-member group.
-        assert_eq!(head(pile.path(), b, anchor), GroupHead::Missing);
-    }
-
-    #[test]
-    fn create_add_remove_rename_roundtrip() {
-        let pile = TestPile::new();
-        let b = branch(pile.path());
-        let alice = ufoid().id;
-        let bob = ufoid().id;
-        seed_person(pile.path(), b, alice, "Alice");
-        seed_person(pile.path(), b, bob, "Bob");
-
-        cmd_group_create(pile.path(), b, "Crew".to_string()).expect("create");
-        let anchor = resolve(pile.path(), b, "Crew").expect("resolve crew");
-        // Fresh group: Unique head, zero members.
-        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
-        assert!(members(pile.path(), b, anchor).is_empty());
-
-        cmd_group_add(pile.path(), b, "Crew".to_string(), fmt_id(alice)).expect("add alice");
-        cmd_group_add(pile.path(), b, "Crew".to_string(), fmt_id(bob)).expect("add bob");
-        assert_eq!(members(pile.path(), b, anchor), sorted(vec![alice, bob]));
-
-        cmd_group_remove(pile.path(), b, "Crew".to_string(), fmt_id(alice)).expect("remove alice");
-        assert_eq!(members(pile.path(), b, anchor), vec![bob]);
-
-        // Rename: only the NEW name resolves; the anchor and membership persist.
-        cmd_group_rename(pile.path(), b, "Crew".to_string(), "Squad".to_string()).expect("rename");
-        assert!(resolve(pile.path(), b, "Crew").is_err());
-        assert_eq!(
-            resolve(pile.path(), b, "Squad").expect("resolve squad"),
-            anchor
-        );
-        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
-        assert_eq!(members(pile.path(), b, anchor), vec![bob]);
-    }
-
-    /// Commit one content-canonical snapshot of `anchor` (tagging the anchor).
-    /// Two divergent no-predecessor snapshots of the same anchor produce a fork.
-    fn seed_snapshot(
-        pile: &Path,
-        branch_id: Id,
-        anchor: Id,
-        name: &str,
-        members: &[Id],
-        preds: &[Id],
-    ) {
-        with_repo(pile, |repo| {
-            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
-            let handle = ws.put(name.to_string());
-            let mut change = TribleSet::new();
-            change += entity! { ExclusiveId::force_ref(&anchor) @ metadata::tag: &KIND_GROUP };
-            change += group_snapshot_fragment(anchor, handle, members, preds);
-            ws.commit(change, "seed snapshot");
-            repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
-            Ok(())
-        })
-        .expect("seed snapshot");
-    }
-
-    #[test]
-    fn reconcile_heals_a_fork_into_one_head_with_the_union_of_members() {
-        let pile = TestPile::new();
-        let b = branch(pile.path());
-        let anchor = ufoid().id;
-        let m1 = ufoid().id;
-        let m2 = ufoid().id;
-        // Two replicas edited the same anchor concurrently and divergently: two
-        // un-superseded heads with different members => Forked.
-        seed_snapshot(pile.path(), b, anchor, "crew", &[m1], &[]);
-        seed_snapshot(pile.path(), b, anchor, "crew", &[m1, m2], &[]);
-        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Forked(_)));
-        // While forked, ordinary edits fail closed.
-        assert!(cmd_group_add(pile.path(), b, fmt_id(anchor), fmt_id(m2)).is_err());
-
-        cmd_group_reconcile(pile.path(), b, fmt_id(anchor), None).expect("reconcile");
-        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
-        // The union of both heads' members survives (nothing silently dropped).
-        assert_eq!(members(pile.path(), b, anchor), sorted(vec![m1, m2]));
-        // Reconcile on a healthy group is a visible no-op.
-        cmd_group_reconcile(pile.path(), b, fmt_id(anchor), None).expect("reconcile no-op");
-        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
-    }
-
-    #[test]
-    fn reconcile_refuses_divergent_names_without_an_explicit_choice() {
-        let pile = TestPile::new();
-        let b = branch(pile.path());
-        let anchor = ufoid().id;
-        let m1 = ufoid().id;
-        // Concurrent renames: two heads with DIFFERENT names.
-        seed_snapshot(pile.path(), b, anchor, "alpha", &[m1], &[]);
-        seed_snapshot(pile.path(), b, anchor, "beta", &[m1], &[]);
-        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Forked(_)));
-        // No --name => refuses rather than silently picking by content-hash order.
-        let err = cmd_group_reconcile(pile.path(), b, fmt_id(anchor), None).unwrap_err();
-        assert!(
-            err.to_string().contains("disagree on name"),
-            "unexpected error: {err}"
-        );
-        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Forked(_)));
-        // With an explicit name it heals to a single named head.
-        cmd_group_reconcile(pile.path(), b, fmt_id(anchor), Some("gamma".to_string()))
-            .expect("reconcile with explicit name");
-        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
-        assert_eq!(
-            resolve(pile.path(), b, "gamma").expect("resolve gamma"),
-            anchor
-        );
+            .unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 }
