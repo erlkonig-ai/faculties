@@ -102,20 +102,39 @@ pub enum Head {
 
 /// Typed result of resolving a human-facing person or group selector.
 ///
-/// `Forked` contains every matching anchor, including any otherwise-settled
-/// matches, whenever at least one candidate has an unsettled snapshot track.
-/// Callers can inspect the corresponding `*_head` values for detailed
-/// diagnostics without scraping an error string.
+/// `Forked` keeps the two kinds of candidate apart: `forked` are the anchors
+/// whose own snapshot track is unsettled — the actual blockers — and `settled`
+/// are the other matches, retained so a caller sees the whole candidate set.
+/// Flattening the two into one list is what made a fork on an irrelevant
+/// anchor read as a fork on the anchor the user asked for. Callers can inspect
+/// the corresponding `*_head` values for detail without scraping an error
+/// string.
+///
+/// Only candidates that survive disqualification appear here at all: a
+/// selector never reports a fork on an anchor it has already ruled out (see
+/// [`resolve_person`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SelectorOutcome {
     Missing,
     Unique(Id),
     Ambiguous(Vec<Id>),
-    Forked(Vec<Id>),
+    Forked { forked: Vec<Id>, settled: Vec<Id> },
     Invalid(String),
 }
 
 impl SelectorOutcome {
+    /// Every anchor this outcome matched, blockers and settled alike.
+    pub fn candidates(&self) -> Vec<Id> {
+        match self {
+            Self::Unique(id) => vec![*id],
+            Self::Ambiguous(ids) => ids.clone(),
+            Self::Forked { forked, settled } => {
+                sorted_ids(forked.iter().copied().chain(settled.iter().copied()))
+            }
+            Self::Missing | Self::Invalid(_) => Vec::new(),
+        }
+    }
+
     /// Render the typed outcome at a command boundary that requires one exact
     /// anchor. Library consumers should normally retain the enum.
     pub fn require_unique(self, kind: &str, input: &str) -> Result<Id> {
@@ -129,13 +148,27 @@ impl SelectorOutcome {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Self::Forked(ids) => bail!(
-                "{kind} selector '{input}' touches forked state on: {}",
-                ids.iter()
-                    .map(|id| format!("{id:x}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            Self::Forked { forked, settled } => {
+                let mut message = format!(
+                    "cannot resolve {kind} '{input}': unreconciled {kind} state on {}",
+                    forked
+                        .iter()
+                        .map(|id| format!("{id:x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                if !settled.is_empty() {
+                    message.push_str(&format!(
+                        " (also matched, but not selectable while the fork stands: {})",
+                        settled
+                            .iter()
+                            .map(|id| format!("{id:x}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                bail!("{message}")
+            }
             Self::Invalid(reason) => bail!("invalid {kind} selector '{input}': {reason}"),
         }
     }
@@ -1179,12 +1212,15 @@ fn selector_outcome(
     retired: BTreeSet<Id>,
 ) -> SelectorOutcome {
     if !forked.is_empty() {
-        let candidates = settled.union(&forked).copied().collect();
-        return SelectorOutcome::Forked(candidates);
+        return SelectorOutcome::Forked {
+            forked: forked.into_iter().collect(),
+            settled: settled.into_iter().collect(),
+        };
     }
     match settled.into_iter().collect::<Vec<_>>().as_slice() {
         [] if !retired.is_empty() => SelectorOutcome::Invalid(format!(
-            "matching person is retired: {}",
+            "the only match is retired and therefore not addressable: {} (`relations unretire` \
+             to restore it)",
             retired
                 .iter()
                 .map(|id| format!("{id:x}"))
@@ -1197,6 +1233,45 @@ fn selector_outcome(
     }
 }
 
+/// Whether a lifecycle track disqualifies its anchor from selection.
+///
+/// A fork is only indeterminate when its heads disagree. When every head says
+/// the same thing, the answer is settled no matter which head eventually wins,
+/// so the fork cannot change the verdict — the same reasoning
+/// [`IdentityComponents::from_facts`] already applies to agreement-only
+/// verdict forks. `None` means genuinely indeterminate.
+fn retired_verdict(facts: &TribleSet, person: Id, state: &Head) -> Result<Option<bool>> {
+    match state {
+        Head::Unique(id) => Ok(Some(lifecycle_snapshot(facts, *id)?.retired)),
+        Head::Forked(heads) => {
+            let values: BTreeSet<bool> = heads
+                .iter()
+                .map(|id| Ok(lifecycle_snapshot(facts, *id)?.retired))
+                .collect::<Result<_>>()?;
+            Ok(match values.len() {
+                1 => values.into_iter().next(),
+                _ => None,
+            })
+        }
+        Head::Missing => bail!("person {person:x} has no lifecycle snapshot"),
+    }
+}
+
+/// Resolve a person selector against current profile and lifecycle state.
+///
+/// Two rules keep an unreconciled anchor from vetoing an unrelated one:
+///
+/// 1. **Disqualification precedes fork reporting.** Unless `include_retired`,
+///    a retired anchor is dropped outright and never contributes a fork —
+///    whether its own state is settled is simply not a question the selector
+///    asks about a candidate it has already ruled out.
+/// 2. **A fork blocks only when it could change the answer.** The only thing
+///    lifecycle decides here is addressability, so a lifecycle fork whose
+///    heads all agree is settled for this purpose regardless of which head
+///    eventually wins. Heads that disagree are indeterminate and do block.
+///
+/// A profile fork always blocks a surviving candidate: the label match itself
+/// is then head-dependent.
 pub fn resolve_person<Store>(
     reader: &Store,
     facts: &TribleSet,
@@ -1242,21 +1317,26 @@ where
             continue;
         }
 
+        // Disqualification comes BEFORE fork reporting. A retired anchor is
+        // not a candidate, so its internal consistency cannot bear on whether
+        // the selector resolves — otherwise a fork on a retired legacy anchor
+        // vetoes a live, perfectly settled match that merely shares its name.
+        // A retired person carrying a multi-head profile fork must not poison a
+        // live group that happens to share its selector.
         let lifecycle_state = lifecycle_head(facts, person)?;
-        if matches!(profile_state, Head::Forked(_)) || matches!(lifecycle_state, Head::Forked(_)) {
+        let retired_state = retired_verdict(facts, person, &lifecycle_state)?;
+        if !include_retired && retired_state == Some(true) {
+            retired.insert(person);
+            continue;
+        }
+
+        // Past this point the anchor really is in the running, so an unsettled
+        // track on it genuinely blocks: fail closed rather than pick a head.
+        if matches!(profile_state, Head::Forked(_)) || retired_state.is_none() {
             forked.insert(person);
             continue;
         }
-        let lifecycle_id = match lifecycle_state {
-            Head::Unique(id) => id,
-            Head::Missing => bail!("person {person:x} has no lifecycle snapshot"),
-            Head::Forked(_) => unreachable!("handled above"),
-        };
-        if !include_retired && lifecycle_snapshot(facts, lifecycle_id)?.retired {
-            retired.insert(person);
-        } else {
-            settled.insert(person);
-        }
+        settled.insert(person);
     }
     Ok(selector_outcome(settled, forked, retired))
 }
@@ -1922,6 +2002,183 @@ mod tests {
         assert_eq!(
             resolve_person(&view.reader, &view.facts, "countess", false).unwrap(),
             SelectorOutcome::Ambiguous(vec![ada.min(third), ada.max(third)])
+        );
+    }
+
+    /// Fork one person's profile track into two un-superseded heads that both
+    /// still answer to `alias`.
+    fn fork_profile(fixture: &Fixture, person: Id, label: &str, alias: &str, base: Id) {
+        for note in ["left", "right"] {
+            let mut input = profile(label);
+            input.aliases = vec![alias.to_owned()];
+            input.note = Some(note.to_owned());
+            fixture.publish(profile_fragment(person, input, &[base]).unwrap());
+        }
+    }
+
+    /// A broadcast outage in miniature. A retired legacy anchor answering to a
+    /// shared selector carried a profile fork, and that fork vetoed the live,
+    /// entirely settled candidate.
+    #[test]
+    fn a_retired_anchor_is_dropped_before_its_fork_can_block_the_selector() {
+        let fixture = Fixture::new();
+        let legacy = genid().id;
+        let live = genid().id;
+
+        let mut input = profile("legacy shared");
+        input.aliases = vec!["shared".into()];
+        let (fragment, profile_id, lifecycle_id) = person_fragment(legacy, input).unwrap();
+        fixture.publish(fragment);
+        fork_profile(&fixture, legacy, "legacy shared", "shared", profile_id);
+        fixture.publish(lifecycle_fragment(legacy, true, &[lifecycle_id]));
+
+        publish_person(&fixture, live, "shared");
+        let view = fixture.view();
+        validate_catalog(&view.reader, &view.facts).unwrap();
+        assert!(matches!(
+            profile_head(&view.facts, legacy).unwrap(),
+            Head::Forked(_)
+        ));
+        assert!(person_is_retired(&view.facts, legacy).unwrap());
+
+        // Retirement disqualifies before the fork is ever consulted.
+        assert_eq!(
+            resolve_person(&view.reader, &view.facts, "shared", false).unwrap(),
+            SelectorOutcome::Unique(live)
+        );
+        // An operator who explicitly asks for retired anchors still sees the
+        // fork, and sees which side of the tie is the blocker.
+        assert_eq!(
+            resolve_person(&view.reader, &view.facts, "shared", true).unwrap(),
+            SelectorOutcome::Forked {
+                forked: vec![legacy],
+                settled: vec![live],
+            }
+        );
+    }
+
+    /// The fail-closed half of the rule: a fork on a candidate that really is
+    /// in the running must keep blocking, and must be named as the blocker.
+    #[test]
+    fn a_forked_live_anchor_still_blocks_and_is_named_as_the_blocker() {
+        let fixture = Fixture::new();
+        let forked_person = genid().id;
+        let settled_person = genid().id;
+
+        let mut input = profile("ada");
+        input.aliases = vec!["countess".into()];
+        let (fragment, profile_id, _) = person_fragment(forked_person, input).unwrap();
+        fixture.publish(fragment);
+        fork_profile(&fixture, forked_person, "ada", "countess", profile_id);
+        publish_person(&fixture, settled_person, "countess");
+
+        let view = fixture.view();
+        validate_catalog(&view.reader, &view.facts).unwrap();
+        let outcome = resolve_person(&view.reader, &view.facts, "countess", false).unwrap();
+        assert_eq!(
+            outcome,
+            SelectorOutcome::Forked {
+                forked: vec![forked_person],
+                settled: vec![settled_person],
+            }
+        );
+        assert_eq!(
+            outcome.candidates(),
+            sorted_ids([forked_person, settled_person])
+        );
+
+        let message = resolve_person(&view.reader, &view.facts, "countess", false)
+            .unwrap()
+            .require_unique("person", "countess")
+            .unwrap_err()
+            .to_string();
+        // The blocker is named as the blocker, and the innocent match is not
+        // listed as though it were one.
+        assert!(
+            message.contains(&format!("state on {forked_person:x}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "not selectable while the fork stands: {settled_person:x}"
+            )),
+            "{message}"
+        );
+    }
+
+    /// A fork only blocks when it could change the answer. The one thing a
+    /// lifecycle track decides for a selector is addressability, so heads that
+    /// agree are settled for that purpose however the fork later resolves.
+    #[test]
+    fn a_lifecycle_fork_blocks_only_when_its_heads_disagree() {
+        let fixture = Fixture::new();
+        let person = genid().id;
+        let (fragment, _, active) = person_fragment(person, profile("ada")).unwrap();
+        fixture.publish(fragment);
+
+        let resolve = |view: &FixtureView| resolve_person(&view.reader, &view.facts, "ada", false);
+        // The two un-superseded lifecycle heads, split by what they claim.
+        let split = |fixture: &Fixture| -> (Vec<Id>, Vec<Id>) {
+            let facts = fixture.view().facts;
+            let heads = match lifecycle_head(&facts, person).unwrap() {
+                Head::Forked(heads) => heads,
+                other => panic!("expected a fork, got {other:?}"),
+            };
+            heads
+                .into_iter()
+                .partition(|id| lifecycle_snapshot(&facts, *id).unwrap().retired)
+        };
+
+        // Two windows disagree about whether Ada is retired: indeterminate.
+        fixture.publish(lifecycle_fragment(person, true, &[active]));
+        fixture.publish(lifecycle_fragment(person, false, &[active]));
+        let (says_retired, says_active) = split(&fixture);
+        let view = fixture.view();
+        validate_catalog(&view.reader, &view.facts).unwrap();
+        assert!(matches!(
+            resolve(&view).unwrap(),
+            SelectorOutcome::Forked { .. }
+        ));
+
+        // Still two heads, but now both say active: Ada is addressable.
+        fixture.publish(lifecycle_fragment(person, false, &says_retired));
+        let view = fixture.view();
+        validate_catalog(&view.reader, &view.facts).unwrap();
+        assert!(matches!(
+            lifecycle_head(&view.facts, person).unwrap(),
+            Head::Forked(_)
+        ));
+        assert_eq!(resolve(&view).unwrap(), SelectorOutcome::Unique(person));
+
+        // Disagreement returns: indeterminate again.
+        fixture.publish(lifecycle_fragment(person, true, &says_active));
+        let view = fixture.view();
+        validate_catalog(&view.reader, &view.facts).unwrap();
+        assert!(matches!(
+            resolve(&view).unwrap(),
+            SelectorOutcome::Forked { .. }
+        ));
+
+        // Both heads now say retired: disqualified, and reported as retired
+        // rather than as a fork.
+        let (_, still_active) = split(&fixture);
+        fixture.publish(lifecycle_fragment(person, true, &still_active));
+        let view = fixture.view();
+        validate_catalog(&view.reader, &view.facts).unwrap();
+        assert!(matches!(
+            lifecycle_head(&view.facts, person).unwrap(),
+            Head::Forked(_)
+        ));
+        match resolve(&view).unwrap() {
+            SelectorOutcome::Invalid(reason) => {
+                assert!(reason.contains("retired"), "{reason}");
+                assert!(reason.contains(&format!("{person:x}")), "{reason}");
+            }
+            other => panic!("expected a retired verdict, got {other:?}"),
+        }
+        assert_eq!(
+            resolve_person(&view.reader, &view.facts, "ada", true).unwrap(),
+            SelectorOutcome::Unique(person)
         );
     }
 

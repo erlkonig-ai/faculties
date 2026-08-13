@@ -60,7 +60,14 @@ pub enum RecipientOutcome {
     Missing,
     Unique(Recipient),
     Ambiguous(Vec<Id>),
-    Forked(Vec<Id>),
+    /// At least one live candidate has an unsettled snapshot track. The two
+    /// sides stay separate so the error can name the blocker and its kind
+    /// instead of listing the union and leaving the reader to guess which of
+    /// the two is actually broken.
+    Forked {
+        people: Vec<Id>,
+        groups: Vec<Id>,
+    },
     Invalid(String),
 }
 
@@ -73,10 +80,25 @@ impl RecipientOutcome {
             Self::Ambiguous(ids) => {
                 bail!("multiple recipients match '{input}': {}", format_ids(&ids))
             }
-            Self::Forked(ids) => bail!(
-                "recipient selector '{input}' touches forked state on: {}",
-                format_ids(&ids)
-            ),
+            Self::Forked { people, groups } => {
+                let mut blockers = Vec::new();
+                if !people.is_empty() {
+                    blockers.push(format!(
+                        "person {} (reconcile with `relations reconcile`)",
+                        format_ids(&people)
+                    ));
+                }
+                if !groups.is_empty() {
+                    blockers.push(format!(
+                        "group {} (reconcile with `relations group reconcile`)",
+                        format_ids(&groups)
+                    ));
+                }
+                bail!(
+                    "cannot resolve recipient '{input}': unreconciled state on {}",
+                    blockers.join("; ")
+                )
+            }
             Self::Invalid(reason) => bail!("invalid recipient selector '{input}': {reason}"),
         }
     }
@@ -155,11 +177,11 @@ fn sorted_ids(values: impl IntoIterator<Item = Id>) -> Vec<Id> {
     values
 }
 
-fn selector_ids(outcome: &SelectorOutcome) -> Vec<Id> {
+/// The anchors of one side that actually block resolution, if any.
+fn blocking_ids(outcome: &SelectorOutcome) -> Vec<Id> {
     match outcome {
-        SelectorOutcome::Unique(id) => vec![*id],
-        SelectorOutcome::Ambiguous(ids) | SelectorOutcome::Forked(ids) => ids.clone(),
-        SelectorOutcome::Missing | SelectorOutcome::Invalid(_) => Vec::new(),
+        SelectorOutcome::Forked { forked, .. } => forked.clone(),
+        _ => Vec::new(),
     }
 }
 
@@ -177,7 +199,10 @@ where
 /// Resolve a recipient without erasing diagnostic state.
 ///
 /// A label shared by a settled person and group is ambiguous: neither storage
-/// kind gets an imperative tie-break. Any matching fork remains visible.
+/// kind gets an imperative tie-break. Any matching fork remains visible — but
+/// only on a candidate that is genuinely in the running. `relations`
+/// disqualifies retired people before it reports their fork state, so a dead
+/// legacy anchor sharing a group's name can no longer veto the group.
 pub fn resolve_recipient<Store>(
     reader: &Store,
     facts: &TribleSet,
@@ -189,10 +214,13 @@ where
     let person = relations::resolve_person(reader, facts, input, false)?;
     let group = relations::resolve_group(reader, facts, input)?;
 
-    if matches!(person, SelectorOutcome::Forked(_)) || matches!(group, SelectorOutcome::Forked(_)) {
-        let mut candidates = selector_ids(&person);
-        candidates.extend(selector_ids(&group));
-        return Ok(RecipientOutcome::Forked(sorted_ids(candidates)));
+    let forked_people = blocking_ids(&person);
+    let forked_groups = blocking_ids(&group);
+    if !forked_people.is_empty() || !forked_groups.is_empty() {
+        return Ok(RecipientOutcome::Forked {
+            people: forked_people,
+            groups: forked_groups,
+        });
     }
 
     if let SelectorOutcome::Unique(group_id) = group {
@@ -208,7 +236,7 @@ where
                 return Ok(RecipientOutcome::Ambiguous(sorted_ids(candidates)));
             }
             SelectorOutcome::Missing | SelectorOutcome::Invalid(_) => {}
-            SelectorOutcome::Forked(_) => unreachable!("handled above"),
+            SelectorOutcome::Forked { .. } => unreachable!("handled above"),
         }
         let snapshot = relations::current_group(facts, group_id)?;
         return Ok(RecipientOutcome::Unique(Recipient::Group {
@@ -219,8 +247,8 @@ where
     }
 
     if matches!(group, SelectorOutcome::Ambiguous(_)) {
-        let mut candidates = selector_ids(&group);
-        candidates.extend(selector_ids(&person));
+        let mut candidates = group.candidates();
+        candidates.extend(person.candidates());
         return Ok(RecipientOutcome::Ambiguous(sorted_ids(candidates)));
     }
 
@@ -231,7 +259,7 @@ where
             SelectorOutcome::Missing => Ok(RecipientOutcome::Missing),
             SelectorOutcome::Invalid(reason) => Ok(RecipientOutcome::Invalid(reason)),
             SelectorOutcome::Ambiguous(_)
-            | SelectorOutcome::Forked(_)
+            | SelectorOutcome::Forked { .. }
             | SelectorOutcome::Unique(_) => unreachable!("handled above"),
         },
         SelectorOutcome::Invalid(reason) => match group {
@@ -239,10 +267,10 @@ where
                 Ok(RecipientOutcome::Invalid(reason))
             }
             SelectorOutcome::Ambiguous(_)
-            | SelectorOutcome::Forked(_)
+            | SelectorOutcome::Forked { .. }
             | SelectorOutcome::Unique(_) => unreachable!("handled above"),
         },
-        SelectorOutcome::Forked(_) => unreachable!("handled above"),
+        SelectorOutcome::Forked { .. } => unreachable!("handled above"),
     }
 }
 
@@ -937,6 +965,108 @@ mod tests {
             resolve_recipient(&reader, &facts, "shared").unwrap(),
             RecipientOutcome::Ambiguous(sorted_ids([person, group]))
         );
+    }
+
+    /// Regression for a broadcast outage: a shared selector died with a fork
+    /// error naming the perfectly settled group because a retired person with
+    /// the same label had a forked profile.
+    #[test]
+    fn a_retired_namesake_fork_does_not_veto_a_live_group() {
+        let legacy = test_id(0x21);
+        let group = test_id(0x22);
+
+        let mut input = relations::ProfileInput {
+            label: "legacy shared".to_owned(),
+            ..relations::ProfileInput::default()
+        };
+        input.aliases = vec!["shared".to_owned()];
+        let (mut fragment, profile_id, lifecycle_id) =
+            relations::person_fragment(legacy, input).unwrap();
+
+        // Two un-superseded profile heads, both still answering to the selector.
+        for note in ["left", "right"] {
+            fragment += relations::profile_fragment(
+                legacy,
+                relations::ProfileInput {
+                    label: "legacy shared".to_owned(),
+                    aliases: vec!["shared".to_owned()],
+                    note: Some(note.to_owned()),
+                    ..relations::ProfileInput::default()
+                },
+                &[profile_id],
+            )
+            .unwrap();
+        }
+        fragment += relations::lifecycle_fragment(legacy, true, &[lifecycle_id]);
+        fragment += relations::group_create_fragment(group, "shared").unwrap().0;
+
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().reader().unwrap();
+        relations::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
+        assert!(matches!(
+            relations::profile_head(&facts, legacy).unwrap(),
+            relations::Head::Forked(_)
+        ));
+
+        let recipient = resolve_recipient(&reader, &facts, "shared")
+            .unwrap()
+            .require_unique("shared")
+            .unwrap();
+        assert_eq!(recipient.anchor(), group);
+        assert_eq!(
+            recipient.group_snapshot(),
+            Some(relations::current_group(&facts, group).unwrap().id)
+        );
+    }
+
+    /// The other half: a fork on a LIVE candidate must still fail closed, and
+    /// the error must name that candidate and its kind rather than listing the
+    /// union of both sides and leaving the reader to guess.
+    #[test]
+    fn a_live_forked_namesake_still_blocks_and_names_itself() {
+        let person = test_id(0x23);
+        let group = test_id(0x24);
+
+        let (mut fragment, profile_id, _) = relations::person_fragment(
+            person,
+            relations::ProfileInput {
+                label: "crew".to_owned(),
+                ..relations::ProfileInput::default()
+            },
+        )
+        .unwrap();
+        for note in ["left", "right"] {
+            fragment += relations::profile_fragment(
+                person,
+                relations::ProfileInput {
+                    label: "crew".to_owned(),
+                    note: Some(note.to_owned()),
+                    ..relations::ProfileInput::default()
+                },
+                &[profile_id],
+            )
+            .unwrap();
+        }
+        fragment += relations::group_create_fragment(group, "crew").unwrap().0;
+
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().reader().unwrap();
+        relations::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
+
+        assert_eq!(
+            resolve_recipient(&reader, &facts, "crew").unwrap(),
+            RecipientOutcome::Forked {
+                people: vec![person],
+                groups: Vec::new(),
+            }
+        );
+        let message = resolve_recipient(&reader, &facts, "crew")
+            .unwrap()
+            .require_unique("crew")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(&format!("person {person:x}")), "{message}");
+        assert!(!message.contains(&format!("{group:x}")), "{message}");
     }
 
     #[test]

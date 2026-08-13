@@ -352,8 +352,12 @@ fn resolve_person_anchor(
     match relations::resolve_person(reader, facts, selector, include_retired)? {
         SelectorOutcome::Unique(id) => Ok(id),
         // Reconciliation operations may deliberately address the one stable
-        // anchor whose profile/lifecycle happens to have several heads.
-        SelectorOutcome::Forked(ids) if ids.len() == 1 => Ok(ids[0]),
+        // anchor whose profile/lifecycle happens to have several heads — but
+        // only when it is the sole claimant, so no settled match is displaced.
+        SelectorOutcome::Forked {
+            ref forked,
+            ref settled,
+        } if forked.len() == 1 && settled.is_empty() => Ok(forked[0]),
         outcome => outcome.require_unique("person", selector),
     }
 }
@@ -361,7 +365,10 @@ fn resolve_person_anchor(
 fn resolve_group_anchor(reader: &PileReader, facts: &TribleSet, selector: &str) -> Result<Id> {
     match relations::resolve_group(reader, facts, selector)? {
         SelectorOutcome::Unique(id) => Ok(id),
-        SelectorOutcome::Forked(ids) if ids.len() == 1 => Ok(ids[0]),
+        SelectorOutcome::Forked {
+            ref forked,
+            ref settled,
+        } if forked.len() == 1 && settled.is_empty() => Ok(forked[0]),
         outcome => outcome.require_unique("group", selector),
     }
 }
