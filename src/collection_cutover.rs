@@ -38,7 +38,7 @@ use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader, ReadError};
-use triblespace::core::repo::{self, BlobStore, BlobStoreGet, CommitHandle, PinStore};
+use triblespace::core::repo::{self, BlobStore, BlobStoreGet, CommitHandle, PinSnapshotSource};
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{entity, find, pattern};
@@ -1005,8 +1005,13 @@ fn physical_fingerprint_from_open_file(
     })
 }
 
-fn legacy_pin_coordinates(pile: &mut Pile) -> Result<Vec<LegacyPinCoordinate>> {
-    let snapshot = pile.pin_snapshot().context("snapshot frozen legacy pins")?;
+fn legacy_pin_coordinates<S>(source: &mut S) -> Result<Vec<LegacyPinCoordinate>>
+where
+    S: PinSnapshotSource,
+{
+    let snapshot = source
+        .snapshot_pin_heads()
+        .context("snapshot frozen legacy pins")?;
     let mut coordinates = Vec::new();
     for raw_id in snapshot.iter_ordered() {
         let id = Id::new(*raw_id).expect("legacy pin snapshot contains nil id");
