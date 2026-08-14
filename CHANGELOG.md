@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Archive accelerators now ensure only the unsupported residual of one exact
+  frozen ticket.** Raw-Succinct and BM25 reuse admitted resident `DERIVE` and
+  `MERGE` proofs, deduplicate equal source data without losing signed-root
+  support, and canonically reprobe the same byte-identical commit records after
+  appending. Missing canonical descriptor blobs are restored after ticket
+  validation, including on an otherwise complete fast path. BM25 compaction
+  remains a separate step, and neither path adds an explicit durability flush
+  or reopens its mutable pile.
 - **Retired the unused branch-era persisted HNSW API.** The public
   `embedding_rollup`, `refresh_index`, and `nearest_via_index` helpers and their
   mutable-head tests are removed. Live Files, Wiki, and Memory similarity uses
@@ -31,15 +39,16 @@ All notable changes to this project will be documented in this file.
   current. Every derived supersedes edge is owned by an authored source commit
   carrying that selected observation.
 - **Archive full-text search is live on the descriptor-handle V4 algebra.**
-  Each authored Archive `COMMIT` is projected by the frozen block-text recipe
-  into a canonical portable exact-TF BM25 leaf; byte-exact `DERIVE` and
-  pointwise-maximum `MERGE` validators admit a resident cover without a
-  branch, manifest, registry, timestamp winner, or legacy index trust. The
-  `archive index` and `archive search` commands now build and query that cover.
+  The frozen block-text recipe maps admitted SimpleArchive lattice elements
+  into canonical portable exact-TF BM25 elements; byte-exact `DERIVE` and
+  pointwise-maximum `MERGE` validators admit leaf-wise, merge-before-derive,
+  or mixed resident covers without a branch, manifest, registry, timestamp
+  winner, or legacy index trust. The `archive index` and `archive search`
+  commands now build and query that cover.
   Archive reads bind facts, the exact authorized source commits, and their
-  validating blob reader through one coherent collection snapshot; a source
-  element missing the complete block/part/fact closure fails before any index
-  record is appended.
+  validating blob reader through one coherent collection snapshot; a split
+  source without either complete leaf derivations or an admitted merge route
+  fails before any index record is appended.
 - **Viewer projections now preserve native ambiguity instead of inventing
   winners.** Files validates exact scalar records and uses neutral digest names
   for shared content; Atlas renders every metadata variant; Triage reduces

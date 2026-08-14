@@ -609,12 +609,12 @@ fn run_index(storage: ArchiveStorage<'_>) -> Result<()> {
     let succinct = archive_collection::ensure_succinct_index(storage.pile, storage.key)?;
     let bm25 = archive_collection::ensure_bm25_index(storage.pile, storage.key)?;
     println!(
-        "Archive: {} authored element(s), {} exact raw-Succinct DERIVE record(s)",
-        succinct.source_commits, succinct.derived_elements,
+        "Archive: {} authored commit(s), {} distinct source element(s) covered by raw-Succinct",
+        succinct.source_commits, succinct.source_elements,
     );
     println!(
-        "Archive BM25: {} exact derived element(s), {} resident cover segment(s)",
-        bm25.derived_elements, bm25.cover_segments,
+        "Archive BM25: {} distinct source element(s), {} resident cover segment(s)",
+        bm25.source_elements, bm25.cover_segments,
     );
     Ok(())
 }
@@ -1130,7 +1130,7 @@ mod tests {
         let first =
             archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first.source_commits, 1);
-        assert_eq!(first.derived_elements, 1);
+        assert_eq!(first.source_elements, 1);
         assert_ne!(first.source_collection, first.target_collection);
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
@@ -1154,7 +1154,7 @@ mod tests {
         let first_bm25 =
             archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first_bm25.source_commits, 1);
-        assert_eq!(first_bm25.derived_elements, 1);
+        assert_eq!(first_bm25.source_elements, 1);
         assert_eq!(first_bm25.cover_segments, 1);
         let after_bm25 = fs::metadata(&fixture.pile).unwrap().len();
         assert_eq!(
