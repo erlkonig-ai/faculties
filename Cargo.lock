@@ -10512,6 +10512,7 @@ dependencies = [
  "libc",
  "memmap2",
  "num-rational",
+ "num-traits",
  "object_store",
  "page_size",
  "proptest",
