@@ -19,11 +19,8 @@ use anyhow::{bail, Result};
 
 use triblespace::core::blob::encodings::longstring::LongString;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
-use triblespace::core::collection::simplearchive_union;
-use triblespace::core::collection::{
-    CollectionData, CollectionDerive, CollectionDescriptor, CollectionMerge,
-};
+use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
+use triblespace::core::collection::CollectionDescriptor;
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -51,27 +48,9 @@ pub const ARCHIVE_BLOCK_TEXT_BM25_RECIPE_V1: Id = id_hex!("0DDC5AFF78EFBC00CA64C
 
 pub type ArchiveBM25Index = PortableBM25Index<GenId, WordHash>;
 
-/// Concrete semantic verdict for one Archive BM25 equation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Validation {
-    /// Every descriptor, endpoint, and canonical output byte was verified.
-    Accepted,
-    /// At least one required content-addressed blob is not resident yet.
-    Pending,
-    /// Resident evidence proves the equation invalid.
-    Rejected(String),
-}
-
 #[derive(Debug)]
 enum DeriveValidation {
     Ready(Blob<PortableBM25Blob>),
-    Pending,
-    Rejected(String),
-}
-
-#[derive(Debug)]
-enum AttachValidation {
-    Ready(ArchiveBM25Index),
     Pending,
     Rejected(String),
 }
@@ -93,7 +72,7 @@ pub fn descriptor() -> CollectionDescriptor {
 /// Build one exact portable Archive BM25 element.
 ///
 /// A missing selected payload is an operational cache miss for an active
-/// builder. [`validate_derive`] classifies the same condition as `Pending`.
+/// builder. A later exact ensure retries with a fresh attachment reader.
 pub fn derive_element(
     reader: &PileReader,
     source: Blob<SimpleArchive>,
@@ -103,305 +82,6 @@ pub fn derive_element(
         DeriveValidation::Pending => bail!("Archive BM25 source has a nonresident text payload"),
         DeriveValidation::Rejected(reason) => bail!("invalid Archive BM25 source: {reason}"),
     }
-}
-
-/// Validate one exact Archive-SimpleArchive to portable-BM25 equation.
-///
-/// The descriptors, record endpoints, source bytes, selected resident text
-/// payloads, and target bytes all participate. Resident malformed data rejects
-/// even if a different dependency is absent; only genuinely absent data is
-/// retryable.
-pub fn validate_derive(
-    reader: &PileReader,
-    source_descriptor: &CollectionDescriptor,
-    target_descriptor: &CollectionDescriptor,
-    claim: &CollectionDerive,
-) -> Result<Validation> {
-    let expected_source = simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID);
-    let expected_target = descriptor();
-    if source_descriptor != &expected_source || target_descriptor != &expected_target {
-        return Ok(Validation::Rejected(
-            "Archive BM25 derive descriptors do not name the exact V4 recipe endpoints".to_owned(),
-        ));
-    }
-    if claim.source() != source_descriptor.handle() || claim.target() != target_descriptor.handle()
-    {
-        return Ok(Validation::Rejected(
-            "Archive BM25 derive record does not name its exact descriptor handles".to_owned(),
-        ));
-    }
-
-    let (input, output) = claim.mapping();
-    let source = load_blob::<SimpleArchive>(reader, input)?;
-    let target = load_blob::<PortableBM25Blob>(reader, output)?;
-
-    // Inspect every resident endpoint before allowing absence elsewhere to
-    // downgrade the verdict to Pending.
-    let target = match target {
-        Some(blob) => match ArchiveBM25Index::try_from_blob(blob) {
-            Ok(index) => Some(index),
-            Err(error) => {
-                return Ok(Validation::Rejected(format!(
-                    "invalid resident Archive BM25 derive output: {error}"
-                )))
-            }
-        },
-        None => None,
-    };
-
-    let expected = match source {
-        Some(source) => match derive_for_validation(reader, source)? {
-            DeriveValidation::Ready(expected) => Some(expected),
-            DeriveValidation::Pending => None,
-            DeriveValidation::Rejected(reason) => return Ok(Validation::Rejected(reason)),
-        },
-        None => None,
-    };
-    let (Some(expected), Some(target)) = (expected, target) else {
-        return Ok(Validation::Pending);
-    };
-    let target: Blob<PortableBM25Blob> = target.to_blob();
-    Ok(if target.bytes == expected.bytes {
-        Validation::Accepted
-    } else {
-        Validation::Rejected(
-            "Archive BM25 derive output is not the exact canonical block-text projection"
-                .to_owned(),
-        )
-    })
-}
-
-/// Validate supplied endpoint bytes for one exact derivation.
-///
-/// This is the publication-side form of [`validate_derive`]: it admits no
-/// residency ambiguity, recomputes both endpoint identities from the supplied
-/// bytes, and still classifies a selected nonresident payload as `Pending`.
-pub fn validate_derive_bytes(
-    reader: &PileReader,
-    source_descriptor: &CollectionDescriptor,
-    target_descriptor: &CollectionDescriptor,
-    claim: &CollectionDerive,
-    source: &Blob<SimpleArchive>,
-    target: &Blob<PortableBM25Blob>,
-) -> Result<Validation> {
-    let expected_source = simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID);
-    let expected_target = descriptor();
-    if source_descriptor != &expected_source || target_descriptor != &expected_target {
-        return Ok(Validation::Rejected(
-            "Archive BM25 derive descriptors do not name the exact V4 recipe endpoints".to_owned(),
-        ));
-    }
-    if claim.source() != source_descriptor.handle() || claim.target() != target_descriptor.handle()
-    {
-        return Ok(Validation::Rejected(
-            "Archive BM25 derive record does not name its exact descriptor handles".to_owned(),
-        ));
-    }
-    let (input, output) = claim.mapping();
-    if endpoint_identity(source) != input {
-        return Ok(Validation::Rejected(
-            "Archive BM25 derive source bytes do not match the claimed input".to_owned(),
-        ));
-    }
-    if endpoint_identity(target) != output {
-        return Ok(Validation::Rejected(
-            "Archive BM25 derive target bytes do not match the claimed output".to_owned(),
-        ));
-    }
-
-    let target = match ArchiveBM25Index::try_from_blob(target.clone()) {
-        Ok(target) => target,
-        Err(error) => {
-            return Ok(Validation::Rejected(format!(
-                "invalid resident Archive BM25 derive output: {error}"
-            )))
-        }
-    };
-    let expected = match derive_for_validation(reader, source.clone())? {
-        DeriveValidation::Ready(expected) => expected,
-        DeriveValidation::Pending => return Ok(Validation::Pending),
-        DeriveValidation::Rejected(reason) => return Ok(Validation::Rejected(reason)),
-    };
-    let target: Blob<PortableBM25Blob> = target.to_blob();
-    Ok(if target.bytes == expected.bytes {
-        Validation::Accepted
-    } else {
-        Validation::Rejected(
-            "Archive BM25 derive output is not the exact canonical block-text projection"
-                .to_owned(),
-        )
-    })
-}
-
-/// Validate one exact pointwise-maximum merge in the Archive BM25 collection.
-pub fn validate_merge(
-    reader: &PileReader,
-    target_descriptor: &CollectionDescriptor,
-    claim: &CollectionMerge,
-) -> Result<Validation> {
-    let expected_target = descriptor();
-    if target_descriptor != &expected_target {
-        return Ok(Validation::Rejected(
-            "Archive BM25 merge descriptor does not name the exact V4 recipe".to_owned(),
-        ));
-    }
-    if claim.collection() != target_descriptor.handle() {
-        return Ok(Validation::Rejected(
-            "Archive BM25 merge record names a different collection descriptor".to_owned(),
-        ));
-    }
-
-    let (low_data, high_data) = claim.inputs();
-    let low = load_blob::<PortableBM25Blob>(reader, low_data)?;
-    let high = load_blob::<PortableBM25Blob>(reader, high_data)?;
-    let result = load_blob::<PortableBM25Blob>(reader, claim.result())?;
-
-    let low = attach_resident(low, "merge low input");
-    let high = attach_resident(high, "merge high input");
-    let result = attach_resident(result, "merge result");
-    for endpoint in [&low, &high, &result] {
-        if let AttachValidation::Rejected(reason) = endpoint {
-            return Ok(Validation::Rejected(reason.clone()));
-        }
-    }
-    let (
-        AttachValidation::Ready(low),
-        AttachValidation::Ready(high),
-        AttachValidation::Ready(result),
-    ) = (low, high, result)
-    else {
-        return Ok(Validation::Pending);
-    };
-
-    let expected = match low.merged(&high) {
-        Ok(expected) => expected,
-        Err(error) => {
-            return Ok(Validation::Rejected(format!(
-                "Archive BM25 exact merge failed: {error}"
-            )))
-        }
-    };
-    let expected: Blob<PortableBM25Blob> = expected.to_blob();
-    let result: Blob<PortableBM25Blob> = result.to_blob();
-    Ok(if result.bytes == expected.bytes {
-        Validation::Accepted
-    } else {
-        Validation::Rejected(
-            "Archive BM25 merge result is not the exact document-union/pointwise-max join"
-                .to_owned(),
-        )
-    })
-}
-
-/// Validate supplied endpoint bytes for one exact BM25 join equation.
-pub fn validate_merge_bytes(
-    target_descriptor: &CollectionDescriptor,
-    claim: &CollectionMerge,
-    low: &Blob<PortableBM25Blob>,
-    high: &Blob<PortableBM25Blob>,
-    result: &Blob<PortableBM25Blob>,
-) -> Validation {
-    if target_descriptor != &descriptor() {
-        return Validation::Rejected(
-            "Archive BM25 merge descriptor does not name the exact V4 recipe".to_owned(),
-        );
-    }
-    if claim.collection() != target_descriptor.handle() {
-        return Validation::Rejected(
-            "Archive BM25 merge record names a different collection descriptor".to_owned(),
-        );
-    }
-    let (expected_low, expected_high) = claim.inputs();
-    if endpoint_identity(low) != expected_low
-        || endpoint_identity(high) != expected_high
-        || endpoint_identity(result) != claim.result()
-    {
-        return Validation::Rejected(
-            "Archive BM25 merge endpoint bytes do not match the claimed identities".to_owned(),
-        );
-    }
-
-    let low = match ArchiveBM25Index::try_from_blob(low.clone()) {
-        Ok(index) => index,
-        Err(error) => {
-            return Validation::Rejected(format!(
-                "invalid resident Archive BM25 merge low input: {error}"
-            ))
-        }
-    };
-    let high = match ArchiveBM25Index::try_from_blob(high.clone()) {
-        Ok(index) => index,
-        Err(error) => {
-            return Validation::Rejected(format!(
-                "invalid resident Archive BM25 merge high input: {error}"
-            ))
-        }
-    };
-    let result_index = match ArchiveBM25Index::try_from_blob(result.clone()) {
-        Ok(index) => index,
-        Err(error) => {
-            return Validation::Rejected(format!(
-                "invalid resident Archive BM25 merge result: {error}"
-            ))
-        }
-    };
-    let expected = match low.merged(&high) {
-        Ok(expected) => expected,
-        Err(error) => {
-            return Validation::Rejected(format!("Archive BM25 exact merge failed: {error}"))
-        }
-    };
-    let expected: Blob<PortableBM25Blob> = expected.to_blob();
-    let result: Blob<PortableBM25Blob> = result_index.to_blob();
-    if result.bytes == expected.bytes {
-        Validation::Accepted
-    } else {
-        Validation::Rejected(
-            "Archive BM25 merge result is not the exact document-union/pointwise-max join"
-                .to_owned(),
-        )
-    }
-}
-
-fn attach_resident(blob: Option<Blob<PortableBM25Blob>>, role: &str) -> AttachValidation {
-    let Some(blob) = blob else {
-        return AttachValidation::Pending;
-    };
-    match ArchiveBM25Index::try_from_blob(blob) {
-        Ok(index) => AttachValidation::Ready(index),
-        Err(error) => {
-            AttachValidation::Rejected(format!("invalid resident Archive BM25 {role}: {error}"))
-        }
-    }
-}
-
-fn load_blob<E>(reader: &PileReader, data: CollectionData) -> Result<Option<Blob<E>>>
-where
-    E: BlobEncoding,
-    Handle<E>: InlineEncoding,
-{
-    let handle = Handle::<E>::from_hash(data);
-    if reader.metadata(handle)?.is_none() {
-        return Ok(None);
-    }
-    let blob: Blob<E> = reader.get(handle)?;
-    let actual = Blob::<E>::new(blob.bytes.clone()).get_handle();
-    if actual.raw != data.raw {
-        bail!(
-            "resident collection endpoint {} hashes to {}",
-            hex::encode_upper(data.raw),
-            hex::encode_upper(actual.raw),
-        );
-    }
-    Ok(Some(blob))
-}
-
-fn endpoint_identity<E>(blob: &Blob<E>) -> CollectionData
-where
-    E: BlobEncoding,
-    Handle<E>: InlineEncoding,
-{
-    Handle::<E>::to_hash(Blob::<E>::new(blob.bytes.clone()).get_handle())
 }
 
 fn derive_for_validation(
@@ -832,10 +512,6 @@ mod tests {
         derive_element(reader, source).unwrap()
     }
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
-    }
-
     #[test]
     fn recipe_v1_freezes_case_punctuation_and_unicode_tokenization() {
         let actual: Vec<_> = hash_tokens("Hello, WORLD — hello. 🛰️")
@@ -930,138 +606,12 @@ mod tests {
     }
 
     #[test]
-    fn validators_bind_v4_endpoints_and_exact_output() {
-        let source_descriptor = simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID);
-        let target_descriptor = descriptor();
-        let block = text_block(&[(schema::content_fact::modality::TEXT, "alpha")]);
-        let (source, attachments) = source_and_attachments(block);
-        let attachment_store = StoredBlobs::new(attachments.clone());
-        let target = derive(&attachment_store.reader, source.clone());
-        let wrong_target: Blob<PortableBM25Blob> = ArchiveBM25Index::from_exact_counts([], [])
-            .unwrap()
-            .to_blob();
-
-        let mut blobs = attachments;
-        blobs.push(source.clone().transmute::<UnknownBlob>());
-        blobs.push(target.clone().transmute::<UnknownBlob>());
-        blobs.push(wrong_target.clone().transmute::<UnknownBlob>());
-        let store = StoredBlobs::new(blobs);
-        let derive = CollectionDerive::new(
-            source_descriptor.handle(),
-            target_descriptor.handle(),
-            Handle::<SimpleArchive>::to_hash(source.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(target.get_handle()),
-        );
-        assert_eq!(
-            validate_derive(
-                &store.reader,
-                &source_descriptor,
-                &target_descriptor,
-                &derive
-            )
-            .unwrap(),
-            Validation::Accepted
-        );
-
-        let wrong_output = CollectionDerive::new(
-            source_descriptor.handle(),
-            target_descriptor.handle(),
-            Handle::<SimpleArchive>::to_hash(source.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(wrong_target.get_handle()),
-        );
-        assert!(matches!(
-            validate_derive(
-                &store.reader,
-                &source_descriptor,
-                &target_descriptor,
-                &wrong_output
-            )
-            .unwrap(),
-            Validation::Rejected(_)
-        ));
-        let wrong_endpoint = CollectionDerive::new(
-            source_descriptor.handle(),
-            CollectionDescriptor::new(id(0x72), <PortableBM25Blob as MetaDescribe>::id(), id(0x73))
-                .handle(),
-            Handle::<SimpleArchive>::to_hash(source.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(target.get_handle()),
-        );
-        assert!(matches!(
-            validate_derive(
-                &store.reader,
-                &source_descriptor,
-                &target_descriptor,
-                &wrong_endpoint
-            )
-            .unwrap(),
-            Validation::Rejected(_)
-        ));
-
-        let document: Inline<GenId> = id(0x71).to_inline();
-        let term = hash_tokens("maximum")[0];
-        let low = ArchiveBM25Index::from_exact_counts([document], [(document, term, 2)])
-            .unwrap()
-            .to_blob();
-        let high = ArchiveBM25Index::from_exact_counts([document], [(document, term, 5)])
-            .unwrap()
-            .to_blob();
-        let joined = parse(low.clone()).merged(&parse(high.clone())).unwrap();
-        assert_eq!(joined.term_frequency(&document, &term), 5);
-        let joined: Blob<PortableBM25Blob> = joined.to_blob();
-        let merge_store = StoredBlobs::new([
-            low.clone().transmute::<UnknownBlob>(),
-            high.clone().transmute::<UnknownBlob>(),
-            joined.clone().transmute::<UnknownBlob>(),
-        ]);
-        let merge = CollectionMerge::new(
-            target_descriptor.handle(),
-            Handle::<PortableBM25Blob>::to_hash(low.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(high.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(joined.get_handle()),
-        );
-        assert_eq!(
-            validate_merge(&merge_store.reader, &target_descriptor, &merge).unwrap(),
-            Validation::Accepted
-        );
-        let wrong_merge = CollectionMerge::new(
-            target_descriptor.handle(),
-            Handle::<PortableBM25Blob>::to_hash(low.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(high.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(low.get_handle()),
-        );
-        assert!(matches!(
-            validate_merge(&merge_store.reader, &target_descriptor, &wrong_merge).unwrap(),
-            Validation::Rejected(_)
-        ));
-    }
-
-    #[test]
-    fn missing_payload_is_pending_but_malformed_resident_source_rejects() {
-        let source_descriptor = simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID);
-        let target_descriptor = descriptor();
-        let absent_target: Blob<PortableBM25Blob> = ArchiveBM25Index::from_exact_counts([], [])
-            .unwrap()
-            .to_blob();
-
+    fn missing_payload_and_malformed_source_fail_derivation() {
         let block = text_block(&[(schema::content_fact::modality::TEXT, "not resident")]);
         let (source, _attachments) = source_and_attachments(block);
-        let missing_store = StoredBlobs::new([source.clone().transmute::<UnknownBlob>()]);
-        let missing_claim = CollectionDerive::new(
-            source_descriptor.handle(),
-            target_descriptor.handle(),
-            Handle::<SimpleArchive>::to_hash(source.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(absent_target.get_handle()),
-        );
-        assert_eq!(
-            validate_derive(
-                &missing_store.reader,
-                &source_descriptor,
-                &target_descriptor,
-                &missing_claim,
-            )
-            .unwrap(),
-            Validation::Pending
-        );
+        let missing_store = StoredBlobs::new([]);
+        let error = derive_element(&missing_store.reader, source).unwrap_err();
+        assert!(format!("{error:#}").contains("nonresident text payload"));
 
         let mut malformed_graph =
             text_block(&[(schema::content_fact::modality::TEXT, "also absent")]);
@@ -1070,42 +620,12 @@ mod tests {
             metadata::name: "unexpected block field",
         };
         let (malformed_graph, _attachments) = source_and_attachments(malformed_graph);
-        let malformed_store =
-            StoredBlobs::new([malformed_graph.clone().transmute::<UnknownBlob>()]);
-        let malformed_claim = CollectionDerive::new(
-            source_descriptor.handle(),
-            target_descriptor.handle(),
-            Handle::<SimpleArchive>::to_hash(malformed_graph.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(absent_target.get_handle()),
-        );
-        assert!(matches!(
-            validate_derive(
-                &malformed_store.reader,
-                &source_descriptor,
-                &target_descriptor,
-                &malformed_claim,
-            )
-            .unwrap(),
-            Validation::Rejected(reason) if reason.contains("unknown attribute")
-        ));
+        let malformed_store = StoredBlobs::new([]);
+        let error = derive_element(&malformed_store.reader, malformed_graph).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown attribute"));
 
         let malformed = Blob::<SimpleArchive>::new(Bytes::from(vec![0xFF]));
-        let malformed_store = StoredBlobs::new([malformed.clone().transmute::<UnknownBlob>()]);
-        let malformed_claim = CollectionDerive::new(
-            source_descriptor.handle(),
-            target_descriptor.handle(),
-            Handle::<SimpleArchive>::to_hash(malformed.get_handle()),
-            Handle::<PortableBM25Blob>::to_hash(absent_target.get_handle()),
-        );
-        assert!(matches!(
-            validate_derive(
-                &malformed_store.reader,
-                &source_descriptor,
-                &target_descriptor,
-                &malformed_claim,
-            )
-            .unwrap(),
-            Validation::Rejected(reason) if reason.contains("canonical SimpleArchive")
-        ));
+        let error = derive_element(&malformed_store.reader, malformed).unwrap_err();
+        assert!(format!("{error:#}").contains("canonical SimpleArchive"));
     }
 }

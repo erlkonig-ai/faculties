@@ -4,14 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-- **Archive accelerators now ensure only the unsupported residual of one exact
-  frozen ticket.** Raw-Succinct and BM25 reuse admitted resident `DERIVE` and
-  `MERGE` proofs, deduplicate equal source data without losing signed-root
-  support, and canonically reprobe the same byte-identical commit records after
-  appending. Missing canonical descriptor blobs are restored after ticket
-  validation, including on an otherwise complete fast path. BM25 compaction
-  remains a separate step, and neither path adds an explicit durability flush
-  or reopens its mutable pile.
+- **Archive accelerators now use TribleSpace's native exact-ticket kernel.**
+  Raw Succinct delegates directly to the canonical collection algebra without
+  eagerly publishing unused Rank9 fibers. Archive BM25 supplies only its five
+  attachment-aware algebra operations, while the shared kernel owns frozen
+  ticket admission, overlap-aware physical covers, residual publication, and
+  explicit dyadic target compaction. Complete retries remain write-free even
+  when descriptor blobs were collected, no path adds a durability flush, and
+  the now-unused Faculties `gpu-succinct` policy feature is removed.
 - **Retired the unused branch-era persisted HNSW API.** The public
   `embedding_rollup`, `refresh_index`, and `nearest_via_index` helpers and their
   mutable-head tests are removed. Live Files, Wiki, and Memory similarity uses
@@ -278,10 +278,6 @@ All notable changes to this project will be documented in this file.
   validates BM25 + Succinct coverage from one branch-head snapshot before any
   attachment and reads the succinct segments only when lexical hits need
   materialising; the legacy monolithic rollup is no longer rebuilt or consulted.
-  A dedicated archive build can opt large Succinct carries into the reusable
-  WGPU backend with `--no-default-features --features gpu-succinct`; the normal
-  build stays GPU-free, canonical segment bytes are shared, and returned
-  accelerator errors retry on CPU before any manifest replacement.
 - **Archive list and search are indexed-only reads.** `archive list` now
   validates and attaches the branch-head Succinct manifest instead of checking
   out the entire raw archive, k-way merges each segment's reverse

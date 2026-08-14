@@ -3941,7 +3941,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "triblespace",
- "triblespace-gpu",
  "triblespace-paths",
  "triblespace-search",
  "typst",

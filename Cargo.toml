@@ -133,11 +133,6 @@ imagine = ["dep:mary", "mary/flux", "dep:image"]
 # (FreeBSD build class, 2026-07-21) via --no-default-features.
 audio = ["dep:rodio"]
 voice = ["dep:mary", "mary/speak", "audio"]
-# Opt-in WGPU acceleration for large SuccinctArchive LSM carries. The normal
-# archive binary remains GPU-free; enabling this feature selects the reusable
-# shared CubeCL 0.10 WGPU backend with canonical CPU fallback.
-gpu-succinct = ["dep:triblespace-gpu", "triblespace-gpu/wgpu"]
-
 [dependencies]
 # Core: every CLI faculty depends on these.
 anyhow = "1.0"
@@ -149,7 +144,6 @@ triblespace = { version = "0.47", path = "../triblespace-rs" }
 triblespace-paths = { version = "0.47.0", path = "../triblespace-rs/triblespace-paths" }
 triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
 faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
-triblespace-gpu = { version = "0.47.0", path = "../triblespace-rs/triblespace-gpu", optional = true, default-features = false }
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).
 anybytes = "0.20"           # files
