@@ -869,26 +869,40 @@ fn derived_links(reader: &PileReader, entry: &EntryRecord) -> Result<BTreeSet<Id
     Ok(out)
 }
 
-fn derived_typed_links(
+#[derive(Default)]
+struct BacklinkSummary {
+    tags: BTreeSet<Id>,
+    types: BTreeSet<String>,
+}
+
+fn backlink_summaries(
     reader: &PileReader,
-    entry: &EntryRecord,
-) -> Result<Vec<(Option<String>, Id)>> {
+    entries: &[EntryRecord],
+) -> Result<BTreeMap<Id, BacklinkSummary>> {
     let expression = regex::Regex::new(
         r#"#link\("wiki:(?:(?P<kind>[A-Za-z_][A-Za-z0-9_]*):)?(?P<id>[0-9A-Fa-f]{32})"\)"#,
     )
     .expect("static Wiki link expression");
-    let mut links = Vec::new();
-    for head in &entry.frontier {
-        let content = revision_content(reader, head)?;
-        for captures in expression.captures_iter(&content) {
-            let target = Id::from_hex(&captures["id"]).expect("expression matched a full id");
-            let kind = captures.name("kind").map(|value| value.as_str().to_owned());
-            links.push((kind, target));
+    let mut summaries = BTreeMap::<Id, BacklinkSummary>::new();
+    for source in entries {
+        let source_tags: BTreeSet<Id> = source
+            .frontier
+            .iter()
+            .flat_map(|head| head.tags.iter().copied())
+            .collect();
+        for head in &source.frontier {
+            let content = revision_content(reader, head)?;
+            for captures in expression.captures_iter(&content) {
+                let target = Id::from_hex(&captures["id"]).expect("expression matched a full id");
+                let summary = summaries.entry(target).or_default();
+                summary.tags.extend(source_tags.iter().copied());
+                if let Some(kind) = captures.name("kind") {
+                    summary.types.insert(kind.as_str().to_ascii_lowercase());
+                }
+            }
         }
     }
-    links.sort();
-    links.dedup();
-    Ok(links)
+    Ok(summaries)
 }
 
 fn cmd_links(storage: WikiStorage<'_>, id: String) -> Result<()> {
@@ -963,7 +977,28 @@ fn cmd_list(
         .iter()
         .map(|name| named_tag(name))
         .collect::<Result<_>>()?;
-    let all_entries = catalog.revisions.all_entries();
+    let with_backlink_types: Vec<String> = with_backlink_type
+        .iter()
+        .map(|kind| kind.to_ascii_lowercase())
+        .collect();
+    let without_backlink_types: Vec<String> = without_backlink_type
+        .iter()
+        .map(|kind| kind.to_ascii_lowercase())
+        .collect();
+    let has_backlink_filter = !with_backlink_tags.is_empty()
+        || !without_backlink_tags.is_empty()
+        || !with_backlink_types.is_empty()
+        || !without_backlink_types.is_empty();
+    // Titles and tags are already in the catalog. Only backlink filters need
+    // page content, so scan every source once and invert its links on demand.
+    let backlink_summaries = if has_backlink_filter {
+        Some(backlink_summaries(
+            &view.reader,
+            &catalog.revisions.all_entries(),
+        )?)
+    } else {
+        None
+    };
     let entries = if all {
         catalog.revisions.all_entries()
     } else {
@@ -978,42 +1013,30 @@ fn cmd_list(
         {
             continue;
         }
-        let target_ids: BTreeSet<Id> = entry
-            .members
-            .iter()
-            .copied()
-            .chain(entry.legacy_fragments.iter().copied())
-            .collect();
-        let mut incoming_tags = BTreeSet::new();
-        let mut incoming_types = BTreeSet::new();
-        for source in &all_entries {
-            let links = derived_typed_links(&view.reader, source)?;
-            for (kind, _) in links
-                .into_iter()
-                .filter(|(_, target)| target_ids.contains(target))
-            {
-                if let Some(kind) = kind {
-                    incoming_types.insert(kind.to_ascii_lowercase());
-                }
-                for head in &source.frontier {
-                    incoming_tags.extend(head.tags.iter().copied());
+        if let Some(backlink_summaries) = &backlink_summaries {
+            let mut incoming_tags = BTreeSet::new();
+            let mut incoming_types = BTreeSet::new();
+            for target in entry.members.iter().chain(entry.legacy_fragments.iter()) {
+                if let Some(summary) = backlink_summaries.get(target) {
+                    incoming_tags.extend(summary.tags.iter().copied());
+                    incoming_types.extend(summary.types.iter().cloned());
                 }
             }
-        }
-        if !with_backlink_tags
-            .iter()
-            .all(|tag| incoming_tags.contains(tag))
-            || without_backlink_tags
+            if !with_backlink_tags
                 .iter()
-                .any(|tag| incoming_tags.contains(tag))
-            || !with_backlink_type
-                .iter()
-                .all(|kind| incoming_types.contains(&kind.to_ascii_lowercase()))
-            || without_backlink_type
-                .iter()
-                .any(|kind| incoming_types.contains(&kind.to_ascii_lowercase()))
-        {
-            continue;
+                .all(|tag| incoming_tags.contains(tag))
+                || without_backlink_tags
+                    .iter()
+                    .any(|tag| incoming_tags.contains(tag))
+                || !with_backlink_types
+                    .iter()
+                    .all(|kind| incoming_types.contains(kind))
+                || without_backlink_types
+                    .iter()
+                    .any(|kind| incoming_types.contains(kind))
+            {
+                continue;
+            }
         }
         println!(
             "{}{}",
@@ -1716,6 +1739,43 @@ mod tests {
             fixed,
             format!("#link(\"wiki:reviews:{revision:x}\")[review]")
         );
+    }
+
+    #[test]
+    fn backlink_summaries_index_typed_links_and_source_tags() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let before = storage.view().unwrap();
+        let mut fragment = Fragment::empty();
+        let target = stage_revision(
+            storage,
+            &mut fragment,
+            None,
+            "target".to_owned(),
+            "body".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let (tag_fragment, source_tag, _) = wiki_model::tag_record("source").unwrap();
+        fragment += tag_fragment;
+        stage_revision(
+            storage,
+            &mut fragment,
+            None,
+            "source".to_owned(),
+            format!("#link(\"wiki:Reviews:{target:x}\")[review]"),
+            BTreeSet::from([source_tag]),
+        )
+        .unwrap();
+        storage.publish(&before, fragment).unwrap();
+
+        let after = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&after.facts).unwrap();
+        let summaries =
+            backlink_summaries(&after.reader, &catalog.revisions.all_entries()).unwrap();
+        let incoming = summaries.get(&target).unwrap();
+        assert_eq!(incoming.tags, BTreeSet::from([source_tag]));
+        assert_eq!(incoming.types, BTreeSet::from(["reviews".to_owned()]));
     }
 
     #[test]
