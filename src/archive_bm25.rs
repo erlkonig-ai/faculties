@@ -42,8 +42,10 @@ use crate::schemas::blockdag as schema;
 /// Minted with `trible genid` on 2026-08-08:
 /// `0DDC5AFF78EFBC00CA64CEA0F9565291`.
 ///
-/// Changing the selected graph fields, aggregation law, tokenizer behavior,
-/// document/term schemas, or scoring semantics requires a new recipe id.
+/// Changing the selected graph fields, occurrence aggregation / term-frequency
+/// law, tokenizer behavior, or document/term schemas requires a new recipe id.
+/// BM25 `k1` / `b` scoring policy is derived query behavior and is deliberately
+/// outside the persisted collection identity.
 pub const ARCHIVE_BLOCK_TEXT_BM25_RECIPE_V1: Id = id_hex!("0DDC5AFF78EFBC00CA64CEA0F9565291");
 
 pub type ArchiveBM25Index = PortableBM25Index<GenId, WordHash>;

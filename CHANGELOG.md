@@ -44,7 +44,9 @@ All notable changes to this project will be documented in this file.
   pointwise-maximum `MERGE` validators admit leaf-wise, merge-before-derive,
   or mixed resident covers without a branch, manifest, registry, timestamp
   winner, or legacy index trust. The `archive index` and `archive search`
-  commands now build and query that cover.
+  commands now build and query that cover. Recipe identity freezes the selected
+  graph, occurrence aggregation / exact-TF law, tokenizer, and document/term
+  schemas; derived `k1` / `b` query scoring policy is intentionally outside it.
   Archive reads bind facts, the exact authorized source commits, and their
   validating blob reader through one coherent collection snapshot; a split
   source without either complete leaf derivations or an admitted merge route

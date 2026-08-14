@@ -27,7 +27,6 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
-use triblespace_search::index_bm25::query_across;
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
 use triblespace_search::tokens::{hash_tokens, WordHash};
 
@@ -378,14 +377,9 @@ impl ExactDerivedAlgebra<SimpleArchive, PortableBM25Blob> for ArchiveBm25Algebra
                 "target descriptor does not match the Archive BM25 recipe".to_owned(),
             ));
         }
-        let index = ArchiveBm25::try_from_blob(target.clone()).map_err(fatal_bm25)?;
-        let canonical: Blob<PortableBM25Blob> = index.to_blob();
-        if canonical.bytes != target.bytes {
-            return Err(ExactAlgebraError::Fatal(
-                "Archive BM25 target is not canonical".to_owned(),
-            ));
-        }
-        Ok(())
+        ArchiveBm25::try_from_blob(target.clone())
+            .map(|_| ())
+            .map_err(fatal_bm25)
     }
 
     fn join_source(
@@ -421,11 +415,11 @@ fn distinct_ticket_data(commits: &[CollectionCommit]) -> BTreeSet<CollectionData
     commits.iter().map(CollectionCommit::data).collect()
 }
 
-/// One frozen Archive view and the exact portable BM25 cover derived from the
-/// same set of authorized source commits.
+/// One frozen Archive view and one resident portable BM25 index attached from
+/// the exact cover of the same authorized source commits.
 pub struct ArchiveSearchSnapshot {
     archive: ArchiveSnapshot,
-    segments: Vec<ArchiveBm25>,
+    index: ArchiveBm25,
 }
 
 impl ArchiveSearchSnapshot {
@@ -448,7 +442,14 @@ impl ArchiveSearchSnapshot {
                     )
                 })?);
             }
-            Ok(Self { archive, segments })
+            let index = match segments.len() {
+                0 => ArchiveBm25::merge(std::iter::empty::<&ArchiveBm25>())
+                    .context("construct the empty Archive BM25 resident view")?,
+                1 => segments.pop().expect("one attached Archive BM25 element"),
+                _ => ArchiveBm25::merge(segments.iter())
+                    .context("join exact Archive BM25 cover for resident search")?,
+            };
+            Ok(Self { archive, index })
         })();
         close_collection(
             collection,
@@ -461,16 +462,11 @@ impl ArchiveSearchSnapshot {
         &self.archive
     }
 
-    pub fn segment_count(&self) -> usize {
-        self.segments.len()
-    }
-
     pub fn search(&self, text: &str, limit: usize) -> Result<Vec<ArchiveSearchHit>> {
-        if limit == 0 || self.segments.is_empty() {
+        if limit == 0 {
             return Ok(Vec::new());
         }
-        let ranked = query_across(&self.segments, &hash_tokens(text))
-            .map_err(|error| anyhow!("query Archive BM25 cover: {error}"))?;
+        let ranked = self.index.query_multi(&hash_tokens(text));
         ranked
             .into_iter()
             .take(limit)
@@ -1102,6 +1098,29 @@ mod tests {
     }
 
     #[test]
+    fn zero_commit_search_uses_the_canonical_empty_resident_index() {
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("archive.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_signer(&pile_path, Some(&key)).unwrap();
+
+        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
+        assert_eq!(
+            (
+                report.source_commits,
+                report.source_elements,
+                report.cover_segments
+            ),
+            (0, 0, 0)
+        );
+
+        let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        assert!(search.archive().commits().is_empty());
+        assert!(search.search("anything", 10).unwrap().is_empty());
+    }
+
+    #[test]
     fn empty_commit_receives_exact_empty_derives_and_keeps_reads_empty() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
@@ -1255,7 +1274,6 @@ mod tests {
         pile.close().unwrap();
 
         let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
-        assert_eq!(search.segment_count(), 1);
         assert_eq!(search.search("alpha", 10).unwrap().len(), 1);
         assert_eq!(search.search("beta", 10).unwrap().len(), 1);
     }
