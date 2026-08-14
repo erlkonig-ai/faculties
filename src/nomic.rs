@@ -85,12 +85,7 @@ fn open_model_repo(path: &Path) -> Result<Repository<Pile>> {
     let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
-        return Err(anyhow!(
-            "refresh model pile {}: {err:?} — refusing to auto-repair on a read path; if, and \
-             only if, the tail is a genuinely torn write, amputate explicitly with `trible pile \
-             amputate`",
-            path.display()
-        ));
+        return Err(crate::collection_cutover::pile_read_error(path, err));
     }
     Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
         .map_err(|err| anyhow!("create repository: {err:?}"))

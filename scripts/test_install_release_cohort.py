@@ -50,7 +50,15 @@ class ReleaseCohortTest(unittest.TestCase):
         path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{content}'\n")
         path.chmod(0o755)
 
-    def invoke(self, generation: str, *extra: str) -> subprocess.CompletedProcess[str]:
+    def invoke(
+        self, generation: str, *extra: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        invocation_env = os.environ.copy()
+        invocation_env["PATH"] = os.pathsep.join(
+            [str(self.prefix / "bin"), invocation_env.get("PATH", "")]
+        )
+        if env is not None:
+            invocation_env.update(env)
         return subprocess.run(
             [
                 str(SCRIPT),
@@ -67,6 +75,28 @@ class ReleaseCohortTest(unittest.TestCase):
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=invocation_env,
+        )
+
+    def activate(
+        self, generation: str, *, path: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["PATH"] = path or os.pathsep.join(
+            [str(self.prefix / "bin"), env.get("PATH", "")]
+        )
+        return subprocess.run(
+            [
+                str(SCRIPT),
+                "--prefix",
+                str(self.prefix),
+                "--activate-staged",
+                generation,
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
         )
 
     def test_stages_manifest_links_and_atomic_generation_switch(self) -> None:
@@ -78,18 +108,7 @@ class ReleaseCohortTest(unittest.TestCase):
         release = self.prefix / "lib" / "faculties" / "releases" / "first"
         current = self.prefix / "lib" / "faculties" / "current"
         self.assertFalse(os.path.lexists(current))
-        activated = subprocess.run(
-            [
-                str(SCRIPT),
-                "--prefix",
-                str(self.prefix),
-                "--activate-staged",
-                "first",
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        activated = self.activate("first")
         self.assertEqual(activated.returncode, 0, activated.stderr)
         self.assertEqual(os.readlink(current), "releases/first")
         self.assertEqual(
@@ -157,6 +176,28 @@ class ReleaseCohortTest(unittest.TestCase):
         (worktree / "scratch.rs").write_text("outside selected checkout\n")
         clean = self.invoke("litter", "--dry-run")
         self.assertEqual(clean.returncode, 0, clean.stderr)
+
+    def test_refuses_activation_when_an_earlier_path_entry_shadows_cohort(self) -> None:
+        self.binary("orient", "managed orient")
+        staged = self.invoke("shadowed", "--stage-only")
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+
+        stale_bin = self.root / "home" / ".cargo" / "bin"
+        stale_bin.mkdir(parents=True)
+        stale_orient = stale_bin / "orient"
+        stale_orient.write_text("#!/bin/sh\nprintf 'stale orient\\n'\n")
+        stale_orient.chmod(0o755)
+        path = os.pathsep.join(
+            [str(stale_bin), str(self.prefix / "bin"), os.environ.get("PATH", "")]
+        )
+
+        activated = self.activate("shadowed", path=path)
+        self.assertNotEqual(activated.returncode, 0)
+        self.assertIn("PATH shadows managed Faculties command 'orient'", activated.stderr)
+        self.assertIn(str(stale_orient), activated.stderr)
+        self.assertFalse(
+            os.path.lexists(self.prefix / "lib" / "faculties" / "current")
+        )
 
 
 if __name__ == "__main__":

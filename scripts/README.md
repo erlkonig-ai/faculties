@@ -6,6 +6,11 @@ before atomically replacing `~/.local/lib/faculties/current`; commands in
 `~/.local/bin` always pass through that symlink. The `mail` binary is exposed as
 `faculties-mail` so the operating system's `mail(1)` is never shadowed.
 
+Keep `~/.local/bin` before directories containing ad-hoc Faculties installs,
+especially `~/.cargo/bin`. Activation checks the caller's `PATH` and refuses if
+an earlier executable would shadow any command in the staged cohort; it never
+deletes or rewrites that executable on the operator's behalf.
+
 The installer refuses dirty Git repositories among the selected local Cargo
 dependencies. Each generation carries `Cargo.lock` and a JSON manifest with
 the exact source revisions and tree hashes, requested and resolved Cargo

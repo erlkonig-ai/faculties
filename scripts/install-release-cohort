@@ -219,6 +219,42 @@ def preflight_links(prefix: Path, links: dict[str, str]) -> None:
                 raise ReleaseError(f"refusing to replace unmanaged command: {path}")
 
 
+def preflight_path(prefix: Path, links: dict[str, str], path_value: str) -> None:
+    """Refuse activation when another executable would shadow this cohort.
+
+    We inspect PATH exactly as the caller supplied it. Activation cannot make
+    ``prefix/bin`` win over an earlier directory, and silently succeeding in
+    that state gives the operator a coherent installed generation that no
+    ordinary command actually reaches.
+    """
+    command_dir = (prefix / "bin").resolve()
+    if not path_value:
+        raise ReleaseError(
+            f"PATH is empty; activation would not make {command_dir} directly invocable"
+        )
+    entries = [
+        Path(entry or ".").expanduser().resolve()
+        for entry in path_value.split(os.pathsep)
+    ]
+    try:
+        managed_index = entries.index(command_dir)
+    except ValueError as error:
+        raise ReleaseError(
+            f"{command_dir} is absent from PATH; activation would not make the managed "
+            "Faculties cohort directly invocable"
+        ) from error
+
+    for earlier in entries[:managed_index]:
+        for link_name in sorted(links):
+            candidate = earlier / link_name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                raise ReleaseError(
+                    f"PATH shadows managed Faculties command {link_name!r}: {candidate} "
+                    f"precedes {command_dir / link_name}. Remove/archive the stale binary or "
+                    f"place {command_dir} earlier in PATH; nothing was activated"
+                )
+
+
 def links_for_binaries(binaries: list[Path]) -> dict[str, str]:
     links: dict[str, str] = {}
     for binary in binaries:
@@ -429,6 +465,7 @@ def activate_staged(prefix: Path, generation: str, *, dry_run: bool) -> dict[str
     command_dir = prefix / "bin"
     manifest, links = validate_staged_release(release_dir, generation)
     preflight_links(prefix, links)
+    preflight_path(prefix, links, os.environ.get("PATH", ""))
     if os.path.lexists(current) and not current.is_symlink():
         raise ReleaseError(f"current is not a symlink: {current}")
     if dry_run:

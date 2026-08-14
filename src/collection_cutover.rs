@@ -162,7 +162,7 @@ pub fn open_pile_strict(path: &Path) -> Result<Pile> {
     let mut pile = Pile::open(path).with_context(|| format!("open pile {}", path.display()))?;
     if let Err(error) = pile.refresh() {
         let close = pile.close();
-        let mut failure = read_error(path, error);
+        let mut failure = pile_read_error(path, error);
         if let Err(close_error) = close {
             failure = failure.context(format!(
                 "closing pile after failed refresh also failed: {close_error}"
@@ -1033,10 +1033,27 @@ fn fingerprint_legacy_pins(pins: &[LegacyPinCoordinate]) -> SourceFingerprint {
     }
 }
 
-fn read_error(path: &Path, error: ReadError) -> anyhow::Error {
+/// Render one non-mutating pile read failure without presenting data loss as
+/// routine repair.
+///
+/// A malformed known record and an interrupted append share the same
+/// conservative core error. Only an operator inspecting the bytes can decide
+/// whether the suffix is disposable, so faculties report evidence and stop.
+pub fn pile_read_error(path: &Path, error: ReadError) -> anyhow::Error {
     match error {
         ReadError::CorruptPile { valid_length } => anyhow!(
-            "pile {} is corrupt at byte {valid_length}; refusing to auto-repair",
+            "pile {} has a malformed or incomplete known record at byte {valid_length}; this \
+             reader cannot prove that the remaining bytes are a disposable torn write. The pile \
+             was left unchanged. Upgrade `trible` to the matching current source cohort, then \
+             inspect that boundary with `trible pile diagnose record-at {} {valid_length}` before \
+             considering any destructive action",
+            path.display(),
+            path.display()
+        ),
+        ReadError::UnsupportedRecord { .. } => anyhow!(
+            "pile {} contains a record format unsupported by this binary ({error}); this is \
+             likely version skew. Upgrade to a reader that recognizes the marker. The pile was \
+             left unchanged",
             path.display()
         ),
         other => anyhow!("refresh pile {}: {other}", path.display()),
@@ -1109,6 +1126,36 @@ mod tests {
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
+    }
+
+    #[test]
+    fn strict_open_reports_evidence_without_prescribing_data_loss() {
+        let files = TestFiles::new();
+        fs::write(&files.pile, [0xFF; 8]).unwrap();
+        let before = fs::read(&files.pile).unwrap();
+
+        let error = open_pile_strict(&files.pile)
+            .err()
+            .expect("malformed pile must fail strict open");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("malformed or incomplete known record at byte 0"));
+        assert!(rendered.contains("cannot prove"));
+        assert!(rendered.contains("matching current source cohort"));
+        assert!(rendered.contains("pile diagnose record-at"));
+        assert!(!rendered.contains("pile amputate"));
+        assert_eq!(fs::read(&files.pile).unwrap(), before);
+
+        let mut unsupported = [0u8; 256];
+        unsupported[..16].fill(0xA5);
+        fs::write(&files.pile, unsupported).unwrap();
+        let error = open_pile_strict(&files.pile)
+            .err()
+            .expect("unsupported marker must fail strict open");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("unsupported by this binary"));
+        assert!(rendered.contains("likely version skew"));
+        assert!(!rendered.contains("pile amputate"));
+        assert_eq!(fs::read(&files.pile).unwrap(), unsupported);
     }
 
     #[test]

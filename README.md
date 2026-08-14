@@ -47,9 +47,17 @@ git -C triblespace-rs checkout d8e8c13ee30f2973cb55e867b01a50f1503cc047
 git -C mary checkout 48751c261bcc98ffbe34dab4789eb49d24cd9b95
 git -C cubecl-fork checkout f299aed551ec97bf28b779bfed6e88a484a167e4
 cd faculties
-cargo install --path . --bins --locked
+cargo build --release --bins --locked
+scripts/install-release-cohort target/release
 cargo install --path ../triblespace-rs/trible --locked
 ```
+
+The cohort installer publishes one immutable generation through
+`~/.local/bin`; put that directory before `~/.cargo/bin` on `PATH`. Do not also
+run `cargo install --path . --bins`: that creates a second unmanaged Faculties
+suite in `~/.cargo/bin`, where an older parser can shadow the active cohort and
+misread newer pile records. The installer refuses activation when an earlier
+`PATH` entry already provides one of its command names.
 
 ### Use it
 
