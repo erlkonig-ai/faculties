@@ -45,14 +45,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: triblespace/triblespace-rs
-          ref: d8e8c13ee30f2973cb55e867b01a50f1503cc047
+          ref: 8eb734bc27b9dc860109deba929508701f07adcc
           path: triblespace-rs
 
       - name: Check out Mary cohort
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/mary
-          ref: 48751c261bcc98ffbe34dab4789eb49d24cd9b95
+          ref: 9d75973baf86dee200283345862a484869667e7d
           path: mary
 
       - name: Check out CubeCL zero-copy cohort

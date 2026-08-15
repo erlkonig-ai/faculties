@@ -43,8 +43,8 @@ git clone https://github.com/erlkonig-ai/faculties
 git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
-git -C triblespace-rs checkout d8e8c13ee30f2973cb55e867b01a50f1503cc047
-git -C mary checkout 48751c261bcc98ffbe34dab4789eb49d24cd9b95
+git -C triblespace-rs checkout 8eb734bc27b9dc860109deba929508701f07adcc
+git -C mary checkout 9d75973baf86dee200283345862a484869667e7d
 git -C cubecl-fork checkout f299aed551ec97bf28b779bfed6e88a484a167e4
 cd faculties
 cargo build --release --bins --locked
