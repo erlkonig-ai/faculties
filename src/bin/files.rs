@@ -571,8 +571,14 @@ fn load_mm7b() -> Result<Mm7bEmbedder> {
         })?,
     };
     eprintln!("files: loading nomic-embed-multimodal-7b (once, ~20s)…");
-    mary::persist::load_nomic_mm7b_aliased_from_pile(
-        &pile,
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+        .context("load native Mary MM7B model collection")?;
+    mary::persist::load_nomic_mm7b_aliased_from_snapshot(
+        snapshot,
+        mary::selection::ModelSelector::Source {
+            source: MODEL,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
         &tok,
         mary::nn::backend::WgpuDevice::default(),
     )
