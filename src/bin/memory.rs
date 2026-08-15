@@ -54,8 +54,6 @@ use triblespace::prelude::*;
              memory density [<grain>]        — find where the hierarchy is BUSHY (many flat leaf-children under one span, no intermediate arc summary) vs balanced vs coarse; worst-first\n  \
              memory search <query>           — exact lexical (BM25) search rebuilt from the frozen Memory view\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
-             memory import-tokenizer <json>   — one-time: seed the nomic model pile from a tokenizer.json (provenance blob + canonical tokenizer GRAPH), so the embedder is fully pile-loaded (no HF cache) [needs --features local-embed]\n  \
-             memory ingest-tokenizer          — one-time: build the canonical tokenizer GRAPH from the tokenizer.json blob already in the model pile (append-only, idempotent) [needs --features local-embed]\n  \
              memory lens [<theme>]            — thematic lenses beside the spine: list them, or print a theme's narratives (create with `create --lens <theme>`)\n  \
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
@@ -476,57 +474,13 @@ fn cmd_search(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 // of one cross-faculty semantic search: a text query here is directly
 // comparable to an image candidate there (nomic text+vision are co-embedded).
 //
-// Both embedders load ENTIRELY from their model piles — weights and
-// tokenizer — via the shared `faculties::nomic` seam. The tokenizer's
-// canonical form is a native TOKENIZER GRAPH in the pile (constructed back
-// into a `tokenizers::Tokenizer` at load, no tokenizer.json in the runtime
-// path); `memory import-tokenizer` seeds a fresh pile from a tokenizer.json
-// (blob provenance + graph), `memory ingest-tokenizer` upgrades a pile that
-// has only the blob. After that the HF cache can evict whatever it likes.
+// Both embedders load ENTIRELY from one immutable native Mary collection
+// snapshot per model pile — weights and tokenizer — via the shared
+// `faculties::nomic` seam. Import and legacy migration belong in Mary, outside
+// ordinary memory operation.
 
 #[cfg(feature = "local-embed")]
 use faculties::nomic;
-
-/// `memory import-tokenizer <tokenizer.json>` — append the text model's
-/// tokenizer to the nomic text pile, once: the json blob as import provenance
-/// plus the canonical tokenizer GRAPH built from it (idempotent; see
-/// `faculties::nomic::import_tokenizer`).
-#[cfg(feature = "local-embed")]
-fn cmd_import_tokenizer(args: &[String]) -> Result<()> {
-    let [path] = args else {
-        bail!("usage: memory import-tokenizer <path/to/tokenizer.json>");
-    };
-    nomic::import_tokenizer(
-        &nomic::text_pile(),
-        Path::new(path),
-        nomic::NOMIC_TEXT_MODEL,
-    )
-}
-
-#[cfg(not(feature = "local-embed"))]
-fn cmd_import_tokenizer(_args: &[String]) -> Result<()> {
-    bail!(
-        "`memory import-tokenizer` needs the local embedder — rebuild with --features local-embed"
-    );
-}
-
-/// `memory ingest-tokenizer` — build the canonical tokenizer GRAPH in the
-/// nomic text pile from its already-stored tokenizer.json blob (one-time,
-/// append-only, idempotent; see `faculties::nomic::ingest_tokenizer_graph`).
-#[cfg(feature = "local-embed")]
-fn cmd_ingest_tokenizer(args: &[String]) -> Result<()> {
-    if !args.is_empty() {
-        bail!("usage: memory ingest-tokenizer   (no arguments — reads the blob already in the model pile)");
-    }
-    nomic::ingest_tokenizer_graph(&nomic::text_pile())
-}
-
-#[cfg(not(feature = "local-embed"))]
-fn cmd_ingest_tokenizer(_args: &[String]) -> Result<()> {
-    bail!(
-        "`memory ingest-tokenizer` needs the local embedder — rebuild with --features local-embed"
-    );
-}
 
 /// `memory embed` — embed every live chunk summary that lacks a vector and
 /// store it as an observation in the shared Embeddings collection. Idempotent:
@@ -754,20 +708,6 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "similar") {
         return cmd_similar(storage, &cli.ids[1..]);
-    }
-    if cli
-        .ids
-        .first()
-        .is_some_and(|value| value == "import-tokenizer")
-    {
-        return cmd_import_tokenizer(&cli.ids[1..]);
-    }
-    if cli
-        .ids
-        .first()
-        .is_some_and(|value| value == "ingest-tokenizer")
-    {
-        return cmd_ingest_tokenizer(&cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "context") {
         return cmd_context(storage, &cli.ids[1..]);

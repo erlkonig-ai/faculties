@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Nomic inference now reads native Mary collections directly.** Each text or
+  vision model pile is frozen once, then its explicit source/quantization and
+  tokenizer-name selectors operate on that one coherent snapshot. Runtime no
+  longer opens Repository branches, writes ephemeral heads, falls back through
+  tokenizer JSON/temp files, or exposes model-import commands through Memory;
+  legacy import and migration live at Mary's control-plane boundary.
 - **Archive accelerators now use TribleSpace's native exact-ticket kernel.**
   Raw Succinct delegates directly to the canonical collection algebra without
   eagerly publishing unused Rank9 fibers. Archive BM25 supplies only its five

@@ -1,71 +1,36 @@
-//! The durable nomic embedder seam — weights AND tokenizer load from the
-//! dedicated model piles, with NO Hugging Face hub dependency at runtime.
+//! The durable Nomic embedder seam.
 //!
-//! One loader per modality of the shared 768-d space
-//! ([`crate::schemas::embeddings`]): [`load_text_embedder`] for
-//! nomic-embed-text-v1.5 and [`load_vision_embedder`] for
-//! nomic-embed-vision-v1.5, shared by every faculty that embeds (`memory
-//! embed/similar`, `wiki embed/similar`, …) so the seam lives in ONE place.
+//! Ordinary inference reads one immutable native Mary collection snapshot per
+//! model pile. Weight and tokenizer selection then happen against the same
+//! frozen facts and blob reader, so a concurrent append cannot give one
+//! component a different authority set from the other. There is no Repository
+//! branch, mutable Workspace, tokenizer JSON, temporary file, or Hugging Face
+//! fallback in this runtime path.
 //!
-//! Why the pile and not the HF cache: the cache is an EVICTABLE download
-//! artifact — `tokenizer.json` fell out of it once and silently broke
-//! `memory similar` on a machine whose weights pile was fine. The model pile
-//! is the durable store, so everything the embedder needs at runtime lives
-//! there: mary's `embed_persist` writes the weight graph, and the tokenizer
-//! lives beside it as a NATIVE TOKENIZER GRAPH (`mary::tokenizer`) — vocab,
-//! merges, added tokens, and the normalizer/pre-tok/decoder config tail all
-//! as tribles. Loading is construct-from-graph
-//! (`mary::persist::load_tokenizer_from_pile`): the parts are queried and fed
-//! to the `tokenizers` builders — no JSON parse, no temp file, no network.
-//!
-//! The graph is the CANONICAL tokenizer source. The `tokenizer.json` blob
-//! ([`attr::tokenizer_json`], via [`import_tokenizer`]) is retained as import
-//! provenance and as a fallback: if a pile predates the graph,
-//! [`load_text_embedder`] warns on stderr and materializes the blob to a temp
-//! file — run [`ingest_tokenizer_graph`] (`memory ingest-tokenizer`) once to
-//! build the graph and retire the fallback.
-//!
-//! Vision needs no tokenizer today (its pile is weights-only), but any future
-//! side-asset follows the same pattern: a graph (or at minimum a blob) in the
-//! model pile, never a hub-cache side-file.
+//! Import and schema-epoch migration belong in Mary. A model pile without the
+//! canonical native graph fails loudly here instead of silently switching
+//! storage models.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
-use ed25519_dalek::SigningKey;
-use rand_core::OsRng;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Repository;
-use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::Handle;
-use triblespace::prelude::*;
+use anyhow::{Context, Result};
+use mary::selection::{ModelSelector, TokenizerSelector};
+use triblespace::core::collection::CollectionSnapshot;
+use triblespace::core::repo::pile::PileReader;
 
-/// HF model ids — provenance only; nothing is fetched from the hub here.
+/// Hugging Face model ids are provenance only; runtime never fetches them.
 pub const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
 pub const NOMIC_VISION_MODEL: &str = "nomic-ai/nomic-embed-vision-v1.5";
 
-/// Default model-pile filenames (resolved under [`crate::model_dir`]);
-/// `NOMIC_TEXT_PILE` / `NOMIC_VISION_PILE` env vars override the full path so
-/// the faculty isn't pinned to one machine's layout.
+/// Default model-pile filenames (resolved under [`crate::model_dir`]).
+/// `NOMIC_TEXT_PILE` / `NOMIC_VISION_PILE` override the full path.
 pub const NOMIC_TEXT_PILE_FILE: &str = "nomic_text.pile";
 pub const NOMIC_VISION_PILE_FILE: &str = "nomic_vision.pile";
-
-pub mod attr {
-    use triblespace::prelude::*;
-
-    attributes! {
-        /// The model's `tokenizer.json` (HF tokenizers format), stored beside
-        /// the weight graph in the SAME model pile. Attached to an entity that
-        /// also carries mary's `model_name` for provenance. Minted 2026-07-18.
-        "7B8D68E86EEC09D7096D40D65FBA7026" unsafe as tokenizer_json: inlineencodings::Handle<blobencodings::LongString>;
-    }
-}
 
 /// The text model pile path (env override, else the model-dir default).
 pub fn text_pile() -> PathBuf {
     match std::env::var_os("NOMIC_TEXT_PILE") {
-        Some(p) => PathBuf::from(p),
+        Some(path) => PathBuf::from(path),
         None => crate::model_dir().join(NOMIC_TEXT_PILE_FILE),
     }
 }
@@ -73,270 +38,251 @@ pub fn text_pile() -> PathBuf {
 /// The vision model pile path (env override, else the model-dir default).
 pub fn vision_pile() -> PathBuf {
     match std::env::var_os("NOMIC_VISION_PILE") {
-        Some(p) => PathBuf::from(p),
+        Some(path) => PathBuf::from(path),
         None => crate::model_dir().join(NOMIC_VISION_PILE_FILE),
     }
 }
 
-/// Open a model pile read/append. Mirrors the faculties' non-amputating open:
-/// a corrupt tail fails LOUD — truncation is an explicit operator decision,
-/// never a side effect of loading an embedder.
-fn open_model_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
-        let _ = pile.close();
-        return Err(crate::collection_cutover::pile_read_error(path, err));
-    }
-    Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
-        .map_err(|err| anyhow!("create repository: {err:?}"))
-}
-
-/// The stored tokenizer.json handle on the model pile's `main` branch, if any.
-fn stored_tokenizer(
-    repo: &mut Repository<Pile>,
-) -> Result<
-    Option<(
-        triblespace::core::repo::Workspace<Pile>,
-        Inline<Handle<LongString>>,
-    )>,
-> {
-    let branch_id = repo
-        .lookup_branch("main")
-        .map_err(|e| anyhow!("lookup main: {e:?}"))?
-        .ok_or_else(|| anyhow!("model pile has no 'main' branch"))?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull main: {e:?}"))?;
-    let space = ws.checkout(..).context("checkout model pile main")?;
-    let handle = find!(
-        h: Inline<Handle<LongString>>,
-        pattern!(&space, [{ _?e @ attr::tokenizer_json: ?h }])
-    )
-    .next();
-    Ok(handle.map(|h| (ws, h)))
-}
-
-/// Append a model's `tokenizer.json` to its pile, once. Idempotent: if the
-/// pile already carries a tokenizer blob, this is a no-op. `model_name` is
-/// recorded beside it (mary's provenance attribute) so the entity is
-/// self-describing.
-pub fn import_tokenizer(pile_path: &Path, tokenizer_json: &Path, model_name: &str) -> Result<()> {
-    let content = std::fs::read_to_string(tokenizer_json)
-        .map_err(|e| anyhow!("read {}: {e}", tokenizer_json.display()))?;
-    // Shallow shape check — enough to catch an accidentally-passed weights or
-    // config file without pulling in a JSON parser.
-    if !(content.trim_start().starts_with('{') && content.contains("\"model\"")) {
-        bail!(
-            "{} does not look like a HF tokenizer.json (expected a JSON object with a \"model\" key)",
-            tokenizer_json.display()
-        );
-    }
-
-    let mut repo = open_model_repo(pile_path)?;
-    let result = (|| {
-        if stored_tokenizer(&mut repo)?.is_some() {
-            println!(
-                "tokenizer.json already present in {} — nothing to do",
-                pile_path.display()
-            );
-            return Ok(());
-        }
-        let branch_id = repo
-            .lookup_branch("main")
-            .map_err(|e| anyhow!("lookup main: {e:?}"))?
-            .ok_or_else(|| anyhow!("model pile has no 'main' branch"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull main: {e:?}"))?;
-        let bytes = content.len();
-        let tok_handle = ws.put(content);
-        let name_handle = ws.put(model_name.to_owned());
-        let ent = ufoid();
-        let mut change = TribleSet::new();
-        change += entity! { &ent @
-            attr::tokenizer_json: tok_handle,
-            mary::format::attrs::model_name: name_handle,
-        };
-        ws.commit(change, "import tokenizer.json");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push tokenizer import: {e:?}"))?;
-        println!(
-            "imported tokenizer.json ({bytes} bytes) for {model_name} into {}",
-            pile_path.display()
-        );
-        Ok(())
-    })();
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    result.and(close_res)?;
-    // The blob is provenance; the GRAPH is the canonical source — build it in
-    // the same breath so a fresh import is immediately graph-loadable.
-    ingest_tokenizer_graph(pile_path)
-}
-
-/// Build the tokenizer GRAPH in a model pile from its stored `tokenizer.json`
-/// blob — the one-time step that makes the graph the canonical tokenizer
-/// source (the blob stays as import provenance). Append-only and idempotent:
-/// a pile that already carries a tokenizer graph is left untouched.
-///
-/// The graph fragment's blobs (token pieces, patterns) are staged in the
-/// workspace and shipped with the commit; the tokenizer root is linked from
-/// the blob entity via `mary::tokenizer::attrs::tokenizer` so provenance
-/// (source blob → derived graph) is explicit.
-pub fn ingest_tokenizer_graph(pile_path: &Path) -> Result<()> {
-    let mut repo = open_model_repo(pile_path)?;
-    let result = (|| {
-        let branch_id = repo
-            .lookup_branch("main")
-            .map_err(|e| anyhow!("lookup main: {e:?}"))?
-            .ok_or_else(|| anyhow!("model pile has no 'main' branch"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull main: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout model pile main")?;
-        if let Some(root) = mary::tokenizer::find_tokenizer(space.facts()) {
-            println!(
-                "tokenizer graph already present in {} (root {root:X}) — nothing to do",
-                pile_path.display()
-            );
-            return Ok(());
-        }
-        let Some((blob_entity, handle)) = find!(
-            (e: Id, h: Inline<Handle<LongString>>),
-            pattern!(space.facts(), [{ ?e @ attr::tokenizer_json: ?h }])
-        )
-        .next() else {
-            bail!(
-                "no tokenizer.json blob in {} — import one first with \
-                 `memory import-tokenizer <path/to/tokenizer.json>`",
-                pile_path.display()
-            );
-        };
-        let json: View<str> = ws
-            .get(handle)
-            .map_err(|e| anyhow!("read tokenizer blob: {e:?}"))?;
-
-        let frag =
-            mary::tokenizer::save_tokenizer_json(json.as_bytes(), NOMIC_TEXT_MODEL, &mut ws.staged)
-                .map_err(|e| anyhow!("build tokenizer graph: {e}"))?;
-        let root = frag
-            .root()
-            .ok_or_else(|| anyhow!("tokenizer fragment has no root"))?;
-        let facts: TribleSet = frag.into_facts();
-
-        // Report what the graph holds before committing it.
-        use mary::tokenizer::attrs as tok;
-        let n_vocab = find!((v: Id), pattern!(&facts, [{ root @ tok::vocab: ?v }])).count();
-        let n_merges = find!((m: Id), pattern!(&facts, [{ root @ tok::merge: ?m }])).count();
-        let n_added = find!((a: Id), pattern!(&facts, [{ root @ tok::added: ?a }])).count();
-        let n_tribles = facts.len();
-
-        let mut change = facts;
-        change += entity! { ExclusiveId::force_ref(&blob_entity) @
-            tok::tokenizer: root,
-        };
-        ws.commit(change, "ingest tokenizer graph from stored tokenizer.json");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push tokenizer graph: {e:?}"))?;
-        println!(
-            "ingested tokenizer graph into {}: root {root:X}, {n_vocab} vocab + {n_merges} \
-             merges + {n_added} added tokens, {n_tribles} tribles (+1 provenance link)",
-            pile_path.display()
-        );
-        Ok(())
-    })();
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    result.and(close_res)
-}
-
-/// FALLBACK PATH ONLY (the canonical source is the tokenizer graph):
-/// materialize the pile-stored tokenizer.json blob to a content-addressed
-/// temp file (mary's json loader wants a path). Cheap when already
-/// materialized; regenerates from the pile whenever the temp dir is cleaned.
-fn materialize_tokenizer(pile_path: &Path) -> Result<PathBuf> {
-    let mut repo = open_model_repo(pile_path)?;
-    let result = (|| {
-        let Some((mut ws, handle)) = stored_tokenizer(&mut repo)? else {
-            bail!(
-                "no tokenizer.json blob in model pile {} — import it once with \
-                 `memory import-tokenizer <path/to/tokenizer.json>`",
-                pile_path.display()
-            );
-        };
-        let hex: String = handle.raw.iter().map(|b| format!("{b:02x}")).collect();
-        let target = std::env::temp_dir().join(format!("nomic-tokenizer-{}.json", &hex[..16]));
-        if target.is_file() {
-            return Ok(target);
-        }
-        let content: View<str> = ws
-            .get(handle)
-            .map_err(|e| anyhow!("read tokenizer blob: {e:?}"))?;
-        // Write-then-rename so a concurrent loader never sees a torn file.
-        let staging = target.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&staging, content.as_bytes())
-            .map_err(|e| anyhow!("write {}: {e}", staging.display()))?;
-        std::fs::rename(&staging, &target)
-            .map_err(|e| anyhow!("rename {} → {}: {e}", staging.display(), target.display()))?;
-        Ok(target)
-    })();
-    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    match close_res {
-        Ok(()) => result,
-        Err(err) => result.and(Err(err)),
-    }
-}
-
-/// nomic-embed-text-v1.5, fully from the text model pile: weight graph AND
-/// tokenizer GRAPH. Self-contained and eviction-proof — no HF hub, no cache,
-/// no tokenizer.json in the runtime path.
-///
-/// The tokenizer is constructed from the graph
-/// (`mary::persist::load_tokenizer_from_pile`). Piles that predate the graph
-/// fall back to the stored tokenizer.json blob with a stderr warning — run
-/// `memory ingest-tokenizer` once to build the graph and silence it.
-pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
-    let pile = text_pile();
-    let device = mary::embed::default_device();
-    let keymap = mary::persist::load_keymap_from_pile(&pile).map_err(|e| {
-        anyhow!(
-            "load nomic text weights from pile {}: {e:?}",
-            pile.display()
-        )
-    })?;
-    match mary::persist::load_tokenizer_from_pile(&pile) {
-        Ok(tokenizer) => {
-            mary::embed::nomic_text_from_parts(keymap, tokenizer, device).map_err(|e| {
-                anyhow!(
-                    "build nomic text embedder from pile {}: {e:?}",
-                    pile.display()
-                )
-            })
-        }
-        Err(err) => {
-            eprintln!(
-                "memory: no tokenizer graph in {} ({err}); falling back to the stored \
-                 tokenizer.json blob — run `memory ingest-tokenizer` once to build the graph",
-                pile.display()
-            );
-            let tokenizer = materialize_tokenizer(&pile)?;
-            mary::embed::load_nomic_text_from_keymap(keymap, &tokenizer, device).map_err(|e| {
-                anyhow!(
-                    "load nomic text embedder from pile {}: {e:?}",
-                    pile.display()
-                )
-            })
-        }
-    }
-}
-
-/// nomic-embed-vision-v1.5 from the vision model pile — co-embedded into the
-/// SAME 768-d space as the text model, so an image's vector is directly
-/// comparable to a text query's. Weights-only (a ViT has no tokenizer).
-pub fn load_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
-    let pile = vision_pile();
-    mary::embed::load_nomic_vision_from_pile(&pile, mary::embed::default_device()).map_err(|e| {
-        anyhow!(
-            "load nomic vision embedder from pile {}: {e:?}",
-            pile.display()
+fn load_model_snapshot(path: &Path, model: &str) -> Result<CollectionSnapshot<PileReader>> {
+    mary::model_collection::load_model_collection_local_latest(path).with_context(|| {
+        format!(
+            "load locally admitted native Mary collection for {model} from {}",
+            path.display()
         )
     })
+}
+
+/// Load nomic-embed-text-v1.5 entirely from one canonical collection snapshot.
+///
+/// Absence or ambiguity of either the native weight graph or tokenizer graph
+/// is an error. Migrate the pile with Mary's model migration CLI rather than
+/// adding a compatibility path to ordinary inference.
+pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
+    let pile = text_pile();
+    let snapshot = load_model_snapshot(&pile, NOMIC_TEXT_MODEL)?;
+    let keymap = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        ModelSelector::Source {
+            source: NOMIC_TEXT_MODEL,
+            quantization: "native",
+        },
+    )
+    .with_context(|| format!("select native Nomic text weights from {}", pile.display()))?;
+    let tokenizer = mary::selection::load_tokenizer_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        TokenizerSelector::Name(NOMIC_TEXT_MODEL),
+    )
+    .with_context(|| format!("select native Nomic text tokenizer from {}", pile.display()))?;
+
+    mary::embed::nomic_text_from_parts(keymap, tokenizer, mary::embed::default_device())
+        .with_context(|| {
+            format!(
+                "build Nomic text embedder from native collection {}",
+                pile.display()
+            )
+        })
+}
+
+/// Load nomic-embed-vision-v1.5 from one canonical collection snapshot.
+pub fn load_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
+    let pile = vision_pile();
+    let snapshot = load_model_snapshot(&pile, NOMIC_VISION_MODEL)?;
+    let keymap = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        ModelSelector::Source {
+            source: NOMIC_VISION_MODEL,
+            quantization: "native",
+        },
+    )
+    .with_context(|| format!("select native Nomic vision weights from {}", pile.display()))?;
+
+    mary::embed::load_nomic_vision_from_keymap(keymap, mary::embed::default_device()).with_context(
+        || {
+            format!(
+                "build Nomic vision embedder from native collection {}",
+                pile.display()
+            )
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use mary::format::{attrs, F32Array, U64Array};
+    use tempfile::NamedTempFile;
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::*;
+
+    const WORDPIECE: &str = r###"{
+      "added_tokens": [],
+      "normalizer": {"type": "BertNormalizer", "clean_text": true,
+                     "handle_chinese_chars": true, "strip_accents": null,
+                     "lowercase": true},
+      "pre_tokenizer": {"type": "BertPreTokenizer"},
+      "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true},
+      "model": {"type": "WordPiece", "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 100,
+                "vocab": {"[UNK]": 0, "hello": 1}}
+    }"###;
+
+    fn weight_fragment(source: &str, tensor_name: &str, value: f32) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let data = fragment.put::<F32Array, _>(vec![value]);
+        let shape = fragment.put::<U64Array, _>(vec![1_u64]);
+        let leaf = entity! { _ @ attrs::data: data, attrs::shape: shape };
+        let leaf_id = leaf.root().expect("tensor leaf root");
+        fragment += leaf;
+
+        let tensor_name = fragment.put::<LongString, _>(tensor_name.to_owned());
+        let member = entity! { _ @
+            attrs::safetensor_path: tensor_name,
+            attrs::weight: &leaf_id,
+        };
+        let member_id = member.root().expect("model member root");
+        fragment += member;
+
+        let model_name = fragment.put::<LongString, _>(format!("{source}.safetensors"));
+        let source = fragment.put::<LongString, _>(source.to_owned());
+        fragment += entity! { _ @
+            attrs::model_name: model_name,
+            attrs::source: source,
+            attrs::quantization: "native",
+            attrs::member: &member_id,
+        };
+        fragment
+    }
+
+    fn tokenizer_fragment() -> Fragment {
+        let mut fragment = Fragment::empty();
+        let tokenizer = mary::tokenizer::save_tokenizer_json(
+            WORDPIECE.as_bytes(),
+            NOMIC_TEXT_MODEL,
+            fragment.blobs_mut(),
+        )
+        .expect("build synthetic tokenizer graph");
+        fragment += tokenizer;
+        fragment
+    }
+
+    fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
+        let mut pile = Pile::open(path).expect("open synthetic model pile");
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            mary::model_collection::publish_model_fragment(
+                &mut pile,
+                &SigningKey::from_bytes(&[0x31 + index as u8; 32]),
+                fragment,
+            )
+            .expect("publish native model fragment");
+        }
+        pile.close().expect("close synthetic model pile");
+    }
+
+    #[test]
+    fn one_native_snapshot_selects_each_nomic_runtime_graph() {
+        let text_file = NamedTempFile::new().expect("create text pile");
+        publish(
+            text_file.path(),
+            [
+                weight_fragment(NOMIC_TEXT_MODEL, "text.weight", 1.25),
+                tokenizer_fragment(),
+            ],
+        );
+
+        let text = load_model_snapshot(text_file.path(), NOMIC_TEXT_MODEL)
+            .expect("load one text collection snapshot");
+        assert_eq!(text.commits().len(), 2);
+
+        // Freeze really means freeze: a later same-coordinate model commit
+        // cannot change the facts used for either half of this text load.
+        publish(
+            text_file.path(),
+            [weight_fragment(NOMIC_TEXT_MODEL, "conflicting.weight", 9.0)],
+        );
+        let text_keymap = mary::selection::load_keymap_from_graph(
+            text.facts(),
+            text.reader(),
+            ModelSelector::Source {
+                source: NOMIC_TEXT_MODEL,
+                quantization: "native",
+            },
+        )
+        .expect("select text weights from frozen snapshot");
+        assert_eq!(text_keymap["text.weight"], (vec![1.25], vec![1]));
+        let tokenizer = mary::selection::load_tokenizer_from_graph(
+            text.facts(),
+            text.reader(),
+            TokenizerSelector::Name(NOMIC_TEXT_MODEL),
+        )
+        .expect("select tokenizer from the same frozen snapshot");
+        assert_eq!(tokenizer.token_to_id("hello"), Some(1));
+
+        let widened = load_model_snapshot(text_file.path(), NOMIC_TEXT_MODEL)
+            .expect("load later widened text snapshot");
+        let ambiguity = mary::selection::load_keymap_from_graph(
+            widened.facts(),
+            widened.reader(),
+            ModelSelector::Source {
+                source: NOMIC_TEXT_MODEL,
+                quantization: "native",
+            },
+        )
+        .expect_err("later conflicting same-coordinate commit must fail closed");
+        assert!(
+            ambiguity.to_string().contains("ambiguous model root"),
+            "unexpected ambiguity diagnostic: {ambiguity}"
+        );
+
+        let vision_file = NamedTempFile::new().expect("create vision pile");
+        publish(
+            vision_file.path(),
+            [weight_fragment(NOMIC_VISION_MODEL, "vision.weight", 2.5)],
+        );
+        let vision = load_model_snapshot(vision_file.path(), NOMIC_VISION_MODEL)
+            .expect("load one vision collection snapshot");
+        assert_eq!(vision.commits().len(), 1);
+        let vision_keymap = mary::selection::load_keymap_from_graph(
+            vision.facts(),
+            vision.reader(),
+            ModelSelector::Source {
+                source: NOMIC_VISION_MODEL,
+                quantization: "native",
+            },
+        )
+        .expect("select vision weights from frozen snapshot");
+        assert_eq!(vision_keymap["vision.weight"], (vec![2.5], vec![1]));
+    }
+
+    #[test]
+    fn ordinary_runtime_source_has_no_legacy_storage_or_json_path() {
+        let source = include_str!("nomic.rs");
+        let runtime = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("runtime source precedes tests");
+        for forbidden in [
+            concat!("repo::", "Repository"),
+            concat!("Repository", "::"),
+            concat!("Workspace", "<"),
+            concat!("tokenizer", "_json"),
+            concat!("load_keymap_from_", "pile"),
+            concat!("load_tokenizer_from_", "pile"),
+            concat!("materialize_", "tokenizer"),
+        ] {
+            assert!(
+                !runtime.contains(forbidden),
+                "ordinary Nomic runtime regained forbidden legacy seam {forbidden}"
+            );
+        }
+
+        let memory = include_str!("bin/memory.rs");
+        assert!(!memory.contains(concat!("import-", "tokenizer")));
+        assert!(!memory.contains(concat!("ingest-", "tokenizer")));
+    }
 }
