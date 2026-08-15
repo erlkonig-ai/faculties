@@ -10,6 +10,8 @@ use hifitime::efmt::consts::ISO8601_DATE;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
 use std::collections::BTreeMap;
+#[cfg(feature = "local-embed")]
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::collection::Collection;
@@ -458,10 +460,33 @@ impl<T: mary::embed::LocalEmbedder> ImageEmbedder for T {
     }
 }
 
-/// Load mary's CLIP-ViT-B v0 (warm; ~1-2s, ~600MB) from its durable pile
-/// (write it with mary's `embed_persist`; `CLIP_PILE` overrides the path —
-/// tokenizer.json stays a small HF-cache side-file). SigLIP so400m swaps in
-/// behind this same trait later.
+/// Materialize one explicitly selected model from a single frozen native Mary
+/// collection snapshot. The snapshot owns its pile reader, so the keymap is
+/// coherent even if another process appends a later model commit.
+#[cfg(feature = "local-embed")]
+fn load_native_model_keymap(
+    pile: &Path,
+    source: &str,
+    quantization: &str,
+) -> Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
+    let snapshot = mary::model_collection::load_model_collection_local_latest(pile)
+        .context("load native Mary model collection")?;
+    mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        mary::selection::ModelSelector::Source {
+            source,
+            quantization,
+        },
+    )
+    .with_context(|| format!("select Mary model ({source:?}, {quantization:?})"))
+}
+
+/// Load mary's CLIP-ViT-B v0 (warm; ~1-2s, ~600MB) from its native model
+/// collection (`CLIP_PILE` overrides the path; import with source
+/// `openai/clip-vit-base-patch32` and quantization `native`). `tokenizer.json`
+/// stays a small HF-cache side-file. SigLIP so400m swaps in behind this same
+/// trait later.
 #[cfg(feature = "local-embed")]
 fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
     const CLIP_MODEL: &str = "openai/clip-vit-base-patch32";
@@ -471,7 +496,8 @@ fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
     };
     let tok = mary::embed::hf_cache_resolve(CLIP_MODEL, "tokenizer.json")
         .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {CLIP_MODEL}"))?;
-    let emb = mary::embed::load_clip_from_pile(&pile, &tok, mary::embed::default_device())?;
+    let keymap = load_native_model_keymap(&pile, CLIP_MODEL, "native")?;
+    let emb = mary::embed::load_clip_from_keymap(keymap, &tok, mary::embed::default_device())?;
     Ok(Box::new(emb))
 }
 
@@ -2098,6 +2124,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "local-embed")]
+    use ed25519_dalek::SigningKey;
     use faculties::collection_cutover::initialize_signer;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2128,6 +2156,89 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[cfg(feature = "local-embed")]
+    fn native_model_fragment(source: &str, tensor_name: &str, value: f32) -> Fragment {
+        use mary::format::attrs;
+
+        let mut fragment = Fragment::empty();
+        let data = fragment.put::<mary::format::F32Array, _>(vec![value]);
+        let shape = fragment.put::<mary::format::U64Array, _>(vec![1_u64]);
+        let leaf = entity! { _ @ attrs::data: data, attrs::shape: shape };
+        let leaf_id = leaf.root().unwrap();
+        fragment += leaf;
+
+        let tensor_name = fragment.put::<blobencodings::LongString, _>(tensor_name.to_owned());
+        let member = entity! { _ @
+            attrs::kind: "vector",
+            attrs::safetensor_path: tensor_name,
+            attrs::weight: &leaf_id,
+        };
+        let member_id = member.root().unwrap();
+        fragment += member;
+
+        let root = entity! { _ @ attrs::member: &member_id };
+        let root_id = root.root().unwrap();
+        fragment += root;
+        let source = fragment.put::<blobencodings::LongString, _>(source.to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&root_id) @
+            attrs::source: source,
+            attrs::quantization: "native",
+        };
+        fragment
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn native_model_selection_is_explicit_and_snapshot_coherent() {
+        let test_pile = TestPile::new();
+        let signer = SigningKey::from_bytes(&[0x73; 32]);
+        let mut pile = Pile::open(&test_pile.path).unwrap();
+        mary::model_collection::publish_model_fragment(
+            &mut pile,
+            &signer,
+            native_model_fragment("clip/target", "target.weight", 1.0),
+        )
+        .unwrap();
+        mary::model_collection::publish_model_fragment(
+            &mut pile,
+            &signer,
+            native_model_fragment("clip/distractor", "distractor.weight", 2.0),
+        )
+        .unwrap();
+        pile.close().unwrap();
+
+        let selected = load_native_model_keymap(&test_pile.path, "clip/target", "native").unwrap();
+        assert_eq!(selected["target.weight"], (vec![1.0], vec![1]));
+        assert!(!selected.contains_key("distractor.weight"));
+
+        let frozen =
+            mary::model_collection::load_model_collection_local_latest(&test_pile.path).unwrap();
+        let mut pile = Pile::open(&test_pile.path).unwrap();
+        mary::model_collection::publish_model_fragment(
+            &mut pile,
+            &signer,
+            native_model_fragment("clip/target", "later.weight", 3.0),
+        )
+        .unwrap();
+        pile.close().unwrap();
+
+        let still_selected = mary::selection::load_keymap_from_graph(
+            frozen.facts(),
+            frozen.reader(),
+            mary::selection::ModelSelector::Source {
+                source: "clip/target",
+                quantization: "native",
+            },
+        )
+        .unwrap();
+        assert_eq!(still_selected["target.weight"], (vec![1.0], vec![1]));
+        assert!(!still_selected.contains_key("later.weight"));
+
+        let error = load_native_model_keymap(&test_pile.path, "clip/target", "native").unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("ambiguous"), "unexpected error: {error}");
     }
 
     #[test]
