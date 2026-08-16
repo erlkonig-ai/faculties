@@ -10,8 +10,6 @@ use hifitime::efmt::consts::ISO8601_DATE;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
 use std::collections::BTreeMap;
-#[cfg(feature = "local-embed")]
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::collection::Collection;
@@ -460,33 +458,12 @@ impl<T: mary::embed::LocalEmbedder> ImageEmbedder for T {
     }
 }
 
-/// Materialize one explicitly selected model from a single frozen native Mary
-/// collection snapshot. The snapshot owns its pile reader, so the keymap is
-/// coherent even if another process appends a later model commit.
-#[cfg(feature = "local-embed")]
-fn load_native_model_keymap(
-    pile: &Path,
-    source: &str,
-    quantization: &str,
-) -> Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
-    let snapshot = mary::model_collection::load_model_collection_local_latest(pile)
-        .context("load native Mary model collection")?;
-    mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.reader(),
-        mary::selection::ModelSelector::Source {
-            source,
-            quantization,
-        },
-    )
-    .with_context(|| format!("select Mary model ({source:?}, {quantization:?})"))
-}
-
 /// Load mary's CLIP-ViT-B v0 (warm; ~1-2s, ~600MB) from its native model
 /// collection (`CLIP_PILE` overrides the path; import with source
-/// `openai/clip-vit-base-patch32` and quantization `native`). `tokenizer.json`
-/// stays a small HF-cache side-file. SigLIP so400m swaps in behind this same
-/// trait later.
+/// `openai/clip-vit-base-patch32` and quantization `native`). The weights and
+/// named tokenizer are selected from one frozen collection snapshot; no HF
+/// cache or side-file participates in runtime authority. SigLIP so400m swaps
+/// in behind this same trait later.
 #[cfg(feature = "local-embed")]
 fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
     const CLIP_MODEL: &str = "openai/clip-vit-base-patch32";
@@ -494,10 +471,24 @@ fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
         Some(p) => PathBuf::from(p),
         None => faculties::model_dir().join("clip.pile"),
     };
-    let tok = mary::embed::hf_cache_resolve(CLIP_MODEL, "tokenizer.json")
-        .ok_or_else(|| anyhow::anyhow!("tokenizer.json not in HF cache for {CLIP_MODEL}"))?;
-    let keymap = load_native_model_keymap(&pile, CLIP_MODEL, "native")?;
-    let emb = mary::embed::load_clip_from_keymap(keymap, &tok, mary::embed::default_device())?;
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+        .context("load native Mary CLIP model collection")?;
+    let keymap = mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        mary::selection::ModelSelector::Source {
+            source: CLIP_MODEL,
+            quantization: mary::persist::QUANTIZATION_NATIVE,
+        },
+    )
+    .context("select native CLIP weights")?;
+    let tokenizer = mary::selection::load_tokenizer_from_graph(
+        snapshot.facts(),
+        snapshot.reader(),
+        mary::selection::TokenizerSelector::Name(CLIP_MODEL),
+    )
+    .context("select native CLIP tokenizer")?;
+    let emb = mary::embed::clip_from_parts(keymap, tokenizer, mary::embed::default_device())?;
     Ok(Box::new(emb))
 }
 
@@ -564,11 +555,14 @@ fn load_mm7b() -> Result<Mm7bEmbedder> {
     };
     let tok = match std::env::var_os("NOMIC_MM7B_TOKENIZER") {
         Some(path) => PathBuf::from(path),
-        None => mary::embed::hf_cache_resolve(MODEL, "tokenizer.json").ok_or_else(|| {
-            anyhow::anyhow!(
-                "tokenizer.json not in Hugging Face cache for {MODEL}; set NOMIC_MM7B_TOKENIZER"
-            )
-        })?,
+        None => {
+            let path = mary::embed::hf_cache_main_snapshot(MODEL)?.join("tokenizer.json");
+            anyhow::ensure!(
+                path.is_file(),
+                "tokenizer.json not in cached main revision for {MODEL}; set NOMIC_MM7B_TOKENIZER"
+            );
+            path
+        }
     };
     eprintln!("files: loading nomic-embed-multimodal-7b (once, ~20s)…");
     let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
@@ -2138,6 +2132,34 @@ mod tests {
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(feature = "local-embed")]
+    const WORDPIECE: &str = r###"{
+      "added_tokens": [],
+      "normalizer": {"type": "BertNormalizer", "clean_text": true,
+                     "handle_chinese_chars": true, "strip_accents": null,
+                     "lowercase": true},
+      "pre_tokenizer": {"type": "BertPreTokenizer"},
+      "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true},
+      "model": {"type": "WordPiece", "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 100,
+                "vocab": {"[UNK]": 0, "hello": 1}}
+    }"###;
+
+    #[cfg(feature = "local-embed")]
+    const LATER_WORDPIECE: &str = r###"{
+      "added_tokens": [],
+      "normalizer": {"type": "BertNormalizer", "clean_text": true,
+                     "handle_chinese_chars": true, "strip_accents": null,
+                     "lowercase": true},
+      "pre_tokenizer": {"type": "BertPreTokenizer"},
+      "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true},
+      "model": {"type": "WordPiece", "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 100,
+                "vocab": {"[UNK]": 0, "later": 1}}
+    }"###;
+
     struct TestPile {
         dir: PathBuf,
         path: PathBuf,
@@ -2196,15 +2218,26 @@ mod tests {
     }
 
     #[cfg(feature = "local-embed")]
+    fn native_tokenizer_fragment(source: &str, json: &str) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let tokenizer =
+            mary::tokenizer::save_tokenizer_json(json.as_bytes(), source, fragment.blobs_mut())
+                .unwrap();
+        fragment += tokenizer;
+        fragment
+    }
+
+    #[cfg(feature = "local-embed")]
     #[test]
-    fn native_model_selection_is_explicit_and_snapshot_coherent() {
+    fn native_clip_parts_are_selected_from_one_explicit_snapshot() {
+        const CLIP_MODEL: &str = "clip/target";
         let test_pile = TestPile::new();
         let signer = SigningKey::from_bytes(&[0x73; 32]);
         let mut pile = Pile::open(&test_pile.path).unwrap();
         mary::model_collection::publish_model_fragment(
             &mut pile,
             &signer,
-            native_model_fragment("clip/target", "target.weight", 1.0),
+            native_model_fragment(CLIP_MODEL, "target.weight", 1.0),
         )
         .unwrap();
         mary::model_collection::publish_model_fragment(
@@ -2213,19 +2246,46 @@ mod tests {
             native_model_fragment("clip/distractor", "distractor.weight", 2.0),
         )
         .unwrap();
+        mary::model_collection::publish_model_fragment(
+            &mut pile,
+            &signer,
+            native_tokenizer_fragment(CLIP_MODEL, WORDPIECE),
+        )
+        .unwrap();
         pile.close().unwrap();
-
-        let selected = load_native_model_keymap(&test_pile.path, "clip/target", "native").unwrap();
-        assert_eq!(selected["target.weight"], (vec![1.0], vec![1]));
-        assert!(!selected.contains_key("distractor.weight"));
 
         let frozen =
             mary::model_collection::load_model_collection_local_latest(&test_pile.path).unwrap();
+        let selected = mary::selection::load_keymap_from_graph(
+            frozen.facts(),
+            frozen.reader(),
+            mary::selection::ModelSelector::Source {
+                source: CLIP_MODEL,
+                quantization: mary::persist::QUANTIZATION_NATIVE,
+            },
+        )
+        .unwrap();
+        let tokenizer = mary::selection::load_tokenizer_from_graph(
+            frozen.facts(),
+            frozen.reader(),
+            mary::selection::TokenizerSelector::Name(CLIP_MODEL),
+        )
+        .unwrap();
+        assert_eq!(selected["target.weight"], (vec![1.0], vec![1]));
+        assert!(!selected.contains_key("distractor.weight"));
+        assert_eq!(tokenizer.token_to_id("hello"), Some(1));
+
         let mut pile = Pile::open(&test_pile.path).unwrap();
         mary::model_collection::publish_model_fragment(
             &mut pile,
             &signer,
-            native_model_fragment("clip/target", "later.weight", 3.0),
+            native_model_fragment(CLIP_MODEL, "later.weight", 3.0),
+        )
+        .unwrap();
+        mary::model_collection::publish_model_fragment(
+            &mut pile,
+            &signer,
+            native_tokenizer_fragment(CLIP_MODEL, LATER_WORDPIECE),
         )
         .unwrap();
         pile.close().unwrap();
@@ -2234,17 +2294,47 @@ mod tests {
             frozen.facts(),
             frozen.reader(),
             mary::selection::ModelSelector::Source {
-                source: "clip/target",
-                quantization: "native",
+                source: CLIP_MODEL,
+                quantization: mary::persist::QUANTIZATION_NATIVE,
             },
+        )
+        .unwrap();
+        let still_tokenizer = mary::selection::load_tokenizer_from_graph(
+            frozen.facts(),
+            frozen.reader(),
+            mary::selection::TokenizerSelector::Name(CLIP_MODEL),
         )
         .unwrap();
         assert_eq!(still_selected["target.weight"], (vec![1.0], vec![1]));
         assert!(!still_selected.contains_key("later.weight"));
+        assert_eq!(still_tokenizer.token_to_id("hello"), Some(1));
+        assert_eq!(still_tokenizer.token_to_id("later"), None);
 
-        let error = load_native_model_keymap(&test_pile.path, "clip/target", "native").unwrap_err();
-        let error = format!("{error:#}");
-        assert!(error.contains("ambiguous"), "unexpected error: {error}");
+        let latest =
+            mary::model_collection::load_model_collection_local_latest(&test_pile.path).unwrap();
+        let model_error = mary::selection::load_keymap_from_graph(
+            latest.facts(),
+            latest.reader(),
+            mary::selection::ModelSelector::Source {
+                source: CLIP_MODEL,
+                quantization: mary::persist::QUANTIZATION_NATIVE,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            model_error.to_string().contains("ambiguous"),
+            "{model_error}"
+        );
+        let tokenizer_error = mary::selection::load_tokenizer_from_graph(
+            latest.facts(),
+            latest.reader(),
+            mary::selection::TokenizerSelector::Name(CLIP_MODEL),
+        )
+        .unwrap_err();
+        assert!(
+            tokenizer_error.to_string().contains("ambiguous"),
+            "{tokenizer_error}"
+        );
     }
 
     #[test]
