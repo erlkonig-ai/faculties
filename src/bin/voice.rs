@@ -25,11 +25,13 @@
 //! guarantee is in this code, so no misconfiguration can leak a private
 //! utterance into a room.
 //!
-//! Synthesis (Qwen3-TTS via mary's Burn/Metal pipeline, weights zero-copy
-//! mmap-aliased from a durable standalone pile) is gated behind the heavy
-//! `voice` feature, mirroring `imagine`; the default build compiles a bail
-//! stub so the rest of the faculty suite stays light. There is ONE generation
-//! path — `mary::speak::synthesize_stream`, a live PCM-chunk iterator — and
+//! Synthesis (Qwen3-TTS via mary's Burn/Metal pipeline) selects the exact base,
+//! shared codec, filtered f16 talker, and folded f16 talker from one frozen
+//! native model-collection snapshot. Its mmap pages are aliased zero-copy on
+//! the production path. The heavy lane is gated behind the `voice` feature,
+//! mirroring `imagine`; the default build compiles a bail stub so the rest of
+//! the faculty suite stays light. There is ONE generation path —
+//! `mary::speak::synthesize_stream`, a live PCM-chunk iterator — and
 //! the channels differ only by SINK: local devices play the chunks as they
 //! are synthesized through a NATIVE in-process audio sink (rodio/cpal — no
 //! ffplay/afplay/SwitchAudioSource subprocesses, no pipe-probing latency),
@@ -76,8 +78,9 @@ const DEFAULT_DAEMON: &str = "http://localhost:8000";
 // mary as the voice-origin lineage); every utterance clones the v2 reference
 // kit: an 11.46 s clean-boundary clip (24 kHz render of `ref_voice_v2.wav`),
 // its EXACT transcript, and the clip's codec frames. Weights load from a
-// durable standalone pile (under the faculties model dir); `QWEN3TTS_PILE`
-// overrides the path. The reference-kit assets live beside it in the model dir.
+// native model-collection pile (under the faculties model dir);
+// `QWEN3TTS_PILE` overrides the path. The reference-kit assets live beside it
+// in the model dir.
 #[cfg(feature = "voice")]
 const QWEN3TTS_PILE_FILE: &str = "qwen3tts.pile";
 #[cfg(feature = "voice")]
@@ -770,9 +773,19 @@ fn speak_and_play(
         ref_samples.len() as f32 / ref_sr.max(1) as f32,
         ref_text.trim().chars().count(),
     );
+    let variant = mary::speak::Qwen3TtsVariant::from_env();
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+        .with_context(|| format!("freeze native Qwen3-TTS snapshot {}", pile.display()))?;
+    let weights =
+        mary::speak::Qwen3TtsWeights::from_snapshot(snapshot, variant).with_context(|| {
+            format!(
+                "select {variant:?} Qwen3-TTS cohort from {}",
+                pile.display()
+            )
+        })?;
     let t_call = std::time::Instant::now();
     let mut stream =
-        mary::speak::synthesize_stream(&pile, &ref_wav, ref_text.trim(), &ref_code, text)?;
+        mary::speak::synthesize_stream(weights, &ref_wav, ref_text.trim(), &ref_code, text)?;
 
     let mut samples: Vec<f32> = Vec::new();
     let played: Result<()> = match routed {

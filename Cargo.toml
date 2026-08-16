@@ -124,10 +124,11 @@ local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
 imagine = ["dep:mary", "mary/flux", "dep:image"]
 # In-process Qwen3-TTS in the `voice` faculty (`voice say`/
 # `voice shout`) via mary's ported Burn/Metal pipeline. Calls
-# `mary::speak::synthesize` directly — no separately-built binary that can
+# `mary::speak::synthesize_stream` directly — no separately-built binary that can
 # drift stale against the pile format (the staleness class that truncated memory
-# on 2026-06-30). Weights load from a durable standalone pile (QWEN3TTS_PILE);
-# mary/speak = qwen3tts port + the pile persist/load seam.
+# on 2026-06-30). Four explicit roots are selected from one frozen native
+# model-collection pile (`QWEN3TTS_PILE`): exact base, shared codec, filtered
+# f16 talker, and folded f16 talker.
 # Native audio device enumeration + playback sink (rodio/cpal). Default so
 # stock installs keep `voice devices`/routing; excluded on audio-less servers
 # (FreeBSD build class, 2026-07-21) via --no-default-features.

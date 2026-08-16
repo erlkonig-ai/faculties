@@ -52,7 +52,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/mary
-          ref: de6282f2251917e14d4ce1bfe7da92577cc6e012
+          ref: 84857d64b81f7f5f90a30630e220896c3da2e8b8
           path: mary
 
       - name: Check out CubeCL zero-copy cohort

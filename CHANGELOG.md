@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Voice freezes one native Qwen3-TTS snapshot per utterance.** Exact base,
+  shared codec, filtered f16 talker, and versioned folded f16 talker roots are
+  selected together before synthesis. Runtime no longer opens Repository
+  branches, resolves sibling piles, or admits a different model prefix for
+  each component; the owned snapshot keeps every zero-copy mmap alive through
+  generation and codec playback.
 - **Imagine freezes one native FLUX model snapshot.** The text encoder,
   transformer, and VAE are selected as three explicit component roots from one
   coherent Mary collection view, while phase-wise materialization preserves

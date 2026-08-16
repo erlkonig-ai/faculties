@@ -44,7 +44,7 @@ git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
 git -C triblespace-rs checkout 8eb734bc27b9dc860109deba929508701f07adcc
-git -C mary checkout de6282f2251917e14d4ce1bfe7da92577cc6e012
+git -C mary checkout 84857d64b81f7f5f90a30630e220896c3da2e8b8
 git -C cubecl-fork checkout f299aed551ec97bf28b779bfed6e88a484a167e4
 cd faculties
 cargo build --release --bins --locked
