@@ -79,7 +79,7 @@ fn main() -> anyhow::Result<()> {
 #[cfg(feature = "imagine")]
 fn main() -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
-    use mary::models::flux::pipeline::{Flux2Pipeline, ModelVariant};
+    use mary::models::flux::pipeline::{Flux2Pipeline, FluxWeights, ModelVariant};
     use mary::nn::backend::WgpuDevice;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
@@ -103,9 +103,9 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("locating the {label} model in the HF cache"))?;
     eprintln!("imagine: {label} model dir → {}", model_dir.display());
 
-    // WEIGHTS come only from the durable flux pile (write one with mary's
-    // `flux_persist`); the model dir supplies configs + tokenizer. `FLUX_PILE`
-    // overrides the per-variant default.
+    // WEIGHTS come only from the durable native model collection (write one
+    // with mary's `flux_persist`); the model dir supplies configs + tokenizer.
+    // `FLUX_PILE` overrides the per-variant default.
     let default_pile_file = match variant {
         ModelVariant::Klein => "flux_klein.pile",
         ModelVariant::Dev => "flux_dev.pile",
@@ -116,11 +116,19 @@ fn main() -> anyhow::Result<()> {
     };
     anyhow::ensure!(
         pile.exists(),
-        "flux weights pile not found at {} — write one with mary's flux_persist \
-         (or set FLUX_PILE)",
+        "FLUX native model collection not found at {} — write one with mary's \
+         `flux_persist <model-dir> <pile> <signing-key>` (or set FLUX_PILE)",
         pile.display()
     );
     eprintln!("imagine: weights pile → {}", pile.display());
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+        .with_context(|| format!("freezing native FLUX collection {}", pile.display()))?;
+    let weights = FluxWeights::from_snapshot(snapshot, variant).with_context(|| {
+        format!(
+            "selecting the {label} text encoder, transformer, and VAE from {}",
+            pile.display()
+        )
+    })?;
 
     // Step default: distilled Klein needs very few; Dev wants ~28.
     let steps = cli.steps.unwrap_or(match variant {
@@ -163,7 +171,7 @@ fn main() -> anyhow::Result<()> {
         cli.guidance,
         cli.seed,
         &model_dir,
-        &pile,
+        &weights,
         None, // no LoRA
         &device,
     );

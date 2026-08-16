@@ -65,7 +65,7 @@ pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::b
         snapshot.reader(),
         ModelSelector::Source {
             source: NOMIC_TEXT_MODEL,
-            quantization: "native",
+            quantization: mary::persist::QUANTIZATION_NATIVE,
         },
     )
     .with_context(|| format!("select native Nomic text weights from {}", pile.display()))?;
@@ -94,7 +94,7 @@ pub fn load_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::n
         snapshot.reader(),
         ModelSelector::Source {
             source: NOMIC_VISION_MODEL,
-            quantization: "native",
+            quantization: mary::persist::QUANTIZATION_NATIVE,
         },
     )
     .with_context(|| format!("select native Nomic vision weights from {}", pile.display()))?;
@@ -153,7 +153,7 @@ mod tests {
         fragment += entity! { _ @
             attrs::model_name: model_name,
             attrs::source: source,
-            attrs::quantization: "native",
+            attrs::quantization: mary::persist::QUANTIZATION_NATIVE,
             attrs::member: &member_id,
         };
         fragment
@@ -210,7 +210,7 @@ mod tests {
             text.reader(),
             ModelSelector::Source {
                 source: NOMIC_TEXT_MODEL,
-                quantization: "native",
+                quantization: mary::persist::QUANTIZATION_NATIVE,
             },
         )
         .expect("select text weights from frozen snapshot");
@@ -230,7 +230,7 @@ mod tests {
             widened.reader(),
             ModelSelector::Source {
                 source: NOMIC_TEXT_MODEL,
-                quantization: "native",
+                quantization: mary::persist::QUANTIZATION_NATIVE,
             },
         )
         .expect_err("later conflicting same-coordinate commit must fail closed");
@@ -252,7 +252,7 @@ mod tests {
             vision.reader(),
             ModelSelector::Source {
                 source: NOMIC_VISION_MODEL,
-                quantization: "native",
+                quantization: mary::persist::QUANTIZATION_NATIVE,
             },
         )
         .expect("select vision weights from frozen snapshot");

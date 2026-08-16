@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Imagine freezes one native FLUX model snapshot.** The text encoder,
+  transformer, and VAE are selected as three explicit component roots from one
+  coherent Mary collection view, while phase-wise materialization preserves
+  the existing low-RAM execution. Runtime no longer reopens a legacy Repository
+  pile for every phase, and `flux_persist` publishes the three ordinary native
+  roots under stable source coordinates.
 - **Nomic inference now reads native Mary collections directly.** Each text or
   vision model pile is frozen once, then its explicit source/quantization and
   tokenizer-name selectors operate on that one coherent snapshot. Runtime no
