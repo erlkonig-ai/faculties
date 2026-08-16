@@ -3924,6 +3924,7 @@ dependencies = [
  "lopdf",
  "mailparse",
  "mary",
+ "memchr",
  "mime",
  "quick-xml 0.37.5",
  "rand_core 0.6.4",

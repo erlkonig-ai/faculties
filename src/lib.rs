@@ -35,6 +35,7 @@ pub fn model_dir() -> std::path::PathBuf {
 pub mod activation_cutover;
 pub mod archive_bm25;
 pub mod archive_claude_code;
+pub mod archive_codex;
 pub mod archive_collection;
 pub mod archive_cutover;
 pub mod atlas;

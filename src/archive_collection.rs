@@ -1,9 +1,9 @@
 //! Collection-native Archive runtime over the V4 descriptor-handle calculus.
 //!
 //! Archive authorship has one durable Ed25519 signer and one fixed canonical
-//! SimpleArchive-union descriptor. Imports stage complete projector fragments
-//! in memory, validate the candidate block DAG, and cross exactly one
-//! Collection::commit visibility edge. Reads materialize that same collection;
+//! SimpleArchive-union descriptor. Imports stage only facts absent from the
+//! current authored union, validate the candidate block DAG, and cross exactly
+//! one Collection::commit visibility edge. Reads materialize that same collection;
 //! there is no Repository branch, CAS head, sidecar registry, or fallback
 //! identity.
 
@@ -158,7 +158,21 @@ impl ArchiveImportWriter {
     }
 
     pub fn stage_fragment(&mut self, fragment: Fragment) -> Result<()> {
-        self.delta += fragment;
+        // A projector describes its complete observed source prefix. Publish
+        // only the monotone suffix of facts not already authorized by this
+        // collection (or by another fragment in this import). This keeps
+        // published collection growth proportional to new evidence without
+        // source-specific watermarks, while preserving the fragment's blobs
+        // and metafacts for every newly published fact. Projectors may still
+        // rescan their complete source prefix to construct this candidate.
+        let (_, facts, metafacts, blobs) = fragment.into_parts();
+        let facts = facts
+            .difference(&self.current)
+            .difference(self.delta.facts());
+        if facts.is_empty() {
+            return Ok(());
+        }
+        self.delta += Fragment::from_parts(facts, metafacts, blobs);
         Ok(())
     }
 
@@ -611,7 +625,8 @@ impl ArchiveSnapshot {
         projections
     }
 
-    /// Most recent source receipts by canonical block timestamp.
+    /// Most recent source receipts by exact source time, falling back to the
+    /// canonical block time for sources which carry time semantically.
     ///
     /// Untimed blocks sort after genuinely timed blocks. Ties use the source
     /// projection id, making the result independent of collection commit order.
@@ -619,27 +634,36 @@ impl ArchiveSnapshot {
         if limit == 0 {
             return Vec::new();
         }
-        let mut rows: Vec<(Id, Option<i128>)> = self
-            .projection_ids()
-            .into_iter()
-            .map(|projection| {
-                let timestamp = find!(
+        let mut rows: Vec<(Id, Option<i128>)> =
+            self.projection_ids()
+                .into_iter()
+                .map(|projection| {
+                    let source_timestamp = find!(
+                        value: Inline<NsTAIInterval>,
+                        pattern!(&self.facts, [{
+                            projection @ schema::source_projection::source_timestamp: ?value
+                        }])
+                    )
+                    .next();
+                    let timestamp = source_timestamp
+                        .or_else(|| {
+                            find!(
                     value: Inline<NsTAIInterval>,
                     pattern!(&self.facts, [
                         { projection @ schema::source_projection::projects_to: _?block },
                         { _?block @ schema::block::timestamp: ?value },
                     ])
-                )
-                .next()
-                .map(|value| {
-                    let (lower, _upper): (i128, i128) = value
-                        .try_from_inline()
-                        .expect("validated Archive timestamp is inline");
-                    lower
-                });
-                (projection, timestamp)
-            })
-            .collect();
+                ).next()
+                        })
+                        .map(|value| {
+                            let (lower, _upper): (i128, i128) = value
+                                .try_from_inline()
+                                .expect("validated Archive timestamp is inline");
+                            lower
+                        });
+                    (projection, timestamp)
+                })
+                .collect();
         rows.sort_unstable_by(|left, right| {
             right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0))
         });
@@ -1088,13 +1112,47 @@ mod tests {
         let mut retry = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         retry.stage_fragment(fragment).unwrap();
         let (_, repeated) = retry.finish(Ok(())).unwrap();
-        assert_eq!(repeated, Some(first));
+        assert_eq!(repeated, None);
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
 
         let snapshot =
             ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
         assert_eq!(snapshot.commits(), &[first]);
         assert_eq!(snapshot.projection_ids().len(), 1);
+    }
+
+    #[test]
+    fn growing_source_commits_only_facts_absent_from_the_current_union() {
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        std::fs::File::create(&pile).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_signer(&pile, Some(&key)).unwrap();
+
+        let first_fragment = projection("session:one", "one");
+        let first_len = first_fragment.facts().len();
+        let mut first_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        first_writer.stage_fragment(first_fragment.clone()).unwrap();
+        let first = first_writer.finish(Ok(())).unwrap().1.unwrap();
+
+        let second_fragment = projection("session:two", "two");
+        let expected_delta_len = second_fragment
+            .facts()
+            .difference(first_fragment.facts())
+            .len();
+        let mut complete_prefix = first_fragment;
+        complete_prefix += second_fragment.clone();
+        let mut second_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        second_writer.stage_fragment(complete_prefix).unwrap();
+        assert_eq!(second_writer.delta_len(), expected_delta_len);
+        let second = second_writer.finish(Ok(())).unwrap().1.unwrap();
+        assert_ne!(first.data(), second.data());
+
+        let snapshot =
+            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        assert_eq!(snapshot.commits().len(), 2);
+        assert_eq!(snapshot.projection_ids().len(), 2);
+        assert!(snapshot.catalog().len() > first_len);
     }
 
     #[test]

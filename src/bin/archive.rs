@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
-use faculties::archive_claude_code::{self, ProjectionSummary};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use faculties::archive_claude_code::{self, ProjectionSummary as ClaudeCodeProjectionSummary};
+use faculties::archive_codex::{self, ProjectionSummary as CodexProjectionSummary};
 use faculties::archive_collection::{
     self as archive_collection, ArchiveImportWriter, ArchivePart, ArchivePayload,
     ArchiveProjection, ArchiveSearchSnapshot, ArchiveSnapshot,
@@ -54,10 +55,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Project one Claude Code JSONL file or directory and publish one COMMIT.
+    /// Project one source into the Archive and publish one COMMIT.
     Import {
-        /// JSONL file or recursively scanned directory.
+        /// Source path. Claude Code accepts a JSONL file or directory; Codex
+        /// deliberately accepts one explicit rollout JSONL file.
         path: PathBuf,
+        /// Source adapter used to interpret PATH.
+        #[arg(long, value_enum, default_value = "claude-code")]
+        source: ImportSource,
     },
     /// List the most recent source projections from one frozen Archive view.
     List {
@@ -100,6 +105,12 @@ enum Command {
         #[arg(long, env = "PERSONA")]
         persona: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ImportSource {
+    ClaudeCode,
+    Codex,
 }
 
 #[derive(Clone, Copy)]
@@ -186,7 +197,14 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
     });
 }
 
-fn run_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
+fn run_import(storage: ArchiveStorage<'_>, path: &Path, source: ImportSource) -> Result<()> {
+    match source {
+        ImportSource::ClaudeCode => run_claude_code_import(storage, path),
+        ImportSource::Codex => run_codex_import(storage, path),
+    }
+}
+
+fn run_claude_code_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
     let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
     let projection = archive_claude_code::project_path(path, |projected| {
         writer
@@ -194,13 +212,25 @@ fn run_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
             .with_context(|| format!("stage {}", projected.source_path.display()))
     });
     let (summary, commit) = writer.finish(projection)?;
-    print_import_summary(&summary, commit.is_some());
+    print_claude_code_import_summary(&summary, commit.is_some());
     Ok(())
 }
 
-fn print_import_summary(summary: &ProjectionSummary, published: bool) {
+fn run_codex_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let projection = archive_codex::project_path(path, |projected| {
+        writer
+            .stage_fragment(projected.fragment)
+            .with_context(|| format!("stage {}", projected.source_path.display()))
+    });
+    let (summary, commit) = writer.finish(projection)?;
+    print_codex_import_summary(&summary, commit.is_some());
+    Ok(())
+}
+
+fn print_claude_code_import_summary(summary: &ClaudeCodeProjectionSummary, published: bool) {
     println!(
-        "projected {} file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
+        "projected {} Claude Code file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
         summary.files_scanned,
         summary.fragments_emitted,
         summary.stats.source_projections,
@@ -215,12 +245,36 @@ fn print_import_summary(summary: &ProjectionSummary, published: bool) {
         summary.stats.unresolved_tool_results,
         summary.stats.undecodable_images,
     );
+    print_collection_publication(published);
+}
+
+fn print_codex_import_summary(summary: &CodexProjectionSummary, published: bool) {
+    println!(
+        "projected {} Codex rollout file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
+        summary.files_scanned,
+        summary.fragments_emitted,
+        summary.stats.source_projections,
+        summary.stats.content_parts,
+    );
+    println!(
+        "records={} skipped={} invalid_timestamps={} undecodable_assets={} frozen_bytes={} trailing_bytes_ignored={}",
+        summary.stats.records_seen,
+        summary.stats.skipped_records,
+        summary.stats.invalid_timestamps,
+        summary.stats.undecodable_assets,
+        summary.frozen_bytes,
+        summary.trailing_bytes_ignored,
+    );
+    print_collection_publication(published);
+}
+
+fn print_collection_publication(published: bool) {
     println!(
         "Archive collection: {}",
         if published {
             "one signed COMMIT published"
         } else {
-            "unchanged (projector emitted no facts)"
+            "unchanged (no novel facts)"
         }
     );
 }
@@ -264,6 +318,10 @@ fn format_interval(interval: Option<Inline<NsTAIInterval>>) -> Result<String> {
     } else {
         Ok(format!("{lower}..{upper}"))
     }
+}
+
+fn projection_display_timestamp(projection: &ArchiveProjection) -> Option<Inline<NsTAIInterval>> {
+    projection.source_timestamp.or(projection.block_timestamp)
 }
 
 fn modality_label(id: Id) -> String {
@@ -346,7 +404,7 @@ fn render_projection_summary(projection: &ArchiveProjection) -> Result<String> {
     Ok(format!(
         "{} {} {} {}",
         short_id(projection.id),
-        format_interval(projection.block_timestamp)?,
+        format_interval(projection_display_timestamp(projection))?,
         projection_actor(projection),
         projection_snippet(projection),
     ))
@@ -490,6 +548,27 @@ fn load_block(archive: &ArchiveSnapshot, block: Id) -> Result<LoadedBlock> {
     })
 }
 
+fn earliest_receipt_source_timestamp(block: &LoadedBlock) -> Result<Option<Inline<NsTAIInterval>>> {
+    let mut earliest = None;
+    for receipt in &block.receipts {
+        let Some(timestamp) = receipt.source_timestamp else {
+            continue;
+        };
+        let key = interval_key(timestamp)?;
+        if earliest.is_none_or(|(earliest_key, _)| key < earliest_key) {
+            earliest = Some((key, timestamp));
+        }
+    }
+    Ok(earliest.map(|(_, timestamp)| timestamp))
+}
+
+fn semantic_block_timestamp(block: &LoadedBlock) -> Result<Option<Inline<NsTAIInterval>>> {
+    match block.semantic.block_timestamp {
+        Some(timestamp) => Ok(Some(timestamp)),
+        None => earliest_receipt_source_timestamp(block),
+    }
+}
+
 fn load_thread(
     archive: &ArchiveSnapshot,
     projection_prefix: &str,
@@ -555,7 +634,7 @@ fn render_block(block: &LoadedBlock, include_all_parts: bool) -> Result<String> 
     writeln!(
         out,
         "timestamp: {}",
-        format_interval(block.semantic.block_timestamp)?
+        format_interval(semantic_block_timestamp(block)?)?
     )?;
     for predecessor in &block.semantic.block_previous {
         writeln!(out, "previous: {predecessor:X}")?;
@@ -598,7 +677,7 @@ fn run_search(storage: ArchiveStorage<'_>, text: &str, limit: usize) -> Result<(
             hit.score,
             short_id(hit.block),
             hit.projections.len(),
-            format_interval(block.semantic.block_timestamp)?,
+            format_interval(semantic_block_timestamp(&block)?)?,
             projection_snippet(&block.semantic),
         );
     }
@@ -819,20 +898,47 @@ fn timeline_after(
     with_tools: bool,
 ) -> Result<Vec<TimelineBlock>> {
     let catalog = archive.catalog();
-    let mut seen = BTreeSet::new();
-    let mut timeline = Vec::new();
-    for (block, timestamp) in find!(
+    let blocks: BTreeSet<Id> = find!(
+        block: Id,
+        pattern!(catalog, [{ _?projection @ archive_schema::source_projection::projects_to: ?block }])
+    )
+    .collect();
+    let canonical_timestamps: BTreeMap<Id, Inline<NsTAIInterval>> = find!(
         (block: Id, timestamp: Inline<NsTAIInterval>),
         pattern!(catalog, [{ ?block @ archive_schema::block::timestamp: ?timestamp }])
+    )
+    .collect();
+    let mut earliest_receipt_timestamps = BTreeMap::<Id, (i128, Inline<NsTAIInterval>)>::new();
+    for (block, timestamp) in find!(
+        (block: Id, timestamp: Inline<NsTAIInterval>),
+        pattern!(catalog, [
+            { _?projection @ archive_schema::source_projection::projects_to: ?block },
+            { _?projection @ archive_schema::source_projection::source_timestamp: ?timestamp },
+        ])
     ) {
-        if !seen.insert(block) {
-            continue;
+        let key = interval_key(timestamp)?;
+        let entry = earliest_receipt_timestamps
+            .entry(block)
+            .or_insert((key, timestamp));
+        if key < entry.0 {
+            *entry = (key, timestamp);
         }
+    }
+    let mut timeline = Vec::new();
+    for block_id in blocks {
+        let timestamp = canonical_timestamps.get(&block_id).copied().or_else(|| {
+            earliest_receipt_timestamps
+                .get(&block_id)
+                .map(|(_, timestamp)| *timestamp)
+        });
+        let Some(timestamp) = timestamp else {
+            continue;
+        };
         let key = interval_key(timestamp)?;
         if key <= position {
             continue;
         }
-        let block = load_block(archive, block)?;
+        let block = load_block(archive, block_id)?;
         if with_tools || is_dialogue(&block) {
             timeline.push(TimelineBlock { key, block });
         }
@@ -955,7 +1061,7 @@ fn main() -> Result<()> {
         key: cli.key.as_deref(),
     };
     match command {
-        Command::Import { path } => run_import(storage, &path),
+        Command::Import { path, source } => run_import(storage, &path, source),
         Command::List { limit } => run_list(storage, limit),
         Command::Show { id } => run_show(storage, &id),
         Command::Thread { id, limit } => run_thread(storage, &id, limit),
@@ -1066,6 +1172,39 @@ mod tests {
             "backup"
         ])
         .is_err());
+
+        let default_source = Cli::try_parse_from([
+            "archive",
+            "--pile",
+            "archive.pile",
+            "import",
+            "rollout.jsonl",
+        ])
+        .unwrap();
+        assert!(matches!(
+            default_source.command,
+            Some(Command::Import {
+                source: ImportSource::ClaudeCode,
+                ..
+            })
+        ));
+        let codex_source = Cli::try_parse_from([
+            "archive",
+            "--pile",
+            "archive.pile",
+            "import",
+            "rollout.jsonl",
+            "--source",
+            "codex",
+        ])
+        .unwrap();
+        assert!(matches!(
+            codex_source.command,
+            Some(Command::Import {
+                source: ImportSource::Codex,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1084,16 +1223,83 @@ mod tests {
         )
         .unwrap();
 
-        run_import(storage(&fixture), &source).unwrap();
+        run_import(storage(&fixture), &source, ImportSource::ClaudeCode).unwrap();
         assert_eq!(archive_root_count(&fixture), 1);
         let archive = storage(&fixture).load().unwrap();
         assert_eq!(archive.projection_ids().len(), 2);
         drop(archive);
         let after_first = fs::metadata(&fixture.pile).unwrap().len();
 
-        run_import(storage(&fixture), &source).unwrap();
+        run_import(storage(&fixture), &source, ImportSource::ClaudeCode).unwrap();
         assert_eq!(archive_root_count(&fixture), 1);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
+    }
+
+    #[test]
+    fn codex_import_uses_receipt_time_and_replays_one_semantic_block_once() {
+        let fixture = fixture();
+        let first = fixture._directory.path().join("first-rollout.jsonl");
+        let second = fixture._directory.path().join("second-rollout.jsonl");
+        fs::write(
+            &first,
+            concat!(
+                r#"{"timestamp":"2026-08-16T08:00:00Z","type":"session_meta","payload":{"id":"first-session","session_id":"first-session"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-16T08:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"same semantic message"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &second,
+            concat!(
+                r#"{"timestamp":"2026-08-16T08:00:00Z","type":"session_meta","payload":{"id":"second-session","session_id":"second-session"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-16T08:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"same semantic message"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        run_import(storage(&fixture), &first, ImportSource::Codex).unwrap();
+        run_import(storage(&fixture), &second, ImportSource::Codex).unwrap();
+
+        let archive = storage(&fixture).load().unwrap();
+        let projection_ids = archive.projection_ids();
+        assert_eq!(projection_ids.len(), 2);
+        let projections = projection_ids
+            .into_iter()
+            .map(|id| archive.projection(id).unwrap())
+            .collect::<Vec<_>>();
+        assert!(projections
+            .iter()
+            .all(|projection| projection.block_timestamp.is_none()));
+        assert!(projections
+            .iter()
+            .all(|projection| !render_projection_summary(projection)
+                .unwrap()
+                .contains("<untimed>")));
+
+        let blocks: BTreeSet<_> = projections
+            .iter()
+            .map(|projection| projection.block)
+            .collect();
+        assert_eq!(blocks.len(), 1);
+        let block = load_block(&archive, *blocks.first().unwrap()).unwrap();
+        let earliest_receipt_key = projections
+            .iter()
+            .map(|projection| interval_key(projection.source_timestamp.unwrap()).unwrap())
+            .min()
+            .unwrap();
+        assert_eq!(
+            interval_key(semantic_block_timestamp(&block).unwrap().unwrap()).unwrap(),
+            earliest_receipt_key
+        );
+        assert!(!render_block(&block, false).unwrap().contains("<untimed>"));
+
+        let timeline = timeline_after(&archive, i128::MIN, false).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].key, earliest_receipt_key);
     }
 
     #[test]
@@ -1112,7 +1318,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = run_import(storage(&fixture), &source).unwrap_err();
+        let error = run_import(storage(&fixture), &source, ImportSource::ClaudeCode).unwrap_err();
         assert!(format!("{error:#}").contains("conflicting semantic payloads"));
         assert_eq!(archive_root_count(&fixture), 0);
     }
@@ -1126,7 +1332,7 @@ mod tests {
             r#"{"type":"user","sessionId":"read","uuid":"one","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"quasar needle"}}"#,
         )
         .unwrap();
-        run_import(storage(&fixture), &source).unwrap();
+        run_import(storage(&fixture), &source, ImportSource::ClaudeCode).unwrap();
         let first =
             archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first.source_commits, 1);
@@ -1189,7 +1395,7 @@ mod tests {
             ),
         )
         .unwrap();
-        run_import(storage(&fixture), &source).unwrap();
+        run_import(storage(&fixture), &source, ImportSource::ClaudeCode).unwrap();
         let archive = storage(&fixture).load().unwrap();
         let joined = archive
             .projection_ids()
@@ -1228,7 +1434,7 @@ mod tests {
             ),
         )
         .unwrap();
-        run_import(storage(&fixture), &source).unwrap();
+        run_import(storage(&fixture), &source, ImportSource::ClaudeCode).unwrap();
 
         let archive = storage(&fixture).load().unwrap();
         let timeline = timeline_after(&archive, i128::MIN, false).unwrap();

@@ -167,4 +167,8 @@ pub mod source_projection {
 
     /// Claude Code JSONL source namespace.
     pub const SOURCE_CLAUDE_CODE: Id = id_hex!("08C70B08B8F48CA5C9FAFEA714A4EACE");
+
+    /// Codex app-server rollout JSONL source namespace. Minted with
+    /// `trible genid` on 2026-08-16.
+    pub const SOURCE_CODEX: Id = id_hex!("C9B3D07DA2B5939383F342B1054E08F3");
 }
