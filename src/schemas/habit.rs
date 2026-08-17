@@ -53,8 +53,31 @@ pub mod attrs {
 
         /// `active` or `paused` on a state assertion.
         "5C1E4BD13E8FA4633F286CD5B33BCAC7" unsafe as state: inlineencodings::ShortString;
+
+        /// Executable the standing intention carries with it, addressed by
+        /// content hash. A habit whose predicate lives in the pile is the same
+        /// habit in every window; one whose predicate is an absolute path is a
+        /// habit only the authoring machine can ever evaluate.
+        ///
+        /// Anchor minted with `trible genid` on 2026-08-13:
+        /// `96EC24A8226E9D848A4905D982485678`. Declared in the anchored form
+        /// (no `unsafe`) because this attribute has no published byte identity
+        /// to preserve — the encoding therefore participates in its id.
+        "96EC24A8226E9D848A4905D982485678" as script:
+            inlineencodings::Handle<blobencodings::RawBytes>;
     }
 }
+
+/// Placeholder inside a `when` command standing for the habit's own carried
+/// script.
+///
+/// Evaluation expands it to the local path of the materialized blob, so one
+/// condition text stays meaningful on every machine holding the collection.
+/// It is recognized only as the leading command word; occurrences in later
+/// arguments, comments, quotes, or longer words stay literal. A real command
+/// named `script` (BSD's terminal recorder) keeps working because it carries
+/// no `@`.
+pub const SCRIPT_TOKEN: &str = "@script";
 
 /// Labels are inline values and command addresses. Refuse overflow explicitly
 /// instead of allowing the encoder to panic.
@@ -117,6 +140,27 @@ impl Condition {
             cooldown_secs: cooldown_override.unwrap_or(default_cooldown),
             command,
         })
+    }
+
+    /// Suffix after a leading `@script` command word, when present.
+    ///
+    /// The token is deliberately grammar, not substring replacement: only the
+    /// first shell word may name the carried executable. Text in arguments,
+    /// comments, quotes, or longer words such as `@scripture` stays literal.
+    pub fn script_suffix(&self) -> Option<&str> {
+        let suffix = self.command.strip_prefix(SCRIPT_TOKEN)?;
+        match suffix.chars().next() {
+            None => Some(suffix),
+            Some(character) if character.is_whitespace() => Some(suffix),
+            Some(_) => None,
+        }
+    }
+
+    /// Whether the predicate delegates to the habit's own carried script.
+    /// `every` and `daily at` synthesize other leading command words, so only
+    /// an authored `when @script …` can answer yes.
+    pub fn uses_script(&self) -> bool {
+        self.script_suffix().is_some()
     }
 
     /// Whether no completion lies inside this condition's cooldown window.
@@ -199,6 +243,33 @@ mod tests {
         assert!(condition.cooled_down(10_000, []));
         assert!(condition.cooled_down(10_000, [1_000, 6_400]));
         assert!(!condition.cooled_down(10_000, [1_000, 9_000]));
+    }
+
+    #[test]
+    fn only_an_authored_when_can_reach_the_carried_script() {
+        assert!(Condition::parse("when @script --due")
+            .unwrap()
+            .uses_script());
+        assert!(Condition::parse("when @script | grep -q .")
+            .unwrap()
+            .uses_script());
+        for literal in [
+            "when echo @script",
+            "when true # @script",
+            "when @scripture --chapter 1",
+            "when \"@script\" --due",
+        ] {
+            assert!(
+                !Condition::parse(literal).unwrap().uses_script(),
+                "{literal}"
+            );
+        }
+        // A real `script(1)` invocation carries no `@` and stays untouched.
+        assert!(!Condition::parse("when script -q /dev/null true")
+            .unwrap()
+            .uses_script());
+        assert!(!Condition::parse("every 1h").unwrap().uses_script());
+        assert!(!Condition::parse("daily at 09:30").unwrap().uses_script());
     }
 
     #[test]

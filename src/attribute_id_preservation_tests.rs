@@ -90,6 +90,14 @@ fn durable_faculty_attributes_keep_their_published_ids() {
             format!("{:X}", crate::schemas::habit::attrs::state.id()),
             "5C1E4BD13E8FA4633F286CD5B33BCAC7",
         ),
+        // Anchored, not pinned: the recorded id is the value derived from
+        // anchor 96EC24A8226E9D848A4905D982485678 and the
+        // Handle<RawBytes> encoding, so changing either is caught here.
+        (
+            "habit::script",
+            format!("{:X}", crate::schemas::habit::attrs::script.id()),
+            "9B053A1DFE1A091635E8D619B03B9FB1",
+        ),
     ] {
         assert_id(path, got, expected);
     }

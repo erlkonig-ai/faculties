@@ -2406,7 +2406,8 @@ mod tests {
         let fixture = TestPile::new();
         let signer = SigningKey::generate(&mut rand_core::OsRng);
         let (definition, habit) =
-            habits::habit_fragment("lineage-hygiene", "every 1s", "inspect branches").unwrap();
+            habits::habit_fragment("lineage-hygiene", "every 1s", "inspect branches", None, &[])
+                .unwrap();
         let completed_at = Epoch::from_unix_seconds(100.0);
         let completed_secs = epoch_seconds(completed_at);
         let (completion, _) =

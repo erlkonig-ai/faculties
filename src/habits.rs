@@ -24,10 +24,11 @@ use triblespace::prelude::*;
 use crate::collection_cutover::{load_signer, open_pile_strict};
 use crate::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
-    MAX_LABEL_BYTES, STATE_ACTIVE, STATE_PAUSED,
+    MAX_LABEL_BYTES, SCRIPT_TOKEN, STATE_ACTIVE, STATE_PAUSED,
 };
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type ScriptHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 /// Canonical descriptor for the one supported Habit collection.
@@ -35,13 +36,64 @@ pub fn descriptor() -> CollectionDescriptor {
     simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
 }
 
+/// One pile-resident executable carried by a standing intention.
+///
+/// The handle is the content hash, so it is simultaneously the pile address,
+/// the identity recorded in the habit's own facts, and the local cache key.
+/// Editing the script therefore yields a different habit at a different cache
+/// path: no stale copy is reachable, because nothing is ever overwritten.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Script {
+    pub handle: ScriptHandle,
+    pub bytes: Vec<u8>,
+}
+
+/// Content hash a script will be addressed by, computed without publishing it.
+///
+/// Authoring surfaces need to name the attachment before the collection has
+/// been written, and the address is a pure function of the bytes.
+pub fn script_digest(bytes: &[u8]) -> String {
+    let mut fragment = Fragment::empty();
+    let handle = fragment.put::<blobencodings::RawBytes, _>(bytes.to_vec());
+    hex::encode(handle.raw)
+}
+
+impl Script {
+    /// Lowercase hex content hash — the cache key and the display form.
+    pub fn digest(&self) -> String {
+        hex::encode(self.handle.raw)
+    }
+
+    /// First eight hex digits, for one-line listings.
+    pub fn short_digest(&self) -> String {
+        self.digest()[..8].to_owned()
+    }
+
+    fn validate_identity(&self) -> std::result::Result<(), String> {
+        let expected = self.digest();
+        let actual = script_digest(&self.bytes);
+        if actual != expected {
+            return Err(format!(
+                "Habit script handle {expected} does not address its carried bytes (actual {actual})"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Habit {
     pub id: Id,
+    /// Display name. Deliberately **not** an identity: several definitions may
+    /// carry the same label, and none of them owns it.
     pub label: String,
     /// Author-written source (`every …`, `daily at …`, or `when …`).
     pub condition: String,
     pub nudge: String,
+    /// Executable the definition carries, when the condition names `@script`.
+    pub script: Option<Script>,
+    /// Definitions this one replaces, by intrinsic id.
+    pub supersedes: Vec<Id>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,14 +188,45 @@ impl Catalog {
         self.assertions.values()
     }
 
-    /// Case-insensitive command-address lookup. Several results are a visible
-    /// concurrent-definition conflict; callers must not choose one.
+    /// Every definition displaying this name, case-insensitively.
+    ///
+    /// Several results are ordinary, not a conflict: the label is a display
+    /// attribute and nothing owns it. Callers that need one definition must
+    /// disambiguate by id rather than choose.
     pub fn labelled(&self, label: &str) -> Vec<&Habit> {
         let label = label.trim().to_ascii_lowercase();
         self.habits
             .values()
             .filter(|habit| habit.label.to_ascii_lowercase() == label)
             .collect()
+    }
+
+    /// Definitions no other definition supersedes — the current revisions.
+    ///
+    /// Liveness is a property of the supersession DAG and therefore of ids
+    /// alone. It is never derived from the label: a name-based rule is not
+    /// monotonic, because which definition "owns" a name depends on which
+    /// facts a window happens to have observed, so two windows could disagree
+    /// indefinitely while each is locally correct. An explicit edge only ever
+    /// retires, never resurrects, so every window that has seen it agrees and
+    /// order does not matter.
+    pub fn live(&self) -> Vec<&Habit> {
+        let superseded: BTreeSet<Id> = self
+            .habits
+            .values()
+            .flat_map(|habit| habit.supersedes.iter().copied())
+            .collect();
+        self.habits
+            .values()
+            .filter(|habit| !superseded.contains(&habit.id))
+            .collect()
+    }
+
+    /// Whether any other definition supersedes this one.
+    pub fn is_superseded(&self, id: Id) -> bool {
+        self.habits
+            .values()
+            .any(|habit| habit.supersedes.contains(&id))
     }
 
     pub fn activation(&self, habit: Id) -> Result<Activation> {
@@ -174,9 +257,12 @@ impl Catalog {
         Ok(Activation::Forked(heads))
     }
 
+    /// One row per **live** definition. A superseded revision keeps its facts
+    /// as durable history but is no longer a standing intention, so it is not
+    /// evaluated and cannot come due.
     pub fn rows(&self) -> Result<Vec<HabitRow>> {
         let mut rows = Vec::with_capacity(self.habits.len());
-        for habit in self.habits.values() {
+        for habit in self.live() {
             let mut completed_at = self
                 .completions
                 .values()
@@ -190,6 +276,7 @@ impl Catalog {
                 label: habit.label.clone(),
                 condition: habit.condition.clone(),
                 nudge: habit.nudge.clone(),
+                script: habit.script.clone(),
                 activation: self.activation(habit.id)?,
                 completed_at,
             });
@@ -205,6 +292,7 @@ pub struct HabitRow {
     pub label: String,
     pub condition: String,
     pub nudge: String,
+    pub script: Option<Script>,
     pub activation: Activation,
     /// Complete set of completion points, represented in integral TAI seconds.
     pub completed_at: Vec<i64>,
@@ -303,12 +391,39 @@ fn interval_seconds(value: IntervalValue, field: &str) -> Result<i64> {
         .map_err(|_| anyhow!("{field} lies outside the supported second range"))
 }
 
-fn habit_record(label: &str, condition: TextHandle, nudge: TextHandle) -> Fragment {
+fn habit_record(
+    label: &str,
+    condition: TextHandle,
+    nudge: TextHandle,
+    script: Option<ScriptHandle>,
+    supersedes: &[Id],
+) -> Fragment {
     entity! { _ @
         metadata::tag: &KIND_HABIT_ID,
         attrs::label: label,
         attrs::condition: condition,
         attrs::nudge: nudge,
+        attrs::script?: script,
+        metadata::supersedes*: supersedes.iter(),
+    }
+}
+
+/// A condition and its attachment must agree in both directions.
+///
+/// Either mismatch describes a habit that cannot do what it says: a `@script`
+/// with nothing to run, or an executable no condition will ever reach. Both are
+/// caught where the definition is built, not where it silently stops firing.
+fn check_script_agreement(condition: &Condition, has_script: bool, subject: &str) -> Result<()> {
+    match (condition.uses_script(), has_script) {
+        (true, false) => bail!(
+            "{subject} condition names `{SCRIPT_TOKEN}` but carries no script; \
+             attach one with `--script <path>`"
+        ),
+        (false, true) => bail!(
+            "{subject} carries a script no condition reaches; \
+             write the condition as `when {SCRIPT_TOKEN} <args>`"
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -336,20 +451,44 @@ fn state_record(
 }
 
 /// Build one complete, intrinsically identified standing intention.
+///
+/// When `script` is present its bytes travel inside the fragment, exactly as
+/// the condition and nudge payloads do. That is what makes the definition
+/// self-contained: whoever receives this one collection commit receives the
+/// executable too, and does not have to already hold some other collection —
+/// or some machine-local path — for the intention to mean anything.
+///
+/// `supersedes` names the definitions this one replaces, by intrinsic id. The
+/// edge is part of the record, so two windows authoring the same revision of
+/// the same intention produce byte-identical facts and therefore the same id:
+/// they converge on one definition instead of forking. Concurrent authoring
+/// *without* an edge is not an error — it is two live definitions that happen
+/// to share a display name, which is the truth, and a later revision citing
+/// both resolves it.
 pub fn habit_fragment(
     label: impl Into<String>,
     condition: impl Into<String>,
     nudge: impl Into<String>,
+    script: Option<Vec<u8>>,
+    supersedes: &[Id],
 ) -> Result<(Fragment, Id)> {
     let label = canonical_label(label)?;
     let condition = canonical_required(condition, "Habit condition")?;
-    Condition::parse(&condition).map_err(|error| anyhow!(error))?;
+    let parsed = Condition::parse(&condition).map_err(|error| anyhow!(error))?;
     let nudge = canonical_required(nudge, "Habit nudge")?;
+    if let Some(bytes) = &script {
+        if bytes.is_empty() {
+            bail!("Habit script is empty");
+        }
+    }
+    check_script_agreement(&parsed, script.is_some(), &format!("Habit {label:?}"))?;
 
+    let supersedes = sorted_ids(supersedes.iter().copied());
     let mut fragment = Fragment::empty();
     let condition = fragment.put(condition);
     let nudge = fragment.put(nudge);
-    let record = habit_record(&label, condition, nudge);
+    let script = script.map(|bytes| fragment.put::<blobencodings::RawBytes, _>(bytes));
+    let record = habit_record(&label, condition, nudge, script, &supersedes);
     let id = record
         .root()
         .expect("Habit definition has one intrinsic root");
@@ -395,6 +534,16 @@ fn exactly_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<T> {
     Ok(values.into_iter().next().unwrap())
 }
 
+fn at_most_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>> {
+    if values.len() > 1 {
+        bail!(
+            "Habit entity {entity:x} has {} values for {field}; expected at most one",
+            values.len()
+        );
+    }
+    Ok(values.into_iter().next())
+}
+
 fn ids_of_kind(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: kind }])).collect()
 }
@@ -426,6 +575,8 @@ struct RawHabit {
     label: String,
     condition: TextHandle,
     nudge: TextHandle,
+    script: Option<ScriptHandle>,
+    supersedes: Vec<Id>,
 }
 
 #[derive(Clone)]
@@ -454,6 +605,15 @@ fn parse_habit(facts: &TribleSet, id: Id) -> Result<RawHabit> {
             id,
             "habit::nudge",
         )?,
+        script: at_most_one(
+            find!(value: ScriptHandle, pattern!(facts, [{ id @ attrs::script: ?value }])).collect(),
+            id,
+            "habit::script",
+        )?,
+        supersedes: sorted_ids(find!(
+            value: Id,
+            pattern!(facts, [{ id @ metadata::supersedes: ?value }])
+        )),
     })
 }
 
@@ -526,7 +686,13 @@ fn validate_structure(facts: &TribleSet) -> Result<RawCatalog> {
         if canonical != raw.label {
             bail!("Habit {id:x} label is not canonical");
         }
-        let expected = habit_record(&raw.label, raw.condition, raw.nudge);
+        let expected = habit_record(
+            &raw.label,
+            raw.condition,
+            raw.nudge,
+            raw.script,
+            &raw.supersedes,
+        );
         if expected.root() != Some(id) {
             // Additive cutovers retain the exact random-id legacy record next
             // to its intrinsic native shadow. It remains durable evidence but
@@ -536,6 +702,17 @@ fn validate_structure(facts: &TribleSet) -> Result<RawCatalog> {
         ensure_exact_entity(facts, id, expected.facts(), "Habit definition")?;
         habits.insert(id, raw);
     }
+
+    // The revision track is deliberately *not* gated here, unlike the state
+    // track. Every rule one could impose on it — predecessors must be present,
+    // must form an antichain, must not cycle — is a rule a partial view can
+    // violate, and violating it would make the whole catalog unreadable to a
+    // window that happened to receive the successor before what it retires.
+    // Liveness is instead computed structurally in `Catalog::live`, where an
+    // edge naming an unseen definition simply retires nothing yet, and retires
+    // it the moment it arrives. Ids are intrinsic, so an id names one
+    // definition forever and retiring it early is correct rather than
+    // accidental. Adding facts can only ever retire more, never resurrect.
 
     let mut completions = BTreeMap::new();
     for id in completion_ids {
@@ -700,6 +877,48 @@ where
     load_text(reader, handle, field)
 }
 
+/// Resolve a carried script, from the staged fragment first and the pile
+/// second.
+///
+/// An unresolvable handle is a hard error naming both the habit and the exact
+/// missing blob. It is deliberately not degraded into "this habit is not due":
+/// a standing intention that quietly stops firing is worse than one that
+/// refuses to be read at all, because nobody notices the first.
+fn load_script_overlay<Overlay>(
+    reader: &PileReader,
+    overlay: Option<&Overlay>,
+    handle: ScriptHandle,
+    habit: Id,
+) -> Result<Script>
+where
+    Overlay: BlobStoreGet + BlobStoreMeta,
+{
+    let missing = || {
+        anyhow!(
+            "Habit {habit:x} script blob {} is not in this pile",
+            hex::encode(handle.raw)
+        )
+    };
+    if let Some(overlay) = overlay {
+        if overlay
+            .metadata(handle)
+            .expect("in-memory Habit attachment lookup is infallible")
+            .is_some()
+        {
+            let bytes: anybytes::Bytes = overlay.get(handle).map_err(|_| missing())?;
+            return Ok(Script {
+                handle,
+                bytes: bytes.to_vec(),
+            });
+        }
+    }
+    let bytes: anybytes::Bytes = reader.get(handle).map_err(|_| missing())?;
+    Ok(Script {
+        handle,
+        bytes: bytes.to_vec(),
+    })
+}
+
 fn decode_catalog<Overlay>(
     reader: &PileReader,
     overlay: Option<&Overlay>,
@@ -723,8 +942,18 @@ where
             bail!("Habit {} condition payload is not canonical", raw_habit.id);
         }
         let condition = canonical_condition;
-        Condition::parse(&condition)
+        let parsed = Condition::parse(&condition)
             .map_err(|error| anyhow!("Habit {} condition: {error}", raw_habit.id))?;
+
+        let script = match raw_habit.script {
+            Some(handle) => Some(load_script_overlay(reader, overlay, handle, raw_habit.id)?),
+            None => None,
+        };
+        check_script_agreement(
+            &parsed,
+            script.is_some(),
+            &format!("Habit {:x}", raw_habit.id),
+        )?;
 
         let nudge = if let Some(value) = texts.get(&raw_habit.nudge.raw) {
             value.clone()
@@ -745,6 +974,8 @@ where
                 label: raw_habit.label.clone(),
                 condition,
                 nudge,
+                script,
+                supersedes: raw_habit.supersedes.clone(),
             },
         );
     }
@@ -808,9 +1039,18 @@ pub fn validate_publication_fragment(fragment: &Fragment) -> Result<()> {
         if label != raw.label {
             bail!("Habit {id:x} label is not canonical");
         }
+        if raw.supersedes.contains(&id) {
+            bail!("Habit {id:x} supersedes itself");
+        }
         let expected = ensure_intrinsic(
             id,
-            habit_record(&raw.label, raw.condition, raw.nudge),
+            habit_record(
+                &raw.label,
+                raw.condition,
+                raw.nudge,
+                raw.script,
+                &raw.supersedes,
+            ),
             "Habit definition",
         )?;
         let mut local = fragment.clone();
@@ -829,7 +1069,19 @@ pub fn validate_publication_fragment(fragment: &Fragment) -> Result<()> {
         if condition != condition_source {
             bail!("Habit {id:x} condition payload is not canonical");
         }
-        Condition::parse(&condition).map_err(|error| anyhow!(error))?;
+        let parsed = Condition::parse(&condition).map_err(|error| anyhow!(error))?;
+        if let Some(handle) = raw.script {
+            let script: anybytes::Bytes = reader.get(handle).map_err(|_| {
+                anyhow!(
+                    "complete Habit definition {id:x} is missing script payload {}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+            if script.is_empty() {
+                bail!("Habit {id:x} script payload is empty");
+            }
+        }
+        check_script_agreement(&parsed, raw.script.is_some(), &format!("Habit {id:x}"))?;
         let nudge: View<str> = reader.get(raw.nudge).map_err(|_| {
             anyhow!(
                 "complete Habit definition {id:x} is missing nudge payload {}",
@@ -928,6 +1180,118 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
     }
 }
 
+/// Local cache root holding materialized habit scripts.
+///
+/// Content-addressed, so nothing in it is ever invalidated — only added to. The
+/// override exists for sandboxes with a read-only home, and for tests.
+pub fn script_cache_dir() -> std::result::Result<std::path::PathBuf, String> {
+    if let Some(dir) = std::env::var_os("FACULTIES_HABIT_SCRIPT_CACHE") {
+        return Ok(std::path::PathBuf::from(dir));
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })
+        .ok_or_else(|| {
+            "neither FACULTIES_HABIT_SCRIPT_CACHE, XDG_CACHE_HOME nor HOME is set, so there is \
+             nowhere to materialize the habit script"
+                .to_owned()
+        })?;
+    Ok(base.join("faculties").join("habit"))
+}
+
+/// Whether the cache already holds this exact script, executable.
+///
+/// The path is the content hash and files arrive there only by rename, but the
+/// cache is still ordinary user-writable state. Check the bytes as well as the
+/// length and mode so a same-length edit can never run under somebody else's
+/// digest.
+fn cached_copy_is_usable(path: &Path, script: &Script) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            meta.is_file()
+                && meta.len() == script.bytes.len() as u64
+                && meta.permissions().mode() & 0o100 != 0
+                && std::fs::read(path)
+                    .map(|bytes| bytes == script.bytes)
+                    .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Write a carried script into the content-addressed cache and return its path.
+///
+/// Staging plus rename is what makes the cache safe to trust: the hash-named
+/// path only ever appears complete, so a crashed writer cannot leave a
+/// truncated executable behind for the next evaluation to run.
+pub fn materialize_script(script: &Script) -> std::result::Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    script.validate_identity()?;
+    let directory = script_cache_dir()?;
+    let path = directory.join(script.digest());
+    if cached_copy_is_usable(&path, script) {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("create habit script cache {}: {error}", directory.display()))?;
+    // The staging name is unique per *attempt*, not per process: two
+    // evaluations of the same script inside one process would otherwise share
+    // a staging path and rename it out from under each other.
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging = directory.join(format!(
+        ".{}.{}.{attempt}.staging",
+        script.digest(),
+        std::process::id()
+    ));
+    std::fs::write(&staging, &script.bytes)
+        .map_err(|error| format!("write habit script {}: {error}", staging.display()))?;
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).map_err(
+        |error| {
+            let _ = std::fs::remove_file(&staging);
+            format!(
+                "make habit script {} executable: {error}",
+                staging.display()
+            )
+        },
+    )?;
+    std::fs::rename(&staging, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&staging);
+        format!("install habit script {}: {error}", path.display())
+    })?;
+    Ok(path)
+}
+
+/// Quote one path as a single shell word.
+///
+/// The cache path is generated, but its root comes from the environment, so
+/// quoting is not optional.
+fn shell_word(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
+}
+
+/// Resolve a parsed condition into the exact shell command to run.
+///
+/// A leading `@script` command word is rewritten to the local path of the
+/// materialized blob; everything else passes through untouched.
+pub fn resolve_command(
+    condition: &Condition,
+    script: Option<&Script>,
+) -> std::result::Result<String, String> {
+    let Some(suffix) = condition.script_suffix() else {
+        return Ok(condition.command.clone());
+    };
+    let script = script.ok_or_else(|| {
+        format!("condition names `{SCRIPT_TOKEN}` but this Habit carries no script")
+    })?;
+    let path = materialize_script(script)?;
+    Ok(format!("{}{suffix}", shell_word(&path)))
+}
+
 /// Run the predicate from the fixed directory supplied by the caller.
 pub fn condition_holds(command: &str, at: &Path) -> std::result::Result<bool, String> {
     // A timer-driven predicate must not stream arbitrary output into whoever
@@ -939,13 +1303,22 @@ pub fn condition_holds(command: &str, at: &Path) -> std::result::Result<bool, St
         .current_dir(at)
         .output()
         .map_err(|error| format!("running {command:?}: {error}"))?;
-    if output.status.code() == Some(127) {
-        return Err(format!(
-            "command not found: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(code @ (126 | 127)) => {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            let detail = detail.trim();
+            Err(if detail.is_empty() {
+                format!("condition command exited {code}")
+            } else {
+                format!("condition command exited {code}: {detail}")
+            })
+        }
+        Some(_) => Ok(false),
+        None => Err(format!(
+            "condition command terminated by signal: {command:?}"
+        )),
     }
-    Ok(output.status.success())
 }
 
 /// Evaluate one standing intention against a wall-clock second.
@@ -966,7 +1339,14 @@ pub fn evaluate(row: &HabitRow, now_secs: i64, at: &Path) -> State {
     if !condition.cooled_down(now_secs, row.completed_at.iter().copied()) {
         return State::Cooling;
     }
-    match condition_holds(&condition.command, at) {
+    // A predicate that cannot be resolved is an error, never a quiet "not
+    // due" — the whole point of carrying the script is that this cannot
+    // depend on which machine is asking.
+    let command = match resolve_command(&condition, row.script.as_ref()) {
+        Ok(command) => command,
+        Err(error) => return State::Failed(error),
+    };
+    match condition_holds(&command, at) {
         Ok(true) => State::Due,
         Ok(false) => State::Waiting,
         Err(error) => State::Failed(error),
@@ -1027,15 +1407,48 @@ mod tests {
         }
     }
 
+    fn live_ids(catalog: &Catalog) -> Vec<Id> {
+        catalog.live().into_iter().map(|habit| habit.id).collect()
+    }
+
     fn row(condition: &str, completed_at: &[i64], activation: Activation) -> HabitRow {
         HabitRow {
             id: Id::new([1; 16]).unwrap(),
             label: "test".to_owned(),
             condition: condition.to_owned(),
             nudge: "do it".to_owned(),
+            script: None,
             activation,
             completed_at: completed_at.to_vec(),
         }
+    }
+
+    /// One content-addressed cache for the whole test binary.
+    ///
+    /// The cache root is process-global state, so tests share it rather than
+    /// racing to set it; content addressing makes sharing safe.
+    fn shared_cache() -> &'static Path {
+        static CACHE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let directory = CACHE.get_or_init(|| {
+            let directory = tempfile::tempdir().unwrap();
+            std::env::set_var("FACULTIES_HABIT_SCRIPT_CACHE", directory.path());
+            directory
+        });
+        directory.path()
+    }
+
+    /// A carried script, addressed exactly as publication would address it.
+    fn script(source: &str) -> Script {
+        let mut fragment = Fragment::empty();
+        let handle = fragment.put::<blobencodings::RawBytes, _>(source.as_bytes().to_vec());
+        let script = Script {
+            handle,
+            bytes: source.as_bytes().to_vec(),
+        };
+        // The pre-publication digest an authoring surface prints must be the
+        // address the published definition actually carries.
+        assert_eq!(script_digest(source.as_bytes()), script.digest());
+        script
     }
 
     #[test]
@@ -1068,7 +1481,8 @@ mod tests {
     #[test]
     fn intrinsic_definition_and_exact_retry_are_idempotent() {
         let fixture = Fixture::new();
-        let (fragment, id) = habit_fragment("journal", "every 1d", "write the journal").unwrap();
+        let (fragment, id) =
+            habit_fragment("journal", "every 1d", "write the journal", None, &[]).unwrap();
         let first = fixture.publish(fragment.clone());
         let after_first = std::fs::metadata(&fixture.pile).unwrap().len();
         let replay = fixture.publish(fragment);
@@ -1090,7 +1504,8 @@ mod tests {
     #[test]
     fn concurrent_state_assertions_stay_forked_until_reconciled() {
         let fixture = Fixture::new();
-        let (definition, habit) = habit_fragment("journal", "every 1h", "write").unwrap();
+        let (definition, habit) =
+            habit_fragment("journal", "every 1h", "write", None, &[]).unwrap();
         fixture.publish(definition);
 
         // Two writers observed the same empty frontier and asserted different
@@ -1112,12 +1527,144 @@ mod tests {
         ));
     }
 
+    /// Revision is an explicit id edge, so the upgrade path exists without the
+    /// label ever behaving like a key.
+    #[test]
+    fn a_successor_retires_its_predecessor_by_id_not_by_name() {
+        let fixture = Fixture::new();
+        let (original, original_id) = habit_fragment(
+            "sweep",
+            "when /usr/local/bin/sweep --due",
+            "sweep",
+            None,
+            &[],
+        )
+        .unwrap();
+        fixture.publish(original);
+        assert_eq!(live_ids(&fixture.catalog()), vec![original_id]);
+
+        let (successor, successor_id) = habit_fragment(
+            "sweep",
+            "when @script --due",
+            "sweep",
+            Some(b"#!/bin/sh\nexit 0\n".to_vec()),
+            &[original_id],
+        )
+        .unwrap();
+        fixture.publish(successor);
+
+        let catalog = fixture.catalog();
+        // Both definitions remain; only the successor is live, and only it is
+        // evaluated.
+        assert_eq!(catalog.habits().count(), 2);
+        assert_eq!(catalog.labelled("sweep").len(), 2);
+        assert_eq!(live_ids(&catalog), vec![successor_id]);
+        assert!(catalog.is_superseded(original_id));
+        assert_eq!(
+            catalog
+                .rows()
+                .unwrap()
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [successor_id]
+        );
+    }
+
+    /// Liveness must not depend on the order facts arrive in. Publishing the
+    /// successor before its predecessor is legal set union, and both orders
+    /// have to agree — this is the property a name-based rule cannot give.
+    #[test]
+    fn liveness_is_order_independent() {
+        let (original, original_id) =
+            habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();
+        let (successor, successor_id) =
+            habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
+
+        for order in [[0usize, 1], [1, 0]] {
+            let fixture = Fixture::new();
+            for index in order {
+                let fragment = if index == 0 {
+                    original.clone()
+                } else {
+                    successor.clone()
+                };
+                fixture.publish(fragment);
+            }
+            assert_eq!(
+                live_ids(&fixture.catalog()),
+                vec![successor_id],
+                "{order:?}"
+            );
+        }
+    }
+
+    /// Two windows authoring the same revision of the same intention converge
+    /// on one definition, because identity is the content and not the name.
+    #[test]
+    fn identical_revisions_authored_independently_are_one_definition() {
+        let fixture = Fixture::new();
+        let (original, original_id) =
+            habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();
+        fixture.publish(original);
+
+        let first = habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
+        let second = habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
+        assert_eq!(first.1, second.1);
+        fixture.publish(first.0);
+        fixture.publish(second.0);
+        assert_eq!(fixture.catalog().habits().count(), 2);
+        assert_eq!(live_ids(&fixture.catalog()), vec![first.1]);
+    }
+
+    /// Concurrent creation without an edge is two live definitions sharing a
+    /// name. That is the truth, and it stays visible until an explicit edge
+    /// resolves it — no winner is picked.
+    #[test]
+    fn concurrent_creation_stays_forked_until_an_edge_resolves_it() {
+        let fixture = Fixture::new();
+        let (mine, mine_id) = habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();
+        let (theirs, theirs_id) = habit_fragment("sweep", "every 2h", "sweep", None, &[]).unwrap();
+        fixture.publish(mine);
+        fixture.publish(theirs);
+        assert_eq!(live_ids(&fixture.catalog()).len(), 2);
+
+        let (joined, joined_id) =
+            habit_fragment("sweep", "every 3h", "sweep", None, &[mine_id, theirs_id]).unwrap();
+        fixture.publish(joined);
+        assert_eq!(live_ids(&fixture.catalog()), vec![joined_id]);
+    }
+
+    /// An edge naming a definition this window has not seen is legal and
+    /// retires nothing yet. Rejecting it would mean a window that received the
+    /// successor first could not read the catalog at all — the partial-view
+    /// hazard that makes any such rule non-monotonic.
+    #[test]
+    fn an_edge_to_an_unseen_definition_retires_it_on_arrival() {
+        let fixture = Fixture::new();
+        let (original, original_id) =
+            habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();
+        let (successor, successor_id) =
+            habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
+
+        fixture.publish(successor);
+        // The predecessor is not here; nothing is retired, and the catalog reads.
+        assert_eq!(live_ids(&fixture.catalog()), vec![successor_id]);
+        assert!(fixture.catalog().is_superseded(original_id));
+
+        fixture.publish(original);
+        // It arrives already retired, and liveness is unchanged.
+        assert_eq!(fixture.catalog().habits().count(), 2);
+        assert_eq!(live_ids(&fixture.catalog()), vec![successor_id]);
+    }
+
     #[test]
     fn concurrent_definition_conflicts_are_visible_not_timestamp_arbitrated() {
         let fixture = Fixture::new();
-        let (daily, daily_id) = habit_fragment("hygiene", "every 1d", "inspect branches").unwrap();
+        let (daily, daily_id) =
+            habit_fragment("hygiene", "every 1d", "inspect branches", None, &[]).unwrap();
         let (weekly, weekly_id) =
-            habit_fragment("hygiene", "every 7d", "inspect branches").unwrap();
+            habit_fragment("hygiene", "every 7d", "inspect branches", None, &[]).unwrap();
         fixture.publish(daily);
         fixture.publish(weekly);
         let catalog = fixture.catalog();
@@ -1133,9 +1680,11 @@ mod tests {
 
     #[test]
     fn strict_catalog_rejects_extra_facts_and_dangling_events() {
-        let mut fragment = habit_fragment("journal", "every 1h", "write").unwrap().0;
+        let mut fragment = habit_fragment("journal", "every 1h", "write", None, &[])
+            .unwrap()
+            .0;
         let id = fragment.root().unwrap();
-        fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::supersedes: &id };
+        fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::created_at: at(1.0) };
         assert!(validate_publication_fragment(&fragment).is_err());
 
         let dangling = completion_fragment(Id::new([9; 16]).unwrap(), at(1.0))
@@ -1155,7 +1704,8 @@ mod tests {
 
     #[test]
     fn additive_legacy_records_are_inert_beside_exact_intrinsic_shadows() {
-        let (mut fragment, native) = habit_fragment("journal", "every 1h", "write").unwrap();
+        let (mut fragment, native) =
+            habit_fragment("journal", "every 1h", "write", None, &[]).unwrap();
         let raw = parse_habit(fragment.facts(), native).unwrap();
         let legacy = Id::new([0xA7; 16]).unwrap();
         assert_ne!(legacy, native);
@@ -1183,8 +1733,195 @@ mod tests {
     fn publication_definition_must_carry_its_own_payloads() {
         let missing_condition = TextHandle::new([3; 32]);
         let missing_nudge = TextHandle::new([4; 32]);
-        let bare = habit_record("journal", missing_condition, missing_nudge);
+        let bare = habit_record("journal", missing_condition, missing_nudge, None, &[]);
         let error = validate_publication_fragment(&bare).unwrap_err();
         assert!(format!("{error:#}").contains("missing condition payload"));
+    }
+
+    /// The point of the whole feature: the predicate is the pile's bytes, not
+    /// anything the evaluating machine happens to have on disk or on PATH.
+    #[test]
+    fn a_carried_script_is_run_from_the_content_addressed_cache() {
+        shared_cache();
+        let due = script("#!/bin/sh\nexit 0\n");
+        let mut row = row("when @script --due", &[], Activation::Active(Vec::new()));
+        row.script = Some(due.clone());
+        assert_eq!(evaluate(&row, 10_000, Path::new(".")), State::Due);
+
+        let path = materialize_script(&due).unwrap();
+        assert_eq!(path.parent().unwrap(), shared_cache());
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), due.digest());
+        assert_eq!(std::fs::read(&path).unwrap(), due.bytes);
+
+        let mut waiting = row.clone();
+        waiting.script = Some(script("#!/bin/sh\nexit 1\n"));
+        assert_eq!(evaluate(&waiting, 10_000, Path::new(".")), State::Waiting);
+    }
+
+    /// Editing a script changes its hash, so it lands beside the old copy
+    /// rather than on top of it. Nothing can execute a superseded body.
+    #[test]
+    fn an_edited_script_is_a_different_cache_entry() {
+        shared_cache();
+        let first = script("#!/bin/sh\nexit 0\n");
+        let second = script("#!/bin/sh\nexit 1\n");
+        assert_ne!(first.digest(), second.digest());
+        let first_path = materialize_script(&first).unwrap();
+        let second_path = materialize_script(&second).unwrap();
+        assert_ne!(first_path, second_path);
+        assert_eq!(std::fs::read(&first_path).unwrap(), first.bytes);
+        assert_eq!(std::fs::read(&second_path).unwrap(), second.bytes);
+    }
+
+    /// A truncated leftover at the hash path is repaired, not executed. Rename
+    /// makes this unreachable in practice; the check is what makes that a fact
+    /// rather than an assumption.
+    #[test]
+    fn a_short_cache_entry_is_rewritten_rather_than_trusted() {
+        let cache = shared_cache();
+        let full = script("#!/bin/sh\n# a longer body\nexit 0\n");
+        let path = cache.join(full.digest());
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        assert_eq!(materialize_script(&full).unwrap(), path);
+        assert_eq!(std::fs::read(&path).unwrap(), full.bytes);
+    }
+
+    /// A hash-shaped path is not proof by itself: the cache is user-writable,
+    /// so a same-length edit must be repaired before evaluation can execute it.
+    #[test]
+    fn a_same_length_cache_edit_is_rewritten_rather_than_executed() {
+        shared_cache();
+        let expected = script("#!/bin/sh\n# cache-integrity-only\nexit 0\n");
+        let path = materialize_script(&expected).unwrap();
+        let altered = b"#!/bin/sh\n# cache-integrity-only\nexit 1\n";
+        assert_eq!(altered.len(), expected.bytes.len());
+        std::fs::write(&path, altered).unwrap();
+
+        assert_eq!(materialize_script(&expected).unwrap(), path);
+        assert_eq!(std::fs::read(path).unwrap(), expected.bytes);
+    }
+
+    #[test]
+    fn a_script_handle_cannot_name_different_bytes() {
+        shared_cache();
+        let named = script("#!/bin/sh\n# named body\nexit 0\n");
+        let other = script("#!/bin/sh\n# other body\nexit 0\n");
+        let forged = Script {
+            handle: named.handle,
+            bytes: other.bytes,
+        };
+        let error = materialize_script(&forged).unwrap_err();
+        assert!(
+            error.contains("does not address its carried bytes"),
+            "{error}"
+        );
+    }
+
+    /// Substitution has to survive a cache root with a quote or a space in it,
+    /// because the root comes from the environment.
+    #[test]
+    fn script_substitution_produces_one_shell_word() {
+        let directory = tempfile::tempdir().unwrap();
+        let awkward = directory.path().join("it's a cache");
+        std::fs::create_dir_all(&awkward).unwrap();
+        let path = awkward.join("body");
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        let command = format!("test -f {} && exit 0", shell_word(&path));
+        assert!(condition_holds(&command, Path::new(".")).unwrap());
+    }
+
+    #[test]
+    fn script_substitution_only_replaces_the_leading_command_word() {
+        shared_cache();
+        let carried = script("#!/bin/sh\nexit 0\n");
+        let condition = Condition::parse("when @scripture @script").unwrap();
+        assert_eq!(
+            resolve_command(&condition, Some(&carried)).unwrap(),
+            "@scripture @script"
+        );
+    }
+
+    #[test]
+    fn unavailable_shell_commands_are_errors_not_false_predicates() {
+        assert!(condition_holds("exit 126", Path::new(".")).is_err());
+        assert!(condition_holds("exit 127", Path::new(".")).is_err());
+        assert_eq!(condition_holds("exit 1", Path::new(".")).unwrap(), false);
+    }
+
+    /// Round-trip: publish a definition carrying its script, read it back from
+    /// the pile alone, and get the same bytes and the same handle.
+    #[test]
+    fn a_published_definition_carries_its_script_through_the_pile() {
+        let fixture = Fixture::new();
+        let source = b"#!/bin/sh\nexit 0\n".to_vec();
+        let (fragment, id) = habit_fragment(
+            "sweep",
+            "when @script --due",
+            "sweep the worktrees",
+            Some(source.clone()),
+            &[],
+        )
+        .unwrap();
+        fixture.publish(fragment);
+        let catalog = fixture.catalog();
+        let carried = catalog.habit(id).unwrap().script.as_ref().unwrap();
+        assert_eq!(carried.bytes, source);
+        assert_eq!(carried.digest().len(), 64);
+    }
+
+    /// A definition and its attachment must agree in both directions, and the
+    /// check has to hold at publication as well as at authoring.
+    #[test]
+    fn condition_and_attachment_must_agree() {
+        let dangling =
+            habit_fragment("sweep", "when @script --due", "sweep", None, &[]).unwrap_err();
+        assert!(format!("{dangling:#}").contains("carries no script"));
+
+        let unreachable = habit_fragment(
+            "sweep",
+            "every 1h",
+            "sweep",
+            Some(b"#!/bin/sh\n".to_vec()),
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{unreachable:#}").contains("no condition reaches"));
+
+        let mut fragment = Fragment::empty();
+        let condition = fragment.put("when @script --due".to_owned());
+        let nudge = fragment.put("sweep".to_owned());
+        let record = habit_record("sweep", condition, nudge, None, &[]);
+        fragment += record;
+        let error = validate_publication_fragment(&fragment).unwrap_err();
+        assert!(format!("{error:#}").contains("carries no script"));
+    }
+
+    /// An unresolvable script names the habit and the exact missing blob, and
+    /// refuses; it never degrades into a habit that silently stops firing.
+    #[test]
+    fn an_unresolvable_script_blob_is_a_loud_error() {
+        let mut fragment = Fragment::empty();
+        let condition = fragment.put("when @script --due".to_owned());
+        let nudge = fragment.put("sweep".to_owned());
+        let absent = ScriptHandle::new([7; 32]);
+        let record = habit_record("sweep", condition, nudge, Some(absent), &[]);
+        let id = record.root().unwrap();
+        fragment += record;
+
+        let error = validate_publication_fragment(&fragment).unwrap_err();
+        assert!(format!("{error:#}").contains("missing script payload"));
+        assert!(format!("{error:#}").contains(&hex::encode(absent.raw)));
+
+        // And the same handle, reached through a pile which does not hold it.
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("empty.pile");
+        File::create(&pile_path).unwrap();
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let reader = pile.reader().unwrap();
+        let error = validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(&format!("{id:x}")), "{rendered}");
+        assert!(rendered.contains("is not in this pile"), "{rendered}");
+        pile.close().unwrap();
     }
 }

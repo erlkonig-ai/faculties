@@ -264,6 +264,8 @@ pub fn plan(source: &FrozenSource) -> Result<HabitMigrationPlan> {
             definition.label.clone(),
             definition.condition.clone(),
             definition.nudge.clone(),
+            None,
+            &[],
         )?;
         insert_canonical(&mut records, record)?;
         definition_ids.insert(definition.id, native);
