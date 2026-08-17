@@ -166,6 +166,7 @@ lopdf = { version = "0.44", default-features = false }  # posture (PDF objects +
 mailparse = "0.16"          # mail (RFC 5322 parser)
 memchr = "2"                # archive (bounded streaming rollout prefilter)
 mime = "0.3"                # shared canonical file media-type parsing
+zmij = "1"                  # archive (canonical JSON float spelling)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }  # mail POP transport
 rustls-native-certs = "0.8" # mail POP transport (platform trust roots)
 quick-xml = "0.37"          # posture (OOXML part parsing)
@@ -174,9 +175,8 @@ regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)
 rrule = "0.14"              # planner
-scraper = "0.23"            # archive
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
-serde_json = "1"            # archive, discord, teams, triage, web
+serde_json = "1"            # discord, teams, triage, web
 tracing = "0.1"             # archive
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # archive
 typst = "0.14"              # wiki

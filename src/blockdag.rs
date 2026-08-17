@@ -14,13 +14,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use anybytes::Bytes;
 use anyhow::{anyhow, bail, Result};
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::inline::IntoInline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreList};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
@@ -70,8 +72,9 @@ type OverlayReader = <MemoryBlobStore as BlobStore>::Reader;
 /// different set of tribles.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogValidation {
-    /// Structure, intrinsic identities, closure, and every resident attachment
-    /// are canonical.
+    /// Structure, intrinsic identities, closure, and attachment residency are
+    /// canonical. Durable payload hashes and decodings remain lazy until the
+    /// bytes are consumed; newly staged payloads are validated before publish.
     Accepted,
     /// The graph is canonical, but these content hashes are not resident yet.
     Pending { missing: BTreeSet<[u8; 32]> },
@@ -91,6 +94,14 @@ struct AttachmentPlan {
     texts: BTreeSet<TextHandle>,
     raws: BTreeSet<RawHandle>,
     media_type_names: BTreeSet<TextHandle>,
+    source_chunks: BTreeMap<Id, (u128, RawHandle)>,
+    source_snapshots: Vec<SourceSnapshotPlan>,
+}
+
+struct SourceSnapshotPlan {
+    id: Id,
+    byte_length: u128,
+    chunks: Vec<Id>,
 }
 
 fn rooted(fragment: &Fragment, what: &str) -> Result<Id> {
@@ -105,10 +116,86 @@ fn attach_kind(mut fragment: Fragment, kind: Id, what: &str) -> Result<Fragment>
     Ok(fragment)
 }
 
+/// Queryable names for the reified Archive modality and direction tags.
+///
+/// These facts are ordinary collection data rather than renderer knowledge.
+/// Repeating them in authored imports is harmless set duplication, and lets a
+/// reader display a newly introduced tag without adding another match table.
+pub fn vocabulary_fragment() -> Fragment {
+    let mut fragment = Fragment::empty();
+    for &(id, name) in schema::content_fact::modality::SPECS
+        .iter()
+        .chain(schema::content_fact::direction::SPECS)
+    {
+        let name = fragment.put::<LongString, _>(name.to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&id) @
+            metadata::tag: &metadata::KIND_TAG,
+            metadata::name: name,
+        };
+    }
+    fragment
+}
+
+/// Construct one intrinsic byte range inside a frozen source snapshot.
+pub fn source_chunk(offset: u128, bytes: Bytes) -> Result<Fragment> {
+    let offset: Inline<U256BE> = offset.to_inline();
+    let mut fragment = Fragment::empty();
+    let bytes = fragment.put::<RawBytes, _>(bytes);
+    fragment += entity! { _ @
+        schema::source_chunk::offset: offset,
+        schema::source_chunk::bytes: bytes,
+    };
+    attach_kind(fragment, schema::source_chunk::KIND, "source chunk")
+}
+
+/// Construct one exact frozen-source snapshot over intrinsic byte ranges.
+///
+/// `chunks` exports [`schema::source_chunk`] roots. Their offsets and byte
+/// handles determine ordering and reconstruction; the snapshot's total length
+/// makes validation independent of import history or collection COMMIT grouping.
+pub fn source_snapshot(
+    namespace: Id,
+    locator: impl Into<String>,
+    byte_length: u128,
+    chunks: Fragment,
+    source_path: Option<String>,
+) -> Result<Fragment> {
+    let byte_length: Inline<U256BE> = byte_length.to_inline();
+    let mut fragment = Fragment::empty();
+    let locator = fragment.put::<LongString, _>(locator.into());
+    fragment += entity! { _ @
+        schema::source_projection::source_namespace: &namespace,
+        schema::source_projection::source_locator: locator,
+        schema::source_snapshot::byte_length: byte_length,
+        schema::source_snapshot::contains*: chunks,
+    };
+    let mut fragment = attach_kind(fragment, schema::source_snapshot::KIND, "source snapshot")?;
+    if let Some(source_path) = source_path {
+        let snapshot = rooted(&fragment, "source snapshot")?;
+        let path = fragment.put::<LongString, _>(source_path);
+        fragment += entity! { ExclusiveId::force_ref(&snapshot) @
+            files_schema::file::source_path: path,
+        };
+    }
+    Ok(fragment)
+}
+
 /// Construct one intrinsic textual content fact.
 pub fn text_fact(modality: Id, direction: Id, text: impl Into<String>) -> Result<Fragment> {
+    text_fact_blob(modality, direction, text.into())
+}
+
+/// Construct one intrinsic textual fact while retaining a source-backed view.
+pub fn text_fact_view(modality: Id, direction: Id, text: anybytes::View<str>) -> Result<Fragment> {
+    text_fact_blob(modality, direction, text)
+}
+
+fn text_fact_blob<T>(modality: Id, direction: Id, text: T) -> Result<Fragment>
+where
+    T: triblespace::core::blob::IntoBlob<LongString>,
+{
     let mut fragment = Fragment::empty();
-    let payload = fragment.put::<LongString, _>(text.into());
+    let payload = fragment.put::<LongString, _>(text);
     fragment += entity! { _ @
         schema::content_fact::modality: &modality,
         schema::content_fact::direction: &direction,
@@ -149,8 +236,48 @@ pub fn asset_pointer_fact(
     media_type: Option<&str>,
     size: Option<u128>,
 ) -> Result<Fragment> {
+    asset_pointer_fact_blob(
+        modality,
+        direction,
+        asset_namespace,
+        pointer.into(),
+        media_type,
+        size,
+    )
+}
+
+/// Construct an unresolved asset fact from a source-backed pointer view.
+pub fn asset_pointer_fact_view(
+    modality: Id,
+    direction: Id,
+    asset_namespace: Id,
+    pointer: anybytes::View<str>,
+    media_type: Option<&str>,
+    size: Option<u128>,
+) -> Result<Fragment> {
+    asset_pointer_fact_blob(
+        modality,
+        direction,
+        asset_namespace,
+        pointer,
+        media_type,
+        size,
+    )
+}
+
+fn asset_pointer_fact_blob<P>(
+    modality: Id,
+    direction: Id,
+    asset_namespace: Id,
+    pointer: P,
+    media_type: Option<&str>,
+    size: Option<u128>,
+) -> Result<Fragment>
+where
+    P: triblespace::core::blob::IntoBlob<LongString>,
+{
     let mut fragment = Fragment::empty();
-    let pointer = fragment.put::<LongString, _>(pointer.into());
+    let pointer = fragment.put::<LongString, _>(pointer);
     let media_type = media_type
         .map(files::media_type_fragment)
         .transpose()?
@@ -198,16 +325,19 @@ pub fn content_part(ordinal: u64, fact: Fragment, responds_to: Option<Id>) -> Re
 }
 
 /// Construct one intrinsic block from structural predecessors, an optional
-/// genuine event interval, and one or more exported content parts.
+/// genuine event interval, and zero or more exported content parts.
+///
+/// The unique predecessor-free, timeless, content-free block is the bottom
+/// projection used by exact source receipts that yielded no semantic content.
 pub fn block(
     predecessors: impl IntoIterator<Item = Id>,
     timestamp: Option<Inline<NsTAIInterval>>,
     parts: Fragment,
 ) -> Result<Fragment> {
-    if parts.exports().next().is_none() {
-        bail!("block must contain at least one content part");
-    }
     let predecessors: Vec<_> = predecessors.into_iter().collect();
+    if parts.exports().next().is_none() && (!predecessors.is_empty() || timestamp.is_some()) {
+        bail!("a content-free block must be the predecessor-free, timeless canonical bottom");
+    }
     let fragment = entity! { _ @
         schema::block::previous*: predecessors.iter(),
         schema::block::timestamp?: timestamp,
@@ -231,9 +361,35 @@ pub fn source_projection<T>(
 where
     T: triblespace::core::blob::IntoBlob<RawBytes>,
 {
+    source_projection_blob(source_namespace, source_locator.into(), raw_record, block)
+}
+
+/// Construct a source projection while retaining a source-backed locator view.
+pub fn source_projection_view<T>(
+    source_namespace: Id,
+    source_locator: anybytes::View<str>,
+    raw_record: T,
+    block: Fragment,
+) -> Result<Fragment>
+where
+    T: triblespace::core::blob::IntoBlob<RawBytes>,
+{
+    source_projection_blob(source_namespace, source_locator, raw_record, block)
+}
+
+fn source_projection_blob<L, T>(
+    source_namespace: Id,
+    source_locator: L,
+    raw_record: T,
+    block: Fragment,
+) -> Result<Fragment>
+where
+    L: triblespace::core::blob::IntoBlob<LongString>,
+    T: triblespace::core::blob::IntoBlob<RawBytes>,
+{
     rooted(&block, "block")?;
     let mut fragment = Fragment::empty();
-    let source_locator = fragment.put::<LongString, _>(source_locator.into());
+    let source_locator = fragment.put::<LongString, _>(source_locator);
     let raw_record = fragment.put::<RawBytes, _>(raw_record);
     fragment += entity! { _ @
         schema::source_projection::source_namespace: &source_namespace,
@@ -352,16 +508,9 @@ fn ensure_intrinsic_with_kind(id: Id, core: Fragment, kind: Id, label: &str) -> 
 }
 
 fn known_modality(value: Id) -> bool {
-    [
-        schema::content_fact::modality::TEXT,
-        schema::content_fact::modality::AUDIO,
-        schema::content_fact::modality::IMAGE,
-        schema::content_fact::modality::TOOL_CALL,
-        schema::content_fact::modality::TOOL_RESULT,
-        schema::content_fact::modality::THINKING,
-        schema::content_fact::modality::EVENT,
-    ]
-    .contains(&value)
+    schema::content_fact::modality::SPECS
+        .iter()
+        .any(|(id, _)| *id == value)
 }
 
 fn textual_modality(value: Id) -> bool {
@@ -379,17 +528,16 @@ fn media_modality(value: Id) -> bool {
     [
         schema::content_fact::modality::AUDIO,
         schema::content_fact::modality::IMAGE,
+        schema::content_fact::modality::FILE,
+        schema::content_fact::modality::VIDEO,
     ]
     .contains(&value)
 }
 
 fn known_direction(value: Id) -> bool {
-    [
-        schema::content_fact::direction::IN,
-        schema::content_fact::direction::OUT,
-        schema::content_fact::direction::AMBIENT,
-    ]
-    .contains(&value)
+    schema::content_fact::direction::SPECS
+        .iter()
+        .any(|(id, _)| *id == value)
 }
 
 fn require_disjoint(kinds: &[(&str, &BTreeSet<Id>)]) -> Result<()> {
@@ -468,12 +616,16 @@ where
     let content_parts = ids_of_kind(facts, schema::content_part::KIND);
     let blocks = ids_of_kind(facts, schema::block::KIND);
     let projections = ids_of_kind(facts, schema::source_projection::KIND);
+    let source_chunks = ids_of_kind(facts, schema::source_chunk::KIND);
+    let source_snapshots = ids_of_kind(facts, schema::source_snapshot::KIND);
     let media_types = ids_of_kind(facts, files_schema::KIND_MEDIA_TYPE);
     require_disjoint(&[
         ("content fact", &content_facts),
         ("content part", &content_parts),
         ("block", &blocks),
         ("source projection", &projections),
+        ("source chunk", &source_chunks),
+        ("source snapshot", &source_snapshots),
         ("media type", &media_types),
     ])?;
 
@@ -481,6 +633,12 @@ where
         (entity: Id, value: TextHandle),
         pattern!(facts, [{ ?entity @ metadata::name: ?value }])
     ));
+    let vocabulary_ids: BTreeSet<_> = schema::content_fact::modality::SPECS
+        .iter()
+        .chain(schema::content_fact::direction::SPECS)
+        .map(|(id, _)| *id)
+        .collect();
+    let has_vocabulary = vocabulary_ids.iter().any(|id| media_names.contains_key(id));
     let modalities = values_by_entity(find!(
         (entity: Id, value: Id),
         pattern!(facts, [{ ?entity @ schema::content_fact::modality: ?value }])
@@ -516,6 +674,22 @@ where
     let resolutions = values_by_entity(find!(
         (entity: Id, value: RawHandle),
         pattern!(facts, [{ ?entity @ schema::content_fact::resolved_to: ?value }])
+    ));
+    let source_chunk_offsets = values_by_entity(find!(
+        (entity: Id, value: OrdinalValue),
+        pattern!(facts, [{ ?entity @ schema::source_chunk::offset: ?value }])
+    ));
+    let source_chunk_bytes = values_by_entity(find!(
+        (entity: Id, value: RawHandle),
+        pattern!(facts, [{ ?entity @ schema::source_chunk::bytes: ?value }])
+    ));
+    let source_snapshot_lengths = values_by_entity(find!(
+        (entity: Id, value: OrdinalValue),
+        pattern!(facts, [{ ?entity @ schema::source_snapshot::byte_length: ?value }])
+    ));
+    let source_snapshot_chunks = values_by_entity(find!(
+        (entity: Id, value: Id),
+        pattern!(facts, [{ ?entity @ schema::source_snapshot::contains: ?value }])
     ));
 
     let ordinals = values_by_entity(find!(
@@ -612,6 +786,86 @@ where
         attachments.texts.insert(name);
         attachments.media_type_names.insert(name);
     }
+
+    // Once vocabulary annotation is present, require the complete canonical
+    // bootstrap vocabulary. Additional names are ordinary additive graph data:
+    // readers may display all of them without a last-writer-wins label table.
+    // A completely absent vocabulary remains valid so the writer can add the
+    // bootstrap monotonically to a pre-vocabulary collection.
+    if has_vocabulary {
+        for id in &vocabulary_ids {
+            let names = values_for(&media_names, *id);
+            if names.is_empty() {
+                bail!("entity {id:x} has no Archive vocabulary name");
+            }
+            attachments.texts.extend(names.iter().copied());
+            expected += entity! { ExclusiveId::force_ref(id) @
+                metadata::name*: names.iter(),
+            }
+            .into_facts();
+        }
+        expected += vocabulary_fragment().into_facts();
+    }
+
+    let mut referenced_source_chunks = BTreeSet::new();
+    for id in &source_chunks {
+        let offset = one_required(&source_chunk_offsets, *id, "source chunk offset")?;
+        let offset_number = u128::try_from_inline(&offset)
+            .map_err(|error| anyhow!("source chunk {id:x} offset does not fit u128: {error:?}"))?;
+        let bytes = one_required(&source_chunk_bytes, *id, "source chunk bytes")?;
+        let core = entity! { _ @
+            schema::source_chunk::offset: offset,
+            schema::source_chunk::bytes: bytes,
+        };
+        expected +=
+            ensure_intrinsic_with_kind(*id, core, schema::source_chunk::KIND, "source chunk")?;
+        attachments
+            .source_chunks
+            .insert(*id, (offset_number, bytes));
+    }
+
+    for id in &source_snapshots {
+        let namespace = one_required(&source_namespaces, *id, "source snapshot namespace")?;
+        let locator = one_required(&source_locators, *id, "source snapshot locator")?;
+        let byte_length =
+            one_required(&source_snapshot_lengths, *id, "source snapshot byte length")?;
+        let byte_length_number = u128::try_from_inline(&byte_length).map_err(|error| {
+            anyhow!("source snapshot {id:x} length does not fit u128: {error:?}")
+        })?;
+        let chunks = values_for(&source_snapshot_chunks, *id);
+        for chunk in &chunks {
+            if !source_chunks.contains(chunk) {
+                bail!("source snapshot {id:x} cites missing chunk {chunk:x}");
+            }
+        }
+        referenced_source_chunks.extend(chunks.iter().copied());
+        let paths = values_for(&source_paths, *id);
+        let core = entity! { _ @
+            schema::source_projection::source_namespace: &namespace,
+            schema::source_projection::source_locator: locator,
+            schema::source_snapshot::byte_length: byte_length,
+            schema::source_snapshot::contains*: chunks.iter(),
+        };
+        let mut canonical = ensure_intrinsic_with_kind(
+            *id,
+            core,
+            schema::source_snapshot::KIND,
+            "source snapshot",
+        )?;
+        canonical += entity! { ExclusiveId::force_ref(id) @
+            files_schema::file::source_path*: paths.iter(),
+        }
+        .into_facts();
+        expected += canonical;
+        attachments.texts.insert(locator);
+        attachments.texts.extend(paths.iter().copied());
+        attachments.source_snapshots.push(SourceSnapshotPlan {
+            id: *id,
+            byte_length: byte_length_number,
+            chunks: chunks.into_iter().collect(),
+        });
+    }
+    require_coverage(&source_chunks, &referenced_source_chunks, "source chunk")?;
 
     for id in &content_facts {
         let modality = one_required(&modalities, *id, "content fact modality")?;
@@ -756,8 +1010,10 @@ where
             })?;
         }
         let parts = values_for(&block_parts, *id);
-        if parts.is_empty() {
-            bail!("block {id:x} contains no content parts");
+        if parts.is_empty() && (!previous.is_empty() || timestamp.is_some()) {
+            bail!(
+                "content-free block {id:x} is not the predecessor-free, timeless canonical bottom"
+            );
         }
         let mut by_ordinal = BTreeMap::new();
         for part in &parts {
@@ -941,27 +1197,23 @@ fn read_text_attachment(
     overlay: Option<&OverlayReader>,
     handle: TextHandle,
 ) -> std::result::Result<Option<String>, String> {
-    if overlay.is_some_and(|overlay| {
-        overlay
-            .metadata(handle)
-            .expect("memory metadata lookup is infallible")
-            .is_some()
-    }) {
-        let value: anybytes::View<str> = overlay
-            .expect("overlay was present")
-            .get(handle)
-            .map_err(|error| {
+    if let Some(overlay) = overlay {
+        if overlay
+            .contains_blob(handle)
+            .map_err(|error| format!("inspect staged LongString attachment: {error}"))?
+        {
+            let value: anybytes::View<str> = overlay.get(handle).map_err(|error| {
                 format!(
                     "invalid staged LongString attachment {}: {error}",
                     hex::encode(handle.raw)
                 )
             })?;
-        return Ok(Some(value.to_string()));
+            return Ok(Some(value.to_string()));
+        }
     }
-    if reader
-        .metadata(handle)
-        .expect("PileReader metadata lookup is infallible")
-        .is_none()
+    if !reader
+        .contains_blob(handle)
+        .map_err(|error| format!("inspect resident LongString attachment: {error}"))?
     {
         return Ok(None);
     }
@@ -974,43 +1226,187 @@ fn read_text_attachment(
     Ok(Some(value.to_string()))
 }
 
-fn read_raw_attachment(
+fn text_attachment_present(
+    reader: &PileReader,
+    overlay: Option<&OverlayReader>,
+    handle: TextHandle,
+) -> std::result::Result<bool, String> {
+    if let Some(overlay) = overlay {
+        if overlay
+            .contains_blob(handle)
+            .map_err(|error| format!("inspect staged LongString attachment: {error}"))?
+        {
+            let _: anybytes::View<str> = overlay.get(handle).map_err(|error| {
+                format!(
+                    "invalid staged LongString attachment {}: {error}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+            return Ok(true);
+        }
+    }
+    reader
+        .contains_blob(handle)
+        .map_err(|error| format!("inspect resident LongString attachment: {error}"))
+}
+
+fn raw_attachment_present(
     reader: &PileReader,
     overlay: Option<&OverlayReader>,
     handle: RawHandle,
 ) -> std::result::Result<bool, String> {
-    if overlay.is_some_and(|overlay| {
-        overlay
-            .metadata(handle)
-            .expect("memory metadata lookup is infallible")
-            .is_some()
-    }) {
-        let _: anybytes::Bytes =
-            overlay
-                .expect("overlay was present")
-                .get(handle)
-                .map_err(|error| {
+    if let Some(overlay) = overlay {
+        if overlay
+            .contains_blob(handle)
+            .map_err(|error| format!("inspect staged RawBytes attachment: {error}"))?
+        {
+            let _: Bytes = overlay.get(handle).map_err(|error| {
+                format!(
+                    "invalid staged RawBytes attachment {}: {error}",
+                    hex::encode(handle.raw)
+                )
+            })?;
+            return Ok(true);
+        }
+    }
+    reader
+        .contains_blob(handle)
+        .map_err(|error| format!("inspect resident RawBytes attachment: {error}"))
+}
+
+fn validate_source_snapshots(
+    chunks: &BTreeMap<Id, (u128, RawHandle)>,
+    snapshots: &[SourceSnapshotPlan],
+    stored_lengths: &BTreeMap<RawHandle, u128>,
+) -> std::result::Result<(), String> {
+    for snapshot in snapshots {
+        let mut ordered = snapshot
+            .chunks
+            .iter()
+            .map(|chunk| {
+                let (offset, handle) = chunks.get(chunk).ok_or_else(|| {
                     format!(
-                        "invalid staged RawBytes attachment {}: {error}",
+                        "source snapshot {:x} lost declared chunk {:x}",
+                        snapshot.id, chunk
+                    )
+                })?;
+                Ok((*offset, *chunk, *handle))
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        ordered.sort_unstable();
+
+        if snapshot.byte_length == 0 && !ordered.is_empty() {
+            return Err(format!(
+                "empty source snapshot {:x} contains byte chunks",
+                snapshot.id
+            ));
+        }
+        if snapshot.byte_length != 0 && ordered.is_empty() {
+            return Err(format!(
+                "nonempty source snapshot {:x} contains no byte chunks",
+                snapshot.id
+            ));
+        }
+
+        let mut cursor = 0u128;
+        for (index, (offset, chunk, handle)) in ordered.iter().copied().enumerate() {
+            if offset != cursor {
+                return Err(format!(
+                    "source snapshot {:x} chunk {:x} starts at {offset}, expected {cursor}",
+                    snapshot.id, chunk
+                ));
+            }
+            let is_last = index + 1 == ordered.len();
+            let len = if is_last {
+                snapshot.byte_length.checked_sub(offset).ok_or_else(|| {
+                    format!(
+                        "source snapshot {:x} chunk {:x} starts beyond its claimed length",
+                        snapshot.id, chunk
+                    )
+                })?
+            } else {
+                schema::source_chunk::CANONICAL_BYTES as u128
+            };
+            if len == 0 || len > schema::source_chunk::CANONICAL_BYTES as u128 {
+                return Err(format!(
+                    "source snapshot {:x} chunk {:x} has noncanonical length {len}",
+                    snapshot.id, chunk
+                ));
+            }
+            if let Some(stored) = stored_lengths.get(&handle) {
+                if *stored != len {
+                    return Err(format!(
+                        "source snapshot {:x} chunk {:x} stores {stored} bytes, expected {len}",
+                        snapshot.id, chunk
+                    ));
+                }
+            }
+            if !is_last && len != schema::source_chunk::CANONICAL_BYTES as u128 {
+                return Err(format!(
+                    "source snapshot {:x} nonfinal chunk {:x} has length {len}, expected {}",
+                    snapshot.id,
+                    chunk,
+                    schema::source_chunk::CANONICAL_BYTES
+                ));
+            }
+            cursor = cursor.checked_add(len).ok_or_else(|| {
+                format!("source snapshot {:x} length overflows u128", snapshot.id)
+            })?;
+        }
+        if cursor != snapshot.byte_length {
+            return Err(format!(
+                "source snapshot {:x} reconstructs {cursor} bytes, claims {}",
+                snapshot.id, snapshot.byte_length
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn source_chunk_storage_lengths(
+    reader: &PileReader,
+    overlay: Option<&OverlayReader>,
+    chunks: &BTreeMap<Id, (u128, RawHandle)>,
+) -> std::result::Result<BTreeMap<RawHandle, u128>, String> {
+    let wanted: BTreeSet<_> = chunks.values().map(|(_, handle)| handle.raw).collect();
+    let mut lengths = BTreeMap::new();
+    if wanted.is_empty() {
+        return Ok(lengths);
+    }
+    for raw in &wanted {
+        let handle = Inline::<Handle<RawBytes>>::new(*raw);
+        if let Some(info) = reader
+            .blob_info(handle)
+            .map_err(|error| format!("inspect resident source chunk: {error}"))?
+        {
+            lengths.insert(handle, u128::from(info.length));
+        }
+    }
+    if let Some(overlay) = overlay {
+        for info in overlay.blobs() {
+            let info = info.map_err(|error| format!("enumerate staged source chunks: {error}"))?;
+            if wanted.contains(&info.handle.raw) {
+                let handle = Inline::<Handle<RawBytes>>::new(info.handle.raw);
+                // A caller-supplied overlay can contain a forged handle.
+                // Validate staged bytes once; durable Pile headers are trusted
+                // only for length/presence and remain hash-lazy until read.
+                let bytes: Bytes = overlay.get(handle).map_err(|error| {
+                    format!(
+                        "invalid staged source chunk {}: {error}",
                         hex::encode(handle.raw)
                     )
                 })?;
-        return Ok(true);
+                if bytes.len() as u64 != info.length {
+                    return Err(format!(
+                        "staged source chunk {} header length disagrees with its bytes",
+                        hex::encode(handle.raw)
+                    ));
+                }
+                lengths.insert(handle, u128::from(info.length));
+            }
+        }
     }
-    if reader
-        .metadata(handle)
-        .expect("PileReader metadata lookup is infallible")
-        .is_none()
-    {
-        return Ok(false);
-    }
-    let _: anybytes::Bytes = reader.get(handle).map_err(|error| {
-        format!(
-            "invalid resident RawBytes attachment {}: {error}",
-            hex::encode(handle.raw)
-        )
-    })?;
-    Ok(true)
+    Ok(lengths)
 }
 
 fn validate_attachments(
@@ -1018,21 +1414,16 @@ fn validate_attachments(
     overlay: Option<&OverlayReader>,
     plan: AttachmentPlan,
 ) -> CatalogValidation {
+    let AttachmentPlan {
+        texts,
+        raws,
+        media_type_names,
+        source_chunks,
+        source_snapshots,
+    } = plan;
     let mut missing = BTreeSet::new();
-    let mut text_values = BTreeMap::new();
-    for handle in plan.texts {
-        match read_text_attachment(reader, overlay, handle) {
-            Ok(Some(value)) => {
-                text_values.insert(handle, value);
-            }
-            Ok(None) => {
-                missing.insert(handle.raw);
-            }
-            Err(reason) => return CatalogValidation::Rejected(reason),
-        }
-    }
-    for handle in plan.raws {
-        match read_raw_attachment(reader, overlay, handle) {
+    for handle in texts {
+        match text_attachment_present(reader, overlay, handle) {
             Ok(true) => {}
             Ok(false) => {
                 missing.insert(handle.raw);
@@ -1040,11 +1431,41 @@ fn validate_attachments(
             Err(reason) => return CatalogValidation::Rejected(reason),
         }
     }
-    for handle in plan.media_type_names {
-        let Some(name) = text_values.get(&handle) else {
-            continue;
+    for handle in raws {
+        match raw_attachment_present(reader, overlay, handle) {
+            Ok(true) => {}
+            Ok(false) => {
+                missing.insert(handle.raw);
+            }
+            Err(reason) => return CatalogValidation::Rejected(reason),
+        }
+    }
+    let source_chunk_lengths = match source_chunk_storage_lengths(reader, overlay, &source_chunks) {
+        Ok(lengths) => lengths,
+        Err(reason) => return CatalogValidation::Rejected(reason),
+    };
+    if let Err(reason) =
+        validate_source_snapshots(&source_chunks, &source_snapshots, &source_chunk_lengths)
+    {
+        return CatalogValidation::Rejected(reason);
+    }
+    let source_chunk_handles: BTreeSet<_> =
+        source_chunks.values().map(|(_, handle)| *handle).collect();
+    for handle in source_chunk_handles {
+        if !source_chunk_lengths.contains_key(&handle) {
+            missing.insert(handle.raw);
+        }
+    }
+    for handle in media_type_names {
+        let name = match read_text_attachment(reader, overlay, handle) {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                missing.insert(handle.raw);
+                continue;
+            }
+            Err(reason) => return CatalogValidation::Rejected(reason),
         };
-        let normalized = match files::normalize_media_type(name) {
+        let normalized = match files::normalize_media_type(&name) {
             Ok(value) => value,
             Err(error) => {
                 return CatalogValidation::Rejected(format!(
@@ -1052,17 +1473,16 @@ fn validate_attachments(
                 ))
             }
         };
-        if normalized != *name {
+        if normalized != name {
             return CatalogValidation::Rejected(format!(
                 "media type name {name:?} is not canonical; expected {normalized:?}"
             ));
         }
     }
-    if missing.is_empty() {
-        CatalogValidation::Accepted
-    } else {
-        CatalogValidation::Pending { missing }
+    if !missing.is_empty() {
+        return CatalogValidation::Pending { missing };
     }
+    CatalogValidation::Accepted
 }
 
 fn validate_catalog_with_overlay(
@@ -1176,6 +1596,18 @@ mod tests {
         (directory, reader)
     }
 
+    fn validate_fragment(fragment: &Fragment) -> CatalogValidation {
+        let (_directory, reader) = empty_reader();
+        validate_catalog_union(&reader, &TribleSet::new(), fragment)
+            .unwrap()
+            .1
+    }
+
+    fn without_blobs(fragment: Fragment) -> Fragment {
+        let (_, facts, metafacts, _) = fragment.into_parts();
+        Fragment::from_parts(facts, metafacts, Default::default())
+    }
+
     #[test]
     fn part_ordinals_preserve_order_and_repeated_equal_facts() {
         let a = text("a");
@@ -1209,6 +1641,195 @@ mod tests {
                 part @ schema::content_part::fact: &fact
             }])));
         }
+    }
+
+    #[test]
+    fn raw_only_receipt_projects_to_the_canonical_bottom_block() {
+        let receipt = projection(Fragment::empty());
+        let receipt_id = receipt.root().unwrap();
+        let block = find!(
+            (block: Id),
+            pattern!(&receipt, [{
+                receipt_id @ schema::source_projection::projects_to: ?block
+            }])
+        )
+        .next()
+        .map(|(block,)| block)
+        .unwrap();
+        assert!(!exists!(pattern!(&receipt, [{
+            block @ schema::block::contains: _?part
+        }])));
+
+        let (_directory, reader) = empty_reader();
+        let (_, validation) = validate_catalog_union(&reader, &TribleSet::new(), &receipt).unwrap();
+        assert_eq!(validation, CatalogValidation::Accepted);
+    }
+
+    #[test]
+    fn archive_vocabulary_is_queryable_collection_data() {
+        let mut vocabulary = vocabulary_fragment();
+        let text = schema::content_fact::modality::TEXT;
+        let alias = vocabulary.put::<LongString, _>("written text".to_owned());
+        vocabulary += entity! { ExclusiveId::force_ref(&text) @
+            metadata::name: alias,
+        };
+        let names: BTreeSet<_> = find!(
+            value: TextHandle,
+            pattern!(&vocabulary, [{
+                text @ metadata::tag: &metadata::KIND_TAG,
+                metadata::name: ?value,
+            }])
+        )
+        .collect();
+        let mut blobs = vocabulary.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        let values: BTreeSet<String> = names
+            .into_iter()
+            .map(|name| {
+                let value: anybytes::View<str> = reader.get(name).unwrap();
+                value.to_string()
+            })
+            .collect();
+        assert_eq!(
+            values,
+            BTreeSet::from(["text".to_owned(), "written text".to_owned()])
+        );
+
+        let (_directory, reader) = empty_reader();
+        let (_, validation) =
+            validate_catalog_union(&reader, &TribleSet::new(), &vocabulary).unwrap();
+        assert_eq!(validation, CatalogValidation::Accepted);
+    }
+
+    #[test]
+    fn source_snapshot_is_exact_path_independent_and_empty_safe() {
+        let make = |path: Option<&str>| {
+            source_snapshot(
+                schema::source_projection::SOURCE_CLAUDE_CODE,
+                "snapshot/v1/session:test",
+                3,
+                source_chunk(0, Bytes::from_source(b"abc".to_vec())).unwrap(),
+                path.map(str::to_owned),
+            )
+            .unwrap()
+        };
+        let first = make(Some("/old/export.jsonl"));
+        let moved = make(Some("/new/export.jsonl"));
+        assert_eq!(first.root(), moved.root());
+        assert_ne!(first.facts(), moved.facts());
+        assert_eq!(validate_fragment(&first), CatalogValidation::Accepted);
+
+        let empty = source_snapshot(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            "snapshot/v1/empty",
+            0,
+            Fragment::empty(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(validate_fragment(&empty), CatalogValidation::Accepted);
+        assert!(!exists!(pattern!(&empty, [{
+            _?chunk @ schema::source_chunk::bytes: _?raw
+        }])));
+    }
+
+    #[test]
+    fn source_snapshot_geometry_uses_store_lengths_without_reading_payloads() {
+        let wrong_total = source_snapshot(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            "snapshot/v1/wrong-total",
+            2,
+            source_chunk(0, Bytes::from_source(vec![1u8])).unwrap(),
+            None,
+        )
+        .unwrap();
+        let validation = validate_fragment(&wrong_total);
+        match validation {
+            CatalogValidation::Rejected(reason) => assert!(
+                reason.contains("stores 1 bytes, expected 2"),
+                "unexpected rejection: {reason}"
+            ),
+            other => panic!("expected length rejection, got {other:?}"),
+        }
+
+        let mut short_nonfinal = Fragment::empty();
+        short_nonfinal += source_chunk(0, Bytes::from_source(vec![1u8])).unwrap();
+        short_nonfinal += source_chunk(
+            schema::source_chunk::CANONICAL_BYTES as u128,
+            Bytes::from_source(vec![2u8]),
+        )
+        .unwrap();
+        let short_nonfinal = source_snapshot(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            "snapshot/v1/short-nonfinal",
+            schema::source_chunk::CANONICAL_BYTES as u128 + 1,
+            short_nonfinal,
+            None,
+        )
+        .unwrap();
+        let validation = validate_fragment(&short_nonfinal);
+        match validation {
+            CatalogValidation::Rejected(reason) => assert!(
+                reason.contains("stores 1 bytes, expected 8388608"),
+                "unexpected rejection: {reason}"
+            ),
+            other => panic!("expected nonfinal length rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_snapshot_rejects_gaps_duplicates_and_orphan_chunks_before_residency() {
+        let canonical = schema::source_chunk::CANONICAL_BYTES as u128;
+        for (label, second_offset, expected) in [
+            ("gap", canonical + 1, "starts at 8388609, expected 8388608"),
+            ("duplicate", 0, "starts at 0, expected 8388608"),
+        ] {
+            let mut chunks = Fragment::empty();
+            chunks += source_chunk(0, Bytes::from_source(vec![1u8])).unwrap();
+            chunks += source_chunk(second_offset, Bytes::from_source(vec![2u8])).unwrap();
+            let snapshot = source_snapshot(
+                schema::source_projection::SOURCE_CLAUDE_CODE,
+                format!("snapshot/v1/{label}"),
+                canonical + 1,
+                chunks,
+                None,
+            )
+            .unwrap();
+            let snapshot = without_blobs(snapshot);
+            assert!(matches!(
+                validate_fragment(&snapshot),
+                CatalogValidation::Rejected(reason) if reason.contains(expected)
+            ));
+        }
+
+        let orphan = source_chunk(0, Bytes::from_source(vec![1u8])).unwrap();
+        assert!(matches!(
+            validate_fragment(&orphan),
+            CatalogValidation::Rejected(reason) if reason.contains("orphan source chunk")
+        ));
+    }
+
+    #[test]
+    fn source_snapshot_with_absent_bytes_is_pending_not_rejected() {
+        let snapshot = source_snapshot(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            "snapshot/v1/missing",
+            1,
+            source_chunk(0, Bytes::from_source(vec![7u8])).unwrap(),
+            None,
+        )
+        .unwrap();
+        let raw = find!(
+            handle: RawHandle,
+            pattern!(&snapshot, [{ _?chunk @ schema::source_chunk::bytes: ?handle }])
+        )
+        .next()
+        .unwrap();
+        let snapshot = without_blobs(snapshot);
+        assert!(matches!(
+            validate_fragment(&snapshot),
+            CatalogValidation::Pending { missing } if missing.contains(&raw.raw)
+        ));
     }
 
     #[test]
@@ -1369,8 +1990,39 @@ mod tests {
     }
 
     #[test]
-    fn blocks_reject_empty_part_sets() {
-        assert!(block([], None, Fragment::empty()).is_err());
+    fn only_the_canonical_bottom_block_may_be_content_free() {
+        let bottom = block([], None, Fragment::empty()).unwrap();
+        let predecessor = block([], None, one_part("predecessor")).unwrap();
+        let predecessor_id = predecessor.root().unwrap();
+
+        assert!(block([predecessor_id], None, Fragment::empty()).is_err());
+        assert!(block([], Some(instant(42.0)), Fragment::empty()).is_err());
+
+        let invalid_core = entity! { _ @
+            schema::block::previous: &predecessor_id,
+        };
+        let invalid = attach_kind(invalid_core, schema::block::KIND, "block").unwrap();
+        let invalid_id = invalid.root().unwrap();
+        let receipt = source_projection(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            "invalid:content-free-child",
+            b"{}".as_slice(),
+            invalid,
+        )
+        .unwrap();
+        let mut catalog = bottom;
+        catalog += predecessor;
+        catalog += receipt;
+        let (_directory, reader) = empty_reader();
+        let (_, validation) = validate_catalog_union(&reader, &TribleSet::new(), &catalog).unwrap();
+        assert!(matches!(
+            validation,
+            CatalogValidation::Rejected(reason)
+                if reason.contains("is not the predecessor-free, timeless canonical bottom")
+        ));
+        assert!(exists!(pattern!(&catalog, [{
+            invalid_id @ schema::block::previous: &predecessor_id
+        }])));
     }
 
     #[test]

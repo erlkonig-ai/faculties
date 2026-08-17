@@ -2,11 +2,13 @@
 //!
 //! This module is one concrete V4 collection recipe, not a registry. Its
 //! source is Archive's canonical `SimpleArchive` union and its target is the
-//! portable BM25 carrier. Every canonical block is a document, including a
-//! textless block. Content parts are occurrences, so the same content fact at
-//! two ordinals contributes twice. Every selected `LongString` payload is
-//! tokenized with [`hash_tokens`], and repeated documents join by pointwise
-//! maximum in the portable carrier.
+//! portable BM25 carrier. Every canonical semantic block is a document,
+//! including a genuine textless block. The unique content-free canonical
+//! bottom used only by raw source receipts is excluded so provenance volume
+//! cannot perturb corpus statistics. Content parts are occurrences, so the
+//! same content fact at two ordinals contributes twice. Every selected
+//! `LongString` payload is tokenized with [`hash_tokens`], and repeated
+//! documents join by pointwise maximum in the portable carrier.
 //!
 //! Importer receipts are deliberately outside the projection. The recipe
 //! validates the intrinsic block/part/fact graph it consumes; Archive's full
@@ -180,7 +182,9 @@ fn projection_plan(source: Blob<SimpleArchive>) -> std::result::Result<Projectio
         let block_rows = entities
             .get(&block_id)
             .expect("a discovered entity has rows");
-        validate_block(block_id, block_rows)?;
+        if validate_block(block_id, block_rows)? {
+            continue;
+        }
 
         let mut parts = Vec::new();
         for raw in values(block_rows, schema::block::contains.id()) {
@@ -214,7 +218,8 @@ fn projection_plan(source: Blob<SimpleArchive>) -> std::result::Result<Projectio
     Ok(ProjectionPlan { documents })
 }
 
-fn validate_block(entity: Id, rows: &[Trible]) -> std::result::Result<(), String> {
+/// Validate one block and report whether it is Archive's canonical bottom.
+fn validate_block(entity: Id, rows: &[Trible]) -> std::result::Result<bool, String> {
     let identity = [
         schema::block::previous.id(),
         schema::block::timestamp.id(),
@@ -223,8 +228,9 @@ fn validate_block(entity: Id, rows: &[Trible]) -> std::result::Result<(), String
     let nonidentity = [metadata::tag.id()];
     validate_intrinsic_entity(entity, rows, schema::block::KIND, &identity, &nonidentity)?;
 
-    for raw in values(rows, schema::block::previous.id()) {
-        parse_id(raw, "block previous")?;
+    let previous = values(rows, schema::block::previous.id());
+    for raw in &previous {
+        parse_id(*raw, "block previous")?;
     }
     let timestamps = values(rows, schema::block::timestamp.id());
     if timestamps.len() > 1 {
@@ -235,15 +241,15 @@ fn validate_block(entity: Id, rows: &[Trible]) -> std::result::Result<(), String
             .map_err(|_| format!("Archive block {entity:X} has an invalid timestamp"))?;
     }
     let contained = values(rows, schema::block::contains.id());
-    if contained.is_empty() {
+    if contained.is_empty() && (!previous.is_empty() || !timestamps.is_empty()) {
         return Err(format!(
-            "Archive block {entity:X} contains no content parts"
+            "Archive content-free block {entity:X} is not the predecessor-free, timeless canonical bottom"
         ));
     }
-    for raw in contained {
-        parse_id(raw, "block contains")?;
+    for raw in &contained {
+        parse_id(*raw, "block contains")?;
     }
-    Ok(())
+    Ok(contained.is_empty())
 }
 
 fn validate_part(entity: Id, rows: &[Trible]) -> std::result::Result<(u64, Id), String> {
@@ -536,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_corpus_and_textless_blocks_remain_documents() {
+    fn empty_corpus_and_semantic_textless_blocks_remain_documents() {
         let (empty_source, empty_attachments) = source_and_attachments(Fragment::empty());
         let empty_store = StoredBlobs::new(empty_attachments);
         let empty = parse(derive(&empty_store.reader, empty_source));
@@ -555,8 +561,10 @@ mod tests {
         let binary_part = archive::content_part(0, binary_fact, None).unwrap();
         let binary_block = archive::block(std::iter::empty::<Id>(), None, binary_part).unwrap();
         let binary_id = binary_block.root().unwrap();
+        let bottom = archive::block(std::iter::empty::<Id>(), None, Fragment::empty()).unwrap();
         let mut corpus = empty_text;
         corpus += binary_block;
+        corpus += bottom;
         let (source, attachments) = source_and_attachments(corpus);
         let store = StoredBlobs::new(attachments);
         let index = parse(derive(&store.reader, source));
@@ -568,6 +576,47 @@ mod tests {
         assert_eq!(
             documents,
             BTreeSet::from([empty_text_inline.raw, binary_inline.raw])
+        );
+    }
+
+    #[test]
+    fn canonical_bottom_does_not_perturb_the_bm25_carrier() {
+        let semantic = text_block(&[(schema::content_fact::modality::TEXT, "stable corpus")]);
+        let (semantic_source, semantic_attachments) = source_and_attachments(semantic.clone());
+        let semantic_store = StoredBlobs::new(semantic_attachments);
+        let semantic_index = parse(derive(&semantic_store.reader, semantic_source));
+
+        let mut with_bottom = semantic;
+        with_bottom += archive::block(std::iter::empty::<Id>(), None, Fragment::empty()).unwrap();
+        let (with_bottom_source, with_bottom_attachments) = source_and_attachments(with_bottom);
+        let with_bottom_store = StoredBlobs::new(with_bottom_attachments);
+        let with_bottom_index = parse(derive(&with_bottom_store.reader, with_bottom_source));
+
+        assert_eq!(semantic_index, with_bottom_index);
+    }
+
+    #[test]
+    fn bm25_rejects_noncanonical_content_free_blocks() {
+        let predecessor = text_block(&[(schema::content_fact::modality::TEXT, "parent")]);
+        let predecessor_id = predecessor.root().unwrap();
+        let mut invalid = entity! { _ @
+            schema::block::previous: &predecessor_id,
+        };
+        let invalid_id = invalid.root().unwrap();
+        invalid += entity! { ExclusiveId::force_ref(&invalid_id) @
+            metadata::tag: &schema::block::KIND,
+        };
+
+        let mut corpus = predecessor;
+        corpus += invalid;
+        let (source, attachments) = source_and_attachments(corpus);
+        let store = StoredBlobs::new(attachments);
+        let error = derive_element(&store.reader, source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is not the predecessor-free, timeless canonical bottom"),
+            "unexpected validation error: {error:#}"
         );
     }
 

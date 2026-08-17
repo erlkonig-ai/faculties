@@ -5,13 +5,18 @@ use std::sync::Once;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use faculties::archive_agy::{self, ProjectionSummary as AgyProjectionSummary};
+use faculties::archive_chatgpt::{self, ProjectionSummary as ChatGptProjectionSummary};
 use faculties::archive_claude_code::{self, ProjectionSummary as ClaudeCodeProjectionSummary};
+use faculties::archive_claude_web::{self, ProjectionSummary as ClaudeWebProjectionSummary};
 use faculties::archive_codex::{self, ProjectionSummary as CodexProjectionSummary};
 use faculties::archive_collection::{
     self as archive_collection, ArchiveImportWriter, ArchivePart, ArchivePayload,
     ArchiveProjection, ArchiveSearchSnapshot, ArchiveSnapshot,
 };
+use faculties::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
 use faculties::archive_cutover;
+use faculties::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
 use faculties::blockdag::CatalogValidation;
 use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
 use faculties::comb::{
@@ -57,8 +62,7 @@ struct Cli {
 enum Command {
     /// Project one source into the Archive and publish one COMMIT.
     Import {
-        /// Source path. Claude Code accepts a JSONL file or directory; Codex
-        /// deliberately accepts one explicit rollout JSONL file.
+        /// Source file or directory accepted by the selected adapter.
         path: PathBuf,
         /// Source adapter used to interpret PATH.
         #[arg(long, value_enum, default_value = "claude-code")]
@@ -109,8 +113,14 @@ enum Command {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ImportSource {
+    Agy,
+    #[value(name = "chatgpt")]
+    ChatGpt,
     ClaudeCode,
+    ClaudeWeb,
     Codex,
+    Copilot,
+    Gemini,
 }
 
 #[derive(Clone, Copy)]
@@ -199,9 +209,38 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
 
 fn run_import(storage: ArchiveStorage<'_>, path: &Path, source: ImportSource) -> Result<()> {
     match source {
+        ImportSource::Agy => run_agy_import(storage, path),
+        ImportSource::ChatGpt => run_chatgpt_import(storage, path),
         ImportSource::ClaudeCode => run_claude_code_import(storage, path),
+        ImportSource::ClaudeWeb => run_claude_web_import(storage, path),
         ImportSource::Codex => run_codex_import(storage, path),
+        ImportSource::Copilot => run_copilot_import(storage, path),
+        ImportSource::Gemini => run_gemini_import(storage, path),
     }
+}
+
+fn run_agy_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let projection = archive_agy::project_path(path, |projected| {
+        writer
+            .stage_fragment(projected.fragment)
+            .with_context(|| format!("stage {}", projected.source_path.display()))
+    });
+    let (summary, commit) = writer.finish(projection)?;
+    print_agy_import_summary(&summary, commit.is_some());
+    Ok(())
+}
+
+fn run_chatgpt_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let projection = archive_chatgpt::project_path(path, |projected| {
+        writer
+            .stage_fragment(projected.fragment)
+            .with_context(|| format!("stage {}", projected.source_path.display()))
+    });
+    let (summary, commit) = writer.finish(projection)?;
+    print_chatgpt_import_summary(&summary, commit.is_some());
+    Ok(())
 }
 
 fn run_claude_code_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
@@ -226,6 +265,80 @@ fn run_codex_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
     let (summary, commit) = writer.finish(projection)?;
     print_codex_import_summary(&summary, commit.is_some());
     Ok(())
+}
+
+fn run_claude_web_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let projection = archive_claude_web::project_path(path, |projected| {
+        writer
+            .stage_fragment(projected.fragment)
+            .with_context(|| format!("stage {}", projected.source_path.display()))
+    });
+    let (summary, commit) = writer.finish(projection)?;
+    print_claude_web_import_summary(&summary, commit.is_some());
+    Ok(())
+}
+
+fn run_copilot_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let projection = archive_copilot::project_path(path, |projected| {
+        writer
+            .stage_fragment(projected.fragment)
+            .with_context(|| format!("stage {}", projected.source_path.display()))
+    });
+    let (summary, commit) = writer.finish(projection)?;
+    print_copilot_import_summary(&summary, commit.is_some());
+    Ok(())
+}
+
+fn run_gemini_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let projection = archive_gemini::project_path(path, |projected| {
+        writer
+            .stage_fragment(projected.fragment)
+            .with_context(|| format!("stage {}", projected.source_path.display()))
+    });
+    let (summary, commit) = writer.finish(projection)?;
+    print_gemini_import_summary(&summary, commit.is_some());
+    Ok(())
+}
+
+fn print_agy_import_summary(summary: &AgyProjectionSummary, published: bool) {
+    println!(
+        "projected {} Antigravity transcript file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
+        summary.files_scanned,
+        summary.fragments_emitted,
+        summary.stats.projections_emitted,
+        summary.stats.content_parts,
+    );
+    println!(
+        "records={} transparent={} raw_only={} missing_predecessors={}",
+        summary.stats.records_seen,
+        summary.stats.transparent_records,
+        summary.stats.raw_only_records,
+        summary.stats.missing_predecessors,
+    );
+    print_collection_publication(published);
+}
+
+fn print_chatgpt_import_summary(summary: &ChatGptProjectionSummary, published: bool) {
+    println!(
+        "projected {} ChatGPT shard(s), {} conversation(s), {} mapping node(s), {} source projection(s), {} content part(s)",
+        summary.files_scanned,
+        summary.conversations_seen,
+        summary.mapping_nodes_seen,
+        summary.stats.projections_emitted,
+        summary.stats.content_parts,
+    );
+    println!(
+        "attachments={} resolved={} transparent={} raw_only={} missing_predecessors={}",
+        summary.attachments_seen,
+        summary.attachments_resolved,
+        summary.stats.transparent_records,
+        summary.stats.raw_only_records,
+        summary.stats.missing_predecessors,
+    );
+    print_collection_publication(published);
 }
 
 fn print_claude_code_import_summary(summary: &ClaudeCodeProjectionSummary, published: bool) {
@@ -264,6 +377,66 @@ fn print_codex_import_summary(summary: &CodexProjectionSummary, published: bool)
         summary.stats.undecodable_assets,
         summary.frozen_bytes,
         summary.trailing_bytes_ignored,
+    );
+    print_collection_publication(published);
+}
+
+fn print_claude_web_import_summary(summary: &ClaudeWebProjectionSummary, published: bool) {
+    println!(
+        "projected {} Claude Web export file(s), emitted {} fragment(s), {} conversation(s), {} message(s), {} content part(s)",
+        summary.files_scanned,
+        summary.fragments_emitted,
+        summary.stats.conversations,
+        summary.stats.messages,
+        summary.stats.common.content_parts,
+    );
+    println!(
+        "attachments={} extracted_contents={} missing_conversation_ids={} missing_message_ids={} invalid_timestamps={} missing_predecessors={}",
+        summary.stats.attachments,
+        summary.stats.extracted_contents,
+        summary.stats.missing_conversation_uuids,
+        summary.stats.missing_message_uuids,
+        summary.stats.invalid_timestamps,
+        summary.stats.common.missing_predecessors,
+    );
+    print_collection_publication(published);
+}
+
+fn print_copilot_import_summary(summary: &CopilotProjectionSummary, published: bool) {
+    println!(
+        "projected {} Copilot session file(s), ignored {} unrelated JSON file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
+        summary.files_scanned,
+        summary.files_ignored,
+        summary.fragments_emitted,
+        summary.stats.projections_emitted,
+        summary.stats.content_parts,
+    );
+    println!(
+        "records={} transparent={} raw_only={} missing_predecessors={}",
+        summary.stats.records_seen,
+        summary.stats.transparent_records,
+        summary.stats.raw_only_records,
+        summary.stats.missing_predecessors,
+    );
+    print_collection_publication(published);
+}
+
+fn print_gemini_import_summary(summary: &GeminiProjectionSummary, published: bool) {
+    println!(
+        "projected {} Gemini Takeout file(s), ignored {} unrelated HTML file(s), {} activity card(s), {} source projection(s), {} content part(s)",
+        summary.files_scanned,
+        summary.files_ignored,
+        summary.cards_seen,
+        summary.stats.projections_emitted,
+        summary.stats.content_parts,
+    );
+    println!(
+        "assets={} resolved={} transparent={} raw_only={} missing_predecessors={}",
+        summary.assets_seen,
+        summary.assets_resolved,
+        summary.stats.transparent_records,
+        summary.stats.raw_only_records,
+        summary.stats.missing_predecessors,
     );
     print_collection_publication(published);
 }
@@ -324,25 +497,12 @@ fn projection_display_timestamp(projection: &ArchiveProjection) -> Option<Inline
     projection.source_timestamp.or(projection.block_timestamp)
 }
 
-fn modality_label(id: Id) -> String {
-    match id {
-        archive_schema::content_fact::modality::TEXT => "text".to_owned(),
-        archive_schema::content_fact::modality::AUDIO => "audio".to_owned(),
-        archive_schema::content_fact::modality::IMAGE => "image".to_owned(),
-        archive_schema::content_fact::modality::TOOL_CALL => "tool-call".to_owned(),
-        archive_schema::content_fact::modality::TOOL_RESULT => "tool-result".to_owned(),
-        archive_schema::content_fact::modality::THINKING => "thinking".to_owned(),
-        archive_schema::content_fact::modality::EVENT => "event".to_owned(),
-        _ => format!("modality:{id:X}"),
-    }
-}
-
-fn direction_label(id: Id) -> String {
-    match id {
-        archive_schema::content_fact::direction::IN => "in".to_owned(),
-        archive_schema::content_fact::direction::OUT => "out".to_owned(),
-        archive_schema::content_fact::direction::AMBIENT => "ambient".to_owned(),
-        _ => format!("direction:{id:X}"),
+fn entity_label(archive: &ArchiveSnapshot, id: Id, namespace: &str) -> Result<String> {
+    let names = archive.names(id)?;
+    if names.is_empty() {
+        Ok(format!("{namespace}:{id:X}"))
+    } else {
+        Ok(names.join(" / "))
     }
 }
 
@@ -410,13 +570,13 @@ fn render_projection_summary(projection: &ArchiveProjection) -> Result<String> {
     ))
 }
 
-fn render_part(out: &mut String, part: &ArchivePart) -> Result<()> {
+fn render_part(out: &mut String, archive: &ArchiveSnapshot, part: &ArchivePart) -> Result<()> {
     writeln!(
         out,
         "part[{}]: {} {} id={:X} fact={:X}",
         part.ordinal,
-        modality_label(part.modality),
-        direction_label(part.direction),
+        entity_label(archive, part.modality, "modality")?,
+        entity_label(archive, part.direction, "direction")?,
         part.id,
         part.fact,
     )?;
@@ -457,7 +617,7 @@ fn render_part(out: &mut String, part: &ArchivePart) -> Result<()> {
     Ok(())
 }
 
-fn render_projection(projection: &ArchiveProjection) -> Result<String> {
+fn render_projection(archive: &ArchiveSnapshot, projection: &ArchiveProjection) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "projection: {:X}", projection.id)?;
     writeln!(out, "source_namespace: {:X}", projection.source_namespace)?;
@@ -503,7 +663,7 @@ fn render_projection(projection: &ArchiveProjection) -> Result<String> {
         writeln!(out, "source_path: {path}")?;
     }
     for part in &projection.parts {
-        render_part(&mut out, part)?;
+        render_part(&mut out, archive, part)?;
     }
     Ok(out)
 }
@@ -519,7 +679,7 @@ fn run_list(storage: ArchiveStorage<'_>, limit: usize) -> Result<()> {
 fn run_show(storage: ArchiveStorage<'_>, prefix: &str) -> Result<()> {
     let archive = storage.load()?;
     let id = archive.resolve_projection_prefix(prefix)?;
-    print!("{}", render_projection(&archive.projection(id)?)?);
+    print!("{}", render_projection(&archive, &archive.projection(id)?)?);
     Ok(())
 }
 
@@ -628,7 +788,11 @@ fn load_thread(
     Ok(ordered)
 }
 
-fn render_block(block: &LoadedBlock, include_all_parts: bool) -> Result<String> {
+fn render_block(
+    archive: &ArchiveSnapshot,
+    block: &LoadedBlock,
+    include_all_parts: bool,
+) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "block: {:X}", block.semantic.block)?;
     writeln!(
@@ -650,7 +814,7 @@ fn render_block(block: &LoadedBlock, include_all_parts: bool) -> Result<String> 
     }
     for part in &block.semantic.parts {
         if include_all_parts || part.modality == archive_schema::content_fact::modality::TEXT {
-            render_part(&mut out, part)?;
+            render_part(&mut out, archive, part)?;
         }
     }
     Ok(out)
@@ -662,7 +826,7 @@ fn run_thread(storage: ArchiveStorage<'_>, prefix: &str, limit: usize) -> Result
         if index != 0 {
             println!("---");
         }
-        print!("{}", render_block(block, true)?);
+        print!("{}", render_block(&archive, block, true)?);
     }
     Ok(())
 }
@@ -1024,7 +1188,10 @@ fn run_replay(
     }
 
     for block in &selected {
-        print!("{}", render_block(&block.block, with_tools)?);
+        print!(
+            "{}",
+            render_block(&replay.archive, &block.block, with_tools)?
+        );
         println!("---");
     }
     let last_key = selected.last().expect("selected is nonempty").key;
@@ -1188,23 +1355,92 @@ mod tests {
                 ..
             })
         ));
-        let codex_source = Cli::try_parse_from([
-            "archive",
-            "--pile",
-            "archive.pile",
-            "import",
-            "rollout.jsonl",
-            "--source",
-            "codex",
-        ])
+        for (spelling, expected) in [
+            ("agy", ImportSource::Agy),
+            ("chatgpt", ImportSource::ChatGpt),
+            ("claude-code", ImportSource::ClaudeCode),
+            ("claude-web", ImportSource::ClaudeWeb),
+            ("codex", ImportSource::Codex),
+            ("copilot", ImportSource::Copilot),
+            ("gemini", ImportSource::Gemini),
+        ] {
+            let parsed = Cli::try_parse_from([
+                "archive",
+                "--pile",
+                "archive.pile",
+                "import",
+                "source",
+                "--source",
+                spelling,
+            ])
+            .unwrap();
+            assert!(matches!(
+                parsed.command,
+                Some(Command::Import { source, .. }) if source == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn new_source_importers_each_publish_one_validated_commit() {
+        let fixture = fixture();
+
+        let chatgpt = fixture._directory.path().join("conversations.json");
+        fs::write(
+            &chatgpt,
+            r#"[{"id":"chatgpt-cli","mapping":{"node":{"id":"node","parent":null,"message":{"id":"message","author":{"role":"user"},"content":{"content_type":"text","parts":["chatgpt"]}}}}}]"#,
+        )
         .unwrap();
-        assert!(matches!(
-            codex_source.command,
-            Some(Command::Import {
-                source: ImportSource::Codex,
-                ..
-            })
-        ));
+        run_import(storage(&fixture), &chatgpt, ImportSource::ChatGpt).unwrap();
+        assert_eq!(archive_root_count(&fixture), 1);
+
+        let claude_web = fixture._directory.path().join("claude-web.json");
+        fs::write(
+            &claude_web,
+            r#"[{"uuid":"claude-cli","chat_messages":[{"uuid":"message","sender":"human","text":"claude"}]}]"#,
+        )
+        .unwrap();
+        run_import(storage(&fixture), &claude_web, ImportSource::ClaudeWeb).unwrap();
+        assert_eq!(archive_root_count(&fixture), 2);
+
+        let copilot = fixture._directory.path().join("copilot.json");
+        fs::write(
+            &copilot,
+            r#"{"sessionId":"copilot-cli","requests":[{"requestId":"request","message":{"text":"copilot"},"response":[{"value":"answer"}]}]}"#,
+        )
+        .unwrap();
+        run_import(storage(&fixture), &copilot, ImportSource::Copilot).unwrap();
+        assert_eq!(archive_root_count(&fixture), 3);
+
+        let agy = fixture._directory.path().join("transcript_full.jsonl");
+        fs::write(
+            &agy,
+            concat!(
+                r#"{"source":"USER_INPUT","content":"agy","step_index":1}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        run_import(storage(&fixture), &agy, ImportSource::Agy).unwrap();
+        assert_eq!(archive_root_count(&fixture), 4);
+
+        let gemini = fixture._directory.path().join("My Activity.html");
+        fs::write(
+            &gemini,
+            concat!(
+                "<html><body><div class=\"outer-cell mdl-cell mdl-cell--12-col mdl-shadow--2dp\"><div>",
+                "<div class=\"header-cell\"><p>Gemini Apps<br></p></div>",
+                "<div class=\"content-cell mdl-cell mdl-cell--6-col mdl-typography--body-1\">",
+                "Prompted&nbsp;gemini<br>18 Sept 2025, 12:02:52 CET<br><p>answer</p>",
+                "</div><div class=\"content-cell mdl-cell mdl-cell--6-col mdl-typography--body-1 mdl-typography--text-right\"></div>",
+                "</div></div></body></html>",
+            ),
+        )
+        .unwrap();
+        run_import(storage(&fixture), &gemini, ImportSource::Gemini).unwrap();
+        assert_eq!(archive_root_count(&fixture), 5);
+
+        assert_eq!(storage(&fixture).load().unwrap().projection_ids().len(), 10);
     }
 
     #[test]
@@ -1295,7 +1531,9 @@ mod tests {
             interval_key(semantic_block_timestamp(&block).unwrap().unwrap()).unwrap(),
             earliest_receipt_key
         );
-        assert!(!render_block(&block, false).unwrap().contains("<untimed>"));
+        assert!(!render_block(&archive, &block, false)
+            .unwrap()
+            .contains("<untimed>"));
 
         let timeline = timeline_after(&archive, i128::MIN, false).unwrap();
         assert_eq!(timeline.len(), 1);
@@ -1343,7 +1581,7 @@ mod tests {
         let archive = storage(&fixture).load().unwrap();
         let id = archive.projection_ids()[0];
         let projection = archive.projection(id).unwrap();
-        assert!(render_projection(&projection)
+        assert!(render_projection(&archive, &projection)
             .unwrap()
             .contains("quasar needle"));
         assert_eq!(

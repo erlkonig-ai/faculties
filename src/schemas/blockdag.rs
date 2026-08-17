@@ -1,12 +1,15 @@
 //! Canonical block-DAG archive schema.
 //!
-//! Archive data is split into four algebraic layers:
+//! Archive data is split into semantic/source-occurrence layers plus an
+//! orthogonal exact-source substrate:
 //!
 //! ```text
 //! content fact  -- semantic datum (text, media, tool payload, ...)
 //! content part  -- ordinal-bearing occurrence of one fact inside a block
 //! block         -- structural event in the predecessor DAG
 //! source projection -- exact vendor occurrence projected onto one block
+//! source chunk      -- reusable content-addressed source byte range
+//! source snapshot   -- exact ordered version of one source file
 //! ```
 //!
 //! The first three layers are structural hash-consing. Source multiplicity,
@@ -112,6 +115,23 @@ pub mod content_fact {
         pub const TOOL_RESULT: Id = id_hex!("09A663D69EBDEC15ED329EC5CB7AF445");
         pub const THINKING: Id = id_hex!("293748A40FE28BDC888C1AF336F60D5C");
         pub const EVENT: Id = id_hex!("2F13E9308B0760AAFBAC4B1FF959154C");
+        /// Generic file payload. Minted with `trible genid` on 2026-08-17.
+        pub const FILE: Id = id_hex!("2F241F546612E13BBED8D08048F4298E");
+        /// Moving-image payload. Minted with `trible genid` on 2026-08-17.
+        pub const VIDEO: Id = id_hex!("F987E4C900B76116CE7E84045DC9F5F4");
+
+        /// Canonical, queryable display vocabulary for Archive modalities.
+        pub const SPECS: &[(Id, &str)] = &[
+            (TEXT, "text"),
+            (AUDIO, "audio"),
+            (IMAGE, "image"),
+            (FILE, "file"),
+            (VIDEO, "video"),
+            (TOOL_CALL, "tool-call"),
+            (TOOL_RESULT, "tool-result"),
+            (THINKING, "thinking"),
+            (EVENT, "event"),
+        ];
     }
 
     pub mod direction {
@@ -119,7 +139,45 @@ pub mod content_fact {
         pub const IN: Id = id_hex!("1452B759336E0DEF96E78937D6E7F15D");
         pub const OUT: Id = id_hex!("39990F231B5FDB6F0FF4DB55616A2939");
         pub const AMBIENT: Id = id_hex!("0EE490D68C82C4F734D15222C8F2AF5D");
+
+        /// Canonical, queryable display vocabulary for Archive directions.
+        pub const SPECS: &[(Id, &str)] = &[(IN, "in"), (OUT, "out"), (AMBIENT, "ambient")];
     }
+}
+
+/// One content-addressed byte range inside an exact frozen source snapshot.
+pub mod source_chunk {
+    use super::*;
+
+    /// Canonical fixed boundary used by every Archive source adapter.
+    pub const CANONICAL_BYTES: usize = 8 * 1024 * 1024;
+
+    attributes! {
+        /// IDENTITY. Zero-based byte offset inside the frozen source.
+        "28C0C5F405037AD6D385E47B8504EC05" as pub offset: U256BE;
+        /// IDENTITY. Exact bytes in this range; chunk boundaries may split
+        /// UTF-8 and source-format records.
+        "A4839C10C67A7AD3952BEA072865CC2B" as pub bytes: Handle<RawBytes>;
+    }
+
+    /// Nonidentity kind marker. Minted with `trible genid` on 2026-08-17.
+    pub const KIND: Id = id_hex!("6BE555E2350E42803AFF1DF43283ACD0");
+}
+
+/// One exact, reconstructible version of a potentially live source file.
+pub mod source_snapshot {
+    use super::*;
+
+    attributes! {
+        /// IDENTITY. Exact source length in bytes.
+        "6123C7D5D325756485E74212336BD1D4" as pub byte_length: U256BE;
+        /// IDENTITY. Ordered byte ranges, whose offsets live on the referenced
+        /// [`source_chunk`] entities.
+        "F9A5D6DC87EA518FAC423D5E81158A2D" as pub contains: GenId;
+    }
+
+    /// Nonidentity kind marker. Minted with `trible genid` on 2026-08-17.
+    pub const KIND: Id = id_hex!("CF3D9B1669728FD0A5DAC20417ACEE58");
 }
 
 /// Exact vendor occurrence and projection receipt.
@@ -171,4 +229,20 @@ pub mod source_projection {
     /// Codex app-server rollout JSONL source namespace. Minted with
     /// `trible genid` on 2026-08-16.
     pub const SOURCE_CODEX: Id = id_hex!("C9B3D07DA2B5939383F342B1054E08F3");
+
+    /// ChatGPT data-export source namespace. Minted with `trible genid` on
+    /// 2026-08-17.
+    pub const SOURCE_CHATGPT: Id = id_hex!("5F2A3161281F3A8EA18589208FE729DA");
+    /// Claude Web data-export source namespace. Minted with `trible genid` on
+    /// 2026-08-17.
+    pub const SOURCE_CLAUDE_WEB: Id = id_hex!("A77D6A2BE2BECFD88641652EBC8EF1D4");
+    /// Gemini Takeout activity source namespace. Minted with `trible genid` on
+    /// 2026-08-17.
+    pub const SOURCE_GEMINI: Id = id_hex!("8F043C104DEF05097364108E8826634F");
+    /// GitHub Copilot / VS Code chat-session source namespace. Minted with
+    /// `trible genid` on 2026-08-17.
+    pub const SOURCE_COPILOT: Id = id_hex!("2D8A49CBF2B2D4D4E705B37C4FFEDB48");
+    /// Gemini Antigravity transcript source namespace. Minted with `trible
+    /// genid` on 2026-08-17.
+    pub const SOURCE_AGY: Id = id_hex!("29D3BFFAF4AC6C2AD2EFD1C7D22B60FB");
 }

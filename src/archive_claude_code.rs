@@ -1,8 +1,9 @@
 //! Deterministic Claude Code JSONL projection onto Archive's canonical block DAG.
 //!
 //! This module deliberately stops at the source-adapter boundary. It scans a
-//! file or directory, projects each source file into an attachment-complete
-//! [`Fragment`], and hands those fragments to a caller-provided sink. A child
+//! file or directory, projects each source file into bounded,
+//! attachment-complete [`Fragment`]s, and hands those fragments to a
+//! caller-provided sink. A child
 //! fragment may name a predecessor catalog entity carried by another emitted
 //! fragment, so callers must stage the complete emitted union through
 //! `ArchiveImportWriter` and publish it with one validated COMMIT. The adapter
@@ -20,8 +21,13 @@
 //! predecessor classes; this is semantic support, not a transcription of that
 //! receipt's raw `parentUuid`, which remains preserved in `raw_record`.
 //! Missing corpus-external references are accounted but do not block otherwise
-//! useful definitions. Both passes are line-streaming and materialize only the
-//! fields required by the canonical ontology.
+//! useful definitions. Projection first freezes each live JSONL file into one
+//! immutable, disk-backed snapshot and verifies it against the pre-scan. It
+//! then emits semantic receipts one record at a time plus one exact source
+//! snapshot over reusable fixed-size byte chunks. Snapshots are disjoint from
+//! dialogue projections: they retain everything contracted out of the
+//! semantic graph without creating a fake bottom-block message. Both passes
+//! are line-streaming and materialize only canonical fields.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
@@ -40,28 +46,26 @@ use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use crate::schemas::blockdag as schema;
-use crate::{blockdag, files};
+use crate::{archive_source, blockdag, files};
 
-/// Maximum number of whole-file fragments resident during parallel projection.
-///
-/// This is an implementation detail rather than a tuning surface: a single
-/// transcript can be very large, while four files still expose useful CPU
-/// parallelism on the scanner and intrinsic-id construction path.
-const PROJECTION_BATCH: usize = 4;
 const TOOL_RESULT_STATUS_OK: &str = "urn:triblespace:archive:tool-result-status:v1:ok";
 const TOOL_RESULT_STATUS_ERROR: &str = "urn:triblespace:archive:tool-result-status:v1:error";
-
 /// Observable projection accounting. Missing or unresolved source evidence is
 /// counted rather than silently replaced with invented values.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProjectionStats {
     /// Non-empty JSONL records scanned.
     pub records_seen: usize,
-    /// Canonical source projections emitted (one per projected dialogue record).
+    /// Canonical source projections emitted for semantic occurrences.
     pub source_projections: usize,
+    /// Reusable content-addressed byte ranges in exact source snapshots.
+    pub raw_chunks: usize,
+    /// Exact frozen source versions retained independently of semantic rows.
+    pub source_snapshots: usize,
     /// Ordered content parts emitted before set-level deduplication.
     pub content_parts: usize,
-    /// Non-dialogue, contentless, or identity-less records not projected.
+    /// Non-dialogue, contentless, or identity-less records retained only in
+    /// the exact source snapshot rather than semantic dialogue blocks.
     pub skipped_records: usize,
     /// Dialogue records lacking either `sessionId` or `uuid`.
     pub missing_source_identity: usize,
@@ -82,6 +86,8 @@ impl ProjectionStats {
     fn absorb(&mut self, other: Self) {
         self.records_seen += other.records_seen;
         self.source_projections += other.source_projections;
+        self.raw_chunks += other.raw_chunks;
+        self.source_snapshots += other.source_snapshots;
         self.content_parts += other.content_parts;
         self.skipped_records += other.skipped_records;
         self.missing_source_identity += other.missing_source_identity;
@@ -92,7 +98,7 @@ impl ProjectionStats {
     }
 }
 
-/// One source file projected into facts plus every blob those facts reference.
+/// One bounded projection fragment plus every blob its facts reference.
 ///
 /// `source_path` is presentation metadata only. It is also attached to each
 /// source-projection receipt as a nonidentity occurrence annotation, so moving
@@ -104,20 +110,22 @@ pub struct ProjectedFile {
     pub stats: ProjectionStats,
 }
 
-/// Corpus-level result returned after every projected file has reached `emit`.
+/// Corpus-level result returned after every projected fragment has reached
+/// `emit`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProjectionSummary {
     /// JSONL files scanned, including files containing no projectable records.
     pub files_scanned: usize,
-    /// Non-empty fragments handed to the sink.
+    /// Non-empty bounded fragments handed to the sink.
     pub fragments_emitted: usize,
     pub stats: ProjectionStats,
 }
 
 /// Project one Claude Code JSONL file or a recursively scanned directory.
 ///
-/// Files are discovered and emitted deterministically. `emit` is invoked at
-/// most once per non-empty source file. The caller must stage every supplied
+/// Files are discovered and emitted deterministically. Each semantic source
+/// occurrence is emitted immediately as a bounded fragment, followed by one
+/// exact source snapshot over offset-addressed chunks. The caller must stage every supplied
 /// fragment into one `ArchiveImportWriter` and call its `finish` only after
 /// projection succeeds; publishing fragments independently can expose an
 /// invalid partial catalog. The projector itself performs no pile writes.
@@ -132,27 +140,15 @@ where
     let prescan = prescan_file(path)?;
     let plan = SourcePlan::from_scans(std::slice::from_ref(&prescan))
         .context("plan canonical Claude Code lineage")?;
-    let projected = project_file(path, &plan)?;
-    if projected.digest != prescan.digest {
-        bail!(
-            "Claude Code source {} changed between dependency pre-scan and projection",
-            path.display()
-        );
-    }
-    let mut summary = ProjectionSummary {
-        files_scanned: 1,
-        stats: projected.stats,
-        ..ProjectionSummary::default()
-    };
-    if !projected.fragment.facts().is_empty() {
-        emit(ProjectedFile {
-            source_path: path.to_path_buf(),
-            fragment: projected.fragment,
-            stats: projected.stats,
-        })?;
-        summary.fragments_emitted = 1;
-    }
-    Ok(summary)
+    let snapshot = archive_source::freeze_file(path)?;
+    project_snapshot(
+        path,
+        snapshot,
+        prescan.digest,
+        prescan.file_anchor.as_ref(),
+        &plan,
+        &mut emit,
+    )
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -178,6 +174,8 @@ impl SourceKey {
 struct PreScan {
     sources: HashMap<SourceKey, SourceObservation>,
     aliases: BTreeSet<(SourceKey, SourceKey)>,
+    /// First native `(sessionId, uuid)` observed in this physical file.
+    file_anchor: Option<SourceKey>,
     digest: [u8; 32],
 }
 
@@ -779,12 +777,6 @@ fn validate_semantic_dag(
     Ok(())
 }
 
-struct Projected {
-    fragment: Fragment,
-    stats: ProjectionStats,
-    digest: [u8; 32],
-}
-
 fn project_directory<F>(root: &Path, emit: &mut F) -> Result<ProjectionSummary>
 where
     F: FnMut(ProjectedFile) -> Result<()>,
@@ -805,37 +797,23 @@ where
         ..ProjectionSummary::default()
     };
 
-    // The complete record DAG has already fixed every intrinsic id. Files are
-    // therefore only attachment-bearing emission units and may be projected in
-    // bounded parallel batches without becoming a semantic schedule.
-    for indices in (0..paths.len())
-        .collect::<Vec<_>>()
-        .chunks(PROJECTION_BATCH)
-    {
-        let projected: Vec<Result<Projected>> = indices
-            .par_iter()
-            .map(|&index| project_file(&paths[index], &plan))
-            .collect();
-        for (&index, projected) in indices.iter().zip(projected) {
-            let projected = projected
-                .with_context(|| format!("project Claude Code file {}", paths[index].display()))?;
-            if projected.digest != prescans[index].digest {
-                bail!(
-                    "Claude Code source {} changed between dependency pre-scan and projection",
-                    paths[index].display()
-                );
-            }
-            summary.stats.absorb(projected.stats);
-            if projected.fragment.facts().is_empty() {
-                continue;
-            }
-            emit(ProjectedFile {
-                source_path: paths[index].clone(),
-                fragment: projected.fragment,
-                stats: projected.stats,
-            })?;
-            summary.fragments_emitted += 1;
-        }
+    // The complete record DAG has already fixed every intrinsic id. Freeze and
+    // project one physical file at a time: pre-scan may exploit parallelism,
+    // but projection never retains several multi-gigabyte snapshots or
+    // per-file fragment unions concurrently.
+    for (path, prescan) in paths.iter().zip(&prescans) {
+        let snapshot = archive_source::freeze_file(path)?;
+        let projected = project_snapshot(
+            path,
+            snapshot,
+            prescan.digest,
+            prescan.file_anchor.as_ref(),
+            &plan,
+            emit,
+        )
+        .with_context(|| format!("project Claude Code file {}", path.display()))?;
+        summary.fragments_emitted += projected.fragments_emitted;
+        summary.stats.absorb(projected.stats);
     }
 
     Ok(summary)
@@ -869,8 +847,7 @@ fn prescan_file(path: &Path) -> Result<PreScan> {
 fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreScan> {
     let mut scan = PreScan::default();
     let mut digest = blake3::Hasher::new();
-    for_each_jsonl_line(reader, |line_number, raw| {
-        hash_record(&mut digest, raw);
+    for_each_jsonl_line(reader, Some(&mut digest), |line_number, raw| {
         let mut bytes = scanner_bytes(raw)?;
         let record = scan_record(&mut bytes).map_err(|error| {
             anyhow!(
@@ -882,6 +859,7 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
         let Some(key) = record.source_key() else {
             return Ok(());
         };
+        scan.file_anchor.get_or_insert_with(|| key.clone());
         let shape = record_shape(&record, &key)?;
         let semantic = shape.is_some();
         let turn_duration =
@@ -930,24 +908,35 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
     Ok(scan)
 }
 
-fn project_file(path: &Path, plan: &SourcePlan) -> Result<Projected> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    project_reader(&mut reader, path, plan)
-}
-
-fn project_reader<R: BufRead>(
-    reader: &mut R,
+fn project_snapshot<F>(
     source_path: &Path,
+    snapshot: archive_source::FrozenSource,
+    expected_digest: [u8; 32],
+    native_anchor: Option<&SourceKey>,
     plan: &SourcePlan,
-) -> Result<Projected> {
-    let mut fragment = Fragment::empty();
-    let mut stats = ProjectionStats::default();
-    let mut digest = blake3::Hasher::new();
+    emit: &mut F,
+) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedFile) -> Result<()>,
+{
+    if snapshot.digest != expected_digest {
+        bail!(
+            "Claude Code source {} changed between dependency pre-scan and immutable snapshot",
+            source_path.display()
+        );
+    }
 
-    for_each_jsonl_line(reader, |line_number, raw| {
-        hash_record(&mut digest, raw);
-        stats.records_seen += 1;
+    let mut summary = ProjectionSummary {
+        files_scanned: 1,
+        ..ProjectionSummary::default()
+    };
+    let mut reader = std::io::Cursor::new(snapshot.bytes.as_ref());
+
+    for_each_jsonl_line(&mut reader, None, |line_number, raw| {
+        let mut row_stats = ProjectionStats {
+            records_seen: 1,
+            ..ProjectionStats::default()
+        };
         let mut bytes = scanner_bytes(raw)?;
         let record = scan_record(&mut bytes).map_err(|error| {
             anyhow!(
@@ -956,25 +945,82 @@ fn project_reader<R: BufRead>(
                 line_number
             )
         })?;
-        project_record(record, raw, source_path, plan, &mut fragment, &mut stats).with_context(
-            || {
-                format!(
-                    "project Claude Code record at {}:{}",
-                    source_path.display(),
-                    line_number
-                )
-            },
+        let mut fragment = Fragment::empty();
+        project_record(
+            record,
+            raw,
+            source_path,
+            plan,
+            &mut fragment,
+            &mut row_stats,
         )
+        .with_context(|| {
+            format!(
+                "project Claude Code record at {}:{}",
+                source_path.display(),
+                line_number
+            )
+        })?;
+        summary.stats.absorb(row_stats);
+        if !fragment.facts().is_empty() {
+            emit(ProjectedFile {
+                source_path: source_path.to_path_buf(),
+                fragment,
+                stats: row_stats,
+            })?;
+            summary.fragments_emitted += 1;
+        }
+        Ok(())
     })?;
 
-    Ok(Projected {
+    let anchor = native_anchor.map_or_else(
+        || {
+            let first = snapshot.bytes.slice(
+                0..snapshot
+                    .bytes
+                    .len()
+                    .min(schema::source_chunk::CANONICAL_BYTES),
+            );
+            format!("digest/{}", blake3::hash(first.as_ref()).to_hex())
+        },
+        |key| format!("native/{}", key.locator()),
+    );
+    // Chunks are reusable content-addressed values, while the snapshot root
+    // records which exact ordered sequence and length coexisted. They are not
+    // dialogue projections and therefore never pollute projection queries.
+    let (fragment, raw_chunks) = archive_source::source_snapshot_fragment(
+        schema::source_projection::SOURCE_CLAUDE_CODE,
+        &anchor,
+        source_path,
+        &snapshot.bytes,
+    )?;
+    let snapshot_stats = ProjectionStats {
+        raw_chunks,
+        source_snapshots: 1,
+        ..ProjectionStats::default()
+    };
+    emit(ProjectedFile {
+        source_path: source_path.to_path_buf(),
         fragment,
-        stats,
-        digest: *digest.finalize().as_bytes(),
-    })
+        stats: snapshot_stats,
+    })?;
+    summary.fragments_emitted += 1;
+    summary.stats.absorb(snapshot_stats);
+
+    Ok(summary)
 }
 
-fn for_each_jsonl_line<R, F>(reader: &mut R, mut visit: F) -> Result<()>
+#[cfg(test)]
+struct Projected {
+    fragment: Fragment,
+    stats: ProjectionStats,
+}
+
+fn for_each_jsonl_line<R, F>(
+    reader: &mut R,
+    mut digest: Option<&mut blake3::Hasher>,
+    mut visit: F,
+) -> Result<()>
 where
     R: BufRead,
     F: FnMut(usize, &[u8]) -> Result<()>,
@@ -986,6 +1032,9 @@ where
         let read = reader.read_until(b'\n', &mut buffer)?;
         if read == 0 {
             break;
+        }
+        if let Some(digest) = digest.as_deref_mut() {
+            digest.update(&buffer);
         }
         line_number += 1;
         if buffer.last() == Some(&b'\n') {
@@ -1012,12 +1061,6 @@ fn scanner_bytes(raw: &[u8]) -> Result<Bytes> {
         .rposition(|byte| !byte.is_ascii_whitespace())
         .expect("a first non-whitespace byte implies a last byte");
     Ok(Bytes::from_source(raw[first..=last].to_vec()))
-}
-
-fn hash_record(digest: &mut blake3::Hasher, raw: &[u8]) {
-    let len = u64::try_from(raw.len()).expect("one JSONL record fits in u64 bytes");
-    digest.update(&len.to_le_bytes());
-    digest.update(raw);
 }
 
 fn project_record(
@@ -1417,7 +1460,7 @@ struct BlockAccum {
     tool_id: Option<String>,
     tool_name: Option<String>,
     tool_use_id: Option<String>,
-    input_raw: Option<String>,
+    input_raw: Option<Bytes>,
     is_error: Option<bool>,
     tool_result_items: Vec<RawItem>,
     image_source: Option<RawImageSource>,
@@ -1567,7 +1610,7 @@ fn scan_content_block(bytes: &mut Bytes) -> std::result::Result<RawBlock, sc::Sc
             "id" => block.tool_id = parse_optional_string(value)?,
             "name" => block.tool_name = parse_optional_string(value)?,
             "tool_use_id" => block.tool_use_id = parse_optional_string(value)?,
-            "input" => block.input_raw = Some(capture_raw_json(value)?),
+            "input" => block.input_raw = Some(sc::take_value(value)?),
             "is_error" => block.is_error = parse_optional_bool(value)?,
             "content" => block.tool_result_items = scan_tool_result_content(value)?,
             "source" => block.image_source = scan_optional_image_source(value)?,
@@ -1634,17 +1677,14 @@ fn parse_optional_bool(bytes: &mut Bytes) -> std::result::Result<Option<bool>, s
 
 fn canonical_tool_call(
     name: Option<String>,
-    input: Option<String>,
+    input: Option<Bytes>,
 ) -> std::result::Result<String, sc::ScanError> {
-    let name = serde_json::to_string(&name)
-        .map_err(|error| scan_syntax(&format!("serialize tool name: {error}")))?;
+    let name = match name {
+        Some(name) => archive_source::canonical_json_string(&name),
+        None => "null".to_owned(),
+    };
     let input = match input {
-        Some(raw) => {
-            let value: serde_json::Value = serde_json::from_str(&raw)
-                .map_err(|error| scan_syntax(&format!("canonicalize tool input: {error}")))?;
-            serde_json::to_string(&value)
-                .map_err(|error| scan_syntax(&format!("serialize tool input: {error}")))?
-        }
+        Some(raw) => archive_source::canonical_json(raw)?,
         None => "null".to_owned(),
     };
     Ok(format!(r#"{{"name":{name},"input":{input}}}"#))
@@ -1715,6 +1755,8 @@ fn scan_optional_image_source(
         return Ok(None);
     }
     let mut source = RawImageSource::default();
+    let mut file_size = None;
+    let mut legacy_size = None;
     sc::object(bytes, &mut source, |source, key, value| {
         let key = key
             .view::<str>()
@@ -1725,13 +1767,13 @@ fn scan_optional_image_source(
             "data" => source.data = parse_optional_string(value)?,
             "url" => source.url = parse_optional_string(value)?,
             "file_id" => source.file_id = parse_optional_string(value)?,
-            "file_size" | "size" => {
-                source.size = capture_raw_json(value)?.trim().parse::<u128>().ok()
-            }
+            "file_size" => file_size = Some(capture_raw_json(value)?.trim().parse::<u128>().ok()),
+            "size" => legacy_size = Some(capture_raw_json(value)?.trim().parse::<u128>().ok()),
             _ => sc::skip_value(value)?,
         }
         Ok(source)
     })?;
+    source.size = file_size.unwrap_or_else(|| legacy_size.flatten());
     Ok(Some(source))
 }
 
@@ -1769,8 +1811,28 @@ mod tests {
     fn project_text(text: &str, path: &Path) -> Projected {
         let prescan = prescan_text(text, path);
         let plan = SourcePlan::from_scans(std::slice::from_ref(&prescan)).unwrap();
-        let mut reader = Cursor::new(text.as_bytes());
-        project_reader(&mut reader, path, &plan).unwrap()
+        let bytes = Bytes::from_source(text.as_bytes().to_vec());
+        let snapshot = archive_source::FrozenSource {
+            digest: *blake3::hash(bytes.as_ref()).as_bytes(),
+            bytes,
+        };
+        let mut fragment = Fragment::empty();
+        let summary = project_snapshot(
+            path,
+            snapshot,
+            prescan.digest,
+            prescan.file_anchor.as_ref(),
+            &plan,
+            &mut |projected| {
+                fragment += projected.fragment;
+                Ok(())
+            },
+        )
+        .unwrap();
+        Projected {
+            fragment,
+            stats: summary.stats,
+        }
     }
 
     fn empty_reader() -> (TempDir, PileReader) {
@@ -1846,6 +1908,51 @@ mod tests {
         raw.as_ref().to_vec()
     }
 
+    fn source_chunk_raws(fragment: &Fragment) -> Vec<(Id, u128, Bytes)> {
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        find!(
+            (
+                chunk: Id,
+                offset: Inline<triblespace::prelude::inlineencodings::U256BE>,
+                raw: Inline<Handle<RawBytes>>
+            ),
+            pattern!(fragment.facts(), [
+                { ?chunk @ metadata::tag: &schema::source_chunk::KIND },
+                { ?chunk @ schema::source_chunk::offset: ?offset },
+                { ?chunk @ schema::source_chunk::bytes: ?raw },
+            ])
+        )
+        .map(|(chunk, offset, raw)| {
+            let offset = u128::try_from_inline(&offset).unwrap();
+            let raw = reader.get::<Bytes, RawBytes>(raw).unwrap();
+            (chunk, offset, raw)
+        })
+        .collect()
+    }
+
+    fn exact_source_snapshot(fragment: &Fragment) -> Vec<u8> {
+        let snapshots = ids_with_tag(fragment, schema::source_snapshot::KIND);
+        assert_eq!(snapshots.len(), 1, "expected exactly one source snapshot");
+        let snapshot = *snapshots.first().unwrap();
+        let selected: BTreeSet<_> = find!(
+            chunk: Id,
+            pattern!(fragment.facts(), [{
+                snapshot @ schema::source_snapshot::contains: ?chunk
+            }])
+        )
+        .collect();
+        let mut chunks = source_chunk_raws(fragment)
+            .into_iter()
+            .filter(|(chunk, _, _)| selected.contains(chunk))
+            .collect::<Vec<_>>();
+        chunks.sort_by_key(|(_, offset, _)| *offset);
+        chunks
+            .into_iter()
+            .flat_map(|(_, _, bytes)| bytes.as_ref().to_vec())
+            .collect()
+    }
+
     #[test]
     fn precomputed_projection_identity_matches_the_canonical_constructor() {
         let source = SourceKey::new("identity-session", "identity-record");
@@ -1870,6 +1977,8 @@ mod tests {
     fn projection_is_canonical_and_does_not_fabricate_missing_time_or_actors() {
         let projected = project_text(SINGLE_FILE, Path::new("/imports/session.jsonl"));
         assert_eq!(projected.stats.source_projections, 3);
+        assert_eq!(projected.stats.source_snapshots, 1);
+        assert_eq!(projected.stats.raw_chunks, 1);
         assert_eq!(projected.stats.content_parts, 6);
         assert_eq!(projected.stats.unresolved_tool_results, 0);
         assert_eq!(projected.stats.undecodable_images, 0);
@@ -1947,6 +2056,110 @@ mod tests {
             child_raw.as_bytes(),
             "the exact receipt retains direct vendor adjacency while the semantic graph contracts it"
         );
+    }
+
+    #[test]
+    fn nonsemantic_rows_live_only_in_the_exact_source_snapshot() {
+        let semantic = r#"{"type":"user","sessionId":"raw-cover","uuid":"root","message":{"role":"user","content":"hello"}}"#;
+        let telemetry = r#"{"type":"progress","sessionId":"raw-cover","uuid":"progress","parentUuid":"root","data":{"type":"agent_progress"}}"#;
+        let empty = r#"{"type":"user","sessionId":"raw-cover","uuid":"empty","parentUuid":"progress","message":{"role":"user","content":[]}}"#;
+        let source = format!("{semantic}\n{telemetry}\n{empty}\n");
+        let projected = project_text(&source, Path::new("raw-cover.jsonl"));
+
+        assert_eq!(projected.stats.records_seen, 3);
+        assert_eq!(projected.stats.skipped_records, 2);
+        assert_eq!(projected.stats.raw_chunks, 1);
+        assert_eq!(projected.stats.source_projections, 1);
+        assert_eq!(projected.stats.source_snapshots, 1);
+        assert_eq!(
+            exact_source_snapshot(&projected.fragment),
+            source.as_bytes()
+        );
+
+        let raw_records = ids_with_tag(&projected.fragment, schema::source_projection::KIND)
+            .into_iter()
+            .map(|projection| raw_projection_record(&projected.fragment, projection))
+            .collect::<Vec<_>>();
+        assert!(raw_records.iter().any(|raw| raw == semantic.as_bytes()));
+        assert!(!raw_records.iter().any(|raw| raw == telemetry.as_bytes()));
+        assert!(!raw_records.iter().any(|raw| raw == empty.as_bytes()));
+    }
+
+    #[test]
+    fn append_reuses_complete_raw_chunks_and_replaces_only_the_bounded_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("growing.jsonl");
+        let root = r#"{"type":"user","sessionId":"growing","uuid":"root","message":{"role":"user","content":"hello"}}"#;
+        let large_progress = format!(
+            r#"{{"type":"progress","sessionId":"growing","uuid":"progress","parentUuid":"root","data":"{}"}}"#,
+            "x".repeat(schema::source_chunk::CANONICAL_BYTES)
+        );
+        let first_source = format!("{root}\n{large_progress}\n");
+        fs::write(&path, &first_source).unwrap();
+
+        let mut first = Fragment::empty();
+        let first_summary = project_path(&path, |projected| {
+            first += projected.fragment;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(first_summary.stats.raw_chunks, 2);
+        let first_chunks = ids_with_tag(&first, schema::source_chunk::KIND);
+        assert_eq!(first_chunks.len(), 2);
+
+        let appended = format!(
+            "{first_source}{}\n",
+            r#"{"type":"progress","sessionId":"growing","uuid":"later","parentUuid":"progress","data":"more"}"#
+        );
+        fs::write(&path, appended).unwrap();
+        let mut second = Fragment::empty();
+        let second_summary = project_path(&path, |projected| {
+            second += projected.fragment;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(second_summary.stats.raw_chunks, 2);
+        let second_chunks = ids_with_tag(&second, schema::source_chunk::KIND);
+        assert_eq!(second_chunks.len(), 2);
+        assert_eq!(
+            first_chunks.intersection(&second_chunks).count(),
+            1,
+            "the complete prefix chunk is stable while only the bounded tail changes"
+        );
+    }
+
+    #[test]
+    fn digest_mismatch_emits_no_fragment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mutable.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"user","sessionId":"mutable","uuid":"before","message":{"role":"user","content":"before"}}"#,
+        )
+        .unwrap();
+        let prescan = prescan_file(&path).unwrap();
+        let plan = SourcePlan::from_scans(std::slice::from_ref(&prescan)).unwrap();
+        fs::write(
+            &path,
+            r#"{"type":"user","sessionId":"mutable","uuid":"after","message":{"role":"user","content":"after"}}"#,
+        )
+        .unwrap();
+        let snapshot = archive_source::freeze_file(&path).unwrap();
+        let mut emitted = 0usize;
+        let error = project_snapshot(
+            &path,
+            snapshot,
+            prescan.digest,
+            prescan.file_anchor.as_ref(),
+            &plan,
+            &mut |_| {
+                emitted += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(emitted, 0);
+        assert!(format!("{error:#}").contains("changed between dependency pre-scan"));
     }
 
     #[test]
@@ -2309,6 +2522,59 @@ mod tests {
     }
 
     #[test]
+    fn canonical_tool_json_sorts_nested_objects_and_escapes_decoded_strings() {
+        let input = Bytes::from_source(
+            br#"{ "z":{"quote":"a\"b","line":"x\ny"},"a":[{"two":2,"one":1}],"dup":0,"dup":3}"#
+                .to_vec(),
+        );
+        let canonical = canonical_tool_call(Some("say \"hi\"\n".to_owned()), Some(input)).unwrap();
+        assert_eq!(
+            canonical,
+            "{\"name\":\"say \\\"hi\\\"\\n\",\"input\":{\"a\":[{\"one\":1,\"two\":2}],\"dup\":3,\"z\":{\"line\":\"x\\ny\",\"quote\":\"a\\\"b\"}}}"
+        );
+    }
+
+    #[test]
+    fn canonical_json_preserves_historical_number_spelling_at_boundaries() {
+        for (raw, expected) in [
+            ("-0", "-0.0"),
+            ("-0.0", "-0.0"),
+            ("0.0", "0.0"),
+            ("1e2", "100.0"),
+            ("1e-2", "0.01"),
+            ("9223372036854775807", "9223372036854775807"),
+            ("9223372036854775808", "9223372036854775808"),
+            ("18446744073709551615", "18446744073709551615"),
+            ("18446744073709551616", "1.8446744073709552e+19"),
+            ("-9223372036854775808", "-9223372036854775808"),
+            ("-9223372036854775809", "-9.223372036854776e+18"),
+        ] {
+            let actual =
+                archive_source::canonical_json(Bytes::from_source(raw.as_bytes().to_vec()))
+                    .unwrap();
+            assert_eq!(actual, expected, "canonical spelling for {raw}");
+        }
+        assert!(archive_source::canonical_json(Bytes::from_source(b"1e400".to_vec())).is_err());
+    }
+
+    #[test]
+    fn image_size_alias_priority_is_order_independent_and_null_authoritative() {
+        fn size(source: &str) -> Option<u128> {
+            let mut source = Bytes::from_source(source.as_bytes().to_vec());
+            scan_optional_image_source(&mut source)
+                .unwrap()
+                .unwrap()
+                .size
+        }
+
+        assert_eq!(size(r#"{"file_size":7,"size":99}"#), Some(7));
+        assert_eq!(size(r#"{"size":99,"file_size":7}"#), Some(7));
+        assert_eq!(size(r#"{"file_size":null,"size":99}"#), None);
+        assert_eq!(size(r#"{"size":99,"file_size":null}"#), None);
+        assert_eq!(size(r#"{"size":99}"#), Some(99));
+    }
+
+    #[test]
     fn explicit_tool_source_resolves_a_call_that_appears_later_in_the_file() {
         let projected = project_text(
             concat!(
@@ -2646,12 +2912,17 @@ mod tests {
     }
 
     #[test]
-    fn dialogue_without_vendor_identity_is_skipped_not_fabricated() {
-        let projected = project_text(
-            r#"{"type":"user","message":{"role":"user","content":"anonymous"}}"#,
-            Path::new("anonymous.jsonl"),
+    fn dialogue_without_vendor_identity_is_retained_only_in_the_exact_snapshot() {
+        let source = r#"{"type":"user","message":{"role":"user","content":"anonymous"}}"#;
+        let projected = project_text(source, Path::new("anonymous.jsonl"));
+        let receipts = ids_with_tag(&projected.fragment, schema::source_projection::KIND);
+        assert!(receipts.is_empty());
+        assert_eq!(projected.stats.source_projections, 0);
+        assert_eq!(projected.stats.source_snapshots, 1);
+        assert_eq!(
+            exact_source_snapshot(&projected.fragment),
+            source.as_bytes()
         );
-        assert!(projected.fragment.facts().is_empty());
         assert_eq!(projected.stats.missing_source_identity, 1);
         assert_eq!(projected.stats.skipped_records, 1);
     }

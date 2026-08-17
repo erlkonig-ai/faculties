@@ -1,17 +1,17 @@
 //! Collection-native Archive runtime over the V4 descriptor-handle calculus.
 //!
 //! Archive authorship has one durable Ed25519 signer and one fixed canonical
-//! SimpleArchive-union descriptor. Imports stage only facts absent from the
-//! current authored union, validate the candidate block DAG, and cross exactly
-//! one Collection::commit visibility edge. Reads materialize that same collection;
+//! SimpleArchive-union descriptor. Imports stage independently derivable source
+//! fragments which contribute new evidence, validate the candidate block DAG,
+//! and cross exactly one Collection::commit visibility edge. Reads materialize that same collection;
 //! there is no Repository branch, CAS head, sidecar registry, or fallback
 //! identity.
 
 use std::collections::BTreeSet;
 
-use anybytes::View;
+use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::exact_derived::{
     ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
@@ -23,7 +23,7 @@ use triblespace::core::collection::{
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
@@ -42,7 +42,7 @@ use triblespace::core::collection::{
     succinctarchive_union, CollectionDerive, CollectionRecord, CollectionStore,
 };
 #[cfg(test)]
-use triblespace::core::repo::{BlobStoreMeta, BlobStorePut};
+use triblespace::core::repo::BlobStoreMeta;
 
 type TextHandle = Inline<Handle<LongString>>;
 type RawHandle = Inline<Handle<RawBytes>>;
@@ -99,6 +99,28 @@ pub struct ArchiveProjection {
     pub parts: Vec<ArchivePart>,
 }
 
+/// One ordered content-addressed range in an exact source snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveSourceChunk {
+    pub id: Id,
+    pub offset: u128,
+    pub bytes: RawHandle,
+}
+
+/// One exact source-file version retained independently of semantic messages.
+///
+/// Chunks stay lightweight until explicitly read, so listing a 100+ GiB
+/// archive never hashes or maps all source bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveSourceSnapshot {
+    pub id: Id,
+    pub source_namespace: Id,
+    pub source_locator: String,
+    pub byte_length: u128,
+    pub source_paths: Vec<String>,
+    pub chunks: Vec<ArchiveSourceChunk>,
+}
+
 /// One BM25 result over a canonical Archive block.
 ///
 /// Search indexes semantic blocks rather than source receipts. `projections`
@@ -114,7 +136,6 @@ pub struct ArchiveSearchHit {
 pub struct ArchiveImportWriter {
     collection: Option<Collection<Pile>>,
     current: TribleSet,
-    reader: PileReader,
     delta: Fragment,
 }
 
@@ -136,15 +157,31 @@ impl ArchiveImportWriter {
                     .context("validate materialized Archive collection")?,
                 "materialized Archive collection",
             )?;
-            Ok((current, reader))
+            Ok(current)
         })();
         match result {
-            Ok((current, reader)) => Ok(Self {
-                collection: Some(collection),
-                current,
-                reader,
-                delta: Fragment::empty(),
-            }),
+            Ok(current) => {
+                let mut writer = Self {
+                    collection: Some(collection),
+                    current,
+                    delta: Fragment::empty(),
+                };
+                if let Err(error) = writer.stage_fragment(blockdag::vocabulary_fragment()) {
+                    let close = writer
+                        .collection
+                        .take()
+                        .expect("new Archive writer owns its collection")
+                        .into_storage()
+                        .close();
+                    return match close {
+                        Ok(()) => Err(error),
+                        Err(close_error) => Err(error.context(format!(
+                            "closing Archive pile after vocabulary staging failed: {close_error}"
+                        ))),
+                    };
+                }
+                Ok(writer)
+            }
             Err(error) => {
                 let close = collection.into_storage().close();
                 match close {
@@ -158,21 +195,42 @@ impl ArchiveImportWriter {
     }
 
     pub fn stage_fragment(&mut self, fragment: Fragment) -> Result<()> {
-        // A projector describes its complete observed source prefix. Publish
-        // only the monotone suffix of facts not already authorized by this
-        // collection (or by another fragment in this import). This keeps
-        // published collection growth proportional to new evidence without
-        // source-specific watermarks, while preserving the fragment's blobs
-        // and metafacts for every newly published fact. Projectors may still
-        // rescan their complete source prefix to construct this candidate.
+        // A Fragment is the independently derivable source unit. A wholly
+        // known candidate is an idempotent replay and can be skipped. Once it
+        // contributes even one new fact, retain its complete closure in this
+        // COMMIT element—including facts already present in older elements.
+        // Set union makes that duplication semantically free, while exact
+        // homomorphisms (BM25 and future derivatives) can derive every leaf
+        // without depending on an implicit merge with historical commits.
         let (_, facts, metafacts, blobs) = fragment.into_parts();
-        let facts = facts
+        let novel = facts
             .difference(&self.current)
             .difference(self.delta.facts());
-        if facts.is_empty() {
+        if novel.is_empty() {
             return Ok(());
         }
-        self.delta += Fragment::from_parts(facts, metafacts, blobs);
+
+        // Embedded payloads can dominate an import's resident memory. Prove
+        // their content identities before touching the pile, then append them
+        // immediately as content-addressed dependencies. They remain
+        // semantically unreachable until the one signed COMMIT written by
+        // `finish`; abandoning this writer therefore leaves only GC-able
+        // blobs, never a partially visible Archive import.
+        let embedded = validated_embedded_blobs(blobs)?;
+        let pile = self
+            .collection
+            .as_mut()
+            .expect("Archive writer remains open while staging")
+            .storage_mut();
+        for blob in embedded {
+            pile.put::<UnknownBlob, _>(blob)
+                .context("stage Archive embedded blob")?;
+        }
+
+        // Only the lightweight logical delta remains resident between source
+        // fragments. Data and metadata archives are constructed once at the
+        // final publication boundary.
+        self.delta += Fragment::from_parts(facts, metafacts, Default::default());
         Ok(())
     }
 
@@ -185,8 +243,18 @@ impl ArchiveImportWriter {
             if self.delta.facts().is_empty() {
                 return Ok((value, None));
             }
+            // `PileReader` snapshots are immutable. Open this view only after
+            // every staged blob append so catalog validation sees those
+            // dependencies without retaining them in the Fragment overlay.
+            let reader = self
+                .collection
+                .as_mut()
+                .expect("Archive writer remains open until finish")
+                .storage_mut()
+                .reader()
+                .context("open staged Archive dependency reader")?;
             let (_, validation) =
-                blockdag::validate_catalog_union(&self.reader, &self.current, &self.delta)
+                blockdag::validate_catalog_union(&reader, &self.current, &self.delta)
                     .context("validate staged Archive union")?;
             require_accepted(validation, "staged Archive union")?;
             let fragment = std::mem::replace(&mut self.delta, Fragment::empty());
@@ -212,6 +280,42 @@ impl ArchiveImportWriter {
             ))),
         }
     }
+}
+
+/// Recompute and verify every identity carried by a Fragment blob store.
+///
+/// `MemoryBlobStore` normally receives only safely constructed `Blob`s, but
+/// its low-level reconstruction APIs can represent a forged PATCH key and
+/// `Blob::with_handle` can represent a forged cached handle. Facts may name
+/// either value, so silently normalizing one would publish dangling or
+/// misdirected references. Match the collection publication boundary's strict
+/// rule: store key, cached handle, and Blake3(bytes) must all agree.
+fn validated_embedded_blobs(
+    mut blobs: triblespace::core::blob::MemoryBlobStore,
+) -> Result<Vec<Blob<UnknownBlob>>> {
+    let reader = blobs
+        .reader()
+        .expect("MemoryBlobStore reader creation is infallible");
+    let mut embedded: Vec<_> = reader.iter().collect();
+    embedded.sort_unstable_by_key(|(store_key, _)| store_key.raw);
+
+    embedded
+        .into_iter()
+        .map(|(store_key, blob)| {
+            let cached_handle = blob.get_handle();
+            let normalized = Blob::<UnknownBlob>::new(blob.bytes.clone());
+            let actual = normalized.get_handle();
+            if store_key != actual || cached_handle != actual {
+                bail!(
+                    "embedded blob store key {} and cached handle {} do not both match byte identity {}",
+                    hex::encode_upper(store_key.raw),
+                    hex::encode_upper(cached_handle.raw),
+                    hex::encode_upper(actual.raw),
+                );
+            }
+            Ok(normalized)
+        })
+        .collect()
 }
 
 fn require_accepted(validation: CatalogValidation, label: &str) -> Result<()> {
@@ -571,6 +675,23 @@ impl ArchiveSnapshot {
         &self.commits
     }
 
+    /// Every queryable display-name variant attached to an entity.
+    ///
+    /// Archive metadata is additive, so this deliberately preserves several
+    /// names instead of manufacturing a last-writer-wins label.
+    pub fn names(&self, id: Id) -> Result<Vec<String>> {
+        let handles: BTreeSet<_> = find!(
+            value: TextHandle,
+            pattern!(&self.facts, [{ id @ metadata::name: ?value }])
+        )
+        .collect();
+        handles
+            .into_iter()
+            .map(|handle| self.read_text(handle))
+            .collect::<Result<BTreeSet<_>>>()
+            .map(|names| names.into_iter().collect())
+    }
+
     /// Canonical source-projection ids in byte order.
     pub fn projection_ids(&self) -> Vec<Id> {
         let catalog = &self.facts;
@@ -583,6 +704,190 @@ impl ArchiveSnapshot {
         .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Canonical exact-source snapshot ids in byte order.
+    pub fn source_snapshot_ids(&self) -> Vec<Id> {
+        let mut ids: Vec<_> = find!(
+            snapshot: Id,
+            pattern!(&self.facts, [{
+                ?snapshot @ metadata::tag: &schema::source_snapshot::KIND
+            }])
+        )
+        .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Resolve an exact-source snapshot from a hexadecimal id prefix.
+    pub fn resolve_source_snapshot_prefix(&self, prefix: &str) -> Result<Id> {
+        let prefix = prefix.trim();
+        if prefix.is_empty()
+            || prefix.len() > 32
+            || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("Archive source-snapshot prefix must contain 1..=32 hexadecimal digits");
+        }
+        let prefix = prefix.to_ascii_uppercase();
+        let mut matches = self
+            .source_snapshot_ids()
+            .into_iter()
+            .filter(|id| format!("{id:X}").starts_with(&prefix));
+        let first = matches
+            .next()
+            .ok_or_else(|| anyhow!("no Archive source snapshot matches {prefix}"))?;
+        if matches.next().is_some() {
+            bail!("Archive source-snapshot prefix {prefix} is ambiguous");
+        }
+        Ok(first)
+    }
+
+    /// Load exact-source metadata and ordered lightweight chunk handles.
+    pub fn source_snapshot(&self, id: Id) -> Result<ArchiveSourceSnapshot> {
+        if !exists!(pattern!(&self.facts, [{
+            id @ metadata::tag: &schema::source_snapshot::KIND
+        }])) {
+            bail!("Archive entity {id:X} is not a source snapshot");
+        }
+        let source_namespace = required_one(
+            find!(
+                value: Id,
+                pattern!(&self.facts, [{
+                    id @ schema::source_projection::source_namespace: ?value
+                }])
+            )
+            .collect(),
+            id,
+            "source namespace",
+        )?;
+        let source_locator = self.read_required_text(
+            find!(
+                value: TextHandle,
+                pattern!(&self.facts, [{
+                    id @ schema::source_projection::source_locator: ?value
+                }])
+            )
+            .collect(),
+            id,
+            "source locator",
+        )?;
+        let byte_length = required_one(
+            find!(
+                value: Inline<U256BE>,
+                pattern!(&self.facts, [{
+                    id @ schema::source_snapshot::byte_length: ?value
+                }])
+            )
+            .collect(),
+            id,
+            "source snapshot byte length",
+        )?;
+        let byte_length = u128::try_from_inline(&byte_length).map_err(|error| {
+            anyhow!("Archive source snapshot {id:X} length does not fit u128: {error:?}")
+        })?;
+
+        let mut chunks = Vec::new();
+        let chunk_ids: BTreeSet<_> = find!(
+            chunk: Id,
+            pattern!(&self.facts, [{
+                id @ schema::source_snapshot::contains: ?chunk
+            }])
+        )
+        .collect();
+        for chunk in chunk_ids {
+            let offset = required_one(
+                find!(
+                    value: Inline<U256BE>,
+                    pattern!(&self.facts, [{
+                        chunk @ schema::source_chunk::offset: ?value
+                    }])
+                )
+                .collect(),
+                chunk,
+                "source chunk offset",
+            )?;
+            let offset = u128::try_from_inline(&offset).map_err(|error| {
+                anyhow!("Archive source chunk {chunk:X} offset does not fit u128: {error:?}")
+            })?;
+            let bytes = required_one(
+                find!(
+                    value: RawHandle,
+                    pattern!(&self.facts, [{
+                        chunk @ schema::source_chunk::bytes: ?value
+                    }])
+                )
+                .collect(),
+                chunk,
+                "source chunk bytes",
+            )?;
+            chunks.push(ArchiveSourceChunk {
+                id: chunk,
+                offset,
+                bytes,
+            });
+        }
+        chunks.sort_by_key(|chunk| (chunk.offset, chunk.id));
+
+        let path_handles: BTreeSet<_> = find!(
+            value: TextHandle,
+            pattern!(&self.facts, [{ id @ files_schema::file::source_path: ?value }])
+        )
+        .collect();
+        let source_paths = path_handles
+            .into_iter()
+            .map(|handle| self.read_text(handle))
+            .collect::<Result<BTreeSet<_>>>()?
+            .into_iter()
+            .collect();
+
+        Ok(ArchiveSourceSnapshot {
+            id,
+            source_namespace,
+            source_locator,
+            byte_length,
+            source_paths,
+            chunks,
+        })
+    }
+
+    /// Retrieve and hash-validate one source chunk on demand.
+    pub fn source_chunk_bytes(&self, chunk: &ArchiveSourceChunk) -> Result<Bytes> {
+        self.reader
+            .get(chunk.bytes)
+            .with_context(|| format!("read Archive source chunk {:X}", chunk.id))
+    }
+
+    /// Stream one exact source snapshot without assembling it in memory.
+    pub fn write_source_snapshot<W: std::io::Write>(
+        &self,
+        id: Id,
+        destination: &mut W,
+    ) -> Result<u128> {
+        let snapshot = self.source_snapshot(id)?;
+        let mut written = 0u128;
+        for chunk in &snapshot.chunks {
+            if chunk.offset != written {
+                bail!(
+                    "Archive source snapshot {id:X} chunk {:X} begins at {}, expected {written}",
+                    chunk.id,
+                    chunk.offset
+                );
+            }
+            let bytes = self.source_chunk_bytes(chunk)?;
+            destination
+                .write_all(bytes.as_ref())
+                .with_context(|| format!("write Archive source snapshot {id:X}"))?;
+            written = written
+                .checked_add(bytes.len() as u128)
+                .ok_or_else(|| anyhow!("Archive source snapshot {id:X} length overflows u128"))?;
+        }
+        if written != snapshot.byte_length {
+            bail!(
+                "Archive source snapshot {id:X} yielded {written} bytes, expected {}",
+                snapshot.byte_length
+            );
+        }
+        Ok(written)
     }
 
     /// Resolve one source-projection id from a case-insensitive hexadecimal
@@ -1028,6 +1333,7 @@ mod tests {
     use super::*;
     use crate::collection_cutover::initialize_signer;
     use ed25519_dalek::SigningKey;
+    use hifitime::Epoch;
     use tempfile::TempDir;
     use triblespace::core::blob::IntoBlob;
     use triblespace::core::collection::discover_collection_records;
@@ -1045,6 +1351,27 @@ mod tests {
             schema::source_projection::SOURCE_CLAUDE_CODE,
             locator,
             format!("{{\\\"text\\\":{text:?}}}").into_bytes(),
+            block,
+        )
+        .unwrap()
+    }
+
+    fn projection_at(locator: &str, text: &str, unix_seconds: f64) -> Fragment {
+        let fact = blockdag::text_fact(
+            schema::content_fact::modality::TEXT,
+            schema::content_fact::direction::IN,
+            text,
+        )
+        .unwrap();
+        let part = blockdag::content_part(0, fact, None).unwrap();
+        let epoch = Epoch::from_unix_seconds(unix_seconds);
+        let timestamp: Inline<NsTAIInterval> =
+            (epoch, epoch).try_to_inline().expect("valid test interval");
+        let block = blockdag::block([], Some(timestamp), part).unwrap();
+        blockdag::source_projection(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            locator,
+            format!("{{\"text\":{text:?}}}").into_bytes(),
             block,
         )
         .unwrap()
@@ -1094,6 +1421,132 @@ mod tests {
         writer.finish(Ok(())).unwrap().1.unwrap()
     }
 
+    fn first_embedded_handle(fragment: &Fragment) -> Inline<Handle<UnknownBlob>> {
+        let mut blobs = fragment.blobs().clone();
+        blobs
+            .reader()
+            .unwrap()
+            .iter()
+            .next()
+            .expect("fixture carries embedded blobs")
+            .0
+    }
+
+    #[test]
+    fn staged_blobs_leave_the_delta_and_remain_semantically_invisible_until_finish() {
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        std::fs::File::create(&pile).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_signer(&pile, Some(&key)).unwrap();
+
+        let fragment = projection("session:staged", "resident only after commit");
+        let embedded = first_embedded_handle(&fragment);
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        writer.stage_fragment(fragment).unwrap();
+
+        assert!(writer.delta_len() > 0);
+        assert!(
+            writer.delta.blobs().is_empty(),
+            "the long-lived logical delta must not retain embedded bytes"
+        );
+
+        // The payload is already durable enough to satisfy a fresh reader,
+        // but no signed collection root makes its facts visible yet.
+        let mut physical = open_pile_strict(&pile).unwrap();
+        let reader = physical.reader().unwrap();
+        let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
+        drop(reader);
+        physical.close().unwrap();
+        let before =
+            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        assert!(before.commits().is_empty());
+        assert!(before.catalog().is_empty());
+        drop(before);
+
+        let commit = writer.finish(Ok(())).unwrap().1.unwrap();
+        let after =
+            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        assert_eq!(after.commits(), &[commit]);
+        assert_eq!(after.projection_ids().len(), 1);
+    }
+
+    #[test]
+    fn rejected_staged_union_closes_without_publishing_a_collection_commit() {
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        std::fs::File::create(&pile).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_signer(&pile, Some(&key)).unwrap();
+
+        let invalid_id = Id::new([0x42; 16]).unwrap();
+        let mut invalid = entity! { ExclusiveId::force_ref(&invalid_id) @
+            metadata::tag: &schema::source_projection::KIND,
+        };
+        let embedded = invalid.put::<RawBytes, _>(b"unreachable after rejection".to_vec());
+        let embedded: Inline<Handle<UnknownBlob>> = embedded.transmute();
+
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        writer.stage_fragment(invalid).unwrap();
+        let error = writer.finish(Ok(())).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("staged Archive union is invalid"));
+
+        // `finish` closed the writer even on validation failure. Reopening is
+        // sound, no semantic edge escaped, and the dependency is merely an
+        // unreachable content-addressed record available for later GC.
+        let snapshot =
+            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        assert!(snapshot.commits().is_empty());
+        assert!(snapshot.catalog().is_empty());
+        drop(snapshot);
+        let mut physical = open_pile_strict(&pile).unwrap();
+        let reader = physical.reader().unwrap();
+        let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
+        drop(reader);
+        physical.close().unwrap();
+    }
+
+    #[test]
+    fn staging_rejects_forged_embedded_identity_before_writing() {
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        std::fs::File::create(&pile).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_signer(&pile, Some(&key)).unwrap();
+
+        // Establish the canonical queryable vocabulary so the forged-fragment
+        // attempt is the only candidate work in the writer under test.
+        ArchiveImportWriter::open(&pile, Some(&key))
+            .unwrap()
+            .finish(Ok(()))
+            .unwrap();
+
+        let id = Id::new([0x43; 16]).unwrap();
+        let mut fragment = entity! { ExclusiveId::force_ref(&id) @
+            metadata::tag: &schema::source_projection::KIND,
+        };
+        let bogus = Inline::<Handle<UnknownBlob>>::new([0xAA; 32]);
+        let forged = Blob::<UnknownBlob>::with_handle(
+            anybytes::Bytes::from_source(b"forged Archive payload".to_vec()),
+            bogus,
+        );
+        fragment.blobs_mut().insert(forged);
+
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        assert_eq!(writer.delta_len(), 0);
+        let before = std::fs::metadata(&pile).unwrap().len();
+        let error = writer.stage_fragment(fragment).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("do not both match byte identity"));
+        assert_eq!(writer.delta_len(), 0);
+        assert!(writer.delta.blobs().is_empty());
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), before);
+        assert_eq!(writer.finish(Ok(())).unwrap().1, None);
+    }
+
     #[test]
     fn import_crosses_one_v4_visibility_edge_and_retries_idempotently() {
         let directory = TempDir::new().unwrap();
@@ -1122,29 +1575,84 @@ mod tests {
     }
 
     #[test]
-    fn growing_source_commits_only_facts_absent_from_the_current_union() {
+    fn exact_source_snapshots_are_listed_lazily_and_stream_reconstructible() {
         let directory = TempDir::new().unwrap();
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
         initialize_signer(&pile, Some(&key)).unwrap();
 
-        let first_fragment = projection("session:one", "one");
+        let source = b"opaque telemetry and encrypted reasoning\n";
+        let chunks = blockdag::source_chunk(0, Bytes::from_source(source.to_vec())).unwrap();
+        let fragment = blockdag::source_snapshot(
+            schema::source_projection::SOURCE_CODEX,
+            "snapshot/v1/session:exact",
+            source.len() as u128,
+            chunks,
+            Some("/moved/rollout.jsonl".to_owned()),
+        )
+        .unwrap();
+        let expected = fragment.root().unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        writer.stage_fragment(fragment).unwrap();
+        writer.finish(Ok(())).unwrap();
+
+        let archive =
+            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        assert_eq!(archive.source_snapshot_ids(), vec![expected]);
+        assert_eq!(
+            archive
+                .resolve_source_snapshot_prefix(&format!("{expected:X}")[..8])
+                .unwrap(),
+            expected
+        );
+        let snapshot = archive.source_snapshot(expected).unwrap();
+        assert_eq!(
+            snapshot.source_namespace,
+            schema::source_projection::SOURCE_CODEX
+        );
+        assert_eq!(snapshot.source_locator, "snapshot/v1/session:exact");
+        assert_eq!(snapshot.byte_length, source.len() as u128);
+        assert_eq!(snapshot.source_paths, vec!["/moved/rollout.jsonl"]);
+        assert_eq!(snapshot.chunks.len(), 1);
+        assert_eq!(snapshot.chunks[0].offset, 0);
+
+        let mut reconstructed = Vec::new();
+        assert_eq!(
+            archive
+                .write_source_snapshot(expected, &mut reconstructed)
+                .unwrap(),
+            source.len() as u128
+        );
+        assert_eq!(reconstructed, source);
+    }
+
+    #[test]
+    fn growing_source_skips_known_fragments_and_keeps_new_leaf_closure() {
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        std::fs::File::create(&pile).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_signer(&pile, Some(&key)).unwrap();
+
+        let first_fragment = projection("session:one", "shared");
         let first_len = first_fragment.facts().len();
         let mut first_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         first_writer.stage_fragment(first_fragment.clone()).unwrap();
         let first = first_writer.finish(Ok(())).unwrap().1.unwrap();
 
-        let second_fragment = projection("session:two", "two");
-        let expected_delta_len = second_fragment
-            .facts()
-            .difference(first_fragment.facts())
-            .len();
-        let mut complete_prefix = first_fragment;
-        complete_prefix += second_fragment.clone();
+        let second_fragment = projection("session:two", "shared");
         let mut second_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        second_writer.stage_fragment(complete_prefix).unwrap();
-        assert_eq!(second_writer.delta_len(), expected_delta_len);
+        second_writer.stage_fragment(first_fragment).unwrap();
+        assert_eq!(second_writer.delta_len(), 0, "known fragment is a replay");
+        second_writer
+            .stage_fragment(second_fragment.clone())
+            .unwrap();
+        assert_eq!(
+            second_writer.delta_len(),
+            second_fragment.facts().len(),
+            "a novel source unit retains its reused fact/part/block closure"
+        );
         let second = second_writer.finish(Ok(())).unwrap().1.unwrap();
         assert_ne!(first.data(), second.data());
 
@@ -1334,6 +1842,30 @@ mod tests {
         let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
         assert_eq!(search.search("alpha", 10).unwrap().len(), 1);
         assert_eq!(search.search("beta", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bm25_derives_repeated_content_from_each_naturally_authored_leaf() {
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("archive.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_signer(&pile_path, Some(&key)).unwrap();
+
+        for (locator, seconds) in [("session:first", 1.0), ("session:second", 2.0)] {
+            let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+            writer
+                .stage_fragment(projection_at(locator, "shared closure needle", seconds))
+                .unwrap();
+            writer.finish(Ok(())).unwrap();
+        }
+
+        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
+        assert_eq!((report.source_commits, report.source_elements), (2, 2));
+        let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        let hits = search.search("shared closure needle", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_ne!(hits[0].block, hits[1].block);
     }
 
     #[test]
