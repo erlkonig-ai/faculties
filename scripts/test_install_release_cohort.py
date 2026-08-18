@@ -41,6 +41,7 @@ class ReleaseCohortTest(unittest.TestCase):
         self.build = self.root / "build"
         self.build.mkdir()
         self.prefix = self.root / "home" / ".local"
+        self.binary("migrations", "fixture migrations")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -133,6 +134,7 @@ class ReleaseCohortTest(unittest.TestCase):
 
         for path in self.build.iterdir():
             path.unlink()
+        self.binary("migrations", "second migrations")
         self.binary("orient", "second orient")
         self.assertEqual(self.invoke("second").returncode, 0)
         self.assertEqual(os.readlink(current), "releases/second")
@@ -150,6 +152,15 @@ class ReleaseCohortTest(unittest.TestCase):
         result = self.invoke("dry", "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["generation"], "dry")
+        self.assertFalse(self.prefix.exists())
+
+    def test_refuses_build_directory_without_migrations(self) -> None:
+        (self.build / "migrations").unlink()
+        self.binary("orient", "incomplete")
+        result = self.invoke("incomplete", "--dry-run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required cohort binary is absent", result.stderr)
+        self.assertIn("cargo build --release --workspace --bins", result.stderr)
         self.assertFalse(self.prefix.exists())
 
     def test_refuses_dirty_sources_and_unmanaged_commands(self) -> None:

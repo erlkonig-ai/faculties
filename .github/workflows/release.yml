@@ -76,7 +76,8 @@ jobs:
         # noise from their rust-script origins. Add a separate lint
         # workflow if/when we want to enforce.
         working-directory: faculties
-        run: cargo build --locked --release --bins --target ${{ matrix.target }}
+        # `migrations` lives in a workspace member rather than the root package.
+        run: cargo build --locked --release --workspace --bins --target ${{ matrix.target }}
 
       - name: Build bundled trible CLI
         # Ship the `trible` CLI alongside the faculty bins so users
@@ -98,6 +99,11 @@ jobs:
           stage="faculties-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "$stage"
           cp LICENSE-MIT LICENSE-APACHE README.md "$stage/" || true
+          migration="target/${{ matrix.target }}/release/migrations"
+          if [ ! -x "$migration" ]; then
+            echo "::error::$migration is absent; build the full workspace binary cohort"
+            exit 1
+          fi
           # All faculty binaries, including the default-enabled viewer and
           # capture tools (extension-less; .exe suffix on windows if we ever
           # add it).

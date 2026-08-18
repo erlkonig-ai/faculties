@@ -4,7 +4,9 @@
 directory as one immutable generation. Build with `--workspace` so the
 `migrations` binary — which lives in the `faculties-migrations` member crate and
 is the only path from a pre-collection pile to a native one — is part of the
-cohort. It copies and hashes the complete cohort
+cohort. The installer refuses a build directory without it, so accidentally
+omitting `--workspace` cannot activate an incomplete generation. It copies and
+hashes the complete cohort
 before atomically replacing `~/.local/lib/faculties/current`; commands in
 `~/.local/bin` always pass through that symlink. The `mail` binary is exposed as
 `faculties-mail` so the operating system's `mail(1)` is never shadowed.
