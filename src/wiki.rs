@@ -369,6 +369,17 @@ fn validate_graph(revisions: &BTreeMap<Id, RevisionRecord>) -> Result<()> {
     Ok(())
 }
 
+/// Group revisions into entries by `metadata::supersedes` connectivity alone.
+///
+/// The legacy `attrs::fragment` anchor is NOT an edge here. It was one until
+/// 2026-08-18, when it became redundant: the additive migration synthesized the
+/// supersedes chain FROM the anchor groups, so every anchor group is already a
+/// connected component. Verified over the live corpus before removal — 11231
+/// revisions across 3035 anchors partition into the same 3095 entries, with
+/// identical membership, whether or not the anchor edge is applied. The anchor
+/// facts remain in the store and still resolve as selectors
+/// ([`RevisionReadModel::legacy_fragment_frontier`]); they simply no longer
+/// decide what belongs to what.
 fn entry_records(
     revisions: &BTreeMap<Id, RevisionRecord>,
 ) -> (Vec<EntryRecord>, BTreeMap<Id, Vec<Id>>) {
@@ -402,19 +413,6 @@ fn entry_records(
             unite(record.id, *predecessor);
         }
     }
-    let mut same_fragment: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
-    for record in revisions.values() {
-        if let Some(fragment) = record.legacy_fragment {
-            same_fragment.entry(fragment).or_default().push(record.id);
-        }
-    }
-    for members in same_fragment.values() {
-        if let Some((&first, rest)) = members.split_first() {
-            for member in rest {
-                unite(first, *member);
-            }
-        }
-    }
 
     let mut components: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
     for id in revisions.keys().copied() {
@@ -424,7 +422,7 @@ fn entry_records(
             .push(id);
     }
     let mut entries = Vec::new();
-    let mut legacy_frontiers = BTreeMap::new();
+    let mut legacy_frontiers: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
     for mut members in components.into_values() {
         members.sort_unstable();
         let member_set: BTreeSet<Id> = members.iter().copied().collect();
@@ -459,8 +457,15 @@ fn entry_records(
             .collect();
         legacy_fragments.sort_unstable();
         legacy_fragments.dedup();
+        // An anchor no longer forces its versions into one entry, so it can in
+        // principle name several. Accumulate rather than overwrite: the
+        // selector is set-valued, and a last-write-wins insert would silently
+        // hide every entry but one.
         for fragment in &legacy_fragments {
-            legacy_frontiers.insert(*fragment, frontier_ids.clone());
+            legacy_frontiers
+                .entry(*fragment)
+                .or_default()
+                .extend(frontier_ids.iter().copied());
         }
         entries.push(EntryRecord {
             roots,
@@ -468,6 +473,10 @@ fn entry_records(
             frontier,
             legacy_fragments,
         });
+    }
+    for frontier in legacy_frontiers.values_mut() {
+        frontier.sort_unstable();
+        frontier.dedup();
     }
     entries.sort_by_key(|entry| {
         entry
@@ -1187,6 +1196,41 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("not normalized")
+        );
+    }
+
+    /// The legacy anchor is a selector, never an edge.
+    ///
+    /// Two versions carrying the same `attrs::fragment` and NO `supersedes`
+    /// between them are two entries. Grouping them would infer lineage from an
+    /// anchor that never asserted any; the migration wrote the real lineage
+    /// down as supersedes facts, and that is the only thing consulted now.
+    #[test]
+    fn a_shared_legacy_anchor_does_not_group_unlinked_versions() {
+        let fragment = genid().id;
+        let first = genid().id;
+        let second = genid().id;
+        let mut facts = entity! { ExclusiveId::force_ref(&first) @
+            metadata::tag: &KIND_VERSION_ID,
+            attrs::fragment: fragment,
+            attrs::title: "T".to_blob().get_handle(),
+            attrs::content: "one".to_blob().get_handle(),
+            metadata::created_at: at(1.0),
+        }
+        .into_facts();
+        facts += entity! { ExclusiveId::force_ref(&second) @
+            metadata::tag: &KIND_VERSION_ID,
+            attrs::fragment: fragment,
+            attrs::title: "T".to_blob().get_handle(),
+            attrs::content: "two".to_blob().get_handle(),
+            metadata::created_at: at(2.0),
+        }
+        .into_facts();
+        let model = load_catalog(&facts).unwrap().revisions;
+        assert_eq!(model.all_entries().len(), 2);
+        assert_ne!(
+            model.entry_containing(first).unwrap().members,
+            model.entry_containing(second).unwrap().members
         );
     }
 

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Wiki entries are supersedes-connected components; the legacy anchor no
+  longer groups.** The additive migration synthesized the supersedes chain from
+  the anchor groups, so the anchor edge had become redundant. Verified over the
+  live corpus before removal (`examples/anchor_gate.rs`): 11231 revisions across
+  3035 anchors partition into the same 3095 entries, identical membership, with
+  and without it. Anchor facts stay in the store and still resolve as selectors,
+  and a legacy selector naming several entries now reports all their frontiers
+  instead of silently keeping one.
 - **Voice freezes one native Qwen3-TTS snapshot per utterance.** Exact base,
   shared codec, filtered f16 talker, and versioned folded f16 talker roots are
   selected together before synthesis. Runtime no longer opens Repository
