@@ -21,6 +21,22 @@ All notable changes to this project will be documented in this file.
   order-independence and frame-relativity checks on live data. Compass is
   censused, not converted: it carries supersedes edges on notes but resolves
   currency by timestamp, a different question.
+- **`wiki lint` rewrites every `wiki:` reference to a revision id.** A revision
+  id is a citation — immutable, pinned to what its author read; a legacy anchor
+  is a live indirection that returns whatever is head today, so a citation
+  written in March silently follows the page into August. Lint now resolves any
+  anchor reference in content — link target, link label that repeats the id, or
+  bare prose mention — to the anchor's CURRENT head revision, which is the
+  faithful reading of what an anchor always said ("latest"), and expands
+  unambiguous truncated prefixes on the way. References that already name a
+  revision keep their exact bytes, and fenced code blocks are left verbatim, so
+  a wiki of citations is a fixpoint. `--fix` mints successors as usual; the
+  anchor-citing revisions stay immutable with their anchors intact. Measured on
+  the live corpus (`examples/anchor_reference_census.rs`): 10094 anchor
+  references in 1731 frontier revisions, 9092 of them in link syntax, resolving
+  through 3035 anchors that each have exactly one head; a `--fix` on a
+  copy-on-write clone left 0 anchor references in the frontier, 0 issues in
+  `wiki check`, and was a fixpoint on the second pass.
 - **Wiki entries are supersedes-connected components; the legacy anchor no
   longer groups.** The additive migration synthesized the supersedes chain from
   the anchor groups, so the anchor edge had become redundant. Verified over the
