@@ -14,12 +14,10 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenSource, LegacyCommitCoordinate,
-    LegacyPinCoordinate, ProjectedLegacyCommit,
-};
-use crate::schemas::wiki::{DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
-use crate::wiki_additive::{plan_additive, LegacyDelta};
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
+use faculties::storage::{publish_fragments};
+use faculties::schemas::wiki::{DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
+use faculties::wiki_additive::{plan_additive, LegacyDelta};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WikiMigrationCommit {
@@ -106,10 +104,10 @@ pub fn plan(source: &FrozenSource) -> Result<WikiMigrationPlan> {
         .legacy_branch(LEGACY_BRANCH_NAME)?
         .ok_or_else(|| anyhow!("frozen source has no legacy Wiki branch"))?;
     let projected =
-        project_legacy_authored_commits(source, &branch, crate::wiki::validate_known_payloads)
+        project_legacy_authored_commits(source, &branch, faculties::wiki::validate_known_payloads)
             .context("project frozen Wiki authored commits")?;
     let plan = plan_projected(branch.pin_coordinate(), projected)?;
-    crate::wiki::validate_catalog(source.reader(), &plan.materialized_facts())
+    faculties::wiki::validate_catalog(source.reader(), &plan.materialized_facts())
         .context("validate complete planned Wiki catalog and payloads")?;
     Ok(plan)
 }
@@ -244,7 +242,7 @@ fn plan_projected(
         extras,
     };
     plan.verify_conservation()?;
-    crate::wiki::load_catalog(&plan.materialized_facts())
+    faculties::wiki::load_catalog(&plan.materialized_facts())
         .context("validate complete planned Wiki structure before publication")?;
     Ok(plan)
 }
@@ -262,10 +260,9 @@ mod tests {
     use triblespace::core::repo::{BlobStoreGet, CommitHandle, PinStore, Repository};
     use triblespace::macros::exists;
 
-    use crate::collection_cutover::{
-        discover_target, freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
-    use crate::schemas::wiki::{attrs, KIND_VERSION_ID};
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
+    use faculties::schemas::wiki::{attrs, KIND_VERSION_ID};
 
     fn at(seconds: f64) -> Inline<inlineencodings::NsTAIInterval> {
         let epoch = Epoch::from_tai_seconds(seconds);
@@ -428,7 +425,7 @@ mod tests {
         assert_eq!(plan.report().versions, 2);
         assert_eq!(plan.report().added_facts, 1);
 
-        let model = crate::wiki::load_catalog(&materialized).unwrap().revisions;
+        let model = faculties::wiki::load_catalog(&materialized).unwrap().revisions;
         assert_eq!(
             model.legacy_fragment_frontier(page),
             Some([state_a].as_slice()),
@@ -578,7 +575,7 @@ mod tests {
 
         let reader = target.reader().unwrap();
         let content = find!(
-            handle: crate::schemas::wiki::TextHandle,
+            handle: faculties::schemas::wiki::TextHandle,
             pattern!(&materialized, [{ second @ attrs::content: ?handle }])
         )
         .next()

@@ -200,7 +200,7 @@ mod tests {
 
     use anybytes::View;
     use ed25519_dalek::SigningKey;
-    use faculties::collection_cutover::{initialize_signer, load_signer, open_pile_strict};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
     use faculties::schemas::reason::{reason_schema, KIND_REASON_ID};
     use std::fs::File;

@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::headspace;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use faculties::secrets::{self as secrets_model, schema as secrets_schema};
-use faculties::web_cutover;
 use hifitime::Epoch;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -77,9 +76,6 @@ enum Command {
         #[arg(long, default_value_t = 12_000)]
         max_characters: usize,
     },
-    /// Additively publish the stopped legacy `web` branch into the fixed
-    /// native Web collection. Stop every legacy Web writer first.
-    MigrateLegacy,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,10 +96,6 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     };
 
-    if matches!(cmd, Command::MigrateLegacy) {
-        return migrate_legacy(&cli);
-    }
-
     let storage = WebStorage {
         pile: &cli.pile,
         key: cli.key.as_deref(),
@@ -111,7 +103,6 @@ fn run(cli: Cli) -> Result<()> {
     };
     let requested_provider = match cmd {
         Command::Search { provider, .. } | Command::Fetch { provider, .. } => *provider,
-        Command::MigrateLegacy => unreachable!("handled before credential resolution"),
     };
     let keys = resolve_api_keys(&cli, storage, requested_provider)?;
 
@@ -129,7 +120,6 @@ fn run(cli: Cli) -> Result<()> {
             provider,
             max_characters,
         } => cmd_fetch(&cli, storage, keys, *provider, url, *max_characters),
-        Command::MigrateLegacy => unreachable!("handled before credential resolution"),
     }
 }
 
@@ -369,22 +359,6 @@ impl WebStorage<'_> {
             .map(|_| ());
         finish_pile(collection.into_storage(), result, "observation write")
     }
-}
-
-fn migrate_legacy(cli: &Cli) -> Result<()> {
-    load_signer(&cli.pile, cli.key.as_deref())?;
-    let source = freeze_source(&cli.pile).context("freeze legacy Web source")?;
-    let plan = web_cutover::plan(&source).context("plan legacy Web cutover")?;
-    let commits = web_cutover::publish(&source, &plan, &cli.pile, cli.key.as_deref())?;
-    println!(
-        "Migrated {} authored Web commits ({} facts, {} authored empty, {} contentless merges) into {} native commits.",
-        plan.report().authored_commits,
-        plan.report().facts,
-        plan.report().authored_empty_commits,
-        plan.report().contentless_merges,
-        commits.len(),
-    );
-    Ok(())
 }
 
 fn finish_pile<T>(pile: Pile, result: Result<T>, operation: &str) -> Result<T> {
@@ -707,7 +681,7 @@ mod tests {
     use triblespace::macros::{find, pattern};
 
     use super::*;
-    use faculties::collection_cutover::initialize_signer;
+    use faculties::storage::initialize_signer;
 
     #[test]
     fn cli_exposes_one_fixed_collection_without_legacy_coordinates() {
@@ -721,9 +695,6 @@ mod tests {
         assert!(arguments.contains("secrets_identity"));
         assert!(!arguments.contains("branch_id"));
         assert!(!arguments.contains("scope"));
-        assert!(command
-            .get_subcommands()
-            .any(|subcommand| subcommand.get_name() == "migrate-legacy"));
     }
 
     #[test]

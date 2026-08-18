@@ -32,9 +32,8 @@ use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use serde_json::{json, Value as JsonValue};
 
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::discord as discord_model;
-use faculties::discord_cutover;
 use faculties::files as file_capability;
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{discord, DEFAULT_SCOPE_ID};
@@ -104,8 +103,6 @@ enum CommandMode {
         #[command(subcommand)]
         command: ChannelsCommand,
     },
-    /// Migrate the stopped legacy `discord` Repository branch additively.
-    MigrateLegacy,
 }
 
 #[derive(Subcommand)]
@@ -258,7 +255,6 @@ fn main() -> Result<()> {
                 list_channels(&token, guild.as_deref())
             }
         },
-        CommandMode::MigrateLegacy => migrate_legacy(&cli),
     }
 }
 
@@ -272,27 +268,6 @@ fn require_token(cli: &Cli) -> Result<String> {
         bail!("empty Discord token");
     }
     Ok(token)
-}
-
-fn migrate_legacy(cli: &Cli) -> Result<()> {
-    // Missing authority must fail before the source or target is touched.
-    load_signer(&cli.pile, cli.key.as_deref())?;
-    let source = freeze_source(&cli.pile).context(
-        "freeze the complete legacy Discord source; every legacy Discord writer must be stopped",
-    )?;
-    let plan = discord_cutover::plan(&source)?;
-    let commits = discord_cutover::publish(&source, &plan, &cli.pile, cli.key.as_deref())?;
-    println!(
-        "Migrated {} authored Discord commits ({} empty; {} contentless merges remained ancestry), preserving {} unique facts in fixed scope {DEFAULT_SCOPE_ID:X}.",
-        commits.len(),
-        plan.report().authored_empty_commits,
-        plan.report().contentless_merges,
-        plan.report().facts,
-    );
-    println!(
-        "Historical rows remain inert evidence; re-pull Discord to establish native coverage. Legacy credentials and cursors are never consulted."
-    );
-    Ok(())
 }
 
 fn send(storage: DiscordStorage<'_>, token: &str, channel_id: &str, raw_text: &str) -> Result<()> {
@@ -1249,7 +1224,7 @@ mod tests {
         let pile = directory.path().join("discord.pile");
         let key = directory.path().join("discord.key");
         File::create(&pile).unwrap();
-        faculties::collection_cutover::initialize_signer(&pile, Some(&key)).unwrap();
+        faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
         (pile, key)
     }
 

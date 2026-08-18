@@ -1,7 +1,10 @@
 # Atomic local release cohorts
 
 `install-release-cohort` installs every executable found directly in one build
-directory as one immutable generation. It copies and hashes the complete cohort
+directory as one immutable generation. Build with `--workspace` so the
+`migrations` binary — which lives in the `faculties-migrations` member crate and
+is the only path from a pre-collection pile to a native one — is part of the
+cohort. It copies and hashes the complete cohort
 before atomically replacing `~/.local/lib/faculties/current`; commands in
 `~/.local/bin` always pass through that symlink. The `mail` binary is exposed as
 `faculties-mail` so the operating system's `mail(1)` is never shadowed.
@@ -20,7 +23,7 @@ siblings and `target/` output outside that source closure do not block a release
 Build and inspect without writing anything:
 
 ```sh
-cargo build --release --bins --no-default-features
+cargo build --release --workspace --bins --no-default-features
 scripts/install-release-cohort target/release \
   --no-default-features --generation "$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=12 HEAD)" \
   --dry-run

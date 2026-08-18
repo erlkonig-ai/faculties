@@ -13,14 +13,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use triblespace::core::collection::{Collection, CollectionId};
+use triblespace::core::collection::CollectionId;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStore;
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
 
-use crate::collection_cutover::{load_signer, open_pile_strict};
+use crate::storage::{load_signer, open_pile_strict};
 use crate::schemas::atlas::DEFAULT_SCOPE_ID as ATLAS_SCOPE_ID;
 use crate::schemas::blockdag::DEFAULT_SCOPE_ID as ARCHIVE_SCOPE_ID;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID as COGNITION_SCOPE_ID;
@@ -760,7 +760,7 @@ mod tests {
 
     fn create_pile(path: &Path) {
         File::create(path).unwrap();
-        crate::collection_cutover::initialize_signer(path, None).unwrap();
+        crate::storage::initialize_signer(path, None).unwrap();
     }
 
     fn publish_reason(path: &Path, text: &str, second: f64) {

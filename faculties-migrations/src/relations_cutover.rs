@@ -35,15 +35,13 @@ use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{attributes, entity, id_hex};
 use triblespace::prelude::{blobencodings, inlineencodings};
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenLegacyBranch, FrozenLegacyDelta,
-    FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit,
-};
-use crate::relations::{self as current, ProfileInput};
-use crate::schemas::relations as schema;
-use crate::schemas::relations::{group, KIND_GROUP, KIND_PERSON_ID};
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenLegacyDelta, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
+use faculties::storage::{publish_fragments};
+use faculties::relations::{self as current, ProfileInput};
+use faculties::schemas::relations as schema;
+use faculties::schemas::relations::{group, KIND_GROUP, KIND_PERSON_ID};
 
-use crate::schemas::relations::LEGACY_BRANCH_NAME;
+use faculties::schemas::relations::LEGACY_BRANCH_NAME;
 const KIND_RETIRE_ID: Id = id_hex!("CB9251505F663A9232C632CC9E68863A");
 const KIND_UNRETIRE_ID: Id = id_hex!("D2D4AFCAD74CBD193B2EB7FE94AE27E9");
 
@@ -1575,9 +1573,8 @@ mod tests {
     use triblespace::macros::{find, pattern};
     use triblespace::prelude::TryToInline;
 
-    use crate::collection_cutover::{
-        discover_target, freeze_source, initialize_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
 
     type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 

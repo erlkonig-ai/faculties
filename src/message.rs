@@ -853,7 +853,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::collection_cutover::{discover_target, initialize_signer, open_pile_strict};
+    use crate::storage::{discover_target, initialize_signer, open_pile_strict};
     use crate::schemas::message::DEFAULT_SCOPE_ID;
     use crate::schemas::relations::{
         DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID, KIND_GROUP, KIND_PERSON_ID,

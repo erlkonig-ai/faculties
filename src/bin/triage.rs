@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::cognition as cognition_model;
-use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::memory::{self as memory_model, ChunkContent, MemoryCatalog};
 use faculties::message as message_model;
 use faculties::relations as relations_model;
@@ -1219,7 +1219,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use ed25519_dalek::SigningKey;
-    use faculties::collection_cutover::initialize_signer;
+    use faculties::storage::initialize_signer;
     use faculties::headspace::{self, Resolution};
     use faculties::memory::{ChunkDraft, ChunkDraftContent, RetractionDraft};
     use faculties::schemas::triage::{exec, KIND_EXEC_REQUEST_ID};

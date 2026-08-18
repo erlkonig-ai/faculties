@@ -22,11 +22,9 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, project_legacy_authored_commits, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate,
-};
-use crate::secrets::{self as capability, schema};
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{load_signer, open_pile_strict};
+use faculties::secrets::{self as capability, schema};
 
 /// Exact historical Mail vocabulary which was written onto the branch named
 /// `secrets`. It is intentionally local to cutover: current Secrets and Mail
@@ -626,9 +624,8 @@ mod tests {
     use triblespace::core::repo::{BlobStore, BlobStoreMeta, PinStore, Repository};
 
     use super::*;
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -723,7 +720,7 @@ mod tests {
         let metadata_root =
             semantic_metadata.put::<blobencodings::RawBytes, _>(metadata_child.raw.to_vec());
         semantic_metadata += entity! {
-            crate::schemas::files::file::content: metadata_root,
+            faculties::schemas::files::file::content: metadata_root,
         };
         workspace.commit_with_metadata(
             identity_fragment.clone(),

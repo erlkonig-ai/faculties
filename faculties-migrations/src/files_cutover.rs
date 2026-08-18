@@ -35,12 +35,10 @@ use triblespace::core::trible::{intrinsic_entity_id_v1, Fragment, Trible, Trible
 use triblespace::macros::{attributes, entity, find, pattern};
 use triblespace::prelude::{inlineencodings::R256, ExclusiveId};
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenSource, LegacyCommitCoordinate,
-    LegacyPinCoordinate, ProjectedLegacyCommit,
-};
-use crate::files as file_capability;
-use crate::schemas::files::{
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
+use faculties::storage::{publish_fragments};
+use faculties::files as file_capability;
+use faculties::schemas::files::{
     file, DEFAULT_SCOPE_ID, FILES_BRANCH_NAME, KIND_FILE, KIND_MEDIA_TYPE,
 };
 
@@ -592,7 +590,8 @@ mod tests {
     use triblespace::macros::exists;
     use triblespace::prelude::{blobencodings::RawBytes, TryToInline};
 
-    use crate::collection_cutover::{discover_target, freeze_source, initialize_signer};
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{discover_target, initialize_signer};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -640,7 +639,7 @@ mod tests {
         File::create(&source).unwrap();
         File::create(&target).unwrap();
 
-        let pile = crate::collection_cutover::open_pile_strict(&source).unwrap();
+        let pile = faculties::storage::open_pile_strict(&source).unwrap();
         let mut repository =
             Repository::new(pile, SigningKey::from_bytes(&[0x51; 32]), Fragment::empty()).unwrap();
         let branch = *repository.create_branch(FILES_BRANCH_NAME, None).unwrap();
@@ -681,7 +680,7 @@ mod tests {
         let old_second_file = second_file.root().unwrap();
         directory_fragment += second_file;
         let directory_record = entity! {
-            metadata::tag: &crate::schemas::files::KIND_DIRECTORY,
+            metadata::tag: &faculties::schemas::files::KIND_DIRECTORY,
             file::name: "docs",
             file::children*: [old_file, old_second_file],
         };
@@ -791,7 +790,7 @@ mod tests {
             file::imported_at: _?time,
         }])));
         assert!(!exists!(pattern!(&materialized, [{
-            _?import @ metadata::tag: &crate::schemas::files::KIND_IMPORT
+            _?import @ metadata::tag: &faculties::schemas::files::KIND_IMPORT
         }])));
         assert_eq!(plan.decisions().len(), 2);
         assert!(plan.decisions().iter().all(|decision| {
@@ -816,7 +815,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(after_first, after_second);
 
-        let mut pile = crate::collection_cutover::open_pile_strict(&fixture.target).unwrap();
+        let mut pile = faculties::storage::open_pile_strict(&fixture.target).unwrap();
         assert!(pile
             .pins()
             .unwrap()
@@ -876,7 +875,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(fs::metadata(&fixture.source).unwrap().len(), after_first);
 
-        let mut pile = crate::collection_cutover::open_pile_strict(&fixture.source).unwrap();
+        let mut pile = faculties::storage::open_pile_strict(&fixture.source).unwrap();
         assert!(!pile
             .pins()
             .unwrap()
@@ -893,7 +892,7 @@ mod tests {
         let directory = TestDirectory::new();
         let source = directory.path().join("malformed.pile");
         File::create(&source).unwrap();
-        let pile = crate::collection_cutover::open_pile_strict(&source).unwrap();
+        let pile = faculties::storage::open_pile_strict(&source).unwrap();
         let mut repository =
             Repository::new(pile, SigningKey::from_bytes(&[0x61; 32]), Fragment::empty()).unwrap();
         let branch = *repository.create_branch(FILES_BRANCH_NAME, None).unwrap();
@@ -920,7 +919,7 @@ mod tests {
         let directory = TestDirectory::new();
         let source = directory.path().join("partial-import.pile");
         File::create(&source).unwrap();
-        let pile = crate::collection_cutover::open_pile_strict(&source).unwrap();
+        let pile = faculties::storage::open_pile_strict(&source).unwrap();
         let mut repository =
             Repository::new(pile, SigningKey::from_bytes(&[0x62; 32]), Fragment::empty()).unwrap();
         let branch = *repository.create_branch(FILES_BRANCH_NAME, None).unwrap();
@@ -938,7 +937,7 @@ mod tests {
         malformed += file;
         let import_id = Id::new([0x63; 16]).unwrap();
         malformed += entity! { ExclusiveId::force_ref(&import_id) @
-            metadata::tag: &crate::schemas::files::KIND_IMPORT,
+            metadata::tag: &faculties::schemas::files::KIND_IMPORT,
             file::root: &root,
         };
         workspace.commit(malformed, "partial import");
@@ -957,7 +956,7 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.path().join("media-type-v2.pile");
         File::create(&path).unwrap();
-        let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
+        let mut pile = faculties::storage::open_pile_strict(&path).unwrap();
         let name = pile
             .put::<LongString, _>("application/pdf".to_owned())
             .unwrap();
@@ -977,7 +976,7 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.path().join("media-type-v1.pile");
         File::create(&path).unwrap();
-        let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
+        let mut pile = faculties::storage::open_pile_strict(&path).unwrap();
         let name = pile
             .put::<LongString, _>("application/octet-stream".to_owned())
             .unwrap();
@@ -1008,7 +1007,7 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.path().join("media-type-extrinsic.pile");
         File::create(&path).unwrap();
-        let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
+        let mut pile = faculties::storage::open_pile_strict(&path).unwrap();
         let name = pile
             .put::<LongString, _>("application/pdf".to_owned())
             .unwrap();

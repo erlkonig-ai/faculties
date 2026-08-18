@@ -1,11 +1,11 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::schemas::compass::{
     board, latest_status_event, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
-use faculties::{compass, compass_cutover, relations};
+use faculties::{compass, relations};
 use hifitime::Epoch;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -115,9 +115,6 @@ enum Command {
         /// Hex prefix to search for
         prefix: String,
     },
-    /// Additively publish the frozen legacy `compass` branch as native
-    /// collection commits. Stop every legacy Compass writer before running.
-    MigrateLegacy,
 }
 
 // ── on-demand board queries ───────────────────────────────────────────
@@ -1101,29 +1098,6 @@ fn cmd_resolve(storage: CompassStorage<'_>, prefix: String) -> Result<()> {
     })
 }
 
-fn cmd_migrate_legacy(storage: CompassStorage<'_>) -> Result<()> {
-    load_signer(storage.pile, storage.key)?;
-    let existing = storage.with_view(|facts, _| Ok(facts.clone()))?;
-    let source = freeze_source(storage.pile).context("freeze legacy Compass source")?;
-    let plan = compass_cutover::plan(&source)?;
-    let mut expected = existing;
-    expected += plan.original_facts().clone();
-
-    let commits = compass_cutover::publish(&source, &plan, storage.pile, storage.key)?;
-    let actual = storage.with_view(|facts, _| Ok(facts.clone()))?;
-    if actual != expected {
-        bail!("Compass migration result is not prior native value union legacy facts");
-    }
-    println!(
-        "migrated {} authored Compass commit{} ({} facts)",
-        commits.len(),
-        if commits.len() == 1 { "" } else { "s" },
-        plan.report().facts,
-    );
-    println!("legacy branch retained; native commands no longer consult it");
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.command else {
@@ -1184,14 +1158,13 @@ fn main() -> Result<()> {
         Command::Prioritize { higher, over } => cmd_prioritize(storage, higher, over),
         Command::Deprioritize { higher, over } => cmd_deprioritize(storage, higher, over),
         Command::Resolve { prefix } => cmd_resolve(storage, prefix),
-        Command::MigrateLegacy => cmd_migrate_legacy(storage),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::collection_cutover::initialize_signer;
+    use faculties::storage::initialize_signer;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);

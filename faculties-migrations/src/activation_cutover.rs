@@ -16,16 +16,18 @@ use triblespace::prelude::Inline;
 use triblespace::prelude::{Fragment, Id, TribleSet};
 
 use crate::collection_cutover::{FrozenSource, LegacyPinCoordinate};
-use crate::schemas;
-use crate::secrets;
+use faculties::schemas;
+use faculties::secrets;
 use crate::{
-    archive_cutover, atlas, atlas_cutover, blockdag, body, body_cutover, cognition,
-    cognition_cutover, comb, comb_cutover, compass, compass_cutover, decide, decide_cutover,
-    discord, discord_cutover, files, files_cutover, habit_cutover, habits, headspace,
-    headspace_cutover, mail, mail_cutover, memory, memory_cutover, message, message_cutover,
-    orient_cutover, planner, planner_cutover, posture_cutover, relations, relations_cutover,
-    secrets_cutover, status, status_cutover, teams, teams_cutover, voice, voice_cutover,
-    web_cutover, wiki, wiki_cutover,
+    archive_cutover, atlas_cutover, body_cutover, cognition_cutover, comb_cutover, compass_cutover,
+    decide_cutover, discord_cutover, files_cutover, habit_cutover, headspace_cutover, mail_cutover,
+    memory_cutover, message_cutover, orient_cutover, planner_cutover, posture_cutover,
+    relations_cutover, secrets_cutover, status_cutover, teams_cutover, voice_cutover, web_cutover,
+    wiki_cutover,
+};
+use faculties::{
+    atlas, blockdag, body, cognition, comb, compass, decide, discord, files, habits, headspace,
+    mail, memory, message, planner, relations, status, teams, voice, wiki,
 };
 
 /// One validated native collection projection with its concrete source inputs.
@@ -264,7 +266,7 @@ pub fn validate_candidate_views(
         required_view(views, "Planner", schemas::planner::DEFAULT_SCOPE_ID)?,
     )
     .context("validate Planner candidate")?;
-    posture_cutover::validate_policy_catalog(
+    faculties::posture_policy::validate_policy_catalog(
         reader,
         required_view(views, "Posture", schemas::posture::DEFAULT_POLICY_SCOPE_ID)?,
     )

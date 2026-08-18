@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::{Parser, Subcommand};
-use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::planner::{
     self as planner_model, cancellation_fragment, event_facts, event_fragment, note_fragment,
     read_text, EventDraft, EventRow, IntervalValue, PlannerCatalog, STATUS_CANCELLED,
@@ -182,7 +182,7 @@ impl PlannerStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
-        let result = faculties::collection_cutover::discover_target(&mut pile, DEFAULT_SCOPE_ID)
+        let result = faculties::storage::discover_target(&mut pile, DEFAULT_SCOPE_ID)
             .map(|target| {
                 target
                     .commits()
@@ -944,7 +944,7 @@ mod tests {
         let pile = directory.0.join("planner.pile");
         let key = directory.0.join("planner.key");
         File::create(&pile).unwrap();
-        faculties::collection_cutover::initialize_signer(&pile, Some(&key)).unwrap();
+        faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
         (pile, key)
     }
 

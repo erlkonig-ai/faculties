@@ -812,7 +812,7 @@ mod tests {
     use std::fs::File;
     use std::path::PathBuf;
 
-    use crate::collection_cutover::{
+    use crate::storage::{
         initialize_signer, load_signer, open_pile_strict, publish_fragment,
     };
     use crate::schemas::decide::DEFAULT_SCOPE_ID;

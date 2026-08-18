@@ -381,7 +381,7 @@ fn validate_legacy_identity(
 
 /// Strictly load the marker-free historical Voice ontology under the v1
 /// intrinsic-identity rule. This seam exists only for stopped-world cutover.
-pub(crate) fn validate_legacy_catalog_v1(
+pub fn validate_legacy_catalog_v1(
     reader: &PileReader,
     facts: &TribleSet,
 ) -> Result<VoiceCatalog> {
@@ -537,7 +537,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<VoiceC
 
 /// Validate a complete materialized Voice value while resolving newly staged
 /// payloads from an overlay before they have crossed the commit boundary.
-pub(crate) fn validate_catalog_with_overlay<Overlay>(
+pub fn validate_catalog_with_overlay<Overlay>(
     reader: &PileReader,
     overlay: &Overlay,
     facts: &TribleSet,
@@ -650,7 +650,7 @@ mod tests {
     use triblespace::core::repo::BlobStore;
 
     use super::*;
-    use crate::collection_cutover::open_pile_strict;
+    use crate::storage::open_pile_strict;
 
     fn point(seconds: f64) -> IntervalValue {
         let epoch = Epoch::from_tai_seconds(seconds);

@@ -20,15 +20,13 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, project_legacy_authored_commits, FrozenLegacyBranch,
-    FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit,
-};
-use crate::mail::{self, BytesHandle, IntervalValue, TextHandle};
-use crate::schemas::mail::{
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
+use faculties::storage::{load_signer, open_pile_strict};
+use faculties::mail::{self, BytesHandle, IntervalValue, TextHandle};
+use faculties::schemas::mail::{
     self as schema, imported_legacy, IMPORT_DRAFT, IMPORT_RECEIVED, IMPORT_SENT,
 };
-use crate::schemas::message::{local as legacy_read, KIND_READ_ID};
+use faculties::schemas::message::{local as legacy_read, KIND_READ_ID};
 
 /// Provenance of one native Mail migration commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -562,7 +560,7 @@ mod tests {
     use triblespace::core::repo::{BlobStoreList, Repository};
 
     use super::*;
-    use crate::collection_cutover::{initialize_signer, publish_fragment};
+    use faculties::storage::{initialize_signer, publish_fragment};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 

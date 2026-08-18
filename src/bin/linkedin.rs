@@ -39,8 +39,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 #[cfg(test)]
-use faculties::collection_cutover;
-use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::storage;
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::relations::{self, Head, ProfileInput};
 use faculties::schemas::linkedin;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
@@ -267,7 +267,7 @@ impl RelationsStorage<'_> {
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
         let result =
-            collection_cutover::discover_target(&mut pile, DEFAULT_SCOPE_ID).map(|target| {
+            storage::discover_target(&mut pile, DEFAULT_SCOPE_ID).map(|target| {
                 target
                     .commits()
                     .iter()
@@ -1289,7 +1289,7 @@ mod tests {
             let pile = directory.path().join("linkedin.pile");
             let key = directory.path().join("linkedin.key");
             File::create(&pile).unwrap();
-            collection_cutover::initialize_signer(&pile, Some(&key)).unwrap();
+            storage::initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 pile,

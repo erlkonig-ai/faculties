@@ -106,7 +106,7 @@ pub struct AdditivePlan {
 }
 
 impl AdditivePlan {
-    pub(crate) fn selected_created_at(
+    pub fn selected_created_at(
         &self,
         version: Id,
     ) -> Option<Inline<inlineencodings::NsTAIInterval>> {

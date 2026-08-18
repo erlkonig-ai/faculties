@@ -3895,6 +3895,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "faculties-migrations"
+version = "0.1.0"
+dependencies = [
+ "anybytes",
+ "anyhow",
+ "blake3",
+ "clap",
+ "ed25519-dalek",
+ "faculties",
+ "hex",
+ "hifitime",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "triblespace",
+ "triblespace-search",
+]
+
+[[package]]
 name = "faculties-secrets"
 version = "0.1.0"
 dependencies = [

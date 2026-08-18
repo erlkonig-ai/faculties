@@ -21,15 +21,13 @@ use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
-use crate::blockdag::{self, CatalogValidation};
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenSource, LegacyCommitCoordinate,
-    LegacyPinCoordinate,
-};
-use crate::schemas::{blockdag as schema, files as files_schema};
+use faculties::blockdag::{self, CatalogValidation};
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{publish_fragments};
+use faculties::schemas::{blockdag as schema, files as files_schema};
 
 /// Historical branch name used only as a read-only migration coordinate.
-pub use crate::schemas::blockdag::LEGACY_BRANCH_NAME;
+pub use faculties::schemas::blockdag::LEGACY_BRANCH_NAME;
 
 /// One native commit projected from one authored legacy commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -329,9 +327,8 @@ mod tests {
     use triblespace::macros::{find, pattern};
 
     use super::*;
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -465,7 +462,7 @@ mod tests {
     #[test]
     fn exact_tf_bm25_attribute_rotation_remains_pinned() {
         assert_eq!(
-            crate::schemas::archive::search_index::index.id(),
+            faculties::schemas::archive::search_index::index.id(),
             Id::from_hex("BE3EF8A63DFD0C29993E93B8037BC2C7").unwrap()
         );
     }

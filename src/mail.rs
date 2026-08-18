@@ -3199,7 +3199,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    use crate::collection_cutover::{
+    use crate::storage::{
         initialize_signer, load_signer, open_pile_strict, publish_fragment,
     };
     use crate::relations::{self, ProfileInput};

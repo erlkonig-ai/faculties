@@ -21,14 +21,12 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenSource, LegacyCommitCoordinate,
-    LegacyPinCoordinate,
-};
-use crate::schemas::status::{
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{publish_fragments};
+use faculties::schemas::status::{
     status as status_attr, DEFAULT_SCOPE_ID, KIND_STATUS_UPDATE, STATUS_BRANCH_NAME,
 };
-use crate::status::{self, StatusRow};
+use faculties::status::{self, StatusRow};
 
 /// One native commit projected from one exact authored legacy commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -320,9 +318,8 @@ mod tests {
     use triblespace::core::repo::{BlobStore, Repository};
 
     use super::*;
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 

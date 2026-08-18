@@ -47,7 +47,7 @@ git -C triblespace-rs checkout 8eb734bc27b9dc860109deba929508701f07adcc
 git -C mary checkout 84857d64b81f7f5f90a30630e220896c3da2e8b8
 git -C cubecl-fork checkout f299aed551ec97bf28b779bfed6e88a484a167e4
 cd faculties
-cargo build --release --bins --locked
+cargo build --release --workspace --bins --locked
 scripts/install-release-cohort target/release
 cargo install --path ../triblespace-rs/trible --locked
 ```

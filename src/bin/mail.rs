@@ -9,11 +9,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::decide;
 use faculties::files;
 use faculties::mail::{self, AccountConfigInput, DraftInput, Head, SendAttemptInput};
-use faculties::mail_cutover;
 use faculties::mail_pop;
 use faculties::relations;
 use faculties::schemas::{
@@ -78,8 +77,6 @@ enum Command {
     Show { message: String },
     /// Case-insensitive substring search over projected subject and body.
     Search { query: String },
-    /// Migrate the stopped legacy `mail` Repository branch additively.
-    MigrateLegacy,
 }
 
 #[derive(Subcommand)]
@@ -1231,25 +1228,6 @@ fn cmd_fetch(storage: &Storage<'_>) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if matches!(&cli.command, Command::MigrateLegacy) {
-        let source = freeze_source(&cli.pile).context("freeze stopped legacy Mail source")?;
-        let plan = mail_cutover::plan(&source).context("plan additive Mail migration")?;
-        let commits = mail_cutover::publish(&source, &plan, &cli.pile, cli.key.as_deref())
-            .context("publish additive Mail migration")?;
-        println!(
-            "Migrated {} authored Mail commit(s) plus {} normalization commit(s): {} old fact(s) + {} additive fact(s)",
-            plan.report().authored_commits,
-            plan.report().normalization_commits,
-            plan.report().original_facts,
-            plan.report().added_facts
-        );
-        debug_assert_eq!(
-            commits.len(),
-            plan.report().authored_commits + plan.report().normalization_commits
-        );
-        return Ok(());
-    }
-
     let storage = Storage::open(
         &cli.pile,
         cli.key.as_deref(),
@@ -1293,7 +1271,6 @@ fn main() -> Result<()> {
         Command::Read { message } => cmd_read(&storage, &message),
         Command::Show { message } => cmd_show(&storage, &message),
         Command::Search { query } => cmd_search(&storage, &query),
-        Command::MigrateLegacy => unreachable!("migration was dispatched before opening storage"),
     };
     let close = storage.close();
     match (result, close) {
@@ -1318,7 +1295,7 @@ mod tests {
     use std::fs::File;
     use std::rc::Rc;
 
-    use faculties::collection_cutover::{initialize_signer, publish_fragment};
+    use faculties::storage::{initialize_signer, publish_fragment};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()

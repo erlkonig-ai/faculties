@@ -199,7 +199,7 @@ mod tests {
     use super::*;
 
     use ed25519_dalek::SigningKey;
-    use faculties::collection_cutover::{initialize_signer, load_signer, open_pile_strict};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
     use faculties::schemas::patience::{exec_schema, KIND_TIMEOUT_EXTENSION_ID};
     use std::fs::File;

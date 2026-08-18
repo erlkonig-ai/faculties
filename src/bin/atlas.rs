@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::atlas::{self, AtlasCatalog, AtlasEntry};
-use faculties::atlas_cutover;
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
@@ -29,9 +28,6 @@ enum Command {
     List,
     /// Show metadata for a single id prefix.
     Show { id: String },
-    /// Additively publish the stopped legacy `atlas` branch into the fixed
-    /// native Atlas collection. Stop every old Atlas writer first.
-    MigrateLegacy,
 }
 
 #[derive(Clone, Copy)]
@@ -82,7 +78,6 @@ fn main() -> Result<()> {
     match command {
         Command::List => cmd_list(storage),
         Command::Show { id } => cmd_show(storage, &id),
-        Command::MigrateLegacy => cmd_migrate_legacy(storage),
     }
 }
 
@@ -175,42 +170,6 @@ fn cmd_show(storage: AtlasStorage<'_>, prefix: &str) -> Result<()> {
         }
         Ok(())
     })
-}
-
-fn cmd_migrate_legacy(storage: AtlasStorage<'_>) -> Result<()> {
-    // Fail on missing authority before taking the stopped source snapshot.
-    load_signer(storage.pile, storage.key)?;
-    let existing = storage.with_view(|_, facts, _| Ok(facts.clone()))?;
-    let source = freeze_source(storage.pile)
-        .context("freeze legacy Atlas source; every old Atlas writer must be stopped")?;
-    let fingerprint = source.fingerprint();
-    let plan = atlas_cutover::plan(&source)?;
-    let mut expected = existing;
-    expected += plan.original_facts().clone();
-
-    let commits = atlas_cutover::publish(&source, &plan, storage.pile, storage.key)?;
-    let refreshed = freeze_source(storage.pile)?;
-    if refreshed.fingerprint() != fingerprint {
-        bail!(
-            "legacy Atlas pins changed during migration; published commits are replay-safe, stop every writer and retry"
-        );
-    }
-    let actual = storage.with_view(|_, facts, _| Ok(facts.clone()))?;
-    if actual != expected {
-        bail!("Atlas migration result is not prior native value union exact legacy facts");
-    }
-
-    println!(
-        "migrated {} authored Atlas commit{} ({} authored empty, {} verified contentless merge{}): {} exact facts in scope {DEFAULT_SCOPE_ID:X}",
-        commits.len(),
-        if commits.len() == 1 { "" } else { "s" },
-        plan.report().authored_empty_commits,
-        plan.report().contentless_merges,
-        if plan.report().contentless_merges == 1 { "" } else { "s" },
-        plan.report().facts,
-    );
-    println!("legacy branch retained as inert evidence; native commands no longer consult it");
-    Ok(())
 }
 
 fn resolve_prefix<'a>(catalog: &'a AtlasCatalog, prefix: &str) -> Result<&'a AtlasEntry> {

@@ -46,6 +46,11 @@ cargo run --bin compass --release -- list
 cargo install --path . --bins
 ```
 
+The `migrations` binary lives in the `faculties-migrations` member crate, so
+whole-suite builds need `--workspace` (`cargo build --release --workspace
+--bins`). Without it the cohort silently ships without the only command that can
+read a pre-collection pile.
+
 `PILE` is read from the environment by every faculty (clap's native
 env-var support). Set it once per shell — `export PILE=./self.pile`
 — and skip the `--pile` flag.

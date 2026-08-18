@@ -19,7 +19,7 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{load_signer, open_pile_strict};
+use crate::storage::{load_signer, open_pile_strict};
 use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::schemas::patience::{exec_schema as patience, KIND_TIMEOUT_EXTENSION_ID};
 use crate::schemas::reason::{reason_schema as reason, KIND_REASON_ID};
@@ -195,7 +195,7 @@ pub fn validate_candidate(
 /// Strict payload validation used while projecting each frozen legacy delta.
 /// This is crate-visible so the stopped-world migration can fail on a missing
 /// typed attachment rather than silently relying on conservative reachability.
-pub(crate) fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
     validate_payloads(reader, None::<&PileReader>, facts)
 }
 
@@ -484,7 +484,7 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 mod tests {
     use std::fs::File;
 
-    use crate::collection_cutover::{initialize_signer, load_signer};
+    use crate::storage::{initialize_signer, load_signer};
 
     use super::*;
 

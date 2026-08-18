@@ -472,7 +472,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("archive-bm25-test.pile");
             File::create(&path).unwrap();
-            let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
+            let mut pile = crate::storage::open_pile_strict(&path).unwrap();
             for blob in blobs {
                 pile.put::<UnknownBlob, _>(blob).unwrap();
             }

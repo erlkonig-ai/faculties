@@ -19,13 +19,11 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
-use crate::cognition;
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, project_legacy_authored_commits, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate,
-};
-use crate::schemas::cognition::{DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
-use crate::schemas::triage;
+use faculties::cognition;
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{load_signer, open_pile_strict};
+use faculties::schemas::cognition::{DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
+use faculties::schemas::triage;
 
 const LEGACY_MAIN_BRANCH_NAME: &str = "main";
 
@@ -488,7 +486,8 @@ mod tests {
     use triblespace::core::repo::Repository;
 
     use super::*;
-    use crate::collection_cutover::{freeze_source, open_pile_strict};
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{open_pile_strict};
 
     const THOUGHT: Id = triblespace::macros::id_hex!("C1000000000000000000000000000001");
     const REQUEST: Id = triblespace::macros::id_hex!("C1000000000000000000000000000002");

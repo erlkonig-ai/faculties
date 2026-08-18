@@ -17,7 +17,7 @@ use triblespace::core::trible::Fragment;
 use triblespace::macros::id_hex;
 use triblespace::prelude::TryToInline;
 
-use crate::collection_cutover::{load_signer, open_pile_strict};
+use crate::storage::{load_signer, open_pile_strict};
 use crate::wiki::{self, RevisionDraft};
 use crate::{compass, wiki as wiki_model};
 
@@ -568,7 +568,7 @@ mod tests {
     use triblespace::core::collection::discover_collection_records;
 
     use super::*;
-    use crate::collection_cutover::{initialize_signer, load_signer, open_pile_strict};
+    use crate::storage::{initialize_signer, load_signer, open_pile_strict};
 
     struct Imported {
         _directory: tempfile::TempDir,

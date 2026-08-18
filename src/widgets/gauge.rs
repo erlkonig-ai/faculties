@@ -432,7 +432,7 @@ mod tests {
 
     use std::fs::File;
 
-    use crate::collection_cutover::{initialize_signer, open_pile_strict};
+    use crate::storage::{initialize_signer, open_pile_strict};
     use crate::widgets::storage::{SourceKey, StorageState};
     use crate::wiki::{self, RevisionDraft};
     use hifitime::Epoch;

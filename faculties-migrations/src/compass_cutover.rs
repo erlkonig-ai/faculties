@@ -14,13 +14,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::collection::CollectionCommit;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenSource, LegacyCommitCoordinate,
-    LegacyPinCoordinate,
-};
-use crate::schemas::compass::DEFAULT_SCOPE_ID;
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{publish_fragments};
+use faculties::schemas::compass::DEFAULT_SCOPE_ID;
 
-pub use crate::schemas::compass::LEGACY_BRANCH_NAME;
+pub use faculties::schemas::compass::LEGACY_BRANCH_NAME;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompassMigrationCommit {
@@ -80,7 +78,7 @@ pub fn plan(source: &FrozenSource) -> Result<CompassMigrationPlan> {
         .legacy_branch(LEGACY_BRANCH_NAME)?
         .ok_or_else(|| anyhow!("frozen source has no legacy Compass branch"))?;
     let mut projected =
-        project_legacy_authored_commits(source, &branch, crate::compass::validate_known_payloads)
+        project_legacy_authored_commits(source, &branch, faculties::compass::validate_known_payloads)
             .context("project frozen Compass authored commits")?;
     projected.sort_unstable_by_key(|commit| commit.source);
 
@@ -153,10 +151,9 @@ mod tests {
     use triblespace::macros::entity;
 
     use super::*;
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
-    use crate::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use faculties::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -270,8 +267,8 @@ mod tests {
         plan.verify_conservation().unwrap();
         assert_eq!(plan.original_facts(), &fixture.source_facts);
         assert_eq!(plan.report().authored_commits, 2);
-        assert!(crate::compass::goal_ids(&plan.materialized_facts()).contains(&fixture.goal));
-        assert!(crate::compass::note_ids(&plan.materialized_facts()).contains(&fixture.note));
+        assert!(faculties::compass::goal_ids(&plan.materialized_facts()).contains(&fixture.goal));
+        assert!(faculties::compass::note_ids(&plan.materialized_facts()).contains(&fixture.note));
     }
 
     #[test]

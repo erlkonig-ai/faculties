@@ -21,7 +21,7 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{load_signer, open_pile_strict};
+use crate::storage::{load_signer, open_pile_strict};
 use crate::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
     MAX_LABEL_BYTES, SCRIPT_TOKEN, STATE_ACTIVE, STATE_PAUSED,
@@ -1370,7 +1370,7 @@ mod tests {
 
     use hifitime::Epoch;
 
-    use crate::collection_cutover::{initialize_signer, load_signer};
+    use crate::storage::{initialize_signer, load_signer};
 
     use super::*;
 

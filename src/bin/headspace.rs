@@ -8,9 +8,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::headspace::{self, Catalog, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
-use faculties::headspace_cutover;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
 use hifitime::Epoch;
@@ -81,9 +80,6 @@ enum Command {
         #[arg(value_name = "SNAPSHOT")]
         snapshot: String,
     },
-    /// Additively publish the stopped legacy config branch into the fixed
-    /// native Headspace collection. Stop every old config writer first.
-    MigrateLegacy,
 }
 
 #[derive(Args)]
@@ -271,10 +267,6 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     };
 
-    if matches!(command, Command::MigrateLegacy) {
-        return migrate_legacy(&cli);
-    }
-
     let storage = Storage::open(
         &cli.pile,
         cli.key.as_deref(),
@@ -313,7 +305,6 @@ fn dispatch(storage: &Storage<'_>, command: &Command) -> Result<()> {
             SecretCommand::Unset => unset_secret(storage, *role),
         },
         Command::Reconcile { snapshot } => reconcile(storage, snapshot),
-        Command::MigrateLegacy => unreachable!("migration is dispatched before storage opens"),
     }
 }
 
@@ -951,62 +942,6 @@ fn format_snapshot_ids(ids: impl IntoIterator<Item = Id>) -> String {
         .join(",")
 }
 
-fn migrate_legacy(cli: &Cli) -> Result<()> {
-    // Missing authority must fail before opening or growing the pile.
-    load_signer(&cli.pile, cli.key.as_deref())?;
-    let before = load_exact_facts(cli)?;
-    let source = freeze_source(&cli.pile)
-        .context("freeze legacy config source; every old config writer must be stopped")?;
-    let fingerprint = source.fingerprint();
-    let plan = headspace_cutover::plan(&source)?;
-    let mut expected = before;
-    expected += plan.original_facts().clone();
-
-    let commits = headspace_cutover::publish(&source, &plan, &cli.pile, cli.key.as_deref())?;
-    let refreshed = freeze_source(&cli.pile)?;
-    if refreshed.fingerprint() != fingerprint {
-        bail!(
-            "legacy config pins changed during migration; published commits are replay-safe, stop every writer and retry"
-        );
-    }
-    let actual = load_exact_facts(cli)?;
-    if actual != expected {
-        bail!("Headspace migration result is not prior native value union exact legacy facts");
-    }
-
-    println!(
-        "Migrated {} authored config commit{} ({} authored empty, {} verified contentless merge{}): {} exact legacy facts",
-        commits.len(),
-        if commits.len() == 1 { "" } else { "s" },
-        plan.report().authored_empty_commits,
-        plan.report().contentless_merges,
-        if plan.report().contentless_merges == 1 { "" } else { "s" },
-        plan.report().unique_facts,
-    );
-    println!(
-        "Legacy plaintext remains inert evidence. Re-supply credentials into Secrets, add a native profile/config, verify consumers, then stop using the old writer."
-    );
-    Ok(())
-}
-
-fn load_exact_facts(cli: &Cli) -> Result<TribleSet> {
-    let storage = Storage::open(
-        &cli.pile,
-        cli.key.as_deref(),
-        cli.secrets_identity.as_deref(),
-    )?;
-    let result = storage.views().map(|views| views.headspace.facts);
-    let close = storage.close();
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => Err(error.context(format!(
-            "closing migration preflight also failed: {close_error}"
-        ))),
-    }
-}
-
 fn parse_u64(raw: &str, label: &str) -> Result<u64> {
     raw.parse::<u64>()
         .map_err(|_| anyhow!("invalid {label} {raw}"))
@@ -1026,7 +961,7 @@ mod tests {
 
     use std::fs::File;
 
-    use faculties::collection_cutover::{initialize_signer, open_pile_strict};
+    use faculties::storage::{initialize_signer, open_pile_strict};
     use triblespace::core::repo::BlobStore;
 
     fn cli(pile: &Path, key: &Path, command: Command) -> Cli {

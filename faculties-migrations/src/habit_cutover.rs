@@ -36,17 +36,15 @@ use triblespace::core::repo::{self, BlobStoreGet};
 use triblespace::macros::{attributes, find, pattern};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenLegacyBranch, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate,
-};
-use crate::habits::{self, DeclaredState, IntervalValue, TextHandle};
-use crate::schemas::habit::{
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{publish_fragments};
+use faculties::habits::{self, DeclaredState, IntervalValue, TextHandle};
+use faculties::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
     MAX_LABEL_BYTES, STATE_ACTIVE, STATE_PAUSED,
 };
 
-pub use crate::schemas::habit::LEGACY_BRANCH_NAME;
+pub use faculties::schemas::habit::LEGACY_BRANCH_NAME;
 
 const LEGACY_HABIT_LABEL: &str = "habit";
 const LEGACY_FIRE_LABEL: &str = "habit_fire";
@@ -904,10 +902,9 @@ mod tests {
     use triblespace::macros::entity;
 
     use super::*;
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
-    use crate::habits::Activation;
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use faculties::habits::Activation;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 

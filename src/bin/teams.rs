@@ -10,8 +10,8 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 #[cfg(test)]
-use faculties::collection_cutover::initialize_signer;
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::initialize_signer;
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
@@ -31,7 +31,6 @@ use faculties::schemas::archive::{archive, RawBytes};
 use faculties::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
 use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
 use faculties::teams as teams_core;
-use faculties::teams_cutover;
 use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
@@ -146,8 +145,6 @@ enum CommandMode {
         )]
         scopes: Option<String>,
     },
-    /// Migrate the stopped legacy `teams` branch while retiring plaintext OAuth rows.
-    MigrateLegacy,
 }
 
 #[derive(Subcommand)]
@@ -805,7 +802,6 @@ fn main() -> Result<()> {
                 )
             })
         }
-        CommandMode::MigrateLegacy => migrate_legacy(&cli),
     }
 }
 
@@ -951,30 +947,6 @@ fn with_teams_context<T>(
         let runtime = resolve_auth_config(session, config, source_id)?;
         operation(&runtime, session, &context)
     })
-}
-
-fn migrate_legacy(cli: &Cli) -> Result<()> {
-    let frozen = freeze_source(&cli.pile)?;
-    let plan = teams_cutover::plan(&frozen)?;
-    let report = plan.report().clone();
-    let commits = teams_cutover::publish(&frozen, &plan, &cli.pile, cli.key.as_deref())?;
-    println!(
-        "Migrated {} authored Teams commits ({} source-empty, {} OAuth-only retired; {} contentless merges remained ancestry), publishing {} of {} source facts and retiring {} plaintext OAuth facts in {} native commits.",
-        report.authored_commits,
-        report.authored_empty_commits,
-        report.retired_only_commits,
-        report.contentless_merges,
-        report.facts,
-        report.source_facts,
-        report.retired_facts,
-        commits.len(),
-    );
-    if report.retired_facts > 0 {
-        eprintln!(
-            "SECURITY: the native Teams collection omits the retired OAuth rows, but this in-place append leaves their old plaintext bytes in the legacy pile prefix. Rotate the Microsoft client secret and delegated grants, then repack the validated native collections into a fresh pile before sharing or archiving it."
-        );
-    }
-    Ok(())
 }
 
 fn default_scopes() -> String {

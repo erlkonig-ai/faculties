@@ -1,7 +1,7 @@
 # This package is also the workspace root so the reusable secrets core can stay
 # independently consumable. The `[patch.crates-io]` below applies workspace-wide.
 [workspace]
-members = ["faculties-secrets"]
+members = ["faculties-migrations", "faculties-secrets"]
 resolver = "2"
 
 [package]

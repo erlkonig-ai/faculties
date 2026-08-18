@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::relations::{self, Head, SelectorOutcome};
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID;
-use faculties::{status, status_cutover};
+use faculties::status;
 use hifitime::Epoch;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::pile::{Pile, PileReader};
@@ -60,9 +60,6 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
-    /// Additively publish the frozen legacy `status` branch as intrinsic
-    /// native events. Stop every legacy Status writer before running this.
-    MigrateLegacy,
 }
 
 #[derive(Clone, Copy)]
@@ -296,61 +293,6 @@ fn cmd_show(storage: StatusStorage<'_>, selector: String, limit: usize) -> Resul
     })
 }
 
-fn cmd_migrate_legacy(storage: StatusStorage<'_>) -> Result<()> {
-    // Migration is the deliberate exception to the ordinary one-open path:
-    // the old branch is first frozen and closed as immutable input, then the
-    // target pile is opened once for preflight, publication, and verification.
-    let signer = load_signer(storage.pile, storage.key)?;
-    let source = freeze_source(storage.pile).context("freeze legacy Status source")?;
-    let plan = status_cutover::plan(&source)?;
-
-    storage.with_loaded_pile(&signer, |pile, signer| {
-        let existing = materialize_scope(pile, signer, DEFAULT_SCOPE_ID, "Status")?;
-        let reader = pile.reader().context("open Status migration reader")?;
-        status::validate_catalog(&reader, &existing).context("validate prior native Status")?;
-
-        let mut candidate = Fragment::empty();
-        for commit in plan.commits() {
-            candidate += commit.fragment.clone();
-        }
-        let expected = status::validate_catalog_union(&reader, &existing, &candidate)
-            .context("preflight native Status plus legacy rewrite")?;
-
-        let mut published = Vec::with_capacity(plan.commits().len());
-        {
-            let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
-            for commit in plan.commits() {
-                published.push(
-                    collection
-                        .commit(commit.fragment.clone())
-                        .context("publish migrated Status commit")?,
-                );
-            }
-        }
-
-        let actual = materialize_scope(pile, signer, DEFAULT_SCOPE_ID, "Status")?;
-        let reader = pile.reader().context("open migrated Status reader")?;
-        status::validate_catalog(&reader, &actual).context("validate migrated Status")?;
-        if actual != expected {
-            bail!("Status migration result differs from prior native union canonical rewrite");
-        }
-
-        println!(
-            "migrated {} authored Status commit{}: {} legacy events → {} canonical events ({} preserved facts + {} canonical shadow facts = {} total) in scope {:X}",
-            published.len(),
-            if published.len() == 1 { "" } else { "s" },
-            plan.report().legacy_events,
-            plan.report().canonical_events,
-            plan.report().preserved_facts,
-            plan.report().canonical_facts,
-            plan.report().output_facts,
-            DEFAULT_SCOPE_ID
-        );
-        println!("legacy branch retained; native commands no longer consult it");
-        Ok(())
-    })
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let storage = StatusStorage {
@@ -361,7 +303,6 @@ fn main() -> Result<()> {
         Command::Set { text } => cmd_set(storage, cli.persona.as_deref(), text),
         Command::List => cmd_list(storage),
         Command::Show { window, limit } => cmd_show(storage, window, limit),
-        Command::MigrateLegacy => cmd_migrate_legacy(storage),
     }
 }
 
@@ -370,13 +311,8 @@ mod tests {
     use std::fs::{self, File};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use faculties::collection_cutover::initialize_signer;
+    use faculties::storage::initialize_signer;
     use faculties::relations::ProfileInput;
-    use faculties::schemas::status::{
-        status as status_attr, KIND_STATUS_UPDATE, STATUS_BRANCH_NAME,
-    };
-    use triblespace::core::metadata;
-    use triblespace::core::repo::Repository;
 
     use super::*;
 
@@ -602,41 +538,4 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn migrate_command_reuses_one_target_open_and_is_exactly_replayable() {
-        let fixture = fixture();
-        let legacy_signer = SigningKey::from_bytes(&[0x89; 32]);
-        let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut repository = Repository::new(pile, legacy_signer, Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(STATUS_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        let window = Id::new([0x8A; 16]).unwrap();
-        let mut legacy = Fragment::empty();
-        let text = legacy.put::<blobencodings::LongString, _>("legacy".to_owned());
-        legacy += entity! { ufoid() @
-            metadata::tag: &KIND_STATUS_UPDATE,
-            status_attr::window: window,
-            status_attr::text: text,
-            metadata::created_at: at(40.0),
-        };
-        workspace.commit(legacy, "legacy status");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        cmd_migrate_legacy(storage(&fixture)).unwrap();
-        let length = fs::metadata(&fixture.pile).unwrap().len();
-        cmd_migrate_legacy(storage(&fixture)).unwrap();
-        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
-
-        storage(&fixture)
-            .with_pile(|pile, signer| {
-                let catalogs = load_catalogs(pile, signer)?;
-                let rows = status::load_status_rows(&catalogs.status)?;
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].window, window);
-                assert_eq!(status::read_text(&catalogs.reader, rows[0].text)?, "legacy");
-                Ok(())
-            })
-            .unwrap();
-    }
 }

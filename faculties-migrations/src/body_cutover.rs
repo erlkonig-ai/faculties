@@ -24,12 +24,10 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::core::trible::intrinsic_entity_id_v1;
 use triblespace::prelude::*;
 
-use crate::body::{self, BodyCatalog, CaptureRow, IntentRow, IntervalValue, RawHandle, TextHandle};
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, project_legacy_authored_commits, FrozenLegacyBranch,
-    FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit,
-};
-use crate::schemas::body::{
+use faculties::body::{self, BodyCatalog, CaptureRow, IntentRow, IntervalValue, RawHandle, TextHandle};
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
+use faculties::storage::{load_signer, open_pile_strict};
+use faculties::schemas::body::{
     self as schema, KIND_CAPTURE, KIND_INTENT, LEGACY_BODY_BRANCH_NAME, LEGACY_SENSES_BRANCH_NAME,
 };
 
@@ -751,9 +749,8 @@ mod tests {
     use triblespace::core::repo::Repository;
 
     use super::*;
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn point(seconds: f64) -> IntervalValue {
         let epoch = Epoch::from_tai_seconds(seconds);

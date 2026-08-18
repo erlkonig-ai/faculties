@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::message::{self, IntervalValue, MessageRow};
 use faculties::relations::{self, IdentityComponents};
 use faculties::schemas::message::DEFAULT_SCOPE_ID;

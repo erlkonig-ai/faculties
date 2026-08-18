@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::decide::{
     self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
 };

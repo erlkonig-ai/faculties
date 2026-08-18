@@ -93,7 +93,7 @@ fn tagged_entities(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
     .collect()
 }
 
-pub(crate) fn entity_facts(facts: &TribleSet, entity: Id) -> TribleSet {
+pub fn entity_facts(facts: &TribleSet, entity: Id) -> TribleSet {
     facts
         .iter()
         .filter(|fact| fact.e() == &entity)
@@ -103,7 +103,7 @@ pub(crate) fn entity_facts(facts: &TribleSet, entity: Id) -> TribleSet {
 
 /// Build the canonical intrinsic record around already-stored capture
 /// payload handles.
-pub(crate) fn capture_record(row: &CaptureRow) -> Fragment {
+pub fn capture_record(row: &CaptureRow) -> Fragment {
     entity! {
         metadata::tag: &KIND_CAPTURE,
         metadata::created_at: row.created_at,
@@ -118,7 +118,7 @@ pub(crate) fn capture_record(row: &CaptureRow) -> Fragment {
 }
 
 /// Build the canonical intrinsic record around an already-stored intent text.
-pub(crate) fn intent_record(row: &IntentRow) -> Fragment {
+pub fn intent_record(row: &IntentRow) -> Fragment {
     entity! {
         metadata::tag: &KIND_INTENT,
         metadata::created_at: row.created_at,
@@ -169,7 +169,7 @@ fn validate_capture_shape(row: &CaptureRow) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn decode_capture(space: &TribleSet, id: Id) -> Result<CaptureRow> {
+pub fn decode_capture(space: &TribleSet, id: Id) -> Result<CaptureRow> {
     let row = CaptureRow {
         id,
         created_at: exactly_one(
@@ -249,7 +249,7 @@ pub(crate) fn decode_capture(space: &TribleSet, id: Id) -> Result<CaptureRow> {
     Ok(row)
 }
 
-pub(crate) fn decode_intent(space: &TribleSet, id: Id) -> Result<IntentRow> {
+pub fn decode_intent(space: &TribleSet, id: Id) -> Result<IntentRow> {
     let row = IntentRow {
         id,
         created_at: exactly_one(

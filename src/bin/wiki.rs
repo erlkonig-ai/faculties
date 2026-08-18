@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 #[cfg(feature = "local-embed")]
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
@@ -12,11 +12,8 @@ use faculties::schemas::wiki::{self as schema, extract_link_targets};
 use faculties::wiki::{
     self as wiki_model, EntryRecord, RevisionDraft, RevisionReadModel, RevisionRecord, WikiCatalog,
 };
-use faculties::wiki_cutover;
 use hifitime::Epoch;
 use triblespace::core::collection::CollectionCommit;
-#[cfg(test)]
-use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
 use faculties::legacy_hint::open_scope;
@@ -160,11 +157,6 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Additively publish the frozen legacy Wiki branch as authored leaves.
-    ///
-    /// Stop every legacy Wiki writer before running. The branch remains
-    /// untouched and is no longer consulted by native commands.
-    MigrateLegacy,
 }
 
 #[derive(Subcommand)]
@@ -1389,38 +1381,6 @@ fn cmd_batch_import(storage: WikiStorage<'_>, dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_migrate_legacy(storage: WikiStorage<'_>) -> Result<()> {
-    load_signer(storage.pile, storage.key)?;
-    let existing = storage.view()?.facts;
-    let source = freeze_source(storage.pile).context("freeze legacy Wiki source")?;
-    let plan = wiki_cutover::plan(&source)?;
-    let mut expected = existing;
-    expected += plan.original_facts().clone();
-    expected += plan.added_facts().clone();
-
-    let commits = wiki_cutover::publish(&source, &plan, storage.pile, storage.key)?;
-    let actual = storage.view()?.facts;
-    if actual != expected {
-        bail!("Wiki migration result is not prior native value union legacy facts and lineage");
-    }
-    println!(
-        "migrated {} authored Wiki commit{} ({} preserved facts, {} lineage edges)",
-        commits.len(),
-        if commits.len() == 1 { "" } else { "s" },
-        plan.report().original_facts,
-        plan.report().added_facts,
-    );
-    if plan.report().ties > 0 {
-        println!(
-            "{} timestamp tie{} resolved deterministically by revision id",
-            plan.report().ties,
-            if plan.report().ties == 1 { "" } else { "s" },
-        );
-    }
-    println!("legacy branch retained; native commands no longer consult it");
-    Ok(())
-}
-
 #[cfg(feature = "local-embed")]
 fn l2_normalize(mut values: Vec<f32>) -> Vec<f32> {
     let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
@@ -1595,8 +1555,6 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    use ed25519_dalek::SigningKey;
-    use triblespace::core::repo::Repository;
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -1610,7 +1568,7 @@ mod tests {
             let pile = directory.path().join("wiki.pile");
             let key = directory.path().join("wiki.key");
             File::create(&pile).unwrap();
-            faculties::collection_cutover::initialize_signer(&pile, Some(&key)).unwrap();
+            faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 pile,
@@ -1779,76 +1737,6 @@ mod tests {
         assert_eq!(incoming.types, BTreeSet::from(["reviews".to_owned()]));
     }
 
-    #[test]
-    fn migrate_legacy_cuts_reads_over_without_touching_the_branch_pin() {
-        let directory = tempfile::tempdir().unwrap();
-        let pile = directory.path().join("wiki.pile");
-        let key = directory.path().join("wiki.key");
-        File::create(&pile).unwrap();
-
-        let repository_storage = open_pile_strict(&pile).unwrap();
-        let mut repository = Repository::new(
-            repository_storage,
-            SigningKey::from_bytes(&[0x31; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository
-            .create_branch(schema::LEGACY_BRANCH_NAME, None)
-            .unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        let page = genid().id;
-        let first = genid().id;
-        let second = genid().id;
-        for (id, body, seconds) in [(first, "one", 1.0), (second, "two", 2.0)] {
-            let mut fragment = Fragment::empty();
-            let title = fragment.put::<blobencodings::LongString, _>("Legacy".to_owned());
-            let content = fragment.put::<blobencodings::LongString, _>(body.to_owned());
-            let epoch = Epoch::from_tai_seconds(seconds);
-            let authored_at: Inline<inlineencodings::NsTAIInterval> =
-                (epoch, epoch).try_to_inline().unwrap();
-            fragment += entity! { ExclusiveId::force_ref(&id) @
-                metadata::tag: &schema::KIND_VERSION_ID,
-                schema::attrs::fragment: page,
-                schema::attrs::title: title,
-                schema::attrs::content: content,
-                metadata::created_at: authored_at,
-            };
-            let message = format!("legacy {body}");
-            workspace.commit(fragment, &message);
-            repository.push(&mut workspace).unwrap();
-        }
-        repository.close().unwrap();
-        faculties::collection_cutover::initialize_signer(&pile, Some(&key)).unwrap();
-        let storage = WikiStorage {
-            pile: &pile,
-            key: Some(&key),
-        };
-        let before_pins = freeze_source(&pile).unwrap().legacy_pins().to_vec();
-
-        cmd_migrate_legacy(storage).unwrap();
-        let length = fs::metadata(&pile).unwrap().len();
-        cmd_migrate_legacy(storage).unwrap();
-        assert_eq!(fs::metadata(&pile).unwrap().len(), length);
-        assert_eq!(
-            freeze_source(&pile).unwrap().legacy_pins(),
-            before_pins.as_slice()
-        );
-
-        let view = storage.view().unwrap();
-        let catalog = wiki_model::load_catalog(&view.facts).unwrap();
-        assert_eq!(
-            catalog.revisions.legacy_fragment_frontier(page),
-            Some([second].as_slice())
-        );
-        assert!(find!(
-            earlier: Id,
-            pattern!(&view.facts, [{
-                second @ metadata::supersedes: ?earlier
-            }])
-        )
-        .any(|earlier| earlier == first));
-    }
 }
 
 fn main() -> Result<()> {
@@ -1923,6 +1811,5 @@ fn main() -> Result<()> {
         Command::Check { compile } => cmd_check(storage, compile),
         Command::FixTruncated { input } => cmd_fix_truncated(storage, input),
         Command::Lint { fix, check } => cmd_lint(storage, fix, check),
-        Command::MigrateLegacy => cmd_migrate_legacy(storage),
     }
 }

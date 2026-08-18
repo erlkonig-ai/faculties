@@ -14,13 +14,11 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenSource, LegacyCommitCoordinate,
-    LegacyPinCoordinate,
-};
-use crate::schemas::atlas::DEFAULT_SCOPE_ID;
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{publish_fragments};
+use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
 
-pub use crate::schemas::atlas::LEGACY_BRANCH_NAME;
+pub use faculties::schemas::atlas::LEGACY_BRANCH_NAME;
 
 /// One native commit projected from one verified legacy authored commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,7 +169,7 @@ pub fn publish(
 /// The generic projector additionally copies the complete resident closure,
 /// so unknown future attributes remain preserved rather than filtered out.
 pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
-    crate::atlas::validate_known_payloads(reader, facts)
+    faculties::atlas::validate_known_payloads(reader, facts)
 }
 
 #[cfg(test)]
@@ -186,9 +184,8 @@ mod tests {
     use triblespace::core::repo::{BlobStoreGet, PinStore, Repository};
 
     use super::*;
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 

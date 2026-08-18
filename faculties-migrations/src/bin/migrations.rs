@@ -1,26 +1,46 @@
-//! `migrations` — inspect and execute whole-pile migrations.
+//! `migrations` — inspect and execute migrations of a pre-collection pile.
 //!
-//! Planning freezes one source snapshot, runs every typed transform, and
-//! prints the exact coverage proof. Activation reruns that same pure boundary,
-//! then publishes into a disposable sibling and atomically replaces an
-//! unchanged live pile. Neither command writes migration bookkeeping facts.
+//! Every migration verb lives here, and nowhere else. The faculties read
+//! native collections only; a pile written before the storage cutover keeps
+//! all of its data on named legacy branches that no faculty consults, and this
+//! binary is the single path from there to here. It is kept forever for
+//! exactly that reason: deleting it would make an existing user's data
+//! invisible the day they upgrade.
+//!
+//! - `plan-cutover` freezes one source snapshot, runs every typed transform,
+//!   and prints the exact coverage proof without writing anything.
+//! - `activate-cutover` reruns that same pure boundary, publishes into a
+//!   disposable sibling, and atomically replaces an unchanged live pile. This
+//!   is the whole-pile path and the one to prefer.
+//! - `migrate-legacy <faculty>` migrates one faculty's branch in place, which
+//!   is what that faculty's own `migrate-legacy` subcommand used to do.
+//! - `faculties` lists the names `migrate-legacy` accepts.
+//!
+//! No command writes migration bookkeeping facts, and none deletes, consumes,
+//! or rewrites a legacy branch.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
-use faculties::{activation_cutover, collection_cutover, disposable_cutover};
+use faculties_migrations::per_faculty::{self, Faculty};
+use faculties_migrations::{activation_cutover, collection_cutover, disposable_cutover};
 
 #[derive(Parser)]
 #[command(
     version = faculties::GIT_VERSION,
     name = "migrations",
-    about = "Plan and execute whole-pile schema and storage migrations"
+    about = "Plan and execute migrations of a pre-collection Faculties pile"
 )]
 struct Cli {
     #[arg(long, env = "PILE")]
     pile: PathBuf,
+
+    /// Durable signing key. Defaults to the key beside the pile; migration
+    /// never mints an ephemeral identity.
+    #[arg(long)]
+    key: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -35,9 +55,28 @@ enum Command {
     /// With every pile writer stopped, build and validate a disposable native
     /// candidate and atomically replace the unchanged live pile.
     ActivateCutover,
+
+    /// With every pile writer stopped, migrate one faculty's legacy branch
+    /// into its native collection, in place, leaving the rest of the pile
+    /// alone. This is what each faculty's own `migrate-legacy` subcommand did
+    /// before every migration verb moved here.
+    MigrateLegacy {
+        /// Faculty to migrate; see `migrations faculties` for the full list.
+        faculty: Faculty,
+    },
+
+    /// List the faculty names `migrate-legacy` accepts.
+    Faculties,
 }
 
-fn plan_cutover(pile: &PathBuf) -> Result<()> {
+fn list_faculties() {
+    println!("Faculties `migrations migrate-legacy` can move, and the scope each lands in:");
+    for faculty in Faculty::ALL {
+        println!("- {:<10} scope {:X}", faculty.label(), faculty.scope());
+    }
+}
+
+fn plan_cutover(pile: &Path) -> Result<()> {
     let source = collection_cutover::freeze_source(pile)
         .with_context(|| format!("freeze cutover source {}", pile.display()))?;
     let plan = activation_cutover::plan(&source).context("plan aggregate collection cutover")?;
@@ -82,7 +121,7 @@ fn plan_cutover(pile: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn activate_cutover(pile: &PathBuf) -> Result<()> {
+fn activate_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
     let source = collection_cutover::freeze_source(pile)
         .with_context(|| format!("freeze cutover source {}", pile.display()))?;
     let plan = activation_cutover::plan(&source).context("plan aggregate collection cutover")?;
@@ -93,7 +132,7 @@ fn activate_cutover(pile: &PathBuf) -> Result<()> {
         .sum::<usize>();
     let outcome = disposable_cutover::activate(
         pile,
-        None,
+        key,
         &source,
         &plan,
         activation_cutover::validate_candidate_views,
@@ -124,7 +163,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::PlanCutover) => plan_cutover(&cli.pile),
-        Some(Command::ActivateCutover) => activate_cutover(&cli.pile),
+        Some(Command::ActivateCutover) => activate_cutover(&cli.pile, cli.key.as_deref()),
+        Some(Command::MigrateLegacy { faculty }) => {
+            per_faculty::migrate(faculty, &cli.pile, cli.key.as_deref())
+        }
+        Some(Command::Faculties) => {
+            list_faculties();
+            Ok(())
+        }
         None => {
             Cli::command().print_help()?;
             println!();

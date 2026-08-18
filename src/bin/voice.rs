@@ -52,12 +52,11 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::schemas::voice::{
     route, CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID, KIND_LIVE_RECORD, KIND_ROUTE,
 };
 use faculties::voice as voice_model;
-use faculties::voice_cutover;
 use hifitime::efmt::consts::ISO8601;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -164,12 +163,6 @@ enum Command {
     /// List the connected audio output devices and their privacy class. The
     /// raw input to routing — a quick way to see what `say`/`shout` can target.
     Devices,
-    /// Canonically and additively reconstruct the stopped legacy `voice`
-    /// branch and the pre-extraction utterances on `body` in the fixed native
-    /// Voice collection. Stop every writer to both branches and initialize the
-    /// durable signer first. Reconstructed routes are live immediately; a
-    /// later native route set supersedes them by timestamp.
-    MigrateLegacy,
 }
 
 // ── time / id helpers (mirrors body/headspace) ─────────────────────────────
@@ -1206,30 +1199,6 @@ fn cmd_devices() -> Result<()> {
     Ok(())
 }
 
-fn migrate_legacy(pile: &Path, key: Option<&Path>) -> Result<()> {
-    let frozen = freeze_source(pile)?;
-    let plan = voice_cutover::plan(&frozen)?;
-    let report = plan.report().clone();
-    let commits = voice_cutover::publish(&frozen, &plan, pile, key)?;
-    println!(
-        "Validated {} Voice + {} Body authored commits ({} split across native transaction boundaries; {} native transactions coalesced several route sources; {} unrelated Body commits omitted; {} source-empty; {} contentless merges remained ancestry); reconstructed {} routes and {} utterances ({} from Voice, {} from Body) / {} facts in {} native commits.",
-        report.voice_authored_commits,
-        report.body_authored_commits,
-        report.split_authored_commits,
-        report.coalesced_native_commits,
-        report.body_without_voice_commits,
-        report.authored_empty_commits,
-        report.contentless_merges,
-        report.canonical_routes,
-        report.canonical_utterances,
-        report.legacy_voice_utterances,
-        report.legacy_body_utterances,
-        report.output_facts,
-        commits.len(),
-    );
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let pile = cli.pile.clone();
@@ -1254,7 +1223,6 @@ fn main() -> Result<()> {
             storage.with_session(|session| cmd_route_set(session, &channel, &devices))?
         }
         Some(Command::Devices) => cmd_devices()?,
-        Some(Command::MigrateLegacy) => migrate_legacy(&pile, key.as_deref())?,
     }
     Ok(())
 }
@@ -1268,7 +1236,7 @@ mod tests {
     use triblespace::core::collection::simplearchive_union;
     use triblespace::core::repo::BlobStoreGet;
 
-    use faculties::collection_cutover::{discover_target, initialize_signer};
+    use faculties::storage::{discover_target, initialize_signer};
     use faculties::schemas::voice::{utterance, KIND_UTTERANCE};
 
     fn dev(name: &str, default: bool) -> AudioDevice {

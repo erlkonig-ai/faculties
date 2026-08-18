@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::files as file_capability;
 use faculties::schemas::embeddings;
 use faculties::schemas::files::{
@@ -2127,7 +2127,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "local-embed")]
     use ed25519_dalek::SigningKey;
-    use faculties::collection_cutover::initialize_signer;
+    use faculties::storage::initialize_signer;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU64, Ordering};
 

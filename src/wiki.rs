@@ -1094,7 +1094,7 @@ mod tests {
         fragment += right_fragment;
         fragment += untagged_fragment;
 
-        let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         Collection::new(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
             .commit(fragment)
             .unwrap();
@@ -1132,7 +1132,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wiki.pile");
         File::create(&path).unwrap();
-        let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         let reader = pile.reader().unwrap();
         pile.close().unwrap();
 
@@ -1158,7 +1158,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wiki.pile");
         File::create(&path).unwrap();
-        let mut pile = crate::collection_cutover::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         let reader = pile.reader().unwrap();
         pile.close().unwrap();
 

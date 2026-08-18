@@ -27,14 +27,12 @@ use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::View;
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenLegacyBranch, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit,
-};
-use crate::decide::{self as capability, FactorSide, IntervalValue, TextHandle};
-use crate::schemas::decide::{self as schema, decide, factor, KIND_CON, KIND_DECISION, KIND_PRO};
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
+use faculties::storage::{publish_fragments};
+use faculties::decide::{self as capability, FactorSide, IntervalValue, TextHandle};
+use faculties::schemas::decide::{self as schema, decide, factor, KIND_CON, KIND_DECISION, KIND_PRO};
 
-pub use crate::schemas::decide::LEGACY_BRANCH_NAME;
+pub use faculties::schemas::decide::LEGACY_BRANCH_NAME;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LegacyDecision {
@@ -862,9 +860,8 @@ mod tests {
     use triblespace::macros::entity;
     use triblespace::prelude::{ufoid, BlobStore, ExclusiveId, TryToInline};
 
-    use crate::collection_cutover::{
-        discover_target, freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     struct Fixture {
         _directory: tempfile::TempDir,

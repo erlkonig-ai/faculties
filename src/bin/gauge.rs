@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::collection_cutover::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::schemas::wiki::extract_link_targets;
 use faculties::wiki::{self as wiki_model, WikiCatalog};
 use triblespace::core::repo::pile::PileReader;
@@ -499,7 +499,7 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    use faculties::collection_cutover::initialize_signer;
+    use faculties::storage::initialize_signer;
     use faculties::schemas::wiki::TAG_ARCHIVED_ID;
     use faculties::wiki::{author_record, revision_record, tag_record, RevisionDraft};
     use hifitime::Epoch;

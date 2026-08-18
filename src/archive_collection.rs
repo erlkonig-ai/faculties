@@ -32,7 +32,7 @@ use triblespace_search::tokens::{hash_tokens, WordHash};
 
 use crate::archive_bm25;
 use crate::blockdag::{self, CatalogValidation};
-use crate::collection_cutover::{load_signer, open_pile_strict};
+use crate::storage::{load_signer, open_pile_strict};
 use crate::schemas::{blockdag as schema, files as files_schema};
 
 #[cfg(test)]
@@ -1332,7 +1332,7 @@ fn optional_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collection_cutover::initialize_signer;
+    use crate::storage::initialize_signer;
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use tempfile::TempDir;

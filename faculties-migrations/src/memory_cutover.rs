@@ -28,13 +28,11 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use triblespace_search::succinct::SuccinctBM25Blob;
 
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, project_legacy_authored_commits, FrozenLegacyBranch,
-    FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
-};
-use crate::memory;
-use crate::schemas::embeddings::{self, Embedding768};
-use crate::schemas::memory::{
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{load_signer, open_pile_strict};
+use faculties::memory;
+use faculties::schemas::embeddings::{self, Embedding768};
+use faculties::schemas::memory::{
     self as schema, ctx, search_index, KIND_CHUNK_ID, KIND_RETRACTION, KIND_SEARCH_INDEX,
 };
 
@@ -1313,9 +1311,8 @@ mod tests {
     use triblespace::core::collection::Collection;
     use triblespace::core::repo::{BlobStore, Repository};
 
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 

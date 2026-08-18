@@ -34,9 +34,8 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::core::trible::{Fragment, TribleSet};
 
 use crate::activation_cutover::{ActivationPlan, PlannedCollection};
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, FrozenSource, PhysicalSourceFingerprint,
-};
+use crate::collection_cutover::{FrozenSource, PhysicalSourceFingerprint};
+use faculties::storage::{load_signer, open_pile_strict};
 
 /// Result of a completely validated activation attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -615,7 +614,8 @@ mod tests {
     use triblespace::macros::entity;
 
     use super::*;
-    use crate::collection_cutover::{freeze_source, initialize_signer};
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer};
 
     const SCOPE: Id = Id::new([0x61; 16]).expect("nonzero test id");
 
@@ -873,7 +873,7 @@ mod tests {
         assert_eq!(signer.verifying_key(), fixture.signer.verifying_key());
         assert_eq!(target, real.canonicalize().unwrap());
         assert_eq!(candidate.parent(), target.parent());
-        assert!(!crate::collection_cutover::signer_path(&real, None).exists());
+        assert!(!faculties::storage::signer_path(&real, None).exists());
 
         let frozen = freeze_source(&fixture.live).unwrap();
         let fragment = text_fragment(0x6A, "through symlink");

@@ -21,9 +21,8 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::body_cutover;
-use faculties::collection_cutover::{
-    freeze_source, load_signer, open_pile_strict, publish_fragment,
+use faculties::storage::{
+    load_signer, open_pile_strict, publish_fragment,
 };
 use faculties::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
 use hifitime::efmt::consts::ISO8601;
@@ -135,11 +134,6 @@ enum Command {
         /// Output path. Omit for a default name, @- for stdout.
         output: Option<String>,
     },
-    /// Additively reconstruct the frozen legacy `body` and `senses` branches
-    /// as current native Body records. Stop every writer to both branches
-    /// before running this command. The old pins are retained and no live
-    /// command ever reads or writes them afterwards.
-    MigrateLegacy,
     /// Gentle wake-up motion (daemon-defined, bounded).
     Wake,
     /// Gentle go-to-sleep motion (daemon-defined, bounded).
@@ -1076,46 +1070,6 @@ fn cmd_act(daemon: &str, pose: &str, duration: f64, dt: f64, now: bool) -> Resul
     Ok(())
 }
 
-fn cmd_migrate_legacy(storage: BodyStorage<'_>) -> Result<()> {
-    // Fail before inspecting legacy state if no durable native authority was
-    // explicitly initialized for this pile.
-    load_signer(storage.pile, storage.key)?;
-    let existing = storage.with_view(|facts, _| Ok(facts.clone()))?;
-    let source = freeze_source(storage.pile).context("freeze legacy Body source")?;
-    let plan = body_cutover::plan(&source)?;
-    let mut expected = existing;
-    expected += plan.materialized_facts();
-
-    let commits = body_cutover::publish(&source, &plan, storage.pile, storage.key)?;
-    let actual = storage.with_view(|facts, _| Ok(facts.clone()))?;
-    if actual != expected {
-        bail!("Body migration result is not exactly the prior native value union the canonical legacy rewrite");
-    }
-
-    let report = plan.report();
-    println!(
-        "migrated {} authored Body/Senses commit{} ({} source-empty; {} contentless merges remained ancestry), reconstructing {} captures and {} intents / {} facts in {} native commits into scope {:X}",
-        report.authored_commits,
-        if report.authored_commits == 1 {
-            ""
-        } else {
-            "s"
-        },
-        report.authored_empty_commits,
-        report.contentless_merges,
-        report.canonical_captures,
-        report.canonical_intents,
-        report.output_facts,
-        commits.len(),
-        DEFAULT_SCOPE_ID
-    );
-    println!(
-        "validated and excluded {} historical utterances for the Voice rewrite; legacy branches retained",
-        report.excluded_utterances
-    );
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let pile = cli.pile;
@@ -1186,9 +1140,6 @@ fn main() -> Result<()> {
             &id,
             output.as_deref(),
         )?,
-        Some(Command::MigrateLegacy) => {
-            cmd_migrate_legacy(require_storage(pile.as_deref(), key.as_deref())?)?
-        }
     }
     Ok(())
 }
@@ -1198,7 +1149,7 @@ mod tests {
     use std::fs::{self, File};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use faculties::collection_cutover::initialize_signer;
+    use faculties::storage::initialize_signer;
 
     use super::*;
 

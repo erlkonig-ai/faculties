@@ -35,12 +35,10 @@ use triblespace::core::trible::{Fragment, Trible, TribleSet};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::inlineencodings;
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenLegacyBranch, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit,
-};
-use crate::planner::{self, EventDraft, IntervalValue, STATUS_CANCELLED};
-use crate::schemas::planner::{
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
+use faculties::storage::{publish_fragments};
+use faculties::planner::{self, EventDraft, IntervalValue, STATUS_CANCELLED};
+use faculties::schemas::planner::{
     event, note, DEFAULT_SCOPE_ID, KIND_EVENT_ID, KIND_NOTE_ID, LEGACY_BRANCH_NAME,
 };
 
@@ -1101,10 +1099,9 @@ mod tests {
     use triblespace::prelude::{ExclusiveId, TryToInline};
 
     use super::*;
-    use crate::collection_cutover::{
-        discover_target, freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
-    use crate::planner::{STATUS_CONFIRMED, TRANSP_OPAQUE};
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
+    use faculties::planner::{STATUS_CONFIRMED, TRANSP_OPAQUE};
 
     const OLD_EVENT_A: Id = id_hex!("B1000000000000000000000000000001");
     const OLD_EVENT_B: Id = id_hex!("B1000000000000000000000000000002");
@@ -1464,7 +1461,7 @@ mod tests {
         for commit in &target_commits {
             let metadata: TribleSet = target_reader.get(commit.metadata()).unwrap();
             for (message,) in find!(
-                (message: crate::planner::TextHandle),
+                (message: faculties::planner::TextHandle),
                 pattern!(&metadata, [{ _?subject @ metadata::description: ?message }])
             ) {
                 let message: View<str> = target_reader.get(message).unwrap();

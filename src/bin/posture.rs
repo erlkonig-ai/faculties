@@ -26,7 +26,6 @@
 //!   decide ... --about <occurrence> — durable judgement of one occurrence
 //!   posture coverage <scan>    — what that scan did NOT look at
 //!   posture scans              — recent scans
-//!   posture migrate-legacy     — additive stopped-world policy migration
 
 // In the query DSL `(expression)` means "this bound Rust value", while
 // `?name` introduces a query variable. Rust's ordinary-expression lint cannot
@@ -35,9 +34,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::collection_cutover::{discover_target, load_signer, open_pile_strict};
+use faculties::storage::{discover_target, load_signer, open_pile_strict};
 use faculties::decide::{self, Resolution};
-use faculties::posture_cutover;
 use faculties::schemas::decide::DEFAULT_SCOPE_ID as DEFAULT_DECIDE_SCOPE_ID;
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::posture::{
@@ -110,9 +108,6 @@ enum Command {
     },
     /// Recent scans
     Scans,
-    /// Additively publish the stopped legacy `posture` branch into the fixed
-    /// native policy collection. Stop every legacy Posture writer first.
-    MigrateLegacy,
     /// Install a pre-push hook so the audit runs without being remembered
     Hook {
         /// Repository to install into
@@ -1819,7 +1814,7 @@ impl PostureStorage<'_> {
             DEFAULT_POLICY_SCOPE_ID,
             "policy",
             |collection, current, reader, _| {
-                posture_cutover::validate_policy_catalog_union(reader, current, &fragment)?;
+                faculties::posture_policy::validate_policy_catalog_union(reader, current, &fragment)?;
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
                 collection
                     .commit(fragment)
@@ -2107,7 +2102,7 @@ where
 }
 
 fn validate_policy_view(view: &CollectionView) -> Result<()> {
-    posture_cutover::validate_policy_catalog(&view.reader, &view.facts)
+    faculties::posture_policy::validate_policy_catalog(&view.reader, &view.facts)
 }
 fn validate_scan_view(view: &CollectionView) -> Result<()> {
     validate_scan_view_parts(&view.reader, &view.facts, &view.commits)
@@ -3181,46 +3176,6 @@ fn cmd_scans(storage: PostureStorage<'_>) -> Result<()> {
     for (_, scan, findings, target) in scans {
         println!("{}  {findings:>5} findings  {target}", fmt_id(scan));
     }
-    Ok(())
-}
-
-fn cmd_migrate_legacy(storage: PostureStorage<'_>) -> Result<()> {
-    let source = faculties::collection_cutover::freeze_source(storage.pile)
-        .context("freeze legacy Posture source")?;
-    let source_pins = source.legacy_pins().to_vec();
-    let plan = posture_cutover::plan(&source)?;
-
-    let current = storage.policy_view()?;
-    let mut staged = Fragment::empty();
-    for commit in plan.commits() {
-        staged += commit.fragment.clone();
-    }
-    let union =
-        posture_cutover::validate_policy_catalog_union(&current.reader, &current.facts, &staged)
-            .context("preflight prior native policy union additive legacy projection")?;
-    drop(current);
-
-    let published = posture_cutover::publish(&source, &plan, storage.pile, storage.key)?;
-    let actual = storage.policy_view()?;
-    if actual.facts != union {
-        bail!("Posture migration result differs from the preflight additive union");
-    }
-    let refreshed = faculties::collection_cutover::freeze_source(storage.pile)?;
-    if refreshed.legacy_pins() != source_pins.as_slice() {
-        bail!("Posture migration changed the frozen legacy pin table");
-    }
-
-    println!(
-        "migrated {} authored Posture commit{}: {} preserved facts + {} canonical shadow facts = {} facts in policy scope {:X}",
-        published.len(),
-        if published.len() == 1 { "" } else { "s" },
-        plan.report().input_unique_facts,
-        plan.report().canonical_facts,
-        plan.report().output_facts,
-        DEFAULT_POLICY_SCOPE_ID,
-    );
-    println!("legacy branch retained; native commands no longer consult it");
-    println!("historical scan projection is empty; no synthetic scan authority was published");
     Ok(())
 }
 
@@ -5199,7 +5154,6 @@ fn main() -> Result<()> {
         }) => cmd_list(storage, scan, examples, all, ids),
         Some(Command::Coverage { scan }) => cmd_coverage(storage, scan),
         Some(Command::Scans) => cmd_scans(storage),
-        Some(Command::MigrateLegacy) => cmd_migrate_legacy(storage),
         Some(Command::Hook {
             repo,
             channel,
@@ -5248,7 +5202,7 @@ mod tests {
             let pile = directory.path().join("posture-test.pile");
             let key = directory.path().join("posture-test.key");
             File::create(&pile).unwrap();
-            faculties::collection_cutover::initialize_signer(&pile, Some(&key)).unwrap();
+            faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 pile,
@@ -5265,7 +5219,7 @@ mod tests {
 
         fn publish_raw(&self, scope: Id, mut fragment: Fragment, description: &str) {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
-            faculties::collection_cutover::publish_fragment(
+            faculties::storage::publish_fragment(
                 &self.pile,
                 Some(&self.key),
                 scope,

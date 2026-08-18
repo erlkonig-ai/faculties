@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::secrets::schema::DEFAULT_SCOPE_ID;
 use faculties::secrets::{
     self as secrets_model, entity_name, grant_fragment, open_version, prepare_identity, read_text,
@@ -19,7 +19,6 @@ use faculties::secrets::{
     scope_by_creator_and_name, scope_fragment, seal_version, share_version, validate_candidate,
     SecretsCatalog,
 };
-use faculties::secrets_cutover;
 use hifitime::Epoch;
 use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
@@ -86,8 +85,6 @@ enum Command {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
-    /// Migrate the stopped legacy `secrets` Repository branch additively.
-    MigrateLegacy,
 }
 
 #[derive(Subcommand)]
@@ -175,16 +172,6 @@ struct LoadedSecrets {
 }
 
 impl SecretsStorage<'_> {
-    fn materialized_facts(&self) -> Result<TribleSet> {
-        let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
-        let result = collection
-            .materialize()
-            .context("materialize raw Secrets collection");
-        finish_pile(collection.into_storage(), result)
-    }
-
     fn with_collection<T>(
         &self,
         operation: impl FnOnce(&mut Collection<Pile>, &LoadedSecrets) -> Result<T>,
@@ -631,45 +618,6 @@ fn cmd_secret_list(storage: SecretsStorage<'_>) -> Result<()> {
     })
 }
 
-fn cmd_migrate_legacy(storage: SecretsStorage<'_>) -> Result<()> {
-    // Fail before inspecting legacy state if durable native authority was not
-    // initialized explicitly for this pile.
-    load_signer(storage.pile, storage.key)?;
-    // Read the raw collection value without requiring domain validity. This
-    // lets an idempotent rerun finish after a process died between commits.
-    let existing = storage.materialized_facts()?;
-    let source = freeze_source(storage.pile).context("freeze legacy Secrets source")?;
-    let plan = secrets_cutover::plan(&source)?;
-    let mut expected = existing;
-    expected += plan.materialized_facts();
-
-    let commits = secrets_cutover::publish(&source, &plan, storage.pile, storage.key)?;
-    let actual = storage.with_view(|loaded| Ok(loaded.view.facts.clone()))?;
-    if actual != expected {
-        bail!(
-            "Secrets migration result is not prior native value union planned canonical Secrets facts"
-        );
-    }
-
-    println!(
-        "migrated {} authored Secrets commit{} ({} retained facts, {} retired historical Mail facts, {} retired-only commit{}, {} authored-empty) into scope {:X}",
-        commits.len(),
-        if commits.len() == 1 { "" } else { "s" },
-        plan.report().facts,
-        plan.report().retired_facts,
-        plan.report().retired_only_commits,
-        if plan.report().retired_only_commits == 1 {
-            ""
-        } else {
-            "s"
-        },
-        plan.report().authored_empty_commits,
-        DEFAULT_SCOPE_ID,
-    );
-    println!("legacy branch retained; native commands no longer consult it");
-    Ok(())
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -705,6 +653,5 @@ fn main() -> Result<()> {
             SecretCmd::Share { scope, name, r#as } => cmd_secret_share(storage, scope, name, r#as),
             SecretCmd::List => cmd_secret_list(storage),
         },
-        Command::MigrateLegacy => cmd_migrate_legacy(storage),
     }
 }

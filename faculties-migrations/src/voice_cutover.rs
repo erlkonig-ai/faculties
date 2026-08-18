@@ -22,13 +22,11 @@ use triblespace::core::repo::{BlobStore, BlobStoreMeta};
 use triblespace::prelude::*;
 
 use crate::body_cutover;
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, project_legacy_authored_commits, FrozenLegacyBranch,
-    FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit,
-};
-use crate::schemas::body::LEGACY_BODY_BRANCH_NAME;
-use crate::schemas::voice::{self as schema, COLLECTION_SCOPE_ID, LEGACY_BRANCH_NAME};
-use crate::voice;
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
+use faculties::storage::{load_signer, open_pile_strict};
+use faculties::schemas::body::LEGACY_BODY_BRANCH_NAME;
+use faculties::schemas::voice::{self as schema, COLLECTION_SCOPE_ID, LEGACY_BRANCH_NAME};
+use faculties::voice;
 
 const BODY_PRIVATE_CHANNEL: &str = "computer";
 const BODY_PUBLIC_CHANNEL: &str = "body";
@@ -734,13 +732,12 @@ mod tests {
     use triblespace::core::trible::intrinsic_entity_id_v1;
 
     use super::*;
-    use crate::body::{self, IntentRow};
+    use faculties::body::{self, IntentRow};
     use crate::body_cutover::{legacy_utterance, LEGACY_KIND_UTTERANCE};
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
-    use crate::schemas::body::{capture, KIND_INTENT};
-    use crate::schemas::voice::{
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use faculties::schemas::body::{capture, KIND_INTENT};
+    use faculties::schemas::voice::{
         route, utterance, CHANNEL_SAY, CHANNEL_SHOUT, KIND_ROUTE, KIND_UTTERANCE,
     };
 

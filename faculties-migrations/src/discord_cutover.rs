@@ -18,13 +18,11 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, project_legacy_authored_commits, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate,
-};
-use crate::discord;
-use crate::schemas::archive::archive;
-use crate::schemas::discord::{discord as schema, DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{load_signer, open_pile_strict};
+use faculties::discord;
+use faculties::schemas::archive::archive;
+use faculties::schemas::discord::{discord as schema, DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
 
 /// One exact native COMMIT projected from one authored legacy commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,9 +264,8 @@ mod tests {
     use triblespace::core::repo::{PinStore, Repository};
 
     use super::*;
-    use crate::collection_cutover::{
-        discover_target, freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     struct Fixture {
         _directory: tempfile::TempDir,

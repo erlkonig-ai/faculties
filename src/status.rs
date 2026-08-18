@@ -57,7 +57,7 @@ fn exactly_one<T>(event: Id, field: &str, values: Vec<T>) -> Result<T> {
 ///
 /// The stopped-world transform uses this same constructor as the live writer,
 /// so migration cannot accidentally introduce a second identity protocol.
-pub(crate) fn status_record(window: Id, text: TextHandle, at: IntervalValue) -> Fragment {
+pub fn status_record(window: Id, text: TextHandle, at: IntervalValue) -> Fragment {
     entity! {
         metadata::tag: &KIND_STATUS_UPDATE,
         status::window: window,
@@ -83,7 +83,7 @@ pub fn status_fragment(window: Id, text: &str, at: IntervalValue) -> Result<Frag
 /// This is crate-visible for the stopped-world legacy validator. Ordinary
 /// readers use [`load_status_rows`], which selects only intrinsic records and
 /// thereby leaves preserved legacy facts inert.
-pub(crate) fn load_tagged_status_rows(facts: &TribleSet) -> Result<Vec<StatusRow>> {
+pub fn load_tagged_status_rows(facts: &TribleSet) -> Result<Vec<StatusRow>> {
     let events: BTreeSet<Id> = find!(
         event: Id,
         pattern!(facts, [{ ?event @ metadata::tag: &KIND_STATUS_UPDATE }])

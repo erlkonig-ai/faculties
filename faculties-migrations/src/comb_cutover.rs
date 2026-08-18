@@ -22,12 +22,10 @@ use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenLegacyBranch, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate,
-};
-use crate::comb::{self, CursorDraft, CursorState, CursorTrack};
-use crate::schemas::memory::{
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{publish_fragments};
+use faculties::comb::{self, CursorDraft, CursorState, CursorTrack};
+use faculties::schemas::memory::{
     self as schema,
     comb::{cursor_grain, cursor_persona, cursor_position, cursor_stream, kind_comb_cursor},
 };
@@ -59,7 +57,7 @@ pub struct CombMigrationPlan {
 struct LegacyCursor {
     track: CursorTrack,
     state: CursorState,
-    observed_at: BTreeSet<crate::comb::IntervalValue>,
+    observed_at: BTreeSet<faculties::comb::IntervalValue>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -246,7 +244,7 @@ fn project_authored_delta(
                 && is_cursor_intrinsic_attribute(*fact.a())
                 && !parent_snapshot.contains(fact)
         });
-        let new_observations: BTreeSet<crate::comb::IntervalValue> = delta
+        let new_observations: BTreeSet<faculties::comb::IntervalValue> = delta
             .facts
             .iter()
             .filter(|fact| fact.e() == &legacy && fact.a() == &metadata::created_at.id())
@@ -488,6 +486,14 @@ pub struct CombCutoverPlan {
     aliases: BTreeMap<Id, Id>,
 }
 
+/// Conservation census for one legacy Comb cursor migration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CombMigrationReport {
+    pub commits: usize,
+    pub facts: usize,
+    pub aliases: usize,
+}
+
 impl CombCutoverPlan {
     pub const fn source_pin(&self) -> LegacyPinCoordinate {
         self.source_pin
@@ -505,6 +511,16 @@ impl CombCutoverPlan {
     /// cursor snapshots. It is not asserted into the strict Comb scope.
     pub fn aliases(&self) -> &BTreeMap<Id, Id> {
         &self.aliases
+    }
+
+    /// Conservation census for this plan, in the same shape every other typed
+    /// migration reports, so one caller can render all of them alike.
+    pub fn report(&self) -> CombMigrationReport {
+        CombMigrationReport {
+            commits: self.commits.len(),
+            facts: self.facts.len(),
+            aliases: self.aliases.len(),
+        }
     }
 
     pub fn verify(&self) -> Result<()> {
@@ -660,12 +676,11 @@ mod tests {
     use triblespace::core::repo::{BlobStore, PinStore, Repository};
 
     use super::*;
-    use crate::collection_cutover::{
-        freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
-    use crate::comb::CursorResolution;
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use faculties::comb::CursorResolution;
 
-    fn point(seconds: f64) -> crate::comb::IntervalValue {
+    fn point(seconds: f64) -> faculties::comb::IntervalValue {
         let at = hifitime::Epoch::from_tai_seconds(seconds);
         (at, at).try_to_inline().unwrap()
     }

@@ -17,12 +17,10 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, project_legacy_authored_commits, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate,
-};
-use crate::headspace as capability;
-use crate::schemas::headspace::{DEFAULT_SCOPE_ID, KIND_LIVE_RECORD, LEGACY_BRANCH_NAME};
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{load_signer, open_pile_strict};
+use faculties::headspace as capability;
+use faculties::schemas::headspace::{DEFAULT_SCOPE_ID, KIND_LIVE_RECORD, LEGACY_BRANCH_NAME};
 
 /// One native commit projected from one verified legacy authored commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -275,7 +273,8 @@ mod tests {
     use triblespace::core::repo::{BlobStoreGet, BlobStoreList, PinStore, Repository};
 
     use super::*;
-    use crate::collection_cutover::{freeze_source, initialize_signer};
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{initialize_signer};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 

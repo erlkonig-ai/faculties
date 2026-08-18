@@ -8,9 +8,9 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
-use faculties::{cognition, cognition_cutover};
+use faculties::cognition;
 use triblespace::core::repo::BlobStore;
 use faculties::legacy_hint::open_scope;
 
@@ -35,9 +35,6 @@ struct Cli {
 enum Command {
     /// Validate the native Cognition value and all known attachments.
     Check,
-    /// Additively publish the complete frozen legacy `cognition` and `main`
-    /// branches. Stop every Faculties and drive legacy writer first.
-    MigrateLegacy,
 }
 
 fn check(cli: &Cli) -> Result<()> {
@@ -62,27 +59,6 @@ fn check(cli: &Cli) -> Result<()> {
     finish(collection.into_storage(), result)
 }
 
-fn migrate_legacy(cli: &Cli) -> Result<()> {
-    // Fail on absent authority before even freezing the stopped source. The
-    // migration then deliberately has two pile lifetimes: immutable source
-    // snapshot, followed by one target publication lifetime.
-    load_signer(&cli.pile, cli.key.as_deref())?;
-    let source = freeze_source(&cli.pile).context(
-        "freeze the complete legacy Cognition source; every Faculties and drive writer must be stopped",
-    )?;
-    let plan = cognition_cutover::plan(&source)?;
-    let commits = cognition_cutover::publish(&source, &plan, &cli.pile, cli.key.as_deref())?;
-    println!(
-        "migrated {} authored Cognition/main commit{} ({} authored empty): {} exact facts in fixed scope {DEFAULT_SCOPE_ID:X}",
-        commits.len(),
-        if commits.len() == 1 { "" } else { "s" },
-        plan.report().authored_empty_commits,
-        plan.report().facts,
-    );
-    println!("legacy branches retained as inert evidence; native commands no longer consult them");
-    Ok(())
-}
-
 fn finish<T>(pile: triblespace::core::repo::pile::Pile, result: Result<T>) -> Result<T> {
     match (result, pile.close()) {
         (Ok(value), Ok(())) => Ok(value),
@@ -98,7 +74,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Check => check(&cli),
-        Command::MigrateLegacy => migrate_legacy(&cli),
     }
 }
 

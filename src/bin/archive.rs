@@ -15,14 +15,11 @@ use faculties::archive_collection::{
     ArchiveProjection, ArchiveSearchSnapshot, ArchiveSnapshot,
 };
 use faculties::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
-use faculties::archive_cutover;
 use faculties::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
-use faculties::blockdag::CatalogValidation;
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::comb::{
     self as comb_model, CombCatalog, CursorDraft, CursorResolution, CursorState,
 };
-use faculties::comb_cutover;
 use faculties::schemas::blockdag as archive_schema;
 use faculties::schemas::memory::DEFAULT_COMB_SCOPE_ID;
 use hifitime::Epoch;
@@ -93,8 +90,6 @@ enum Command {
     },
     /// Ensure exact raw-Succinct and portable BM25 collection derives.
     Index,
-    /// Migrate stopped legacy Archive and optional Comb repository branches.
-    MigrateLegacy,
     /// Replay canonical blocks as one interleaved temporal stream.
     Replay {
         /// `start <from-ts>`, `stop`, or nothing for the next batch.
@@ -863,87 +858,6 @@ fn run_index(storage: ArchiveStorage<'_>) -> Result<()> {
     Ok(())
 }
 
-fn run_migrate_legacy(storage: ArchiveStorage<'_>) -> Result<()> {
-    let source = freeze_source(storage.pile).context(
-        "freeze legacy Archive source; every legacy writer must be stopped before migration",
-    )?;
-    let plan = archive_cutover::plan(&source)?;
-    let comb_plan = comb_cutover::plan_if_present(&source)?;
-
-    let existing = storage.load()?;
-    let mut staged = Fragment::empty();
-    for commit in plan.commits() {
-        staged += commit.fragment().clone();
-    }
-    let (expected, validation) = faculties::blockdag::validate_catalog_union(
-        existing.reader(),
-        existing.catalog(),
-        &staged,
-    )?;
-    require_accepted(validation, "existing Archive union legacy migration")?;
-    drop(existing);
-
-    let expected_comb = if let Some(plan) = &comb_plan {
-        let (mut current, _) = storage.load_comb()?;
-        current += plan.facts().clone();
-        comb_model::load_catalog(&current)
-            .context("validate existing Comb union legacy cursor migration")?;
-        Some(current)
-    } else {
-        None
-    };
-
-    let commits = archive_cutover::publish(&source, &plan, storage.pile, storage.key)?;
-    let comb_commits = match &comb_plan {
-        Some(plan) => comb_cutover::publish(&source, plan, storage.pile, storage.key)?,
-        None => Vec::new(),
-    };
-    let materialized = storage.load()?;
-    if materialized.catalog() != &expected {
-        bail!("Archive changed during stopped-world migration; published commits are replay-safe, stop every writer and retry verification");
-    }
-    if let Some(expected_comb) = expected_comb {
-        let (actual, _) = storage.load_comb()?;
-        if actual != expected_comb {
-            bail!("Comb changed during stopped-world migration; published commits are replay-safe, stop every writer and retry verification");
-        }
-    }
-    println!(
-        "migrated {} authored legacy commit(s), {} fact(s), {} metafact(s); {} native COMMIT record(s)",
-        plan.report().authored_commits,
-        plan.report().facts,
-        plan.report().metafacts,
-        commits.len(),
-    );
-    if let Some(comb_plan) = comb_plan {
-        println!(
-            "migrated {} authored Comb cursor commit(s) into its separate collection ({} canonical cursor fact(s), {} native COMMIT record(s))",
-            comb_plan.commits().len(),
-            comb_plan.facts().len(),
-            comb_commits.len(),
-        );
-    }
-    println!("legacy branch retained as read-only migration evidence");
-    Ok(())
-}
-
-fn require_accepted(validation: CatalogValidation, label: &str) -> Result<()> {
-    match validation {
-        CatalogValidation::Accepted => Ok(()),
-        CatalogValidation::Pending { missing } => bail!(
-            "{label} is missing {} attachment blob(s): {}",
-            missing.len(),
-            missing
-                .iter()
-                .take(8)
-                .map(hex::encode_upper)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        CatalogValidation::Rejected(reason) => bail!("{label} is invalid: {reason}"),
-    }
-}
-
 fn parse_tai_timestamp(value: &str) -> Result<Epoch> {
     let (date, time) = value
         .split_once('T')
@@ -1235,7 +1149,6 @@ fn main() -> Result<()> {
         Command::Thread { id, limit } => run_thread(storage, &id, limit),
         Command::Search { text, limit } => run_search(storage, &text, limit),
         Command::Index => run_index(storage),
-        Command::MigrateLegacy => run_migrate_legacy(storage),
         Command::Replay {
             action,
             limit,
@@ -1248,7 +1161,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::collection_cutover::initialize_signer;
+    use faculties::storage::initialize_signer;
     use std::fs;
 
     struct Fixture {
@@ -1293,7 +1206,6 @@ mod tests {
                 "import",
                 "index",
                 "list",
-                "migrate-legacy",
                 "replay",
                 "search",
                 "show",

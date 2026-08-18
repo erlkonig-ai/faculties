@@ -24,16 +24,14 @@ use triblespace::prelude::blobencodings::{LongString, RawBytes, WasmCode};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{
-    load_signer, open_pile_strict, project_legacy_authored_commits, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate,
-};
-use crate::schemas::archive::archive;
-use crate::schemas::files::file;
-use crate::schemas::teams::{teams, DEFAULT_SCOPE_ID};
-use crate::teams as capability;
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
+use faculties::storage::{load_signer, open_pile_strict};
+use faculties::schemas::archive::archive;
+use faculties::schemas::files::file;
+use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID};
+use faculties::teams as capability;
 
-use crate::schemas::teams::LEGACY_BRANCH_NAME;
+use faculties::schemas::teams::LEGACY_BRANCH_NAME;
 
 mod legacy {
     use super::*;
@@ -606,9 +604,8 @@ mod tests {
     use triblespace::core::repo::{PinStore, Repository};
 
     use super::*;
-    use crate::collection_cutover::{
-        discover_target, freeze_source, initialize_signer, load_signer, open_pile_strict,
-    };
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 

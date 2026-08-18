@@ -730,7 +730,7 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    use crate::collection_cutover::{initialize_signer, open_pile_strict};
+    use crate::storage::{initialize_signer, open_pile_strict};
     use crate::schemas::memory::DEFAULT_SCOPE_ID;
     use triblespace::core::collection::Collection;
 

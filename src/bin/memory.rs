@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
-use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::schemas::embeddings::DEFAULT_SCOPE_ID as EMBEDDINGS_SCOPE_ID;
 #[cfg(feature = "local-embed")]
 use faculties::schemas::embeddings::{self, Embedding768};
@@ -25,7 +25,7 @@ use faculties::memory_cover::{
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
 use faculties::{
     blockdag::{self, CatalogValidation},
-    cognition as cognition_model, comb as comb_model, memory as memory_model, memory_cutover,
+    cognition as cognition_model, comb as comb_model, memory as memory_model,
 };
 use hifitime::Epoch;
 use triblespace::core::blob::Bytes;
@@ -63,7 +63,6 @@ use faculties::legacy_hint::open_scope;
              memory supersede <new> <old>     — mark an existing chunk as replacing another (old leaves all views)\n  \
              memory retract <id> [reason]      — retire a mistaken/duplicate chunk with NO replacement (invisible tombstone; target leaves all views, nothing new shows up as a memory)\n  \
              memory retractions               — audit surface: list retractions (what was retracted, and why)\n  \
-             memory migrate-legacy            — additively publish the frozen legacy memory branch as native commits (stop every legacy writer first)\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
              memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
@@ -727,17 +726,6 @@ fn main() -> Result<()> {
     if cli.ids.first().is_some_and(|value| value == "density") {
         return cmd_density(storage, &cli.ids[1..]);
     }
-    if cli
-        .ids
-        .first()
-        .is_some_and(|value| value == "migrate-legacy")
-    {
-        if cli.ids.len() != 1 {
-            bail!("usage: memory migrate-legacy");
-        }
-        return cmd_migrate_legacy(storage);
-    }
-
     let loaded = storage.load()?;
     if cli.ids.first().is_some_and(|value| value == "turn") {
         if cli.ids.len() != 2 {
@@ -765,42 +753,6 @@ fn main() -> Result<()> {
         }
         first = false;
         print_chunk(&loaded.memory.reader, &loaded.memory.facts, chunk_id)?;
-    }
-    Ok(())
-}
-
-fn cmd_migrate_legacy(storage: MemoryStorage<'_>) -> Result<()> {
-    // Migration deliberately freezes and closes the old repository first,
-    // then performs preflight, publication, and verification through one
-    // native target open. No legacy pin is changed or consumed.
-    let source = freeze_source(storage.pile).context("freeze legacy Memory source")?;
-    let plan = memory_cutover::plan(&source)?;
-    let published = memory_cutover::publish(&source, &plan, storage.pile, storage.key)?;
-    let report = plan.report();
-    println!(
-        "migrated {} authored Memory commit{}: {} preserved facts + {} canonical shadow facts = {} total planned facts in scope {:X}",
-        published.len(),
-        if published.len() == 1 { "" } else { "s" },
-        report.preserved_facts,
-        report.canonical_facts,
-        report.output_facts,
-        MEMORY_SCOPE_ID,
-    );
-    println!(
-        "{} intrinsic nodes, {} legacy aliases, {} byte-exact cross-scope reference{}; legacy branch retained",
-        report.canonical_nodes,
-        report.legacy_aliases,
-        report.cross_scope_references,
-        if report.cross_scope_references == 1 { "" } else { "s" },
-    );
-    if report.omitted_search_entities != 0 || report.omitted_embedding_facts != 0 {
-        println!(
-            "preserved {} historical search-index entit{} and {} embedding fact{} as exact legacy exhaust; neither enters the canonical Memory projection",
-            report.omitted_search_entities,
-            if report.omitted_search_entities == 1 { "y" } else { "ies" },
-            report.omitted_embedding_facts,
-            if report.omitted_embedding_facts == 1 { "" } else { "s" },
-        );
     }
     Ok(())
 }
@@ -2946,8 +2898,6 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    use ed25519_dalek::SigningKey;
-    use triblespace::core::repo::Repository;
 
     struct TestPile {
         pile: PathBuf,
@@ -2960,7 +2910,7 @@ mod tests {
                 std::env::temp_dir().join(format!("faculties-memory-cover-{}.pile", ufoid().id));
             let key = pile.with_extension("key");
             File::create(&pile).expect("create test pile");
-            faculties::collection_cutover::initialize_signer(&pile, Some(&key))
+            faculties::storage::initialize_signer(&pile, Some(&key))
                 .expect("initialize test signer");
             Self { pile, key }
         }
@@ -2992,43 +2942,6 @@ mod tests {
             .publish_memory(&loaded, fragment)
             .expect("publish Memory chunk");
         id
-    }
-
-    #[test]
-    fn migrate_legacy_command_is_additive_and_replayable() {
-        let pile = TestPile::new();
-        let legacy_signer = SigningKey::from_bytes(&[0xA5; 32]);
-        let legacy_id = Id::new([0xA6; 16]).unwrap();
-        let legacy_store = open_pile_strict(&pile.pile).unwrap();
-        let mut repository =
-            Repository::new(legacy_store, legacy_signer, Fragment::empty()).unwrap();
-        let branch = *repository
-            .create_branch(faculties::schemas::memory::LEGACY_MEMORY_BRANCH_NAME, None)
-            .unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        let mut legacy = Fragment::empty();
-        let summary = legacy.put::<LongString, _>("legacy CLI memory".to_owned());
-        legacy += entity! { ExclusiveId::force_ref(&legacy_id) @
-            metadata::tag: &faculties::schemas::memory::KIND_CHUNK_ID,
-            ctx::summary: summary,
-            ctx::start_at: point("2026-02-01T00:00:00"),
-            ctx::end_at: point("2026-02-01T01:00:00"),
-            metadata::created_at: point("2026-02-01T01:00:00"),
-        };
-        workspace.commit(legacy, "legacy CLI event");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let storage = pile.storage();
-        cmd_migrate_legacy(storage).unwrap();
-        let loaded = storage.load().unwrap();
-        assert_eq!(loaded.catalog.chunks.len(), 1);
-        assert_eq!(loaded.catalog.alias_targets(legacy_id).len(), 1);
-        drop(loaded);
-
-        let length = std::fs::metadata(&pile.pile).unwrap().len();
-        cmd_migrate_legacy(storage).unwrap();
-        assert_eq!(std::fs::metadata(&pile.pile).unwrap().len(), length);
     }
 
     fn text_draft(summary: &str, start: &str, end: &str) -> memory_model::ChunkDraft {

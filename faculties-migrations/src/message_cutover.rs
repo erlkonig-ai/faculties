@@ -38,20 +38,18 @@ use triblespace::core::trible::{Fragment, TribleSet, V_START};
 use triblespace::macros::{attributes, entity, id_hex};
 use triblespace::prelude::inlineencodings;
 
-use crate::collection_cutover::{
-    project_legacy_authored_commits, publish_fragments, FrozenLegacyBranch, FrozenSource,
-    LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit,
-};
-use crate::message as current;
-use crate::relations;
+use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
+use faculties::storage::{publish_fragments};
+use faculties::message as current;
+use faculties::relations;
 use crate::relations_cutover;
-use crate::schemas::message::{
+use faculties::schemas::message::{
     self as schema, local, GROUP_SNAPSHOT_BASIS_CUTOVER_RECONSTRUCTED, KIND_MESSAGE_ID,
     KIND_READ_ID,
 };
-use crate::schemas::relations::KIND_GROUP_SNAPSHOT;
+use faculties::schemas::relations::KIND_GROUP_SNAPSHOT;
 
-pub use crate::schemas::message::LEGACY_BRANCH_NAME;
+pub use faculties::schemas::message::LEGACY_BRANCH_NAME;
 
 const KIND_PARTY_ID: Id = id_hex!("3AA2883528D3812067DFA1CD5DE5F8B8");
 const PARTY_LOCAL_AGENT_ID: Id = id_hex!("5EBC44A9FC4C8444AA01DFA7AC315AD5");
@@ -1515,10 +1513,9 @@ mod tests {
     use triblespace::macros::{entity, find, pattern};
 
     use super::*;
-    use crate::collection_cutover::{
-        discover_target, freeze_source, initialize_signer, open_pile_strict,
-    };
-    use crate::schemas::relations::KIND_PERSON_ID;
+    use crate::collection_cutover::{freeze_source};
+use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
+    use faculties::schemas::relations::KIND_PERSON_ID;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -1897,7 +1894,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(fs::metadata(&target_path).unwrap().len(), length);
 
-        let signer = crate::collection_cutover::load_signer(&target_path, Some(&key_path)).unwrap();
+        let signer = faculties::storage::load_signer(&target_path, Some(&key_path)).unwrap();
         let mut target = open_pile_strict(&target_path).unwrap();
         assert!(target
             .pins()

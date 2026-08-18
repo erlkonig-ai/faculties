@@ -398,7 +398,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::collection_cutover::initialize_signer;
+    use faculties::storage::initialize_signer;
 
     #[test]
     fn permanent_cli_has_no_branch_scope_head_or_migration_surface() {

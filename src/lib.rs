@@ -32,7 +32,6 @@ pub fn model_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".cache/faculties/models")
 }
 
-pub mod activation_cutover;
 pub mod archive_agy;
 pub mod archive_bm25;
 pub mod archive_chatgpt;
@@ -41,65 +40,41 @@ pub mod archive_claude_web;
 pub mod archive_codex;
 pub mod archive_collection;
 pub mod archive_copilot;
-pub mod archive_cutover;
 pub mod archive_gemini;
 pub mod archive_source;
 pub mod atlas;
-pub mod atlas_cutover;
 pub mod blockdag;
 pub mod body;
-pub mod body_cutover;
 pub mod bootstrap;
 pub mod cognition;
-pub mod cognition_cutover;
-pub mod collection_cutover;
 pub mod comb;
-pub mod comb_cutover;
 pub mod compass;
-pub mod compass_cutover;
 pub mod decide;
-pub mod decide_cutover;
 pub mod discord;
-pub mod discord_cutover;
-pub mod disposable_cutover;
 pub mod files;
-pub mod files_cutover;
-pub mod habit_cutover;
 pub mod habits;
 pub mod headspace;
-pub mod headspace_cutover;
 pub mod legacy_hint;
 pub mod mail;
-pub mod mail_cutover;
 pub mod mail_pop;
 pub mod memory;
 pub mod memory_cover;
-pub mod memory_cutover;
 pub mod message;
-pub mod message_cutover;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
 pub mod orient;
-pub mod orient_cutover;
 pub mod planner;
-pub mod planner_cutover;
-pub mod posture_cutover;
+pub mod posture_policy;
 pub mod relations;
-pub mod relations_cutover;
 pub mod schemas;
-pub mod secrets_cutover;
 pub mod status;
-pub mod status_cutover;
+pub mod storage;
 pub mod teams;
-pub mod teams_cutover;
 pub mod tokens;
 pub mod triage;
 pub mod voice;
-pub mod voice_cutover;
-pub mod web_cutover;
 pub mod wiki;
 pub mod wiki_additive;
-pub mod wiki_cutover;
 
 #[cfg(test)]
 mod attribute_id_preservation_tests;
