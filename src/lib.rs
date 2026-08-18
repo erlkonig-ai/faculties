@@ -65,6 +65,7 @@ pub mod nomic;
 pub mod orient;
 pub mod out;
 pub mod planner;
+pub mod posture_finding;
 pub mod posture_policy;
 pub mod relations;
 pub mod schemas;

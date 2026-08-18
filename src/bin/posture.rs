@@ -38,10 +38,17 @@ use faculties::storage::{discover_target, load_signer, open_pile_strict};
 use faculties::decide::{self, Resolution};
 use faculties::schemas::decide::DEFAULT_SCOPE_ID as DEFAULT_DECIDE_SCOPE_ID;
 use faculties::schemas::embeddings::{self, Embedding768};
+use faculties::posture_finding::{
+    commit_message_location, finding_entity, finding_id, git_probe, Carrier, GitObjects, Location,
+};
+#[cfg(test)]
+use faculties::posture_finding::Inner;
 use faculties::schemas::posture::{
-    modality, posture, DEFAULT_POLICY_SCOPE_ID, DEFAULT_SCAN_SCOPE_ID, DOC_UNSUPPORTED,
-    EXEMPLAR_PROTECTED, KIND_CHANNEL, KIND_DOCUMENT, KIND_FINDING, KIND_OMISSION,
-    KIND_POLICY_REVISION, KIND_SCAN, KIND_TERM, OUTCOME_EXAMINED, OUTCOME_PARSE_FAILED,
+    modality, posture, CARRIER_CONTAINER_MEMBER, CARRIER_GIT_BLOB, CARRIER_GIT_COMMIT,
+    DEFAULT_POLICY_SCOPE_ID, DEFAULT_SCAN_SCOPE_ID, DOC_UNSUPPORTED, EXEMPLAR_PROTECTED,
+    KIND_CHANNEL, KIND_DOCUMENT, KIND_FINDING, KIND_LEGACY_BRIDGE, KIND_OMISSION,
+    KIND_POLICY_REVISION, KIND_SCAN, KIND_SIGHTING, KIND_TERM, OUTCOME_EXAMINED,
+    OUTCOME_PARSE_FAILED,
 };
 #[cfg(any(feature = "local-embed", test))]
 use faculties::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
@@ -204,22 +211,53 @@ enum VocabCommand {
     },
 }
 
-// ── the extractors ──────────────────────────────────────────────────────────
-// Each returns (modality, locator, value) triples. No judgement, no ranking —
-// extraction and adjudication are separate stages on purpose.
+// ── where a finding lives ───────────────────────────────────────────────────
+//
+// A finding is located by CONTENT, and its id is `(modality, carrier, inner
+// locator)`. It used to be `(modality, path, commit:path:line, value)`, which
+// commit surgery destroyed: a rebase, cherry-pick, amend or history scrub
+// gives the same material a new `commit:path:line`, hence a new id, so every
+// Decide resolution silently stopped applying and the finding re-blocked.
+//
+// The coordinate is MODALITY-DEPENDENT on purpose. Source material has a git
+// blob and blobs survive commit surgery byte-identical; a byte range into an
+// OOXML zip or a PDF means nothing, so a container's carrier is the member
+// posture extracted, hashed by posture; and a commit message has no blob at
+// all, so its carrier is the commit.
 
-#[derive(Debug)]
+// ── the extractors ──────────────────────────────────────────────────────────
+// Each returns located material. No judgement, no ranking — extraction and
+// adjudication are separate stages on purpose.
+
+#[derive(Clone, Debug)]
 struct Found {
     modality: Id,
-    locator: String,
+    /// Content-addressed identity coordinate.
+    location: Location,
+    /// The coordinate exactly as observed, for a human reading the report.
+    evidence: String,
+    /// The material itself. Evidence, never identity.
     value: String,
+    /// The commit this sighting came from, when there was one. The rebuildable
+    /// locator cache, not a coordinate.
+    seen_in: Option<String>,
 }
 
-fn f(modality: Id, locator: impl Into<String>, value: impl Into<String>) -> Found {
+/// Material inside a container member posture extracted, at a named coordinate
+/// within it.
+fn member_found(
+    modality: Id,
+    carrier: Carrier,
+    field: impl Into<String>,
+    value: impl Into<String>,
+) -> Found {
+    let field = field.into();
     Found {
         modality,
-        locator: locator.into(),
+        location: Location::field(carrier, field.clone()),
+        evidence: field,
         value: value.into(),
+        seen_in: None,
     }
 }
 
@@ -327,10 +365,12 @@ fn extract_ooxml(path: &Path) -> Result<Vec<Found>> {
     // core properties — creator / lastModifiedBy / revision are the classic
     // "we sent it out under the wrong name" leak.
     if let Some(xml) = read(&mut zip, "docProps/core.xml") {
+        let carrier = Carrier::member(&xml);
         for tag in ["creator", "lastModifiedBy", "revision", "lastPrinted"] {
             for v in xml_tag_texts(&xml, tag) {
-                out.push(f(
+                out.push(member_found(
                     modality::OOXML_CORE_PROPS,
+                    carrier.clone(),
                     format!("docProps/core.xml:{tag}"),
                     v,
                 ));
@@ -338,10 +378,12 @@ fn extract_ooxml(path: &Path) -> Result<Vec<Found>> {
         }
     }
     if let Some(xml) = read(&mut zip, "docProps/app.xml") {
+        let carrier = Carrier::member(&xml);
         for tag in ["Company", "Manager"] {
             for v in xml_tag_texts(&xml, tag) {
-                out.push(f(
+                out.push(member_found(
                     modality::OOXML_CORE_PROPS,
+                    carrier.clone(),
                     format!("docProps/app.xml:{tag}"),
                     v,
                 ));
@@ -353,15 +395,22 @@ fn extract_ooxml(path: &Path) -> Result<Vec<Found>> {
         // comments — every Office app has them, nobody checks before sending
         if name.contains("comments") && name.ends_with(".xml") {
             if let Some(xml) = read(&mut zip, name) {
+                let carrier = Carrier::member(&xml);
                 for (_, author) in xml_attrs(&xml, "comment", "author") {
-                    out.push(f(
+                    out.push(member_found(
                         modality::OOXML_COMMENTS,
+                        carrier.clone(),
                         format!("{name}:author"),
                         author,
                     ));
                 }
                 for t in xml_tag_texts(&xml, "t") {
-                    out.push(f(modality::OOXML_COMMENTS, format!("{name}:text"), t));
+                    out.push(member_found(
+                        modality::OOXML_COMMENTS,
+                        carrier.clone(),
+                        format!("{name}:text"),
+                        t,
+                    ));
                 }
             }
         }
@@ -370,7 +419,12 @@ fn extract_ooxml(path: &Path) -> Result<Vec<Found>> {
             if let Some(xml) = read(&mut zip, name) {
                 let text = xml_tag_texts(&xml, "t").join(" ");
                 if !text.trim().is_empty() {
-                    out.push(f(modality::OOXML_SPEAKER_NOTES, name.clone(), text));
+                    out.push(member_found(
+                        modality::OOXML_SPEAKER_NOTES,
+                        Carrier::member(&xml),
+                        name.clone(),
+                        text,
+                    ));
                 }
             }
         }
@@ -378,18 +432,21 @@ fn extract_ooxml(path: &Path) -> Result<Vec<Found>> {
 
     // tracked changes still in the body — the deleted paragraph is still there
     if let Some(xml) = read(&mut zip, "word/document.xml") {
+        let carrier = Carrier::member(&xml);
         for (tag, kind) in [("ins", "insertion"), ("del", "deletion")] {
             for (_, author) in xml_attrs(&xml, tag, "author") {
-                out.push(f(
+                out.push(member_found(
                     modality::OOXML_TRACKED_CHANGES,
+                    carrier.clone(),
                     format!("word/document.xml:{kind}@author"),
                     author,
                 ));
             }
         }
         for t in xml_tag_texts(&xml, "delText") {
-            out.push(f(
+            out.push(member_found(
                 modality::OOXML_TRACKED_CHANGES,
+                carrier.clone(),
                 "word/document.xml:deleted-text",
                 t,
             ));
@@ -398,10 +455,12 @@ fn extract_ooxml(path: &Path) -> Result<Vec<Found>> {
 
     // hidden / veryHidden sheets
     if let Some(xml) = read(&mut zip, "xl/workbook.xml") {
+        let carrier = Carrier::member(&xml);
         for (name, state) in xml_attrs(&xml, "sheet", "state") {
             if state == "hidden" || state == "veryHidden" {
-                out.push(f(
+                out.push(member_found(
                     modality::OOXML_HIDDEN_SHEET,
+                    carrier.clone(),
                     format!("xl/workbook.xml:{name}"),
                     format!("state={state}"),
                 ));
@@ -426,6 +485,11 @@ fn extract_exif(path: &Path) -> Result<Vec<Found>> {
         Err(e) => return Err(e.into()),
     };
     let mut out = Vec::new();
+    // The extracted member is the TIFF block the tags were decoded from. The
+    // decoded values (a GPS coordinate, a rational, a MakerNote) are nowhere in
+    // those bytes verbatim, so the coordinate is the tag and the member's hash
+    // carries the content.
+    let carrier = Carrier::member(exif.buf());
     for field in exif.fields() {
         let tag = field.tag;
         let interesting = matches!(
@@ -451,7 +515,12 @@ fn extract_exif(path: &Path) -> Result<Vec<Found>> {
             } else {
                 v
             };
-            out.push(f(modality::EXIF, format!("EXIF:{tag}"), v));
+            out.push(member_found(
+                modality::EXIF,
+                carrier.clone(),
+                format!("EXIF:{tag}"),
+                v,
+            ));
         }
     }
     Ok(out)
@@ -1284,7 +1353,7 @@ impl<'a> PageScan<'a> {
     }
 
     /// Emit one finding per fill that has extractable text under it.
-    fn report(&self, page: u32, out: &mut Vec<Found>) {
+    fn report(&self, page: u32, carrier: &Carrier, out: &mut Vec<Found>) {
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for cover in &self.covers {
             let mut text = String::new();
@@ -1328,7 +1397,12 @@ impl<'a> PageScan<'a> {
             } else {
                 text.to_string()
             };
-            out.push(f(modality::PDF_REDACTION_RECT, locator, value));
+            out.push(member_found(
+                modality::PDF_REDACTION_RECT,
+                carrier.clone(),
+                locator,
+                value,
+            ));
         }
     }
 }
@@ -1472,7 +1546,11 @@ fn pdf_value_text(doc: &Document, obj: &Object) -> Option<String> {
     }
 }
 
-fn extract_pdf_metadata(doc: &Document, out: &mut Vec<Found>) {
+/// `file` is the carrier for information-dictionary findings: lopdf hands back
+/// decoded objects, not the byte range they were parsed from, so the smallest
+/// honest unit posture can name for them is the document it read. XMP findings
+/// do have their own extracted packet and use it.
+fn extract_pdf_metadata(doc: &Document, file: &Carrier, out: &mut Vec<Found>) {
     if let Some(info) = doc
         .trailer
         .get(b"Info")
@@ -1486,7 +1564,12 @@ fn extract_pdf_metadata(doc: &Document, out: &mut Vec<Found>) {
                 .ok()
                 .and_then(|o| pdf_value_text(doc, o))
             {
-                out.push(f(modality::PDF_METADATA, format!("Info:{key}"), v));
+                out.push(member_found(
+                    modality::PDF_METADATA,
+                    file.clone(),
+                    format!("Info:{key}"),
+                    v,
+                ));
             }
         }
         // Custom keys are where workflow tools stash things like an internal
@@ -1497,7 +1580,12 @@ fn extract_pdf_metadata(doc: &Document, out: &mut Vec<Found>) {
                 continue;
             }
             if let Some(v) = pdf_value_text(doc, value) {
-                out.push(f(modality::PDF_METADATA, format!("Info:{name}"), v));
+                out.push(member_found(
+                    modality::PDF_METADATA,
+                    file.clone(),
+                    format!("Info:{name}"),
+                    v,
+                ));
             }
         }
     }
@@ -1512,6 +1600,7 @@ fn extract_pdf_metadata(doc: &Document, out: &mut Vec<Found>) {
         .and_then(|o| o.as_stream().ok())
         .and_then(|s| s.get_plain_content_with_limit(PDF_STREAM_LIMIT).ok());
     let Some(xmp) = xmp else { return };
+    let packet = Carrier::member(&xmp);
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for field in PDF_XMP_FIELDS {
         let mut values = xml_tag_texts(&xmp, field);
@@ -1532,7 +1621,12 @@ fn extract_pdf_metadata(doc: &Document, out: &mut Vec<Found>) {
             } else {
                 v
             };
-            out.push(f(modality::PDF_METADATA, format!("XMP:{field}"), v));
+            out.push(member_found(
+                modality::PDF_METADATA,
+                packet.clone(),
+                format!("XMP:{field}"),
+                v,
+            ));
         }
     }
 }
@@ -1549,9 +1643,17 @@ fn extract_pdf(path: &Path) -> Result<Vec<Found>> {
     .map_err(|e| anyhow!("load pdf: {e}"))?;
 
     let mut out = Vec::new();
+    let file = Carrier::Member(
+        blake3::Hasher::new()
+            .update_reader(std::fs::File::open(path)?)
+            .map_err(|error| anyhow!("hash pdf: {error}"))?
+            .finalize()
+            .to_hex()
+            .to_string(),
+    );
     // A PDF with no `/Info` and no XMP leaves this empty, which is the honest
     // answer: nothing found, not a failure to look.
-    extract_pdf_metadata(&doc, &mut out);
+    extract_pdf_metadata(&doc, &file, &mut out);
 
     for (page_no, page_id) in doc.get_pages() {
         let content = doc
@@ -1579,7 +1681,7 @@ fn extract_pdf(path: &Path) -> Result<Vec<Found>> {
         };
         scan.stream(&content, &res, base, 0)
             .map_err(|e| anyhow!("page {page_no}: {e}"))?;
-        scan.report(page_no, &mut out);
+        scan.report(page_no, &Carrier::member(&content), &mut out);
     }
     Ok(out)
 }
@@ -1760,7 +1862,6 @@ struct PostureStorage<'a> {
 struct CollectionView {
     facts: TribleSet,
     reader: PileReader,
-    commits: Vec<CollectionCommit>,
 }
 
 impl PostureStorage<'_> {
@@ -1772,17 +1873,25 @@ impl PostureStorage<'_> {
         let author = signer.verifying_key().to_bytes();
         let mut collection = open_scope(pile, scope, signer);
         let result = (|| {
-            let (facts, commits) = materialize_stable(&mut collection, scope, author, label)?;
+            let (facts, _) = materialize_stable(&mut collection, scope, author, label)?;
             let reader = collection
                 .storage_mut()
                 .reader()
                 .with_context(|| format!("open Posture {label} blob reader"))?;
-            Ok(CollectionView {
-                facts,
-                reader,
-                commits,
-            })
+            Ok(CollectionView { facts, reader })
         })();
+        finish_pile(collection.into_storage(), result)
+    }
+
+    /// The signed COMMITs this key authored in `scope`. Tests use it to check
+    /// that one scan is one atomic COMMIT; ordinary reads never need it.
+    #[cfg(test)]
+    fn authored_commits(&self, scope: Id, label: &str) -> Result<Vec<CollectionCommit>> {
+        let signer = load_signer(self.pile, self.key)?;
+        let pile = open_pile_strict(self.pile)?;
+        let author = signer.verifying_key().to_bytes();
+        let mut collection = open_scope(pile, scope, signer);
+        let result = (|| Ok(materialize_stable(&mut collection, scope, author, label)?.1))();
         finish_pile(collection.into_storage(), result)
     }
 
@@ -1792,10 +1901,9 @@ impl PostureStorage<'_> {
         Ok(view)
     }
 
+    /// Reads do not validate. See [`validate_scan_commits`].
     fn scan_view(&self) -> Result<CollectionView> {
-        let view = self.load_scope(DEFAULT_SCAN_SCOPE_ID, "scan")?;
-        validate_scan_view(&view)?;
-        Ok(view)
+        self.load_scope(DEFAULT_SCAN_SCOPE_ID, "scan")
     }
 
     fn decide_view(&self) -> Result<CollectionView> {
@@ -1827,16 +1935,16 @@ impl PostureStorage<'_> {
         self.with_collection(
             DEFAULT_SCAN_SCOPE_ID,
             "scan",
-            |collection, current, reader, commits| {
-                validate_scan_view_parts(reader, current, commits)?;
-                validate_scan_commit_fragment(fragment.facts())?;
+            |collection, _current, reader, commits| {
+                let scan = validate_scan_commit_fragment(fragment.facts())?;
+                validate_scan_commits(reader, commits, scan)?;
                 let mut staged_blobs = fragment.blobs().clone();
                 let staged = staged_blobs
                     .reader()
                     .context("snapshot staged Posture scan payloads")?;
-                let mut union = current.clone();
-                union += fragment.facts().clone();
-                validate_scan_catalog_with(reader, Some(&staged), &union)?;
+                // Only the fragment being written is validated. The accumulated
+                // past is not re-judged against today's schema.
+                validate_scan_catalog_with(reader, Some(&staged), fragment.facts())?;
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
                 collection
                     .commit(fragment)
@@ -1964,18 +2072,27 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-/// Identity of material independent of which scan happened to observe it.
-/// Including the value prevents a benign classification at one stable locator
-/// from silently hiding different material that later replaces it.
-fn occurrence_id(modality: Id, path: TextHandle, locator: TextHandle, value: TextHandle) -> Id {
-    entity! {
-        metadata::tag: modality,
-        posture::path: path,
-        posture::locator: locator,
+/// Write one observation of a finding. Sightings are annotations: which
+/// document and commit a scan met the material in, and the material itself as
+/// evidence. Losing one costs a re-walk, never a resolution.
+fn sighting_entity(fragment: &mut Fragment, finding: Id, document: Id, found: &Found) -> Id {
+    let value: TextHandle = fragment.put(found.value.clone());
+    let evidence: TextHandle = fragment.put(found.evidence.clone());
+    let seen_in: Option<TextHandle> = found
+        .seen_in
+        .as_ref()
+        .map(|commit| fragment.put(commit.clone()));
+    let sighting = entity! {
+        metadata::tag: KIND_SIGHTING,
+        posture::sighting_of: finding,
+        posture::document: document,
         posture::value: value,
-    }
-    .root()
-    .expect("semantic occurrence has one intrinsic root")
+        posture::evidence: evidence,
+        posture::seen_in?: seen_in,
+    };
+    let id = sighting.root().expect("intrinsic sighting has one root");
+    *fragment += sighting;
+    id
 }
 
 fn entity_attributes(facts: &TribleSet, entity: Id) -> BTreeSet<Id> {
@@ -2034,6 +2151,9 @@ fn text_attribute_ids() -> HashSet<Id> {
         posture::path.id(),
         posture::locator.id(),
         posture::value.id(),
+        posture::carrier.id(),
+        posture::evidence.id(),
+        posture::seen_in.id(),
         posture::target.id(),
         posture::detail.id(),
     ]
@@ -2104,14 +2224,18 @@ where
 fn validate_policy_view(view: &CollectionView) -> Result<()> {
     faculties::posture_policy::validate_policy_catalog(&view.reader, &view.facts)
 }
-fn validate_scan_view(view: &CollectionView) -> Result<()> {
-    validate_scan_view_parts(&view.reader, &view.facts, &view.commits)
-}
-
-fn validate_scan_view_parts(
+/// Check that every signed COMMIT about to be joined by a new one is exactly
+/// one atomic scan. This runs on the WRITE path only.
+///
+/// It used to run inside `scan_view()`, which meant every read validated all
+/// history against the *current* schema and so guaranteed that any schema
+/// change broke the reader — which is exactly what happened. In an append-only
+/// store the past was valid when it was written; validation belongs in
+/// migrations and at the moment of writing, never on a read path.
+fn validate_scan_commits(
     reader: &PileReader,
-    facts: &TribleSet,
     commits: &[CollectionCommit],
+    writing: Id,
 ) -> Result<()> {
     let mut scan_commits = BTreeMap::<Id, usize>::new();
     for commit in commits {
@@ -2121,8 +2245,16 @@ fn validate_scan_view_parts(
             .with_context(|| format!("read Posture scan COMMIT {}", fmt_id(commit.id())))?;
         let facts = TribleSet::try_from_blob(blob)
             .with_context(|| format!("decode Posture scan COMMIT {}", fmt_id(commit.id())))?;
-        let scan = validate_scan_commit_fragment(&facts)
-            .with_context(|| format!("validate Posture scan COMMIT {}", fmt_id(commit.id())))?;
+        let scan = find!(
+            scan: Id,
+            pattern!(&facts, [{ ?scan @ metadata::tag: (&KIND_SCAN) }])
+        )
+        .collect::<BTreeSet<_>>();
+        let Ok(scan) = one_required(scan, "scan COMMIT root") else {
+            // A COMMIT with no scan root predates this shape entirely. It is
+            // history, not a fault to relitigate on every write.
+            continue;
+        };
         *scan_commits.entry(scan).or_default() += 1;
     }
     if let Some((scan, count)) = scan_commits.iter().find(|(_, count)| **count != 1) {
@@ -2131,7 +2263,13 @@ fn validate_scan_view_parts(
             fmt_id(*scan)
         );
     }
-    validate_scan_catalog(reader, facts)
+    if scan_commits.contains_key(&writing) {
+        bail!(
+            "scan {} already has a signed COMMIT; scans must be atomic",
+            fmt_id(writing)
+        );
+    }
+    Ok(())
 }
 
 fn validate_scan_commit_fragment(facts: &TribleSet) -> Result<Id> {
@@ -2147,10 +2285,20 @@ fn validate_scan_commit_fragment(facts: &TribleSet) -> Result<Id> {
         value: Id,
         pattern!(facts, [{ (scan) @ posture::scan_document: ?value }])
     ));
-    expected_subjects.extend(find!(
+    let sightings = find!(
         value: Id,
-        pattern!(facts, [{ (scan) @ posture::scan_finding: ?value }])
-    ));
+        pattern!(facts, [{ (scan) @ posture::scan_sighting: ?value }])
+    )
+    .collect::<BTreeSet<_>>();
+    // Findings enter the Merkle root through the sightings that name them, so
+    // the scan never carries a separate list of them.
+    for sighting in &sightings {
+        expected_subjects.extend(find!(
+            value: Id,
+            pattern!(facts, [{ (*sighting) @ posture::sighting_of: ?value }])
+        ));
+    }
+    expected_subjects.extend(sightings);
     expected_subjects.extend(find!(
         value: Id,
         pattern!(facts, [{ (scan) @ posture::scan_omission: ?value }])
@@ -2160,10 +2308,6 @@ fn validate_scan_commit_fragment(facts: &TribleSet) -> Result<Id> {
         bail!("scan COMMIT must contain exactly its Merkle-rooted observation");
     }
     Ok(scan)
-}
-
-fn validate_scan_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
-    validate_scan_catalog_with::<PileReader>(reader, None, facts)
 }
 
 fn validate_scan_catalog_with<R>(
@@ -2195,6 +2339,11 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
         pattern!(facts, [{ ?finding @ metadata::tag: (&KIND_FINDING) }])
     )
     .collect::<BTreeSet<_>>();
+    let sightings = find!(
+        sighting: Id,
+        pattern!(facts, [{ ?sighting @ metadata::tag: (&KIND_SIGHTING) }])
+    )
+    .collect::<BTreeSet<_>>();
     let omissions = find!(
         omission: Id,
         pattern!(facts, [{ ?omission @ metadata::tag: (&KIND_OMISSION) }])
@@ -2203,6 +2352,7 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
     let mut known = scans.clone();
     known.extend(documents.iter().copied());
     known.extend(findings.iter().copied());
+    known.extend(sightings.iter().copied());
     known.extend(omissions.iter().copied());
     let actual = facts.iter().map(|fact| *fact.e()).collect::<BTreeSet<_>>();
     if actual != known {
@@ -2231,7 +2381,7 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
                 posture::unchecked.id(),
                 posture::scan_channel.id(),
                 posture::scan_document.id(),
-                posture::scan_finding.id(),
+                posture::scan_sighting.id(),
                 posture::scan_omission.id(),
             ],
             "scan",
@@ -2280,9 +2430,9 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
             pattern!(facts, [{ (*scan) @ posture::scan_document: ?value }])
         )
         .collect::<BTreeSet<_>>();
-        let scan_findings = find!(
+        let scan_sightings = find!(
             value: Id,
-            pattern!(facts, [{ (*scan) @ posture::scan_finding: ?value }])
+            pattern!(facts, [{ (*scan) @ posture::scan_sighting: ?value }])
         )
         .collect::<BTreeSet<_>>();
         let scan_omissions = find!(
@@ -2291,7 +2441,7 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
         )
         .collect::<BTreeSet<_>>();
         if !scan_documents.is_subset(&documents)
-            || !scan_findings.is_subset(&findings)
+            || !scan_sightings.is_subset(&sightings)
             || !scan_omissions.is_subset(&omissions)
         {
             bail!(
@@ -2327,7 +2477,7 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
             posture::unchecked*: unchecked,
             posture::scan_channel?: channel,
             posture::scan_document*: scan_documents,
-            posture::scan_finding*: scan_findings,
+            posture::scan_sighting*: scan_sightings,
             posture::scan_omission*: scan_omissions,
         }
         .root()
@@ -2415,10 +2565,11 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
             *finding,
             [
                 metadata::tag.id(),
-                posture::document.id(),
+                posture::carrier_kind.id(),
+                posture::carrier.id(),
                 posture::locator.id(),
-                posture::value.id(),
-                posture::occurrence.id(),
+                posture::span_start.id(),
+                posture::span_end.id(),
             ],
             "finding",
         )?;
@@ -2431,37 +2582,160 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
         if tags != BTreeSet::from([KIND_FINDING, modality]) {
             bail!("finding {} has invalid tags", fmt_id(*finding));
         }
+        let observers = find!(
+            sighting: Id,
+            pattern!(facts, [{ ?sighting @ posture::sighting_of: (*finding) }])
+        )
+        .collect::<BTreeSet<_>>();
+        if observers.is_empty() || !observers.is_subset(&sightings) {
+            bail!("finding {} was never sighted", fmt_id(*finding));
+        }
+        let carrier_kind = one_required(
+            find!(
+                value: Id,
+                pattern!(facts, [{ (*finding) @ posture::carrier_kind: ?value }])
+            )
+            .collect(),
+            "finding carrier kind",
+        )?;
+        if ![
+            CARRIER_GIT_BLOB,
+            CARRIER_CONTAINER_MEMBER,
+            CARRIER_GIT_COMMIT,
+        ]
+        .contains(&carrier_kind)
+        {
+            bail!("finding {} has an unknown carrier kind", fmt_id(*finding));
+        }
+        let carrier = one_required(
+            find!(
+                value: TextHandle,
+                pattern!(facts, [{ (*finding) @ posture::carrier: ?value }])
+            )
+            .collect(),
+            "finding carrier",
+        )?;
+        let field = one_optional(
+            find!(
+                value: TextHandle,
+                pattern!(facts, [{ (*finding) @ posture::locator: ?value }])
+            )
+            .collect(),
+            "finding inner locator",
+        )?;
+        let span_start = one_optional(
+            find!(
+                value: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ (*finding) @ posture::span_start: ?value }])
+            )
+            .collect(),
+            "finding span start",
+        )?;
+        let span_end = one_optional(
+            find!(
+                value: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ (*finding) @ posture::span_end: ?value }])
+            )
+            .collect(),
+            "finding span end",
+        )?;
+        // A byte range where the carrier's bytes spell the material, a named
+        // coordinate where they do not. Both at once would let the two
+        // disagree about where the material is.
+        match (field, span_start, span_end) {
+            (Some(_), None, None) => {}
+            (None, Some(start), Some(end)) => {
+                if inline_u256_to_u128(start)? > inline_u256_to_u128(end)? {
+                    bail!("finding {} has an inverted byte range", fmt_id(*finding));
+                }
+            }
+            _ => bail!(
+                "finding {} must carry exactly one of a byte range or a named coordinate",
+                fmt_id(*finding)
+            ),
+        }
+        let expected = entity! {
+            metadata::tag: KIND_FINDING,
+            metadata::tag: modality,
+            posture::carrier_kind: carrier_kind,
+            posture::carrier: carrier,
+            posture::locator?: field,
+            posture::span_start?: span_start,
+            posture::span_end?: span_end,
+        }
+        .root()
+        .expect("finding identity has one root");
+        if expected != *finding {
+            bail!("finding {} is not content-located", fmt_id(*finding));
+        }
+    }
+
+    for sighting in &sightings {
+        require_attributes(
+            facts,
+            *sighting,
+            [
+                metadata::tag.id(),
+                posture::sighting_of.id(),
+                posture::document.id(),
+                posture::value.id(),
+                posture::evidence.id(),
+                posture::seen_in.id(),
+            ],
+            "sighting",
+        )?;
+        if entity_tags(facts, *sighting) != BTreeSet::from([KIND_SIGHTING]) {
+            bail!("sighting {} has invalid tags", fmt_id(*sighting));
+        }
         let owners = find!(
             scan: Id,
-            pattern!(facts, [{ ?scan @ posture::scan_finding: (*finding) }])
+            pattern!(facts, [{ ?scan @ posture::scan_sighting: (*sighting) }])
         )
         .collect::<BTreeSet<_>>();
         if owners.is_empty() || !owners.is_subset(&scans) {
-            bail!("finding {} is not owned by a scan", fmt_id(*finding));
+            bail!("sighting {} is not owned by a scan", fmt_id(*sighting));
         }
+        let finding = one_required(
+            find!(
+                value: Id,
+                pattern!(facts, [{ (*sighting) @ posture::sighting_of: ?value }])
+            )
+            .collect(),
+            "sighting finding",
+        )?;
+        if !findings.contains(&finding) {
+            bail!("sighting {} names a missing finding", fmt_id(*sighting));
+        }
+        let modality = one_required(
+            entity_tags(facts, finding)
+                .intersection(&known_modalities)
+                .copied()
+                .collect(),
+            "sighted finding modality",
+        )?;
         let document = one_required(
             find!(
                 value: Id,
-                pattern!(facts, [{ (*finding) @ posture::document: ?value }])
+                pattern!(facts, [{ (*sighting) @ posture::document: ?value }])
             )
             .collect(),
-            "finding document",
+            "sighting document",
         )?;
         if !documents.contains(&document) {
-            bail!("finding {} references a missing document", fmt_id(*finding));
+            bail!("sighting {} references a missing document", fmt_id(*sighting));
         }
         for scan in &owners {
             if !exists!(pattern!(facts, [{ (*scan) @ posture::scan_document: (document) }])) {
                 bail!(
-                    "finding {} references a document outside scan {}",
-                    fmt_id(*finding),
+                    "sighting {} references a document outside scan {}",
+                    fmt_id(*sighting),
                     fmt_id(*scan)
                 );
             }
             if !exists!(pattern!(facts, [{ (*scan) @ posture::checked: (modality) }])) {
                 bail!(
-                    "finding {} uses a modality scan {} did not mark checked",
-                    fmt_id(*finding),
+                    "sighting {} uses a modality scan {} did not mark checked",
+                    fmt_id(*sighting),
                     fmt_id(*scan)
                 );
             }
@@ -2472,64 +2746,50 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
                 pattern!(facts, [{ (document) @ posture::outcome: ?value }])
             )
             .collect(),
-            "finding document outcome",
+            "sighting document outcome",
         )?;
         if document_outcome != OUTCOME_EXAMINED {
             bail!(
-                "finding {} belongs to a document that was not examined",
-                fmt_id(*finding)
+                "sighting {} belongs to a document that was not examined",
+                fmt_id(*sighting)
             );
         }
-        let locator = one_required(
-            find!(
-                value: TextHandle,
-                pattern!(facts, [{ (*finding) @ posture::locator: ?value }])
-            )
-            .collect(),
-            "finding locator",
-        )?;
         let value = one_required(
             find!(
                 value: TextHandle,
-                pattern!(facts, [{ (*finding) @ posture::value: ?value }])
+                pattern!(facts, [{ (*sighting) @ posture::value: ?value }])
             )
             .collect(),
-            "finding value",
+            "sighting value",
         )?;
-        let occurrence = one_required(
-            find!(
-                value: Id,
-                pattern!(facts, [{ (*finding) @ posture::occurrence: ?value }])
-            )
-            .collect(),
-            "finding occurrence",
-        )?;
-        let path = one_required(
+        let evidence = one_required(
             find!(
                 value: TextHandle,
-                pattern!(facts, [{ (document) @ posture::path: ?value }])
+                pattern!(facts, [{ (*sighting) @ posture::evidence: ?value }])
             )
             .collect(),
-            "finding document path",
+            "sighting evidence",
         )?;
-        if occurrence != occurrence_id(modality, path, locator, value) {
-            bail!(
-                "finding {} carries a non-semantic occurrence id",
-                fmt_id(*finding)
-            );
-        }
+        let seen_in = one_optional(
+            find!(
+                value: TextHandle,
+                pattern!(facts, [{ (*sighting) @ posture::seen_in: ?value }])
+            )
+            .collect(),
+            "sighting commit",
+        )?;
         let expected = entity! {
-            metadata::tag: KIND_FINDING,
-            metadata::tag: modality,
+            metadata::tag: KIND_SIGHTING,
+            posture::sighting_of: finding,
             posture::document: document,
-            posture::locator: locator,
             posture::value: value,
-            posture::occurrence: occurrence,
+            posture::evidence: evidence,
+            posture::seen_in?: seen_in,
         }
         .root()
-        .expect("finding identity has one root");
-        if expected != *finding {
-            bail!("finding {} is not intrinsic", fmt_id(*finding));
+        .expect("sighting identity has one root");
+        if expected != *sighting {
+            bail!("sighting {} is not intrinsic", fmt_id(*sighting));
         }
     }
 
@@ -2616,7 +2876,7 @@ fn build_scan_fragment(
         .filter(|id| !checked.contains(id))
         .collect::<BTreeSet<_>>();
     let mut documents = BTreeSet::new();
-    let mut findings = BTreeSet::new();
+    let mut sightings = BTreeSet::new();
     let mut omitted_paths = BTreeSet::new();
 
     for file in files {
@@ -2640,19 +2900,8 @@ fn build_scan_fragment(
         fragment += document;
 
         for found in &file.findings {
-            let locator: TextHandle = fragment.put(found.locator.clone());
-            let value: TextHandle = fragment.put(found.value.clone());
-            let occurrence = occurrence_id(found.modality, path, locator, value);
-            let finding = entity! {
-                metadata::tag: KIND_FINDING,
-                metadata::tag: found.modality,
-                posture::document: document_id,
-                posture::locator: locator,
-                posture::value: value,
-                posture::occurrence: occurrence,
-            };
-            findings.insert(finding.root().expect("intrinsic finding has one root"));
-            fragment += finding;
+            let finding = finding_entity(&mut fragment, found.modality, &found.location);
+            sightings.insert(sighting_entity(&mut fragment, finding, document_id, found));
         }
     }
 
@@ -2668,9 +2917,10 @@ fn build_scan_fragment(
         fragment += omission;
     }
 
-    // The root names every child identity. A changed outcome, finding, or
+    // The root names every child identity. A changed outcome, sighting, or
     // omission therefore changes the scan id; an exact retry derives the same
-    // id without a random nonce.
+    // id without a random nonce. Findings hang under their sightings, so the
+    // root covers them transitively rather than listing them twice.
     let scan = entity! {
         metadata::tag: KIND_SCAN,
         metadata::created_at: created_at,
@@ -2680,7 +2930,7 @@ fn build_scan_fragment(
         posture::unchecked*: unchecked,
         posture::scan_channel?: channel,
         posture::scan_document*: documents,
-        posture::scan_finding*: findings,
+        posture::scan_sighting*: sightings,
         posture::scan_omission*: omitted_paths,
     };
     let scan_id = scan.root().expect("intrinsic scan has one Merkle root");
@@ -2754,7 +3004,11 @@ fn cmd_scan(storage: PostureStorage<'_>, target: &Path, dry_run: bool) -> Result
         for (path, found) in items.iter().take(3) {
             let value = found.value.replace('\n', " ");
             let value: String = value.chars().take(90).collect();
-            println!("    {}  {}  {value}", path.display(), found.locator);
+            println!(
+                "    {}  {}  {value}",
+                path.display(),
+                found.location.display()
+            );
         }
         if items.len() > 3 {
             println!("    … {} more", items.len() - 3);
@@ -2866,15 +3120,53 @@ fn select_scan(space: &TribleSet, requested: Option<&str>) -> Result<Option<Id>>
 const BENIGN_DECISION_OUTCOME: &str = "benign";
 
 #[derive(Default)]
-struct OccurrenceDecisionState {
+struct FindingDecisionState {
     benign: bool,
     justified_benign: bool,
     disputed: bool,
 }
 
-struct BenignOccurrenceSets {
+/// Which findings a resolved Decide outcome takes off the board.
+///
+/// `bridges` carries the pre-2026-08-18 occurrence ids a migration proved to
+/// be the same material, so a judgement made under the old identity keeps
+/// applying to the content-located finding it turned out to be.
+struct Settled {
     ordinary: BTreeSet<Id>,
     justified: BTreeSet<Id>,
+    bridges: BTreeMap<Id, BTreeSet<Id>>,
+}
+
+impl Settled {
+    fn hides(&self, modality: Id, finding: Id) -> bool {
+        let settled = if modality == modality::UNSAFE_ATTRIBUTE_ID {
+            &self.justified
+        } else {
+            &self.ordinary
+        };
+        settled.contains(&finding)
+            || self
+                .bridges
+                .get(&finding)
+                .is_some_and(|legacy| legacy.iter().any(|id| settled.contains(id)))
+    }
+}
+
+/// The legacy occurrence ids a migration bridged onto each finding.
+fn legacy_bridges(facts: &TribleSet) -> BTreeMap<Id, BTreeSet<Id>> {
+    let mut bridges = BTreeMap::<Id, BTreeSet<Id>>::new();
+    for (finding, legacy) in find!(
+        (finding: Id, legacy: Id),
+        pattern!(facts, [{
+            _?bridge @
+            metadata::tag: (&KIND_LEGACY_BRIDGE),
+            posture::sighting_of: ?finding,
+            posture::occurrence: ?legacy
+        }])
+    ) {
+        bridges.entry(finding).or_default().insert(legacy);
+    }
+    bridges
 }
 
 /// Occurrences classified benign by the native Decide collection.
@@ -2885,15 +3177,19 @@ struct BenignOccurrenceSets {
 /// nothing. A fork or a second resolved decision with another outcome keeps
 /// the occurrence visible; set union therefore exposes disagreement instead of
 /// choosing a winner by time or iteration order.
-fn benign_occurrence_sets(reader: &PileReader, facts: &TribleSet) -> Result<BenignOccurrenceSets> {
-    let mut states = BTreeMap::<Id, OccurrenceDecisionState>::new();
+fn settled_findings(
+    reader: &PileReader,
+    facts: &TribleSet,
+    bridges: BTreeMap<Id, BTreeSet<Id>>,
+) -> Result<Settled> {
+    let mut states = BTreeMap::<Id, FindingDecisionState>::new();
     for decision in decide::decision_anchors(facts) {
         let genesis = decide::genesis_for_decision(facts, decision)?
             .ok_or_else(|| anyhow!("Decide decision {} has no genesis", fmt_id(decision)))?;
-        let Some(occurrence) = genesis.about else {
+        let Some(about) = genesis.about else {
             continue;
         };
-        let state = states.entry(occurrence).or_default();
+        let state = states.entry(about).or_default();
         let snapshot = match decide::resolution(facts, decision) {
             Resolution::Missing => continue,
             Resolution::Unique(snapshot) => snapshot,
@@ -2924,31 +3220,22 @@ fn benign_occurrence_sets(reader: &PileReader, facts: &TribleSet) -> Result<Beni
     }
     let ordinary = states
         .iter()
-        .filter_map(|(occurrence, state)| (state.benign && !state.disputed).then_some(*occurrence))
+        .filter_map(|(finding, state)| (state.benign && !state.disputed).then_some(*finding))
         .collect();
     let justified = states
         .into_iter()
-        .filter_map(|(occurrence, state)| {
-            (state.justified_benign && !state.disputed).then_some(occurrence)
-        })
+        .filter_map(|(finding, state)| (state.justified_benign && !state.disputed).then_some(finding))
         .collect();
-    Ok(BenignOccurrenceSets {
+    Ok(Settled {
         ordinary,
         justified,
+        bridges,
     })
 }
 
 #[cfg(test)]
 fn benign_occurrences(reader: &PileReader, facts: &TribleSet) -> Result<BTreeSet<Id>> {
-    Ok(benign_occurrence_sets(reader, facts)?.ordinary)
-}
-
-fn occurrence_is_hidden(modality: Id, occurrence: Id, benign: &BenignOccurrenceSets) -> bool {
-    if modality == modality::UNSAFE_ATTRIBUTE_ID {
-        benign.justified.contains(&occurrence)
-    } else {
-        benign.ordinary.contains(&occurrence)
-    }
+    Ok(settled_findings(reader, facts, BTreeMap::new())?.ordinary)
 }
 
 fn cmd_list(
@@ -2969,56 +3256,81 @@ fn cmd_list(
             );
         }
     }
-    let benign = benign_occurrence_sets(&decisions.reader, &decisions.facts)?;
-    let all_rows = find!(
-        (finding: Id, scan: Id, occurrence: Id, locator: TextHandle, value: TextHandle),
+    let settled = settled_findings(
+        &decisions.reader,
+        &decisions.facts,
+        legacy_bridges(&view.facts),
+    )?;
+    // Content-located sightings, and — because the store is append-only and
+    // those observations really happened — the pre-2026-08-18 findings beside
+    // them, under the occurrence id Decide named. Dropping them from the report
+    // would be the tool telling a comfortable half-truth about what it holds.
+    // (scan, the id Decide names, the entity carrying the modality tag,
+    // evidence, value). For a content-located finding the first two are the
+    // same entity; for a legacy record the id is its derived occurrence.
+    let mut all_rows = find!(
+        (scan: Id, finding: Id, evidence: TextHandle, value: TextHandle),
         pattern!(&view.facts, [{
-            ?scan @ posture::scan_finding: ?finding,
+            ?scan @ posture::scan_sighting: _?sighting,
         }, {
-            ?finding @
-            metadata::tag: (&KIND_FINDING),
-            posture::occurrence: ?occurrence,
-            posture::locator: ?locator,
+            _?sighting @
+            metadata::tag: (&KIND_SIGHTING),
+            posture::sighting_of: ?finding,
+            posture::evidence: ?evidence,
             posture::value: ?value
         }])
     )
-    .filter(|(_, scan, _, _, _)| want.is_none_or(|wanted| *scan == wanted))
+    .map(|(scan, finding, evidence, value)| (scan, finding, finding, evidence, value))
     .collect::<Vec<_>>();
+    all_rows.extend(
+        find!(
+            (scan: Id, finding: Id, occurrence: Id, locator: TextHandle, value: TextHandle),
+            pattern!(&view.facts, [{
+                ?scan @ posture::scan_finding: ?finding,
+            }, {
+                ?finding @
+                metadata::tag: (&KIND_FINDING),
+                posture::occurrence: ?occurrence,
+                posture::locator: ?locator,
+                posture::value: ?value
+            }])
+        )
+        .map(|(scan, finding, occurrence, locator, value)| {
+            (scan, occurrence, finding, locator, value)
+        }),
+    );
     let all_rows = all_rows
         .into_iter()
-        .map(|(finding, scan, occurrence, locator, value)| {
+        .filter(|(scan, _, _, _, _)| want.is_none_or(|wanted| *scan == wanted))
+        .map(|(scan, id, tagged, evidence, value)| {
             let modality = find!(
                 tag: Id,
-                pattern!(&view.facts, [{ (finding) @ metadata::tag: ?tag }])
+                pattern!(&view.facts, [{ (tagged) @ metadata::tag: ?tag }])
             )
             .find(|tag| modality::is_known(*tag))
-            .expect("validated finding has one known modality");
-            (finding, scan, occurrence, locator, value, modality)
+            .expect("a finding carries one known modality");
+            (scan, id, evidence, value, modality)
         })
         .collect::<Vec<_>>();
     let hidden = all_rows
         .iter()
-        .filter(|(_, _, occurrence, _, _, modality)| {
-            occurrence_is_hidden(*modality, *occurrence, &benign)
-        })
+        .filter(|(_, finding, _, _, modality)| settled.hides(*modality, *finding))
         .count();
     let rows = all_rows
         .into_iter()
-        .filter(|(_, _, occurrence, _, _, modality)| {
-            all || !occurrence_is_hidden(*modality, *occurrence, &benign)
-        })
+        .filter(|(_, finding, _, _, modality)| all || !settled.hides(*modality, *finding))
         .collect::<Vec<_>>();
 
     let mut groups: BTreeMap<&str, Vec<(Id, TextHandle, TextHandle)>> = BTreeMap::new();
-    for (_, _, occurrence, locator, value, modality) in &rows {
+    for (_, finding, evidence, value, modality) in &rows {
         groups
             .entry(modality::name(*modality))
             .or_default()
-            .push((*occurrence, *locator, *value));
+            .push((*finding, *evidence, *value));
     }
     if hidden > 0 && !all {
         println!(
-            "{hidden} occurrence(s) hidden by resolved Decide outcome {BENIGN_DECISION_OUTCOME:?} \
+            "{hidden} finding(s) hidden by resolved Decide outcome {BENIGN_DECISION_OUTCOME:?} \
              — pass --all to include them"
         );
     }
@@ -3032,14 +3344,14 @@ fn cmd_list(
     }
     for (name, items) in &groups {
         println!("{name}  ({})", items.len());
-        for (occurrence, locator, value) in items.iter().take(examples) {
-            let locator = read_text(&view.reader, *locator, "finding locator")?;
+        for (finding, evidence, value) in items.iter().take(examples) {
+            let evidence = read_text(&view.reader, *evidence, "finding evidence")?;
             let value = read_text(&view.reader, *value, "finding value")?.replace('\n', " ");
             let value: String = value.chars().take(90).collect();
             if ids {
-                println!("  {}  {locator}  {value}", fmt_id(*occurrence));
+                println!("  {}  {evidence}  {value}", fmt_id(*finding));
             } else {
-                println!("  {locator}  {value}");
+                println!("  {evidence}  {value}");
             }
         }
         if items.len() > examples {
@@ -3154,14 +3466,23 @@ fn cmd_scans(storage: PostureStorage<'_>) -> Result<()> {
             "scan created_at",
         )?;
         let findings = find!(
-            finding: Id,
+            sighting: Id,
             pattern!(&view.facts, [{
-                (scan) @ posture::scan_finding: ?finding,
+                (scan) @ posture::scan_sighting: ?sighting,
             }, {
-                ?finding @ metadata::tag: (&KIND_FINDING)
+                ?sighting @ metadata::tag: (&KIND_SIGHTING)
             }])
         )
-        .count();
+        .count()
+            + find!(
+                finding: Id,
+                pattern!(&view.facts, [{
+                    (scan) @ posture::scan_finding: ?finding,
+                }, {
+                    ?finding @ metadata::tag: (&KIND_FINDING)
+                }])
+            )
+            .count();
         scans.push((
             interval_key(created_at),
             scan,
@@ -3540,12 +3861,40 @@ fn cmd_vocab_list(storage: PostureStorage<'_>, channel: Option<&str>) -> Result<
 /// ONE implementation, used by both `posture git` and `posture sweep`. Two
 /// copies of a security check drift, and the copy that drifts is the one that
 /// quietly stops looking.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum UnsafeAttributeChange {
+    Added,
+    Removed,
+}
+
+impl UnsafeAttributeChange {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GitHit {
-    /// Stable identity coordinate. This always contains the complete object id
-    /// and an occurrence position; terminal abbreviation is display-only.
-    locator: String,
+    /// Content-addressed identity coordinate.
+    location: Location,
+    /// The coordinate exactly as observed, kept as evidence on the sighting.
+    evidence: String,
+    /// The commit the material was seen in — the rebuildable locator cache.
+    seen_in: String,
     display: String,
+    /// Unsafe-attribute hits only: the pin claim without its direction, so an
+    /// add/remove pair that leaves the claim unchanged cancels.
+    claim: Option<(UnsafeAttributeChange, String)>,
+}
+
+fn canonical_git_root(repo_path: &Path) -> Result<PathBuf> {
+    let root = git_required(repo_path, &["rev-parse", "--show-toplevel"])?;
+    let root = PathBuf::from(root.trim());
+    std::fs::canonicalize(&root)
+        .with_context(|| format!("canonicalize git repository root {}", root.display()))
 }
 
 #[derive(Debug)]
@@ -3567,59 +3916,34 @@ fn abbreviated_object_id(object_id: &str) -> &str {
     &object_id[..object_id.len().min(8)]
 }
 
-fn git_hit(kind: &str, object_id: &str, position: impl std::fmt::Display, text: &str) -> GitHit {
+fn git_hit(
+    kind: &str,
+    location: Location,
+    sha: &str,
+    position: impl std::fmt::Display,
+    text: &str,
+) -> GitHit {
     let position = position.to_string();
     GitHit {
-        locator: format!("{kind} {object_id}:{position}  {}", text.trim()),
+        location,
+        evidence: format!("{kind} {sha}:{position}  {}", text.trim()),
+        seen_in: sha.to_owned(),
         display: format!(
             "{kind} {}:{position}  {}",
-            abbreviated_object_id(object_id),
+            abbreviated_object_id(sha),
             text.trim()
         ),
-    }
-}
-
-fn canonical_git_root(repo_path: &Path) -> Result<PathBuf> {
-    let root = git_required(repo_path, &["rev-parse", "--show-toplevel"])?;
-    let root = PathBuf::from(root.trim());
-    std::fs::canonicalize(&root)
-        .with_context(|| format!("canonicalize git repository root {}", root.display()))
-}
-
-fn git_occurrence_id(repo_root: &Path, hit: &GitHit, term: &str) -> Id {
-    let path: TextHandle = repo_root.display().to_string().to_blob().get_handle();
-    let locator: TextHandle = hit.locator.clone().to_blob().get_handle();
-    let value: TextHandle = term.to_owned().to_blob().get_handle();
-    occurrence_id(modality::PROTECTED_TERM, path, locator, value)
-}
-
-fn unsafe_attribute_occurrence_id(repo_root: &Path, hit: &GitHit) -> Id {
-    let path: TextHandle = repo_root.display().to_string().to_blob().get_handle();
-    let locator: TextHandle = hit.locator.clone().to_blob().get_handle();
-    let value: TextHandle = UNSAFE_ATTRIBUTE_FINDING.to_owned().to_blob().get_handle();
-    occurrence_id(modality::UNSAFE_ATTRIBUTE_ID, path, locator, value)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UnsafeAttributeChange {
-    Added,
-    Removed,
-}
-
-impl UnsafeAttributeChange {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Added => "added",
-            Self::Removed => "removed",
-        }
+        claim: None,
     }
 }
 
 /// Unlike a protected-text hit, the policy judgement here belongs to the
-/// source declaration, not to one spelling of the commit that introduced it.
-/// A rebase or amend therefore changes only the display evidence. Moving the
-/// declaration to another source path or changing its text is a new occurrence
-/// and needs its own justification.
+/// source DECLARATION — its pinned id, name and encoding — not to a byte range
+/// in one blob. So the carrier is the declaration posture normalized out of
+/// the source, hashed by posture, and a reformat that leaves the claim intact
+/// keeps its justification while a rebase or amend changes only the display.
+/// Moving the declaration to another source path or changing its text is a new
+/// finding and needs its own justification.
 fn unsafe_attribute_hit(
     object_id: &str,
     position: &str,
@@ -3627,16 +3951,33 @@ fn unsafe_attribute_hit(
     change: UnsafeAttributeChange,
     declaration: &UnsafeAttributeDeclaration,
 ) -> GitHit {
-    let kind = format!("unsafe-attribute-{}", change.label());
-    let exact = git_hit(&kind, object_id, position, &declaration.text);
+    let carrier = Carrier::member(declaration.text.as_bytes());
+    let claim = format!(
+        "{}\u{0}{source_path}#{}",
+        carrier.address(),
+        declaration.same_text_ordinal
+    );
+    let coordinate = format!(
+        "{} {source_path}#{}",
+        change.label(),
+        declaration.same_text_ordinal
+    );
     GitHit {
-        locator: format!(
+        location: Location::field(carrier, coordinate),
+        evidence: format!(
             "rust-attribute-{} {source_path}#{}  {}",
             change.label(),
             declaration.same_text_ordinal,
             declaration.text
         ),
-        display: exact.display,
+        seen_in: object_id.to_owned(),
+        display: format!(
+            "unsafe-attribute-{} {}:{position}  {}",
+            change.label(),
+            abbreviated_object_id(object_id),
+            declaration.text.trim()
+        ),
+        claim: Some((change, claim)),
     }
 }
 
@@ -3815,30 +4156,29 @@ fn append_changed_unsafe_attributes(
     Ok(())
 }
 
-fn unsafe_attribute_claim_key(hit: &GitHit) -> Option<&str> {
-    hit.locator
-        .strip_prefix("rust-attribute-added ")
-        .or_else(|| hit.locator.strip_prefix("rust-attribute-removed "))
+fn unsafe_attribute_claims(
+    hits: &[GitHit],
+    direction: UnsafeAttributeChange,
+) -> BTreeSet<String> {
+    hits.iter()
+        .filter_map(|hit| hit.claim.as_ref())
+        .filter(|(change, _)| *change == direction)
+        .map(|(_, claim)| claim.clone())
+        .collect()
 }
 
 fn cancel_unchanged_unsafe_attributes(hits: &mut Vec<GitHit>) {
-    let added = hits
-        .iter()
-        .filter(|hit| hit.locator.starts_with("rust-attribute-added "))
-        .filter_map(unsafe_attribute_claim_key)
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    let removed = hits
-        .iter()
-        .filter(|hit| hit.locator.starts_with("rust-attribute-removed "))
-        .filter_map(unsafe_attribute_claim_key)
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
+    let added = unsafe_attribute_claims(hits, UnsafeAttributeChange::Added);
+    let removed = unsafe_attribute_claims(hits, UnsafeAttributeChange::Removed);
     let unchanged = added
         .intersection(&removed)
         .cloned()
         .collect::<BTreeSet<_>>();
-    hits.retain(|hit| unsafe_attribute_claim_key(hit).is_none_or(|key| !unchanged.contains(key)));
+    hits.retain(|hit| {
+        hit.claim
+            .as_ref()
+            .is_none_or(|(_, claim)| !unchanged.contains(claim))
+    });
 }
 
 /// Audit one ordinary two-way commit edge. Merge commits are deliberately
@@ -3981,6 +4321,7 @@ fn collect_commit_patch_term_hits(
     repo_root: &Path,
     sha: &str,
     terms: &[(String, String)],
+    objects: &mut GitObjects,
     hits: &mut BTreeMap<String, Vec<GitHit>>,
 ) -> Result<usize> {
     let patch = git_required(
@@ -4017,18 +4358,31 @@ fn collect_commit_patch_term_hits(
             continue;
         }
         n_added += 1;
-        let position = match next_new_line {
+        let added_line = next_new_line;
+        let position = match added_line {
             Some(new_line) => format!("{patch_path}:{new_line}:diff-{}", diff_line_index + 1),
             None => format!("{patch_path}:diff-{}", diff_line_index + 1),
         };
         next_new_line = next_new_line.map(|line| line + 1);
+        let source_path = patch_path
+            .strip_prefix("a/")
+            .or_else(|| patch_path.strip_prefix("b/"))
+            .unwrap_or(patch_path);
         let lower = line.to_lowercase();
         for (term, _) in terms {
-            if lower.contains(&term.to_lowercase()) {
-                hits.entry(term.clone())
-                    .or_default()
-                    .push(git_hit("patch", sha, &position, line));
+            if !lower.contains(&term.to_lowercase()) {
+                continue;
             }
+            // The material is a line of the new file version, so it lives in
+            // that file's blob — content-addressed, and untouched by the
+            // rebase that used to re-identify it.
+            let location = match added_line {
+                Some(new_line) => objects.locate(repo_root, sha, source_path, new_line, term)?,
+                None => Location::field(Carrier::Commit(sha.to_owned()), position.clone()),
+            };
+            hits.entry(term.clone())
+                .or_default()
+                .push(git_hit("patch", location, sha, &position, line));
         }
     }
     Ok(n_added)
@@ -4036,6 +4390,7 @@ fn collect_commit_patch_term_hits(
 
 fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Result<GitAudit> {
     let repo_root = canonical_git_root(repo_path)?;
+    let mut objects = GitObjects::default();
     let mut hits: BTreeMap<String, Vec<GitHit>> = BTreeMap::new();
     let mut unsafe_attribute_hits = Vec::new();
     let mut n_commits = 0usize;
@@ -4056,18 +4411,27 @@ fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Re
         n_commits += 1;
         let (sha, body) = rec.split_once('\u{1e}').unwrap_or(("?", rec));
         let sha = sha.trim();
-        for (t, _) in terms {
-            let lt = t.to_lowercase();
-            for (line_index, line) in body.lines().enumerate() {
-                if line.to_lowercase().contains(&lt) {
-                    hits.entry(t.clone()).or_default().push(git_hit(
-                        "message",
-                        sha,
-                        line_index + 1,
-                        line,
-                    ));
+        // A commit message has no blob, so the carrier is the commit and the
+        // range is into its message. This is the one modality commit surgery
+        // still moves; there is nothing content-addressed to hold it still.
+        let mut offset = 0usize;
+        for (line_index, raw) in body.split_inclusive('\n').enumerate() {
+            let line = raw.trim_end_matches(['\n', '\r']);
+            let lower = line.to_lowercase();
+            for (t, _) in terms {
+                if !lower.contains(&t.to_lowercase()) {
+                    continue;
                 }
+                let location = commit_message_location(sha, offset, line, line_index, t);
+                hits.entry(t.clone()).or_default().push(git_hit(
+                    "message",
+                    location,
+                    sha,
+                    line_index + 1,
+                    line,
+                ));
             }
+            offset += raw.len();
         }
     }
 
@@ -4089,10 +4453,18 @@ fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Re
         .enumerate()
         {
             let lower = path.to_lowercase();
+            // A path is a tree entry, not bytes inside a blob. The blob it
+            // names is still the content-addressed anchor: a rebase preserves
+            // both the blob and the name it is stored under.
+            let carrier = match objects.blob_at(&repo_root, sha, path)? {
+                Some(oid) => Carrier::GitBlob(oid),
+                None => Carrier::Commit(sha.to_owned()),
+            };
             for (t, _) in terms {
                 if lower.contains(&t.to_lowercase()) {
                     hits.entry(t.clone()).or_default().push(git_hit(
                         "path",
+                        Location::field(carrier.clone(), path.to_owned()),
                         sha,
                         format!("{}:{path}", path_index + 1),
                         path,
@@ -4117,14 +4489,16 @@ fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Re
                 n_removed += removed;
             }
         }
-        n_added += collect_commit_patch_term_hits(&repo_root, sha, terms, &mut hits)?;
+        n_added += collect_commit_patch_term_hits(&repo_root, sha, terms, &mut objects, &mut hits)?;
     }
+    // One sighting per (location, commit): the same material seen in two
+    // commits is one finding with two sightings, never two findings.
     for term_hits in hits.values_mut() {
-        term_hits.sort_by(|left, right| left.locator.cmp(&right.locator));
-        term_hits.dedup_by(|left, right| left.locator == right.locator);
+        term_hits.sort();
+        term_hits.dedup();
     }
-    unsafe_attribute_hits.sort_by(|left, right| left.locator.cmp(&right.locator));
-    unsafe_attribute_hits.dedup_by(|left, right| left.locator == right.locator);
+    unsafe_attribute_hits.sort();
+    unsafe_attribute_hits.dedup();
     Ok(GitAudit {
         repo_root,
         hits,
@@ -4215,20 +4589,28 @@ fn cmd_git(
     // This gives Decide a stable semantic occurrence to name and records a
     // genuinely empty audit differently from an audit never run.
     let decisions = storage.decide_view()?;
-    let benign = benign_occurrence_sets(&decisions.reader, &decisions.facts)?;
+    let settled = settled_findings(
+        &decisions.reader,
+        &decisions.facts,
+        legacy_bridges(&storage.scan_view()?.facts),
+    )?;
     let findings = hits
         .iter()
         .flat_map(|(term, term_hits)| {
             term_hits.iter().map(move |hit| Found {
                 modality: modality::PROTECTED_TERM,
-                locator: hit.locator.clone(),
+                location: hit.location.clone(),
+                evidence: hit.evidence.clone(),
                 value: term.clone(),
+                seen_in: Some(hit.seen_in.clone()),
             })
         })
         .chain(unsafe_attribute_hits.iter().map(|hit| Found {
             modality: modality::UNSAFE_ATTRIBUTE_ID,
-            locator: hit.locator.clone(),
+            location: hit.location.clone(),
+            evidence: hit.evidence.clone(),
             value: UNSAFE_ATTRIBUTE_FINDING.to_owned(),
+            seen_in: Some(hit.seen_in.clone()),
         }))
         .collect::<Vec<_>>();
     let files = [ScannedFile {
@@ -4258,9 +4640,10 @@ fn cmd_git(
             let kept = term_hits
                 .into_iter()
                 .filter(|hit| {
-                    !benign
-                        .ordinary
-                        .contains(&git_occurrence_id(&repo_root, hit, &term))
+                    !settled.hides(
+                        modality::PROTECTED_TERM,
+                        finding_id(modality::PROTECTED_TERM, &hit.location),
+                    )
                 })
                 .collect::<Vec<_>>();
             (!kept.is_empty()).then_some((term, kept))
@@ -4271,9 +4654,10 @@ fn cmd_git(
     let unsafe_attribute_hits = unsafe_attribute_hits
         .into_iter()
         .filter(|hit| {
-            !benign
-                .justified
-                .contains(&unsafe_attribute_occurrence_id(&repo_root, hit))
+            !settled.hides(
+                modality::UNSAFE_ATTRIBUTE_ID,
+                finding_id(modality::UNSAFE_ATTRIBUTE_ID, &hit.location),
+            )
         })
         .collect::<Vec<_>>();
     let unsafe_remaining = unsafe_attribute_hits.len();
@@ -4298,8 +4682,8 @@ fn cmd_git(
         for (term, term_hits) in &hits {
             println!("  {term}  ({} hit(s))", term_hits.len());
             for hit in term_hits.iter().take(4) {
-                let occurrence = git_occurrence_id(&repo_root, hit, term);
-                println!("    {}  {}", fmt_id(occurrence), hit.display);
+                let finding = finding_id(modality::PROTECTED_TERM, &hit.location);
+                println!("    {}  {}", fmt_id(finding), hit.display);
             }
             if term_hits.len() > 4 {
                 println!("    … {} more", term_hits.len() - 4);
@@ -4314,7 +4698,7 @@ fn cmd_git(
         for hit in &unsafe_attribute_hits {
             println!(
                 "    {}  {}",
-                fmt_id(unsafe_attribute_occurrence_id(&repo_root, hit)),
+                fmt_id(finding_id(modality::UNSAFE_ATTRIBUTE_ID, &hit.location)),
                 hit.display
             );
         }
@@ -4903,44 +5287,15 @@ fn read_arg(arg: &str) -> Result<String> {
 /// full-history archive whose only remote was the public repository it had been
 /// created to be separated from. "Which repos can leak" should not depend on
 /// somebody happening to look.
-fn git_probe(repo_path: &Path, args: &[&str], absent_statuses: &[i32]) -> Result<Option<String>> {
-    let output = std::process::Command::new("git")
-        .env("LC_ALL", "C")
-        .arg("-C")
-        .arg(repo_path)
-        .args(args)
-        .output()
-        .with_context(|| format!("run git -C {} {}", repo_path.display(), args.join(" ")))?;
-    if output.status.success() {
-        return Ok(Some(
-            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-        ));
-    }
-    if output
-        .status
-        .code()
-        .is_some_and(|code| absent_statuses.contains(&code))
-    {
-        return Ok(None);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    bail!(
-        "git -C {} {} failed{}",
-        repo_path.display(),
-        args.join(" "),
-        if stderr.is_empty() {
-            String::new()
-        } else {
-            format!(": {stderr}")
-        }
-    )
-}
-
 fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool) -> Result<()> {
     let terms = load_terms(storage, channel)?;
     let lexical_checked = !terms.is_empty();
     let decisions = storage.decide_view()?;
-    let benign = benign_occurrence_sets(&decisions.reader, &decisions.facts)?;
+    let settled = settled_findings(
+        &decisions.reader,
+        &decisions.facts,
+        legacy_bridges(&storage.scan_view()?.facts),
+    )?;
 
     let mut repos = Vec::new();
     for entry in
@@ -5050,7 +5405,6 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
             continue;
         }
         let GitAudit {
-            repo_root,
             hits,
             unsafe_attribute_hits,
             ..
@@ -5061,9 +5415,10 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
                 let kept = term_hits
                     .into_iter()
                     .filter(|hit| {
-                        !benign
-                            .ordinary
-                            .contains(&git_occurrence_id(&repo_root, hit, &term))
+                        !settled.hides(
+                            modality::PROTECTED_TERM,
+                            finding_id(modality::PROTECTED_TERM, &hit.location),
+                        )
                     })
                     .collect::<Vec<_>>();
                 (!kept.is_empty()).then_some((term, kept))
@@ -5072,9 +5427,10 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
         let unsafe_attribute_hits = unsafe_attribute_hits
             .into_iter()
             .filter(|hit| {
-                !benign
-                    .justified
-                    .contains(&unsafe_attribute_occurrence_id(&repo_root, hit))
+                !settled.hides(
+                    modality::UNSAFE_ATTRIBUTE_ID,
+                    finding_id(modality::UNSAFE_ATTRIBUTE_ID, &hit.location),
+                )
             })
             .collect::<Vec<_>>();
         let count: usize = hits.values().map(Vec::len).sum::<usize>() + unsafe_attribute_hits.len();
@@ -5368,6 +5724,13 @@ mod tests {
         id
     }
 
+    /// A container-member finding for fixtures. The member is the coordinate's
+    /// own bytes, which is enough to give each fixture finding a distinct
+    /// carrier without carrying a real document around.
+    fn f(modality: Id, field: &str, value: &str) -> Found {
+        member_found(modality, Carrier::member(field.as_bytes()), field, value)
+    }
+
     fn sample_scan_inputs() -> (Vec<ScannedFile>, Vec<WalkOmission>) {
         (
             vec![
@@ -5407,7 +5770,13 @@ mod tests {
         )
         .unwrap();
         let view = storage.policy_view().unwrap();
-        assert_eq!(view.commits.len(), 1);
+        assert_eq!(
+            storage
+                .authored_commits(DEFAULT_POLICY_SCOPE_ID, "policy")
+                .unwrap()
+                .len(),
+            1
+        );
         let channel = channel_by_name(&view.reader, &view.facts, "PUBLIC-RELEASE")
             .unwrap()
             .unwrap();
@@ -5660,7 +6029,14 @@ mod tests {
             .unwrap();
 
         let view = store.storage().scan_view().unwrap();
-        assert_eq!(view.commits.len(), 1);
+        assert_eq!(
+            store
+                .storage()
+                .authored_commits(DEFAULT_SCAN_SCOPE_ID, "scan")
+                .unwrap()
+                .len(),
+            1
+        );
         let outcomes = find!(
             outcome: Id,
             pattern!(&view.facts, [{
@@ -5710,8 +6086,10 @@ mod tests {
             "changing evidence under an otherwise identical header must change the Merkle root"
         );
 
-        store.publish_raw(DEFAULT_SCAN_SCOPE_ID, duplicate, "duplicate scan fixture");
-        let error = store.storage().scan_view().unwrap_err();
+        let error = store
+            .storage()
+            .publish_scan(duplicate, "duplicate scan fixture")
+            .unwrap_err();
         assert!(error.to_string().contains("scans must be atomic"));
     }
 
@@ -5870,11 +6248,11 @@ mod tests {
         );
         let occurrence = one_required(
             find!(
-                value: Id,
-                pattern!(first.facts(), [{ _?finding @ metadata::tag: (&KIND_FINDING), posture::occurrence: ?value }])
+                finding: Id,
+                pattern!(first.facts(), [{ ?finding @ metadata::tag: (&KIND_FINDING) }])
             )
             .collect(),
-            "fixture occurrence",
+            "fixture finding",
         )
         .unwrap();
         storage.publish_scan(first, "first semantic scan").unwrap();
@@ -5888,8 +6266,9 @@ mod tests {
             IMPLEMENTED.iter().copied().collect(),
         );
         assert_ne!(first_scan, second_scan);
+        // The same material, observed again: one finding, two sightings.
         assert!(exists!(pattern!(second.facts(), [{
-            _?finding @ metadata::tag: (&KIND_FINDING), posture::occurrence: (occurrence)
+            (occurrence) @ metadata::tag: (&KIND_FINDING)
         }])));
         storage
             .publish_scan(second, "second semantic scan")
@@ -6073,7 +6452,11 @@ mod tests {
 
         let view = store.storage().scan_view().unwrap();
         assert!(view.facts.is_empty());
-        assert!(view.commits.is_empty());
+        assert!(store
+            .storage()
+            .authored_commits(DEFAULT_SCAN_SCOPE_ID, "scan")
+            .unwrap()
+            .is_empty());
 
         let mut pile = open_pile_strict(&store.pile).unwrap();
         let target = discover_target(&mut pile, DEFAULT_SCAN_SCOPE_ID).unwrap();
@@ -6157,11 +6540,11 @@ mod tests {
         assert_eq!(from_relative.hits, from_absolute.hits);
         let relative_ids = from_relative.hits["project-sunrise"]
             .iter()
-            .map(|hit| git_occurrence_id(&from_relative.repo_root, hit, "project-sunrise"))
+            .map(|hit| finding_id(modality::PROTECTED_TERM, &hit.location))
             .collect::<Vec<_>>();
         let absolute_ids = from_absolute.hits["project-sunrise"]
             .iter()
-            .map(|hit| git_occurrence_id(&from_absolute.repo_root, hit, "project-sunrise"))
+            .map(|hit| finding_id(modality::PROTECTED_TERM, &hit.location))
             .collect::<Vec<_>>();
         assert_eq!(relative_ids, absolute_ids);
     }
@@ -6174,9 +6557,9 @@ mod tests {
         assert!(audit.hits.is_empty());
         assert_eq!(audit.unsafe_attribute_hits.len(), 1);
         let hit = &audit.unsafe_attribute_hits[0];
-        assert!(hit.locator.contains("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"));
-        assert!(hit.locator.contains("ShortString;"));
-        assert!(hit.locator.contains("schema.rs"));
+        assert!(hit.evidence.contains("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"));
+        assert!(hit.evidence.contains("ShortString;"));
+        assert!(hit.evidence.contains("schema.rs"));
 
         let whole_history = collect_hits(directory.path(), "HEAD", &[]).unwrap();
         assert_eq!(
@@ -6244,7 +6627,10 @@ mod tests {
         let before = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
         assert_eq!(before.unsafe_attribute_hits.len(), 1);
         let before_id =
-            unsafe_attribute_occurrence_id(&before.repo_root, &before.unsafe_attribute_hits[0]);
+            finding_id(
+            modality::UNSAFE_ATTRIBUTE_ID,
+            &before.unsafe_attribute_hits[0].location,
+        );
 
         let path = directory.path().join("schema.rs");
         let source = std::fs::read_to_string(&path).unwrap();
@@ -6264,18 +6650,18 @@ mod tests {
         let added = after
             .unsafe_attribute_hits
             .iter()
-            .find(|hit| hit.locator.starts_with("rust-attribute-added"))
+            .find(|hit| hit.evidence.starts_with("rust-attribute-added"))
             .unwrap();
         let removed = after
             .unsafe_attribute_hits
             .iter()
-            .find(|hit| hit.locator.starts_with("rust-attribute-removed"))
+            .find(|hit| hit.evidence.starts_with("rust-attribute-removed"))
             .unwrap();
-        assert!(added.locator.contains("inlineencodings::GenId;"));
-        assert!(removed.locator.contains("ShortString;"));
+        assert!(added.evidence.contains("inlineencodings::GenId;"));
+        assert!(removed.evidence.contains("ShortString;"));
         assert_ne!(
             before_id,
-            unsafe_attribute_occurrence_id(&after.repo_root, added),
+            finding_id(modality::UNSAFE_ATTRIBUTE_ID, &added.location),
             "the encoding is part of the exact compatibility claim"
         );
     }
@@ -6298,10 +6684,10 @@ mod tests {
         let audit = collect_hits(unpinned.path(), "HEAD^..HEAD", &[]).unwrap();
         assert_eq!(audit.unsafe_attribute_hits.len(), 1);
         assert!(audit.unsafe_attribute_hits[0]
-            .locator
+            .evidence
             .starts_with("rust-attribute-removed"));
         assert!(audit.unsafe_attribute_hits[0]
-            .locator
+            .evidence
             .contains("pub migrated"));
 
         let renamed = git_unsafe_attribute_fixture();
@@ -6318,13 +6704,13 @@ mod tests {
         assert!(audit
             .unsafe_attribute_hits
             .iter()
-            .any(|hit| hit.locator.starts_with("rust-attribute-added")
-                && hit.locator.contains("pub renamed")));
+            .any(|hit| hit.evidence.starts_with("rust-attribute-added")
+                && hit.evidence.contains("pub renamed")));
         assert!(audit
             .unsafe_attribute_hits
             .iter()
-            .any(|hit| hit.locator.starts_with("rust-attribute-removed")
-                && hit.locator.contains("pub migrated")));
+            .any(|hit| hit.evidence.starts_with("rust-attribute-removed")
+                && hit.evidence.contains("pub migrated")));
     }
 
     #[test]
@@ -6407,8 +6793,8 @@ mod tests {
             .unwrap();
         assert_eq!(unsafe_hits.len(), 1);
         let hit = &unsafe_hits[0];
-        assert!(hit.locator.starts_with("rust-attribute-removed"));
-        assert!(hit.locator.contains("side_pin: ShortString;"));
+        assert!(hit.evidence.starts_with("rust-attribute-removed"));
+        assert!(hit.evidence.contains("side_pin: ShortString;"));
     }
 
     #[test]
@@ -6454,7 +6840,7 @@ mod tests {
             "one semantic claim compared with two parents is one review occurrence"
         );
         assert!(audit.unsafe_attribute_hits[0]
-            .locator
+            .evidence
             .starts_with("rust-attribute-added"));
     }
 
@@ -6463,23 +6849,29 @@ mod tests {
         let directory = git_unsafe_attribute_fixture();
         let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
         let hit = &audit.unsafe_attribute_hits[0];
-        let occurrence = unsafe_attribute_occurrence_id(&audit.repo_root, hit);
+        let occurrence = finding_id(modality::UNSAFE_ATTRIBUTE_ID, &hit.location);
 
+        // Same declaration, rewritten commit: identity is the declaration's own
+        // hash, so a rebase changes only the evidence.
         let rebased = GitHit {
-            locator: hit.locator.clone(),
+            seen_in: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
             display: "unsafe-attribute deadbeef:b/schema.rs:99  rewritten commit".to_owned(),
+            ..hit.clone()
         };
         assert_eq!(
             occurrence,
-            unsafe_attribute_occurrence_id(&audit.repo_root, &rebased),
+            finding_id(modality::UNSAFE_ATTRIBUTE_ID, &rebased.location),
             "rewriting the introducing commit must not discard its declaration justification"
         );
 
-        let changed = GitHit {
-            locator: hit.locator.replace("schema.rs", "other.rs"),
-            display: hit.display.clone(),
+        let Inner::Field(coordinate) = &hit.location.inner else {
+            panic!("an unsafe-attribute claim is a named coordinate, not a byte range");
         };
-        let changed_occurrence = unsafe_attribute_occurrence_id(&audit.repo_root, &changed);
+        let changed = Location::field(
+            hit.location.carrier.clone(),
+            coordinate.replace("schema.rs", "other.rs"),
+        );
+        let changed_occurrence = finding_id(modality::UNSAFE_ATTRIBUTE_ID, &changed);
         assert_ne!(
             occurrence, changed_occurrence,
             "moving or changing the declaration is a new occurrence"
@@ -6513,7 +6905,7 @@ mod tests {
             "attribute classification",
         );
         let view = store.storage().decide_view().unwrap();
-        let benign = benign_occurrence_sets(&view.reader, &view.facts).unwrap();
+        let benign = settled_findings(&view.reader, &view.facts, BTreeMap::new()).unwrap();
         assert!(benign.justified.contains(&occurrence));
         assert!(!benign.justified.contains(&changed_occurrence));
     }
@@ -6547,19 +6939,11 @@ mod tests {
         store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, resolution, "unexplained benign");
 
         let view = store.storage().decide_view().unwrap();
-        let benign = benign_occurrence_sets(&view.reader, &view.facts).unwrap();
+        let benign = settled_findings(&view.reader, &view.facts, BTreeMap::new()).unwrap();
         assert!(benign.ordinary.contains(&occurrence));
         assert!(!benign.justified.contains(&occurrence));
-        assert!(occurrence_is_hidden(
-            modality::PROTECTED_TERM,
-            occurrence,
-            &benign
-        ));
-        assert!(!occurrence_is_hidden(
-            modality::UNSAFE_ATTRIBUTE_ID,
-            occurrence,
-            &benign
-        ));
+        assert!(benign.hides(modality::PROTECTED_TERM, occurrence));
+        assert!(!benign.hides(modality::UNSAFE_ATTRIBUTE_ID, occurrence));
         drop(view);
 
         let explained = genid().id;
@@ -6585,12 +6969,8 @@ mod tests {
         .0;
         store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, resolution, "explained benign");
         let view = store.storage().decide_view().unwrap();
-        let benign = benign_occurrence_sets(&view.reader, &view.facts).unwrap();
-        assert!(occurrence_is_hidden(
-            modality::UNSAFE_ATTRIBUTE_ID,
-            occurrence,
-            &benign
-        ));
+        let benign = settled_findings(&view.reader, &view.facts, BTreeMap::new()).unwrap();
+        assert!(benign.hides(modality::UNSAFE_ATTRIBUTE_ID, occurrence));
     }
 
     #[test]
@@ -6603,24 +6983,24 @@ mod tests {
 
         let patch_hits = term_hits
             .iter()
-            .filter(|hit| hit.locator.starts_with("patch "))
+            .filter(|hit| hit.evidence.starts_with("patch "))
             .collect::<Vec<_>>();
         assert_eq!(patch_hits.len(), 2);
-        assert_ne!(patch_hits[0].locator, patch_hits[1].locator);
+        assert_ne!(patch_hits[0].location, patch_hits[1].location);
         assert!(patch_hits
             .iter()
-            .all(|hit| hit.locator.contains(&object_id)));
+            .all(|hit| hit.evidence.contains(&object_id)));
         assert_ne!(
-            git_occurrence_id(&audit.repo_root, patch_hits[0], "project-sunrise"),
-            git_occurrence_id(&audit.repo_root, patch_hits[1], "project-sunrise")
+            finding_id(modality::PROTECTED_TERM, &patch_hits[0].location),
+            finding_id(modality::PROTECTED_TERM, &patch_hits[1].location)
         );
 
         let message_hits = term_hits
             .iter()
-            .filter(|hit| hit.locator.starts_with("message "))
+            .filter(|hit| hit.evidence.starts_with("message "))
             .collect::<Vec<_>>();
         assert_eq!(message_hits.len(), 2);
-        assert_ne!(message_hits[0].locator, message_hits[1].locator);
+        assert_ne!(message_hits[0].location, message_hits[1].location);
     }
 
     #[test]
@@ -6629,12 +7009,14 @@ mod tests {
         let second_object_id = format!("12345678{}", "1".repeat(32));
         let first = git_hit(
             "patch",
+            Location::span(Carrier::GitBlob(first_object_id.clone()), 0, 15),
             &first_object_id,
             "b/fixture.txt:1:diff-7",
             "+project-sunrise",
         );
         let second = git_hit(
             "patch",
+            Location::span(Carrier::GitBlob(second_object_id.clone()), 0, 15),
             &second_object_id,
             "b/fixture.txt:1:diff-7",
             "+project-sunrise",
@@ -6644,12 +7026,207 @@ mod tests {
         assert!(second.display.contains("12345678"));
         assert!(!first.display.contains(&first_object_id));
         assert!(!second.display.contains(&second_object_id));
-        assert_ne!(first.locator, second.locator);
+        assert_ne!(first.location, second.location);
 
-        let repo = Path::new("/canonical/repository");
         assert_ne!(
-            git_occurrence_id(repo, &first, "project-sunrise"),
-            git_occurrence_id(repo, &second, "project-sunrise")
+            finding_id(modality::PROTECTED_TERM, &first.location),
+            finding_id(modality::PROTECTED_TERM, &second.location)
+        );
+    }
+
+    /// A repository whose HEAD carries a protected term on one line of one
+    /// file, with unrelated lines around it to move it against later.
+    fn git_carry_forward_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        git_fixture(directory.path(), &["init", "--quiet"]);
+        std::fs::write(directory.path().join("base.txt"), "unrelated\n").unwrap();
+        git_fixture(directory.path(), &["add", "base.txt"]);
+        git_fixture(directory.path(), &["commit", "--quiet", "-m", "base"]);
+        std::fs::write(
+            directory.path().join("notes.md"),
+            "intro\nproject-sunrise appears here\ntail\n",
+        )
+        .unwrap();
+        git_fixture(directory.path(), &["add", "notes.md"]);
+        git_fixture(directory.path(), &["commit", "--quiet", "-m", "add notes"]);
+        directory
+    }
+
+    fn fixture_terms() -> Vec<(String, String)> {
+        vec![("project-sunrise".to_owned(), "fixture".to_owned())]
+    }
+
+    /// Finding ids for one term, restricted to a kind of sighting ("patch",
+    /// "message", "path").
+    fn finding_ids(audit: &GitAudit, term: &str, kind: &str) -> BTreeSet<Id> {
+        audit
+            .hits
+            .get(term)
+            .into_iter()
+            .flatten()
+            .filter(|hit| hit.evidence.starts_with(&format!("{kind} ")))
+            .map(|hit| finding_id(modality::PROTECTED_TERM, &hit.location))
+            .collect()
+    }
+
+    /// THE property the redesign exists for. Commit surgery rewrites commits
+    /// and leaves blobs byte-identical, so the material keeps its id and every
+    /// Decide resolution about it keeps applying.
+    #[test]
+    fn commit_surgery_that_preserves_the_blob_preserves_the_finding_id() {
+        let directory = git_carry_forward_fixture();
+        let terms = fixture_terms();
+        let before = collect_hits(directory.path(), "HEAD", &terms).unwrap();
+        let before_ids = finding_ids(&before, "project-sunrise", "patch");
+        assert_eq!(before_ids.len(), 1, "one protected line, one finding");
+        let head_before = git_fixture(directory.path(), &["rev-parse", "HEAD"]);
+        let blob_before = git_fixture(directory.path(), &["rev-parse", "HEAD:notes.md"]);
+
+        // Amend and then rebase the whole history: new commit ids throughout.
+        git_fixture(
+            directory.path(),
+            &[
+                "commit",
+                "--amend",
+                "--quiet",
+                "--no-edit",
+                "--date=2001-02-03T04:05:06",
+            ],
+        );
+        git_fixture(
+            directory.path(),
+            &["rebase", "--quiet", "--force-rebase", "--root"],
+        );
+        let head_after = git_fixture(directory.path(), &["rev-parse", "HEAD"]);
+        let blob_after = git_fixture(directory.path(), &["rev-parse", "HEAD:notes.md"]);
+        assert_ne!(head_before, head_after, "the fixture must actually rewrite");
+        assert_eq!(blob_before, blob_after, "a rebase does not touch blobs");
+
+        let after = collect_hits(directory.path(), "HEAD", &terms).unwrap();
+        assert_eq!(
+            before_ids,
+            finding_ids(&after, "project-sunrise", "patch"),
+            "the same material at a new commit is the same finding"
+        );
+        let commits = after.hits["project-sunrise"]
+            .iter()
+            .filter(|hit| hit.evidence.starts_with("patch "))
+            .map(|hit| hit.seen_in.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !commits.contains(&head_before),
+            "the locator cache follows the rewrite even though identity does not"
+        );
+    }
+
+    /// git decides what moved. A line lifted into another file inside a commit
+    /// that also edits it is not new material, and `blame -M -C` is the thing
+    /// that knows so — which is why posture asks instead of matching for
+    /// itself.
+    #[test]
+    fn moved_material_is_carried_forward_and_new_material_is_not() {
+        let directory = git_carry_forward_fixture();
+        let terms = fixture_terms();
+        let introduced = finding_ids(
+            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            "project-sunrise",
+            "patch",
+        );
+        assert_eq!(introduced.len(), 1);
+
+        // Move the file AND change it, so the new path's blob is genuinely a
+        // different object from the one the material was introduced in.
+        git_fixture(directory.path(), &["mv", "notes.md", "docs.md"]);
+        let moved = directory.path().join("docs.md");
+        let body = std::fs::read_to_string(&moved).unwrap();
+        std::fs::write(&moved, format!("{body}extra unrelated line\n")).unwrap();
+        git_fixture(directory.path(), &["add", "-A"]);
+        git_fixture(
+            directory.path(),
+            &["commit", "--quiet", "-m", "move and extend notes"],
+        );
+        assert_ne!(
+            git_fixture(directory.path(), &["rev-parse", "HEAD:docs.md"]),
+            git_fixture(directory.path(), &["rev-parse", "HEAD~1:notes.md"]),
+            "the moved file must have a new blob for this test to mean anything"
+        );
+
+        let after_move = finding_ids(
+            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            "project-sunrise",
+            "patch",
+        );
+        assert_eq!(
+            introduced, after_move,
+            "material git reports as moved must not be re-created as a new finding"
+        );
+
+        // Negative control: a genuinely new instance of the same term, in
+        // another file, is a DIFFERENT finding — every instance is judged, and
+        // the equality above is not everything collapsing into one id.
+        std::fs::write(
+            directory.path().join("other.md"),
+            "project-sunrise elsewhere\n",
+        )
+        .unwrap();
+        git_fixture(directory.path(), &["add", "other.md"]);
+        git_fixture(
+            directory.path(),
+            &["commit", "--quiet", "-m", "second instance"],
+        );
+        let after_new = finding_ids(
+            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            "project-sunrise",
+            "patch",
+        );
+        assert_eq!(
+            after_new.len(),
+            2,
+            "the same string in a second place is a second judgement"
+        );
+        assert!(after_new.is_superset(&introduced));
+    }
+
+    /// The honest exception, asserted rather than assumed: a commit message has
+    /// no blob, so its carrier is the commit, and commit surgery DOES move it.
+    /// A reworded or rebased message re-blocks and needs a fresh decision.
+    #[test]
+    fn a_commit_message_finding_does_not_survive_commit_surgery() {
+        let directory = tempfile::tempdir().unwrap();
+        git_fixture(directory.path(), &["init", "--quiet"]);
+        std::fs::write(directory.path().join("base.txt"), "unrelated\n").unwrap();
+        git_fixture(directory.path(), &["add", "base.txt"]);
+        git_fixture(
+            directory.path(),
+            &["commit", "--quiet", "-m", "mentions project-sunrise"],
+        );
+        let terms = fixture_terms();
+        let before = finding_ids(
+            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            "project-sunrise",
+            "message",
+        );
+        assert_eq!(before.len(), 1);
+
+        git_fixture(
+            directory.path(),
+            &[
+                "commit",
+                "--amend",
+                "--quiet",
+                "--no-edit",
+                "--date=2001-02-03T04:05:06",
+            ],
+        );
+        let after = finding_ids(
+            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            "project-sunrise",
+            "message",
+        );
+        assert_eq!(after.len(), 1);
+        assert_ne!(
+            before, after,
+            "there is no content-addressed carrier for a message; say so plainly"
         );
     }
 
