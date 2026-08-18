@@ -23,7 +23,7 @@
 //! Commands:
 //!   posture scan <path>        — walk a path, extract, record findings
 //!   posture list [--scan ID]   — findings, grouped by modality
-//!   decide ... --about <occurrence> — durable judgement of one occurrence
+//!   decide ... --about <finding>   — durable judgement of one finding
 //!   posture coverage <scan>    — what that scan did NOT look at
 //!   posture scans              — recent scans
 
@@ -101,10 +101,10 @@ enum Command {
         /// Show at most this many examples per group
         #[arg(long, default_value_t = 3)]
         examples: usize,
-        /// Include occurrences classified benign by a resolved Decide decision.
+        /// Include findings classified benign by a resolved Decide decision.
         #[arg(long)]
         all: bool,
-        /// Print stable occurrence ids used by `decide propose --about`.
+        /// Print the content-located finding ids `decide propose --about` names.
         #[arg(long)]
         ids: bool,
     },
@@ -3175,7 +3175,7 @@ fn legacy_bridges(facts: &TribleSet) -> BTreeMap<Id, BTreeSet<Id>> {
 /// exact `send`: merely finishing a deliberation must not turn a negative or
 /// unrelated free-form outcome into clearance. Missing decisions contribute
 /// nothing. A fork or a second resolved decision with another outcome keeps
-/// the occurrence visible; set union therefore exposes disagreement instead of
+/// the finding visible; set union therefore exposes disagreement instead of
 /// choosing a winner by time or iteration order.
 fn settled_findings(
     reader: &PileReader,
@@ -3899,8 +3899,8 @@ fn canonical_git_root(repo_path: &Path) -> Result<PathBuf> {
 
 #[derive(Debug)]
 struct GitAudit {
-    /// Physical repository root used by every occurrence identity, regardless
-    /// of how the caller spelled `--repo`.
+    /// Physical repository root the audit ran against, regardless of how the
+    /// caller spelled `--repo`. Identity no longer depends on it.
     repo_root: PathBuf,
     hits: BTreeMap<String, Vec<GitHit>>,
     unsafe_attribute_hits: Vec<GitHit>,
@@ -4586,7 +4586,7 @@ fn cmd_git(
     } = collect_hits(repo_path, range, &terms)?;
 
     // Persist the complete audit before rendering or deciding the exit code.
-    // This gives Decide a stable semantic occurrence to name and records a
+    // This gives Decide a content-located finding to name and records a
     // genuinely empty audit differently from an audit never run.
     let decisions = storage.decide_view()?;
     let settled = settled_findings(
@@ -4672,7 +4672,7 @@ fn cmd_git(
 
     if hidden > 0 {
         println!(
-            "{hidden} occurrence(s) hidden by resolved Decide outcome \
+            "{hidden} finding(s) hidden by resolved Decide outcome \
              {BENIGN_DECISION_OUTCOME:?}."
         );
     }
@@ -4704,7 +4704,7 @@ fn cmd_git(
         }
     }
     if hits.is_empty() && unsafe_attribute_hits.is_empty() {
-        println!("no unresolved Posture occurrence remains in this range.");
+        println!("no unresolved Posture finding remains in this range.");
     } else {
         println!(
             "\nA finding stops blocking only after a Decide decision about its exact id resolves \
