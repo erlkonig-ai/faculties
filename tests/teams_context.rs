@@ -27,7 +27,7 @@ impl TestPile {
         let path = dir.join("test.pile");
         let key = dir.join("test.key");
         fs::File::create(&path).unwrap();
-        faculties::collection_cutover::initialize_signer(&path, Some(&key)).unwrap();
+        faculties::storage::initialize_signer(&path, Some(&key)).unwrap();
         Self { dir, path, key }
     }
 }

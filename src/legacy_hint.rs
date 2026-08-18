@@ -210,7 +210,7 @@ pub fn legacy_migration_hint(pile: &mut Pile, scope: Id) -> Option<String> {
         .find(|(known, _)| *known == scope)
         .map(|(_, name)| *name)?;
 
-    if native_commit_count(pile, scope)? > 0 {
+    if !native_scope_is_empty(pile, scope)? {
         return None;
     }
     let (commits, capped) = legacy_authored_commits(pile, branch_name)?;
@@ -232,26 +232,26 @@ pub fn legacy_migration_hint(pile: &mut Pile, scope: Id) -> Option<String> {
     ))
 }
 
-/// Count commits already published into `scope`, or `None` if the records
+/// Whether `scope` has no commits at all, or `None` if the pile's records
 /// cannot be enumerated.
 ///
 /// This reads the pile's in-memory collection-record index and filters by
-/// collection identity only. Signatures are deliberately not verified and the
-/// signer is deliberately not matched: the question here is "has anything at
-/// all been published into this scope", and answering it must stay far cheaper
-/// than the materialization the caller is about to perform anyway.
-fn native_commit_count(pile: &mut Pile, scope: Id) -> Option<usize> {
+/// collection identity only, stopping at the first match. Signatures are
+/// deliberately not verified and the signer is deliberately not matched: the
+/// question is "has anything at all been published into this scope", and
+/// answering it must stay cheaper than the materialization the caller is about
+/// to perform — which enumerates the same index and then verifies.
+fn native_scope_is_empty(pile: &mut Pile, scope: Id) -> Option<bool> {
     let collection = simplearchive_union::descriptor(scope).handle();
     let records = pile.records().ok()?;
-    let mut count = 0;
     for record in records {
         if let Ok(CollectionRecord::Commit(commit)) = record {
             if commit.collection() == collection {
-                count += 1;
+                return Some(false);
             }
         }
     }
-    Some(count)
+    Some(true)
 }
 
 /// Count authored commits reachable from the head of the legacy branch named
@@ -399,7 +399,7 @@ mod tests {
         write_legacy_branch(&path);
 
         let mut pile = Pile::open(&path).unwrap();
-        assert_eq!(native_commit_count(&mut pile, DEFAULT_SCOPE_ID), Some(0));
+        assert_eq!(native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID), Some(true));
         let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID)
             .expect("a legacy-only pile must say so");
         pile.close().unwrap();
@@ -431,7 +431,7 @@ mod tests {
             .commit(goal_fragment("native goal"))
             .unwrap();
 
-        assert_eq!(native_commit_count(&mut pile, DEFAULT_SCOPE_ID), Some(1));
+        assert_eq!(native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID), Some(false));
         assert_eq!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID), None);
         pile.close().unwrap();
     }
