@@ -63,10 +63,12 @@ pub mod message;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
 pub mod orient;
+pub mod out;
 pub mod planner;
 pub mod posture_policy;
 pub mod relations;
 pub mod schemas;
+pub mod spec;
 pub mod status;
 pub mod storage;
 pub mod teams;
