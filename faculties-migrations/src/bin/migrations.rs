@@ -25,7 +25,9 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
 use faculties_migrations::per_faculty::{self, Faculty};
-use faculties_migrations::{activation_cutover, collection_cutover, disposable_cutover};
+use faculties_migrations::{
+    activation_cutover, collection_cutover, disposable_cutover, posture_findings,
+};
 
 #[derive(Parser)]
 #[command(
@@ -65,8 +67,56 @@ enum Command {
         faculty: Faculty,
     },
 
+    /// Bridge pre-2026-08-18 Posture findings onto their content-located
+    /// identity, so decisions already resolved about the old id keep applying.
+    /// Nothing is deleted or rewritten; the bridges are additive annotations.
+    PostureFindings {
+        /// Report what would be bridged, and what cannot be, without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// List the faculty names `migrate-legacy` accepts.
     Faculties,
+}
+
+fn posture_findings(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
+    let plan = posture_findings::plan(pile, key).context("plan Posture finding bridges")?;
+    println!("Posture finding identity bridges");
+    println!("pile          : {}", pile.display());
+    println!("legacy findings examined : {}", plan.examined());
+    println!("already bridged          : {}", plan.already_bridged());
+    println!("bridgeable               : {}", plan.bridged().len());
+    println!("unbridgeable             : {}", plan.unbridged().len());
+
+    if !plan.unbridged().is_empty() {
+        // Named, not counted away: an unbridgeable finding re-blocks under a new
+        // id, and whoever resolved it once has to see which ones.
+        let mut reasons = std::collections::BTreeMap::<&str, usize>::new();
+        for entry in plan.unbridged() {
+            *reasons.entry(entry.reason.as_str()).or_default() += 1;
+        }
+        println!("\nNOT bridged — these re-block under a new id:");
+        for (reason, count) in &reasons {
+            println!("  {count:>5}  {reason}");
+        }
+        for entry in plan.unbridged().iter().take(10) {
+            println!("    {:X}  {}", entry.occurrence, entry.locator);
+        }
+        if plan.unbridged().len() > 10 {
+            println!("    … {} more", plan.unbridged().len() - 10);
+        }
+    }
+
+    if dry_run {
+        println!("\n(dry run — nothing written)");
+        return Ok(());
+    }
+    match posture_findings::publish(pile, key, plan).context("publish Posture finding bridges")? {
+        Some(commit) => println!("\nwrote bridge COMMIT {:X}", commit.id()),
+        None => println!("\nnothing to write"),
+    }
+    Ok(())
 }
 
 fn list_faculties() {
@@ -166,6 +216,9 @@ fn main() -> Result<()> {
         Some(Command::ActivateCutover) => activate_cutover(&cli.pile, cli.key.as_deref()),
         Some(Command::MigrateLegacy { faculty }) => {
             per_faculty::migrate(faculty, &cli.pile, cli.key.as_deref())
+        }
+        Some(Command::PostureFindings { dry_run }) => {
+            posture_findings(&cli.pile, cli.key.as_deref(), dry_run)
         }
         Some(Command::Faculties) => {
             list_faculties();

@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **A Posture finding is located by content, and git decides what moved.**
+  Identity was `(modality, path, commit:path:line, value)`, so commit surgery —
+  rebase, cherry-pick, amend, scrub — gave the same material a new id and every
+  Decide resolution silently stopped applying. It is now `(modality, carrier,
+  inner locator)`, where the carrier is content-addressed and the coordinate is
+  modality-dependent: a git blob and a byte range for source, the extracted
+  member hashed by posture for a container, and the commit itself for a message,
+  which has no blob. `finding` and `occurrence` collapse into one written
+  entity; per-scan observations become `sighting` annotations carrying the
+  document, the evidence and the commit the material was seen in — a rebuildable
+  cache, never identity. The scanner asks `git blame -M -C` where a line was
+  introduced rather than matching moved material itself, so an edit elsewhere in
+  a file does not re-create a finding as new. Reads no longer validate all
+  history against the current schema: `validate_scan_view` is gone, and
+  validation runs where it belongs, on the fragment being written. Existing
+  records stay exactly where they are; `migrations posture-findings` bridges the
+  old occurrence ids onto the findings they turned out to be so resolved
+  outcomes keep applying, and reports one by one the findings it cannot bridge
+  (a repository no longer on this machine, a commit rewritten away, or a
+  container member whose bytes a legacy record never stored).
 - **Wiki and Memory frontiers come from the shared `latest` operation.** "Which
   states are current" was hand-rolled in nine faculties as *gather every
   superseded id, then subtract*. It is a lattice operation, not a per-faculty

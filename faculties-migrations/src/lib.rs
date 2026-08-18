@@ -45,6 +45,7 @@ pub mod message_cutover;
 pub mod orient_cutover;
 pub mod planner_cutover;
 pub mod posture_cutover;
+pub mod posture_findings;
 pub mod relations_cutover;
 pub mod secrets_cutover;
 pub mod status_cutover;
