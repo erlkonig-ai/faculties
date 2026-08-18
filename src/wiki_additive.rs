@@ -73,6 +73,12 @@ pub struct Malformed {
     pub undated: Vec<Id>,
     /// Tagged versions carrying no `fragment`.
     pub unfragmented: Vec<Id>,
+    /// Versions carrying SEVERAL `fragment` values, which say two different
+    /// things about which page the version belongs to. Chaining one of them
+    /// would pick a page by accident, so this refuses instead. The wiki's read
+    /// model stopped looking at anchors entirely on 2026-08-18; this migration
+    /// is the last reader of that vocabulary, so the arity check lives here.
+    pub ambiguous: Vec<Id>,
 }
 
 /// Supersedes edges, plus the shape of what produced them.
@@ -125,6 +131,7 @@ pub fn plan_additive(deltas: &[LegacyDelta]) -> Result<AdditivePlan, Malformed> 
     let mut fragment_of: BTreeMap<Id, Id> = BTreeMap::new();
     let mut stamp_of: BTreeMap<Id, [u8; 32]> = BTreeMap::new();
     let mut tagged: std::collections::BTreeSet<Id> = std::collections::BTreeSet::new();
+    let mut ambiguous: std::collections::BTreeSet<Id> = std::collections::BTreeSet::new();
 
     for d in deltas {
         for (vid,) in find!(
@@ -137,7 +144,16 @@ pub fn plan_additive(deltas: &[LegacyDelta]) -> Result<AdditivePlan, Malformed> 
             (vid: Id, frag: Id),
             pattern!(&d.facts, [{ ?vid @ attrs::fragment: ?frag }])
         ) {
-            fragment_of.entry(vid).or_insert(frag);
+            match fragment_of.entry(vid) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(frag);
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    if *slot.get() != frag {
+                        ambiguous.insert(vid);
+                    }
+                }
+            }
         }
         // A version can appear in several commits because the deterministic
         // legacy writer deliberately reasserted an existing content-derived
@@ -166,10 +182,11 @@ pub fn plan_additive(deltas: &[LegacyDelta]) -> Result<AdditivePlan, Malformed> 
         .copied()
         .filter(|v| !fragment_of.contains_key(v))
         .collect();
-    if !undated.is_empty() || !unfragmented.is_empty() {
+    if !undated.is_empty() || !unfragmented.is_empty() || !ambiguous.is_empty() {
         return Err(Malformed {
             undated,
             unfragmented,
+            ambiguous: ambiguous.into_iter().collect(),
         });
     }
 
@@ -267,7 +284,8 @@ mod tests {
             err,
             Malformed {
                 undated: vec![B],
-                unfragmented: vec![]
+                unfragmented: vec![],
+                ambiguous: vec![],
             }
         );
     }
@@ -285,7 +303,8 @@ mod tests {
             err,
             Malformed {
                 undated: vec![],
-                unfragmented: vec![B]
+                unfragmented: vec![B],
+                ambiguous: vec![],
             }
         );
     }

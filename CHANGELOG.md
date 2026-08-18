@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **The legacy Wiki anchor is retired: an id names a revision or it names
+  nothing.** `attrs::fragment` is no longer read anywhere in the wiki — not by
+  the read model, not by the CLI selector path, not by the viewer, not by
+  `gauge`. `RevisionRecord::legacy_fragment`, `EntryRecord::legacy_fragments`
+  and `RevisionReadModel::legacy_fragment_frontier` are gone; a legacy revision
+  is now identified by the `native` flag the loader sets from its kind tag, and
+  an entry is labelled by its root revision rather than by an anchor. The
+  branch-era read helpers in `schemas::wiki` (`latest_versions`,
+  `cover_fragments`, `read_title`, `read_content`, `tags_of`,
+  `find_tag_by_name`) go with them — nothing had called them since the
+  collection cutover. The anchor FACTS stay in every pile, because the store is
+  append-only, and the additive migration still reads them as legacy input;
+  what changed is that nothing resolves one.
+  **This is irreversible in effect and it has a measured cost**: superseded
+  revisions are content-addressed, so the anchor references inside them can
+  never be rewritten. On the live corpus that is 12141 references across 2223
+  superseded revisions (1166 distinct anchors) which now resolve to nothing.
+  Run `wiki lint --fix` over a corpus BEFORE installing this — afterwards no
+  build can resolve an anchor, and `wiki check` reports every remaining anchor
+  reference as a broken link (7351 on an un-linted live pile, 0 after the fix).
+  `examples/reference_census.rs` measures both halves; `examples/anchor_gate.rs`
+  is deleted, its gate having already licensed the grouping change it measured.
 - **`wiki lint` rewrites every `wiki:` reference to a revision id.** A revision
   id is a citation — immutable, pinned to what its author read; a legacy anchor
   is a live indirection that returns whatever is head today, so a citation

@@ -123,10 +123,9 @@ impl WikiLive {
 
     fn entry_key(entry: &EntryRecord) -> Id {
         *entry
-            .legacy_fragments
+            .roots
             .first()
-            .or_else(|| entry.roots.first())
-            .expect("validated Wiki entries always have a selector")
+            .expect("validated Wiki entries always have a root")
     }
 
     fn revision(&self, revision: Id) -> Option<&RevisionRecord> {
@@ -184,22 +183,13 @@ impl WikiLive {
             .revisions
             .revision_records()
             .map(|revision| revision.id)
-            .chain(
-                self.catalog
-                    .revisions
-                    .all_entries()
-                    .into_iter()
-                    .flat_map(|entry| entry.legacy_fragments),
-            )
             .collect()
     }
 
-    /// Resolve one full selector without collapsing its legitimate frontier.
+    /// Resolve one full selector. A selector is a revision id or nothing.
     fn resolve_catalog_selector(catalog: &WikiCatalog, selector: Id) -> Vec<Id> {
         if catalog.revisions.revision(selector).is_some() {
             vec![selector]
-        } else if let Some(revisions) = catalog.revisions.legacy_fragment_frontier(selector) {
-            revisions.to_vec()
         } else {
             Vec::new()
         }
@@ -1698,21 +1688,6 @@ impl WikiViewer {
                             );
                         });
 
-                        if let Some(entry) = entry.filter(|entry| entry.legacy_fragments.len() > 1) {
-                            g.full(|ctx| {
-                                let weak = ctx.ctx().global_style().visuals.weak_text_color();
-                                ctx.label(
-                                    egui::RichText::new(format!(
-                                        "{} legacy aliases name this entry",
-                                        entry.legacy_fragments.len()
-                                    ))
-                                    .monospace()
-                                    .small()
-                                    .color(weak),
-                                );
-                            });
-                        }
-
                         g.full(|ctx| { ctx.separator(); });
 
                         g.full(|ctx| {
@@ -1876,8 +1851,11 @@ mod tests {
         );
     }
 
+    /// A legacy anchor id names nothing. Its facts stay in the store — the
+    /// fixture writes them — but the viewer resolves revisions only, so an
+    /// anchor click opens no pane instead of silently opening today's text.
     #[test]
-    fn legacy_fragment_selector_returns_its_complete_frontier() {
+    fn a_legacy_anchor_selector_resolves_to_nothing() {
         let fragment_id = Id::new([0xa1; 16]).unwrap();
         let first = Id::new([0xb1; 16]).unwrap();
         let second = Id::new([0xb2; 16]).unwrap();
@@ -1901,9 +1879,17 @@ mod tests {
 
         let catalog = wiki::load_catalog(fragment.facts()).unwrap();
         assert_eq!(
-            WikiLive::resolve_catalog_selector(&catalog, fragment_id),
-            vec![first, second],
-            "the alias is set-valued; time does not arbitrate the fork"
+            WikiLive::resolve_catalog_selector(&catalog, first),
+            vec![first],
+            "a revision id still resolves to itself"
+        );
+        assert_eq!(
+            WikiLive::resolve_catalog_selector(&catalog, second),
+            vec![second]
+        );
+        assert!(
+            WikiLive::resolve_catalog_selector(&catalog, fragment_id).is_empty(),
+            "an anchor id resolves to nothing"
         );
     }
 

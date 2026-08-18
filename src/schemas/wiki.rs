@@ -4,12 +4,8 @@
 //! fragments from a pile (the GORBIE wiki viewer widget, playground
 //! dashboard, etc.).
 
-use std::collections::HashMap;
-use triblespace::core::inline::encodings::time::Lower;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Workspace;
-use triblespace::macros::{find, id_hex, pattern};
+use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
 /// Text handle type for wiki content/title blobs.
@@ -84,92 +80,6 @@ pub mod attrs {
         // File-entity reference: `files:<32-char-id>` points to a file entity with metadata.
         "C98FE0EF9151F196D8F7D816ABBBCC49" unsafe as references_file: inlineencodings::GenId;
     }
-}
-
-// ── read-side query helpers ────────────────────────────────────────────────
-// Shared by the `wiki` faculty CLI and by `orient`'s wake-assembler (which
-// surfaces `cover`-tagged fragments — ambient principles/beliefs — on wake).
-
-/// Resolve a tag entity id by its `metadata::name` (case-insensitive).
-pub fn find_tag_by_name(space: &TribleSet, ws: &mut Workspace<Pile>, name: &str) -> Option<Id> {
-    for (id, handle) in find!(
-        (id: Id, h: TextHandle),
-        pattern!(space, [{ ?id @ metadata::name: ?h }])
-    ) {
-        if let Ok(view) = ws.get::<View<str>, _>(handle) {
-            if view.as_ref().eq_ignore_ascii_case(name) {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
-/// Tags on a version entity, excluding the `KIND_VERSION` marker itself.
-pub fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
-    find!(tag: Id, pattern!(space, [{ vid @ metadata::tag: ?tag }]))
-        .filter(|t| *t != KIND_VERSION_ID)
-        .collect()
-}
-
-/// Read the title string of a version entity.
-pub fn read_title(space: &TribleSet, ws: &mut Workspace<Pile>, vid: Id) -> Option<String> {
-    let (h,) = find!((h: TextHandle), pattern!(space, [{ vid @ attrs::title: ?h }])).next()?;
-    let view: View<str> = ws.get(h).ok()?;
-    Some(view.as_ref().to_string())
-}
-
-/// Read the content string of a version entity.
-pub fn read_content(space: &TribleSet, ws: &mut Workspace<Pile>, vid: Id) -> Option<String> {
-    let (h,) = find!((h: TextHandle), pattern!(space, [{ vid @ attrs::content: ?h }])).next()?;
-    let view: View<str> = ws.get(h).ok()?;
-    Some(view.as_ref().to_string())
-}
-
-/// Latest-version-per-fragment as `{fragment -> (version, created_at)}`.
-pub fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
-    let mut latest: HashMap<Id, (Id, Lower)> = HashMap::new();
-    for (vid, frag, ts) in find!(
-        (vid: Id, frag: Id, ts: Lower),
-        pattern!(space, [{
-            ?vid @
-            metadata::tag: &KIND_VERSION_ID,
-            attrs::fragment: ?frag,
-            metadata::created_at: ?ts,
-        }])
-    ) {
-        latest
-            .entry(frag)
-            .and_modify(|e| {
-                if ts > e.1 {
-                    *e = (vid, ts);
-                }
-            })
-            .or_insert((vid, ts));
-    }
-    latest
-}
-
-/// Every fragment whose *latest* version carries the `cover` tag, as
-/// `(title, content)` pairs sorted by title — the ambient set the wake ritual
-/// surfaces. Empty if there is no `cover` tag in the pile yet.
-pub fn cover_fragments(space: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<(String, String)> {
-    let cover_tag = match find_tag_by_name(space, ws, "cover") {
-        Some(id) => id,
-        None => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for (_frag, (vid, _ts)) in latest_versions(space) {
-        if !tags_of(space, vid).contains(&cover_tag) {
-            continue;
-        }
-        let title = read_title(space, ws, vid).unwrap_or_default();
-        if let Some(content) = read_content(space, ws, vid) {
-            out.push((title, content));
-        }
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
 }
 
 // ── the revision DAG ───────────────────────────────────────────────────────

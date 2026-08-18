@@ -95,9 +95,8 @@ impl GaugeModel {
 
         for (index, entry) in records.iter().enumerate() {
             let label = *entry
-                .legacy_fragments
+                .roots
                 .first()
-                .or(entry.roots.first())
                 .expect("admitted Wiki entry has a root");
             let mut states = Vec::with_capacity(entry.frontier.len());
             for revision in &entry.frontier {
@@ -121,9 +120,6 @@ impl GaugeModel {
             }
             for revision in &entry.members {
                 selectors.entry(*revision).or_default().insert(index);
-            }
-            for fragment in &entry.legacy_fragments {
-                selectors.entry(*fragment).or_default().insert(index);
             }
             let active = entry.frontier.iter().any(|revision| {
                 !revision
