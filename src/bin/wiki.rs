@@ -97,7 +97,11 @@ enum Command {
         #[arg(long)]
         to: usize,
     },
-    /// Show derived outgoing and incoming links.
+    /// Show outgoing links from the current text, and every revision citing it.
+    ///
+    /// Incoming links are revision-scoped: a citation records what its author
+    /// read, so a superseded revision that cited this page is still listed.
+    /// `wiki show --latest <revision>` says whether the citation survived.
     Links {
         id: String,
     },
@@ -857,14 +861,21 @@ fn cmd_revert(storage: WikiStorage<'_>, id: String, to: usize) -> Result<()> {
     Ok(())
 }
 
+/// Link targets cited by one immutable revision.
+fn revision_links(reader: &PileReader, revision: &RevisionRecord) -> Result<BTreeSet<Id>> {
+    let mut out = BTreeSet::new();
+    for raw in extract_link_targets(&revision_content(reader, revision)?) {
+        if let Some(id) = Id::from_hex(&raw) {
+            out.insert(id);
+        }
+    }
+    Ok(out)
+}
+
 fn derived_links(reader: &PileReader, entry: &EntryRecord) -> Result<BTreeSet<Id>> {
     let mut out = BTreeSet::new();
     for head in &entry.frontier {
-        for raw in extract_link_targets(&revision_content(reader, head)?) {
-            if let Some(id) = Id::from_hex(&raw) {
-                out.insert(id);
-            }
-        }
+        out.extend(revision_links(reader, head)?);
     }
     Ok(out)
 }
@@ -875,30 +886,30 @@ struct BacklinkSummary {
     types: BTreeSet<String>,
 }
 
+/// Invert every revision's citations, one revision at a time.
+///
+/// A citation is a claim about what its author actually read, so the citing
+/// unit is the revision, never the entry that contains it. Summarizing an
+/// entry's frontier would attribute a dropped citation to the whole page: if
+/// A1 cited X and A2 removed it, an entry-scoped index still reports "A cites
+/// X", which A's current text does not say.
 fn backlink_summaries(
     reader: &PileReader,
-    entries: &[EntryRecord],
+    revisions: &RevisionReadModel,
 ) -> Result<BTreeMap<Id, BacklinkSummary>> {
     let expression = regex::Regex::new(
         r#"#link\("wiki:(?:(?P<kind>[A-Za-z_][A-Za-z0-9_]*):)?(?P<id>[0-9A-Fa-f]{32})"\)"#,
     )
     .expect("static Wiki link expression");
     let mut summaries = BTreeMap::<Id, BacklinkSummary>::new();
-    for source in entries {
-        let source_tags: BTreeSet<Id> = source
-            .frontier
-            .iter()
-            .flat_map(|head| head.tags.iter().copied())
-            .collect();
-        for head in &source.frontier {
-            let content = revision_content(reader, head)?;
-            for captures in expression.captures_iter(&content) {
-                let target = Id::from_hex(&captures["id"]).expect("expression matched a full id");
-                let summary = summaries.entry(target).or_default();
-                summary.tags.extend(source_tags.iter().copied());
-                if let Some(kind) = captures.name("kind") {
-                    summary.types.insert(kind.as_str().to_ascii_lowercase());
-                }
+    for source in revisions.revision_records() {
+        let content = revision_content(reader, source)?;
+        for captures in expression.captures_iter(&content) {
+            let target = Id::from_hex(&captures["id"]).expect("expression matched a full id");
+            let summary = summaries.entry(target).or_default();
+            summary.tags.extend(source.tags.iter().copied());
+            if let Some(kind) = captures.name("kind") {
+                summary.types.insert(kind.as_str().to_ascii_lowercase());
             }
         }
     }
@@ -914,21 +925,40 @@ fn cmd_links(storage: WikiStorage<'_>, id: String) -> Result<()> {
         println!("  {target:x}");
     }
     println!("incoming:");
+    for source in incoming_revisions(&view.reader, &catalog.revisions, entry)? {
+        println!("  {source:x}");
+    }
+    Ok(())
+}
+
+/// Every revision whose own text cites `entry`, superseded revisions included.
+///
+/// REVISION-scoped by design. An entry-scoped answer asserts a citation that
+/// may no longer exist: if A1 cited this page and A2 dropped the citation,
+/// naming "A" claims A currently cites it, which A's text denies. Naming A1 is
+/// exactly true — A1 did — and `wiki show --latest <A1>` shows whether A's
+/// current text still does.
+fn incoming_revisions(
+    reader: &PileReader,
+    revisions: &RevisionReadModel,
+    entry: &EntryRecord,
+) -> Result<Vec<Id>> {
     let target_ids: BTreeSet<Id> = entry
         .members
         .iter()
         .copied()
         .chain(entry.legacy_fragments.iter().copied())
         .collect();
-    for source in catalog.revisions.all_entries() {
-        if derived_links(&view.reader, &source)?
+    let mut out = Vec::new();
+    for source in revisions.revision_records() {
+        if revision_links(reader, source)?
             .iter()
             .any(|id| target_ids.contains(id))
         {
-            println!("  {}", entry_label(&source));
+            out.push(source.id);
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn cmd_list(
@@ -990,12 +1020,9 @@ fn cmd_list(
         || !with_backlink_types.is_empty()
         || !without_backlink_types.is_empty();
     // Titles and tags are already in the catalog. Only backlink filters need
-    // page content, so scan every source once and invert its links on demand.
+    // page content, so scan every revision once and invert its links on demand.
     let backlink_summaries = if has_backlink_filter {
-        Some(backlink_summaries(
-            &view.reader,
-            &catalog.revisions.all_entries(),
-        )?)
+        Some(backlink_summaries(&view.reader, &catalog.revisions)?)
     } else {
         None
     };
@@ -1741,6 +1768,136 @@ mod tests {
         );
     }
 
+    /// A citation belongs to the revision that made it, not to the page.
+    ///
+    /// A1 cites X and its successor A2 does not. Incoming links on X must name
+    /// A1 — that citation was really written — and must NOT name A2, whose
+    /// text says nothing about X. Naming the entry would have to pick one of
+    /// those two answers and would be wrong either way.
+    #[test]
+    fn backlinks_name_the_citing_revision_not_its_successor() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+
+        let before = storage.view().unwrap();
+        let mut genesis = Fragment::empty();
+        let target = stage_revision(
+            storage,
+            &mut genesis,
+            None,
+            "target".to_owned(),
+            "body".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let citing = stage_revision(
+            storage,
+            &mut genesis,
+            None,
+            "source".to_owned(),
+            format!("cites #link(\"wiki:{target:x}\")[target]"),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage.publish(&before, genesis).unwrap();
+
+        // A2: same page, citation removed.
+        let current = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&current.facts).unwrap();
+        let source_entry = catalog.revisions.entry_containing(citing).unwrap();
+        let mut edit = Fragment::empty();
+        let dropped = stage_revision(
+            storage,
+            &mut edit,
+            Some(source_entry),
+            "source".to_owned(),
+            "no citation any more".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage.publish(&current, edit).unwrap();
+
+        let after = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&after.facts).unwrap();
+        // `dropped` really is the page's current text, so an entry-scoped
+        // answer would have had a live entry to name.
+        let source_entry = catalog.revisions.entry_containing(citing).unwrap();
+        assert_eq!(
+            source_entry
+                .frontier
+                .iter()
+                .map(|head| head.id)
+                .collect::<Vec<_>>(),
+            vec![dropped]
+        );
+
+        let target_entry = catalog.revisions.entry_containing(target).unwrap();
+        let incoming =
+            incoming_revisions(&after.reader, &catalog.revisions, target_entry).unwrap();
+        assert!(
+            incoming.contains(&citing),
+            "the revision that wrote the citation must be listed"
+        );
+        assert!(
+            !incoming.contains(&dropped),
+            "a revision whose text does not cite the target must not be listed"
+        );
+    }
+
+    /// The same asymmetry, seen through the `--with-backlink-tag` index: the
+    /// citing revision's own tags describe the citation, not its successor's.
+    #[test]
+    fn backlink_summaries_carry_the_citing_revision_tags_only() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+
+        let before = storage.view().unwrap();
+        let mut genesis = Fragment::empty();
+        let target = stage_revision(
+            storage,
+            &mut genesis,
+            None,
+            "target".to_owned(),
+            "body".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let (citing_tag_fragment, citing_tag, _) = wiki_model::tag_record("citing").unwrap();
+        let (later_tag_fragment, later_tag, _) = wiki_model::tag_record("later").unwrap();
+        genesis += citing_tag_fragment;
+        genesis += later_tag_fragment;
+        let citing = stage_revision(
+            storage,
+            &mut genesis,
+            None,
+            "source".to_owned(),
+            format!("cites #link(\"wiki:{target:x}\")[target]"),
+            BTreeSet::from([citing_tag]),
+        )
+        .unwrap();
+        storage.publish(&before, genesis).unwrap();
+
+        let current = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&current.facts).unwrap();
+        let source_entry = catalog.revisions.entry_containing(citing).unwrap();
+        let mut edit = Fragment::empty();
+        stage_revision(
+            storage,
+            &mut edit,
+            Some(source_entry),
+            "source".to_owned(),
+            "no citation any more".to_owned(),
+            BTreeSet::from([later_tag]),
+        )
+        .unwrap();
+        storage.publish(&current, edit).unwrap();
+
+        let after = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&after.facts).unwrap();
+        let summaries = backlink_summaries(&after.reader, &catalog.revisions).unwrap();
+        assert_eq!(summaries.get(&target).unwrap().tags, BTreeSet::from([citing_tag]));
+    }
+
     #[test]
     fn backlink_summaries_index_typed_links_and_source_tags() {
         let fixture = Fixture::new();
@@ -1771,8 +1928,7 @@ mod tests {
 
         let after = storage.view().unwrap();
         let catalog = wiki_model::load_catalog(&after.facts).unwrap();
-        let summaries =
-            backlink_summaries(&after.reader, &catalog.revisions.all_entries()).unwrap();
+        let summaries = backlink_summaries(&after.reader, &catalog.revisions).unwrap();
         let incoming = summaries.get(&target).unwrap();
         assert_eq!(incoming.tags, BTreeSet::from([source_tag]));
         assert_eq!(incoming.types, BTreeSet::from(["reviews".to_owned()]));

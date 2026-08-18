@@ -12,6 +12,13 @@ All notable changes to this project will be documented in this file.
   and without it. Anchor facts stay in the store and still resolve as selectors,
   and a legacy selector naming several entries now reports all their frontiers
   instead of silently keeping one.
+- **Wiki backlinks are revision-scoped.** `wiki links` incoming, and the
+  `--with/--without-backlink-*` filters, now name the revision whose own text
+  carries the citation, superseded revisions included, and attribute source tags
+  to that revision rather than to its entry's frontier. A citation is a claim
+  about what its author actually read; the entry-scoped answer asserted a
+  citation that the page's current text may have dropped. Run
+  `wiki show --latest <revision>` to see whether it survived.
 - **Voice freezes one native Qwen3-TTS snapshot per utterance.** Exact base,
   shared codec, filtered f16 talker, and versioned folded f16 talker roots are
   selected together before synthesis. Runtime no longer opens Repository
