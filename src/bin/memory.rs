@@ -18,8 +18,8 @@ use faculties::schemas::{blockdag as archive_schema, cognition as cognition_sche
 use faculties::memory_cover::{
     all_chunk_ids, chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_span_str,
     chunk_start_at, chunk_summary_handle, collect_chunk_spans, epoch_end_from_interval,
-    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch, superseded_ids,
-    CoverOpts, DEFAULT_SIM_THRESHOLD,
+    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch, live_among,
+    live_chunk_ids, CoverOpts, DEFAULT_SIM_THRESHOLD,
 };
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
@@ -333,8 +333,8 @@ fn chunk_references(space: &TribleSet, id: Id) -> Vec<Id> {
     let mut children: Vec<Id> =
         find!(c: Id, pattern!(space, [{ id @ ctx::reference: ?c }])).collect();
     // Sort referenced chunks by their start_at time.
-    let superseded = superseded_ids(space);
-    children.retain(|child_id| !superseded.contains(child_id));
+    let live = live_among(space, children.iter().copied());
+    children.retain(|child_id| live.contains(child_id));
     children.sort_by_key(|child_id| {
         chunk_start_at(space, *child_id)
             .map(interval_key)
@@ -398,11 +398,7 @@ fn find_chunk_by_time_range(space: &TribleSet, query_start: Epoch, query_end: Ep
 
     let mut best: Option<(Id, i128)> = None; // (id, specificity score)
 
-    let superseded = superseded_ids(space);
-    for chunk_id in all_chunk_ids(space) {
-        if superseded.contains(&chunk_id) {
-            continue;
-        }
+    for chunk_id in live_chunk_ids(space) {
         let start_val = chunk_start_at(space, chunk_id);
         let end_val = chunk_end_at(space, chunk_id);
         let (Some(start_v), Some(end_v)) = (start_val, end_val) else {
