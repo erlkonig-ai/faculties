@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -486,11 +487,36 @@ struct ReferenceResolver<'a> {
 }
 
 impl ReferenceResolver<'_> {
+    /// Resolve one Wiki selector to the id a *citation* should name.
+    ///
+    /// A revision id already is a citation — immutable, pinned to the text its
+    /// author read — so it passes through untouched, superseded or not. A
+    /// legacy anchor is not a citation but a live indirection that always
+    /// meant "latest", so the faithful reading of the pointer is the anchor's
+    /// CURRENT head. Rewriting to the head that was current when the citation
+    /// was written would be a different claim than the anchor ever made.
+    ///
+    /// A forked anchor (several heads) has no single answer and is left alone.
+    fn wiki_target(&self, hex: &str) -> Result<Id> {
+        let selector = resolve_prefix(self.wiki, hex)?;
+        if self.wiki.revision(selector).is_some() {
+            return Ok(selector);
+        }
+        match self.wiki.legacy_fragment_frontier(selector) {
+            Some([head]) => Ok(*head),
+            Some(heads) => bail!(
+                "legacy anchor {selector:x} has {} heads; no single citation target",
+                heads.len()
+            ),
+            None => bail!("unknown Wiki selector {selector:x}"),
+        }
+    }
+
     fn expand(&self, scheme: &str, rest: &str) -> Result<String> {
         match scheme {
             "wiki" => {
                 let (kind, hex) = split_typed(rest);
-                Ok(format!("{kind}{:x}", resolve_prefix(self.wiki, hex)?))
+                Ok(format!("{kind}{:x}", self.wiki_target(hex)?))
             }
             "files" => {
                 if rest.contains(':') {
@@ -543,7 +569,31 @@ fn lint_fix(content: &str, resolver: ReferenceResolver<'_>) -> String {
     output
 }
 
+fn regexes() -> &'static LintPatterns {
+    static PATTERNS: OnceLock<LintPatterns> = OnceLock::new();
+    PATTERNS.get_or_init(|| LintPatterns {
+        bold: regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap(),
+        markdown_links: regex::Regex::new(
+            r"\[([^\]]+)\]\((wiki|files):((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\)",
+        )
+        .unwrap(),
+        web_links: regex::Regex::new(r"\[([^\]]+)\]\((https?://[^)]+)\)").unwrap(),
+        wiki_references: regex::Regex::new(
+            r"wiki:((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\b",
+        )
+        .unwrap(),
+    })
+}
+
+struct LintPatterns {
+    bold: regex::Regex,
+    markdown_links: regex::Regex,
+    web_links: regex::Regex,
+    wiki_references: regex::Regex,
+}
+
 fn lint_line(line: &str, resolver: ReferenceResolver<'_>) -> String {
+    let patterns = regexes();
     let line = if let Some(rest) = line.strip_prefix("### ") {
         format!("=== {rest}")
     } else if let Some(rest) = line.strip_prefix("## ") {
@@ -553,13 +603,9 @@ fn lint_line(line: &str, resolver: ReferenceResolver<'_>) -> String {
     } else {
         line.to_owned()
     };
-    let bold = regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
-    let line = bold.replace_all(&line, "*$1*").to_string();
-    let links = regex::Regex::new(
-        r"\[([^\]]+)\]\((wiki|files):((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\)",
-    )
-    .unwrap();
-    let line = links
+    let line = patterns.bold.replace_all(&line, "*$1*").to_string();
+    let line = patterns
+        .markdown_links
         .replace_all(&line, |captures: &regex::Captures| {
             let scheme = &captures[2];
             let rest = &captures[3];
@@ -569,8 +615,23 @@ fn lint_line(line: &str, resolver: ReferenceResolver<'_>) -> String {
             format!("#link(\"{scheme}:{resolved}\")[{}]", &captures[1])
         })
         .to_string();
-    let web = regex::Regex::new(r"\[([^\]]+)\]\((https?://[^)]+)\)").unwrap();
-    let line = web.replace_all(&line, "#link(\"$2\")[$1]").to_string();
+    let line = patterns.web_links.replace_all(&line, "#link(\"$2\")[$1]").to_string();
+    // Every remaining `wiki:` reference — a Typst link target, a link LABEL
+    // that repeats the id, a bare prose mention — names its target the same
+    // way. This is what retires the legacy anchors: an anchor becomes the
+    // citation it always stood for (its current head revision), a truncated
+    // prefix becomes the full id, and anything that already names a revision
+    // keeps its exact bytes, so a wiki of citations is a fixpoint of the pass.
+    let line = patterns
+        .wiki_references
+        .replace_all(&line, |captures: &regex::Captures| {
+            let rest = &captures[1];
+            match resolver.expand("wiki", rest) {
+                Ok(resolved) if !resolved.eq_ignore_ascii_case(rest) => format!("wiki:{resolved}"),
+                _ => captures[0].to_owned(),
+            }
+        })
+        .to_string();
     if matches!(line.trim(), "---" | "***" | "___") {
         String::new()
     } else {
@@ -1891,6 +1952,178 @@ mod tests {
         let incoming = summaries.get(&target).unwrap();
         assert_eq!(incoming.tags, BTreeSet::from([source_tag]));
         assert_eq!(incoming.types, BTreeSet::from(["reviews".to_owned()]));
+    }
+
+    use triblespace::core::metadata;
+
+    fn point(seconds: f64) -> Inline<inlineencodings::NsTAIInterval> {
+        let epoch = Epoch::from_tai_seconds(seconds);
+        (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    /// Anchor A with two versions, v2 current. Returns (facts, A, v1, v2).
+    fn legacy_anchor_pair() -> (Fragment, Id, Id, Id) {
+        let anchor = genid().id;
+        let mut fragment = Fragment::empty();
+        let title: schema::TextHandle = fragment.put("T".to_owned());
+        let older: schema::TextHandle = fragment.put("first text".to_owned());
+        let newer: schema::TextHandle = fragment.put("second text".to_owned());
+        let v1 = genid().id;
+        let v2 = genid().id;
+        fragment += entity! { ExclusiveId::force_ref(&v1) @
+            metadata::tag: &schema::KIND_VERSION_ID,
+            schema::attrs::fragment: anchor,
+            schema::attrs::title: title,
+            schema::attrs::content: older,
+            metadata::created_at: point(1.0),
+        };
+        fragment += entity! { ExclusiveId::force_ref(&v2) @
+            metadata::tag: &schema::KIND_VERSION_ID,
+            schema::attrs::fragment: anchor,
+            schema::attrs::title: title,
+            schema::attrs::content: newer,
+            metadata::created_at: point(2.0),
+            metadata::supersedes: v1,
+        };
+        (fragment, anchor, v1, v2)
+    }
+
+    /// A legacy anchor is a live pointer; a revision id is a citation.
+    ///
+    /// Anchor A has v1 and v2, v2 current. A fragment citing `wiki:<A>` must
+    /// come out citing v2 SPECIFICALLY — not v1 (the text that was current
+    /// earlier) and not A (which would keep the indirection alive). Resolving
+    /// to the current head is the faithful reading of what an anchor always
+    /// said: "latest".
+    #[test]
+    fn lint_rewrites_a_legacy_anchor_to_the_current_head_revision() {
+        let (fragment, anchor, v1, v2) = legacy_anchor_pair();
+        let catalog = wiki_model::load_catalog(fragment.facts()).unwrap();
+        let resolver = ReferenceResolver {
+            wiki: &catalog.revisions,
+            files: None,
+        };
+        assert_eq!(
+            catalog.revisions.legacy_fragment_frontier(anchor),
+            Some([v2].as_slice()),
+            "fixture must have v2 as the anchor's only head"
+        );
+
+        let fixed = lint_fix(
+            &format!("see #link(\"wiki:{anchor:x}\")[the page]"),
+            resolver,
+        );
+        assert_eq!(fixed, format!("see #link(\"wiki:{v2:x}\")[the page]"));
+        assert!(
+            !fixed.contains(&format!("{anchor:x}")),
+            "the live anchor indirection must be gone"
+        );
+        assert!(
+            !fixed.contains(&format!("{v1:x}")),
+            "resolution is to the CURRENT head, never to an older revision"
+        );
+
+        // The markdown spelling resolves to the same citation.
+        assert_eq!(
+            lint_fix(&format!("[the page](wiki:{anchor:x})"), resolver),
+            format!("#link(\"wiki:{v2:x}\")[the page]")
+        );
+        // And a typed target keeps its type while losing the anchor.
+        assert_eq!(
+            lint_fix(&format!("#link(\"wiki:reviews:{anchor:x}\")[x]"), resolver),
+            format!("#link(\"wiki:reviews:{v2:x}\")[x]")
+        );
+        // A label that repeats the id is a reference too: leaving it behind
+        // would produce a link whose visible text contradicts its target.
+        assert_eq!(
+            lint_fix(
+                &format!("#link(\"wiki:{anchor:x}\")[wiki:{anchor:x}]"),
+                resolver
+            ),
+            format!("#link(\"wiki:{v2:x}\")[wiki:{v2:x}]")
+        );
+        // So is a bare prose mention, which a reader resolves by hand.
+        assert_eq!(
+            lint_fix(&format!("context: wiki:{anchor:x} says so"), resolver),
+            format!("context: wiki:{v2:x} says so")
+        );
+        // A truncated prefix resolves the same way and comes out complete.
+        assert_eq!(
+            lint_fix(&format!("wiki:{}", &format!("{anchor:x}")[..12]), resolver),
+            format!("wiki:{v2:x}")
+        );
+        // Fenced code blocks are quoted material, not citations; they are the
+        // one place an anchor id may legitimately survive verbatim.
+        let fenced = format!("```\nwiki show {anchor:x}\nwiki:{anchor:x}\n```\n");
+        assert_eq!(lint_fix(&fenced, resolver), fenced);
+    }
+
+    /// A citation is already pinned, so the pass must not touch it — including
+    /// a citation of a SUPERSEDED revision, which names what its author read.
+    #[test]
+    fn lint_leaves_revision_citations_byte_unchanged() {
+        let (fragment, _anchor, v1, v2) = legacy_anchor_pair();
+        let catalog = wiki_model::load_catalog(fragment.facts()).unwrap();
+        let resolver = ReferenceResolver {
+            wiki: &catalog.revisions,
+            files: None,
+        };
+        for target in [v1, v2] {
+            let content = format!("cites #link(\"wiki:{target:x}\")[pinned]\n");
+            assert_eq!(lint_fix(&content, resolver), content);
+        }
+        // Idempotence: linting rewritten anchor text again is a fixpoint.
+        let once = lint_fix(&format!("#link(\"wiki:{v2:x}\")[x]"), resolver);
+        assert_eq!(lint_fix(&once, resolver), once);
+    }
+
+    /// End to end: `wiki lint --fix` mints a SUCCESSOR carrying the citation
+    /// and leaves the anchor-citing revision exactly as it found it.
+    #[test]
+    fn lint_fix_mints_a_successor_and_never_edits_the_original() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let (legacy, anchor, _v1, v2) = legacy_anchor_pair();
+        storage
+            .with_pile(|pile, signer| {
+                open_scope(pile, schema::DEFAULT_SCOPE_ID, signer.clone())
+                    .commit(legacy)
+                    .context("seed legacy anchor")
+            })
+            .unwrap();
+
+        let before = storage.view().unwrap();
+        let mut fragment = Fragment::empty();
+        let citing = stage_revision(
+            storage,
+            &mut fragment,
+            None,
+            "source".to_owned(),
+            format!("see #link(\"wiki:{anchor:x}\")[the page]"),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage.publish(&before, fragment).unwrap();
+
+        cmd_lint(storage, true, false).unwrap();
+
+        let after = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&after.facts).unwrap();
+        let original = catalog.revisions.revision(citing).unwrap();
+        assert_eq!(
+            read_string(&after.reader, original.content).unwrap(),
+            format!("see #link(\"wiki:{anchor:x}\")[the page]"),
+            "the original revision is content-addressed and must be untouched"
+        );
+        let entry = catalog.revisions.entry_containing(citing).unwrap();
+        assert_eq!(entry.frontier.len(), 1);
+        let head = &entry.frontier[0];
+        assert_ne!(head.id, citing, "the fix is a successor, not a mutation");
+        assert_eq!(head.supersedes, BTreeSet::from([citing]));
+        assert_eq!(
+            read_string(&after.reader, head.content).unwrap(),
+            format!("see #link(\"wiki:{v2:x}\")[the page]")
+        );
     }
 
 }
