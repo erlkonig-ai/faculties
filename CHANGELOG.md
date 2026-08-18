@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Wiki and Memory frontiers come from the shared `latest` operation.** "Which
+  states are current" was hand-rolled in nine faculties as *gather every
+  superseded id, then subtract*. It is a lattice operation, not a per-faculty
+  rule, and now lives in the query layer as
+  `triblespace::core::query::frontier::latest(facts, observes, candidates)`.
+  Wiki's entry frontier was an O(n²) member-vs-member scan and is now one call;
+  `MemoryCatalog` resolves its head antichain once in `load_catalog`, against
+  the same collection view every other fact came from, so `head_ids`,
+  `live_chunk_ids` and `is_live` can no longer answer in a different frame
+  (`is_live` also stops rebuilding the whole frontier per call).
+  `memory_cover::superseded_ids` is replaced by `live_chunk_ids` and
+  `live_among`. Verified over the live corpus (`examples/latest_frontier_gate.rs`,
+  reads only): 11234 wiki revisions across 3096 entries and 3813 memory nodes
+  (309 superseded) produce byte-identical sets to the deleted code, plus
+  order-independence and frame-relativity checks on live data. Compass is
+  censused, not converted: it carries supersedes edges on notes but resolves
+  currency by timestamp, a different question.
 - **Wiki entries are supersedes-connected components; the legacy anchor no
   longer groups.** The additive migration synthesized the supersedes chain from
   the anchor groups, so the anchor edge had become redundant. Verified over the
