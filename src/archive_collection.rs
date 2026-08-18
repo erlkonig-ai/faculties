@@ -43,6 +43,7 @@ use triblespace::core::collection::{
 };
 #[cfg(test)]
 use triblespace::core::repo::BlobStoreMeta;
+use crate::legacy_hint::open_scope;
 
 type TextHandle = Inline<Handle<LongString>>;
 type RawHandle = Inline<Handle<RawBytes>>;
@@ -143,7 +144,7 @@ impl ArchiveImportWriter {
     pub fn open(pile_path: &std::path::Path, key_path: Option<&std::path::Path>) -> Result<Self> {
         let signer = load_signer(pile_path, key_path)?;
         let pile = open_pile_strict(pile_path)?;
-        let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection = open_scope(pile, schema::DEFAULT_SCOPE_ID, signer);
         let result = (|| {
             let current = collection
                 .materialize()
@@ -628,7 +629,7 @@ impl ArchiveSnapshot {
         }
         let signer = load_signer(pile_path, key_path)?;
         let pile = open_pile_strict(pile_path)?;
-        Ok(Collection::new(pile, scope, signer))
+        Ok(open_scope(pile, scope, signer))
     }
 
     fn from_collection(collection: &mut Collection<Pile>, scope: Id) -> Result<Self> {

@@ -25,11 +25,11 @@ use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
@@ -249,7 +249,7 @@ fn materialize_scope(
     scope: Id,
     label: &str,
 ) -> Result<TribleSet> {
-    Collection::new(&mut *pile, scope, signer.clone())
+    open_scope(&mut *pile, scope, signer.clone())
         .materialize()
         .map_err(|error| anyhow!("materialize {label} collection: {error}"))
 }
@@ -1057,7 +1057,7 @@ fn save_checkpoint(
     let (mut fragment, _) =
         orient_model::checkpoint_fragment(persona, view, epoch_interval(now_epoch()))?;
     fragment += orient_model::seen_notes_fragment(persona, newly_observed);
-    Collection::new(
+    open_scope(
         pile,
         faculties::schemas::orient::DEFAULT_SCOPE_ID,
         signer.clone(),
@@ -1120,7 +1120,7 @@ fn migrate_note_frontier(
     // appended after this commit are absent from Seen and wake normally.
     let selected = universe;
     let fragment = orient_model::seen_notes_fragment(persona, selected.iter().copied());
-    Collection::new(
+    open_scope(
         pile,
         faculties::schemas::orient::DEFAULT_SCOPE_ID,
         signer.clone(),

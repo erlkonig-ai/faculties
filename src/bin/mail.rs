@@ -25,11 +25,11 @@ use hifitime::Epoch;
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
-use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "mail", about = "Immutable email evidence, drafts, and delivery receipts")]
@@ -209,7 +209,7 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        let facts = Collection::new(&mut *pile, scope, self.signer.clone())
+        let facts = open_scope(&mut *pile, scope, self.signer.clone())
             .materialize()
             .with_context(|| format!("materialize {label} collection"))?;
         let reader = pile
@@ -253,7 +253,7 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        Collection::new(&mut *pile, scope, self.signer.clone())
+        open_scope(&mut *pile, scope, self.signer.clone())
             .commit(fragment)
             .with_context(|| format!("commit collection {scope:x}"))?;
         Ok(())

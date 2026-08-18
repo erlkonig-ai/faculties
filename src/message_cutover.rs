@@ -51,7 +51,7 @@ use crate::schemas::message::{
 };
 use crate::schemas::relations::KIND_GROUP_SNAPSHOT;
 
-pub const LEGACY_BRANCH_NAME: &str = "message";
+pub use crate::schemas::message::LEGACY_BRANCH_NAME;
 
 const KIND_PARTY_ID: Id = id_hex!("3AA2883528D3812067DFA1CD5DE5F8B8");
 const PARTY_LOCAL_AGENT_ID: Id = id_hex!("5EBC44A9FC4C8444AA01DFA7AC315AD5");

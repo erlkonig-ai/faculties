@@ -43,7 +43,7 @@ use crate::relations::{self as current, ProfileInput};
 use crate::schemas::relations as schema;
 use crate::schemas::relations::{group, KIND_GROUP, KIND_PERSON_ID};
 
-const LEGACY_BRANCH_NAME: &str = "relations";
+use crate::schemas::relations::LEGACY_BRANCH_NAME;
 const KIND_RETIRE_ID: Id = id_hex!("CB9251505F663A9232C632CC9E68863A");
 const KIND_UNRETIRE_ID: Id = id_hex!("D2D4AFCAD74CBD193B2EB7FE94AE27E9");
 

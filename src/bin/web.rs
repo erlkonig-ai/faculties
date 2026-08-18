@@ -16,12 +16,12 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::json;
-use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Provider {
@@ -294,7 +294,7 @@ impl WebStorage<'_> {
         scope: Id,
         label: &str,
     ) -> Result<CollectionView> {
-        let facts = Collection::new(&mut *pile, scope, signer.clone())
+        let facts = open_scope(&mut *pile, scope, signer.clone())
             .materialize()
             .with_context(|| format!("materialize {label} collection"))?;
         let reader = pile
@@ -362,7 +362,7 @@ impl WebStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         fragment.describe_with(entity! { metadata::description: description });
         let pile = open_pile_strict(self.pile)?;
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
         let result = collection
             .commit(fragment)
             .context("commit Web observation")

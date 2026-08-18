@@ -18,6 +18,7 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
+use faculties::legacy_hint::open_scope;
 
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -345,7 +346,7 @@ fn with_files_collection<T>(
     // new signer and never fall back to an ephemeral identity.
     let signer = load_signer(pile, None)?;
     let storage = open_pile_strict(pile)?;
-    let mut collection = Collection::new(storage, DEFAULT_SCOPE_ID, signer);
+    let mut collection = open_scope(storage, DEFAULT_SCOPE_ID, signer);
     let result = f(&mut collection);
     let close = collection.into_storage().close();
     match (result, close) {

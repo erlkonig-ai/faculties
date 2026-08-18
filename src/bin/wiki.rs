@@ -14,11 +14,12 @@ use faculties::wiki::{
 };
 use faculties::wiki_cutover;
 use hifitime::Epoch;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 #[cfg(test)]
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[cfg(feature = "local-embed")]
 /// Shared embedding scope minted with trible genid on 2026-08-09 and retained
@@ -212,7 +213,7 @@ impl WikiStorage<'_> {
 
     fn scope_view(&self, scope: Id, label: &str) -> Result<CollectionView> {
         self.with_pile(|pile, signer| {
-            let facts = Collection::new(&mut *pile, scope, signer.clone())
+            let facts = open_scope(&mut *pile, scope, signer.clone())
                 .materialize()
                 .with_context(|| format!("materialize {label} collection"))?;
             let reader = pile
@@ -232,7 +233,7 @@ impl WikiStorage<'_> {
     #[cfg(feature = "local-embed")]
     fn publish_scope(&self, scope: Id, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer| {
-            Collection::new(pile, scope, signer.clone())
+            open_scope(pile, scope, signer.clone())
                 .commit(fragment)
                 .context("publish native collection fragment")
         })
@@ -243,7 +244,7 @@ impl WikiStorage<'_> {
             let (_, author) = wiki_model::author_record(&signer.verifying_key());
             wiki_model::validate_candidate(&current.reader, &current.facts, &fragment, author)
                 .context("preflight authored Wiki union")?;
-            Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer.clone())
+            open_scope(pile, schema::DEFAULT_SCOPE_ID, signer.clone())
                 .commit(fragment)
                 .context("publish authored Wiki fragment")
         })
@@ -475,7 +476,7 @@ fn validate_links(content: &str, model: &RevisionReadModel, allow_dangling: bool
 
 fn load_files(storage: WikiStorage<'_>) -> Result<TribleSet> {
     storage.with_pile(|pile, signer| {
-        let facts = Collection::new(&mut *pile, FILES_SCOPE_ID, signer.clone())
+        let facts = open_scope(&mut *pile, FILES_SCOPE_ID, signer.clone())
             .materialize()
             .context("materialize Files collection")?;
         Ok(facts)

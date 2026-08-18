@@ -29,7 +29,6 @@ use faculties::{
 };
 use hifitime::Epoch;
 use triblespace::core::blob::Bytes;
-use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
@@ -37,6 +36,7 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -121,7 +121,7 @@ impl MemoryStorage<'_> {
         scope: Id,
         label: &str,
     ) -> Result<TribleSet> {
-        let mut collection = Collection::new(&mut *pile, scope, signer.clone());
+        let mut collection = open_scope(&mut *pile, scope, signer.clone());
         collection
             .materialize()
             .with_context(|| format!("materialize authored {label} collection"))
@@ -270,7 +270,7 @@ impl MemoryStorage<'_> {
             let reader = pile.reader().context("open Memory mutation reader")?;
             memory_model::validate_candidate(&reader, &current, &fragment)
                 .context("validate Memory mutation")?;
-            let mut collection = Collection::new(&mut pile, MEMORY_SCOPE_ID, signer.clone());
+            let mut collection = open_scope(&mut pile, MEMORY_SCOPE_ID, signer.clone());
             collection
                 .commit(fragment)
                 .context("commit authored Memory fragment")?;
@@ -283,7 +283,7 @@ impl MemoryStorage<'_> {
     fn publish_embeddings(&self, fragment: Fragment) -> Result<()> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
-        let mut collection = Collection::new(pile, EMBEDDINGS_SCOPE_ID, signer);
+        let mut collection = open_scope(pile, EMBEDDINGS_SCOPE_ID, signer);
         let result = collection
             .commit(fragment)
             .context("commit authored embedding observations")
@@ -300,7 +300,7 @@ impl MemoryStorage<'_> {
                 Self::materialize_scope(&mut pile, &signer, DEFAULT_COMB_SCOPE_ID, "Comb")?;
             candidate += fragment.facts().clone();
             comb_model::load_catalog(&candidate).context("validate Comb mutation")?;
-            let mut collection = Collection::new(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.clone());
+            let mut collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.clone());
             collection
                 .commit(fragment)
                 .context("commit authored Comb cursor")?;

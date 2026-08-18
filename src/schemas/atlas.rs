@@ -8,3 +8,6 @@ use triblespace::prelude::*;
 /// Minted with `trible genid` on 2026-08-07:
 /// `37F3B30B4EF60E5ADB07FF7961DA4EF0`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("37F3B30B4EF60E5ADB07FF7961DA4EF0");
+
+/// Name of the pre-collection Atlas branch this scope replaced.
+pub const LEGACY_BRANCH_NAME: &str = "atlas";

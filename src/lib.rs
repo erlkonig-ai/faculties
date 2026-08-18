@@ -68,6 +68,7 @@ pub mod habit_cutover;
 pub mod habits;
 pub mod headspace;
 pub mod headspace_cutover;
+pub mod legacy_hint;
 pub mod mail;
 pub mod mail_cutover;
 pub mod mail_pop;

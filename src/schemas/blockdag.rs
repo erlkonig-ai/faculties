@@ -31,6 +31,13 @@ use triblespace::prelude::*;
 /// Stable extrinsic scope of the Archive source collection.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("940F76A54E6C2E64469935B9FEF724A1");
 
+/// Name of the pre-collection Archive branch this scope replaced.
+///
+/// Retained so `faculties::legacy_hint` can tell an unmigrated pile where its
+/// facts still are; the transform itself lives in the `faculties-migrations`
+/// crate.
+pub const LEGACY_BRANCH_NAME: &str = "archive";
+
 /// A content-addressed position in the perception/action DAG.
 pub mod block {
     use super::*;

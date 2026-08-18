@@ -19,6 +19,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -93,7 +94,7 @@ impl MessageStorage<'_> {
         let pile = open_pile_strict(self.pile)?;
 
         let mut relations_collection =
-            Collection::new(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.clone());
+            open_scope(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.clone());
         let relations_result = (|| {
             let facts = relations_collection
                 .materialize()
@@ -112,7 +113,7 @@ impl MessageStorage<'_> {
             Err(error) => return finish_pile(pile, Err(error)),
         };
 
-        let mut messages = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut messages = open_scope(pile, DEFAULT_SCOPE_ID, signer);
         let result = (|| {
             let message_facts = messages
                 .materialize()

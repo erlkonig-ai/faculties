@@ -18,7 +18,7 @@ use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
@@ -29,6 +29,7 @@ use triblespace_search::schemas::Embedding;
 
 use crate::schemas::embeddings;
 use crate::schemas::files::{file, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_MEDIA_TYPE};
+use crate::legacy_hint::open_scope;
 
 pub type ContentHandle = Inline<Handle<RawBytes>>;
 pub type NameHandle = Inline<Handle<LongString>>;
@@ -972,7 +973,7 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileReader)> {
-    let facts = Collection::new(
+    let facts = open_scope(
         &mut *pile,
         crate::schemas::files::DEFAULT_SCOPE_ID,
         signer.clone(),
@@ -996,7 +997,7 @@ pub fn commit_collection(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    Collection::new(
+    open_scope(
         pile,
         crate::schemas::files::DEFAULT_SCOPE_ID,
         signer.clone(),

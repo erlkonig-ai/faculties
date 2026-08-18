@@ -46,7 +46,7 @@ use crate::schemas::habit::{
     MAX_LABEL_BYTES, STATE_ACTIVE, STATE_PAUSED,
 };
 
-pub const LEGACY_BRANCH_NAME: &str = "habit";
+pub use crate::schemas::habit::LEGACY_BRANCH_NAME;
 
 const LEGACY_HABIT_LABEL: &str = "habit";
 const LEGACY_FIRE_LABEL: &str = "habit_fire";

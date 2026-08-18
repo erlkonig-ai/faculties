@@ -32,6 +32,9 @@ use triblespace::prelude::*;
 /// `D61043AF08CB40E904152AE23C939637`.
 pub const DEFAULT_POLICY_SCOPE_ID: Id = id_hex!("D61043AF08CB40E904152AE23C939637");
 
+/// Name of the pre-collection Posture branch this scope replaced.
+pub const LEGACY_BRANCH_NAME: &str = "posture";
+
 /// Stable extrinsic scope of complete scan observations.
 ///
 /// Minted with `trible genid` on 2026-08-08:

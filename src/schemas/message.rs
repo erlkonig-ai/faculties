@@ -18,6 +18,9 @@ use std::collections::HashSet;
 /// Minted with `trible genid` on 2026-08-08.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("D04664CE96355FFF819AC0F2642A81A8");
 
+/// Name of the pre-collection Message branch this scope replaced.
+pub const LEGACY_BRANCH_NAME: &str = "message";
+
 /// Intrinsic immutable message envelope.
 pub const KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
 /// Intrinsic `(message, reader)` acknowledgement.

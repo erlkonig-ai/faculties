@@ -11,11 +11,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
 use triblespace_paths::{PathExpr, PathIndex, Step};
+use faculties::legacy_hint::open_scope;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
@@ -261,7 +261,7 @@ impl CompassStorage<'_> {
             let (facts, reader) = compass::materialize_collection(pile, signer)?;
             let by = if let Some(persona) = persona {
                 let relation_facts =
-                    Collection::new(&mut *pile, RELATIONS_SCOPE_ID, signer.clone())
+                    open_scope(&mut *pile, RELATIONS_SCOPE_ID, signer.clone())
                         .materialize()
                         .context("materialize Relations collection for Compass persona")?;
                 relations::validate_catalog(&reader, &relation_facts)

@@ -34,7 +34,7 @@ use crate::collection_cutover::{
 use crate::decide::{self as capability, FactorSide, IntervalValue, TextHandle};
 use crate::schemas::decide::{self as schema, decide, factor, KIND_CON, KIND_DECISION, KIND_PRO};
 
-pub const LEGACY_BRANCH_NAME: &str = "decide";
+pub use crate::schemas::decide::LEGACY_BRANCH_NAME;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LegacyDecision {

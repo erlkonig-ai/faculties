@@ -34,6 +34,7 @@ use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::{Inline, TryToInline};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{find, pattern};
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -143,7 +144,7 @@ impl ArchiveStorage<'_> {
     fn load_comb(&self) -> Result<(TribleSet, CombCatalog)> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
-        let mut collection = Collection::new(pile, DEFAULT_COMB_SCOPE_ID, signer);
+        let mut collection = open_scope(pile, DEFAULT_COMB_SCOPE_ID, signer);
         let result = (|| {
             let facts = collection
                 .materialize()
@@ -1026,7 +1027,7 @@ fn validate_cursor_update(current: &TribleSet, fragment: &Fragment) -> Result<()
 fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Result<()> {
     let signer = load_signer(storage.pile, storage.key)?;
     let pile = open_pile_strict(storage.pile)?;
-    let mut collection = Collection::new(pile, DEFAULT_COMB_SCOPE_ID, signer);
+    let mut collection = open_scope(pile, DEFAULT_COMB_SCOPE_ID, signer);
     let result = (|| {
         let current = collection
             .materialize()

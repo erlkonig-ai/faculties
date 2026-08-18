@@ -22,6 +22,7 @@ use triblespace::core::collection::Collection;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -273,7 +274,7 @@ impl RelationsStorage<'_> {
         // commands never mint a key or substitute an ephemeral identity.
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
         let result = f(&mut collection);
         let close = collection.into_storage().close();
         match (result, close) {

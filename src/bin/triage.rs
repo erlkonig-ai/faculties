@@ -33,11 +33,11 @@ use faculties::triage::{
 };
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
-use triblespace::core::collection::Collection;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 type Interval = Inline<inlineencodings::NsTAIInterval>;
@@ -161,7 +161,7 @@ impl TriageSnapshot {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Triage snapshot is already closed"))?;
-        let facts = Collection::new(&mut *pile, scope, self.signer.clone())
+        let facts = open_scope(&mut *pile, scope, self.signer.clone())
             .materialize()
             .with_context(|| format!("materialize {label} collection"))?;
         let reader = pile

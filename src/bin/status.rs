@@ -16,10 +16,11 @@ use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID;
 use faculties::{status, status_cutover};
 use hifitime::Epoch;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -109,7 +110,7 @@ fn materialize_scope(
     scope: Id,
     label: &str,
 ) -> Result<TribleSet> {
-    let mut collection = Collection::new(&mut *pile, scope, signer.clone());
+    let mut collection = open_scope(&mut *pile, scope, signer.clone());
     collection
         .materialize()
         .with_context(|| format!("materialize authored {label} collection"))
@@ -134,7 +135,7 @@ fn commit_status(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    let mut collection = Collection::new(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
+    let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
     collection
         .commit(fragment)
         .context("commit authored Status event")
@@ -317,7 +318,7 @@ fn cmd_migrate_legacy(storage: StatusStorage<'_>) -> Result<()> {
 
         let mut published = Vec::with_capacity(plan.commits().len());
         {
-            let mut collection = Collection::new(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
+            let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
             for commit in plan.commits() {
                 published.push(
                     collection

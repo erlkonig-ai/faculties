@@ -44,7 +44,7 @@ use crate::schemas::posture::{
     KIND_POLICY_REVISION, KIND_TERM,
 };
 
-const LEGACY_BRANCH_NAME: &str = "posture";
+use crate::schemas::posture::LEGACY_BRANCH_NAME;
 
 type TextHandle = Inline<Handle<LongString>>;
 type EmbeddingHandle = Inline<Handle<Embedding768>>;

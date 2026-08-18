@@ -14,10 +14,10 @@ use faculties::headspace_cutover;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
 use hifitime::Epoch;
-use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -202,7 +202,7 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        let facts = Collection::new(&mut *pile, scope, self.signer.clone())
+        let facts = open_scope(&mut *pile, scope, self.signer.clone())
             .materialize()
             .with_context(|| format!("materialize {label} collection"))?;
         let reader = pile
@@ -234,7 +234,7 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        Collection::new(&mut *pile, scope, self.signer.clone())
+        open_scope(&mut *pile, scope, self.signer.clone())
             .commit(fragment)
             .with_context(|| format!("commit collection {scope:x}"))?;
         Ok(())

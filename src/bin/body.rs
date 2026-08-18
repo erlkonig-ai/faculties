@@ -39,6 +39,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
@@ -426,7 +427,7 @@ impl BodyStorage<'_> {
     fn with_collection<T>(&self, f: impl FnOnce(&mut Collection<Pile>) -> Result<T>) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
         let result = f(&mut collection);
         let close = collection.into_storage().close();
         match (result, close) {

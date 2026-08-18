@@ -29,7 +29,7 @@ use crate::collection_cutover::{
 use crate::schemas::{blockdag as schema, files as files_schema};
 
 /// Historical branch name used only as a read-only migration coordinate.
-pub const LEGACY_BRANCH_NAME: &str = "archive";
+pub use crate::schemas::blockdag::LEGACY_BRANCH_NAME;
 
 /// One native commit projected from one authored legacy commit.
 #[derive(Clone, Debug, Eq, PartialEq)]

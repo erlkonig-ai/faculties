@@ -20,7 +20,7 @@ use crate::collection_cutover::{
 };
 use crate::schemas::compass::DEFAULT_SCOPE_ID;
 
-pub const LEGACY_BRANCH_NAME: &str = "compass";
+pub use crate::schemas::compass::LEGACY_BRANCH_NAME;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompassMigrationCommit {

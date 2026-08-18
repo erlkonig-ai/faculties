@@ -33,7 +33,7 @@ use crate::schemas::files::file;
 use crate::schemas::teams::{teams, DEFAULT_SCOPE_ID};
 use crate::teams as capability;
 
-const LEGACY_BRANCH_NAME: &str = "teams";
+use crate::schemas::teams::LEGACY_BRANCH_NAME;
 
 mod legacy {
     use super::*;

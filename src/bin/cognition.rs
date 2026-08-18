@@ -11,8 +11,8 @@ use clap::{Parser, Subcommand};
 use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
 use faculties::{cognition, cognition_cutover};
-use triblespace::core::collection::Collection;
 use triblespace::core::repo::BlobStore;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -43,7 +43,7 @@ enum Command {
 fn check(cli: &Cli) -> Result<()> {
     let signer = load_signer(&cli.pile, cli.key.as_deref())?;
     let pile = open_pile_strict(&cli.pile)?;
-    let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+    let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let facts = collection
             .materialize()

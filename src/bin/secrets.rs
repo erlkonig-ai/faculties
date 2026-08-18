@@ -26,6 +26,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -177,7 +178,7 @@ impl SecretsStorage<'_> {
     fn materialized_facts(&self) -> Result<TribleSet> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
         let result = collection
             .materialize()
             .context("materialize raw Secrets collection");
@@ -190,7 +191,7 @@ impl SecretsStorage<'_> {
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
         let result = (|| {
             let facts = collection
                 .materialize()

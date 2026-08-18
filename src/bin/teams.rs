@@ -32,6 +32,7 @@ use faculties::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
 use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
 use faculties::teams as teams_core;
 use faculties::teams_cutover;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
@@ -450,7 +451,7 @@ impl TeamsSession<'_> {
         }
         let added = fragment.facts().clone();
         fragment.describe_with(entity! { metadata::description: description });
-        let commit = Collection::new(
+        let commit = open_scope(
             self.collection.storage_mut(),
             secrets_schema::DEFAULT_SCOPE_ID,
             self.signer.clone(),
@@ -477,7 +478,7 @@ impl TeamsStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let (secrets_facts, secrets_reader, secrets_catalog) = {
             let mut secrets_collection =
-                Collection::new(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone());
+                open_scope(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone());
             let facts = secrets_collection
                 .materialize()
                 .context("materialize Secrets collection for Teams")?;
@@ -489,7 +490,7 @@ impl TeamsStorage<'_> {
                 .context("validate Secrets collection for Teams")?;
             (facts, reader, catalog)
         };
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer.clone());
+        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer.clone());
         let result = (|| {
             let facts = collection
                 .materialize()

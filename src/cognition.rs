@@ -12,7 +12,7 @@ use std::path::Path;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -24,6 +24,7 @@ use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::schemas::patience::{exec_schema as patience, KIND_TIMEOUT_EXTENSION_ID};
 use crate::schemas::reason::{reason_schema as reason, KIND_REASON_ID};
 use crate::schemas::triage::{cog, context, exec, model_chat, KIND_EXEC_RESULT_ID};
+use crate::legacy_hint::open_scope;
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
@@ -118,7 +119,7 @@ pub fn publish_events(
     }
     let signer = load_signer(pile_path, key_path)?;
     let pile = open_pile_strict(pile_path)?;
-    let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+    let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let current = collection
             .materialize()

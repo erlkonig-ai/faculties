@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
@@ -23,6 +23,7 @@ use crate::schemas::compass::{
     board, interval_key, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
 };
+use crate::legacy_hint::open_scope;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -798,7 +799,7 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileReader)> {
-    let facts = Collection::new(&mut *pile, DEFAULT_SCOPE_ID, signer.clone())
+    let facts = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone())
         .materialize()
         .map_err(|error| anyhow!("materialize Compass collection: {error}"))?;
     let reader = pile
@@ -814,7 +815,7 @@ pub fn commit_collection(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    Collection::new(pile, DEFAULT_SCOPE_ID, signer.clone())
+    open_scope(pile, DEFAULT_SCOPE_ID, signer.clone())
         .commit(fragment)
         .map_err(|error| anyhow!("commit Compass collection fragment: {error}"))
 }

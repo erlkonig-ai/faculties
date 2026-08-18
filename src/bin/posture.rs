@@ -60,6 +60,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -1774,7 +1775,7 @@ impl PostureStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
         let author = signer.verifying_key().to_bytes();
-        let mut collection = Collection::new(pile, scope, signer);
+        let mut collection = open_scope(pile, scope, signer);
         let result = (|| {
             let (facts, commits) = materialize_stable(&mut collection, scope, author, label)?;
             let reader = collection
@@ -1863,7 +1864,7 @@ impl PostureStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
         let author = signer.verifying_key().to_bytes();
-        let mut collection = Collection::new(pile, scope, signer);
+        let mut collection = open_scope(pile, scope, signer);
         let result = (|| {
             let (facts, commits) = materialize_stable(&mut collection, scope, author, label)?;
             let reader = collection

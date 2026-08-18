@@ -14,9 +14,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use faculties::collection_cutover::{load_signer, open_pile_strict};
 use faculties::schemas::wiki::extract_link_targets;
 use faculties::wiki::{self as wiki_model, WikiCatalog};
-use triblespace::core::collection::Collection;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -449,7 +449,7 @@ fn with_model<T>(
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
-        let facts = Collection::new(
+        let facts = open_scope(
             &mut pile,
             faculties::schemas::wiki::DEFAULT_SCOPE_ID,
             signer,

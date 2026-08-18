@@ -14,6 +14,9 @@ use triblespace::prelude::*;
 /// `1BAEE6DB7A2AE4343E611774E04DEE50`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("1BAEE6DB7A2AE4343E611774E04DEE50");
 
+/// Name of the pre-collection Habit branch this scope replaced.
+pub const LEGACY_BRANCH_NAME: &str = "habit";
+
 /// Immutable standing-intention definition.
 ///
 /// Retained from CC's unmerged Habit lineage; its meaning is unchanged.

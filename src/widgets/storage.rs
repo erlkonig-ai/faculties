@@ -38,6 +38,7 @@ use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::schema::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
+use crate::legacy_hint::open_scope;
 
 /// Stable logical input requested by a widget.
 ///
@@ -547,7 +548,7 @@ fn load_catalog(
 
         for (scope, label) in materialization_scopes(sources) {
             let (collection_id, facts) = {
-                let mut collection = Collection::new(&mut pile, scope, signer.clone());
+                let mut collection = open_scope(&mut pile, scope, signer.clone());
                 let collection_id = collection.descriptor().handle();
                 let facts = collection
                     .materialize()

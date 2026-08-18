@@ -13,7 +13,7 @@ use std::path::Path;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::collection::{
-    simplearchive_union, Collection, CollectionCommit, CollectionDescriptor,
+    simplearchive_union, CollectionCommit, CollectionDescriptor,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
@@ -26,6 +26,7 @@ use crate::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
     MAX_LABEL_BYTES, SCRIPT_TOKEN, STATE_ACTIVE, STATE_PAUSED,
 };
+use crate::legacy_hint::open_scope;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 pub type ScriptHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -1132,7 +1133,7 @@ pub fn publish(
     validate_publication_fragment(&fragment)?;
     let signer = load_signer(pile_path, key_path)?;
     let pile = open_pile_strict(pile_path)?;
-    let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+    let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let current = collection
             .materialize()
@@ -1155,7 +1156,7 @@ pub fn publish(
 pub fn read_catalog(pile_path: &Path, key_path: Option<&Path>) -> Result<Catalog> {
     let signer = load_signer(pile_path, key_path)?;
     let pile = open_pile_strict(pile_path)?;
-    let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+    let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let facts = collection
             .materialize()

@@ -12,7 +12,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attestation;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -22,6 +22,7 @@ use crate::schemas::wiki::{
     attrs, authorship_fragment, revision_fragment, revision_fragment_from_handles, TextHandle,
     DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION, KIND_VERSION_ID, TAG_SPECS,
 };
+use crate::legacy_hint::open_scope;
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type PublicKeyValue = Inline<inlineencodings::ED25519PublicKey>;
@@ -951,7 +952,7 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileReader)> {
-    let facts = Collection::new(&mut *pile, DEFAULT_SCOPE_ID, signer.clone())
+    let facts = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone())
         .materialize()
         .map_err(|error| anyhow!("materialize Wiki collection: {error}"))?;
     let reader = pile
@@ -966,7 +967,7 @@ pub fn commit_collection(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    Collection::new(pile, DEFAULT_SCOPE_ID, signer.clone())
+    open_scope(pile, DEFAULT_SCOPE_ID, signer.clone())
         .commit(fragment)
         .map_err(|error| anyhow!("commit Wiki collection fragment: {error}"))
 }

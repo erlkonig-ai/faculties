@@ -20,7 +20,7 @@ use crate::collection_cutover::{
 };
 use crate::schemas::atlas::DEFAULT_SCOPE_ID;
 
-pub const LEGACY_BRANCH_NAME: &str = "atlas";
+pub use crate::schemas::atlas::LEGACY_BRANCH_NAME;
 
 /// One native commit projected from one verified legacy authored commit.
 #[derive(Clone, Debug, Eq, PartialEq)]

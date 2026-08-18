@@ -6,9 +6,9 @@ use faculties::atlas::{self, AtlasCatalog, AtlasEntry};
 use faculties::atlas_cutover;
 use faculties::collection_cutover::{freeze_source, load_signer, open_pile_strict};
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
-use triblespace::core::collection::Collection;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
+use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "atlas", about = "Schema metadata inspection faculty")]
@@ -49,7 +49,7 @@ impl AtlasStorage<'_> {
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
         let result = (|| {
             let facts = collection
                 .materialize()
