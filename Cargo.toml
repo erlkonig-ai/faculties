@@ -107,7 +107,8 @@ required-features = ["widgets"]
 [features]
 # `local-embed` and `widgets` are default: semantic recall is core to knowledge
 # workflows, and the GORBIE viewer is part of the normal office surface.
-# A stock `cargo install --path faculties --bins` must ship both.
+# A stock workspace cohort build (`cargo build --release --workspace --bins`)
+# must ship both.
 default = ["local-embed", "widgets", "audio"]
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
 widgets = [

@@ -21,6 +21,7 @@ from typing import Any
 
 GENERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 BINARY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+REQUIRED_COHORT_BINARIES = frozenset({"migrations"})
 
 
 class ReleaseError(RuntimeError):
@@ -80,6 +81,15 @@ def discover_binaries(build_dir: Path) -> list[Path]:
         binaries.append(candidate)
     if not binaries:
         raise ReleaseError(f"no executable files found directly in {build_dir}")
+    missing = REQUIRED_COHORT_BINARIES.difference(
+        candidate.name for candidate in binaries
+    )
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise ReleaseError(
+            f"required cohort binary is absent from {build_dir}: {names}; "
+            "build with `cargo build --release --workspace --bins`"
+        )
     return sorted(binaries, key=lambda path: path.name)
 
 

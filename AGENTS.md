@@ -42,8 +42,9 @@ cargo build --bin wiki --release
 # or once-off without building first
 cargo run --bin compass --release -- list
 
-# install everything onto $PATH
-cargo install --path . --bins
+# build and atomically install the complete workspace cohort onto $PATH
+cargo build --release --workspace --bins --locked
+scripts/install-release-cohort target/release
 ```
 
 The `migrations` binary lives in the `faculties-migrations` member crate, so
