@@ -37,7 +37,7 @@ All notable changes to this project will be documented in this file.
   revision keep their exact bytes, and fenced code blocks are left verbatim, so
   a wiki of citations is a fixpoint. `--fix` mints successors as usual; the
   anchor-citing revisions stay immutable with their anchors intact. Measured on
-  the live corpus (`examples/anchor_reference_census.rs`): 10094 anchor
+  the live corpus (`examples/reference_census.rs`): 10094 anchor
   references in 1731 frontier revisions, 9092 of them in link syntax, resolving
   through 3035 anchors that each have exactly one head; a `--fix` on a
   copy-on-write clone left 0 anchor references in the frontier, 0 issues in
@@ -45,11 +45,11 @@ All notable changes to this project will be documented in this file.
 - **Wiki entries are supersedes-connected components; the legacy anchor no
   longer groups.** The additive migration synthesized the supersedes chain from
   the anchor groups, so the anchor edge had become redundant. Verified over the
-  live corpus before removal (`examples/anchor_gate.rs`): 11231 revisions across
-  3035 anchors partition into the same 3095 entries, identical membership, with
-  and without it. Anchor facts stay in the store and still resolve as selectors,
-  and a legacy selector naming several entries now reports all their frontiers
-  instead of silently keeping one.
+  live corpus before removal (by `examples/anchor_gate.rs`, since deleted along
+  with the anchor itself): 11231 revisions across 3035 anchors partition into
+  the same 3095 entries, identical membership, with and without it. Anchor facts
+  stayed in the store and still resolved as selectors at the time; the entry
+  above then retired that resolution too.
 - **Wiki backlinks are revision-scoped.** `wiki links` incoming, and the
   `--with/--without-backlink-*` filters, now name the revision whose own text
   carries the citation, superseded revisions included, and attribute source tags
