@@ -381,7 +381,14 @@ fn validate_graph(revisions: &BTreeMap<Id, RevisionRecord>) -> Result<()> {
 /// facts remain in the store and still resolve as selectors
 /// ([`RevisionReadModel::legacy_fragment_frontier`]); they simply no longer
 /// decide what belongs to what.
+///
+/// Each entry's frontier is [`latest`] over `space` — the shared query-layer
+/// operation, not a local rule. Asking it per component rather than once over
+/// every revision is only a scoping convenience: a supersedes edge always
+/// unites its endpoints above, so no revision can be observed from outside its
+/// own component and the two framings agree by construction.
 fn entry_records(
+    space: &TribleSet,
     revisions: &BTreeMap<Id, RevisionRecord>,
 ) -> (Vec<EntryRecord>, BTreeMap<Id, Vec<Id>>) {
     let mut parent: BTreeMap<Id, Id> = revisions.keys().map(|id| (*id, *id)).collect();
@@ -438,16 +445,9 @@ fn entry_records(
             })
             .collect();
         roots.sort_unstable();
-        let mut frontier_ids: Vec<Id> = members
-            .iter()
-            .copied()
-            .filter(|id| {
-                !members
-                    .iter()
-                    .any(|candidate| revisions[candidate].supersedes.contains(id))
-            })
+        let frontier_ids: Vec<Id> = latest(space, metadata::supersedes.id(), members.iter().copied())
+            .into_iter()
             .collect();
-        frontier_ids.sort_unstable();
         let frontier = frontier_ids
             .iter()
             .filter_map(|id| revisions.get(id).cloned())
@@ -692,7 +692,7 @@ pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
         }
     }
 
-    let (entries, legacy_frontiers) = entry_records(&revisions);
+    let (entries, legacy_frontiers) = entry_records(space, &revisions);
     Ok(WikiCatalog {
         revisions: RevisionReadModel {
             revisions,

@@ -13,9 +13,7 @@
 //! views frozen from one pile snapshot, plus the Memory attachment reader and
 //! parsed [`CoverOpts`]. The result is the cover text.
 
-#[cfg(feature = "local-embed")]
-use std::collections::BTreeSet;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 #[cfg(feature = "local-embed")]
 use anyhow::anyhow;
@@ -80,12 +78,24 @@ pub fn all_chunk_ids(space: &TribleSet) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])).collect()
 }
 
-/// Ids of chunks that have been superseded by a corrected chunk.
+/// The chunks nothing in `space` has corrected — [`latest`] over the Memory
+/// supersedes DAG, restricted to chunk-tagged candidates.
+///
 /// Monotonic correction: the `supersedes` fact is appended, never removed;
-/// covers and trees exclude superseded chunks (read-side policy), while
-/// direct id lookup still resolves them for history inspection.
-pub fn superseded_ids(space: &TribleSet) -> HashSet<Id> {
-    find!(old: Id, pattern!(space, [{ _ @ metadata::supersedes: ?old }])).collect()
+/// covers and trees show only this frontier (read-side policy), while direct
+/// id lookup still resolves superseded chunks for history inspection. A
+/// retraction node observes without replacing, and it is an observer here like
+/// any other — retracting a chunk removes it from the frontier and puts
+/// nothing in its place, which is exactly what a retraction means.
+pub fn live_chunk_ids(space: &TribleSet) -> BTreeSet<Id> {
+    latest(space, metadata::supersedes.id(), all_chunk_ids(space))
+}
+
+/// [`latest`] over an arbitrary candidate set of Memory nodes — one
+/// reverse-index probe per candidate, so a caller holding a handful of ids
+/// never pays for a scan of the whole corpus.
+pub fn live_among(space: &TribleSet, candidates: impl IntoIterator<Item = Id>) -> BTreeSet<Id> {
+    latest(space, metadata::supersedes.id(), candidates)
 }
 
 /// The stored shared-space embedding handle for a chunk, if it has been embedded.
@@ -165,12 +175,8 @@ pub fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
 /// Load the non-superseded chunks of canonical Memory as `(start_key, end_key, id)`.
 /// Chunks missing a start/end interval are skipped. Shared by `list` and `check`.
 pub fn collect_chunk_spans(space: &TribleSet) -> Vec<(i128, i128, Id)> {
-    let superseded = superseded_ids(space);
     let mut spans = Vec::new();
-    for id in all_chunk_ids(space) {
-        if superseded.contains(&id) {
-            continue;
-        }
+    for id in live_chunk_ids(space) {
         // Thematic lenses are a parallel weave, not part of the chronological
         // spine — exclude them so a wide lens can't hijack the containment tree.
         if chunk_lens_handle(space, id).is_some() {
@@ -233,12 +239,8 @@ pub fn lexical_relevance_scores<B: BlobStoreGet>(
     reader: &B,
     query: &str,
 ) -> Result<HashMap<Id, f32>> {
-    let superseded = superseded_ids(space);
     let mut builder = BM25Builder::new();
-    for chunk in all_chunk_ids(space) {
-        if superseded.contains(&chunk) {
-            continue;
-        }
+    for chunk in live_chunk_ids(space) {
         let Some(handle) = chunk_summary_handle(space, chunk) else {
             continue;
         };

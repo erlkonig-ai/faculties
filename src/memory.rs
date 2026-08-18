@@ -66,6 +66,9 @@ pub struct RetractionRow {
 pub struct MemoryCatalog {
     pub chunks: BTreeMap<Id, ChunkRow>,
     pub retractions: BTreeMap<Id, RetractionRow>,
+    /// `latest` over the loading collection view: the nodes nothing in that
+    /// frame observes. Resolved by [`load_catalog`], never by a reader.
+    heads: BTreeSet<Id>,
 }
 
 impl MemoryCatalog {
@@ -79,34 +82,20 @@ impl MemoryCatalog {
 
     /// The complete fork-visible frontier, including head retractions.
     pub fn head_ids(&self) -> Vec<Id> {
-        let superseded: BTreeSet<Id> = self
-            .chunks
-            .values()
-            .flat_map(|row| row.predecessors.iter().copied())
-            .chain(
-                self.retractions
-                    .values()
-                    .flat_map(|row| row.predecessors.iter().copied()),
-            )
-            .collect();
-        self.node_ids()
-            .into_iter()
-            .filter(|id| !superseded.contains(id))
-            .collect()
+        self.heads.iter().copied().collect()
     }
 
     /// Content-bearing members of the complete frontier.
     pub fn live_chunk_ids(&self) -> Vec<Id> {
-        let heads: BTreeSet<Id> = self.head_ids().into_iter().collect();
         self.chunks
             .keys()
-            .filter(|id| heads.contains(*id))
+            .filter(|id| self.heads.contains(*id))
             .copied()
             .collect()
     }
 
     pub fn is_live(&self, chunk: Id) -> bool {
-        self.live_chunk_ids().binary_search(&chunk).is_ok()
+        self.heads.contains(&chunk) && self.chunks.contains_key(&chunk)
     }
 
     /// Exact targets of an extrinsic historical name.
@@ -594,6 +583,11 @@ pub fn load_catalog(space: &TribleSet) -> Result<MemoryCatalog> {
         )
         .collect();
     validate_predecessor_dag(&graph, "Memory revision")?;
+
+    // The frontier is resolved once, here, against the same collection view
+    // every other fact came from — so a catalog can never answer "is this
+    // live?" in a frame that differs from the one it was loaded in.
+    catalog.heads = latest(space, metadata::supersedes.id(), catalog.node_ids());
 
     Ok(catalog)
 }
