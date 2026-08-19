@@ -950,7 +950,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         let discovery = discover_target(collection.storage_mut(), DEFAULT_SCOPE_ID).unwrap();
         assert_eq!(
             discovery.descriptor(),
-            simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
+            &simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
         );
         assert_eq!(discovery.commits().len(), plan.commits().len());
         let mut pile = collection.into_storage();

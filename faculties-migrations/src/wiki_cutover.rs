@@ -563,7 +563,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         let discovered = discover_target(&mut target, DEFAULT_SCOPE_ID).unwrap();
         assert_eq!(
             discovered.descriptor(),
-            triblespace::core::collection::simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
+            &triblespace::core::collection::simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
         );
         assert_eq!(discovered.commits().len(), 3);
         assert!(discovered.merges().is_empty());

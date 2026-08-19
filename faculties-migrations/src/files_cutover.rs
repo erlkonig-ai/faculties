@@ -825,7 +825,7 @@ use faculties::storage::{discover_target, initialize_signer};
         let target = discover_target(&mut pile, DEFAULT_SCOPE_ID).unwrap();
         assert_eq!(
             target.descriptor(),
-            triblespace::core::collection::simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
+            &triblespace::core::collection::simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
         );
         let mut expected_commits = first.clone();
         expected_commits.sort_unstable_by_key(CollectionCommit::id);

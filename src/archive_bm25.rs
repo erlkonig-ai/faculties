@@ -31,6 +31,7 @@ use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::inline::{Inline, InlineEncoding, IntoInline, RawInline, TryFromInline};
 use triblespace::core::metadata::{self, MetaDescribe};
+use triblespace::macros::entity;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::core::trible::{build_intrinsic_entity, IntrinsicEntityRow, Trible, TribleSet};
@@ -64,12 +65,35 @@ struct ProjectionPlan {
     documents: BTreeMap<Id, Vec<Inline<Handle<LongString>>>>,
 }
 
-/// Exact V4 descriptor for the derived Archive BM25 collection.
+/// The archive-block-text BM25 law, as a describable type.
+///
+/// A descriptor embeds this rather than only naming it, so a reader holding
+/// the pile can learn what the index is without the code that built it.
+pub struct ArchiveBlockTextBm25V1;
+
+impl MetaDescribe for ArchiveBlockTextBm25V1 {
+    fn describe() -> triblespace::core::trible::Fragment {
+        let id: Id = ARCHIVE_BLOCK_TEXT_BM25_RECIPE_V1;
+        entity! {
+            triblespace::core::id::ExclusiveId::force_ref(&id) @
+                metadata::name: "archive-block-text-bm25-v1",
+                metadata::description: "Portable BM25 term index over the text carried by an archive collection's blocks, unioned across its elements. The recipe pins the selected graph fields, the occurrence aggregation and term-frequency law, tokenizer behaviour, and the document and term schemas; changing any of those is a different law and needs a newly minted id. The k1 and b scoring parameters are deliberately NOT pinned: they are query-time behaviour, not part of what the index IS, so two readers may score the same index differently without disagreeing about it.",
+                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
+}
+
+/// Exact descriptor for the derived Archive BM25 collection.
+///
+/// This collection is a derivation of the archive's canonical SimpleArchive
+/// union, so it names that collection as its source rather than carrying a
+/// dataset anchor of its own.
 pub fn descriptor() -> CollectionDescriptor {
-    CollectionDescriptor::new(
-        schema::DEFAULT_SCOPE_ID,
-        <PortableBM25Blob as MetaDescribe>::id(),
-        ARCHIVE_BLOCK_TEXT_BM25_RECIPE_V1,
+    CollectionDescriptor::derived(
+        triblespace::core::collection::simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID)
+            .handle(),
+        <PortableBM25Blob as MetaDescribe>::describe(),
+        <ArchiveBlockTextBm25V1 as MetaDescribe>::describe(),
     )
 }
 

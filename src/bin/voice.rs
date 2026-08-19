@@ -1313,7 +1313,7 @@ mod tests {
         let discovery = discover_target(&mut pile_storage, COLLECTION_SCOPE_ID).unwrap();
         assert_eq!(
             discovery.descriptor(),
-            simplearchive_union::descriptor(COLLECTION_SCOPE_ID)
+            &simplearchive_union::descriptor(COLLECTION_SCOPE_ID)
         );
         assert_eq!(discovery.commits().len(), 2);
         pile_storage.close().unwrap();

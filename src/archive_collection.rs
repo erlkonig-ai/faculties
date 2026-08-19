@@ -1777,7 +1777,9 @@ mod tests {
             .unwrap();
         succinctarchive_union::validate_derive(
             &simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID),
-            &succinctarchive_union::descriptor(schema::DEFAULT_SCOPE_ID),
+            &succinctarchive_union::descriptor(
+                simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID).handle(),
+            ),
             &derive,
             &input,
             &output,
@@ -1959,7 +1961,7 @@ mod tests {
         let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
         let block_commit = collection.commit(block_element).unwrap();
         let remainder_commit = collection.commit(remainder_element).unwrap();
-        let source = *collection.descriptor();
+        let source = collection.descriptor().clone();
         let reader = collection.storage_mut().reader().unwrap();
         let block_blob: Blob<SimpleArchive> = reader
             .get(Handle::<SimpleArchive>::from_hash(block_commit.data()))

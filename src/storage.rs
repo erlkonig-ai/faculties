@@ -394,7 +394,7 @@ mod tests {
         }
 
         let discovered = discover_target(&mut store, id(1)).unwrap();
-        assert_eq!(discovered.descriptor(), target_descriptor);
+        assert_eq!(discovered.descriptor(), &target_descriptor);
         assert_eq!(discovered.commits(), &[target_commit]);
         assert_eq!(discovered.merges(), &[target_merge]);
         assert_eq!(discovered.derives(), &[derive_to_target]);
@@ -440,7 +440,7 @@ mod tests {
             .unwrap()
             .is_empty());
         let target = discover_target(&mut pile, id(1)).unwrap();
-        assert_eq!(target.descriptor(), simplearchive_union::descriptor(id(1)));
+        assert_eq!(target.descriptor(), &simplearchive_union::descriptor(id(1)));
         assert_eq!(target.commits(), &[first]);
         assert!(target.merges().is_empty());
         assert!(target.derives().is_empty());
@@ -449,7 +449,7 @@ mod tests {
         let unrelated_target = discover_target(&mut pile, id(2)).unwrap();
         assert_eq!(
             unrelated_target.descriptor(),
-            simplearchive_union::descriptor(id(2))
+            &simplearchive_union::descriptor(id(2))
         );
         assert_eq!(unrelated_target.commits().len(), 1);
 
