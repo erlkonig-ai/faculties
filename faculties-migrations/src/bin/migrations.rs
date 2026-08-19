@@ -14,6 +14,8 @@
 //!   is the whole-pile path and the one to prefer.
 //! - `migrate-legacy <faculty>` migrates one faculty's branch in place, which
 //!   is what that faculty's own `migrate-legacy` subcommand used to do.
+//! - `status-register` gives Compass's status register the identity it never
+//!   had, on the events written before that identity existed.
 //! - `faculties` lists the names `migrate-legacy` accepts.
 //!
 //! No command writes migration bookkeeping facts, and none deletes, consumes,
@@ -26,7 +28,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
-    activation_cutover, collection_cutover, disposable_cutover, posture_findings,
+    activation_cutover, collection_cutover, disposable_cutover, posture_findings, status_register,
 };
 
 #[derive(Parser)]
@@ -76,8 +78,39 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Give Compass's status register the identity it never had:
+    /// `board::status_of` on every complete status event written before that
+    /// attribute existed. Additive; nothing is deleted or rewritten.
+    StatusRegister {
+        /// Report what would be written, without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// List the faculty names `migrate-legacy` accepts.
     Faculties,
+}
+
+fn status_register(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
+    let (delta, report) = status_register::plan(pile, key)?;
+    println!("Compass status-register identities");
+    println!("pile                     : {}", pile.display());
+    println!("complete status events   : {}", report.complete_events);
+    println!("already identified       : {}", report.already_identified);
+    println!("identities to write      : {}", report.facts);
+    println!("registers named          : {}", report.registers);
+    // Named rather than counted away: an event with no status or no time is
+    // not a state of a status register, and handing it one would let it
+    // dominate a real status with nothing to say.
+    println!("left alone (incomplete)  : {}", report.skipped_incomplete);
+
+    if dry_run {
+        println!("\n(dry run — nothing written)");
+        return Ok(());
+    }
+    status_register::publish(pile, key, &delta)?;
+    println!("\nwrote {} identities", report.facts);
+    Ok(())
 }
 
 fn posture_findings(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
@@ -219,6 +252,9 @@ fn main() -> Result<()> {
         }
         Some(Command::PostureFindings { dry_run }) => {
             posture_findings(&cli.pile, cli.key.as_deref(), dry_run)
+        }
+        Some(Command::StatusRegister { dry_run }) => {
+            status_register(&cli.pile, cli.key.as_deref(), dry_run)
         }
         Some(Command::Faculties) => {
             list_faculties();

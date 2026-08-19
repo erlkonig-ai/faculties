@@ -16,7 +16,8 @@
 //!
 //! Two later sections gate the *generalised* substrate that grew out of this
 //! one. `gate_compass_stated_order` shows compass's `(created_at, event id)`
-//! rule is not a special case but `sole` over a `StatedOrder`, and
+//! rule is not a special case but the maximal state of a register — once the
+//! register is given the identity it lacked — and
 //! `gate_derived_observed_index` shows the maintained observed-set collection
 //! answers exactly what the live reverse-index probes do.
 //!
@@ -359,18 +360,45 @@ fn properties(space: &TribleSet) -> Result<()> {
 // Compass — the case the generalisation exists for
 // ---------------------------------------------------------------------------
 
-/// Compass resolves a goal's current status by `(created_at, event_id)`, a
-/// last-write-wins register over a *stated* key. Its supersedes edges are
-/// provenance and are deliberately not read — converting it to the
-/// observation frontier would silently drop notes, which the census above
-/// quantifies.
+/// Compass resolved a goal's current status by `(created_at, event_id)`
+/// over the events reachable through `board::task`. That edge is a
+/// grouping, not an identity — notes and priority events carry it too, and
+/// all of them are timestamped — so the rule only worked because it also
+/// filtered by kind tag on the way in. Under a register the filter has
+/// nowhere to live: domination is asked of the whole frame, so a later note
+/// dominated a status event and 778 of 2939 goals reported no status at all.
 ///
-/// Under the register substrate that rule is not a special case: it is
-/// `sole` over a `StatedOrder`, grouped by `board::task` and keyed by
-/// `metadata::created_at` with an id tie-break to make the order total.
-/// This asserts the two agree on every goal in the live pile.
+/// The cure is an identity in the data, `board::status_of`, and the
+/// migration that gives it to the events written before it existed. This
+/// applies that migration **in memory** — the pile is never written — and
+/// then asks the register the question, comparing against Compass's old
+/// hand-rolled rule recomputed here from the *unmigrated* facts. Both sides
+/// are therefore independent: one reads `board::task` and sorts in Rust, the
+/// other reads `board::status_of` and resolves in the engine.
 fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
-    use faculties::schemas::compass::{board, KIND_GOAL_ID, KIND_STATUS_ID};
+    use faculties::schemas::compass::{
+        board, interval_key, status_register, IntervalValue, KIND_GOAL_ID, KIND_STATUS_ID,
+    };
+    use faculties_migrations::status_register::status_register_delta;
+
+    /// Compass's rule before the register, verbatim in behaviour: every
+    /// status event grouped under this goal that carries both a status and
+    /// a timestamp, greatest by `(created_at, event id)`.
+    fn latest_by_hand(space: &TribleSet, goal: Id) -> Option<Id> {
+        find!(
+            (event: Id, status: String, at: IntervalValue),
+            pattern!(space, [{ ?event @
+                metadata::tag: &KIND_STATUS_ID,
+                board::task: &goal,
+                board::status: ?status,
+                metadata::created_at: ?at,
+            }])
+        )
+        .max_by(|left, right| {
+            (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0))
+        })
+        .map(|(event, _, _)| event)
+    }
 
     let goals: BTreeSet<Id> = find!(
         goal: Id,
@@ -378,37 +406,32 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
     )
     .collect();
 
-    // The substrate's order: same grouping, same key, same tie-break.
-    let order = StatedOrder::<_, inlineencodings::NsTAIInterval>::new(
-        space,
-        board::task.id(),
-        metadata::created_at.id(),
-    )
-    .tiebreak_by_id()
-    // The grouping edge is shared: notes and priority events hang off the
-    // same goal and also carry timestamps, so the dominator side has to be
-    // told the register is the *status* events.
-    .among(metadata::tag.id(), KIND_STATUS_ID.to_inline());
+    // The migration, applied to a local copy. `space` is a materialized
+    // TribleSet; the pile is not touched.
+    let (delta, report) = status_register_delta(space);
+    let mut migrated = space.clone();
+    migrated += delta;
+
+    // Nothing about identity or scope at the call site: the recipe is the
+    // register, and the reader only picks a frame.
+    let order = status_register(&migrated);
 
     let mut compared = 0usize;
     let mut with_status = 0usize;
     let mut agreed = 0usize;
     let mut multi_event = 0usize;
+    let mut broken_by_a_foreign_kind = 0usize;
     for goal in &goals {
-        // Compass's own rule, unchanged.
-        let expected = faculties::schemas::compass::latest_status_event(space, *goal)
-            .map(|(event, _, _)| event);
+        let expected = latest_by_hand(space, *goal);
 
-        // The same question asked of the substrate. Candidates are this
-        // goal's status events; the order does the rest.
-        // Compass's own read requires a status string and a timestamp on
-        // the event; matching that here keeps the *ordering rule* the only
-        // thing under test.
+        // The same question asked of the substrate, over the migrated
+        // facts. Candidates are this goal's status events; the register
+        // does the rest.
         let events: BTreeSet<Id> = find!(
             event: Id,
-            pattern!(space, [{ ?event @
+            pattern!(&migrated, [{ ?event @
                 metadata::tag: &KIND_STATUS_ID,
-                board::task: goal,
+                board::status_of: goal,
                 board::status: _?any_status,
                 metadata::created_at: _?any_at,
             }])
@@ -417,7 +440,19 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
         if events.len() > 1 {
             multi_event += 1;
         }
-        let actual = sole(&order, events.iter().copied());
+        let actual = sole(&order, events.iter().copied()).sole();
+
+        // How many goals the removed scoping axis existed to rescue: read
+        // `board::task` as if it were the identity and the answer is lost.
+        let grouped = StatedOrder::<_, inlineencodings::NsTAIInterval>::new(
+            space,
+            board::task.id(),
+            metadata::created_at.id(),
+        )
+        .tiebreak_by_id();
+        if expected.is_some() && sole(&grouped, events.iter().copied()).sole().is_none() {
+            broken_by_a_foreign_kind += 1;
+        }
 
         compared += 1;
         if expected.is_some() {
@@ -438,25 +473,23 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
         pattern!(space, [{ ?event @ metadata::tag: &KIND_STATUS_ID }])
     )
     .collect();
-    let well_formed: BTreeSet<Id> = find!(
-        event: Id,
-        pattern!(space, [{ ?event @
-            metadata::tag: &KIND_STATUS_ID,
-            board::status: _?any_status,
-            metadata::created_at: _?any_at,
-        }])
-    )
-    .collect();
 
-    println!("COMPASS (stated order — last-write-wins on a key, not on edges)");
+    println!("COMPASS (a stated register — an identity and an order, no scope)");
     println!(
-        "  status events: {} · carrying both a status string and a timestamp: {} · incomplete: {}",
+        "  status events: {} · complete (status + time + goal): {} · incomplete: {}",
         all_status.len(),
-        well_formed.len(),
-        all_status.len() - well_formed.len()
+        report.complete_events,
+        report.skipped_incomplete
+    );
+    println!(
+        "  migration: {} identities over {} registers · already identified: {}",
+        report.facts, report.registers, report.already_identified
     );
     println!("  goals examined: {compared} · goals carrying a status: {with_status}");
     println!("  goals with more than one status event: {multi_event}");
+    println!(
+        "  goals the grouping-as-identity reading loses: {broken_by_a_foreign_kind}"
+    );
     println!("  agreements: {agreed} of {compared}");
     assert!(compared > 0, "no goals examined: the gate would be vacuous");
     assert!(
@@ -467,8 +500,19 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
         multi_event > 0,
         "no goal has competing status events: the order would never be exercised"
     );
+    assert!(
+        report.facts > 0,
+        "the migration wrote nothing: the gate would be testing an empty change"
+    );
+    assert!(
+        broken_by_a_foreign_kind > 0,
+        "no goal is lost by reading the grouping as an identity: \
+         the register would have nothing to fix"
+    );
     if agreed == compared {
-        println!("  GATE PASS: sole(StatedOrder) == compass's (created_at, event id) max_by");
+        println!(
+            "  GATE PASS: the status register == compass's (created_at, event id) max_by"
+        );
         Ok(())
     } else {
         std::process::exit(1);
@@ -535,14 +579,19 @@ fn gate_derived_observed_index(space: &TribleSet) -> Result<()> {
 /// candidates by (kind tag, track attribute), dominators restricted to those
 /// same candidates, then a size dispatch to `Missing`/`Unique`/`Forked`.
 ///
-/// The frontier half of that is `resolve` over an `ObservationOrder` scoped
-/// on both axes — `.among(metadata::tag, KIND)` and `.within(track_attr)`.
-/// The bail conditions are *not* frontier questions: "supersedes a
-/// wrong-track predecessor" is a referential-integrity check on the edge
-/// set, and `GroupHead::Invalid` additionally re-derives an intrinsic id.
-/// Those belong to a validation pass, not to resolution.
+/// The frontier half of that is `resolve` over a plain `ObservationOrder`,
+/// with no scope on either side. The scoping the faculty appears to do is
+/// not a frontier question: "supersedes a wrong-track predecessor" is a
+/// referential-integrity check on the edge set, and `GroupHead::Invalid`
+/// additionally re-derives an intrinsic id. Those belong to a validation
+/// pass, not to resolution — an observation edge already asserts that its
+/// two ends are versions of the same thing, and a register that quietly
+/// disbelieves an edge is hiding the bad edge rather than resolving it.
 ///
-/// This asserts the frontier halves agree on every track in the live pile.
+/// This asserts the frontier halves agree on every track in the live pile,
+/// which is also the evidence that the removed scope axis was never load
+/// bearing here: a scope that changes no answer on real data was a knob
+/// answering a question the data does not ask.
 fn gate_relations_track_heads(space: &TribleSet) -> Result<()> {
     use faculties::relations::{group_head, lifecycle_head, profile_head, Head};
     use faculties::schemas::relations::{group, lifecycle, profile};
@@ -572,9 +621,7 @@ fn gate_relations_track_heads(space: &TribleSet) -> Result<()> {
             )
             .collect();
 
-            let order = ObservationOrder::new(space, metadata::supersedes.id())
-                .among(metadata::tag.id(), $kind.to_inline())
-                .within($track.id());
+            let order = ObservationOrder::new(space, metadata::supersedes.id());
 
             let mut examined = 0usize;
             let mut matched = 0usize;
@@ -600,7 +647,7 @@ fn gate_relations_track_heads(space: &TribleSet) -> Result<()> {
         }};
     }
 
-    println!("RELATIONS (track heads — both scope axes at once)");
+    println!("RELATIONS (track heads — an unscoped observation order)");
     let mut total = 0usize;
     let mut agreed = 0usize;
     for (examined, matched) in [
@@ -618,7 +665,9 @@ fn gate_relations_track_heads(space: &TribleSet) -> Result<()> {
     }
     assert!(total > 0, "no tracks examined: the gate would be vacuous");
     if agreed == total {
-        println!("  GATE PASS: scoped ObservationOrder == track_head's frontier, {agreed} subjects");
+        println!(
+            "  GATE PASS: unscoped ObservationOrder == track_head's frontier, {agreed} subjects"
+        );
         Ok(())
     } else {
         std::process::exit(1);

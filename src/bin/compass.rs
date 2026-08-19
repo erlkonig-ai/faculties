@@ -882,7 +882,7 @@ fn cmd_show(storage: CompassStorage<'_>, id: String) -> Result<()> {
             pattern!(space, [{
                 ?event @
                 metadata::tag: &KIND_STATUS_ID,
-                board::task: &task_id,
+                board::status_of: &task_id,
                 board::status: ?status,
                 metadata::created_at: ?at,
             }])

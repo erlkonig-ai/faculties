@@ -139,6 +139,12 @@ pub fn goal_fragment(
 
 /// One intrinsic status event. Exact replay has the same entity id; two
 /// independently timed actions remain distinct events.
+///
+/// The goal is named through `board::status_of`, not `board::task`: this
+/// event is a state of *the status of* that goal, which is a narrower claim
+/// than *attached to* it and is the register's identity. `board::task`
+/// remains readable on events written before that identity existed, but is
+/// no longer written or read for status.
 pub fn status_fragment(
     goal: Id,
     status: impl Into<String>,
@@ -148,7 +154,7 @@ pub fn status_fragment(
     let status = canonical_status(status)?;
     Ok(entity! {
         metadata::tag: &KIND_STATUS_ID,
-        board::task: &goal,
+        board::status_of: &goal,
         board::status: status.as_str(),
         board::by?: by.as_ref(),
         metadata::created_at: created_at,
@@ -245,6 +251,7 @@ fn is_compass_attribute(attribute: Id) -> bool {
         board::tag.id(),
         board::parent.id(),
         board::task.id(),
+        board::status_of.id(),
         board::status.id(),
         board::by.id(),
         board::note.id(),
@@ -263,6 +270,7 @@ fn is_compass_signal_attribute(attribute: Id) -> bool {
         board::tag.id(),
         board::parent.id(),
         board::task.id(),
+        board::status_of.id(),
         board::status.id(),
         board::by.id(),
         board::note.id(),
@@ -290,7 +298,16 @@ fn allowed_attribute(kind: Id, attribute: Id) -> bool {
         ]
         .contains(&attribute)
     } else if kind == KIND_STATUS_ID {
-        [board::task.id(), board::status.id(), board::by.id()].contains(&attribute)
+        // `task` stays allowed but is never written: every status event in
+        // the pile predating `status_of` carries it, and the pile is
+        // append-only.
+        [
+            board::status_of.id(),
+            board::task.id(),
+            board::status.id(),
+            board::by.id(),
+        ]
+        .contains(&attribute)
     } else if kind == KIND_PRIORITIZE_ID || kind == KIND_DEPRIORITIZE_ID {
         [board::higher.id(), board::lower.id()].contains(&attribute)
     } else {
@@ -405,7 +422,18 @@ fn validate_note(facts: &TribleSet, note: Id) -> Result<()> {
 
 fn validate_status(facts: &TribleSet, event: Id) -> Result<()> {
     validate_open_entity(facts, event, KIND_STATUS_ID)?;
-    let _task = exactly_one(
+    // A status event names at most one register and at most one goal. Both
+    // are `at_most_one` rather than `exactly_one` because the two eras
+    // disagree about which attribute carries it, and the pile holds both:
+    // events written before `status_of` have only `task`, and new events
+    // only `status_of`. `require_canonical_status` is what makes the
+    // identity mandatory on everything written from here on.
+    let _register = at_most_one(
+        event,
+        "board::status_of",
+        find!(value: Id, pattern!(facts, [{ event @ board::status_of: ?value }])).collect(),
+    )?;
+    let _task = at_most_one(
         event,
         "board::task",
         find!(value: Id, pattern!(facts, [{ event @ board::task: ?value }])).collect(),
@@ -546,8 +574,8 @@ fn validate_candidate_kind_ownership(
 fn require_canonical_status(facts: &TribleSet, event: Id) -> Result<()> {
     let task = exactly_one(
         event,
-        "board::task",
-        find!(value: Id, pattern!(facts, [{ event @ board::task: ?value }])).collect(),
+        "board::status_of",
+        find!(value: Id, pattern!(facts, [{ event @ board::status_of: ?value }])).collect(),
     )?;
     let status = exactly_one(
         event,
@@ -955,7 +983,7 @@ mod tests {
         let forged_id = genid().id;
         let forged = entity! { ExclusiveId::force_ref(&forged_id) @
             metadata::tag: &KIND_STATUS_ID,
-            board::task: &goal,
+            board::status_of: &goal,
             board::status: "doing",
             metadata::created_at: at(7),
         };

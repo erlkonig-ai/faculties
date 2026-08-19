@@ -49,6 +49,7 @@ pub mod posture_findings;
 pub mod relations_cutover;
 pub mod secrets_cutover;
 pub mod status_cutover;
+pub mod status_register;
 pub mod teams_cutover;
 pub mod voice_cutover;
 pub mod web_cutover;
