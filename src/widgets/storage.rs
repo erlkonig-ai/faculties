@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use triblespace::core::collection::CollectionId;
+use triblespace::core::collection::CollectionHandle;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStore;
 use triblespace::core::trible::TribleSet;
@@ -132,7 +132,7 @@ fn source_closure(sources: impl IntoIterator<Item = SourceKey>) -> BTreeSet<Sour
 pub struct DatasetRevision([u8; 32]);
 
 impl DatasetRevision {
-    fn from_collection(collection: CollectionId, facts: &TribleSet) -> Self {
+    fn from_collection(collection: CollectionHandle, facts: &TribleSet) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"faculties.viewer.dataset-revision.v1");
         hasher.update(&collection.raw);
@@ -181,7 +181,7 @@ struct LoadedDataset {
 }
 
 impl LoadedDataset {
-    fn new(collection: CollectionId, facts: TribleSet, reader: PileReader) -> Self {
+    fn new(collection: CollectionHandle, facts: TribleSet, reader: PileReader) -> Self {
         let revision = DatasetRevision::from_collection(collection, &facts);
         Self {
             facts,
@@ -544,7 +544,7 @@ fn load_catalog(
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
 
     let loaded = (|| {
-        let mut by_scope = BTreeMap::<Id, (CollectionId, TribleSet)>::new();
+        let mut by_scope = BTreeMap::<Id, (CollectionHandle, TribleSet)>::new();
 
         for (scope, label) in materialization_scopes(sources) {
             let (collection_id, facts) = {
@@ -589,7 +589,7 @@ fn load_catalog(
 
 fn validate_catalog(
     reader: &PileReader,
-    by_scope: &BTreeMap<Id, (CollectionId, TribleSet)>,
+    by_scope: &BTreeMap<Id, (CollectionHandle, TribleSet)>,
     sources: &BTreeSet<SourceKey>,
 ) -> Result<(), String> {
     let facts = |source: SourceKey| {

@@ -377,9 +377,9 @@ pub fn ensure_succinct_index(
     let result = (|| {
         let archive = ArchiveSnapshot::from_collection(&mut collection, schema::DEFAULT_SCOPE_ID)?;
         let algebra = SuccinctArchiveCollection::new(schema::DEFAULT_SCOPE_ID);
-        let source = algebra.source_descriptor();
-        let target = algebra.descriptor();
-        let exact = ExactDerivedCollection::new(source, target);
+        let source = algebra.source_descriptor().clone();
+        let target = algebra.descriptor().clone();
+        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let source_elements = distinct_ticket_data(archive.commits()).len();
         exact
             .ensure_exact(collection.storage_mut(), archive.commits(), &algebra)
@@ -436,8 +436,8 @@ pub fn ensure_bm25_index(
 
 fn ensure_bm25_for_snapshot(pile: &mut Pile, archive: &ArchiveSnapshot) -> Result<EnsuredBm25> {
     let source = simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID);
-    let target = archive_bm25::descriptor();
-    let exact = ExactDerivedCollection::new(source, target);
+    let target = archive_bm25::descriptor().clone();
+    let exact = ExactDerivedCollection::new(source.clone(), target.clone());
     let algebra = ArchiveBm25Algebra {
         reader: pile
             .reader()
@@ -1835,7 +1835,7 @@ mod tests {
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
         };
-        let exact = ExactDerivedCollection::new(source, target);
+        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let cover = exact.attach_exact(&mut pile, &commits, &algebra).unwrap();
         assert_eq!(cover.len(), 1);
         pile.close().unwrap();
@@ -2061,7 +2061,7 @@ mod tests {
         let source = simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID);
         let target = archive_bm25::descriptor();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let exact = ExactDerivedCollection::new(source, target);
+        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
         };
@@ -2134,7 +2134,7 @@ mod tests {
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
         };
-        let exact = ExactDerivedCollection::new(source, target);
+        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let ready = exact
             .ensure_exact(&mut pile, &[first, second], &algebra)
             .unwrap();
@@ -2186,7 +2186,7 @@ mod tests {
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
         };
-        let exact = ExactDerivedCollection::new(source, target);
+        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let ready = exact.ensure_exact(&mut pile, &[commit], &algebra).unwrap();
         assert_eq!(
             ready
@@ -2257,7 +2257,7 @@ mod tests {
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
         };
-        let exact = ExactDerivedCollection::new(source, target);
+        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let ready = exact.ensure_exact(&mut pile, &[commit], &algebra).unwrap();
         assert_eq!(ready.len(), 1);
         drop(ready);
@@ -2296,7 +2296,7 @@ mod tests {
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
         };
-        let exact = ExactDerivedCollection::new(source, target);
+        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let error = match exact.ensure_exact(&mut pile, &[absent], &algebra) {
             Ok(_) => panic!("absent frozen ticket was unexpectedly admitted"),
             Err(error) => error,

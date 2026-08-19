@@ -53,8 +53,8 @@ pub struct TargetDiscovery {
 
 impl TargetDiscovery {
     /// Canonical `SimpleArchive`-union descriptor for the requested scope.
-    pub const fn descriptor(&self) -> CollectionDescriptor {
-        self.descriptor
+    pub fn descriptor(&self) -> &CollectionDescriptor {
+        &self.descriptor
     }
 
     /// Valid self-signed commits targeting this collection, ordered by id.
