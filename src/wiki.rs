@@ -42,7 +42,10 @@ pub struct RevisionRecord {
     pub tags: BTreeSet<Id>,
     pub supersedes: BTreeSet<Id>,
     pub author: Option<Id>,
-    pub legacy_fragment: Option<Id>,
+    /// True for a revision authored after the cutover, whose id is intrinsic
+    /// over its own content. False for a preserved legacy version entity,
+    /// whose id predates that identity rule and is kept byte-for-byte.
+    pub native: bool,
     /// Every authoring-time observation retained on a legacy identity.
     ///
     /// The deterministic legacy writer intentionally reasserted an existing
@@ -54,7 +57,7 @@ pub struct RevisionRecord {
 
 impl RevisionRecord {
     pub const fn is_native(&self) -> bool {
-        self.legacy_fragment.is_none()
+        self.native
     }
 
     pub fn authored_at(&self) -> Option<IntervalValue> {
@@ -77,14 +80,12 @@ pub struct EntryRecord {
     pub roots: Vec<Id>,
     pub members: Vec<Id>,
     pub frontier: Vec<RevisionRecord>,
-    pub legacy_fragments: Vec<Id>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionReadModel {
     revisions: BTreeMap<Id, RevisionRecord>,
     entries: Vec<EntryRecord>,
-    legacy_frontiers: BTreeMap<Id, Vec<Id>>,
 }
 
 impl RevisionReadModel {
@@ -131,10 +132,6 @@ impl RevisionReadModel {
         self.entries
             .iter()
             .find(|entry| entry.members.binary_search(&revision).is_ok())
-    }
-
-    pub fn legacy_fragment_frontier(&self, fragment: Id) -> Option<&[Id]> {
-        self.legacy_frontiers.get(&fragment).map(Vec::as_slice)
     }
 
     /// Causal history, dependencies first. Timestamp and id only order
@@ -372,15 +369,15 @@ fn validate_graph(revisions: &BTreeMap<Id, RevisionRecord>) -> Result<()> {
 
 /// Group revisions into entries by `metadata::supersedes` connectivity alone.
 ///
-/// The legacy `attrs::fragment` anchor is NOT an edge here. It was one until
-/// 2026-08-18, when it became redundant: the additive migration synthesized the
-/// supersedes chain FROM the anchor groups, so every anchor group is already a
-/// connected component. Verified over the live corpus before removal — 11231
-/// revisions across 3035 anchors partition into the same 3095 entries, with
-/// identical membership, whether or not the anchor edge is applied. The anchor
-/// facts remain in the store and still resolve as selectors
-/// ([`RevisionReadModel::legacy_fragment_frontier`]); they simply no longer
-/// decide what belongs to what.
+/// The legacy `attrs::fragment` anchor was an edge here until 2026-08-18, when
+/// it became redundant: the additive migration synthesized the supersedes chain
+/// FROM the anchor groups, so every anchor group is already a connected
+/// component. Verified over the live corpus before removal — 11231 revisions
+/// across 3035 anchors partition into the same 3095 entries, with identical
+/// membership, with and without it. Since then the anchor is not read at all:
+/// an id names a REVISION or it names nothing. The facts remain in the store —
+/// it is append-only — and the additive migration still consumes them as legacy
+/// input, but no read path in the wiki resolves one.
 ///
 /// Each entry's frontier is [`latest`] over `space` — the shared query-layer
 /// operation, not a local rule. Asking it per component rather than once over
@@ -390,7 +387,7 @@ fn validate_graph(revisions: &BTreeMap<Id, RevisionRecord>) -> Result<()> {
 fn entry_records(
     space: &TribleSet,
     revisions: &BTreeMap<Id, RevisionRecord>,
-) -> (Vec<EntryRecord>, BTreeMap<Id, Vec<Id>>) {
+) -> Vec<EntryRecord> {
     let mut parent: BTreeMap<Id, Id> = revisions.keys().map(|id| (*id, *id)).collect();
 
     fn root(parent: &mut BTreeMap<Id, Id>, id: Id) -> Id {
@@ -430,7 +427,6 @@ fn entry_records(
             .push(id);
     }
     let mut entries = Vec::new();
-    let mut legacy_frontiers: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
     for mut members in components.into_values() {
         members.sort_unstable();
         let member_set: BTreeSet<Id> = members.iter().copied().collect();
@@ -452,41 +448,14 @@ fn entry_records(
             .iter()
             .filter_map(|id| revisions.get(id).cloned())
             .collect();
-        let mut legacy_fragments: Vec<Id> = members
-            .iter()
-            .filter_map(|id| revisions[id].legacy_fragment)
-            .collect();
-        legacy_fragments.sort_unstable();
-        legacy_fragments.dedup();
-        // An anchor no longer forces its versions into one entry, so it can in
-        // principle name several. Accumulate rather than overwrite: the
-        // selector is set-valued, and a last-write-wins insert would silently
-        // hide every entry but one.
-        for fragment in &legacy_fragments {
-            legacy_frontiers
-                .entry(*fragment)
-                .or_default()
-                .extend(frontier_ids.iter().copied());
-        }
         entries.push(EntryRecord {
             roots,
             members,
             frontier,
-            legacy_fragments,
         });
     }
-    for frontier in legacy_frontiers.values_mut() {
-        frontier.sort_unstable();
-        frontier.dedup();
-    }
-    entries.sort_by_key(|entry| {
-        entry
-            .legacy_fragments
-            .first()
-            .copied()
-            .or_else(|| entry.roots.first().copied())
-    });
-    (entries, legacy_frontiers)
+    entries.sort_by_key(|entry| entry.roots.first().copied());
+    entries
 }
 
 /// Load both immutable native revisions and preserved legacy version entities.
@@ -518,15 +487,6 @@ pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
             )?)
         } else {
             at_most_one(id_values(space, id, &attrs::author), id, "wiki::author")?
-        };
-        let legacy_fragment = if is_native {
-            None
-        } else {
-            Some(exactly_one(
-                id_values(space, id, &attrs::fragment),
-                id,
-                "wiki::fragment",
-            )?)
         };
         let legacy_created_at = if is_native {
             BTreeSet::new()
@@ -565,7 +525,7 @@ pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
                 tags,
                 supersedes,
                 author,
-                legacy_fragment,
+                native: is_native,
                 legacy_created_at,
                 authorships: Vec::new(),
             },
@@ -692,13 +652,9 @@ pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
         }
     }
 
-    let (entries, legacy_frontiers) = entry_records(space, &revisions);
+    let entries = entry_records(space, &revisions);
     Ok(WikiCatalog {
-        revisions: RevisionReadModel {
-            revisions,
-            entries,
-            legacy_frontiers,
-        },
+        revisions: RevisionReadModel { revisions, entries },
         tag_names,
         author_keys,
     })
@@ -1032,12 +988,6 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].frontier[0].id, join);
         assert!(find!(
-            fragment: Id,
-            pattern!(&facts, [{ join @ attrs::fragment: ?fragment }])
-        )
-        .next()
-        .is_none());
-        assert!(find!(
             authored_at: IntervalValue,
             pattern!(&facts, [{
                 _?authorship @
@@ -1200,14 +1150,15 @@ mod tests {
         );
     }
 
-    /// The legacy anchor is a selector, never an edge.
+    /// The legacy anchor is nothing at all now — not an edge, not a selector.
     ///
-    /// Two versions carrying the same `attrs::fragment` and NO `supersedes`
-    /// between them are two entries. Grouping them would infer lineage from an
-    /// anchor that never asserted any; the migration wrote the real lineage
-    /// down as supersedes facts, and that is the only thing consulted now.
+    /// Its facts are still in the store, because the store is append-only, and
+    /// the fixture keeps them for exactly that reason. Two versions carrying
+    /// the same anchor and NO `supersedes` between them are two entries, and
+    /// the anchor id itself resolves to no revision: lineage is read from the
+    /// supersedes facts the migration wrote down, and from nothing else.
     #[test]
-    fn a_shared_legacy_anchor_does_not_group_unlinked_versions() {
+    fn a_shared_legacy_anchor_groups_nothing_and_names_nothing() {
         let fragment = genid().id;
         let first = genid().id;
         let second = genid().id;
@@ -1232,6 +1183,14 @@ mod tests {
         assert_ne!(
             model.entry_containing(first).unwrap().members,
             model.entry_containing(second).unwrap().members
+        );
+        assert!(
+            model.revision(fragment).is_none(),
+            "an anchor id must resolve to no revision"
+        );
+        assert!(
+            model.entry_containing(fragment).is_none(),
+            "an anchor id must belong to no entry"
         );
     }
 
@@ -1258,14 +1217,14 @@ mod tests {
         }
         .into_facts();
         let model = load_catalog(&facts).unwrap().revisions;
-        assert_eq!(
-            model.legacy_fragment_frontier(fragment),
-            Some([second].as_slice())
-        );
-        assert_eq!(
-            model.revision(first).unwrap().legacy_fragment,
-            Some(fragment)
-        );
+        // Both legacy ids keep their identity and their lineage...
+        assert!(model.revision(first).is_some());
+        assert_eq!(model.revision(second).unwrap().supersedes.iter().copied().collect::<Vec<_>>(), vec![first]);
+        assert!(!model.revision(first).unwrap().is_native());
+        let entry = model.entry_containing(second).unwrap();
+        assert_eq!(entry.frontier.iter().map(|head| head.id).collect::<Vec<_>>(), vec![second]);
+        // ...and the anchor they were written under names nothing.
+        assert!(model.revision(fragment).is_none());
     }
 
     #[test]

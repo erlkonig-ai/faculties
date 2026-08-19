@@ -4,3 +4,6 @@
 # name; contributors may also create demo.pile, test.pile, etc.
 *.pile
 *.pile.bak-*
+
+# Agent worktrees; separate git checkouts, not content.
+.claude/

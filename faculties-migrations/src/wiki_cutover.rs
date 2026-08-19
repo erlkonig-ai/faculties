@@ -173,9 +173,10 @@ fn plan_projected(
         .collect();
     let additive = plan_additive(&deltas).map_err(|malformed| {
         anyhow!(
-            "legacy Wiki lineage is malformed: {} undated, {} unfragmented versions",
+            "legacy Wiki lineage is malformed: {} undated, {} unfragmented, {} with several fragments (expected exactly one each)",
             malformed.undated.len(),
-            malformed.unfragmented.len()
+            malformed.unfragmented.len(),
+            malformed.ambiguous.len()
         )
     })?;
     if additive.versions != additive.tagged {
@@ -426,9 +427,14 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         assert_eq!(plan.report().added_facts, 1);
 
         let model = faculties::wiki::load_catalog(&materialized).unwrap().revisions;
+        let entry = model.entry_containing(state_a).unwrap();
         assert_eq!(
-            model.legacy_fragment_frontier(page),
-            Some([state_a].as_slice()),
+            entry
+                .frontier
+                .iter()
+                .map(|head| head.id)
+                .collect::<Vec<_>>(),
+            vec![state_a],
             "A(1), B(2), A(3) must migrate with reasserted A current"
         );
         assert_eq!(

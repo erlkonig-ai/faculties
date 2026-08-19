@@ -41,6 +41,28 @@ All notable changes to this project will be documented in this file.
   order-independence and frame-relativity checks on live data. Compass is
   censused, not converted: it carries supersedes edges on notes but resolves
   currency by timestamp, a different question.
+- **The legacy Wiki anchor is retired: an id names a revision or it names
+  nothing.** `attrs::fragment` is no longer read anywhere in the wiki — not by
+  the read model, not by the CLI selector path, not by the viewer, not by
+  `gauge`. `RevisionRecord::legacy_fragment`, `EntryRecord::legacy_fragments`
+  and `RevisionReadModel::legacy_fragment_frontier` are gone; a legacy revision
+  is now identified by the `native` flag the loader sets from its kind tag, and
+  an entry is labelled by its root revision rather than by an anchor. The
+  branch-era read helpers in `schemas::wiki` (`latest_versions`,
+  `cover_fragments`, `read_title`, `read_content`, `tags_of`,
+  `find_tag_by_name`) go with them — nothing had called them since the
+  collection cutover. The anchor FACTS stay in every pile, because the store is
+  append-only, and the additive migration still reads them as legacy input;
+  what changed is that nothing resolves one.
+  **This is irreversible in effect and it has a measured cost**: superseded
+  revisions are content-addressed, so the anchor references inside them can
+  never be rewritten. On the live corpus that is 12141 references across 2223
+  superseded revisions (1166 distinct anchors) which now resolve to nothing.
+  Run `wiki lint --fix` over a corpus BEFORE installing this — afterwards no
+  build can resolve an anchor, and `wiki check` reports every remaining anchor
+  reference as a broken link (7351 on an un-linted live pile, 0 after the fix).
+  `examples/reference_census.rs` measures both halves; `examples/anchor_gate.rs`
+  is deleted, its gate having already licensed the grouping change it measured.
 - **`wiki lint` rewrites every `wiki:` reference to a revision id.** A revision
   id is a citation — immutable, pinned to what its author read; a legacy anchor
   is a live indirection that returns whatever is head today, so a citation
@@ -52,7 +74,7 @@ All notable changes to this project will be documented in this file.
   revision keep their exact bytes, and fenced code blocks are left verbatim, so
   a wiki of citations is a fixpoint. `--fix` mints successors as usual; the
   anchor-citing revisions stay immutable with their anchors intact. Measured on
-  the live corpus (`examples/anchor_reference_census.rs`): 10094 anchor
+  the live corpus (`examples/reference_census.rs`): 10094 anchor
   references in 1731 frontier revisions, 9092 of them in link syntax, resolving
   through 3035 anchors that each have exactly one head; a `--fix` on a
   copy-on-write clone left 0 anchor references in the frontier, 0 issues in
@@ -60,11 +82,11 @@ All notable changes to this project will be documented in this file.
 - **Wiki entries are supersedes-connected components; the legacy anchor no
   longer groups.** The additive migration synthesized the supersedes chain from
   the anchor groups, so the anchor edge had become redundant. Verified over the
-  live corpus before removal (`examples/anchor_gate.rs`): 11231 revisions across
-  3035 anchors partition into the same 3095 entries, identical membership, with
-  and without it. Anchor facts stay in the store and still resolve as selectors,
-  and a legacy selector naming several entries now reports all their frontiers
-  instead of silently keeping one.
+  live corpus before removal (by `examples/anchor_gate.rs`, since deleted along
+  with the anchor itself): 11231 revisions across 3035 anchors partition into
+  the same 3095 entries, identical membership, with and without it. Anchor facts
+  stayed in the store and still resolved as selectors at the time; the entry
+  above then retired that resolution too.
 - **Wiki backlinks are revision-scoped.** `wiki links` incoming, and the
   `--with/--without-backlink-*` filters, now name the revision whose own text
   carries the citation, superseded revisions included, and attribute source tags
