@@ -14,6 +14,12 @@
 //! candidate order cannot move the answer) and frame-relativity (a reader
 //! holding fewer commits legitimately sees a different, larger frontier).
 //!
+//! Two later sections gate the *generalised* substrate that grew out of this
+//! one. `gate_compass_stated_order` shows compass's `(created_at, event id)`
+//! rule is not a special case but `sole` over a `StatedOrder`, and
+//! `gate_derived_observed_index` shows the maintained observed-set collection
+//! answers exactly what the live reverse-index probes do.
+//!
 //! Reads only; never writes.
 //! `PILE=.../self.pile cargo run --release --example latest_frontier_gate`.
 
@@ -349,6 +355,182 @@ fn properties(space: &TribleSet) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Compass — the case the generalisation exists for
+// ---------------------------------------------------------------------------
+
+/// Compass resolves a goal's current status by `(created_at, event_id)`, a
+/// last-write-wins register over a *stated* key. Its supersedes edges are
+/// provenance and are deliberately not read — converting it to the
+/// observation frontier would silently drop notes, which the census above
+/// quantifies.
+///
+/// Under the register substrate that rule is not a special case: it is
+/// `sole` over a `StatedOrder`, grouped by `board::task` and keyed by
+/// `metadata::created_at` with an id tie-break to make the order total.
+/// This asserts the two agree on every goal in the live pile.
+fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
+    use faculties::schemas::compass::{board, KIND_GOAL_ID, KIND_STATUS_ID};
+
+    let goals: BTreeSet<Id> = find!(
+        goal: Id,
+        pattern!(space, [{ ?goal @ metadata::tag: &KIND_GOAL_ID }])
+    )
+    .collect();
+
+    // The substrate's order: same grouping, same key, same tie-break.
+    let order = StatedOrder::<_, inlineencodings::NsTAIInterval>::new(
+        space,
+        board::task.id(),
+        metadata::created_at.id(),
+    )
+    .tiebreak_by_id()
+    // The grouping edge is shared: notes and priority events hang off the
+    // same goal and also carry timestamps, so the dominator side has to be
+    // told the register is the *status* events.
+    .among(metadata::tag.id(), KIND_STATUS_ID.to_inline());
+
+    let mut compared = 0usize;
+    let mut with_status = 0usize;
+    let mut agreed = 0usize;
+    let mut multi_event = 0usize;
+    for goal in &goals {
+        // Compass's own rule, unchanged.
+        let expected = faculties::schemas::compass::latest_status_event(space, *goal)
+            .map(|(event, _, _)| event);
+
+        // The same question asked of the substrate. Candidates are this
+        // goal's status events; the order does the rest.
+        // Compass's own read requires a status string and a timestamp on
+        // the event; matching that here keeps the *ordering rule* the only
+        // thing under test.
+        let events: BTreeSet<Id> = find!(
+            event: Id,
+            pattern!(space, [{ ?event @
+                metadata::tag: &KIND_STATUS_ID,
+                board::task: goal,
+                board::status: _?any_status,
+                metadata::created_at: _?any_at,
+            }])
+        )
+        .collect();
+        if events.len() > 1 {
+            multi_event += 1;
+        }
+        let actual = sole(&order, events.iter().copied());
+
+        compared += 1;
+        if expected.is_some() {
+            with_status += 1;
+        }
+        if expected == actual {
+            agreed += 1;
+        } else {
+            println!(
+                "  MISMATCH goal {goal:x}: compass says {expected:?}, register says {actual:?}"
+            );
+        }
+    }
+
+    // Measure the malformed-event population directly rather than infer it.
+    let all_status: BTreeSet<Id> = find!(
+        event: Id,
+        pattern!(space, [{ ?event @ metadata::tag: &KIND_STATUS_ID }])
+    )
+    .collect();
+    let well_formed: BTreeSet<Id> = find!(
+        event: Id,
+        pattern!(space, [{ ?event @
+            metadata::tag: &KIND_STATUS_ID,
+            board::status: _?any_status,
+            metadata::created_at: _?any_at,
+        }])
+    )
+    .collect();
+
+    println!("COMPASS (stated order — last-write-wins on a key, not on edges)");
+    println!(
+        "  status events: {} · carrying both a status string and a timestamp: {} · incomplete: {}",
+        all_status.len(),
+        well_formed.len(),
+        all_status.len() - well_formed.len()
+    );
+    println!("  goals examined: {compared} · goals carrying a status: {with_status}");
+    println!("  goals with more than one status event: {multi_event}");
+    println!("  agreements: {agreed} of {compared}");
+    assert!(compared > 0, "no goals examined: the gate would be vacuous");
+    assert!(
+        with_status > 0,
+        "no goal carries a status: the gate would be vacuous"
+    );
+    assert!(
+        multi_event > 0,
+        "no goal has competing status events: the order would never be exercised"
+    );
+    if agreed == compared {
+        println!("  GATE PASS: sole(StatedOrder) == compass's (created_at, event id) max_by");
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
+/// The derived collection maintains the *dominated* set — the monotone half
+/// — and the reader subtracts. This checks the derived index answers exactly
+/// what the live order does over the wiki's revisions.
+fn gate_derived_observed_index(space: &TribleSet) -> Result<()> {
+    use triblespace::core::collection::observed_union::{
+        derive_element, join, ObservedIndex,
+    };
+
+    let catalog = wiki_model::load_catalog(space)?;
+    let entries = catalog.revisions.all_entries();
+    let members: BTreeSet<Id> = entries
+        .iter()
+        .flat_map(|entry| entry.members.iter().copied())
+        .collect();
+
+    // Derive from the archived facts, then read the frontier by subtraction.
+    let archive = space.clone().to_blob();
+    let derived = derive_element(&archive, metadata::supersedes.id())
+        .map_err(|error| anyhow::anyhow!("derive failed: {error}"))?;
+    // Joining with itself must be a no-op — idempotence on real bytes.
+    let rejoined =
+        join(&derived, &derived).map_err(|error| anyhow::anyhow!("join failed: {error}"))?;
+    assert_eq!(
+        derived.bytes.as_ref(),
+        rejoined.bytes.as_ref(),
+        "the observed-set join is not idempotent on live data"
+    );
+
+    let index =
+        ObservedIndex::decode(&derived).map_err(|error| anyhow::anyhow!("decode failed: {error}"))?;
+    let from_index = resolve(&index, members.iter().copied());
+    let from_live = latest(space, metadata::supersedes.id(), members.iter().copied());
+
+    println!("DERIVED OBSERVED SET (the maintained half)");
+    println!(
+        "  revisions examined: {} · observed states in the derived set: {}",
+        members.len(),
+        index.len()
+    );
+    println!(
+        "  frontier via derived index: {} · via live probes: {}",
+        from_index.len(),
+        from_live.len()
+    );
+    assert!(
+        !members.is_empty() && index.len() > 0,
+        "empty inputs: the gate would be vacuous"
+    );
+    if from_index == from_live {
+        println!("  GATE PASS: derived index == live reverse-index probes, same membership");
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
 fn main() -> Result<()> {
     let pile: PathBuf = std::env::var("PILE").expect("PILE").into();
     let signer = load_signer(&pile, None)?;
@@ -375,6 +557,10 @@ fn main() -> Result<()> {
     gate_memory(&memory)?;
     println!();
     census_compass(&compass)?;
+    println!();
+    gate_compass_stated_order(&compass)?;
+    println!();
+    gate_derived_observed_index(&wiki)?;
     println!();
     properties(&wiki)?;
     Ok(())
