@@ -1762,8 +1762,7 @@ mod tests {
             .derives()
             .iter()
             .find(|derive| {
-                derive.source() == report.source_collection
-                    && derive.target() == report.target_collection
+                derive.target() == report.target_collection
             })
             .copied()
             .expect("stored Archive raw-Succinct DERIVE");
@@ -1817,7 +1816,7 @@ mod tests {
         let derives: Vec<_> = records
             .derives()
             .iter()
-            .filter(|claim| claim.source() == source.handle() && claim.target() == target.handle())
+            .filter(|claim| claim.target() == target.handle())
             .copied()
             .collect();
         let merges: Vec<_> = records
@@ -1984,7 +1983,7 @@ mod tests {
         let input_data = Handle::<SimpleArchive>::to_hash(union.get_handle());
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
         let derive =
-            CollectionDerive::new(source.handle(), target.handle(), input_data, output_data);
+            CollectionDerive::new(target.handle(), input_data, output_data);
         let algebra = ArchiveBm25Algebra { reader };
         assert_eq!(algebra.derive(&union).unwrap().bytes, output.bytes);
         algebra.validate_target(&target, &output).unwrap();
@@ -2038,7 +2037,7 @@ mod tests {
         let inputs: BTreeSet<_> = records
             .derives()
             .iter()
-            .filter(|claim| claim.source() == source.handle() && claim.target() == target.handle())
+            .filter(|claim| claim.target() == target.handle())
             .map(|claim| claim.mapping().0)
             .collect();
         assert_eq!(inputs, BTreeSet::from([first.data()]));
@@ -2077,7 +2076,7 @@ mod tests {
         let first_derives = first_records
             .derives()
             .iter()
-            .filter(|claim| claim.source() == source.handle() && claim.target() == target.handle())
+            .filter(|claim| claim.target() == target.handle())
             .count();
         assert_eq!(first_derives, 1);
 
@@ -2087,7 +2086,7 @@ mod tests {
         let full_derives = full_records
             .derives()
             .iter()
-            .filter(|claim| claim.source() == source.handle() && claim.target() == target.handle())
+            .filter(|claim| claim.target() == target.handle())
             .count();
         assert_eq!(
             full_derives, 2,
@@ -2147,7 +2146,7 @@ mod tests {
                 .derives()
                 .iter()
                 .filter(|claim| {
-                    claim.source() == source.handle() && claim.target() == target.handle()
+                    claim.target() == target.handle()
                 })
                 .count(),
             1,
@@ -2174,7 +2173,7 @@ mod tests {
         let output = archive_bm25::derive_element(&reader, input).unwrap();
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
         let pending =
-            CollectionDerive::new(source.handle(), target.handle(), commit.data(), output_data);
+            CollectionDerive::new(target.handle(), commit.data(), output_data);
         drop(output);
         drop(reader);
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(pending)).unwrap();
@@ -2246,7 +2245,7 @@ mod tests {
         let output = archive_bm25::derive_element(&reader, input).unwrap();
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
         let derive =
-            CollectionDerive::new(source.handle(), target.handle(), commit.data(), output_data);
+            CollectionDerive::new(target.handle(), commit.data(), output_data);
         drop(reader);
         pile.put::<PortableBM25Blob, _>(output).unwrap();
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(derive)).unwrap();

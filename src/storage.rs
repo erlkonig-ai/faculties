@@ -377,9 +377,9 @@ mod tests {
             Inline::new([8; 32]),
         );
         let derive_to_target =
-            CollectionDerive::new(other, target, Inline::new([9; 32]), Inline::new([10; 32]));
+            CollectionDerive::new(target, Inline::new([9; 32]), Inline::new([10; 32]));
         let derive_from_target =
-            CollectionDerive::new(target, other, Inline::new([11; 32]), Inline::new([12; 32]));
+            CollectionDerive::new(other, Inline::new([11; 32]), Inline::new([12; 32]));
 
         let mut store = MemoryRepo::default();
         for record in [
