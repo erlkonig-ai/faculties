@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Compass's status register has an identity.** A goal's current status was
+  the greatest `(created_at, event id)` among the status events hanging off
+  `board::task`. That edge means *belongs to this goal* and notes and priority
+  events carry it too, all timestamped — a grouping, not an identity, and a
+  note is not a later version of a status event. New attribute
+  `board::status_of` says the narrower thing, *this is a state of the status of
+  goal G*, and `latest_status_event` is now the maximal state of that register
+  (`StatedOrder` over `status_of` × `created_at`, id tie-break) rather than a
+  hand-rolled `max_by`. Status events are written with `status_of` instead of
+  `task`; `task` stays readable on the events that predate it, because a pile
+  is append-only, but nothing reads it for status. `faculties-migrations`'
+  `status_register` gives the identity to every complete legacy status event —
+  a pure `TribleSet -> TribleSet` delta, so the live-pile gate applies it in
+  memory and the migration and its proof are the same code. Events carrying no
+  status or no time are deliberately left out: they name nothing to be current
+  and Compass's read has always skipped them.
+
 - **A Posture finding is located by content, and git decides what moved.**
   Identity was `(modality, path, commit:path:line, value)`, so commit surgery —
   rebase, cherry-pick, amend, scrub — gave the same material a new id and every

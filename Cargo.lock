@@ -3856,6 +3856,7 @@ dependencies = [
  "dryoc",
  "ed25519-dalek",
  "egui",
+ "faculties-migrations",
  "faculties-secrets",
  "hex",
  "hifitime",

@@ -906,7 +906,7 @@ fn load_watched_view(
         let authored_status = exists!(pattern!(&catalogs.compass, [{
             _?evt @
             metadata::tag: &KIND_STATUS_ID,
-            board::task: &id,
+            board::status_of: &id,
             board::by: &persona_id,
         }]));
         let authored_note = exists!(pattern!(&catalogs.compass, [{

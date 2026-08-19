@@ -6,6 +6,7 @@
 
 use triblespace::core::metadata;
 use triblespace::macros::{find, id_hex, pattern};
+use triblespace::core::query::intersectionconstraint::and;
 use triblespace::prelude::*;
 
 /// Stable scope of the authored Compass collection.
@@ -53,6 +54,16 @@ pub mod board {
         "9D2B6EBDA67E9BB6BE6215959D182041" unsafe as parent: inlineencodings::GenId;
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" unsafe as task: inlineencodings::GenId;
+        // The register a status event is a state OF: "the status of goal G".
+        //
+        // Distinct from `task`, which says only *belongs to this goal* and is
+        // shared with notes and priority events. A register needs an identity
+        // — "these are versions of the same thing" — and `task` is not one:
+        // a note and a status event both hang off the goal and are not
+        // versions of each other, so ordering them together by timestamp let
+        // a note retire a status on 778 of 2939 live goals. Minted with
+        // `trible genid` on 2026-08-19.
+        "9EB26577A63788E805B2C2F7792EF307" as status_of: inlineencodings::GenId;
         "61C44E0F8A73443ED592A713151E99A4" unsafe as status: inlineencodings::ShortString;
         // Optional acting persona (relations person id) on status and note
         // events. This is attribution only; it has no workflow semantics.
@@ -76,17 +87,36 @@ pub fn interval_key(interval: IntervalValue) -> i128 {
     lower
 }
 
-/// Deterministic latest status event for one goal. Ties on timestamp are
-/// broken by event id so merged replicas agree.
+/// The status register: states identified by `board::status_of`, ordered by
+/// `metadata::created_at`, with an id tie-break so the order is total and a
+/// last-write-wins read always answers.
+///
+/// Both attributes are the register, and neither is a filter. Which measure
+/// of domination this is, is [`StatedOrder::recipe_id`] — not something a
+/// call site restates.
+pub fn status_register(space: &TribleSet) -> StatedOrder<'_, TribleSet, inlineencodings::NsTAIInterval> {
+    StatedOrder::new(space, board::status_of.id(), metadata::created_at.id()).tiebreak_by_id()
+}
+
+/// Deterministic latest status event for one goal.
+///
+/// The maximal state of that goal's status register. `maximal` never
+/// proposes, so the pattern enumerates the goal's status events and the
+/// register kills the dominated ones; the total order leaves exactly one.
 pub fn latest_status_event(space: &TribleSet, goal_id: Id) -> Option<(Id, String, IntervalValue)> {
-    find!(
+    let register = status_register(space);
+    let current = find!(
         (event: Id, status: String, at: IntervalValue),
-        pattern!(space, [{ ?event @
-            metadata::tag: &KIND_STATUS_ID,
-            board::task: &goal_id,
-            board::status: ?status,
-            metadata::created_at: ?at,
-        }])
+        and!(
+            pattern!(space, [{ ?event @
+                metadata::tag: &KIND_STATUS_ID,
+                board::status_of: &goal_id,
+                board::status: ?status,
+                metadata::created_at: ?at,
+            }]),
+            maximal(event, &register),
+        )
     )
-    .max_by(|left, right| (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0)))
+    .next();
+    current
 }

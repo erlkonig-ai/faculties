@@ -389,7 +389,7 @@ fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
         pattern!(dataset.facts, [{
             ?event_id @
             metadata::tag: &KIND_STATUS_ID,
-            compass_attrs::task: ?gid,
+            compass_attrs::status_of: ?gid,
             compass_attrs::status: ?status,
             metadata::created_at: ?ts,
         }])
