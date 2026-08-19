@@ -531,6 +531,100 @@ fn gate_derived_observed_index(space: &TribleSet) -> Result<()> {
     }
 }
 
+/// `relations` resolves four snapshot tracks with its own `track_head`:
+/// candidates by (kind tag, track attribute), dominators restricted to those
+/// same candidates, then a size dispatch to `Missing`/`Unique`/`Forked`.
+///
+/// The frontier half of that is `resolve` over an `ObservationOrder` scoped
+/// on both axes — `.among(metadata::tag, KIND)` and `.within(track_attr)`.
+/// The bail conditions are *not* frontier questions: "supersedes a
+/// wrong-track predecessor" is a referential-integrity check on the edge
+/// set, and `GroupHead::Invalid` additionally re-derives an intrinsic id.
+/// Those belong to a validation pass, not to resolution.
+///
+/// This asserts the frontier halves agree on every track in the live pile.
+fn gate_relations_track_heads(space: &TribleSet) -> Result<()> {
+    use faculties::relations::{group_head, lifecycle_head, profile_head, Head};
+    use faculties::schemas::relations::{group, lifecycle, profile};
+    use faculties::schemas::relations::{
+        KIND_GROUP_SNAPSHOT, KIND_PERSON_LIFECYCLE, KIND_PERSON_PROFILE,
+    };
+
+    fn expected_of(head: Result<Head>) -> Option<BTreeSet<Id>> {
+        match head {
+            // The faculty bails on integrity problems, which the substrate
+            // deliberately does not model. Skip rather than count those as
+            // disagreements.
+            Err(_) => None,
+            Ok(Head::Missing) => Some(BTreeSet::new()),
+            Ok(Head::Unique(head)) => Some([head].into_iter().collect()),
+            Ok(Head::Forked(heads)) => Some(heads.into_iter().collect()),
+        }
+    }
+
+    // `pattern!` wants a literal attribute, so the track is a macro
+    // parameter rather than a runtime value.
+    macro_rules! gate_track {
+        ($label:literal, $kind:expr, $track:path, $resolver:expr) => {{
+            let subjects: BTreeSet<Id> = find!(
+                subject: Id,
+                pattern!(space, [{ _?snapshot @ metadata::tag: &$kind, $track: ?subject }])
+            )
+            .collect();
+
+            let order = ObservationOrder::new(space, metadata::supersedes.id())
+                .among(metadata::tag.id(), $kind.to_inline())
+                .within($track.id());
+
+            let mut examined = 0usize;
+            let mut matched = 0usize;
+            for subject in &subjects {
+                let candidates: BTreeSet<Id> = find!(
+                    snapshot: Id,
+                    pattern!(space, [{ ?snapshot @ metadata::tag: &$kind, $track: subject }])
+                )
+                .collect();
+                let Some(expected) = expected_of($resolver(space, *subject)) else {
+                    continue;
+                };
+                let actual = resolve(&order, candidates.iter().copied());
+                examined += 1;
+                if expected == actual {
+                    matched += 1;
+                } else {
+                    println!("  MISMATCH {} {subject:x}: {expected:?} vs {actual:?}", $label);
+                }
+            }
+            println!("  {}: {matched} of {examined} subjects agree", $label);
+            (examined, matched)
+        }};
+    }
+
+    println!("RELATIONS (track heads — both scope axes at once)");
+    let mut total = 0usize;
+    let mut agreed = 0usize;
+    for (examined, matched) in [
+        gate_track!("profile", KIND_PERSON_PROFILE, profile::of, profile_head),
+        gate_track!(
+            "lifecycle",
+            KIND_PERSON_LIFECYCLE,
+            lifecycle::of,
+            lifecycle_head
+        ),
+        gate_track!("group", KIND_GROUP_SNAPSHOT, group::snapshot_of, group_head),
+    ] {
+        total += examined;
+        agreed += matched;
+    }
+    assert!(total > 0, "no tracks examined: the gate would be vacuous");
+    if agreed == total {
+        println!("  GATE PASS: scoped ObservationOrder == track_head's frontier, {agreed} subjects");
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
 fn main() -> Result<()> {
     let pile: PathBuf = std::env::var("PILE").expect("PILE").into();
     let signer = load_signer(&pile, None)?;
@@ -550,6 +644,11 @@ fn main() -> Result<()> {
         faculties::schemas::compass::DEFAULT_SCOPE_ID,
         &signer,
     )?;
+    let relations = scope(
+        &mut handle,
+        faculties::schemas::relations::DEFAULT_SCOPE_ID,
+        &signer,
+    )?;
     let _ = handle.close();
 
     gate_wiki(&wiki)?;
@@ -561,6 +660,8 @@ fn main() -> Result<()> {
     gate_compass_stated_order(&compass)?;
     println!();
     gate_derived_observed_index(&wiki)?;
+    println!();
+    gate_relations_track_heads(&relations)?;
     println!();
     properties(&wiki)?;
     Ok(())
