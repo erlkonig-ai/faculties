@@ -4,7 +4,7 @@ use chrono::{
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::archive::archive;
 use faculties::schemas::compass::latest_status_event;
@@ -19,6 +19,7 @@ use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use faculties::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::{
     compass, habits, mail as mail_model, memory as memory_model, message, orient as orient_model,
     relations, status, teams as teams_model, wiki as wiki_model,
@@ -31,7 +32,6 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
@@ -640,9 +640,14 @@ fn render_native_compass_goals(
 ) -> String {
     use std::fmt::Write as _;
 
-    let mut doing = Vec::<(i128, Id)>::new();
-    let mut todo = Vec::<(i128, Id)>::new();
-    for task in compass::goal_ids(&catalogs.compass) {
+    let goals = compass::goal_ids(&catalogs.compass);
+    let ranks = compass::priority_ranks(
+        goals.iter().copied(),
+        &compass::goal_priority_edges(&catalogs.compass),
+    );
+    let mut doing = Vec::<(usize, i128, Id)>::new();
+    let mut todo = Vec::<(usize, i128, Id)>::new();
+    for task in goals {
         let (status, status_at) = latest_status_event(&catalogs.compass, task)
             .map(|(_, value, at)| (value.to_ascii_lowercase(), Some(interval_key(at))))
             .unwrap_or_else(|| ("todo".to_owned(), None));
@@ -654,14 +659,21 @@ fn render_native_compass_goals(
         .min()
         .unwrap_or(0);
         let key = status_at.unwrap_or(created);
+        let rank = ranks.get(&task).copied().unwrap_or(usize::MAX);
         match status.as_str() {
-            "doing" => doing.push((key, task)),
-            "todo" => todo.push((key, task)),
+            "doing" => doing.push((rank, key, task)),
+            "todo" => todo.push((rank, key, task)),
             _ => {}
         }
     }
-    doing.sort_by(|left, right| right.cmp(left));
-    todo.sort_by(|left, right| right.cmp(left));
+    let compare = |left: &(usize, i128, Id), right: &(usize, i128, Id)| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    };
+    doing.sort_by(compare);
+    todo.sort_by(compare);
 
     let mut out = String::new();
     writeln!(out, "Compass:").unwrap();
@@ -673,7 +685,7 @@ fn render_native_compass_goals(
     if doing.is_empty() {
         writeln!(out, "- None").unwrap();
     } else {
-        for (_, task) in doing.into_iter().take(doing_limit) {
+        for (_, _, task) in doing.into_iter().take(doing_limit) {
             writeln!(
                 out,
                 "- [{}] {}{}",
@@ -688,7 +700,7 @@ fn render_native_compass_goals(
     if todo.is_empty() {
         writeln!(out, "- None").unwrap();
     } else {
-        for (_, task) in todo.into_iter().take(todo_limit) {
+        for (_, _, task) in todo.into_iter().take(todo_limit) {
             writeln!(
                 out,
                 "- [{}] {}{}",

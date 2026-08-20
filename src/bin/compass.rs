@@ -1,13 +1,14 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::compass::{
     board, latest_status_event, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::{compass, relations};
 use hifitime::Epoch;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,6 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
 use triblespace_paths::{PathExpr, PathIndex, Step};
-use faculties::legacy_hint::open_scope;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
@@ -257,10 +257,9 @@ impl CompassStorage<'_> {
         self.with_pile(|pile, signer| {
             let (facts, reader) = compass::materialize_collection(pile, signer)?;
             let by = if let Some(persona) = persona {
-                let relation_facts =
-                    open_scope(&mut *pile, RELATIONS_SCOPE_ID, signer.clone())
-                        .materialize()
-                        .context("materialize Relations collection for Compass persona")?;
+                let relation_facts = open_scope(&mut *pile, RELATIONS_SCOPE_ID, signer.clone())
+                    .materialize()
+                    .context("materialize Relations collection for Compass persona")?;
                 relations::validate_catalog(&reader, &relation_facts)
                     .context("validate Relations collection for Compass persona")?;
                 Some(resolve_persona_id(&relation_facts, &reader, persona)?)
@@ -353,11 +352,6 @@ fn resolve_note_id(input: &str, space: &TribleSet) -> Result<Id> {
     Ok(note_id)
 }
 
-/// Compute active priority edges from the space.
-fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
-    compass::active_priority_edges(space).into_iter().collect()
-}
-
 fn parent_paths(space: &TribleSet) -> Result<PathIndex> {
     let parent_plus = PathExpr::from(Step::Forward(board::parent.id().into()))
         .plus()
@@ -419,69 +413,6 @@ fn note_supersedes(space: &TribleSet, note_id: Id) -> Vec<Id> {
     predecessors
 }
 
-/// Check if adding (higher, lower) would create a cycle in the priority DAG.
-fn would_create_cycle(edges: &HashSet<(Id, Id)>, higher: Id, lower: Id) -> bool {
-    let mut visited = HashSet::new();
-    let mut queue = vec![lower];
-    while let Some(node) = queue.pop() {
-        if node == higher {
-            return true;
-        }
-        if !visited.insert(node) {
-            continue;
-        }
-        for &(h, l) in edges {
-            if h == node && !visited.contains(&l) {
-                queue.push(l);
-            }
-        }
-    }
-    false
-}
-
-/// Topological rank of tasks by priority edges (lower rank = more important).
-fn priority_ranks(task_ids: &[Id], edges: &HashSet<(Id, Id)>) -> HashMap<Id, usize> {
-    let id_set: HashSet<Id> = task_ids.iter().copied().collect();
-    let mut adj: HashMap<Id, Vec<Id>> = HashMap::new();
-    let mut in_degree: HashMap<Id, usize> = HashMap::new();
-    for &id in task_ids {
-        in_degree.entry(id).or_insert(0);
-    }
-    for &(h, l) in edges {
-        if id_set.contains(&h) && id_set.contains(&l) {
-            adj.entry(h).or_default().push(l);
-            *in_degree.entry(l).or_insert(0) += 1;
-        }
-    }
-    let mut queue: Vec<Id> = in_degree
-        .iter()
-        .filter(|(_, &deg)| deg == 0)
-        .map(|(&id, _)| id)
-        .collect();
-    queue.sort_by(|a, b| a.cmp(b));
-    let mut ranks = HashMap::new();
-    let mut rank = 0;
-    while let Some(node) = queue.pop() {
-        ranks.insert(node, rank);
-        rank += 1;
-        if let Some(neighbors) = adj.get(&node) {
-            for &next in neighbors {
-                if let Some(deg) = in_degree.get_mut(&next) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push(next);
-                        queue.sort_by(|a, b| a.cmp(b));
-                    }
-                }
-            }
-        }
-    }
-    for &id in task_ids {
-        ranks.entry(id).or_insert(rank);
-    }
-    ranks
-}
-
 fn render_board(
     reader: &PileReader,
     space: &TribleSet,
@@ -490,13 +421,10 @@ fn render_board(
     show_done: bool,
 ) {
     let goal_ids = all_goal_ids(space);
-    let mut priority_edges = active_priority_edges(space);
-    // Implicit: children must be done before parents → child > parent
-    for &id in &goal_ids {
-        if let Some(parent) = task_parent(space, id) {
-            priority_edges.insert((id, parent));
-        }
-    }
+    let priority_ranks = compass::priority_ranks(
+        goal_ids.iter().copied(),
+        &compass::goal_priority_edges(space),
+    );
 
     let mut columns: HashMap<String, Vec<TaskRow>> = HashMap::new();
 
@@ -561,7 +489,7 @@ fn render_board(
         let rows = columns.remove(&status).unwrap_or_default();
         println!();
         println!("== {} ({}) ==", status.to_uppercase(), rows.len());
-        let ordered = order_rows(rows, &priority_edges);
+        let ordered = order_rows(rows, &priority_ranks);
         for (row, depth) in ordered {
             let indent = "  ".repeat(depth);
             println!(
@@ -627,7 +555,7 @@ impl TaskRow {
     }
 }
 
-fn order_rows(rows: Vec<TaskRow>, priority_edges: &HashSet<(Id, Id)>) -> Vec<(TaskRow, usize)> {
+fn order_rows(rows: Vec<TaskRow>, ranks: &BTreeMap<Id, usize>) -> Vec<(TaskRow, usize)> {
     let mut by_id: HashMap<Id, TaskRow> = HashMap::new();
     for row in rows {
         by_id.insert(row.id, row);
@@ -646,9 +574,6 @@ fn order_rows(rows: Vec<TaskRow>, priority_edges: &HashSet<(Id, Id)>) -> Vec<(Ta
         roots.push(*id);
     }
 
-    let all_ids: Vec<Id> = by_id.keys().copied().collect();
-    let ranks = priority_ranks(&all_ids, priority_edges);
-
     let sort_ids = |items: &mut Vec<Id>| {
         items.sort_by(|a, b| {
             let a_rank = ranks.get(a).copied().unwrap_or(usize::MAX);
@@ -658,7 +583,7 @@ fn order_rows(rows: Vec<TaskRow>, priority_edges: &HashSet<(Id, Id)>) -> Vec<(Ta
                     // Fall back to timestamp (most recent first)
                     let a_key = by_id.get(a).map(|row| row.sort_key).unwrap_or(0);
                     let b_key = by_id.get(b).map(|row| row.sort_key).unwrap_or(0);
-                    b_key.cmp(&a_key)
+                    b_key.cmp(&a_key).then_with(|| a.cmp(b))
                 }
                 other => other,
             }
@@ -1006,14 +931,9 @@ fn cmd_prioritize(
         }
 
         // Build full edge set (explicit + implicit child→parent)
-        let mut edges = active_priority_edges(space);
-        for id in all_goal_ids(space) {
-            if let Some(parent) = task_parent(space, id) {
-                edges.insert((id, parent));
-            }
-        }
+        let edges = compass::goal_priority_edges(space);
 
-        if would_create_cycle(&edges, higher_id, lower_id) {
+        if compass::would_create_priority_cycle(&edges, higher_id, lower_id) {
             let paths = parent_paths(space)?;
             if is_ancestor(&paths, higher_id, lower_id) || is_ancestor(&paths, lower_id, higher_id)
             {
@@ -1058,7 +978,7 @@ fn cmd_deprioritize(
         let higher_id = resolve_task_id(&higher_input, space)?;
         let lower_id = resolve_task_id(&lower_input, space)?;
 
-        let edges = active_priority_edges(space);
+        let edges = compass::active_priority_edges(space);
         if !edges.contains(&(higher_id, lower_id)) {
             bail!("no active priority relationship between these goals");
         }

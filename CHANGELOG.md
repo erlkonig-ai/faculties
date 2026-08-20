@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Compass importance is one shared partial order.** `compass list` already
+  understood explicit `prioritize` assertions, but its private topological
+  sort assigned every unrelated goal a different rank, so the advertised
+  recency tie-break almost never ran; Orient ignored the priority relation
+  entirely. The collection model now derives the complete relation once,
+  including the structural child-before-parent edge, and exposes shared
+  topological tiers. Compass and Orient both sort by those tiers first,
+  recency second, and entity id last. Unrelated maximal goals consequently
+  remain peers instead of acquiring an accidental order from hash-map or id
+  iteration, while every stated precedence still wins. Cycle rejection uses
+  the same shared interpretation as display; a cycle introduced by concurrent
+  replica writes degrades to one final peer tier rather than making reads
+  unavailable.
+
 - **A colleague's Teams reply now wakes the watcher.** `orient wait` blocked
   on peer messages, Mail, goals, status windows and habits — but not on
   Teams, so a reply from a real colleague landed in the pile with nothing

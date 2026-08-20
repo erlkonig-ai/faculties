@@ -19,11 +19,11 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
+use crate::legacy_hint::open_scope;
 use crate::schemas::compass::{
     board, interval_key, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
 };
-use crate::legacy_hint::open_scope;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -754,6 +754,107 @@ pub fn active_priority_edges(facts: &TribleSet) -> BTreeSet<(Id, Id)> {
         .collect()
 }
 
+/// The complete priority relation used by Compass views.
+///
+/// Explicit priority assertions are joined with the structural rule that a
+/// child precedes its parent. Keeping this interpretation here makes every
+/// presentation of the board read the same partial order.
+pub fn goal_priority_edges(facts: &TribleSet) -> BTreeSet<(Id, Id)> {
+    let goals = goal_ids(facts);
+    let mut edges = active_priority_edges(facts);
+    for (child, parent) in find!(
+        (child: Id, parent: Id),
+        pattern!(facts, [{
+            ?child @
+                metadata::tag: &KIND_GOAL_ID,
+                board::parent: ?parent,
+        }])
+    ) {
+        if goals.contains(&parent) {
+            edges.insert((child, parent));
+        }
+    }
+    edges
+}
+
+/// Return whether adding `higher > lower` would close a priority cycle.
+pub fn would_create_priority_cycle(edges: &BTreeSet<(Id, Id)>, higher: Id, lower: Id) -> bool {
+    let mut visited = BTreeSet::new();
+    let mut pending = vec![lower];
+    while let Some(node) = pending.pop() {
+        if node == higher {
+            return true;
+        }
+        if !visited.insert(node) {
+            continue;
+        }
+        pending.extend(
+            edges
+                .iter()
+                .filter_map(|(from, to)| (*from == node).then_some(*to)),
+        );
+    }
+    false
+}
+
+/// Assign topological priority tiers (lower is more important).
+///
+/// All currently maximal, mutually unordered goals share a tier, so callers
+/// can use recency or another presentation concern as a genuine tie-breaker.
+/// A malformed cyclic remainder shares one final tier instead of making a
+/// read fail; writers still reject cycles with [`would_create_priority_cycle`].
+pub fn priority_ranks(
+    goal_ids: impl IntoIterator<Item = Id>,
+    edges: &BTreeSet<(Id, Id)>,
+) -> BTreeMap<Id, usize> {
+    let goals: BTreeSet<Id> = goal_ids.into_iter().collect();
+    let mut outgoing = BTreeMap::<Id, BTreeSet<Id>>::new();
+    let mut incoming = goals
+        .iter()
+        .copied()
+        .map(|goal| (goal, 0usize))
+        .collect::<BTreeMap<_, _>>();
+
+    for &(higher, lower) in edges {
+        if goals.contains(&higher)
+            && goals.contains(&lower)
+            && outgoing.entry(higher).or_default().insert(lower)
+        {
+            *incoming.get_mut(&lower).expect("known priority goal") += 1;
+        }
+    }
+
+    let mut frontier: BTreeSet<Id> = incoming
+        .iter()
+        .filter_map(|(&goal, &count)| (count == 0).then_some(goal))
+        .collect();
+    let mut ranks = BTreeMap::new();
+    let mut rank = 0usize;
+    while !frontier.is_empty() {
+        let current = std::mem::take(&mut frontier);
+        for goal in &current {
+            ranks.insert(*goal, rank);
+        }
+        for goal in current {
+            if let Some(lower_goals) = outgoing.get(&goal) {
+                for lower in lower_goals {
+                    let count = incoming.get_mut(lower).expect("known priority goal");
+                    *count -= 1;
+                    if *count == 0 {
+                        frontier.insert(*lower);
+                    }
+                }
+            }
+        }
+        rank += 1;
+    }
+
+    for goal in goals {
+        ranks.entry(goal).or_insert(rank);
+    }
+    ranks
+}
+
 pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
@@ -879,6 +980,47 @@ mod tests {
             active_priority_edges(&left).contains(&(high, low)),
             activate_id > deactivate_id
         );
+    }
+
+    #[test]
+    fn priority_ranks_are_partial_order_tiers() {
+        let highest = Id::new([1; 16]).unwrap();
+        let middle = Id::new([2; 16]).unwrap();
+        let lowest = Id::new([3; 16]).unwrap();
+        let unrelated = Id::new([4; 16]).unwrap();
+        let edges = BTreeSet::from([(highest, middle), (middle, lowest)]);
+
+        let ranks = priority_ranks([highest, middle, lowest, unrelated], &edges);
+
+        assert_eq!(ranks[&highest], 0);
+        assert_eq!(ranks[&unrelated], 0);
+        assert_eq!(ranks[&middle], 1);
+        assert_eq!(ranks[&lowest], 2);
+    }
+
+    #[test]
+    fn goal_priority_edges_include_child_before_parent() {
+        let parent = Id::new([1; 16]).unwrap();
+        let child = Id::new([2; 16]).unwrap();
+        let mut facts = TribleSet::new();
+        facts += entity! { ExclusiveId::force_ref(&parent) @ metadata::tag: &KIND_GOAL_ID };
+        facts += entity! { ExclusiveId::force_ref(&child) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::parent: &parent,
+        };
+
+        assert!(goal_priority_edges(&facts).contains(&(child, parent)));
+    }
+
+    #[test]
+    fn priority_cycle_check_follows_transitive_edges() {
+        let high = Id::new([1; 16]).unwrap();
+        let middle = Id::new([2; 16]).unwrap();
+        let low = Id::new([3; 16]).unwrap();
+        let edges = BTreeSet::from([(high, middle), (middle, low)]);
+
+        assert!(would_create_priority_cycle(&edges, low, high));
+        assert!(!would_create_priority_cycle(&edges, high, low));
     }
 
     #[test]
