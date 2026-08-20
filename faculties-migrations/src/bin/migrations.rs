@@ -18,6 +18,9 @@
 //!   had, on the events written before that identity existed.
 //! - `node-identity` names this pile's own signing key as a Secrets identity,
 //!   so a node has one key rather than two.
+//! - `mail-credentials` recovers the mail account the Secrets cutover sealed
+//!   and retired, so `mail` can be configured again without re-deriving a
+//!   password nobody wrote down.
 //! - `faculties` lists the names `migrate-legacy` accepts.
 //!
 //! No command writes migration bookkeeping facts, and none deletes, consumes,
@@ -30,8 +33,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
-    activation_cutover, collection_cutover, descriptor_epoch, disposable_cutover, node_identity,
-    posture_findings, status_register, teams_credentials,
+    activation_cutover, collection_cutover, descriptor_epoch, disposable_cutover,
+    mail_credentials, node_identity, posture_findings, status_register, teams_credentials,
 };
 
 #[derive(Parser)]
@@ -135,6 +138,27 @@ enum Command {
         export: Option<PathBuf>,
     },
 
+    /// Recover the Mail account the Secrets cutover retired.
+    ///
+    /// A pre-cutover mail account lived on the legacy `secrets` branch as a
+    /// cleartext address plus a password-locked envelope holding the mailbox
+    /// password, hosts, and ports. `secrets_cutover` retires that record by
+    /// design and nothing was built to restart from it, so `mail account list`
+    /// is empty while the only copy of the password sits sealed on the legacy
+    /// branch. This reads it, never writes to the pile, and with `--export`
+    /// unlocks the envelope and materializes the password into a `0600` file
+    /// next to the exact `mail account set` line that consumes it.
+    ///
+    /// Reporting needs no password; `--export` needs FACULTIES_SECRETS_PW (or
+    /// the configured password file), because the envelope predates the
+    /// identity/scope/grant ceremony and is keyed on the root password.
+    MailCredentials {
+        /// Directory to receive the plaintext mailbox password. Without it,
+        /// nothing is unsealed and only the shape is reported.
+        #[arg(long, value_name = "DIR")]
+        export: Option<PathBuf>,
+    },
+
     /// List the faculty names `migrate-legacy` accepts.
     Faculties,
 }
@@ -213,6 +237,91 @@ fn teams_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
         println!("  {}  — {}", file.path.display(), file.purpose);
     }
     println!("\nThese are live secrets in the clear. Publish them and delete the files.");
+    Ok(())
+}
+
+fn mail_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
+    let report = mail_credentials::plan(pile).context("read the retired Mail account")?;
+    println!("Retired Mail account");
+    println!("pile                     : {}", pile.display());
+    if report.legacy_branch_missing {
+        println!("\nThe legacy `secrets` branch does not exist in this pile.");
+        println!("There is nothing to recover: configure the account from scratch with");
+        println!("`mail account set`.");
+        return Ok(());
+    }
+    println!("legacy authored commits  : {}", report.authored_commits);
+    println!("account records          : {}", report.accounts.len());
+    println!("unreadable envelopes     : {}", report.unreadable_envelopes);
+    println!(
+        "active address           : {}",
+        report
+            .active_address
+            .as_deref()
+            .unwrap_or("(no pointer was ever set)")
+    );
+
+    if report.accounts.is_empty() {
+        println!("\nThe legacy branch carries no Mail account record.");
+        println!("Nothing was sealed here, so nothing can be recovered: configure the");
+        println!("account from scratch with `mail account set`.");
+        return Ok(());
+    }
+
+    println!("\nrecords, newest first (the envelope stays sealed — nothing here is its content):");
+    for row in &report.accounts {
+        let created = row
+            .created_at
+            .map(|epoch| format!("{epoch}"))
+            .unwrap_or_else(|| "(no recorded time)".to_owned());
+        let envelope = match row.envelope_len {
+            Some(len) => format!("envelope[{len}] {:.16}…", row.envelope_handle),
+            None => "envelope UNREADABLE".to_owned(),
+        };
+        println!("  {:x}  {created}  {}  {envelope}", row.entity, row.address);
+    }
+
+    let Some(selected) = report.selected() else {
+        println!("\nNo record still has a readable envelope; the password is not recoverable.");
+        return Ok(());
+    };
+
+    let Some(export) = export else {
+        println!(
+            "\n(nothing unsealed; pass --export <DIR> to open {} and write its password)",
+            selected.address
+        );
+        return Ok(());
+    };
+
+    let password = faculties::secrets::password::read("unlock the retired Mail account envelope")?;
+    let recovered = mail_credentials::open(selected, &password)?;
+    let written = mail_credentials::export(&recovered, export).context("export mailbox password")?;
+    println!("\nwrote (mode 0600):");
+    println!("  {}  — {}", written.path.display(), written.purpose);
+    println!("\nrecovered settings (not secrets — `mail account set` needs them back):");
+    println!("  address       : {}", recovered.address);
+    println!("  display name  : {}", recovered.display_name);
+    println!("  POP endpoint  : {}", recovered.pop_endpoint);
+    println!("  SMTP endpoint : {}", recovered.smtp_endpoint);
+    println!("  password      : {} bytes", recovered.password_len);
+
+    // Deliberately a worklist, not an action. Sealing the password is an
+    // authorized act `mail account set` already owns, and it needs a Secrets
+    // scope to seal into — which on a pile whose only scope is `teams` does
+    // not exist yet.
+    println!("\nto publish it (the scope only needs creating once):");
+    println!("  secrets scope create --name mail --as <admin>");
+    println!("  secrets grant --object mail --subject <node identity> --as <admin>");
+    println!(
+        "  MAIL_PASS=\"$(cat {})\" mail account set \\\n    --address {} --display-name {:?} \\\n    --pop-endpoint {} --smtp-endpoint {} \\\n    --secret-scope mail",
+        written.path.display(),
+        recovered.address,
+        recovered.display_name,
+        recovered.pop_endpoint,
+        recovered.smtp_endpoint,
+    );
+    println!("\nThe exported file is a live secret in the clear. Publish it and delete it.");
     Ok(())
 }
 
@@ -495,6 +604,9 @@ fn main() -> Result<()> {
         }
         Some(Command::TeamsCredentials { export }) => {
             teams_credentials(&cli.pile, export.as_deref())
+        }
+        Some(Command::MailCredentials { export }) => {
+            mail_credentials(&cli.pile, export.as_deref())
         }
         Some(Command::Faculties) => {
             list_faculties();

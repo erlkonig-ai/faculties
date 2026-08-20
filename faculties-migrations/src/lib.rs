@@ -40,6 +40,7 @@ pub mod disposable_cutover;
 pub mod files_cutover;
 pub mod habit_cutover;
 pub mod headspace_cutover;
+pub mod mail_credentials;
 pub mod mail_cutover;
 pub mod memory_cutover;
 pub mod message_cutover;
