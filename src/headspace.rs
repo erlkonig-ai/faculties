@@ -965,13 +965,14 @@ fn open_utf8_secret(
     catalog: &SecretsCatalog,
     secret: Option<Id>,
     identity: Id,
-    password: &[u8],
+    identity_secret: &crate::secrets::IdentitySecret,
     role: &str,
 ) -> Result<Option<String>> {
     let Some(secret) = secret else {
         return Ok(None);
     };
-    let plaintext = crate::secrets::open_version(reader, catalog, secret, identity, password)
+    let plaintext =
+        crate::secrets::open_version(reader, catalog, secret, identity, identity_secret)
         .with_context(|| format!("open exact {role} Secrets version {secret:x}"))?;
     String::from_utf8(plaintext)
         .with_context(|| format!("exact {role} Secrets version {secret:x} is not UTF-8"))
@@ -987,7 +988,7 @@ pub fn open_active_secrets(
     secrets_reader: &PileReader,
     secrets: &SecretsCatalog,
     identity: Id,
-    password: &[u8],
+    identity_secret: &crate::secrets::IdentitySecret,
 ) -> Result<OpenedSecrets> {
     validate_secret_references(headspace, secrets)?;
     let (config, profile) = settled_active(headspace)?;
@@ -997,7 +998,7 @@ pub fn open_active_secrets(
             secrets,
             profile.model_secret_version,
             identity,
-            password,
+            identity_secret,
             "model",
         )?,
         tavily_api_key: open_utf8_secret(
@@ -1005,7 +1006,7 @@ pub fn open_active_secrets(
             secrets,
             config.tavily_secret_version,
             identity,
-            password,
+            identity_secret,
             "Tavily",
         )?,
         exa_api_key: open_utf8_secret(
@@ -1013,7 +1014,7 @@ pub fn open_active_secrets(
             secrets,
             config.exa_secret_version,
             identity,
-            password,
+            identity_secret,
             "Exa",
         )?,
     })
@@ -1328,7 +1329,7 @@ mod tests {
             &secrets_reader,
             &secrets_catalog,
             identity_id,
-            password,
+            &crate::secrets::IdentitySecret::Password(password.to_vec()),
         )
         .unwrap();
         assert_eq!(opened.model_api_key.as_deref(), Some("first"));

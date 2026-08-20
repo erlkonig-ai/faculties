@@ -289,8 +289,19 @@ fn point_now() -> Result<mail::IntervalValue> {
         .map_err(|error| anyhow!("encode current clock: {error:?}"))
 }
 
-fn identity_password() -> Result<Vec<u8>> {
-    faculties::secrets::password::read("unlock the selected Secrets identity")
+/// What opens the selected Secrets identity: this node's signing key when the
+/// identity is the node's own, otherwise the configured root password.
+fn identity_secret(
+    storage: &Storage<'_>,
+    views: &Views,
+    identity: Id,
+) -> Result<faculties::secrets::IdentitySecret> {
+    faculties::secrets_node::identity_secret(
+        &views.secrets_catalog,
+        identity,
+        &storage.signer,
+        "unlock the selected Secrets identity",
+    )
 }
 
 fn persona_selector() -> Result<String> {
@@ -303,19 +314,20 @@ fn relation_persona(views: &Views) -> Result<Id> {
         .require_unique("active Relations person", &raw)
 }
 
-fn secrets_identity(views: &Views, explicit: Option<&str>) -> Result<Id> {
+fn secrets_identity(storage: &Storage<'_>, views: &Views, explicit: Option<&str>) -> Result<Id> {
     let raw = match explicit {
-        Some(raw) => raw.to_owned(),
-        None => persona_selector().context(
-            "set --secrets-identity/SECRETS_IDENTITY when the Secrets identity differs from PERSONA",
-        )?,
+        Some(raw) => Some(raw.to_owned()),
+        None => persona_selector().ok().filter(|value| !value.is_empty()),
     };
-    secrets_model::resolve_identity(&views.secrets.reader, &views.secrets_catalog, &raw)
-        .with_context(|| {
-            format!(
-                "resolve Secrets identity {raw:?}; set --secrets-identity/SECRETS_IDENTITY explicitly when namespaces differ"
-            )
-        })
+    faculties::secrets_node::acting_identity(
+        &views.secrets.reader,
+        &views.secrets_catalog,
+        &storage.signer,
+        raw.as_deref(),
+    )
+    .context(
+        "set --secrets-identity/SECRETS_IDENTITY explicitly when the Secrets and Relations namespaces differ",
+    )
 }
 
 fn mailbox_secret_name(account: Id) -> String {
@@ -846,8 +858,8 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
     if !current_config.enabled {
         bail!("draft account {} is disabled", fmt_id(record.account));
     }
-    let secret_identity = secrets_identity(&views, storage.secrets_identity)?;
-    let identity_password = identity_password()?;
+    let secret_identity = secrets_identity(storage, &views, storage.secrets_identity)?;
+    let identity_secret = identity_secret(storage, &views, secret_identity)?;
     let account = mail::open_account(
         &views.mail.reader,
         &views.mail.facts,
@@ -855,7 +867,7 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
         &views.secrets_catalog,
         record.account,
         secret_identity,
-        &identity_password,
+        &identity_secret,
     )?;
     let draft = mail::materialize_draft(
         &views.mail.reader,
@@ -1181,8 +1193,8 @@ fn cmd_fetch(storage: &Storage<'_>) -> Result<()> {
         return Ok(());
     }
 
-    let secret_identity = secrets_identity(&views, storage.secrets_identity)?;
-    let identity_password = identity_password()?;
+    let secret_identity = secrets_identity(storage, &views, storage.secrets_identity)?;
+    let identity_secret = identity_secret(storage, &views, secret_identity)?;
     let mut accounts = Vec::new();
     for anchor in enabled_anchors {
         let account = mail::open_account(
@@ -1192,7 +1204,7 @@ fn cmd_fetch(storage: &Storage<'_>) -> Result<()> {
             &views.secrets_catalog,
             anchor,
             secret_identity,
-            &identity_password,
+            &identity_secret,
         )
         .with_context(|| format!("open POP account {anchor:x}"))?;
         accounts.push(account);
@@ -1706,7 +1718,7 @@ mod tests {
         .unwrap()
         .require_unique("active Relations person", "work-persona")
         .unwrap();
-        let secret = secrets_identity(&views, Some("mail-vault")).unwrap();
+        let secret = secrets_identity(&storage, &views, Some("mail-vault")).unwrap();
         assert_eq!(relation, relations_person);
         assert_eq!(secret, vault.id);
         assert_ne!(relation, secret);

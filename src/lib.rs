@@ -69,6 +69,7 @@ pub mod posture_finding;
 pub mod posture_policy;
 pub mod relations;
 pub mod schemas;
+pub mod secrets_node;
 pub mod spec;
 pub mod status;
 pub mod storage;

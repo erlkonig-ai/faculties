@@ -19,11 +19,13 @@
 //! `faculties-migrations` crate and depends on this module rather than the
 //! other way round.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;
 
+use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
     discover_collection_records, Collection, CollectionCommit, CollectionDerive,
     CollectionDescriptor, CollectionMerge, CollectionRecordDiagnostic, CollectionStore,
@@ -123,6 +125,67 @@ where
         derives,
         diagnostics: records.diagnostics().to_vec(),
     })
+}
+
+/// One node the pile itself attests, by the key it signed its commits with.
+///
+/// A pile is a roster of its own writers: every commit carries the public key
+/// that signed it, and discovery keeps only commits whose signature verifies.
+/// So the set of keys that have ever written is readable from the pile, with
+/// no registry to maintain and no key to distribute.
+///
+/// This is *discovery*, and discovery is not entitlement. Having written to a
+/// pile makes a node addressable — something a secret can be sealed to by
+/// name — and nothing more. What a node may read is decided entirely by the
+/// grants an admin issues and the wraps a holder creates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeObservation {
+    public_key: [u8; 32],
+    commits: usize,
+    collections: BTreeSet<CollectionHandle>,
+}
+
+impl NodeObservation {
+    /// Ed25519 public key this node signs with.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    /// Commits in this pile whose signature this key verifies.
+    pub fn commits(&self) -> usize {
+        self.commits
+    }
+
+    /// Distinct collections this node has written into.
+    pub fn collections(&self) -> usize {
+        self.collections.len()
+    }
+}
+
+/// Every node that has written a verifiable commit into this pile.
+///
+/// Ordered by public key, so two runs over the same pile report the same
+/// roster in the same order.
+pub fn discover_nodes<S>(store: &mut S) -> Result<Vec<NodeObservation>>
+where
+    S: CollectionStore,
+{
+    let records =
+        discover_collection_records(store).context("discover native collection records")?;
+    let mut by_key: BTreeMap<[u8; 32], (usize, BTreeSet<CollectionHandle>)> = BTreeMap::new();
+    for commit in records.commits() {
+        let entry = by_key.entry(commit.public_key().raw).or_default();
+        entry.0 += 1;
+        entry.1.insert(commit.collection());
+    }
+    Ok(by_key
+        .into_iter()
+        .map(|(public_key, (commits, collections))| NodeObservation {
+            public_key,
+            commits,
+            collections,
+        })
+        .collect())
 }
 
 /// Resolve the durable signer path for a pile without touching the filesystem.

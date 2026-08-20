@@ -750,13 +750,18 @@ fn open_display_secrets(storage: &Storage<'_>, views: &Views) -> Result<Option<O
         return Ok(None);
     }
     let identity = resolve_secrets_identity(storage, views)?;
-    let password = faculties::secrets::password::read("unlock the selected Secrets identity")?;
+    let identity_secret = faculties::secrets_node::identity_secret(
+        &views.secrets_catalog,
+        identity,
+        &storage.signer,
+        "unlock the selected Secrets identity",
+    )?;
     headspace::open_active_secrets(
         &views.catalog,
         &views.secrets.reader,
         &views.secrets_catalog,
         identity,
-        &password,
+        &identity_secret,
     )
     .map(Some)
 }

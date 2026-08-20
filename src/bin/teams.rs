@@ -881,19 +881,23 @@ fn exact_secret_id(catalog: &SecretsCatalog, value: &str, label: &str) -> Result
     Ok(id)
 }
 
+/// Which Secrets identity Teams acts as: an explicit selector, then `PERSONA`,
+/// then this node's own identity — the one whose key already signs every
+/// commit this process writes.
 fn secrets_identity(session: &TeamsSession<'_>, explicit: Option<&str>) -> Result<Id> {
     let selector = match explicit {
-        Some(selector) => selector.to_owned(),
-        None => std::env::var("PERSONA").context(
-            "set --secrets-identity/SECRETS_IDENTITY when the Secrets identity differs from PERSONA",
-        )?,
+        Some(selector) => Some(selector.to_owned()),
+        None => std::env::var("PERSONA").ok().filter(|value| !value.is_empty()),
     };
-    secrets_model::resolve_identity(&session.secrets_reader, &session.secrets_catalog, &selector)
-        .with_context(|| format!("resolve Secrets identity {selector:?}"))
-}
-
-fn identity_password() -> Result<Vec<u8>> {
-    faculties::secrets::password::read("unlock the selected Secrets identity")
+    faculties::secrets_node::acting_identity(
+        &session.secrets_reader,
+        &session.secrets_catalog,
+        &session.signer,
+        selector.as_deref(),
+    )
+    .context(
+        "set --secrets-identity/SECRETS_IDENTITY when the Secrets identity differs from PERSONA",
+    )
 }
 
 fn open_exact_secret(
@@ -902,13 +906,18 @@ fn open_exact_secret(
     secret: Id,
 ) -> Result<Vec<u8>> {
     let identity = secrets_identity(session, identity_selector)?;
-    let password = identity_password()?;
+    let identity_secret = faculties::secrets_node::identity_secret(
+        &session.secrets_catalog,
+        identity,
+        &session.signer,
+        "unlock the selected Secrets identity",
+    )?;
     secrets_model::open_version(
         &session.secrets_reader,
         &session.secrets_catalog,
         secret,
         identity,
-        &password,
+        &identity_secret,
     )
     .with_context(|| format!("open exact Teams Secrets version {secret:x}"))
 }
@@ -3950,7 +3959,7 @@ mod tests {
                     &session.secrets_catalog,
                     client_secret,
                     identity,
-                    b"test identity password",
+                    &secrets_model::IdentitySecret::Password(b"test identity password".to_vec()),
                 )?;
                 assert_eq!(opened_client, b"distinct-test-client-secret");
                 Ok(())

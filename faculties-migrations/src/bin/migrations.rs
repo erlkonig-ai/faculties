@@ -16,6 +16,8 @@
 //!   is what that faculty's own `migrate-legacy` subcommand used to do.
 //! - `status-register` gives Compass's status register the identity it never
 //!   had, on the events written before that identity existed.
+//! - `node-identity` names this pile's own signing key as a Secrets identity,
+//!   so a node has one key rather than two.
 //! - `faculties` lists the names `migrate-legacy` accepts.
 //!
 //! No command writes migration bookkeeping facts, and none deletes, consumes,
@@ -28,8 +30,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
-    activation_cutover, collection_cutover, descriptor_epoch, disposable_cutover, posture_findings,
-    status_register, teams_credentials,
+    activation_cutover, collection_cutover, descriptor_epoch, disposable_cutover, node_identity,
+    posture_findings, status_register, teams_credentials,
 };
 
 #[derive(Parser)]
@@ -94,6 +96,24 @@ enum Command {
     /// `board::status_of` on every complete status event written before that
     /// attribute existed. Additive; nothing is deleted or rewritten.
     StatusRegister {
+        /// Report what would be written, without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Name this pile's durable signing key as a Secrets identity, so the key
+    /// that signs its commits is also the key its secrets are sealed to.
+    ///
+    /// Additive and narrow: it appends one identity record built from public
+    /// material. Existing password-locked identities are untouched and keep
+    /// working. It grants nothing — naming a key is not entitling it — so the
+    /// report names the `secrets grant` and `secrets secret share` commands
+    /// that finish the job under an admin's authority.
+    NodeIdentity {
+        /// Nickname for the node's identity. Names the machine, not a window:
+        /// every persona on this pile shares one signing key.
+        #[arg(long)]
+        nickname: String,
         /// Report what would be written, without writing.
         #[arg(long)]
         dry_run: bool,
@@ -193,6 +213,80 @@ fn teams_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
         println!("  {}  — {}", file.path.display(), file.purpose);
     }
     println!("\nThese are live secrets in the clear. Publish them and delete the files.");
+    Ok(())
+}
+
+fn node_identity(pile: &Path, key: Option<&Path>, nickname: &str, dry_run: bool) -> Result<()> {
+    let report = if dry_run {
+        node_identity::plan(pile, key)?
+    } else {
+        node_identity::publish(pile, key, nickname)?
+    };
+    println!("Node identity");
+    println!("pile                     : {}", pile.display());
+    println!("this node's key          : {}", hex::encode(report.local_public_key));
+    println!("nodes attested by pile   : {}", report.nodes.len());
+    println!("  of those, unnamed      : {}", report.unnamed_nodes());
+    println!("identities on a node key : {}", report.node_identities);
+    println!("identities on a lockbox  : {}", report.lockbox_identities);
+    match &report.bound {
+        Some((id, name)) if report.bound_now => {
+            println!("\nbound this run: identity {id:x} ({name})");
+        }
+        Some((id, name)) => {
+            println!("\nalready bound: identity {id:x} ({name}) — nothing written");
+        }
+        None => {
+            println!("\nnot bound: this node's key names no Secrets identity");
+            if dry_run {
+                println!("  re-run without --dry-run to append it");
+            }
+        }
+    }
+
+    if !report.nodes.is_empty() {
+        println!("\nnodes:");
+        for node in &report.nodes {
+            let named = match (&node.identity, &node.name) {
+                (Some(id), Some(name)) => format!("{name} {id:x}"),
+                _ => "(unnamed)".to_owned(),
+            };
+            println!(
+                "  {}  {:>6} commit(s)  {named}{}",
+                hex::encode(node.public_key),
+                node.commits,
+                if node.is_local { "  [this node]" } else { "" }
+            );
+        }
+    }
+
+    // Deliberately a worklist, not an action. Both remaining steps are
+    // authorized acts: one needs an effective admin, the other needs a DEK
+    // only a current wrap holder can recover.
+    if let Some((_, name)) = &report.bound {
+        if report.gaps.is_empty() {
+            println!("\n✓ {name} is a recipient of every scope and holds a wrap of every current version");
+        } else {
+            println!("\nremaining, for an admin to run:");
+            for gap in &report.gaps {
+                if !gap.member {
+                    println!(
+                        "  secrets grant --object {} --subject {name} --as <admin>",
+                        gap.scope_name
+                    );
+                }
+                for credential in &gap.unwrapped {
+                    println!(
+                        "  secrets secret share --scope {} --name {credential} --as <holder>",
+                        gap.scope_name
+                    );
+                }
+            }
+        }
+    }
+    if dry_run {
+        println!("\n(dry run: nothing written)");
+    }
     Ok(())
 }
 
@@ -392,6 +486,9 @@ fn main() -> Result<()> {
         }
         Some(Command::DescriptorEpoch { dry_run }) => {
             descriptor_epoch(&cli.pile, cli.key.as_deref(), dry_run)
+        }
+        Some(Command::NodeIdentity { nickname, dry_run }) => {
+            node_identity(&cli.pile, cli.key.as_deref(), &nickname, dry_run)
         }
         Some(Command::StatusRegister { dry_run }) => {
             status_register(&cli.pile, cli.key.as_deref(), dry_run)

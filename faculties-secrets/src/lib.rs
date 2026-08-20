@@ -7,7 +7,16 @@
 //! competing values.
 //!
 //! A fresh DEK secretboxes each secret version once and is sealed-boxed to the
-//! X25519 key derived from every recipient's Ed25519 identity. A grant is
+//! X25519 key derived from every recipient's Ed25519 identity. That one keypair
+//! does both jobs, so an identity's private half may rest either in a
+//! password-locked lockbox carried in its record or in the node's durable pile
+//! signing key -- the same key that signs its collection commits. A node
+//! therefore has one identity, not two, and any node that has ever written to
+//! the pile can be named as a recipient from the pile alone.
+//!
+//! Naming is not entitlement. Discovering a node's key makes it *addressable*;
+//! it is sealed to only after an effective admin grants it into a scope, and it
+//! reads a version only through a wrap addressed to it. A grant is
 //! effective only when its issuer belongs to the effective-admin fixpoint of
 //! its object. Retracting one admin grant therefore transitively invalidates
 //! authority derived solely through it, while another independent live grant
@@ -33,6 +42,7 @@ use dryoc::dryocbox::{DryocBox, KeyPair as BoxKeyPair, PublicKey as BoxPublicKey
 use dryoc::dryocsecretbox::{DryocSecretBox, Key, Nonce};
 use dryoc::sign::SigningKeyPair;
 use dryoc::types::*;
+use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
@@ -59,7 +69,9 @@ const SECRET_BODY_MIN_BYTES: usize = 24 + 16;
 const SEALED_DEK_BYTES: usize = 48 + 32;
 
 /// A freshly prepared identity and the public material callers may display.
-/// The password-protected signing key remains embedded in `fragment`.
+/// A password-protected private key, when there is one, remains embedded in
+/// `fragment`; a node identity has none, because its private half never leaves
+/// the node's signing-key file.
 pub struct PreparedIdentity {
     pub fragment: Fragment,
     pub id: Id,
@@ -85,7 +97,41 @@ pub struct IdentityRow {
     pub created_at: IntervalValue,
     pub name: TextHandle,
     pub sign_pk: BytesHandle,
-    pub lockbox: BytesHandle,
+    /// Password-locked private key, when the identity keeps one. `None` is a
+    /// node identity: the same private half rests in the node's durable
+    /// signing-key file beside its pile, so the record carries nothing to lock.
+    pub lockbox: Option<BytesHandle>,
+}
+
+impl IdentityRow {
+    /// Whether this identity's private half rests in a node signing-key file
+    /// rather than in a lockbox carried by the record.
+    pub fn is_node_identity(&self) -> bool {
+        self.lockbox.is_none()
+    }
+}
+
+/// What a caller presents to act as one identity.
+///
+/// Both arms open the same keypair. They differ only in where its private half
+/// was resting, which is why widening from one to two costs the model nothing:
+/// sealing is unchanged, and every recipient is still a specific identity.
+pub enum IdentitySecret {
+    /// The password that opens a lockbox carried in the identity record.
+    Password(Vec<u8>),
+    /// A node's durable pile signing key. Its public half must be the
+    /// identity's own, and that is checked before anything is unsealed.
+    Node(SigningKey),
+}
+
+impl std::fmt::Debug for IdentitySecret {
+    /// Hand-written so neither a password nor a private key can reach a log.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password(_) => formatter.write_str("IdentitySecret::Password(<redacted>)"),
+            Self::Node(_) => formatter.write_str("IdentitySecret::Node(<redacted>)"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -333,16 +379,35 @@ fn identity_box_keypair(
     reader: &PileReader,
     catalog: &SecretsCatalog,
     identity: Id,
-    password: &[u8],
+    secret: &IdentitySecret,
 ) -> Result<BoxKeyPair> {
     let row = catalog
         .identities
         .get(&identity)
         .ok_or_else(|| anyhow!("identity {} not found", fmt_id(identity)))?;
-    let lockbox = read_bytes(reader, row.lockbox).context("read identity lockbox")?;
     let public = read_bytes(reader, row.sign_pk).context("read identity public key")?;
-    let secret = unlock_secret_key(password, &lockbox)?;
-    box_keypair_from_ed25519(&secret, &public)
+    match secret {
+        IdentitySecret::Password(password) => {
+            let lockbox = row.lockbox.ok_or_else(|| {
+                anyhow!(
+                    "identity {} keeps no lockbox; it is a node identity, so unlock it with that node's signing key",
+                    fmt_id(identity)
+                )
+            })?;
+            let lockbox = read_bytes(reader, lockbox).context("read identity lockbox")?;
+            let private = unlock_secret_key(password, &lockbox)?;
+            box_keypair_from_ed25519(&private, &public)
+        }
+        IdentitySecret::Node(signing_key) => {
+            if signing_key.verifying_key().to_bytes()[..] != public[..] {
+                bail!(
+                    "the presented signing key is not the key of identity {}",
+                    fmt_id(identity)
+                );
+            }
+            box_keypair_from_ed25519(&signing_key.to_keypair_bytes(), &public)
+        }
+    }
 }
 
 /// Recover the unique DEK assertion without selecting an arbitrary wrap.
@@ -352,9 +417,9 @@ fn recover_dek(
     catalog: &SecretsCatalog,
     secret: Id,
     identity: Id,
-    password: &[u8],
+    identity_secret: &IdentitySecret,
 ) -> Result<Key> {
-    let keypair = identity_box_keypair(reader, catalog, identity, password)?;
+    let keypair = identity_box_keypair(reader, catalog, identity, identity_secret)?;
     let wraps = catalog.wraps_for(secret, identity);
     if wraps.is_empty() {
         bail!("no wrap for {} on this secret", fmt_id(identity));
@@ -446,7 +511,30 @@ pub fn prepare_identity(
     let public_key = keypair.public_key.to_vec();
     let lockbox = lock_secret_key(password, &keypair.secret_key);
     let id = genid().id;
-    let fragment = identity_fragment(id, nickname, public_key.clone(), lockbox, created_at)?;
+    let fragment =
+        identity_fragment(id, nickname, public_key.clone(), Some(lockbox), created_at)?;
+    Ok(PreparedIdentity {
+        fragment,
+        id,
+        public_key,
+    })
+}
+
+/// Name one node's Ed25519 signing key as an identity.
+///
+/// The record carries only public material, so this needs neither the node's
+/// private key nor its participation: a public key read out of a commit the
+/// node already signed is enough. That is what removes the key-distribution
+/// ceremony -- and it grants nothing. The named identity is a principal an
+/// admin may now grant into a scope, no more.
+pub fn prepare_node_identity(
+    nickname: &str,
+    sign_pk: &[u8],
+    created_at: IntervalValue,
+) -> Result<PreparedIdentity> {
+    let public_key = sign_pk.to_vec();
+    let id = genid().id;
+    let fragment = identity_fragment(id, nickname, public_key.clone(), None, created_at)?;
     Ok(PreparedIdentity {
         fragment,
         id,
@@ -499,9 +587,9 @@ pub fn open_version(
     catalog: &SecretsCatalog,
     secret: Id,
     identity: Id,
-    password: &[u8],
+    identity_secret: &IdentitySecret,
 ) -> Result<Vec<u8>> {
-    let dek = recover_dek(reader, catalog, secret, identity, password)?;
+    let dek = recover_dek(reader, catalog, secret, identity, identity_secret)?;
     decrypt_secret_body(reader, catalog, secret, &dek)
 }
 
@@ -513,7 +601,7 @@ pub fn share_version(
     catalog: &SecretsCatalog,
     secret: Id,
     acting_identity: Id,
-    password: &[u8],
+    identity_secret: &IdentitySecret,
     created_at: IntervalValue,
 ) -> Result<SharedVersion> {
     let scope = catalog
@@ -521,7 +609,7 @@ pub fn share_version(
         .get(&secret)
         .ok_or_else(|| anyhow!("secret {} not found", fmt_id(secret)))?
         .scope;
-    let dek = recover_dek(reader, catalog, secret, acting_identity, password)?;
+    let dek = recover_dek(reader, catalog, secret, acting_identity, identity_secret)?;
     let existing: BTreeSet<Id> = catalog.wrap_holders(secret).into_iter().collect();
     let missing: Vec<_> = recipient_public_keys(reader, catalog, scope)?
         .into_iter()
@@ -588,6 +676,17 @@ fn exactly_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<T> {
     Ok(values.pop().expect("length checked above"))
 }
 
+fn at_most_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<Option<T>> {
+    if values.len() > 1 {
+        bail!(
+            "Secrets entity {} has {} values for {field}; expected at most one",
+            fmt_id(entity),
+            values.len()
+        );
+    }
+    Ok(values.pop())
+}
+
 fn point_interval(entity: Id, field: &str, value: IntervalValue) -> Result<()> {
     let (lower, upper): (i128, i128) = value
         .try_from_inline()
@@ -643,15 +742,18 @@ fn identity_record(
     created_at: IntervalValue,
     name: TextHandle,
     sign_pk: BytesHandle,
-    lockbox: BytesHandle,
+    lockbox: Option<BytesHandle>,
 ) -> Fragment {
-    entity! { ExclusiveId::force_ref(&id) @
+    let mut fragment = entity! { ExclusiveId::force_ref(&id) @
         metadata::tag: &KIND_IDENTITY,
         metadata::created_at: created_at,
         metadata::name: name,
         identity_sign_pk: sign_pk,
-        identity_lockbox: lockbox,
+    };
+    if let Some(lockbox) = lockbox {
+        fragment += entity! { ExclusiveId::force_ref(&id) @ identity_lockbox: lockbox };
     }
+    fragment
 }
 
 fn scope_identity(creator: Id, name: TextHandle) -> Fragment {
@@ -763,7 +865,7 @@ fn identity_fragment(
     id: Id,
     nickname: &str,
     sign_pk: Vec<u8>,
-    lockbox: Vec<u8>,
+    lockbox: Option<Vec<u8>>,
     created_at: IntervalValue,
 ) -> Result<Fragment> {
     validate_name("identity nickname", nickname)?;
@@ -771,13 +873,13 @@ fn identity_fragment(
     if sign_pk.len() != ED25519_PUBLIC_KEY_BYTES {
         bail!("Ed25519 public key must be {ED25519_PUBLIC_KEY_BYTES} bytes");
     }
-    if lockbox.len() != LOCKBOX_BYTES {
+    if lockbox.as_ref().is_some_and(|bytes| bytes.len() != LOCKBOX_BYTES) {
         bail!("identity lockbox must be {LOCKBOX_BYTES} bytes");
     }
     let mut fragment = Fragment::empty();
     let name = fragment.put(nickname.to_owned());
     let sign_pk = fragment.put::<blobencodings::RawBytes, _>(sign_pk);
-    let lockbox = fragment.put::<blobencodings::RawBytes, _>(lockbox);
+    let lockbox = lockbox.map(|bytes| fragment.put::<blobencodings::RawBytes, _>(bytes));
     fragment += identity_record(id, created_at, name, sign_pk, lockbox);
     Ok(fragment)
 }
@@ -921,7 +1023,7 @@ fn load_identity(space: &TribleSet, id: Id) -> Result<IdentityRow> {
             find!(value: BytesHandle, pattern!(space, [{ id @ identity_sign_pk: ?value }]))
                 .collect(),
         )?,
-        lockbox: exactly_one(
+        lockbox: at_most_one(
             id,
             "identity_lockbox",
             find!(value: BytesHandle, pattern!(space, [{ id @ identity_lockbox: ?value }]))
@@ -1300,6 +1402,7 @@ fn validate_payloads<Overlay>(
 where
     Overlay: BlobStoreGet + BlobStoreMeta,
 {
+    let mut keys: BTreeMap<Vec<u8>, Id> = BTreeMap::new();
     for identity in catalog.identities.values() {
         let name = read_text_overlay(reader, overlay, identity.name)
             .with_context(|| format!("read identity {} nickname", fmt_id(identity.id)))?;
@@ -1312,10 +1415,22 @@ where
                 fmt_id(identity.id)
             );
         }
-        let lockbox = read_bytes_overlay(reader, overlay, identity.lockbox)
-            .with_context(|| format!("read identity {} lockbox", fmt_id(identity.id)))?;
-        if lockbox.len() != LOCKBOX_BYTES {
-            bail!("identity {} has a malformed lockbox", fmt_id(identity.id));
+        // One key, one identity. Without this a node key could be named twice
+        // and `identity_by_public_key` would have to choose, which is exactly
+        // the arbitration this collection refuses everywhere else.
+        if let Some(previous) = keys.insert(pk, identity.id) {
+            bail!(
+                "identities {} and {} claim the same Ed25519 public key",
+                fmt_id(previous),
+                fmt_id(identity.id)
+            );
+        }
+        if let Some(handle) = identity.lockbox {
+            let lockbox = read_bytes_overlay(reader, overlay, handle)
+                .with_context(|| format!("read identity {} lockbox", fmt_id(identity.id)))?;
+            if lockbox.len() != LOCKBOX_BYTES {
+                bail!("identity {} has a malformed lockbox", fmt_id(identity.id));
+            }
         }
     }
     for scope in catalog.scopes.values() {
@@ -1514,6 +1629,39 @@ pub fn resolve_principal(reader: &PileReader, catalog: &SecretsCatalog, input: &
     resolve_rows(reader, rows, input, "identity or scope")
 }
 
+/// The Ed25519 public key one identity is bound to.
+pub fn identity_public_key(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    identity: Id,
+) -> Result<Vec<u8>> {
+    let row = catalog
+        .identities
+        .get(&identity)
+        .ok_or_else(|| anyhow!("identity {} not found", fmt_id(identity)))?;
+    read_bytes(reader, row.sign_pk)
+}
+
+/// The identity, if any, already bound to one Ed25519 public key.
+///
+/// This is the join between a node observed in the pile's commits and a named
+/// Secrets principal. It reports naming, never authority: an identity found
+/// here still holds exactly the grants it was given.
+pub fn identity_by_public_key(
+    reader: &PileReader,
+    catalog: &SecretsCatalog,
+    public_key: &[u8],
+) -> Result<Option<Id>> {
+    for row in catalog.identities.values() {
+        if read_bytes(reader, row.sign_pk)? == public_key {
+            // `validate_payloads` rejects two identities on one key, so the
+            // first match on a validated catalog is the only match.
+            return Ok(Some(row.id));
+        }
+    }
+    Ok(None)
+}
+
 pub fn entity_name(reader: &PileReader, catalog: &SecretsCatalog, id: Id) -> Result<String> {
     if let Some(row) = catalog.identities.get(&id) {
         return read_text(reader, row.name);
@@ -1531,7 +1679,6 @@ mod tests {
     use std::path::Path;
 
     use crate::schema::DEFAULT_SCOPE_ID;
-    use ed25519_dalek::SigningKey;
     use triblespace::core::collection::{discover_collection_records, Collection};
     use triblespace::core::repo::pile::{Pile, PileReader};
     use triblespace::core::repo::BlobStore;
@@ -1570,7 +1717,7 @@ mod tests {
             alice,
             "alice",
             vec![1; ED25519_PUBLIC_KEY_BYTES],
-            vec![2; LOCKBOX_BYTES],
+            Some(vec![2; LOCKBOX_BYTES]),
             at(1),
         )
         .unwrap();
@@ -1578,7 +1725,7 @@ mod tests {
             bob,
             "bob",
             vec![3; ED25519_PUBLIC_KEY_BYTES],
-            vec![4; LOCKBOX_BYTES],
+            Some(vec![4; LOCKBOX_BYTES]),
             at(2),
         )
         .unwrap();
@@ -1594,10 +1741,10 @@ mod tests {
         let pile = directory.path().join("secrets.pile");
         let mut collection = test_collection(&pile);
 
-        let alice_password = b"alice correct horse";
-        let bob_password = b"bob battery staple";
-        let alice = prepare_identity("alice", alice_password, at(1)).unwrap();
-        let bob = prepare_identity("bob", bob_password, at(2)).unwrap();
+        let alice_password = IdentitySecret::Password(b"alice correct horse".to_vec());
+        let bob_password = IdentitySecret::Password(b"bob battery staple".to_vec());
+        let alice = prepare_identity("alice", b"alice correct horse", at(1)).unwrap();
+        let bob = prepare_identity("bob", b"bob battery staple", at(2)).unwrap();
         let alice_id = alice.id;
         let bob_id = bob.id;
         let mut foundation = alice.fragment;
@@ -1630,7 +1777,7 @@ mod tests {
                 &sealed_catalog,
                 secret,
                 alice_id,
-                alice_password,
+                &alice_password,
             )
             .unwrap(),
             b"hunter2"
@@ -1640,7 +1787,7 @@ mod tests {
             &sealed_catalog,
             secret,
             alice_id,
-            b"wrong password",
+            &IdentitySecret::Password(b"wrong password".to_vec()),
         )
         .is_err());
 
@@ -1653,7 +1800,7 @@ mod tests {
             &granted_catalog,
             secret,
             alice_id,
-            alice_password,
+            &alice_password,
             at(6),
         )
         .unwrap();
@@ -1668,7 +1815,7 @@ mod tests {
                 &shared_catalog,
                 secret,
                 bob_id,
-                bob_password,
+                &bob_password,
             )
             .unwrap(),
             b"hunter2"
@@ -1694,10 +1841,193 @@ mod tests {
             &conflicting_catalog,
             secret,
             bob_id,
-            bob_password,
+            &bob_password,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("competing DEKs"));
+        collection.into_storage().close().unwrap();
+    }
+
+    /// The whole point of one key per node: the identity that signs a pile's
+    /// commits is the identity a secret is sealed to, and its private half
+    /// never leaves the signing-key file.
+    #[test]
+    fn a_node_identity_opens_a_version_with_its_own_signing_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("secrets.pile");
+        let mut collection = test_collection(&pile);
+
+        let alice_secret = IdentitySecret::Password(b"alice correct horse".to_vec());
+        let alice = prepare_identity("alice", b"alice correct horse", at(1)).unwrap();
+        let alice_id = alice.id;
+        let node_key = SigningKey::generate(&mut OsRng);
+        let node = prepare_node_identity(
+            "node",
+            node_key.verifying_key().as_bytes(),
+            at(2),
+        )
+        .unwrap();
+        let node_id = node.id;
+        let mut foundation = alice.fragment;
+        foundation += node.fragment;
+        let scope_fragment = scope_fragment(alice_id, "prod", at(3)).unwrap();
+        let scope = scope_fragment.root().unwrap();
+        foundation += scope_fragment;
+        collection.commit(foundation).unwrap();
+
+        let base = test_view(&mut collection);
+        let base_catalog = validate_catalog(&base.reader, &base.facts).unwrap();
+        assert!(base_catalog.identities[&node_id].is_node_identity());
+        assert!(!base_catalog.identities[&alice_id].is_node_identity());
+        assert_eq!(
+            identity_by_public_key(&base.reader, &base_catalog, node_key.verifying_key().as_bytes())
+                .unwrap(),
+            Some(node_id)
+        );
+
+        // Naming the node did not entitle it: the scope's recipients are still
+        // its creator alone, so the new version is sealed only to alice.
+        assert_eq!(base_catalog.recipients_of(scope), vec![alice_id]);
+        let sealed = seal_version(
+            &base.reader,
+            &base_catalog,
+            scope,
+            "database",
+            b"hunter2",
+            at(4),
+        )
+        .unwrap();
+        let secret = sealed.secret;
+        assert_eq!(sealed.recipient_count, 1);
+        collection.commit(sealed.fragment).unwrap();
+
+        let sealed_view = test_view(&mut collection);
+        let sealed_catalog = validate_catalog(&sealed_view.reader, &sealed_view.facts).unwrap();
+        let refused = open_version(
+            &sealed_view.reader,
+            &sealed_catalog,
+            secret,
+            node_id,
+            &IdentitySecret::Node(node_key.clone()),
+        )
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains("no wrap"), "{refused:#}");
+
+        // Entitlement is the admin's separate act.
+        let grant = grant_fragment(id(90), scope, "member", node_id, alice_id, at(5)).unwrap();
+        collection.commit(grant).unwrap();
+        let granted_view = test_view(&mut collection);
+        let granted_catalog = validate_catalog(&granted_view.reader, &granted_view.facts).unwrap();
+        let shared = share_version(
+            &granted_view.reader,
+            &granted_catalog,
+            secret,
+            alice_id,
+            &alice_secret,
+            at(6),
+        )
+        .unwrap();
+        assert_eq!(shared.new_recipient_count, 1);
+        collection.commit(shared.fragment).unwrap();
+
+        let shared_view = test_view(&mut collection);
+        let shared_catalog = validate_catalog(&shared_view.reader, &shared_view.facts).unwrap();
+        assert_eq!(
+            open_version(
+                &shared_view.reader,
+                &shared_catalog,
+                secret,
+                node_id,
+                &IdentitySecret::Node(node_key),
+            )
+            .unwrap(),
+            b"hunter2"
+        );
+
+        // Another node's key is not this identity, and says so before it
+        // unseals anything.
+        let stranger = open_version(
+            &shared_view.reader,
+            &shared_catalog,
+            secret,
+            node_id,
+            &IdentitySecret::Node(SigningKey::generate(&mut OsRng)),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{stranger:#}").contains("is not the key of identity"),
+            "{stranger:#}"
+        );
+
+        // A node identity has no lockbox, so a password is not a way in.
+        let by_password = open_version(
+            &shared_view.reader,
+            &shared_catalog,
+            secret,
+            node_id,
+            &IdentitySecret::Password(b"guess".to_vec()),
+        )
+        .unwrap_err();
+        assert!(format!("{by_password:#}").contains("keeps no lockbox"), "{by_password:#}");
+        collection.into_storage().close().unwrap();
+    }
+
+    /// Removing a node is still expressible, and still lands on the rotation
+    /// worklist rather than pretending the old wrap was forgotten.
+    #[test]
+    fn revoking_a_node_leaves_its_wrap_on_the_rotation_worklist() {
+        let (mut fragment, alice, _bob, scope) = fixture();
+        let node_key = SigningKey::generate(&mut OsRng);
+        let node = prepare_node_identity("node", node_key.verifying_key().as_bytes(), at(4))
+            .unwrap();
+        let node_id = node.id;
+        fragment += node.fragment;
+        let grant = id(10);
+        fragment += grant_fragment(grant, scope, "member", node_id, alice, at(5)).unwrap();
+
+        let mut version = Fragment::empty();
+        let name = version.put("db".to_owned());
+        let body = version.put::<blobencodings::RawBytes, _>(vec![0; SECRET_BODY_MIN_BYTES]);
+        let secret = id(20);
+        version += secret_record(secret, at(6), scope, "db", name, body);
+        for (wrap, recipient) in [(id(30), alice), (id(31), node_id)] {
+            let sealed = version.put::<blobencodings::RawBytes, _>(vec![0; SEALED_DEK_BYTES]);
+            version += wrap_record(wrap, at(6), secret, recipient, sealed);
+        }
+        fragment += version;
+
+        let before = load_catalog(fragment.facts()).unwrap();
+        assert_eq!(before.recipients_of(scope), vec![alice, node_id]);
+        assert_eq!(before.wrap_holders(secret), vec![alice, node_id]);
+
+        fragment += retraction_fragment([grant], at(7)).unwrap();
+        let after = load_catalog(fragment.facts()).unwrap();
+        assert_eq!(after.recipients_of(scope), vec![alice]);
+        // Still holding a wrap it is no longer entitled to: exactly the
+        // condition `secret rotate` reports.
+        assert_eq!(after.wrap_holders(secret), vec![alice, node_id]);
+    }
+
+    #[test]
+    fn two_identities_cannot_claim_one_node_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("secrets.pile");
+        let mut collection = test_collection(&pile);
+        let node_key = SigningKey::generate(&mut OsRng);
+        let public = node_key.verifying_key();
+        let mut fragment =
+            prepare_node_identity("node", public.as_bytes(), at(1)).unwrap().fragment;
+        fragment += prepare_node_identity("node-again", public.as_bytes(), at(2))
+            .unwrap()
+            .fragment;
+        collection.commit(fragment).unwrap();
+
+        let view = test_view(&mut collection);
+        let error = validate_catalog(&view.reader, &view.facts).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("claim the same Ed25519 public key"),
+            "{error:#}"
+        );
         collection.into_storage().close().unwrap();
     }
 
@@ -1755,7 +2085,7 @@ mod tests {
             carol,
             "carol",
             vec![5; ED25519_PUBLIC_KEY_BYTES],
-            vec![6; LOCKBOX_BYTES],
+            Some(vec![6; LOCKBOX_BYTES]),
             at(3),
         )
         .unwrap();
@@ -1763,7 +2093,7 @@ mod tests {
             dave,
             "dave",
             vec![7; ED25519_PUBLIC_KEY_BYTES],
-            vec![8; LOCKBOX_BYTES],
+            Some(vec![8; LOCKBOX_BYTES]),
             at(4),
         )
         .unwrap();
@@ -1785,7 +2115,7 @@ mod tests {
             mallory,
             "mallory",
             vec![5; ED25519_PUBLIC_KEY_BYTES],
-            vec![6; LOCKBOX_BYTES],
+            Some(vec![6; LOCKBOX_BYTES]),
             at(3),
         )
         .unwrap();

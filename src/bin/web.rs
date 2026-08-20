@@ -323,22 +323,28 @@ impl WebStorage<'_> {
                 .secrets_identity
                 .map(str::to_owned)
                 .or_else(|| std::env::var("PERSONA").ok())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "set --secrets-identity/SECRETS_IDENTITY (or PERSONA) to decrypt Web credentials"
-                    )
-                })?;
-            let identity =
-                secrets_model::resolve_identity(&secrets.reader, &secrets_catalog, &selector)
-                    .with_context(|| format!("resolve Secrets identity {selector:?}"))?;
-            let password =
-                faculties::secrets::password::read("unlock the selected Secrets identity")?;
+                .filter(|value| !value.is_empty());
+            let identity = faculties::secrets_node::acting_identity(
+                &secrets.reader,
+                &secrets_catalog,
+                &signer,
+                selector.as_deref(),
+            )
+            .context(
+                "set --secrets-identity/SECRETS_IDENTITY (or PERSONA) to decrypt Web credentials",
+            )?;
+            let identity_secret = faculties::secrets_node::identity_secret(
+                &secrets_catalog,
+                identity,
+                &signer,
+                "unlock the selected Secrets identity",
+            )?;
             let opened = headspace::open_active_secrets(
                 &catalog,
                 &secrets.reader,
                 &secrets_catalog,
                 identity,
-                &password,
+                &identity_secret,
             )?;
             Ok(ApiKeys {
                 tavily: opened.tavily_api_key,

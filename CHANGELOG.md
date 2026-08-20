@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **A node has one key, not two.** Every pile writer already has a durable
+  Ed25519 key beside its pile: it signs the collection commits and is the
+  node's identity. Secrets, separately, minted a *second* Ed25519 key per
+  identity and locked its private half behind a password. There was never a
+  cryptographic reason for two — sealing already converts an identity's
+  Ed25519 key to X25519, so one keypair does both jobs, and the only
+  difference was where the private half rested. But rights management is
+  expressed over node identity, so two identities per node needed a binding,
+  and that binding is exactly what never got built: the Secrets store sat
+  empty for months and the Teams integration was dead for want of it. An
+  identity's lockbox is now optional. Without one it is a *node identity*,
+  opened by the signing key beside the pile — no password, no second key to
+  keep. A record that carries a lockbox is opened by its password exactly as
+  before; the record decides, so neither kind can be handed the other's
+  material. `secrets node list` reads the roster the pile already attests
+  (every commit carries the key that signed it, and only verified commits are
+  discovered), and `secrets node adopt` names one — from public material
+  alone, so naming a node that has written here needs neither its
+  participation nor any key distribution. `--as` is now optional on `scope
+  create`, `grant`, `secret get`, and `secret share`, defaulting to this
+  node's own identity; `teams`, `mail`, `web`, and `headspace` fall through to
+  it when no selector and no `PERSONA` is set. **Naming is not entitlement.**
+  A named node is a principal an admin *may* grant to: `grant` still decides a
+  scope's recipients, `secret add` still seals only to those recipients,
+  `secret get` still needs a wrap addressed to the reader, and `revoke` plus
+  the `secret rotate` worklist mean exactly what they meant. `migrations
+  node-identity --nickname <name>` binds one pile's key. It is additive and
+  narrow — one identity record of public material, existing password-locked
+  identities untouched — and it deliberately stops there, reporting the
+  `secrets grant` and `secrets secret share` commands that finish the job
+  under an admin's authority rather than forging a grant from an admin it does
+  not act as.
+
 - **The Teams credentials the cutover retired are recoverable.** The collection
   cutover treats the legacy Teams OAuth rows as a bounded retired partition:
   verified as source evidence, never republished, because native authority

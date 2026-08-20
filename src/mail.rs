@@ -1690,7 +1690,7 @@ pub fn open_account(
     secrets_catalog: &SecretsCatalog,
     anchor: Id,
     identity: Id,
-    identity_password: &[u8],
+    identity_secret: &secrets::IdentitySecret,
 ) -> Result<OpenAccount> {
     let config_id = match account_head(mail_facts, anchor)? {
         Head::Unique(id) => id,
@@ -1705,7 +1705,7 @@ pub fn open_account(
         secrets_catalog,
         config.credential,
         identity,
-        identity_password,
+        identity_secret,
     )?;
     Ok(OpenAccount {
         anchor,
@@ -3746,7 +3746,7 @@ mod tests {
             &views.secrets_catalog,
             account,
             fixture.secret_identity,
-            b"identity password",
+            &secrets::IdentitySecret::Password(b"identity password".to_vec()),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("not UTF-8"));
@@ -3994,7 +3994,7 @@ mod tests {
             &views.secrets_catalog,
             account_id,
             fixture.secret_identity,
-            b"identity password",
+            &secrets::IdentitySecret::Password(b"identity password".to_vec()),
         )
         .unwrap();
         assert_eq!(account.password, "smtp-secret");
@@ -4241,7 +4241,7 @@ mod tests {
             &views.secrets_catalog,
             account_id,
             fixture.secret_identity,
-            b"identity password",
+            &secrets::IdentitySecret::Password(b"identity password".to_vec()),
         )
         .unwrap();
         let materialized = materialize_draft(

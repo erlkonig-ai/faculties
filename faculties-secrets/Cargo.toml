@@ -15,10 +15,12 @@ path = "src/lib.rs"
 anyhow = "1.0"
 anybytes = "0.20"
 dryoc = "0.8"           # secrets (libsodium-compatible pure-Rust crypto)
+# A node's durable pile signing key is also a Secrets identity, so the core
+# needs the same Ed25519 type the signing-key file yields.
+ed25519-dalek = "2.1.1"
 rand_core = "0.6.4"     # OsRng for key generation
 triblespace = { version = "0.47", path = "../../triblespace-rs" }
 
 [dev-dependencies]
-ed25519-dalek = "2.1.1"
 hifitime = "4.2.3"
 tempfile = "3"
