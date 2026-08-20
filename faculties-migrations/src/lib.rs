@@ -35,6 +35,7 @@ pub mod comb_cutover;
 pub mod compass_cutover;
 pub mod decide_cutover;
 pub mod discord_cutover;
+pub mod descriptor_epoch;
 pub mod disposable_cutover;
 pub mod files_cutover;
 pub mod habit_cutover;

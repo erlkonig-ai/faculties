@@ -28,7 +28,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
-    activation_cutover, collection_cutover, disposable_cutover, posture_findings, status_register,
+    activation_cutover, collection_cutover, descriptor_epoch, disposable_cutover, posture_findings,
+    status_register,
 };
 
 #[derive(Parser)]
@@ -78,6 +79,17 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Re-seat every collection on its self-describing descriptor. A
+    /// descriptor now embeds its representation's and its recipe's own
+    /// descriptions, which changed its bytes and so its handle: current code
+    /// computes a handle no existing collection is under. Additive -- the old
+    /// collections stay readable where they are. Run it on a clone first.
+    DescriptorEpoch {
+        /// Report what would be re-seated, without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Give Compass's status register the identity it never had:
     /// `board::status_of` on every complete status event written before that
     /// attribute existed. Additive; nothing is deleted or rewritten.
@@ -89,6 +101,37 @@ enum Command {
 
     /// List the faculty names `migrate-legacy` accepts.
     Faculties,
+}
+
+fn descriptor_epoch(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
+    let report = if dry_run {
+        descriptor_epoch::plan(pile, key)?
+    } else {
+        descriptor_epoch::publish(pile, key)?
+    };
+    println!("Collection descriptor epoch");
+    println!("  already self-describing : {}", report.already_current);
+    println!("  collections to re-seat  : {}", report.reseats.len());
+    println!("  signed states to re-sign: {}", report.commits());
+    for reseat in &report.reseats {
+        println!(
+            "    {:.16}… -> {:.16}…  scope={:X}  commits={}",
+            hex::encode(reseat.old.raw),
+            hex::encode(reseat.new.raw),
+            reseat.scope,
+            reseat.commits
+        );
+    }
+    if !report.undescribable.is_empty() {
+        println!("  left alone ({}):", report.undescribable.len());
+        for (handle, reason) in &report.undescribable {
+            println!("    {:.16}… {reason}", hex::encode(handle.raw));
+        }
+    }
+    if dry_run {
+        println!("  (dry run: nothing written)");
+    }
+    Ok(())
 }
 
 fn status_register(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
@@ -252,6 +295,9 @@ fn main() -> Result<()> {
         }
         Some(Command::PostureFindings { dry_run }) => {
             posture_findings(&cli.pile, cli.key.as_deref(), dry_run)
+        }
+        Some(Command::DescriptorEpoch { dry_run }) => {
+            descriptor_epoch(&cli.pile, cli.key.as_deref(), dry_run)
         }
         Some(Command::StatusRegister { dry_run }) => {
             status_register(&cli.pile, cli.key.as_deref(), dry_run)
