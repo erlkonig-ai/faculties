@@ -33,7 +33,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
-    activation_cutover, collection_cutover, descriptor_epoch, disposable_cutover,
+    activation_cutover, collection_cutover, collection_naming, disposable_cutover,
     mail_credentials, node_identity, posture_findings, status_register, teams_credentials,
 };
 
@@ -84,13 +84,16 @@ enum Command {
         dry_run: bool,
     },
 
-    /// Re-seat every collection on its self-describing descriptor. A
-    /// descriptor now embeds its representation's and its recipe's own
-    /// descriptions, which changed its bytes and so its handle: current code
-    /// computes a handle no existing collection is under. Additive -- the old
-    /// collections stay readable where they are. Run it on a clone first.
-    DescriptorEpoch {
-        /// Report what would be re-seated, without writing.
+    /// Re-seat every scoped root collection onto a name within a team.
+    ///
+    /// A root used to be anchored by an opaque minted scope id, so the pile
+    /// could not say which collection was which; it is now a name plus the
+    /// team's root key. That moves the descriptor's handle, so current code
+    /// looks for a collection nobody wrote and finds an empty one where the
+    /// data is. Additive: the scoped collections stay exactly where they are
+    /// and this appends the named ones beside them.
+    CollectionNaming {
+        /// Report what would move, without writing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -399,38 +402,6 @@ fn node_identity(pile: &Path, key: Option<&Path>, nickname: &str, dry_run: bool)
     Ok(())
 }
 
-fn descriptor_epoch(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
-    let report = if dry_run {
-        descriptor_epoch::plan(pile, key)?
-    } else {
-        descriptor_epoch::publish(pile, key)?
-    };
-    println!("Collection descriptor epoch");
-    println!("  already self-describing : {}", report.already_current);
-    println!("  already re-seated       : {}", report.settled.len());
-    println!("  collections to re-seat  : {}", report.reseats.len());
-    println!("  signed states to re-sign: {}", report.commits());
-    for reseat in &report.reseats {
-        println!(
-            "    {:.16}… -> {:.16}…  scope={:X}  commits={}",
-            hex::encode(reseat.old.raw),
-            hex::encode(reseat.new.raw),
-            reseat.scope,
-            reseat.commits
-        );
-    }
-    if !report.undescribable.is_empty() {
-        println!("  left alone ({}):", report.undescribable.len());
-        for (handle, reason) in &report.undescribable {
-            println!("    {:.16}… {reason}", hex::encode(handle.raw));
-        }
-    }
-    if dry_run {
-        println!("  (dry run: nothing written)");
-    }
-    Ok(())
-}
-
 fn status_register(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
     let (delta, report) = status_register::plan(pile, key)?;
     println!("Compass status-register identities");
@@ -450,6 +421,73 @@ fn status_register(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()>
     }
     status_register::publish(pile, key, &delta)?;
     println!("\nwrote {} identities", report.facts);
+    Ok(())
+}
+
+fn collection_naming(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
+    let report = if dry_run {
+        collection_naming::plan(pile, key).context("plan the collection naming")?
+    } else {
+        collection_naming::publish(pile, key).context("publish the collection naming")?
+    };
+
+    println!("Collection naming: scope anchors become names within a team");
+    println!("pile              : {}", pile.display());
+    println!("already named     : {}", report.already_named);
+    println!("settled           : {}", report.settled.len());
+    println!(
+        "{:<18}: {} collection(s), {} state(s)",
+        if dry_run { "would move" } else { "moved" },
+        report.renames.len(),
+        report.commits()
+    );
+
+    if !report.renames.is_empty() {
+        // Grouped by destination, because several old collections can share
+        // one. The descriptor epoch left both an opaque and a self-describing
+        // descriptor for the same scope, each with its own handle; both carry
+        // the same meaning and so take the same name, and re-seating them
+        // merges them. Printed ungrouped that looks like a collection appearing
+        // twice by mistake, when it is in fact the duplication being healed.
+        let mut by_name: std::collections::BTreeMap<&str, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for rename in &report.renames {
+            let entry = by_name.entry(rename.name).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += rename.commits;
+        }
+        println!();
+        for (name, (sources, states)) in &by_name {
+            if *sources == 1 {
+                println!("  {name:<16} {states:>6} state(s)");
+            } else {
+                println!("  {name:<16} {states:>6} state(s)   from {sources} descriptors, merged");
+            }
+        }
+        println!(
+            "\n  {} source collection(s) -> {} named collection(s)",
+            report.renames.len(),
+            by_name.len()
+        );
+        println!("  State counts are per source; shared states are written once.");
+    }
+
+    if !report.unnamed.is_empty() {
+        // Named, not counted away. An unnamed collection is one this build
+        // does not recognise, and it stays unreachable through the new anchor
+        // until someone decides what it is -- which is the right outcome, but
+        // only if they are told.
+        println!("\nNOT named — these stay reachable only under their old anchor:");
+        for (handle, reason) in &report.unnamed {
+            println!("  {}  {reason}", hex::encode(&handle.raw[..8]));
+        }
+    }
+
+    if dry_run {
+        println!("\nDry run: nothing was written. Re-run without --dry-run to append.");
+        println!("The scoped collections are not removed either way — a pile is");
+        println!("append-only, and the reframe is what drops them.");
+    }
     Ok(())
 }
 
@@ -593,8 +631,8 @@ fn main() -> Result<()> {
         Some(Command::PostureFindings { dry_run }) => {
             posture_findings(&cli.pile, cli.key.as_deref(), dry_run)
         }
-        Some(Command::DescriptorEpoch { dry_run }) => {
-            descriptor_epoch(&cli.pile, cli.key.as_deref(), dry_run)
+        Some(Command::CollectionNaming { dry_run }) => {
+            collection_naming(&cli.pile, cli.key.as_deref(), dry_run)
         }
         Some(Command::NodeIdentity { nickname, dry_run }) => {
             node_identity(&cli.pile, cli.key.as_deref(), &nickname, dry_run)
