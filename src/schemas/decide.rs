@@ -42,6 +42,39 @@ pub const KIND_PRO: Id = id_hex!("01C453F122A83E6255618DFE26984E53");
 /// This retains the already-published meaning of `KIND_CON`.
 pub const KIND_CON: Id = id_hex!("BBD13287E7151B254B49D49A6F11DAFD");
 
+/// Machine-readable result: what this decision concerns is acceptable as it
+/// stands, and any gate keyed to it may stop blocking.
+///
+/// A resolution carries a result tag *in addition to* its prose outcome. The
+/// prose is for a reader and must stay free to say "it is a BPE vocabulary,
+/// there is no signal in it"; the tag is what a program is allowed to read.
+/// Before this existed, the only machine-readable channel was the prose
+/// itself, compared byte-for-byte against a magic string, so `"Benign"`,
+/// `"benign."` and any sentence of actual reasoning silently failed to count
+/// — the one field meant for explanation could not hold an explanation.
+///
+/// Minted with `trible genid` on 2026-08-20.
+pub const RESULT_BENIGN: Id = id_hex!("0D9E3D34CC9107372C0AE255C599E424");
+
+/// Every result tag this build understands, with the name its CLI accepts.
+pub const RESULT_TAGS: &[(&str, Id)] = &[("benign", RESULT_BENIGN)];
+
+/// The result tag a name selects, if any.
+pub fn result_tag(name: &str) -> Option<Id> {
+    RESULT_TAGS
+        .iter()
+        .find(|(label, _)| *label == name)
+        .map(|(_, id)| *id)
+}
+
+/// The name of a result tag, for display.
+pub fn result_name(id: Id) -> Option<&'static str> {
+    RESULT_TAGS
+        .iter()
+        .find(|(_, tag)| *tag == id)
+        .map(|(label, _)| *label)
+}
+
 pub mod decide {
     use super::*;
 
@@ -90,5 +123,11 @@ pub mod resolution {
         /// Exact factor occurrence cited as evidence by this snapshot.
         /// Minted with `trible genid` on 2026-08-08.
         "0D3399D0E9024D344858BE1D59133EA6" unsafe as evidence: inlineencodings::GenId;
+
+        /// Optional machine-readable result of this resolution, alongside the
+        /// free-form outcome prose. Absent means "no program may act on this",
+        /// which is the honest default for a decision written for a human.
+        /// Minted with `trible genid` on 2026-08-20.
+        "D0253DE1AFC5F651DEB38B09D2935B18" as result: inlineencodings::GenId;
     }
 }

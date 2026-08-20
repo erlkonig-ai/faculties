@@ -20,6 +20,7 @@ use crate::schemas::decide::{
     decide, factor, resolution, KIND_CON, KIND_DECISION, KIND_DECISION_GENESIS, KIND_PRO,
     KIND_RESOLUTION_SNAPSHOT,
 };
+pub use crate::schemas::decide::{result_name, result_tag, RESULT_BENIGN, RESULT_TAGS};
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -71,6 +72,9 @@ pub struct ResolutionSnapshot {
     pub id: Id,
     pub decision: Id,
     pub outcome: TextHandle,
+    /// Machine-readable result, when the resolver stated one. The outcome
+    /// prose is for a reader; this is the only field a gate may act on.
+    pub result: Option<Id>,
     pub forced: bool,
     pub evidence: Vec<Id>,
     pub predecessors: Vec<Id>,
@@ -174,6 +178,7 @@ fn resolution_record_fragment(snapshot: &ResolutionSnapshot) -> Fragment {
         metadata::tag: &KIND_RESOLUTION_SNAPSHOT,
         resolution::of: &snapshot.decision,
         decide::outcome: snapshot.outcome,
+        resolution::result?: snapshot.result.as_ref(),
         resolution::forced: snapshot.forced,
         resolution::evidence*: snapshot.evidence.iter(),
         metadata::supersedes*: snapshot.predecessors.iter(),
@@ -229,6 +234,7 @@ pub fn factor_fragment(
 pub fn resolution_fragment(
     decision_id: Id,
     outcome: impl Into<String>,
+    result: Option<Id>,
     forced: bool,
     evidence: &[Id],
     predecessors: &[Id],
@@ -241,6 +247,7 @@ pub fn resolution_fragment(
         id: decision_id,
         decision: decision_id,
         outcome: fragment.put(outcome),
+        result,
         forced,
         evidence: sorted_ids(evidence.iter().copied()),
         predecessors: sorted_ids(predecessors.iter().copied()),
@@ -407,6 +414,11 @@ pub fn resolution_snapshot(facts: &TribleSet, id: Id) -> Result<ResolutionSnapsh
             find!(value: TextHandle, pattern!(facts, [{ id @ decide::outcome: ?value }])).collect(),
             id,
             "decide::outcome",
+        )?,
+        result: at_most_one(
+            find!(value: Id, pattern!(facts, [{ id @ resolution::result: ?value }])).collect(),
+            id,
+            "resolution::result",
         )?,
         forced: exactly_one(
             find!(value: bool, pattern!(facts, [{ id @ resolution::forced: ?value }])).collect(),
@@ -580,10 +592,13 @@ fn resolution_result(facts: &TribleSet, decision_id: Id) -> Result<Resolution> {
                 .into_iter()
                 .map(|id| snapshots.remove(&id).unwrap())
                 .collect();
-            let first = (&heads[0].outcome, heads[0].forced);
+            // The result tag is part of what agreement means: two heads that
+            // read the same to a human but differ in what a gate may do with
+            // them are a fork, not an agreement.
+            let first = (&heads[0].outcome, &heads[0].result, heads[0].forced);
             if heads
                 .iter()
-                .all(|snapshot| (&snapshot.outcome, snapshot.forced) == first)
+                .all(|snapshot| (&snapshot.outcome, &snapshot.result, snapshot.forced) == first)
             {
                 Ok(Resolution::Agreed(heads))
             } else {
@@ -893,8 +908,8 @@ mod tests {
 
         let a = genid().id;
         let b = genid().id;
-        let first = resolution_fragment(decision, "yes", true, &[b, a, b], &[b, a], at(2)).unwrap();
-        let second = resolution_fragment(decision, " yes ", true, &[a, b], &[a, b], at(2)).unwrap();
+        let first = resolution_fragment(decision, "yes", None, true, &[b, a, b], &[b, a], at(2)).unwrap();
+        let second = resolution_fragment(decision, " yes ", None, true, &[a, b], &[a, b], at(2)).unwrap();
         assert_eq!(first.1, second.1);
     }
 
@@ -905,7 +920,7 @@ mod tests {
         let pro = add_factor(&fixture, decision, FactorSide::Pro, "benefit", 1);
         let con = add_factor(&fixture, decision, FactorSide::Con, "risk", 2);
         fixture.publish(
-            resolution_fragment(decision, "proceed", false, &[pro, con], &[], at(3))
+            resolution_fragment(decision, "proceed", None, false, &[pro, con], &[], at(3))
                 .unwrap()
                 .0,
         );
@@ -923,7 +938,7 @@ mod tests {
                 .0,
         );
         fixture.publish(
-            resolution_fragment(forced, "skip", true, &[], &[], at(5))
+            resolution_fragment(forced, "skip", None, true, &[], &[], at(5))
                 .unwrap()
                 .0,
         );
@@ -942,7 +957,7 @@ mod tests {
         let pro = add_factor(&fixture, decision, FactorSide::Pro, "benefit", 1);
         let con = add_factor(&fixture, decision, FactorSide::Con, "risk", 2);
         fixture.publish(
-            resolution_fragment(decision, "proceed", false, &[pro, con], &[], at(3))
+            resolution_fragment(decision, "proceed", None, false, &[pro, con], &[], at(3))
                 .unwrap()
                 .0,
         );
@@ -963,9 +978,9 @@ mod tests {
         let second_pro = add_factor(&fixture, decision, FactorSide::Pro, "other benefit", 2);
         let con = add_factor(&fixture, decision, FactorSide::Con, "risk", 2);
         let (first, first_id) =
-            resolution_fragment(decision, "proceed", false, &[first_pro, con], &[], at(3)).unwrap();
+            resolution_fragment(decision, "proceed", None, false, &[first_pro, con], &[], at(3)).unwrap();
         let (second, second_id) =
-            resolution_fragment(decision, "proceed", false, &[second_pro, con], &[], at(4))
+            resolution_fragment(decision, "proceed", None, false, &[second_pro, con], &[], at(4))
                 .unwrap();
         assert_ne!(first_id, second_id);
         fixture.publish(first);
@@ -979,6 +994,7 @@ mod tests {
             resolution_fragment(
                 decision,
                 "proceed",
+                None,
                 false,
                 &[first_pro, second_pro, con],
                 &heads,
@@ -1001,12 +1017,12 @@ mod tests {
         let pro = add_factor(&fixture, decision, FactorSide::Pro, "benefit", 1);
         let con = add_factor(&fixture, decision, FactorSide::Con, "risk", 2);
         fixture.publish(
-            resolution_fragment(decision, "proceed", false, &[pro, con], &[], at(3))
+            resolution_fragment(decision, "proceed", None, false, &[pro, con], &[], at(3))
                 .unwrap()
                 .0,
         );
         fixture.publish(
-            resolution_fragment(decision, "proceed", true, &[pro, con], &[], at(4))
+            resolution_fragment(decision, "proceed", None, true, &[pro, con], &[], at(4))
                 .unwrap()
                 .0,
         );
@@ -1036,7 +1052,7 @@ mod tests {
             factor_fragment(genid().id, second, FactorSide::Con, "risk", at(2)).unwrap();
         facts += pro_fragment;
         facts += con_fragment;
-        facts += resolution_fragment(first, "proceed", false, &[pro, con], &[], at(3))
+        facts += resolution_fragment(first, "proceed", None, false, &[pro, con], &[], at(3))
             .unwrap()
             .0;
 
@@ -1053,12 +1069,12 @@ mod tests {
         let pro = add_factor(&fixture, decision, FactorSide::Pro, "benefit", 1);
         let con = add_factor(&fixture, decision, FactorSide::Con, "risk", 2);
         fixture.publish(
-            resolution_fragment(decision, "yes", false, &[pro, con], &[], at(3))
+            resolution_fragment(decision, "yes", None, false, &[pro, con], &[], at(3))
                 .unwrap()
                 .0,
         );
         fixture.publish(
-            resolution_fragment(decision, "no", false, &[pro, con], &[], at(4))
+            resolution_fragment(decision, "no", None, false, &[pro, con], &[], at(4))
                 .unwrap()
                 .0,
         );
@@ -1067,7 +1083,7 @@ mod tests {
         let heads = fork.head_ids();
         assert!(matches!(fork, Resolution::Forked(ref values) if values.len() == 2));
         fixture.publish(
-            resolution_fragment(decision, "later", false, &[pro, con], &heads, at(5))
+            resolution_fragment(decision, "later", None, false, &[pro, con], &heads, at(5))
                 .unwrap()
                 .0,
         );

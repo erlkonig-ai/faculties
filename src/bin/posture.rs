@@ -164,6 +164,12 @@ enum Command {
         /// Audit every repo, not only those whose remote `gh` reports PUBLIC.
         #[arg(long)]
         all: bool,
+        /// Audit each repo's WHOLE reachable history, not only what is ahead
+        /// of its remote. A leak is a leak whether it landed today or a year
+        /// ago; the push gate can only block what is still preventable, so
+        /// this is where "existing or not" is actually checked.
+        #[arg(long)]
+        history: bool,
     },
     /// Manage the protected vocabulary, scoped to a channel
     Vocab {
@@ -181,8 +187,13 @@ enum Command {
     /// literal-pinned `unsafe as` attribute declarations, independently of
     /// channel vocabulary.
     Git {
-        /// Commit range, e.g. origin/main..HEAD
-        range: String,
+        /// Revision arguments, passed to `git log` as written. Usually a range
+        /// (`origin/main..HEAD`), but any git revision selection works — and
+        /// for a branch the remote has never seen there IS no two-dot range,
+        /// so `HEAD --not --remotes=origin` is the honest expression of "what
+        /// this push adds". Named options must come BEFORE these.
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        range: Vec<String>,
         /// Channel whose vocabulary to apply
         #[arg(long, default_value = "github-public")]
         channel: String,
@@ -3117,7 +3128,17 @@ fn select_scan(space: &TribleSet, requested: Option<&str>) -> Result<Option<Id>>
     Ok(newest.map(|(_, scan)| scan))
 }
 
-const BENIGN_DECISION_OUTCOME: &str = "benign";
+/// The prose a resolution had to spell EXACTLY, before a resolution could
+/// carry a machine-readable result.
+///
+/// It is still read, and deliberately so. A Decide resolution is an intrinsic,
+/// content-addressed, immutable event and an already-resolved decision cannot
+/// be resolved again, so no edit can re-stamp the historical clearances with
+/// `decide::RESULT_BENIGN` — migrating them would mean forging a second
+/// resolution head nobody authored. Dropping the legacy read would silently
+/// re-block every finding a human already cleared. New clearances use the
+/// tag; this is a read path only.
+const LEGACY_BENIGN_OUTCOME: &str = "benign";
 
 #[derive(Default)]
 struct FindingDecisionState {
@@ -3204,7 +3225,16 @@ fn settled_findings(
                 bail!("Decide decision {} is invalid: {error}", fmt_id(decision));
             }
         };
-        if decide::read_text(reader, snapshot.outcome)? == BENIGN_DECISION_OUTCOME {
+        // The machine-readable result is authoritative. Only when a
+        // resolution carries none does the legacy exact-prose form decide,
+        // which is what keeps pre-tag clearances applying. The outcome text
+        // is otherwise free prose: it exists so a human can say WHY, and a
+        // gate that reads it byte-for-byte takes that field away from them.
+        let benign = match snapshot.result {
+            Some(result) => result == decide::RESULT_BENIGN,
+            None => decide::read_text(reader, snapshot.outcome)? == LEGACY_BENIGN_OUTCOME,
+        };
+        if benign {
             state.benign = true;
             if let Some(context) = genesis.context {
                 // Decide validates proposal context as canonical required text;
@@ -3330,7 +3360,7 @@ fn cmd_list(
     }
     if hidden > 0 && !all {
         println!(
-            "{hidden} finding(s) hidden by resolved Decide outcome {BENIGN_DECISION_OUTCOME:?} \
+            "{hidden} finding(s) hidden by a resolved Decide decision with result \"benign\" \
              — pass --all to include them"
         );
     }
@@ -4388,7 +4418,11 @@ fn collect_commit_patch_term_hits(
     Ok(n_added)
 }
 
-fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Result<GitAudit> {
+fn collect_hits(
+    repo_path: &Path,
+    revisions: &[String],
+    terms: &[(String, String)],
+) -> Result<GitAudit> {
     let repo_root = canonical_git_root(repo_path)?;
     let mut objects = GitObjects::default();
     let mut hits: BTreeMap<String, Vec<GitHit>> = BTreeMap::new();
@@ -4400,7 +4434,7 @@ fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Re
     // Commit messages, one record per commit so a hit can name its commit.
     // %x1e separates sha from body, %x1f terminates the record — control
     // characters, so a message can never forge a record boundary.
-    let log = git_required(&repo_root, &["log", range, "--format=%H%x1e%B%x1f"])?;
+    let log = git_required(&repo_root, &git_log_args(revisions, "--format=%H%x1e%B%x1f"))?;
     for rec in log.split('\u{1f}') {
         // `git log` writes a newline after each custom-format record. Remove
         // only that framing; line numbers within the message body are identity.
@@ -4435,7 +4469,7 @@ fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Re
         }
     }
 
-    let shas: Vec<String> = git_required(&repo_root, &["log", range, "--format=%H"])?
+    let shas: Vec<String> = git_required(&repo_root, &git_log_args(revisions, "--format=%H"))?
         .lines()
         .map(str::to_string)
         .collect();
@@ -4509,6 +4543,16 @@ fn collect_hits(repo_path: &Path, range: &str, terms: &[(String, String)]) -> Re
     })
 }
 
+/// `git log <revisions...> <format>`. The revisions go in verbatim: git owns
+/// that grammar, and re-parsing it here would only teach posture a worse
+/// version of it.
+fn git_log_args<'a>(revisions: &'a [String], format: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["log"];
+    args.extend(revisions.iter().map(String::as_str));
+    args.push(format);
+    args
+}
+
 fn git_required(repo_path: &Path, args: &[&str]) -> Result<String> {
     let output = std::process::Command::new("git")
         .env("LC_ALL", "C")
@@ -4565,10 +4609,22 @@ fn git_audit_must_fail(
 
 fn cmd_git(
     storage: PostureStorage<'_>,
-    range: &str,
+    revisions: &[String],
     channel: &str,
     repo_path: &Path,
 ) -> Result<()> {
+    // A named option swallowed into the revision list would silently audit
+    // against the DEFAULT channel — a gate quietly checking the wrong
+    // vocabulary is worse than one that refuses.
+    if let Some(bad) = revisions
+        .iter()
+        .find(|rev| rev.starts_with("--channel") || rev.starts_with("--repo"))
+    {
+        bail!(
+            "{bad} was read as a revision, not an option; put --channel/--repo before the revisions"
+        );
+    }
+    let range = revisions.join(" ");
     let policy = load_channel_terms(storage, channel)?;
     let (channel_id, terms) = match policy {
         Some((channel_id, terms)) => (Some(channel_id), terms),
@@ -4583,7 +4639,7 @@ fn cmd_git(
         commits: n_commits,
         added_lines: n_added,
         removed_lines: n_removed,
-    } = collect_hits(repo_path, range, &terms)?;
+    } = collect_hits(repo_path, revisions, &terms)?;
 
     // Persist the complete audit before rendering or deciding the exit code.
     // This gives Decide a content-located finding to name and records a
@@ -4672,8 +4728,7 @@ fn cmd_git(
 
     if hidden > 0 {
         println!(
-            "{hidden} finding(s) hidden by resolved Decide outcome \
-             {BENIGN_DECISION_OUTCOME:?}."
+            "{hidden} finding(s) hidden by a resolved Decide decision with result \"benign\"."
         );
     }
     if !hits.is_empty() {
@@ -4707,9 +4762,10 @@ fn cmd_git(
         println!("no unresolved Posture finding remains in this range.");
     } else {
         println!(
-            "\nA finding stops blocking only after a Decide decision about its exact id resolves \
-             to outcome {BENIGN_DECISION_OUTCOME:?}. An unsafe-attribute change additionally \
-             requires a nonempty `decide propose --context` justification."
+            "\nA finding stops blocking only after a Decide decision about its exact id \
+             resolves with `--result benign`; the outcome text is free prose and stays yours \
+             to write. An unsafe-attribute change additionally requires a nonempty \
+             `decide propose --context` justification."
         );
     }
 
@@ -4782,8 +4838,8 @@ fn cmd_hook(
         .to_string();
 
     // The pre-push protocol feeds us "<local ref> <local sha> <remote ref>
-    // <remote sha>" per line. An all-zero remote sha means a brand-new branch,
-    // where everything reachable is new to the channel.
+    // <remote sha>" per line. An all-zero remote sha means the remote has no
+    // such ref yet — a brand-new branch.
     let script = format!(
         r#"#!/bin/sh
 # Installed by `posture hook`. Audits what is about to cross into a channel.
@@ -4832,18 +4888,37 @@ if [ ! -f "$PILE" ]; then
 fi
 
 status=0
+# What is already at the remote is not preventable, so the gate does not read
+# it. It reads what this push ADDS. For a new branch that is NOT its whole
+# history — the branch is new, the commits behind it are mostly not — so the
+# selection is "reachable from the pushed ref, not from anything this remote
+# already has". Auditing the whole history here made a two-file push demand
+# justification for 291 commits and 347k lines of other people's work, and a
+# gate nobody can pass is a gate that gets --no-verify'd. History is audited by
+# `posture sweep --history`, where it can be worked through rather than
+# blocking a push.
+if git remote | grep -qx -- "$1"; then
+    already_there="--remotes=$1"
+else
+    # Pushing to a bare URL: no remote-tracking refs name it, so fall back to
+    # every remote. Over-auditing here is the safe direction.
+    already_there="--remotes"
+fi
+
 while read -r _local_ref local_sha _remote_ref remote_sha; do
     [ "$local_sha" = "$ZERO" ] && continue          # branch deletion
     if [ "$remote_sha" = "$ZERO" ]; then
-        range="$local_sha"                          # new branch: all of it
+        # New branch. Deliberately unquoted below: these are shas and ref
+        # globs, and they have to reach git as separate arguments.
+        revisions="$local_sha --not $already_there"
     else
-        range="$remote_sha..$local_sha"
+        revisions="$remote_sha..$local_sha"
     fi
     if [ -n "$KEY" ]; then
         PILE="$PILE" TRIBLESPACE_KEY="$KEY" \
-            "$POSTURE" git "$range" --channel "$CHANNEL" || status=1
+            "$POSTURE" git --channel "$CHANNEL" $revisions || status=1
     else
-        PILE="$PILE" "$POSTURE" git "$range" --channel "$CHANNEL" || status=1
+        PILE="$PILE" "$POSTURE" git --channel "$CHANNEL" $revisions || status=1
     fi
 done
 
@@ -4893,6 +4968,8 @@ exit $status
     println!("\nIt runs on every push. It exits non-zero on a hit, and also when the");
     println!("channel has no vocabulary — a hook that passes because it checked");
     println!("nothing is worse than no hook.");
+    println!("\nIt audits what the push ADDS, never what the remote already holds.");
+    println!("For existing history, run `posture sweep --history`.");
     Ok(())
 }
 
@@ -5287,7 +5364,13 @@ fn read_arg(arg: &str) -> Result<String> {
 /// full-history archive whose only remote was the public repository it had been
 /// created to be separated from. "Which repos can leak" should not depend on
 /// somebody happening to look.
-fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool) -> Result<()> {
+fn cmd_sweep(
+    storage: PostureStorage<'_>,
+    root: &Path,
+    channel: &str,
+    all: bool,
+    history: bool,
+) -> Result<()> {
     let terms = load_terms(storage, channel)?;
     let lexical_checked = !terms.is_empty();
     let decisions = storage.decide_view()?;
@@ -5373,7 +5456,9 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
 
         // Prefer the remote mainline. With no remote mainline or upstream, scan
         // all of HEAD; an absent comparison base must never turn into zero work.
-        let base = if git_probe(
+        let base = if history {
+            None
+        } else if git_probe(
             repo,
             &["rev-parse", "--verify", "--quiet", "origin/main"],
             &[1],
@@ -5397,6 +5482,10 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
         let range = base
             .map(|base| format!("{base}..HEAD"))
             .unwrap_or_else(|| "HEAD".to_owned());
+        let revisions = vec![range.clone()];
+        // `ahead` is the honest word for the default range and a lie for
+        // --history, where the same number counts the whole reachable history.
+        let scope = if history { "reach" } else { "ahead" };
         let ahead = git_required(repo, &["log", "--oneline", &range])?
             .lines()
             .filter(|line| !line.is_empty())
@@ -5408,7 +5497,7 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
             hits,
             unsafe_attribute_hits,
             ..
-        } = collect_hits(repo, &range, &terms)?;
+        } = collect_hits(repo, &revisions, &terms)?;
         let hits = hits
             .into_iter()
             .filter_map(|(term, term_hits)| {
@@ -5438,7 +5527,7 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
             flagged += 1;
             let classes = hits.len() + usize::from(!unsafe_attribute_hits.is_empty());
             println!(
-                "  {:<24} {:<28} {visibility:<8} ahead={ahead:<5} {count} finding(s) across {classes} class(es)",
+                "  {:<24} {:<28} {visibility:<8} {scope}={ahead:<5} {count} finding(s) across {classes} class(es)",
                 repo.file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("?"),
@@ -5456,7 +5545,7 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
             }
         } else {
             println!(
-                "  {:<24} {:<28} {visibility:<8} ahead={ahead:<5} clean",
+                "  {:<24} {:<28} {visibility:<8} {scope}={ahead:<5} clean",
                 repo.file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("?"),
@@ -5466,13 +5555,23 @@ fn cmd_sweep(storage: PostureStorage<'_>, root: &Path, channel: &str, all: bool)
     }
 
     println!(
-        "\n{flagged} repositor(y/ies) carry unresolved Posture findings ahead of their remote."
+        "\n{flagged} repositor(y/ies) carry unresolved Posture findings {}.",
+        if history {
+            "anywhere in their reachable history"
+        } else {
+            "ahead of their remote"
+        }
     );
     println!("\nNOT CHECKED:");
     println!("  - {skipped_private} repo(s) whose remote gh reports PRIVATE (re-run with --all)");
     println!("  - {no_remote} repo(s) with no origin remote");
     println!("  - repos nested deeper than one level under the root");
     println!("  - OTHER BRANCHES of a scanned repo: only the checked-out HEAD is audited");
+    if !history {
+        println!(
+            "  - HISTORY already on the remote: only work ahead of it was read (pass --history)"
+        );
+    }
     println!("  - uncommitted work, which cannot be pushed but can be committed later");
     println!("  - everything posture git does not check (see its own coverage note)");
 
@@ -5515,7 +5614,12 @@ fn main() -> Result<()> {
             channel,
             remote_match,
         }) => cmd_hook(storage, &repo, &channel, remote_match.as_deref()),
-        Some(Command::Sweep { root, channel, all }) => cmd_sweep(storage, &root, &channel, all),
+        Some(Command::Sweep {
+            root,
+            channel,
+            all,
+            history,
+        }) => cmd_sweep(storage, &root, &channel, all, history),
         Some(Command::Exemplar {
             text,
             channel,
@@ -5545,6 +5649,11 @@ mod tests {
     use super::*;
 
     use std::fs::File;
+
+    /// A revision selection as `git log` would receive it.
+    fn revs(spec: &str) -> Vec<String> {
+        spec.split_whitespace().map(str::to_owned).collect()
+    }
 
     struct TestStore {
         _directory: tempfile::TempDir,
@@ -6296,7 +6405,8 @@ mod tests {
 
         let benign = decide::resolution_fragment(
             decision,
-            BENIGN_DECISION_OUTCOME,
+            "benign, and here is a whole sentence of reasoning about why",
+            Some(decide::RESULT_BENIGN),
             true,
             &[],
             &[],
@@ -6324,6 +6434,7 @@ mod tests {
         let other = decide::resolution_fragment(
             disagreement,
             "sensitive",
+            None,
             true,
             &[],
             &[],
@@ -6364,7 +6475,8 @@ mod tests {
             DEFAULT_DECIDE_SCOPE_ID,
             decide::resolution_fragment(
                 decision,
-                BENIGN_DECISION_OUTCOME,
+                "benign, and here is a whole sentence of reasoning about why",
+                Some(decide::RESULT_BENIGN),
                 true,
                 &[],
                 &[],
@@ -6378,7 +6490,8 @@ mod tests {
             DEFAULT_DECIDE_SCOPE_ID,
             decide::resolution_fragment(
                 decision,
-                BENIGN_DECISION_OUTCOME,
+                "benign, and here is a whole sentence of reasoning about why",
+                Some(decide::RESULT_BENIGN),
                 true,
                 &[],
                 &[],
@@ -6402,6 +6515,7 @@ mod tests {
             decide::resolution_fragment(
                 decision,
                 "reject",
+                None,
                 true,
                 &[],
                 &[],
@@ -6532,8 +6646,8 @@ mod tests {
         let absolute = std::fs::canonicalize(directory.path()).unwrap();
         let terms = vec![("project-sunrise".to_owned(), "fixture".to_owned())];
 
-        let from_relative = collect_hits(&relative, "HEAD", &terms).unwrap();
-        let from_absolute = collect_hits(&absolute, "HEAD", &terms).unwrap();
+        let from_relative = collect_hits(&relative, &revs("HEAD"), &terms).unwrap();
+        let from_absolute = collect_hits(&absolute, &revs("HEAD"), &terms).unwrap();
 
         assert_eq!(from_relative.repo_root, absolute);
         assert_eq!(from_absolute.repo_root, absolute);
@@ -6552,7 +6666,7 @@ mod tests {
     #[test]
     fn git_unsafe_attribute_rule_checks_only_new_literal_pins_in_rust() {
         let directory = git_unsafe_attribute_fixture();
-        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        let audit = collect_hits(directory.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
 
         assert!(audit.hits.is_empty());
         assert_eq!(audit.unsafe_attribute_hits.len(), 1);
@@ -6561,7 +6675,7 @@ mod tests {
         assert!(hit.evidence.contains("ShortString;"));
         assert!(hit.evidence.contains("schema.rs"));
 
-        let whole_history = collect_hits(directory.path(), "HEAD", &[]).unwrap();
+        let whole_history = collect_hits(directory.path(), &revs("HEAD"), &[]).unwrap();
         assert_eq!(
             whole_history.unsafe_attribute_hits.len(),
             2,
@@ -6577,7 +6691,7 @@ mod tests {
             .is_none());
 
         let directory = git_unsafe_attribute_fixture();
-        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        let audit = collect_hits(directory.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
         assert!(audit.hits.is_empty());
         assert_eq!(audit.unsafe_attribute_hits.len(), 1);
         assert!(git_audit_must_fail(
@@ -6624,7 +6738,7 @@ mod tests {
     #[test]
     fn multiline_encoding_only_change_is_a_new_unsafe_attribute_occurrence() {
         let directory = git_unsafe_attribute_fixture();
-        let before = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        let before = collect_hits(directory.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
         assert_eq!(before.unsafe_attribute_hits.len(), 1);
         let before_id =
             finding_id(
@@ -6645,7 +6759,7 @@ mod tests {
             &["commit", "--quiet", "-m", "change pinned encoding"],
         );
 
-        let after = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        let after = collect_hits(directory.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
         assert_eq!(after.unsafe_attribute_hits.len(), 2);
         let added = after
             .unsafe_attribute_hits
@@ -6681,7 +6795,7 @@ mod tests {
             unpinned.path(),
             &["commit", "--quiet", "-m", "use safe attribute anchor"],
         );
-        let audit = collect_hits(unpinned.path(), "HEAD^..HEAD", &[]).unwrap();
+        let audit = collect_hits(unpinned.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
         assert_eq!(audit.unsafe_attribute_hits.len(), 1);
         assert!(audit.unsafe_attribute_hits[0]
             .evidence
@@ -6699,7 +6813,7 @@ mod tests {
             renamed.path(),
             &["commit", "--quiet", "-m", "rename pinned attribute"],
         );
-        let audit = collect_hits(renamed.path(), "HEAD^..HEAD", &[]).unwrap();
+        let audit = collect_hits(renamed.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
         assert_eq!(audit.unsafe_attribute_hits.len(), 2);
         assert!(audit
             .unsafe_attribute_hits
@@ -6731,7 +6845,7 @@ mod tests {
             directory.path(),
             &["commit", "--quiet", "-m", "format schema"],
         );
-        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        let audit = collect_hits(directory.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
         assert!(
             audit.unsafe_attribute_hits.is_empty(),
             "a source-only rewrite of the same path/name/encoding claim keeps its decision"
@@ -6833,7 +6947,7 @@ mod tests {
             &["commit", "--quiet", "-m", "merge adds pin"],
         );
 
-        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        let audit = collect_hits(directory.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
         assert_eq!(
             audit.unsafe_attribute_hits.len(),
             1,
@@ -6847,7 +6961,7 @@ mod tests {
     #[test]
     fn unsafe_attribute_findings_have_exact_decide_occurrences() {
         let directory = git_unsafe_attribute_fixture();
-        let audit = collect_hits(directory.path(), "HEAD^..HEAD", &[]).unwrap();
+        let audit = collect_hits(directory.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
         let hit = &audit.unsafe_attribute_hits[0];
         let occurrence = finding_id(modality::UNSAFE_ATTRIBUTE_ID, &hit.location);
 
@@ -6891,7 +7005,8 @@ mod tests {
         store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposed, "attribute justification");
         let resolved = decide::resolution_fragment(
             decision,
-            BENIGN_DECISION_OUTCOME,
+            "benign, and here is a whole sentence of reasoning about why",
+            Some(decide::RESULT_BENIGN),
             true,
             &[],
             &[],
@@ -6928,7 +7043,8 @@ mod tests {
         store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposal, "unexplained proposal");
         let resolution = decide::resolution_fragment(
             decision,
-            BENIGN_DECISION_OUTCOME,
+            "benign, and here is a whole sentence of reasoning about why",
+            Some(decide::RESULT_BENIGN),
             true,
             &[],
             &[],
@@ -6959,7 +7075,8 @@ mod tests {
         store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposal, "explained proposal");
         let resolution = decide::resolution_fragment(
             explained,
-            BENIGN_DECISION_OUTCOME,
+            "benign, and here is a whole sentence of reasoning about why",
+            Some(decide::RESULT_BENIGN),
             true,
             &[],
             &[],
@@ -6973,11 +7090,68 @@ mod tests {
         assert!(benign.hides(modality::UNSAFE_ATTRIBUTE_ID, occurrence));
     }
 
+    /// A resolution's PROSE is for a human. Only the result tag clears a
+    /// finding — except for the pre-tag resolutions, which had nothing else,
+    /// and are read exactly as they always were.
+    #[test]
+    fn only_a_result_tag_clears_a_finding_and_legacy_prose_still_does() {
+        let store = TestStore::new();
+
+        let mut cleared = |title: &'static str, outcome: &'static str, result: Option<Id>, at: f64| {
+            let finding = genid().id;
+            let decision = genid().id;
+            store.publish_raw(
+                DEFAULT_DECIDE_SCOPE_ID,
+                decide::decision_fragment(
+                    decision,
+                    title,
+                    Some("justified".to_owned()),
+                    Some(finding),
+                    point_interval(Epoch::from_unix_seconds(at)),
+                )
+                .unwrap()
+                .0,
+                "clearance proposal",
+            );
+            store.publish_raw(
+                DEFAULT_DECIDE_SCOPE_ID,
+                decide::resolution_fragment(
+                    decision,
+                    outcome,
+                    result,
+                    true,
+                    &[],
+                    &[],
+                    point_interval(Epoch::from_unix_seconds(at + 1.0)),
+                )
+                .unwrap()
+                .0,
+                "clearance resolution",
+            );
+            let view = store.storage().decide_view().unwrap();
+            let settled = settled_findings(&view.reader, &view.facts, BTreeMap::new()).unwrap();
+            settled.hides(modality::PROTECTED_TERM, finding)
+        };
+
+        // The tag clears, and the prose is free to be an actual explanation.
+        assert!(cleared(
+            "tagged",
+            "benign - it is a BPE vocabulary, so it spells most of the lexicon",
+            Some(decide::RESULT_BENIGN),
+            7_000.0
+        ));
+        // Pre-tag clearances carried the exact word and nothing else.
+        assert!(cleared("legacy prose", LEGACY_BENIGN_OUTCOME, None, 7_100.0));
+        // Everything else is prose a program must not read as clearance.
+        assert!(!cleared("near miss", "Benign.", None, 7_200.0));
+        assert!(!cleared("reasoned but untagged", "benign, because X", None, 7_300.0));
+    }
+
     #[test]
     fn identical_git_lines_are_distinct_exact_occurrences() {
         let directory = git_audit_fixture();
         let terms = vec![("project-sunrise".to_owned(), "fixture".to_owned())];
-        let audit = collect_hits(directory.path(), "HEAD", &terms).unwrap();
+        let audit = collect_hits(directory.path(), &revs("HEAD"), &terms).unwrap();
         let object_id = git_fixture(directory.path(), &["rev-parse", "HEAD"]);
         let term_hits = &audit.hits["project-sunrise"];
 
@@ -7076,7 +7250,7 @@ mod tests {
     fn commit_surgery_that_preserves_the_blob_preserves_the_finding_id() {
         let directory = git_carry_forward_fixture();
         let terms = fixture_terms();
-        let before = collect_hits(directory.path(), "HEAD", &terms).unwrap();
+        let before = collect_hits(directory.path(), &revs("HEAD"), &terms).unwrap();
         let before_ids = finding_ids(&before, "project-sunrise", "patch");
         assert_eq!(before_ids.len(), 1, "one protected line, one finding");
         let head_before = git_fixture(directory.path(), &["rev-parse", "HEAD"]);
@@ -7102,7 +7276,7 @@ mod tests {
         assert_ne!(head_before, head_after, "the fixture must actually rewrite");
         assert_eq!(blob_before, blob_after, "a rebase does not touch blobs");
 
-        let after = collect_hits(directory.path(), "HEAD", &terms).unwrap();
+        let after = collect_hits(directory.path(), &revs("HEAD"), &terms).unwrap();
         assert_eq!(
             before_ids,
             finding_ids(&after, "project-sunrise", "patch"),
@@ -7128,7 +7302,7 @@ mod tests {
         let directory = git_carry_forward_fixture();
         let terms = fixture_terms();
         let introduced = finding_ids(
-            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            &collect_hits(directory.path(), &revs("HEAD"), &terms).unwrap(),
             "project-sunrise",
             "patch",
         );
@@ -7152,7 +7326,7 @@ mod tests {
         );
 
         let after_move = finding_ids(
-            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            &collect_hits(directory.path(), &revs("HEAD"), &terms).unwrap(),
             "project-sunrise",
             "patch",
         );
@@ -7175,7 +7349,7 @@ mod tests {
             &["commit", "--quiet", "-m", "second instance"],
         );
         let after_new = finding_ids(
-            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            &collect_hits(directory.path(), &revs("HEAD"), &terms).unwrap(),
             "project-sunrise",
             "patch",
         );
@@ -7202,7 +7376,7 @@ mod tests {
         );
         let terms = fixture_terms();
         let before = finding_ids(
-            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            &collect_hits(directory.path(), &revs("HEAD"), &terms).unwrap(),
             "project-sunrise",
             "message",
         );
@@ -7219,7 +7393,7 @@ mod tests {
             ],
         );
         let after = finding_ids(
-            &collect_hits(directory.path(), "HEAD", &terms).unwrap(),
+            &collect_hits(directory.path(), &revs("HEAD"), &terms).unwrap(),
             "project-sunrise",
             "message",
         );
@@ -7234,7 +7408,7 @@ mod tests {
     fn git_subprocess_errors_fail_closed() {
         let directory = tempfile::tempdir().unwrap();
         let terms = vec![("project-sunrise".to_owned(), "fixture".to_owned())];
-        let error = collect_hits(directory.path(), "HEAD", &terms).unwrap_err();
+        let error = collect_hits(directory.path(), &revs("HEAD"), &terms).unwrap_err();
         assert!(error.to_string().contains("git -C"));
 
         let error =

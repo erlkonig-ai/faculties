@@ -66,6 +66,12 @@ enum Command {
         decision: String,
         #[arg(help = "Outcome text. Use @path for file input or @- for stdin.")]
         outcome: String,
+        /// Machine-readable result, alongside the outcome prose. The outcome
+        /// is for a reader and may say anything; this is the only part a gate
+        /// is allowed to act on, so reasoning and clearance stop competing for
+        /// one field.
+        #[arg(long, value_parser = parse_result_arg)]
+        result: Option<Id>,
         /// Explicitly bypass the pro-and-con evidence gate.
         #[arg(long)]
         force: bool,
@@ -76,6 +82,9 @@ enum Command {
         decision: String,
         #[arg(help = "Reconciled outcome. Use @path for file input or @- for stdin.")]
         outcome: String,
+        /// Machine-readable result for the reconciled head. See `resolve`.
+        #[arg(long, value_parser = parse_result_arg)]
+        result: Option<Id>,
         /// Explicitly bypass the pro-and-con evidence gate.
         #[arg(long)]
         force: bool,
@@ -166,6 +175,33 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 
 fn parse_id_arg(raw: &str) -> std::result::Result<Id, String> {
     Id::from_hex(raw.trim()).ok_or_else(|| format!("invalid id '{raw}'"))
+}
+
+/// A result tag, by name or by exact id. Names keep the common case typable;
+/// the raw id keeps the vocabulary open, since a tag another tool minted must
+/// be recordable without this binary having to learn it first.
+fn parse_result_arg(raw: &str) -> std::result::Result<Id, String> {
+    let raw = raw.trim();
+    if let Some(id) = decide::result_tag(raw) {
+        return Ok(id);
+    }
+    Id::from_hex(raw).ok_or_else(|| {
+        format!(
+            "unknown result '{raw}'; expected a 32-character id or one of: {}",
+            decide::RESULT_TAGS
+                .iter()
+                .map(|(label, _)| *label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+fn fmt_result(id: Id) -> String {
+    match decide::result_name(id) {
+        Some(name) => format!("{name} ({id:x})"),
+        None => format!("{id:x}"),
+    }
 }
 
 fn fmt_id(id: Id) -> String {
@@ -331,6 +367,7 @@ fn cmd_resolve(
     storage: DecideStorage<'_>,
     input: String,
     outcome: String,
+    result: Option<Id>,
     forced: bool,
 ) -> Result<()> {
     let (decision_id, snapshot_id) = storage.update("resolve Decide decision", |view| {
@@ -344,6 +381,7 @@ fn cmd_resolve(
         let (fragment, snapshot_id) = decide::resolution_fragment(
             decision_id,
             outcome,
+            result,
             forced,
             &evidence,
             &[],
@@ -352,6 +390,10 @@ fn cmd_resolve(
         Ok((fragment, (decision_id, snapshot_id)))
     })?;
     println!("Resolved decision {decision_id:x} at {snapshot_id:x}");
+    match result {
+        Some(result) => println!("Result: {}", fmt_result(result)),
+        None => println!("Result: none — no gate will read this outcome"),
+    }
     if forced {
         println!("Resolution is explicitly forced");
     }
@@ -362,6 +404,7 @@ fn cmd_reconcile(
     storage: DecideStorage<'_>,
     input: String,
     outcome: String,
+    result: Option<Id>,
     forced: bool,
 ) -> Result<()> {
     let (decision_id, snapshot_id, predecessors) =
@@ -373,6 +416,7 @@ fn cmd_reconcile(
             let (fragment, snapshot_id) = decide::resolution_fragment(
                 decision_id,
                 outcome,
+                result,
                 forced,
                 &evidence,
                 &predecessors,
@@ -384,6 +428,10 @@ fn cmd_reconcile(
         "Reconciled {} resolution heads for {decision_id:x} at {snapshot_id:x}",
         predecessors.len()
     );
+    match result {
+        Some(result) => println!("Result: {}", fmt_result(result)),
+        None => println!("Result: none — no gate will read this outcome"),
+    }
     if forced {
         println!("Reconciliation is explicitly forced");
     }
@@ -481,7 +529,20 @@ fn cmd_list(storage: DecideStorage<'_>, all: bool, forced_only: bool) -> Result<
             );
             if let Some(snapshot) = common_snapshot(&row.resolution) {
                 let outcome = decide::read_text(&view.reader, snapshot.outcome)?;
-                print!("  → {}", truncate(outcome.lines().next().unwrap_or(""), 60));
+                // The result tag prints ahead of the prose because it is the
+                // part with consequences; a reader scanning the list should
+                // never have to infer clearance from a sentence.
+                if let Some(result) = snapshot.result {
+                    print!(
+                        "  → [{}]",
+                        decide::result_name(result)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("{result:x}"))
+                    );
+                } else {
+                    print!("  →");
+                }
+                print!(" {}", truncate(outcome.lines().next().unwrap_or(""), 60));
             }
             println!();
         }
@@ -511,6 +572,13 @@ fn print_snapshot(
 ) -> Result<()> {
     let outcome = decide::read_text(&view.reader, snapshot.outcome)?;
     println!("{indent}head {}", fmt_id(snapshot.id));
+    println!(
+        "{indent}  result: {}",
+        snapshot
+            .result
+            .map(fmt_result)
+            .unwrap_or_else(|| "(none - prose only, no gate reads it)".to_owned())
+    );
     println!("{indent}  forced: {}", snapshot.forced);
     println!(
         "{indent}  finished: {}",
@@ -663,21 +731,25 @@ fn main() -> Result<()> {
         Command::Resolve {
             decision,
             outcome,
+            result,
             force,
         } => cmd_resolve(
             storage,
             decision,
             faculties::text_arg(&outcome, "resolution outcome")?,
+            result,
             force,
         ),
         Command::Reconcile {
             decision,
             outcome,
+            result,
             force,
         } => cmd_reconcile(
             storage,
             decision,
             faculties::text_arg(&outcome, "reconciled outcome")?,
+            result,
             force,
         ),
         Command::List { all, forced } => cmd_list(storage, all, forced),
@@ -695,6 +767,7 @@ mod tests {
             id,
             decision: genid().id,
             outcome,
+            result: None,
             forced,
             evidence: Vec::new(),
             predecessors: Vec::new(),

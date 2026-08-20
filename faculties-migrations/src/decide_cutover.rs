@@ -742,6 +742,10 @@ pub fn rewrite_decide_authored_commits(
         let (fragment, id) = capability::resolution_fragment(
             occurrence.decision,
             outcome,
+            // Pre-cutover resolutions predate the machine-readable result tag
+            // and carry outcome prose only. Inventing one here would forge a
+            // judgement nobody made.
+            None,
             forced,
             &evidence,
             &predecessors,

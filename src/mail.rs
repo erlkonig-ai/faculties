@@ -3381,7 +3381,7 @@ mod tests {
         let (_directory, reader) = empty_reader();
         let decision = id(70);
         let (mut resolution, head) =
-            decide::resolution_fragment(decision, "send", true, &[], &[], at(1)).unwrap();
+            decide::resolution_fragment(decision, "send", None, true, &[], &[], at(1)).unwrap();
         let facts = resolution.facts().clone();
         let snapshot = decide::resolution_snapshot(&facts, head).unwrap();
         assert!(decide::read_text(&reader, snapshot.outcome).is_err());
@@ -3981,7 +3981,7 @@ mod tests {
 
         let views = fixture.views();
         let (resolution, resolution_id) =
-            decide::resolution_fragment(draft.decision, "send", true, &[], &[], at(3)).unwrap();
+            decide::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(3)).unwrap();
         decide::validate_catalog_union(&views.decide.reader, &views.decide.facts, &resolution)
             .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, resolution);
@@ -4231,7 +4231,7 @@ mod tests {
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, draft.mail);
 
         let (send, send_id) =
-            decide::resolution_fragment(draft.decision, "send", true, &[], &[], at(2)).unwrap();
+            decide::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(2)).unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, send);
         let views = fixture.views();
         let account = open_account(
@@ -4285,7 +4285,7 @@ mod tests {
         // fork. It prevents a new effect, but it cannot rewrite the evidence
         // of which genuine send head the executor previously observed.
         let (reject, reject_id) =
-            decide::resolution_fragment(draft.decision, "reject", true, &[], &[], at(3)).unwrap();
+            decide::resolution_fragment(draft.decision, "reject", None, true, &[], &[], at(3)).unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, reject);
         let views = fixture.views();
         assert!(format!(
@@ -4310,6 +4310,7 @@ mod tests {
         let (reject_join, _) = decide::resolution_fragment(
             draft.decision,
             "reject",
+            None,
             true,
             &[],
             &[send_id, reject_id],
