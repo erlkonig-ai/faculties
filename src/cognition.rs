@@ -521,7 +521,7 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let facts = Collection::new(&mut pile, DEFAULT_SCOPE_ID, signer)
+        let facts = crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer)
             .materialize()
             .unwrap();
         let reader = pile.reader().unwrap();

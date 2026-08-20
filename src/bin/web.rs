@@ -797,7 +797,7 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let pile = open_pile_strict(&pile_path).unwrap();
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         assert_eq!(
             find!(

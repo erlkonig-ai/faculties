@@ -815,6 +815,7 @@ use faculties::storage::{discover_target, initialize_signer};
         assert_eq!(first, second);
         assert_eq!(after_first, after_second);
 
+        let signer = faculties::storage::load_signer(&fixture.target, Some(&fixture.key)).unwrap();
         let mut pile = faculties::storage::open_pile_strict(&fixture.target).unwrap();
         assert!(pile
             .pins()
@@ -822,10 +823,10 @@ use faculties::storage::{discover_target, initialize_signer};
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap()
             .is_empty());
-        let target = discover_target(&mut pile, DEFAULT_SCOPE_ID).unwrap();
+        let target = discover_target(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         assert_eq!(
-            target.descriptor(),
-            &triblespace::core::collection::simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
+            target.descriptor().facts(),
+            faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, signer.verifying_key()).facts()
         );
         let mut expected_commits = first.clone();
         expected_commits.sort_unstable_by_key(CollectionCommit::id);
@@ -882,7 +883,8 @@ use faculties::storage::{discover_target, initialize_signer};
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap()
             .is_empty());
-        let target = discover_target(&mut pile, DEFAULT_SCOPE_ID).unwrap();
+        let signer = faculties::storage::load_signer(&fixture.target, Some(&fixture.key)).unwrap();
+        let target = discover_target(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         assert_eq!(target.commits().len(), plan.commits().len());
         pile.close().unwrap();
     }

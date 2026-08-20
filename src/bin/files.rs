@@ -472,7 +472,10 @@ fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
         Some(p) => PathBuf::from(p),
         None => faculties::model_dir().join("clip.pile"),
     };
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+    // Which team's model graph? The pile says — this caller holds only a path.
+    let team = mary::model_collection::model_graph_team_at(&pile)
+        .context("read the sole model-graph team from the Mary model pile")?;
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile, team)
         .context("load native Mary CLIP model collection")?;
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
@@ -566,7 +569,10 @@ fn load_mm7b() -> Result<Mm7bEmbedder> {
         }
     };
     eprintln!("files: loading nomic-embed-multimodal-7b (once, ~20s)…");
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
+    // Which team's model graph? The pile says — this caller holds only a path.
+    let team = mary::model_collection::model_graph_team_at(&pile)
+        .context("read the sole model-graph team from the Mary model pile")?;
+    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile, team)
         .context("load native Mary MM7B model collection")?;
     mary::persist::load_nomic_mm7b_aliased_from_snapshot(
         snapshot,
@@ -2234,21 +2240,27 @@ mod tests {
         const CLIP_MODEL: &str = "clip/target";
         let test_pile = TestPile::new();
         let signer = SigningKey::from_bytes(&[0x73; 32]);
+        // A team of one: this fixture signs its own model graph, so its key is
+        // also the team that graph is rooted at.
+        let team = signer.verifying_key();
         let mut pile = Pile::open(&test_pile.path).unwrap();
         mary::model_collection::publish_model_fragment(
             &mut pile,
+            team,
             &signer,
             native_model_fragment(CLIP_MODEL, "target.weight", 1.0),
         )
         .unwrap();
         mary::model_collection::publish_model_fragment(
             &mut pile,
+            team,
             &signer,
             native_model_fragment("clip/distractor", "distractor.weight", 2.0),
         )
         .unwrap();
         mary::model_collection::publish_model_fragment(
             &mut pile,
+            team,
             &signer,
             native_tokenizer_fragment(CLIP_MODEL, WORDPIECE),
         )
@@ -2256,7 +2268,7 @@ mod tests {
         pile.close().unwrap();
 
         let frozen =
-            mary::model_collection::load_model_collection_local_latest(&test_pile.path).unwrap();
+            mary::model_collection::load_model_collection_local_latest(&test_pile.path, team).unwrap();
         let selected = mary::selection::load_keymap_from_graph(
             frozen.facts(),
             frozen.reader(),
@@ -2279,12 +2291,14 @@ mod tests {
         let mut pile = Pile::open(&test_pile.path).unwrap();
         mary::model_collection::publish_model_fragment(
             &mut pile,
+            team,
             &signer,
             native_model_fragment(CLIP_MODEL, "later.weight", 3.0),
         )
         .unwrap();
         mary::model_collection::publish_model_fragment(
             &mut pile,
+            team,
             &signer,
             native_tokenizer_fragment(CLIP_MODEL, LATER_WORDPIECE),
         )
@@ -2312,7 +2326,7 @@ mod tests {
         assert_eq!(still_tokenizer.token_to_id("later"), None);
 
         let latest =
-            mary::model_collection::load_model_collection_local_latest(&test_pile.path).unwrap();
+            mary::model_collection::load_model_collection_local_latest(&test_pile.path, team).unwrap();
         let model_error = mary::selection::load_keymap_from_graph(
             latest.facts(),
             latest.reader(),

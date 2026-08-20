@@ -871,7 +871,7 @@ mod tests {
         fn view(&self) -> TestView {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let pile = open_pile_strict(&self.pile).unwrap();
-            let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+            let mut collection = crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
             let facts = collection.materialize().unwrap();
             let reader = collection.storage_mut().reader().unwrap();
             collection.into_storage().close().unwrap();

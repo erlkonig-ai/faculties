@@ -47,6 +47,7 @@ pub mod blockdag;
 pub mod body;
 pub mod bootstrap;
 pub mod cognition;
+pub mod collection_names;
 pub mod comb;
 pub mod compass;
 pub mod decide;

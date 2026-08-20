@@ -219,7 +219,7 @@ pub fn migrate(faculty: Faculty, pile: &Path, key: Option<&Path>) -> Result<()> 
 /// Read one scope's current native value through a short-lived pile handle.
 fn materialize(pile: &Path, scope: Id, signer: &SigningKey) -> Result<TribleSet> {
     let mut storage = open_pile_strict(pile)?;
-    let result = Collection::new(&mut storage, scope, signer.clone())
+    let result = faculties::collection_names::open(&mut storage, scope, signer.clone())
         .materialize()
         .map_err(|error| anyhow!("materialize collection {scope:X}: {error}"));
     match (result, storage.close()) {

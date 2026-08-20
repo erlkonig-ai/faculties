@@ -553,6 +553,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         assert_eq!(first_publish, second_publish);
         assert_eq!(fs::metadata(&target_path).unwrap().len(), length);
 
+        let signer = load_signer(&target_path, Some(&key_path)).unwrap();
         let mut target = open_pile_strict(&target_path).unwrap();
         assert!(target
             .pins()
@@ -560,10 +561,10 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap()
             .is_empty());
-        let discovered = discover_target(&mut target, DEFAULT_SCOPE_ID).unwrap();
+        let discovered = discover_target(&mut target, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         assert_eq!(
             discovered.descriptor(),
-            &triblespace::core::collection::simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
+            &faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, signer.verifying_key())
         );
         assert_eq!(discovered.commits().len(), 3);
         assert!(discovered.merges().is_empty());
@@ -571,7 +572,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         assert!(discovered.diagnostics().is_empty());
 
         let signer = load_signer(&target_path, Some(&key_path)).unwrap();
-        let materialized = Collection::new(&mut target, DEFAULT_SCOPE_ID, signer)
+        let materialized = faculties::collection_names::open(&mut target, DEFAULT_SCOPE_ID, signer)
             .materialize()
             .unwrap();
         assert_eq!(materialized, plan.materialized_facts());

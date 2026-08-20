@@ -1081,11 +1081,11 @@ mod tests {
         let scope = scope_fragment.root().unwrap();
         let mut foundation = identity.fragment;
         foundation += scope_fragment;
-        Collection::new(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
+        faculties::collection_names::open(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
             .commit(foundation)
             .unwrap();
         let secrets_facts =
-            Collection::new(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
+            faculties::collection_names::open(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
                 .materialize()
                 .unwrap();
         let reader = store.reader().unwrap();
@@ -1100,7 +1100,7 @@ mod tests {
         )
         .unwrap();
         let version = sealed.secret;
-        Collection::new(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer)
+        faculties::collection_names::open(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer)
             .commit(sealed.fragment)
             .unwrap();
         store.close().unwrap();

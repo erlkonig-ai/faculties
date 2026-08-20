@@ -12,9 +12,8 @@ use std::path::Path;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::collection::{
-    simplearchive_union, CollectionCommit, CollectionDescriptor,
-};
+use ed25519_dalek::VerifyingKey;
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -33,8 +32,32 @@ pub type ScriptHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 /// Canonical descriptor for the one supported Habit collection.
-pub fn descriptor() -> CollectionDescriptor {
-    simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
+///
+/// Named `"habit"` within `team`, which is the team's ROOT key rather than the
+/// key that signs commits. It is a parameter because they coincide only for a
+/// team of one, and defaulting would root this collection at whichever key
+/// happened to be writing.
+pub fn descriptor(team: VerifyingKey) -> Fragment {
+    crate::collection_names::root_descriptor(DEFAULT_SCOPE_ID, team)
+}
+
+/// Content identity of the Habit collection this pile roots.
+///
+/// Written out rather than reached for: core deliberately offers no helper for
+/// hashing a descriptor it did not store, because a handle computed beside a
+/// store instead of by it can name a collection whose descriptor is absent.
+/// This one is only ever printed.
+pub fn collection_handle(
+    pile: &Path,
+    key: Option<&Path>,
+) -> Result<triblespace::core::collection::records::CollectionHandle> {
+    let signer = load_signer(pile, key)?;
+    Ok(
+        triblespace::core::blob::IntoBlob::<
+            triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+        >::to_blob(descriptor(signer.verifying_key()).facts().clone())
+        .get_handle(),
+    )
 }
 
 /// One pile-resident executable carried by a standing intention.
@@ -1496,9 +1519,10 @@ mod tests {
         );
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let team = signer.verifying_key();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
-        assert_eq!(collection.descriptor(), &descriptor());
+        let collection = crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
+        assert_eq!(collection.descriptor().facts(), descriptor(team).facts());
         collection.into_storage().close().unwrap();
     }
 

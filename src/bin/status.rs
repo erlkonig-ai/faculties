@@ -385,7 +385,7 @@ mod tests {
                 let reader = pile.reader().unwrap();
                 relations::validate_catalog_union(&reader, &current, &fragment)?;
                 let mut collection =
-                    Collection::new(&mut *pile, RELATIONS_SCOPE_ID, signer.clone());
+                    faculties::collection_names::open(&mut *pile, RELATIONS_SCOPE_ID, signer.clone());
                 collection.commit(fragment)?;
                 Ok(())
             })
@@ -439,7 +439,7 @@ mod tests {
         let window = Id::new([0x83; 16]).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
         {
-            let mut foreign = Collection::new(
+            let mut foreign = faculties::collection_names::open(
                 &mut pile,
                 DEFAULT_SCOPE_ID,
                 SigningKey::from_bytes(&[0x84; 32]),

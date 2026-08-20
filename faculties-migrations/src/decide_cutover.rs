@@ -986,11 +986,11 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     fn materialized(fixture: &Fixture) -> TestView {
         let signer = load_signer(&fixture.destination, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.destination).unwrap();
-        let commits = discover_target(&mut pile, schema::DEFAULT_SCOPE_ID)
+        let commits = discover_target(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())
             .unwrap()
             .commits()
             .len();
-        let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         let reader = collection.storage_mut().reader().unwrap();
         collection.into_storage().close().unwrap();

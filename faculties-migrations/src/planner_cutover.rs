@@ -1287,7 +1287,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     fn materialize(path: &Path, key: &Path) -> (TribleSet, PileReader, Vec<CollectionCommit>) {
         let signer = load_signer(path, Some(key)).unwrap();
         let mut pile = open_pile_strict(path).unwrap();
-        let commits = discover_target(&mut pile, DEFAULT_SCOPE_ID)
+        let commits = discover_target(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
             .unwrap()
             .commits()
             .iter()
@@ -1295,7 +1295,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             .filter(|commit| commit.public_key().raw == signer.verifying_key().to_bytes())
             .collect();
         let mut collection =
-            triblespace::core::collection::Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+            faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         let reader = collection.storage_mut().reader().unwrap();
         let pile = collection.into_storage();
@@ -1488,9 +1488,21 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         assert!(messages.contains("causal rejoin"));
         assert!(messages.contains("redundant overlap"));
         assert!(messages.contains("semantic provenance"));
-        let expected_collection =
-            triblespace::core::collection::simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
-                .handle();
+        // Written out rather than reached for: core deliberately offers no
+        // helper for hashing a descriptor it did not store.
+        let expected_collection = triblespace::core::blob::IntoBlob::<
+            triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+        >::to_blob(
+            faculties::collection_names::root_descriptor(
+                DEFAULT_SCOPE_ID,
+                load_signer(&fixture.destination, Some(&fixture.destination_key))
+                    .unwrap()
+                    .verifying_key(),
+            )
+            .facts()
+            .clone(),
+        )
+        .get_handle();
         assert!(target_commits
             .iter()
             .all(|commit| commit.collection() == expected_collection));

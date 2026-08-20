@@ -1994,7 +1994,7 @@ mod tests {
     }
 
     fn commit_scope(pile: &mut Pile, signer: &SigningKey, scope: Id, fragment: Fragment) {
-        Collection::new(pile, scope, signer.clone())
+        faculties::collection_names::open(pile, scope, signer.clone())
             .commit(fragment)
             .unwrap();
     }

@@ -31,10 +31,10 @@ use std::borrow::BorrowMut;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::encodings::longstring::LongString;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::IntoBlob;
+use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::{
     simplearchive_union, Collection, CollectionRecord, CollectionStore,
 };
@@ -162,7 +162,7 @@ const MAX_WALKED_COMMITS: usize = 100_000;
 ///
 /// This is the call every faculty makes instead of [`Collection::new`], so the
 /// legacy-pile diagnostic exists in exactly one place. The returned collection
-/// is exactly the one `Collection::new(storage, scope, signer)` would return.
+/// is exactly the one `crate::collection_names::open(storage, scope, signer)` would return.
 ///
 /// `storage` is whatever the caller already holds — an owned [`Pile`] or a
 /// `&mut Pile` — so routing a call site through here never forces it to change
@@ -171,12 +171,12 @@ pub fn open_scope<S>(mut storage: S, scope: Id, signer: SigningKey) -> Collectio
 where
     S: BorrowMut<Pile>,
 {
-    warn_once(storage.borrow_mut(), scope);
-    Collection::new(storage, scope, signer)
+    warn_once(storage.borrow_mut(), scope, signer.verifying_key());
+    crate::collection_names::open(storage, scope, signer)
 }
 
 /// Emit the hint for `scope` at most once per process, to stderr.
-fn warn_once(pile: &mut Pile, scope: Id) {
+fn warn_once(pile: &mut Pile, scope: Id, team: VerifyingKey) {
     static WARNED: Mutex<Option<BTreeSet<Id>>> = Mutex::new(None);
 
     if !LEGACY_SOURCES.iter().any(|(known, _)| *known == scope) {
@@ -191,7 +191,7 @@ fn warn_once(pile: &mut Pile, scope: Id) {
             return;
         }
     }
-    if let Some(hint) = legacy_migration_hint(pile, scope) {
+    if let Some(hint) = legacy_migration_hint(pile, scope, team) {
         eprintln!("{hint}");
     }
 }
@@ -204,14 +204,34 @@ fn warn_once(pile: &mut Pile, scope: Id) {
 /// commits, an absent legacy branch, a legacy branch with no head, a legacy
 /// branch whose history carries no authored content, and every read failure
 /// encountered while probing.
-pub fn legacy_migration_hint(pile: &mut Pile, scope: Id) -> Option<String> {
+pub fn legacy_migration_hint(pile: &mut Pile, scope: Id, team: VerifyingKey) -> Option<String> {
     let branch_name = LEGACY_SOURCES
         .iter()
         .find(|(known, _)| *known == scope)
         .map(|(_, name)| *name)?;
 
-    if !native_scope_is_empty(pile, scope)? {
+    if !native_scope_is_empty(pile, scope, team)? {
         return None;
+    }
+
+    // TWO ways a collection can read as empty, and they want opposite advice.
+    //
+    // A pile that never cut over has its history in a legacy branch. A pile
+    // that cut over but predates NAMING has its history in real native
+    // collections that this build cannot address: they are anchored by the
+    // retired scope, so a lookup by name finds nothing and the emptiness above
+    // is an addressing failure rather than an absence. Such a pile usually
+    // still carries the legacy branch as residue, so checking the branch first
+    // confidently names a migration that already ran.
+    //
+    // Naming is named first when both hold: it is what makes the collections
+    // readable at all.
+    if any_scope_anchored_collection(pile)? {
+        return Some(format!(
+            "note: this pile's native `{branch_name}` collection cannot be found by name, but the pile holds collections anchored by the retired scope id.\n\
+             note: a root collection is now named within a team, which changed its descriptor and so its identity; current faculties therefore look for a collection this pile does not have yet. Nothing has been lost — the existing collections are intact and the migration only adds beside them.\n\
+             note: run `migrations --pile <this pile> collection-naming --dry-run` to see exactly what would move, and `migrations --pile <this pile> collection-naming` to migrate."
+        ));
     }
     let (commits, capped) = legacy_authored_commits(pile, branch_name)?;
     if commits == 0 {
@@ -232,6 +252,51 @@ pub fn legacy_migration_hint(pile: &mut Pile, scope: Id) -> Option<String> {
     ))
 }
 
+/// The anchor a root collection carried before it was named within a team.
+///
+/// A bare PROBE id, deliberately not a schema declaration: this crate no longer
+/// knows what a scope MEANS, only that a descriptor still carrying one predates
+/// naming. The transform that understands it lives in `faculties-migrations`,
+/// and rebuilding scope-anchored descriptors from a name table here would drag
+/// that migration surface back into the library it was moved out of.
+///
+/// Minted with `trible genid` on 2026-08-07, retired 2026-08-20.
+const RETIRED_COLLECTION_SCOPE: Id = triblespace::macros::id_hex!("D3418873C70392E3ADAA05C00E11A583");
+
+/// Whether any collection in this pile is still anchored by a scope.
+///
+/// Generic on purpose: the question is "does any descriptor here carry a
+/// scope", never "is THIS faculty's old descriptor present". A name table would
+/// answer only for collections this build happens to know, and would go stale
+/// against a pile older or stranger than itself.
+///
+/// This runs only once a collection has already read as empty, so its cost
+/// lands on a pile that is broken for the reader anyway; being able to say what
+/// is wrong is worth more there than the scan it takes to find out.
+fn any_scope_anchored_collection(pile: &mut Pile) -> Option<bool> {
+    let mut collections = BTreeSet::new();
+    for record in pile.records().ok()? {
+        if let Ok(CollectionRecord::Commit(commit)) = record {
+            collections.insert(commit.collection());
+        }
+    }
+    let reader = pile.reader().ok()?;
+    for collection in collections {
+        // A descriptor that is absent or does not decode says nothing either
+        // way, so it is skipped rather than treated as an answer.
+        let Ok(blob) = reader.get::<Blob<SimpleArchive>, _>(collection.transmute()) else {
+            continue;
+        };
+        let Ok(facts) = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) else {
+            continue;
+        };
+        if facts.iter().any(|fact| *fact.a() == RETIRED_COLLECTION_SCOPE) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// Whether `scope` has no commits at all, or `None` if the pile's records
 /// cannot be enumerated.
 ///
@@ -241,8 +306,18 @@ pub fn legacy_migration_hint(pile: &mut Pile, scope: Id) -> Option<String> {
 /// question is "has anything at all been published into this scope", and
 /// answering it must stay cheaper than the materialization the caller is about
 /// to perform — which enumerates the same index and then verifies.
-fn native_scope_is_empty(pile: &mut Pile, scope: Id) -> Option<bool> {
-    let collection = simplearchive_union::descriptor(scope).handle();
+fn native_scope_is_empty(pile: &mut Pile, scope: Id, team: VerifyingKey) -> Option<bool> {
+    // Written out rather than reached for: this is the handle of a descriptor
+    // that has NOT been stored here, and core deliberately offers no helper for
+    // that, because one computed beside a store instead of by it can name a
+    // collection whose descriptor is absent. On this read path it is only ever
+    // compared against, never published under.
+    let collection = IntoBlob::<SimpleArchive>::to_blob(
+        crate::collection_names::root_descriptor(scope, team)
+            .facts()
+            .clone(),
+    )
+    .get_handle();
     let records = pile.records().ok()?;
     for record in records {
         if let Ok(CollectionRecord::Commit(commit)) = record {
@@ -348,6 +423,13 @@ fn legacy_branch_head(pile: &mut Pile, name: &str) -> Option<CommitHandle> {
 
 #[cfg(test)]
 mod tests {
+    /// These fixtures write with `signer()`, so that IS the team they root at.
+    /// Any other key here would make `native_scope_is_empty` answer "empty"
+    /// about a collection it simply was not looking at.
+    fn test_team() -> VerifyingKey {
+        signer().verifying_key()
+    }
+
     use std::fs::File;
 
     use ed25519_dalek::SigningKey;
@@ -399,8 +481,8 @@ mod tests {
         write_legacy_branch(&path);
 
         let mut pile = Pile::open(&path).unwrap();
-        assert_eq!(native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID), Some(true));
-        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID)
+        assert_eq!(native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_team()), Some(true));
+        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team())
             .expect("a legacy-only pile must say so");
         pile.close().unwrap();
 
@@ -426,14 +508,92 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         // Same pile, same intact legacy branch — only the native side changes.
-        assert!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID).is_some());
+        assert!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()).is_some());
         open_scope(&mut pile, DEFAULT_SCOPE_ID, signer())
             .commit(goal_fragment("native goal"))
             .unwrap();
 
-        assert_eq!(native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID), Some(false));
-        assert_eq!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID), None);
+        assert_eq!(native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_team()), Some(false));
+        assert_eq!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()), None);
         pile.close().unwrap();
+    }
+
+    /// A descriptor as a pile written before naming carries one: the current
+    /// shape plus the retired scope anchor.
+    ///
+    /// Built from the raw retired attribute id rather than a declaration, for
+    /// exactly the reason the probe is: this crate no longer knows what a scope
+    /// means, and declaring it would pull a migration surface back into the
+    /// library it was moved out of.
+    fn scope_anchored_descriptor(scope: Id) -> Fragment {
+        use triblespace::core::inline::encodings::genid::GenId;
+        use triblespace::core::inline::IntoInline;
+        use triblespace::core::trible::Trible;
+
+        let current = crate::collection_names::root_descriptor(scope, test_team());
+        let root = ExclusiveId::force(current.root().expect("a descriptor has one root"));
+        let mut facts = current.into_facts();
+        facts.insert(&Trible::new(
+            &root,
+            &RETIRED_COLLECTION_SCOPE,
+            &IntoInline::<GenId>::to_inline(scope),
+        ));
+        Fragment::rooted(*root, facts)
+    }
+
+    /// A pile that DID cut over but predates naming must not be told to run the
+    /// cutover again. Its collections are real and full; they are simply not
+    /// reachable by name, and the legacy branch it still carries is residue.
+    #[test]
+    fn a_pre_naming_pile_is_told_to_name_its_collections_not_to_cut_over_again() {
+        let directory = TempDir::new().unwrap();
+        let path = new_pile(&directory);
+        // Residue: the branch a pre-naming pile still has lying around.
+        write_legacy_branch(&path);
+
+        let mut pile = Pile::open(&path).unwrap();
+        // Real history, under the anchor that build used.
+        simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &scope_anchored_descriptor(DEFAULT_SCOPE_ID),
+            goal_fragment("a goal published before naming"),
+            &signer(),
+        )
+        .unwrap();
+
+        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team())
+            .expect("a pile whose collections cannot be found by name must say so");
+        pile.close().unwrap();
+
+        assert!(
+            hint.contains("collection-naming"),
+            "the naming migration is the one that applies: {hint}"
+        );
+        assert!(
+            !hint.contains("activate-cutover"),
+            "this pile already cut over; naming it again is not cutting it over: {hint}"
+        );
+        assert!(
+            hint.contains("Nothing has been lost"),
+            "naming is additive too, and the reader needs to know it: {hint}"
+        );
+    }
+
+    /// The two arms are distinct: a genuinely pre-cutover pile still gets the
+    /// cutover advice, because nothing in it is anchored by a scope.
+    #[test]
+    fn a_pre_cutover_pile_still_gets_the_cutover_advice() {
+        let directory = TempDir::new().unwrap();
+        let path = new_pile(&directory);
+        write_legacy_branch(&path);
+
+        let mut pile = Pile::open(&path).unwrap();
+        assert_eq!(any_scope_anchored_collection(&mut pile), Some(false));
+        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()).unwrap();
+        pile.close().unwrap();
+
+        assert!(hint.contains("activate-cutover"), "{hint}");
+        assert!(!hint.contains("collection-naming"), "{hint}");
     }
 
     #[test]
@@ -443,10 +603,10 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         // A brand new pile has neither side.
-        assert_eq!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID), None);
+        assert_eq!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()), None);
         // A scope with no legacy predecessor never speaks, even when empty.
         assert_eq!(
-            legacy_migration_hint(&mut pile, crate::schemas::orient::DEFAULT_SCOPE_ID),
+            legacy_migration_hint(&mut pile, crate::schemas::orient::DEFAULT_SCOPE_ID, test_team()),
             None
         );
         pile.close().unwrap();

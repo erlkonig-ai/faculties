@@ -1896,20 +1896,17 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
 
         let signer = faculties::storage::load_signer(&target_path, Some(&key_path)).unwrap();
         let mut target = open_pile_strict(&target_path).unwrap();
+        let team = signer.verifying_key();
         assert!(target
             .pins()
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap()
             .is_empty());
-        let discovery = discover_target(&mut target, schema::DEFAULT_SCOPE_ID).unwrap();
+        let discovery = discover_target(&mut target, schema::DEFAULT_SCOPE_ID, team).unwrap();
         assert_eq!(discovery.commits().len(), 3);
         let commits = discovery.commits().to_vec();
-        let mut collection = triblespace::core::collection::Collection::new(
-            target,
-            schema::DEFAULT_SCOPE_ID,
-            signer,
-        );
+        let mut collection = faculties::collection_names::open(target, schema::DEFAULT_SCOPE_ID, signer);
         let target_facts = collection.materialize().unwrap();
         for fact in plan.original_facts() {
             assert!(target_facts.contains(fact));
@@ -1956,10 +1953,13 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
         assert_eq!(fs::metadata(&source_path).unwrap().len(), in_place_length);
 
         let source_pin = plan.message_source_pin();
+        let source_team = faculties::storage::load_signer(&source_path, Some(&key_path))
+            .unwrap()
+            .verifying_key();
         let mut source = open_pile_strict(&source_path).unwrap();
         assert_eq!(source.head(source_pin.id).unwrap(), Some(source_pin.value));
         assert_eq!(
-            discover_target(&mut source, schema::DEFAULT_SCOPE_ID)
+            discover_target(&mut source, schema::DEFAULT_SCOPE_ID, source_team)
                 .unwrap()
                 .commits()
                 .len(),

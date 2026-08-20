@@ -191,7 +191,7 @@ pub fn publish(
 
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
-    let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+    let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let current = collection
             .materialize()
@@ -878,7 +878,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         assert_eq!(published.len(), plan.commits().len());
         let signer = load_signer(&path, Some(&key)).unwrap();
         let pile = open_pile_strict(&path).unwrap();
-        let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let materialized = collection.materialize().unwrap();
         assert_eq!(materialized, facts);
         let reader = collection.storage_mut().reader().unwrap();

@@ -251,7 +251,7 @@ fn build_world(
         let baseline = snapshots(&mut pile, signer, publications)?;
         let mut returned = BTreeMap::new();
         for publication in publications {
-            let mut collection = Collection::new(&mut pile, publication.scope, signer.clone());
+            let mut collection = faculties::collection_names::open(&mut pile, publication.scope, signer.clone());
             let mut commits = Vec::new();
             for fragment in publication.fragments {
                 commits.push(
@@ -285,7 +285,7 @@ fn snapshots(
     publications
         .iter()
         .map(|publication| {
-            let mut collection = Collection::new(&mut *pile, publication.scope, signer.clone());
+            let mut collection = faculties::collection_names::open(&mut *pile, publication.scope, signer.clone());
             let (facts, commits, _) = collection
                 .snapshot()
                 .with_context(|| format!("snapshot {} collection", publication.name))?
@@ -617,7 +617,10 @@ mod tests {
     use crate::collection_cutover::{freeze_source};
 use faculties::storage::{initialize_signer};
 
-    const SCOPE: Id = Id::new([0x61; 16]).expect("nonzero test id");
+    /// A REAL scope, not a synthetic id. A root is anchored by a name now, so
+    /// an id this build has never named is one it cannot open at all; which
+    /// faculty it is does not matter to a cutover test, only that it is named.
+    const SCOPE: Id = faculties::schemas::wiki::DEFAULT_SCOPE_ID;
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -644,7 +647,7 @@ use faculties::storage::{initialize_signer};
 
         fn publish(&self, fragment: Fragment) -> CollectionCommit {
             let pile = open_pile_strict(&self.live).unwrap();
-            let mut collection = Collection::new(pile, SCOPE, self.signer.clone());
+            let mut collection = faculties::collection_names::open(pile, SCOPE, self.signer.clone());
             let commit = collection.commit(fragment).unwrap();
             collection.close().unwrap();
             commit
@@ -656,7 +659,7 @@ use faculties::storage::{initialize_signer};
 
         fn facts(&self) -> TribleSet {
             let pile = open_pile_strict(&self.live).unwrap();
-            let mut collection = Collection::new(pile, SCOPE, self.signer.clone());
+            let mut collection = faculties::collection_names::open(pile, SCOPE, self.signer.clone());
             let facts = collection.snapshot().unwrap().into_facts();
             collection.close().unwrap();
             facts

@@ -44,7 +44,16 @@ pub fn vision_pile() -> PathBuf {
 }
 
 fn load_model_snapshot(path: &Path, model: &str) -> Result<CollectionSnapshot<PileReader>> {
-    mary::model_collection::load_model_collection_local_latest(path).with_context(|| {
+    // Which team's model graph? The pile says. Discovering it beats taking it
+    // as a parameter: every caller here holds only a path, so a parameter would
+    // move the guess up one level rather than remove it.
+    let team = mary::model_collection::model_graph_team_at(path).with_context(|| {
+        format!(
+            "read the sole model-graph team for {model} from {}",
+            path.display()
+        )
+    })?;
+    mary::model_collection::load_model_collection_local_latest(path, team).with_context(|| {
         format!(
             "load locally admitted native Mary collection for {model} from {}",
             path.display()
@@ -171,12 +180,26 @@ mod tests {
         fragment
     }
 
+    /// The one team every fragment in these fixtures is published under.
+    ///
+    /// The SIGNERS still vary per fragment, deliberately: local admission
+    /// accepts any signer, and one collection carrying commits from several
+    /// keys is exactly the shape this test is about. What must not vary is the
+    /// team, because the team is half of what names the collection — vary that
+    /// and the fixture publishes two model graphs and then cannot say which
+    /// one it meant.
+    fn fixture_team() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[0x30; 32]).verifying_key()
+    }
+
     fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
         let mut pile = Pile::open(path).expect("open synthetic model pile");
         for (index, fragment) in fragments.into_iter().enumerate() {
+            let signer = SigningKey::from_bytes(&[0x31 + index as u8; 32]);
             mary::model_collection::publish_model_fragment(
                 &mut pile,
-                &SigningKey::from_bytes(&[0x31 + index as u8; 32]),
+                fixture_team(),
+                &signer,
                 fragment,
             )
             .expect("publish native model fragment");

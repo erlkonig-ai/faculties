@@ -1050,7 +1050,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
         let pile = open_pile_strict(&pile_path).unwrap();
-        let mut collection = Collection::new(pile, schema::DEFAULT_COMB_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_COMB_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), *cutover.facts());
         let reader = collection.storage_mut().reader().unwrap();
         let metadata_facts: TribleSet = reader

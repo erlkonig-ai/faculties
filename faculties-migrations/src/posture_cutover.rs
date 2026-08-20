@@ -298,15 +298,21 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
         let signer = load_signer(&fixture.destination, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.destination).unwrap();
-        let discovery = discover_target(&mut pile, schema::DEFAULT_POLICY_SCOPE_ID).unwrap();
-        let expected = simplearchive_union::descriptor(schema::DEFAULT_POLICY_SCOPE_ID);
-        assert_eq!(discovery.descriptor().handle(), expected.handle());
+        let discovery = discover_target(&mut pile, schema::DEFAULT_POLICY_SCOPE_ID, signer.verifying_key()).unwrap();
+        let expected = faculties::collection_names::root_descriptor(schema::DEFAULT_POLICY_SCOPE_ID, signer.verifying_key());
+        assert_eq!(discovery.descriptor().facts(), expected.facts());
+        // Written out rather than reached for: core deliberately offers no
+        // helper for hashing a descriptor it did not store.
+        let expected_collection = triblespace::core::blob::IntoBlob::<
+            triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+        >::to_blob(expected.facts().clone())
+        .get_handle();
         assert_eq!(discovery.commits().len(), 3);
         assert!(discovery
             .commits()
             .iter()
-            .all(|commit| commit.collection() == expected.handle()));
-        let mut collection = Collection::new(pile, schema::DEFAULT_POLICY_SCOPE_ID, signer);
+            .all(|commit| commit.collection() == expected_collection));
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_POLICY_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), plan.materialized_facts());
         collection.into_storage().close().unwrap();
 

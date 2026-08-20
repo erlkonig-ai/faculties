@@ -380,7 +380,9 @@ fn main() -> Result<()> {
             let catalog = habits::read_catalog(&cli.pile, cli.key.as_deref())?;
             println!(
                 "Habit collection {} (scope {DEFAULT_SCOPE_ID:X}): {} definitions ({} live, {} carrying their own script), {} completions, {} state assertions validated",
-                hex::encode_upper(habits::descriptor().handle().raw),
+                hex::encode_upper(
+                    habits::collection_handle(&cli.pile, cli.key.as_deref())?.raw
+                ),
                 catalog.habits().count(),
                 catalog.live().len(),
                 catalog

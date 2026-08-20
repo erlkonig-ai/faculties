@@ -534,7 +534,7 @@ pub fn publish(
     // replay finish after a process died on an earlier valid plan prefix.
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
-    let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+    let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let existing = collection
             .materialize()
@@ -903,7 +903,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         assert_eq!(facts, fixture.canonical_facts);
         let reader = collection.storage_mut().reader().unwrap();
@@ -921,7 +921,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         // Publish only the scope commit, deliberately omitting the identity it
         // references. The raw collection is temporarily not a valid Secrets
         // catalog, as can happen if a process dies partway through migration.
@@ -935,7 +935,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), fixture.canonical_facts);
         collection.into_storage().close().unwrap();
     }
@@ -948,7 +948,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let mut conflict = Fragment::empty();
         let other_name = conflict.put("not-alice".to_owned());
         conflict += entity! { ExclusiveId::force_ref(&fixture.identity) @
@@ -971,7 +971,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         collection
             .commit(Fragment::from(fixture.retired_facts.clone()))
             .unwrap();

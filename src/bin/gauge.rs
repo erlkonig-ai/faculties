@@ -523,7 +523,7 @@ mod tests {
         fn publish(&self, fragment: Fragment) {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
-            Collection::new(
+            faculties::collection_names::open(
                 &mut pile,
                 faculties::schemas::wiki::DEFAULT_SCOPE_ID,
                 signer,

@@ -115,7 +115,7 @@ enum Command {
     },
     /// Recent scans
     Scans,
-    /// Install a pre-push hook so the audit runs without being remembered
+    /// Install git hooks so the audit runs without being remembered
     Hook {
         /// Repository to install into
         #[arg(long, default_value = ".")]
@@ -127,9 +127,17 @@ enum Command {
         /// channel describes a DESTINATION, so auditing every remote against
         /// one channel is a category error — it blocked a push to a private
         /// archive using the public vocabulary. Omit to audit every remote,
-        /// which is the fail-closed default.
+        /// which is the fail-closed default. Applies to the pre-push gate
+        /// only: a commit has no destination yet.
         #[arg(long)]
         remote_match: Option<String>,
+        /// Install only the pre-push GATE, which refuses a push.
+        #[arg(long)]
+        pre_push: bool,
+        /// Install only the post-commit SMOKE ALARM, which refuses nothing and
+        /// tells you while `git commit --amend` is still cheap.
+        #[arg(long)]
+        post_commit: bool,
     },
     /// Store a passage of protected material, embedded, for the semantic tier
     Exemplar {
@@ -1991,14 +1999,25 @@ impl PostureStorage<'_> {
     }
 }
 
+/// The team an already-open collection belongs to.
+fn collection_team(collection: &Collection<Pile>) -> Result<ed25519_dalek::VerifyingKey> {
+    triblespace::core::collection::descriptor::team(collection.descriptor().facts())
+        .ok_or_else(|| anyhow!("a Posture root descriptor names the team it belongs to"))?
+        .map_err(|error| anyhow!("decode the team on the Posture root descriptor: {error}"))
+}
+
 fn materialize_stable(
     collection: &mut Collection<Pile>,
     scope: Id,
     author: [u8; 32],
     label: &str,
 ) -> Result<(TribleSet, Vec<CollectionCommit>)> {
+    // The team is read back off the collection we already hold rather than
+    // passed in beside it: it is a property of that collection, and a second
+    // copy travelling alongside is a second thing that can disagree.
+    let team = collection_team(collection)?;
     loop {
-        let before = discover_target(collection.storage_mut(), scope)
+        let before = discover_target(collection.storage_mut(), scope, team)
             .with_context(|| format!("discover fixed Posture {label} descriptor"))?;
         let before = before
             .commits()
@@ -2009,7 +2028,7 @@ fn materialize_stable(
         let facts = collection
             .materialize()
             .with_context(|| format!("materialize authored Posture {label} collection"))?;
-        let after = discover_target(collection.storage_mut(), scope)
+        let after = discover_target(collection.storage_mut(), scope, team)
             .with_context(|| format!("rediscover fixed Posture {label} descriptor"))?;
         let after = after
             .commits()
@@ -4797,19 +4816,42 @@ fn cmd_git(
     Ok(())
 }
 
-/// Write a pre-push hook that runs the audit on whatever is about to be pushed.
+/// Write the git hooks that run the audit without anyone having to remember it.
 ///
 /// This is the point of the whole thing. A check you have to remember to run is
 /// not a check — yesterday's near-miss was caught because I happened to look at
 /// the remote first, which is luck, not process. Git already knows when content
 /// is about to cross into a channel; the audit should be a side effect of that
 /// moment rather than a separate obligation.
+///
+/// TWO moments, doing different jobs.
+///
+/// `pre-push` is the GATE. It refuses, because a push is the last moment the
+/// material is still preventable.
+///
+/// `post-commit` is the SMOKE ALARM. By push time a leak is already in history
+/// and the remedy is a rewrite; one commit earlier the remedy is
+/// `git commit --amend`, which costs nothing. So it audits the commit that just
+/// happened and SAYS so. It never fails: the commit already exists, a non-zero
+/// exit from post-commit changes nothing git does, and a hook that produces
+/// only noise gets deleted.
+///
+/// Both are installed by default because they are two halves of one habit;
+/// `--pre-push` or `--post-commit` installs just that one.
 fn cmd_hook(
     storage: PostureStorage<'_>,
     repo: &Path,
     channel: &str,
     remote_match: Option<&str>,
+    pre_push: bool,
+    post_commit: bool,
 ) -> Result<()> {
+    // Neither flag means "set this repo up", which is both. Naming one is a
+    // deliberate restriction, never an accidental one.
+    let (want_pre_push, want_post_commit) = match (pre_push, post_commit) {
+        (false, false) => (true, true),
+        pair => pair,
+    };
     let git_dir = {
         let out = std::process::Command::new("git")
             .arg("-C")
@@ -4830,17 +4872,50 @@ fn cmd_hook(
     };
     let hooks = git_dir.join("hooks");
     std::fs::create_dir_all(&hooks).map_err(|e| anyhow!("create {}: {e}", hooks.display()))?;
-    let path = hooks.join("pre-push");
 
     let exe = std::env::current_exe()
         .map_err(|e| anyhow!("locate posture binary: {e}"))?
         .display()
         .to_string();
+    let pile = storage.pile.display().to_string();
+    let key = storage
+        .key
+        .map(Path::display)
+        .map(|path| path.to_string())
+        .unwrap_or_default();
+
+    // Shared by both hooks so they cannot drift apart on the one thing that
+    // matters most: what happens when the tooling is missing. `verdict` is the
+    // word for what this particular hook does about it, because the pre-push
+    // gate refuses the push and the post-commit alarm cannot refuse anything.
+    let missing_tooling = |verdict: &str, on_missing_exit: &str| {
+        format!(
+            r#"# Fail LEGIBLY. If the binary has been rebuilt away or the pile has moved,
+# "command not found" gives no clue why. A safety tool that gets in the way
+# without explaining itself gets deleted in irritation, which is the worst
+# possible outcome for it.
+if [ ! -x "$POSTURE" ]; then
+    echo "posture: hook installed but the binary is missing at:" >&2
+    echo "           $POSTURE" >&2
+    echo "         Rebuild it, or remove this hook with:" >&2
+    echo "           rm \"$0\"" >&2
+    echo "         {verdict}" >&2
+    exit {on_missing_exit}
+fi
+if [ ! -f "$PILE" ]; then
+    echo "posture: hook installed but the pile is missing at:" >&2
+    echo "           $PILE" >&2
+    echo "         The protected vocabulary lives there, so nothing can be checked." >&2
+    echo "         {verdict}" >&2
+    exit {on_missing_exit}
+fi"#
+        )
+    };
 
     // The pre-push protocol feeds us "<local ref> <local sha> <remote ref>
     // <remote sha>" per line. An all-zero remote sha means the remote has no
     // such ref yet — a brand-new branch.
-    let script = format!(
+    let pre_push_script = format!(
         r#"#!/bin/sh
 # Installed by `posture hook`. Audits what is about to cross into a channel.
 # Bypass with --no-verify, but read what it says first.
@@ -4867,25 +4942,7 @@ if [ -n "$REMOTE_MATCH" ]; then
     esac
 fi
 
-# Fail CLOSED but legibly. If the binary has been rebuilt away or the pile has
-# moved, every push in this repo starts failing, and "command not found" gives
-# no clue why. A safety tool that blocks work without explaining itself gets
-# deleted in irritation, which is the worst possible outcome for it.
-if [ ! -x "$POSTURE" ]; then
-    echo "posture: hook installed but the binary is missing at:" >&2
-    echo "           $POSTURE" >&2
-    echo "         Rebuild it, or remove this hook with:" >&2
-    echo "           rm \"$0\"" >&2
-    echo "         Refusing the push rather than passing an unchecked one." >&2
-    exit 1
-fi
-if [ ! -f "$PILE" ]; then
-    echo "posture: hook installed but the pile is missing at:" >&2
-    echo "           $PILE" >&2
-    echo "         The protected vocabulary lives there, so nothing can be checked." >&2
-    echo "         Refusing the push rather than passing an unchecked one." >&2
-    exit 1
-fi
+{missing}
 
 status=0
 # What is already at the remote is not preventable, so the gate does not read
@@ -4930,27 +4987,181 @@ fi
 exit $status
 "#,
         exe = exe,
-        pile = storage.pile.display(),
-        key = storage
-            .key
-            .map(Path::display)
-            .map(|path| path.to_string())
-            .unwrap_or_default(),
+        pile = pile,
+        key = key,
         channel = channel,
         remote_match = remote_match.unwrap_or(""),
+        missing = missing_tooling(
+            "Refusing the push rather than passing an unchecked one.",
+            "1"
+        ),
     );
 
+    // ADVISORY, and every line below follows from that. The commit already
+    // exists; there is no verdict to hand back, only news to deliver early
+    // enough to be worth having.
+    //
+    // DETACHED, and that follows from advisory too. The audit costs one pile
+    // open, which on a real pile is not small: 142s of CPU to read a one-line
+    // commit, measured. A commit that pauses for two minutes is a commit
+    // nobody makes, and this hook would be deleted within the day. Since there
+    // is no verdict to wait for, nothing is gained by making anyone wait —
+    // `git commit --amend` stays cheap until the push, not for the next two
+    // minutes. So git returns immediately and the report arrives when it does,
+    // in the terminal and in a log beside the hook so it cannot be lost.
+    let post_commit_script = format!(
+        r#"#!/bin/sh
+# Installed by `posture hook`. Audits the commit that just happened, so a leak
+# is news while `git commit --amend` is still the whole remedy.
+#
+# ADVISORY. It never fails a commit — the commit already exists, so a non-zero
+# exit would change nothing git does and would only train you to ignore it.
+# The gate that actually refuses is the pre-push hook.
+#
+# It does NOT consult a remote-match: a commit has no destination yet, so it
+# always audits against '{channel}'. Erring toward telling you is the right
+# error for something that cannot block.
+POSTURE="{exe}"
+PILE="{pile}"
+KEY="{key}"
+CHANNEL="{channel}"
+
+{missing}
+
+GIT_DIR_PATH=$(git rev-parse --git-dir)
+LOG="$GIT_DIR_PATH/posture-post-commit.log"
+LOCK="$GIT_DIR_PATH/posture-post-commit.lock"
+
+# Just the commit that was made. `HEAD^@` is all of HEAD's parents, so on a
+# merge this is the merge commit alone rather than the entire branch it brought
+# in — those commits were news when they were made, and re-announcing them on
+# every merge is how an alarm becomes wallpaper. A root commit has no parent to
+# subtract.
+if git rev-parse --verify --quiet HEAD^1 >/dev/null 2>&1; then
+    revisions="HEAD --not HEAD^@"
+else
+    revisions="HEAD"
+fi
+head_sha=$(git rev-parse HEAD)
+
+# `mkdir` is the atomic test-and-set every shell has. Two audits of one pile at
+# once would only make both slower; the one already running is announced rather
+# than silently dropped, because a smoke alarm that quietly does nothing is
+# worse than no smoke alarm.
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "posture: an audit of an earlier commit is still running, so $(git rev-parse --short HEAD) was NOT checked."
+    echo "         Re-run it yourself with:  posture git HEAD --not HEAD^@ --channel $CHANNEL"
+    echo "         (or remove a stale lock:  rmdir \"$LOCK\")"
+    exit 0
+fi
+
+# Detached. Deliberately unquoted revisions: they are revision arguments and
+# must reach git separately.
+{{
+    if [ -n "$KEY" ]; then
+        report=$(PILE="$PILE" TRIBLESPACE_KEY="$KEY" \
+            "$POSTURE" git --channel "$CHANNEL" $revisions 2>&1)
+    else
+        report=$(PILE="$PILE" "$POSTURE" git --channel "$CHANNEL" $revisions 2>&1)
+    fi
+    found=$?
+    rmdir "$LOCK" 2>/dev/null
+
+    if [ "$found" = 0 ]; then
+        # Quiet on a clean commit. The full coverage report after every single
+        # commit is noise, and noise is how this hook gets removed.
+        echo ""
+        echo "posture: nothing flagged in $(git rev-parse --short "$head_sha" 2>/dev/null) for '$CHANNEL' (narrow by"
+        echo "         construction — \`posture git HEAD --not HEAD^@\` prints what it did not check)."
+        exit 0
+    fi
+
+    echo ""
+    echo "posture: COMMIT $(git rev-parse --short "$head_sha" 2>/dev/null) carries something the '$CHANNEL' channel protects."
+    echo ""
+    printf '%s\n' "$report" | sed 's/^/  /'
+    echo ""
+    echo "  It is not pushed yet, so the whole remedy is still cheap:"
+    echo "    git commit --amend        (fix the content, keep the commit)"
+    echo "  or, if the material is genuinely fine for this channel:"
+    echo "    decide propose \"<what this is>\" --context \"<why it is fine>\" --about <finding id>"
+    echo "    decide resolve <decision> \"<the reasoning>\" --result benign"
+    echo ""
+    echo "  Nothing is blocked. The pre-push hook is what will refuse."
+}} 2>&1 | tee -a "$LOG" &
+
+# Advisory to the end: never non-zero, and never a wait.
+exit 0
+"#,
+        exe = exe,
+        pile = pile,
+        key = key,
+        channel = channel,
+        missing = missing_tooling(
+            "Reporting nothing rather than pretending this commit was checked.",
+            "0"
+        ),
+    );
+
+    let mut wanted = Vec::new();
+    if want_pre_push {
+        wanted.push(("pre-push", &pre_push_script));
+    }
+    if want_post_commit {
+        wanted.push(("post-commit", &post_commit_script));
+    }
+
+    // Refuse the whole install before writing ANY of it. Half-installing and
+    // then erroring would leave a repo whose hooks disagree about which
+    // moments are audited, which is worse than the clean refusal.
+    for (name, _) in &wanted {
+        refuse_foreign_hook(&hooks, name)?;
+    }
+    for (name, script) in &wanted {
+        println!("installed {}", write_hook(&hooks, name, script)?.display());
+    }
+    println!("  channel : {channel}");
+    match remote_match {
+        Some(m) => println!("  remotes : only those matching {m:?} (pre-push only)"),
+        None => println!("  remotes : ALL (pass --remote-match to scope by destination)"),
+    }
+    println!("  pile    : {}", storage.pile.display());
+    if want_pre_push {
+        println!("\npre-push is the GATE. It runs on every push and exits non-zero on a hit,");
+        println!("and also when the channel has no vocabulary — a hook that passes because");
+        println!("it checked nothing is worse than no hook. It audits what the push ADDS,");
+        println!("never what the remote already holds; for existing history run");
+        println!("`posture sweep --history`.");
+    }
+    if want_post_commit {
+        println!("\npost-commit is the SMOKE ALARM. It audits the commit that just happened");
+        println!("and never refuses anything — by push time a leak is history and the remedy");
+        println!("is a rewrite; one commit earlier it is `git commit --amend`. It runs");
+        println!("DETACHED, so the commit returns at once and the report follows a little");
+        println!("later, in the terminal and in .git/posture-post-commit.log.");
+    }
+    Ok(())
+}
+
+/// Never clobber someone else's hook silently — that would be a destructive
+/// side effect of a command that reads like a setup step.
+fn refuse_foreign_hook(hooks: &Path, name: &str) -> Result<()> {
+    let path = hooks.join(name);
     if path.exists() {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         if !existing.contains("Installed by `posture hook`") {
-            // Never clobber someone else's hook silently — that would be a
-            // destructive side effect of a command that reads like a setup step.
             anyhow::bail!(
                 "{} already exists and was not written by posture; refusing to overwrite it",
                 path.display()
             );
         }
     }
+    Ok(())
+}
+
+/// Write one hook, executable.
+fn write_hook(hooks: &Path, name: &str, script: &str) -> Result<PathBuf> {
+    let path = hooks.join(name);
     std::fs::write(&path, script).map_err(|e| anyhow!("write {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
@@ -4958,19 +5169,7 @@ exit $status
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| anyhow!("chmod {}: {e}", path.display()))?;
     }
-    println!("installed {}", path.display());
-    println!("  channel : {channel}");
-    match remote_match {
-        Some(m) => println!("  remotes : only those matching {m:?}"),
-        None => println!("  remotes : ALL (pass --remote-match to scope by destination)"),
-    }
-    println!("  pile    : {}", storage.pile.display());
-    println!("\nIt runs on every push. It exits non-zero on a hit, and also when the");
-    println!("channel has no vocabulary — a hook that passes because it checked");
-    println!("nothing is worse than no hook.");
-    println!("\nIt audits what the push ADDS, never what the remote already holds.");
-    println!("For existing history, run `posture sweep --history`.");
-    Ok(())
+    Ok(path)
 }
 
 // ── the semantic tier ────────────────────────────────────────────────────────
@@ -5613,7 +5812,16 @@ fn main() -> Result<()> {
             repo,
             channel,
             remote_match,
-        }) => cmd_hook(storage, &repo, &channel, remote_match.as_deref()),
+            pre_push,
+            post_commit,
+        }) => cmd_hook(
+            storage,
+            &repo,
+            &channel,
+            remote_match.as_deref(),
+            pre_push,
+            post_commit,
+        ),
         Some(Command::Sweep {
             root,
             channel,
@@ -6535,6 +6743,102 @@ mod tests {
             .contains(&occurrence));
     }
 
+    /// The two hooks do different jobs, and the difference has to be real in
+    /// the generated scripts, not only in the documentation.
+    #[test]
+    fn the_gate_refuses_and_the_smoke_alarm_never_does() {
+        let store = TestStore::new();
+        let repo = git_audit_fixture();
+        let hooks = repo.path().join(".git").join("hooks");
+
+        cmd_hook(
+            store.storage(),
+            repo.path(),
+            "github-public",
+            Some("example"),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let pre_push = std::fs::read_to_string(hooks.join("pre-push")).unwrap();
+        let post_commit = std::fs::read_to_string(hooks.join("post-commit")).unwrap();
+
+        // Neither flag installs both: they are two halves of one habit.
+        assert!(pre_push.contains("Installed by `posture hook`"));
+        assert!(post_commit.contains("Installed by `posture hook`"));
+
+        // The gate reads what the push ADDS, and refuses.
+        assert!(pre_push.contains("--not $already_there"));
+        assert!(pre_push.contains("exit $status"));
+        assert!(pre_push.contains("Refusing the push"));
+
+        // The alarm reads the commit that just happened, and cannot refuse:
+        // every exit it can reach is zero, including the one where its own
+        // tooling is missing.
+        assert!(post_commit.contains("HEAD --not HEAD^@"));
+        // It must not make anyone WAIT either: one pile open is 142s of CPU,
+        // and a commit that pauses for two minutes is a commit nobody makes.
+        assert!(
+            post_commit.contains("| tee -a \"$LOG\" &"),
+            "the audit has to run detached or the hook is unusable on a real pile"
+        );
+        assert!(post_commit.contains("mkdir \"$LOCK\""));
+        assert!(
+            !post_commit.contains("exit 1"),
+            "a post-commit hook that exits non-zero changes nothing git does and \
+             only trains the reader to ignore it"
+        );
+        // A destination it cannot know must not silently narrow what it reads.
+        assert!(!post_commit.contains("REMOTE_MATCH"));
+
+        // Naming one hook is a deliberate restriction. Install into a second
+        // repo so this is not confused with the pair written above.
+        let single = git_audit_fixture();
+        cmd_hook(
+            store.storage(),
+            single.path(),
+            "github-public",
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        let single_hooks = single.path().join(".git").join("hooks");
+        assert!(single_hooks.join("post-commit").exists());
+        assert!(!single_hooks.join("pre-push").exists());
+    }
+
+    /// A hook someone else wrote is not ours to overwrite, and that has to hold
+    /// for every hook posture installs, not only the first one it learned.
+    #[test]
+    fn a_foreign_hook_of_either_name_is_never_clobbered() {
+        let store = TestStore::new();
+        for name in ["pre-push", "post-commit"] {
+            let repo = git_audit_fixture();
+            let hooks = repo.path().join(".git").join("hooks");
+            std::fs::create_dir_all(&hooks).unwrap();
+            std::fs::write(hooks.join(name), "#!/bin/sh\n# someone else's\n").unwrap();
+            let error = cmd_hook(
+                store.storage(),
+                repo.path(),
+                "github-public",
+                None,
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("not written by posture"),
+                "{name}: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(hooks.join(name)).unwrap(),
+                "#!/bin/sh\n# someone else's\n"
+            );
+        }
+    }
+
     #[test]
     fn posture_cli_has_no_parallel_verdict_commands() {
         let command = Cli::command();
@@ -6556,9 +6860,17 @@ mod tests {
             IMPLEMENTED.iter().copied().collect(),
         );
         let pile = open_pile_strict(&store.pile).unwrap();
+        // `Collection::new` directly, NOT the team-of-one opener: the whole
+        // point is a signer that is not the team. The foreign key must address
+        // the SAME collection — same name, same team — or this proves only that
+        // two different collections do not see each other, which is trivial.
+        let team = faculties::storage::load_signer(&store.pile, Some(&store.key))
+            .unwrap()
+            .verifying_key();
         let mut foreign = Collection::new(
             pile,
-            DEFAULT_SCAN_SCOPE_ID,
+            &faculties::collection_names::require_name(DEFAULT_SCAN_SCOPE_ID),
+            team,
             ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]),
         );
         foreign.commit(fragment).unwrap();
@@ -6573,11 +6885,10 @@ mod tests {
             .is_empty());
 
         let mut pile = open_pile_strict(&store.pile).unwrap();
-        let target = discover_target(&mut pile, DEFAULT_SCAN_SCOPE_ID).unwrap();
+        let target = discover_target(&mut pile, DEFAULT_SCAN_SCOPE_ID, team).unwrap();
         assert_eq!(
-            target.descriptor().handle(),
-            triblespace::core::collection::simplearchive_union::descriptor(DEFAULT_SCAN_SCOPE_ID)
-                .handle()
+            target.descriptor().facts(),
+            faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, team).facts()
         );
         assert_eq!(target.commits().len(), 1);
         pile.close().unwrap();

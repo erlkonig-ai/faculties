@@ -549,7 +549,13 @@ fn load_catalog(
         for (scope, label) in materialization_scopes(sources) {
             let (collection_id, facts) = {
                 let mut collection = open_scope(&mut pile, scope, signer.clone());
-                let collection_id = collection.descriptor().handle();
+                // Written out rather than reached for: core deliberately offers
+                // no helper for hashing a descriptor it did not store. This one
+                // is a display key for the loaded view, never published under.
+                let collection_id = triblespace::core::blob::IntoBlob::<
+                    triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+                >::to_blob(collection.descriptor().facts().clone())
+                .get_handle();
                 let facts = collection
                     .materialize()
                     .map_err(|error| format!("materialize {label} collection: {error}"))?;
@@ -794,7 +800,7 @@ mod tests {
 
         let signer = load_signer(path, None).unwrap();
         let mut pile = open_pile_strict(path).unwrap();
-        Collection::new(&mut pile, STATUS_SCOPE_ID, signer)
+        crate::collection_names::open(&mut pile, STATUS_SCOPE_ID, signer)
             .commit(fragment)
             .unwrap();
         pile.close().unwrap();

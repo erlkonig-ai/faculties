@@ -935,7 +935,7 @@ mod tests {
         let signer = initialize_signer(&pile, Some(&key)).unwrap();
         let mut pile_store = open_pile_strict(&pile).unwrap();
         let before = {
-            let mut collection = Collection::new(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
+            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
             collection.materialize().unwrap()
         };
         let reader = pile_store.reader().unwrap();
@@ -946,11 +946,11 @@ mod tests {
         assert_eq!(catalog.chunks.len(), 1);
 
         {
-            let mut collection = Collection::new(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
+            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
             collection.commit(fragment).unwrap();
         }
         let after = {
-            let mut collection = Collection::new(&mut pile_store, DEFAULT_SCOPE_ID, signer);
+            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer);
             collection.materialize().unwrap()
         };
         let reader = pile_store.reader().unwrap();
@@ -972,11 +972,11 @@ mod tests {
         let mut initial = left;
         initial += right;
         {
-            let mut collection = Collection::new(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
+            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
             collection.commit(initial).unwrap();
         }
         let current = {
-            let mut collection = Collection::new(&mut pile_store, DEFAULT_SCOPE_ID, signer);
+            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer);
             collection.materialize().unwrap()
         };
         let reader = pile_store.reader().unwrap();

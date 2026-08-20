@@ -3290,7 +3290,7 @@ mod tests {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
             let mut materialize = |scope| CollectionView {
-                facts: Collection::new(&mut pile, scope, signer.clone())
+                facts: crate::collection_names::open(&mut pile, scope, signer.clone())
                     .materialize()
                     .unwrap(),
                 reader: pile.reader().unwrap(),

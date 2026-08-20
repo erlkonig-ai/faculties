@@ -1574,7 +1574,7 @@ mod tests {
     use triblespace::prelude::TryToInline;
 
     use crate::collection_cutover::{freeze_source};
-use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
+use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
@@ -1745,8 +1745,9 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
     }
 
     fn target_facts(fixture: &Fixture) -> (TribleSet, TribleSet, usize) {
+        let signer = load_signer(&fixture.target, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.target).unwrap();
-        let target = discover_target(&mut pile, schema::DEFAULT_SCOPE_ID).unwrap();
+        let target = discover_target(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let commit_count = target.commits().len();
         let reader = pile.reader().unwrap();
         let mut facts = TribleSet::new();

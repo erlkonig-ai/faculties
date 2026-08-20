@@ -380,7 +380,7 @@ pub fn publish(
 
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
-    let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+    let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let existing = collection
             .materialize()
@@ -726,7 +726,7 @@ mod tests {
     fn materialize(path: &Path, key: &Path) -> TribleSet {
         let signer = load_signer(path, Some(key)).unwrap();
         let pile = open_pile_strict(path).unwrap();
-        let mut collection = Collection::new(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         collection.into_storage().close().unwrap();
         facts

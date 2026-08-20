@@ -1359,7 +1359,7 @@ mod tests {
             let signer = load_signer(&pile, Some(&key)).unwrap();
             let mut store = open_pile_strict(&pile).unwrap();
             let secrets_facts =
-                Collection::new(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer)
+                faculties::collection_names::open(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer)
                     .materialize()
                     .unwrap();
             let secrets_reader = store.reader().unwrap();

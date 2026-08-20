@@ -987,7 +987,7 @@ mod tests {
             headspace::add_profile_fragment(&profile, &headspace::default_config(anchor), &[])
                 .unwrap();
         let headspace_facts = fragment.facts().clone();
-        Collection::new(&mut pile, schemas::headspace::DEFAULT_SCOPE_ID, signer)
+        faculties::collection_names::open(&mut pile, schemas::headspace::DEFAULT_SCOPE_ID, signer)
             .commit(fragment)
             .unwrap();
         let reader = pile.reader().unwrap();

@@ -23,14 +23,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::IntoBlob;
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
-    discover_collection_records, Collection, CollectionCommit, CollectionDerive,
-    CollectionDescriptor, CollectionMerge, CollectionRecordDiagnostic, CollectionStore,
+    discover_collection_records, Collection, CollectionCommit, CollectionDerive, CollectionMerge,
+    CollectionRecordDiagnostic, CollectionStore,
 };
-use triblespace::core::collection::simplearchive_union;
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::trible::Fragment;
@@ -46,7 +47,7 @@ use triblespace::core::signing_key_file;
 /// representation-specific validation before they become usable equations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetDiscovery {
-    descriptor: CollectionDescriptor,
+    descriptor: Fragment,
     commits: Vec<CollectionCommit>,
     merges: Vec<CollectionMerge>,
     derives: Vec<CollectionDerive>,
@@ -55,7 +56,11 @@ pub struct TargetDiscovery {
 
 impl TargetDiscovery {
     /// Canonical `SimpleArchive`-union descriptor for the requested scope.
-    pub fn descriptor(&self) -> &CollectionDescriptor {
+    ///
+    /// A `Fragment` rather than a bare `TribleSet`: this one was BUILT here, so
+    /// it still carries its root and metafacts, and throwing those away only to
+    /// scan for them again later would be paying to lose information.
+    pub fn descriptor(&self) -> &Fragment {
         &self.descriptor
     }
 
@@ -88,15 +93,24 @@ impl TargetDiscovery {
 
 /// Discover one target directly through the native collection-record store.
 ///
-/// The canonical descriptor and its collection handle are derived from
-/// `scope`; no definition registry, blob scan, or legacy pin lookup
+/// The canonical descriptor and its collection handle are derived from `scope`
+/// and `team`; no definition registry, blob scan, or legacy pin lookup
 /// participates in target discovery.
-pub fn discover_target<S>(store: &mut S, scope: Id) -> Result<TargetDiscovery>
+///
+/// `team` is the team's ROOT key, not the key that signs commits — they
+/// coincide only for a team of one, and it is a parameter rather than a default
+/// because a collection rooted at the wrong key is one nothing else can find.
+pub fn discover_target<S>(store: &mut S, scope: Id, team: VerifyingKey) -> Result<TargetDiscovery>
 where
     S: CollectionStore,
 {
-    let descriptor = simplearchive_union::descriptor(scope);
-    let collection = descriptor.handle();
+    let descriptor = crate::collection_names::root_descriptor(scope, team);
+    // Written out rather than reached for: core deliberately offers no helper
+    // for hashing a descriptor it did not store, because a handle computed
+    // beside a store instead of by it can name a collection whose descriptor is
+    // absent. Discovery only ever compares against this one.
+    let collection =
+        IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
     let records =
         discover_collection_records(store).context("discover native collection records")?;
     let commits = records
@@ -262,7 +276,7 @@ pub fn publish_fragments(
 ) -> Result<Vec<CollectionCommit>> {
     let signer = load_signer(pile_path, key_path)?;
     let pile = open_pile_strict(pile_path)?;
-    let mut collection = Collection::new(pile, scope, signer);
+    let mut collection = crate::collection_names::open(pile, scope, signer);
     let result = (|| {
         let mut commits = Vec::new();
         for fragment in fragments {
@@ -318,6 +332,11 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    /// Content identity of a descriptor these tests built but have not stored.
+    fn collection_of(descriptor: &Fragment) -> CollectionHandle {
+        IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle()
+    }
+
     use std::fs::{self, File};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -409,11 +428,17 @@ mod tests {
 
     #[test]
     fn target_discovery_uses_descriptor_handle_without_registry_record() {
-        let target_descriptor = simplearchive_union::descriptor(id(1));
-        let other_descriptor = simplearchive_union::descriptor(id(2));
-        let target = target_descriptor.handle();
-        let other = other_descriptor.handle();
+        // Two REAL scopes rather than two arbitrary ids: a root is anchored by
+        // a name now, and an id this build has never named is one it cannot
+        // open at all. Any two distinct faculties prove the same thing.
         let signer = SigningKey::from_bytes(&[7; 32]);
+        let team = signer.verifying_key();
+        let target_scope = crate::schemas::wiki::DEFAULT_SCOPE_ID;
+        let other_scope = crate::schemas::compass::DEFAULT_SCOPE_ID;
+        let target_descriptor = crate::collection_names::root_descriptor(target_scope, team);
+        let other_descriptor = crate::collection_names::root_descriptor(other_scope, team);
+        let target = collection_of(&target_descriptor);
+        let other = collection_of(&other_descriptor);
 
         let target_commit = CollectionCommit::sign(
             &signer,
@@ -456,8 +481,8 @@ mod tests {
             store.insert(record).unwrap();
         }
 
-        let discovered = discover_target(&mut store, id(1)).unwrap();
-        assert_eq!(discovered.descriptor(), &target_descriptor);
+        let discovered = discover_target(&mut store, target_scope, team).unwrap();
+        assert_eq!(discovered.descriptor().facts(), target_descriptor.facts());
         assert_eq!(discovered.commits(), &[target_commit]);
         assert_eq!(discovered.merges(), &[target_merge]);
         assert_eq!(discovered.derives(), &[derive_to_target]);
@@ -481,14 +506,21 @@ mod tests {
         assert!(!expected_facts.is_empty());
         assert!(!expected_metafacts.is_empty());
 
+        let team = load_signer(&files.pile, Some(&files.key))
+            .unwrap()
+            .verifying_key();
+        let target_scope = crate::schemas::wiki::DEFAULT_SCOPE_ID;
+        let other_scope = crate::schemas::compass::DEFAULT_SCOPE_ID;
         let first =
-            publish_fragment(&files.pile, Some(&files.key), id(1), fragment.clone()).unwrap();
+            publish_fragment(&files.pile, Some(&files.key), target_scope, fragment.clone())
+                .unwrap();
         let after_first = fs::metadata(&files.pile).unwrap().len();
 
         let unrelated = entity! { _ @ metadata::tag: &id(9) };
-        publish_fragment(&files.pile, Some(&files.key), id(2), unrelated).unwrap();
+        publish_fragment(&files.pile, Some(&files.key), other_scope, unrelated).unwrap();
         let before_replay = fs::metadata(&files.pile).unwrap().len();
-        let repeated = publish_fragment(&files.pile, Some(&files.key), id(1), fragment).unwrap();
+        let repeated =
+            publish_fragment(&files.pile, Some(&files.key), target_scope, fragment).unwrap();
         let after_replay = fs::metadata(&files.pile).unwrap().len();
 
         assert_eq!(repeated, first);
@@ -502,17 +534,20 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap()
             .is_empty());
-        let target = discover_target(&mut pile, id(1)).unwrap();
-        assert_eq!(target.descriptor(), &simplearchive_union::descriptor(id(1)));
+        let target = discover_target(&mut pile, target_scope, team).unwrap();
+        assert_eq!(
+            target.descriptor().facts(),
+            crate::collection_names::root_descriptor(target_scope, team).facts()
+        );
         assert_eq!(target.commits(), &[first]);
         assert!(target.merges().is_empty());
         assert!(target.derives().is_empty());
         assert!(target.diagnostics().is_empty());
 
-        let unrelated_target = discover_target(&mut pile, id(2)).unwrap();
+        let unrelated_target = discover_target(&mut pile, other_scope, team).unwrap();
         assert_eq!(
-            unrelated_target.descriptor(),
-            &simplearchive_union::descriptor(id(2))
+            unrelated_target.descriptor().facts(),
+            crate::collection_names::root_descriptor(other_scope, team).facts()
         );
         assert_eq!(unrelated_target.commits().len(), 1);
 

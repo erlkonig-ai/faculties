@@ -211,7 +211,7 @@ pub fn publish(
     // pile owns preflight and every idempotent collection append.
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
-    let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+    let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let existing = collection
             .materialize()
@@ -399,7 +399,7 @@ use faculties::storage::{initialize_signer};
     fn materialize(path: &Path, key: &Path) -> TribleSet {
         let signer = load_signer(path, Some(key)).unwrap();
         let pile = open_pile_strict(path).unwrap();
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         collection.into_storage().close().unwrap();
         facts
@@ -487,7 +487,7 @@ use faculties::storage::{initialize_signer};
         let prior_facts = prior.facts().clone();
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         collection.commit(prior).unwrap();
         collection.into_storage().close().unwrap();
 
@@ -517,7 +517,7 @@ use faculties::storage::{initialize_signer};
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         let partial = collection
             .commit(plan.commits()[1].fragment.clone())
             .unwrap();
@@ -539,7 +539,7 @@ use faculties::storage::{initialize_signer};
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         collection
             .commit(entity! { metadata::tag: &KIND_LIVE_RECORD })
             .unwrap();

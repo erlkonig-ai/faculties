@@ -266,8 +266,9 @@ impl RelationsStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
+        let team = signer.verifying_key();
         let result =
-            storage::discover_target(&mut pile, DEFAULT_SCOPE_ID).map(|target| {
+            storage::discover_target(&mut pile, DEFAULT_SCOPE_ID, team).map(|target| {
                 target
                     .commits()
                     .iter()

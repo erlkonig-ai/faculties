@@ -105,7 +105,7 @@ fn the_hint_goes_quiet_once_the_native_scope_has_facts() {
 
     let signer = faculties::storage::load_signer(&pile_path, None).unwrap();
     let mut pile = open_pile_strict(&pile_path).unwrap();
-    Collection::new(
+    faculties::collection_names::open(
         &mut pile,
         faculties::schemas::compass::DEFAULT_SCOPE_ID,
         signer,

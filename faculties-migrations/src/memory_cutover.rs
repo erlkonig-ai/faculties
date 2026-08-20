@@ -1247,7 +1247,7 @@ pub fn publish(
     let signer = load_signer(target, key)?;
     let mut pile = open_pile_strict(target)?;
     let result = (|| {
-        let existing = Collection::new(&mut pile, schema::DEFAULT_SCOPE_ID, signer.clone())
+        let existing = faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer.clone())
             .materialize()
             .context("materialize prior native Memory collection")?;
         let reader = pile.reader().context("open Memory migration reader")?;
@@ -1264,7 +1264,7 @@ pub fn publish(
         let mut published = Vec::with_capacity(plan.commits.len());
         {
             let mut collection =
-                Collection::new(&mut pile, schema::DEFAULT_SCOPE_ID, signer.clone());
+                faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer.clone());
             for commit in &plan.commits {
                 published.push(
                     collection
@@ -1274,7 +1274,7 @@ pub fn publish(
             }
         }
 
-        let actual = Collection::new(&mut pile, schema::DEFAULT_SCOPE_ID, signer)
+        let actual = faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer)
             .materialize()
             .context("materialize migrated Memory collection")?;
         let reader = pile.reader().context("open migrated Memory reader")?;
@@ -1642,7 +1642,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let actual = {
-            let mut collection = Collection::new(&mut pile, schema::DEFAULT_SCOPE_ID, signer);
+            let mut collection = faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer);
             collection.materialize().unwrap()
         };
         let reader = pile.reader().unwrap();

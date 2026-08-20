@@ -1310,10 +1310,13 @@ mod tests {
             .unwrap();
 
         let mut pile_storage = open_pile_strict(&pile).unwrap();
-        let discovery = discover_target(&mut pile_storage, COLLECTION_SCOPE_ID).unwrap();
+        let team = faculties::storage::load_signer(&pile, Some(&key))
+            .unwrap()
+            .verifying_key();
+        let discovery = discover_target(&mut pile_storage, COLLECTION_SCOPE_ID, team).unwrap();
         assert_eq!(
-            discovery.descriptor(),
-            &simplearchive_union::descriptor(COLLECTION_SCOPE_ID)
+            discovery.descriptor().facts(),
+            faculties::collection_names::root_descriptor(COLLECTION_SCOPE_ID, team).facts()
         );
         assert_eq!(discovery.commits().len(), 2);
         pile_storage.close().unwrap();

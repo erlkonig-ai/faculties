@@ -198,7 +198,7 @@ pub fn publish(
 
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
-    let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+    let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let current = collection
             .materialize()

@@ -112,7 +112,7 @@ pub fn status_register_delta(facts: &TribleSet) -> (TribleSet, StatusRegisterRep
 pub fn plan(pile: &Path, key: Option<&Path>) -> Result<(TribleSet, StatusRegisterReport)> {
     let signer = load_signer(pile, key)?;
     let store = open_pile_strict(pile)?;
-    let mut collection = Collection::new(store, DEFAULT_SCOPE_ID, signer);
+    let mut collection = faculties::collection_names::open(store, DEFAULT_SCOPE_ID, signer);
     let result = collection
         .materialize()
         .context("materialize the Compass collection")

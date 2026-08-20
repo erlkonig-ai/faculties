@@ -85,7 +85,11 @@ fn main() -> Result<()> {
     let pile: PathBuf = std::env::var("PILE").expect("PILE").into();
     let signer = load_signer(&pile, None)?;
     let mut handle = open_pile_strict(&pile)?;
-    let facts = Collection::new(&mut handle, faculties::schemas::wiki::DEFAULT_SCOPE_ID, signer)
+    let facts = faculties::collection_names::open(
+        &mut handle,
+        faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+        signer,
+    )
         .materialize()
         .context("materialize Wiki collection")?;
     let reader = handle.reader().context("open Wiki attachment reader")?;

@@ -331,7 +331,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), fixture.facts);
         collection.into_storage().close().unwrap();
 

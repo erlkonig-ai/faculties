@@ -22,7 +22,12 @@ use anyhow::{bail, Result};
 use triblespace::core::blob::encodings::longstring::LongString;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::collection::CollectionDescriptor;
+use ed25519_dalek::VerifyingKey;
+use triblespace::core::trible::Fragment;
+use triblespace::core::collection::records::{
+    collection_recipe, collection_representation, collection_source, CollectionHandle,
+    KIND_COLLECTION_DESCRIPTOR,
+};
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -86,15 +91,32 @@ impl MetaDescribe for ArchiveBlockTextBm25V1 {
 /// Exact descriptor for the derived Archive BM25 collection.
 ///
 /// This collection is a derivation of the archive's canonical SimpleArchive
-/// union, so it names that collection as its source rather than carrying a
-/// dataset anchor of its own.
-pub fn descriptor() -> CollectionDescriptor {
-    CollectionDescriptor::derived(
-        triblespace::core::collection::simplearchive_union::descriptor(schema::DEFAULT_SCOPE_ID)
-            .handle(),
-        <PortableBM25Blob as MetaDescribe>::describe(),
-        <ArchiveBlockTextBm25V1 as MetaDescribe>::describe(),
+/// union, so it names that collection as its SOURCE and carries neither a name
+/// nor a team of its own: a derive inherits both from what it derives from,
+/// transitively, and a second copy of them is a second thing that can go stale.
+pub fn descriptor(team: VerifyingKey) -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_source: source_collection(team),
+        collection_representation*: <PortableBM25Blob as MetaDescribe>::describe(),
+        collection_recipe*: <ArchiveBlockTextBm25V1 as MetaDescribe>::describe(),
+    }
+}
+
+/// The archive's canonical SimpleArchive union, which this collection derives
+/// from.
+///
+/// Written out rather than reached for: core deliberately offers no helper for
+/// hashing a descriptor it did not store, because a handle computed beside a
+/// store instead of by it can name a collection whose descriptor is absent.
+/// Naming a source is exactly a place where that has to be conspicuous.
+pub fn source_collection(team: VerifyingKey) -> CollectionHandle {
+    IntoBlob::<SimpleArchive>::to_blob(
+        crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, team)
+            .facts()
+            .clone(),
     )
+    .get_handle()
 }
 
 /// Build one exact portable Archive BM25 element.

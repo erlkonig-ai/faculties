@@ -1054,7 +1054,7 @@ mod tests {
         fragment += untagged_fragment;
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        Collection::new(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
+        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
             .commit(fragment)
             .unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();

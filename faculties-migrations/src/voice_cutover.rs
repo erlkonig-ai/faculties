@@ -233,7 +233,7 @@ pub fn publish(
 
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
-    let mut collection = Collection::new(pile, COLLECTION_SCOPE_ID, signer);
+    let mut collection = faculties::collection_names::open(pile, COLLECTION_SCOPE_ID, signer);
     let result = (|| {
         let mut candidate = collection
             .materialize()
@@ -911,7 +911,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         assert_eq!(published.len(), plan.commits().len());
         let signer = load_signer(&path, Some(&key)).unwrap();
         let pile = open_pile_strict(&path).unwrap();
-        let mut collection = Collection::new(pile, COLLECTION_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, COLLECTION_SCOPE_ID, signer);
         let materialized = collection.materialize().unwrap();
         assert_eq!(materialized, facts);
         let reader = collection.storage_mut().reader().unwrap();
@@ -1022,7 +1022,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&target_path, Some(&key)).unwrap();
         let pile = open_pile_strict(&target_path).unwrap();
-        let mut collection = Collection::new(pile, COLLECTION_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, COLLECTION_SCOPE_ID, signer);
         let first: Vec<_> = fragments
             .iter()
             .map(|fragment| collection.commit(fragment.clone()).unwrap())
@@ -1034,7 +1034,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&target_path, Some(&key)).unwrap();
         let pile = open_pile_strict(&target_path).unwrap();
-        let mut collection = Collection::new(pile, COLLECTION_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, COLLECTION_SCOPE_ID, signer);
         let replay: Vec<_> = fragments
             .iter()
             .map(|fragment| collection.commit(fragment.clone()).unwrap())
@@ -1045,7 +1045,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&target_path, Some(&key)).unwrap();
         let pile = open_pile_strict(&target_path).unwrap();
-        let mut collection = Collection::new(pile, COLLECTION_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, COLLECTION_SCOPE_ID, signer);
         let snapshot = collection.snapshot().unwrap();
         assert!(snapshot.facts().is_empty());
         assert_eq!(snapshot.commits().len(), 2);

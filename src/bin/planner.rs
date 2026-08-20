@@ -182,7 +182,8 @@ impl PlannerStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
-        let result = faculties::storage::discover_target(&mut pile, DEFAULT_SCOPE_ID)
+        let team = signer.verifying_key();
+        let result = faculties::storage::discover_target(&mut pile, DEFAULT_SCOPE_ID, team)
             .map(|target| {
                 target
                     .commits()

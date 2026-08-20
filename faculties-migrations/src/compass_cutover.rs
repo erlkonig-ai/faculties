@@ -285,7 +285,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let storage = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(storage, DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(storage, DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         assert_eq!(facts, fixture.source_facts);
         collection.into_storage().close().unwrap();

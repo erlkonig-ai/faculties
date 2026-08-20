@@ -1678,7 +1678,7 @@ mod tests {
     use std::fs::File;
     use std::path::Path;
 
-    use crate::schema::DEFAULT_SCOPE_ID;
+    use triblespace::core::collection::records::CollectionName;
     use triblespace::core::collection::{discover_collection_records, Collection};
     use triblespace::core::repo::pile::{Pile, PileReader};
     use triblespace::core::repo::BlobStore;
@@ -1692,7 +1692,13 @@ mod tests {
         File::create(path).unwrap();
         let mut pile = Pile::open(path).unwrap();
         pile.refresh().unwrap();
-        Collection::new(pile, DEFAULT_SCOPE_ID, SigningKey::generate(&mut OsRng))
+        // A team of one: this fixture's own key is its team root. Secrets is a
+        // standalone crate, so it names its collection here rather than through
+        // the faculties table that depends on it.
+        let signer = SigningKey::generate(&mut OsRng);
+        let team = signer.verifying_key();
+        let name = CollectionName::new("secrets").expect("`secrets` is a legal collection name");
+        Collection::new(pile, &name, team, signer)
     }
 
     fn test_view(collection: &mut Collection<Pile>) -> TestView {

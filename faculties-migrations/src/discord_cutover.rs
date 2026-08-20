@@ -162,7 +162,8 @@ pub fn publish(
 
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
-    let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+    let team = signer.verifying_key();
+    let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let existing = collection
             .materialize()
@@ -425,12 +426,13 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let team = signer.verifying_key();
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), fixture.source_facts);
-        let discovery = discover_target(collection.storage_mut(), DEFAULT_SCOPE_ID).unwrap();
+        let discovery = discover_target(collection.storage_mut(), DEFAULT_SCOPE_ID, team).unwrap();
         assert_eq!(
-            discovery.descriptor(),
-            &simplearchive_union::descriptor(DEFAULT_SCOPE_ID)
+            discovery.descriptor().facts(),
+            faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, team).facts()
         );
         assert_eq!(discovery.commits().len(), plan.commits().len());
         let mut pile = collection.into_storage();
@@ -449,7 +451,8 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let team = signer.verifying_key();
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         let partial = collection
             .commit(plan.commits()[1].fragment.clone())
             .unwrap();
@@ -459,7 +462,8 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         assert_eq!(resumed[1], partial);
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let team = signer.verifying_key();
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), fixture.source_facts);
         collection.into_storage().close().unwrap();
     }

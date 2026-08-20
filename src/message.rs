@@ -1391,11 +1391,12 @@ mod tests {
 
         let pile = open_pile_strict(&pile_path).unwrap();
         let mut relations_collection =
-            Collection::new(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.clone());
+            crate::collection_names::open(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.clone());
         relations_collection.commit(relations_fragment).unwrap();
         let pile = relations_collection.into_storage();
 
-        let mut messages = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+        let team = signer.verifying_key();
+        let mut messages = crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         let (fragment, message_id) = message_fragment(
             sender,
             &Recipient::Person(recipient),
@@ -1410,7 +1411,7 @@ mod tests {
         let second = messages.commit(fragment).unwrap();
         assert_eq!(first, second);
         assert_eq!(
-            discover_target(messages.storage_mut(), DEFAULT_SCOPE_ID)
+            discover_target(messages.storage_mut(), DEFAULT_SCOPE_ID, team)
                 .unwrap()
                 .commits()
                 .len(),

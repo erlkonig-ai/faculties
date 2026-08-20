@@ -3884,11 +3884,11 @@ mod tests {
         let scope = scope_fragment.root().unwrap();
         let mut initialization = identity.fragment;
         initialization += scope_fragment;
-        Collection::new(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
+        faculties::collection_names::open(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
             .commit(initialization)
             .unwrap();
 
-        let facts = Collection::new(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
+        let facts = faculties::collection_names::open(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
             .materialize()
             .unwrap();
         let reader = pile.reader().unwrap();
@@ -3922,7 +3922,7 @@ mod tests {
         let token_id = token.secret;
         let mut credentials = client.fragment;
         credentials += token.fragment;
-        Collection::new(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer)
+        faculties::collection_names::open(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer)
             .commit(credentials)
             .unwrap();
         pile.close().unwrap();
