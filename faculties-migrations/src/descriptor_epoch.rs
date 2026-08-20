@@ -64,6 +64,11 @@ pub struct Reseat {
 pub struct DescriptorEpochReport {
     /// Collections that can move, with their counts.
     pub reseats: Vec<Reseat>,
+    /// Collections whose states are already all present under their new
+    /// handle. The old collection is still there -- a pile is append-only and
+    /// nothing removes it -- so a re-run keeps seeing it; this is how the run
+    /// distinguishes "left to do" from "seen again".
+    pub settled: Vec<Reseat>,
     /// Collections whose representation or recipe this build cannot describe,
     /// with the reason. These are left alone rather than guessed at.
     pub undescribable: Vec<(CollectionHandle, String)>,
@@ -125,10 +130,20 @@ where
 }
 
 /// Work out what would move, without writing.
+/// The id a state will have once it is re-seated under `collection`.
+fn expected_id(
+    signer: &ed25519_dalek::SigningKey,
+    collection: CollectionHandle,
+    commit: &CollectionCommit,
+) -> Id {
+    CollectionCommit::sign(signer, collection, commit.data(), commit.metadata()).id()
+}
+
 pub fn plan(pile: &Path, key: Option<&Path>) -> Result<DescriptorEpochReport> {
-    let _ = load_signer(pile, key).context("a re-commit needs the durable signing key")?;
+    let signer = load_signer(pile, key).context("a re-commit needs the durable signing key")?;
     let mut store = open_pile_strict(pile)?;
     let by_collection = collections_with_commits(&mut store)?;
+    let existing_by_collection = by_collection.clone();
     let reader = store.reader().context("open a blob reader")?;
 
     let mut report = DescriptorEpochReport::default();
@@ -175,14 +190,31 @@ pub fn plan(pile: &Path, key: Option<&Path>) -> Result<DescriptorEpochReport> {
             report.already_current += 1;
             continue;
         }
-        report.reseats.push(Reseat {
+        let reseat = Reseat {
             old,
             new,
             scope,
             representation,
             recipe,
             commits: commits.len(),
-        });
+        };
+        // Signing is deterministic over the same transcript, so a state that
+        // has already moved has a predictable commit id under the new handle.
+        // If every one is present, this collection is settled rather than
+        // pending, however many times the migration is re-run.
+        let already: &[CollectionCommit] = existing_by_collection
+            .get(&new)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let landed: BTreeSet<_> = already.iter().map(CollectionCommit::id).collect();
+        if commits
+            .iter()
+            .all(|commit| landed.contains(&expected_id(&signer, new, commit)))
+        {
+            report.settled.push(reseat);
+        } else {
+            report.reseats.push(reseat);
+        }
     }
     store.close().map_err(anyhow::Error::from)?;
     Ok(report)

@@ -111,6 +111,7 @@ fn descriptor_epoch(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()
     };
     println!("Collection descriptor epoch");
     println!("  already self-describing : {}", report.already_current);
+    println!("  already re-seated       : {}", report.settled.len());
     println!("  collections to re-seat  : {}", report.reseats.len());
     println!("  signed states to re-sign: {}", report.commits());
     for reseat in &report.reseats {
