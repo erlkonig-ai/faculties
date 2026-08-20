@@ -3901,6 +3901,7 @@ version = "0.1.0"
 dependencies = [
  "anybytes",
  "anyhow",
+ "base64 0.22.1",
  "blake3",
  "clap",
  "ed25519-dalek",
@@ -3908,6 +3909,7 @@ dependencies = [
  "hex",
  "hifitime",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "triblespace",

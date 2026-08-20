@@ -29,7 +29,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
     activation_cutover, collection_cutover, descriptor_epoch, disposable_cutover, posture_findings,
-    status_register,
+    status_register, teams_credentials,
 };
 
 #[derive(Parser)]
@@ -99,8 +99,101 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Recover the Teams OAuth credentials the collection cutover retired.
+    ///
+    /// The cutover deliberately left the legacy plaintext OAuth rows behind
+    /// rather than republish a secret into native authority, and nothing was
+    /// built to restart authentication from them — so `teams` reports a
+    /// missing auth-profile source while the credentials sit on the legacy
+    /// branch. This reads them, never writes to the pile, and with `--export`
+    /// materializes the newest of each into `0600` files shaped for
+    /// `teams login` and `secrets secret add`.
+    TeamsCredentials {
+        /// Directory to receive the plaintext credential files. Without it,
+        /// nothing leaves the pile and only the shape is reported.
+        #[arg(long, value_name = "DIR")]
+        export: Option<PathBuf>,
+    },
+
     /// List the faculty names `migrate-legacy` accepts.
     Faculties,
+}
+
+fn teams_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
+    let report = teams_credentials::plan(pile).context("read legacy Teams credentials")?;
+    println!("Legacy Teams credentials");
+    println!("pile                     : {}", pile.display());
+    if report.legacy_branch_missing {
+        println!("\nThe legacy `teams` branch does not exist in this pile.");
+        println!("There is nothing to recover: the credentials must be re-issued in Entra");
+        println!("and published with `teams login`.");
+        return Ok(());
+    }
+    println!("legacy authored commits  : {}", report.authored_commits);
+    println!("credential rows          : {}", report.credentials.len());
+    println!("unreadable payload blobs : {}", report.unreadable_payloads);
+    println!(
+        "tenant                   : {}",
+        report.tenant().unwrap_or("(rows disagree)")
+    );
+    println!(
+        "client id                : {}",
+        report.client_id().unwrap_or("(rows disagree)")
+    );
+    println!(
+        "signed-in user id        : {}",
+        report
+            .signed_in_user_id
+            .as_deref()
+            .unwrap_or("(not recoverable from the newest token)")
+    );
+    if !report.user_ids.is_empty() {
+        println!("chat participants seen   : {}", report.user_ids.join(", "));
+    }
+    // Not a secret, and `teams login --scopes` / `teams auth set --scopes`
+    // both need it verbatim.
+    if let Some(scopes) = report.newest_token().and_then(|row| row.scopes.as_deref()) {
+        println!("delegated scopes (newest):\n  {scopes}");
+    }
+
+    println!("\nrows, newest first (lengths only — no value is ever printed):");
+    for row in &report.credentials {
+        let created = row
+            .created_at
+            .map(|epoch| format!("{epoch}"))
+            .unwrap_or_else(|| "(no recorded time)".to_owned());
+        let mut carries = Vec::new();
+        if let Some(len) = row.client_secret_len {
+            carries.push(format!("client_secret[{len}]"));
+        }
+        if let Some(len) = row.access_token_len {
+            carries.push(format!("access_token[{len}]"));
+        }
+        if let Some(len) = row.refresh_token_len {
+            carries.push(format!("refresh_token[{len}]"));
+        }
+        if let Some(expires) = row.expires_at {
+            carries.push(format!("expires={expires}"));
+        }
+        println!(
+            "  {:<6} {:x}  {created}  {}",
+            row.kind.label(),
+            row.entity,
+            carries.join(" ")
+        );
+    }
+
+    let Some(export) = export else {
+        println!("\n(nothing written; pass --export <DIR> to materialize the newest of each)");
+        return Ok(());
+    };
+    let written = teams_credentials::export(&report, export).context("export Teams credentials")?;
+    println!("\nwrote (mode 0600):");
+    for file in &written {
+        println!("  {}  — {}", file.path.display(), file.purpose);
+    }
+    println!("\nThese are live secrets in the clear. Publish them and delete the files.");
+    Ok(())
 }
 
 fn descriptor_epoch(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
@@ -302,6 +395,9 @@ fn main() -> Result<()> {
         }
         Some(Command::StatusRegister { dry_run }) => {
             status_register(&cli.pile, cli.key.as_deref(), dry_run)
+        }
+        Some(Command::TeamsCredentials { export }) => {
+            teams_credentials(&cli.pile, export.as_deref())
         }
         Some(Command::Faculties) => {
             list_faculties();
