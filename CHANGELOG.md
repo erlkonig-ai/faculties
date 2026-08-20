@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **A colleague's Teams reply now wakes the watcher.** `orient wait` blocked
+  on peer messages, Mail, goals, status windows and habits — but not on
+  Teams, so a reply from a real colleague landed in the pile with nothing
+  watching it, and the only thing noticing was an ad-hoc polling loop. Teams
+  is now part of Orient's news. It has no per-reader read state to diff, so
+  attention is the *growth* of the set of present logical messages written by
+  somebody other than us, checkpointed per persona exactly like unread Mail;
+  an edit re-observes a message we already know and is therefore silent, and a
+  deletion never announces a tombstone. Two things are deliberately not news.
+  Our own sends come back through the next delta pull, and they are filtered
+  by joining a message's author entity against the auth profile's Graph user
+  id — the same own-action rule that keeps a persona's own peer sends and
+  goal edits from waking its own watcher. Graph's authorless chat events
+  (`<systemEventMessage/>` for a member added or a chat renamed) are not
+  somebody writing to us, so an unattributed observation is never news. There
+  is no per-persona gating: one tenant account serves every window sharing
+  the pile, so a colleague's message is addressed to the pile rather than to
+  one window, which is the same reading as a peer message sent to a group you
+  are in.
+  **Orient still never talks to Graph.** `wait` re-arms after every turn and a
+  network round trip on that path would both slow the common case and
+  rate-limit the tenant, so it reads only what the pile already holds — which
+  means `teams read` remains the only thing that pulls new messages *into* the
+  pile, and a Teams message nobody has synced still cannot wake anybody.
+  Reading the Teams collection costs about 3 ms of materialization and 0.2 ms
+  of projection on the live 12.8 GB pile, against ~5 s for the command as a
+  whole. The Orient checkpoint view is now version 3; a version 1 or 2
+  checkpoint still parses, and its empty Teams set means the first check after
+  the upgrade reports the standing conversation once.
+
 - **A node has one key, not two.** Every pile writer already has a durable
   Ed25519 key beside its pile: it signs the collection commits and is the
   node's identity. Secrets, separately, minted a *second* Ed25519 key per

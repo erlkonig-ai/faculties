@@ -6,6 +6,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::memory_cover::{render_cover, CoverOpts};
+use faculties::schemas::archive::archive;
 use faculties::schemas::compass::latest_status_event;
 use faculties::schemas::compass::{
     board, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
@@ -16,10 +17,11 @@ use faculties::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use faculties::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
+use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use faculties::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use faculties::{
     compass, habits, mail as mail_model, memory as memory_model, message, orient as orient_model,
-    relations, status, wiki as wiki_model,
+    relations, status, teams as teams_model, wiki as wiki_model,
 };
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -235,6 +237,7 @@ fn visible_notes(
 struct NativeCatalogs {
     messages: TribleSet,
     mail: TribleSet,
+    teams: TribleSet,
     compass: TribleSet,
     relations: TribleSet,
     status: TribleSet,
@@ -260,6 +263,12 @@ fn materialize_scope(
 fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCatalogs> {
     let relations_facts = materialize_scope(pile, signer, RELATIONS_SCOPE_ID, "Relations")?;
     let mail_facts = materialize_scope(pile, signer, MAIL_SCOPE_ID, "Mail")?;
+    // Teams participates in news but is deliberately not run through
+    // `teams::validate_catalog` here: that reads every text payload and every
+    // attachment blob, which is far too much work for a path that re-arms
+    // after every turn. Orient only reads message identity, state and
+    // authorship, all of which are structural.
+    let teams_facts = materialize_scope(pile, signer, TEAMS_SCOPE_ID, "Teams")?;
     let message_facts = materialize_scope(pile, signer, MESSAGE_SCOPE_ID, "Message")?;
     let compass_facts = materialize_scope(pile, signer, COMPASS_SCOPE_ID, "Compass")?;
     let status_facts = materialize_scope(pile, signer, STATUS_SCOPE_ID, "Status")?;
@@ -292,6 +301,7 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
     Ok(NativeCatalogs {
         messages: message_facts,
         mail: mail_facts,
+        teams: teams_facts,
         compass: compass_facts,
         relations: relations_facts,
         status: status_facts,
@@ -425,6 +435,144 @@ fn native_unread_mail(catalogs: &NativeCatalogs, persona: Id) -> Result<BTreeMap
     }
     by_wire.retain(|_, summary| !summary.spam);
     Ok(by_wire)
+}
+
+/// Logical Teams messages that are attention items for this pile.
+///
+/// Teams carries no per-reader read state, so the attention set is every
+/// present (not deleted) logical message written by somebody other than us;
+/// news is growth of that set against the persona's last checkpoint. There is
+/// no persona gating: one tenant account serves every window sharing this
+/// pile, so a colleague's message is addressed to the pile rather than to one
+/// window — the same reading as a peer message sent to a group you are in.
+///
+/// This reads only what the pile already holds. `orient` never calls Graph:
+/// `wait` re-arms after every turn, and a network round trip on that path
+/// would both slow the common case and rate-limit the tenant. `teams read`
+/// remains the only thing that pulls new messages into the pile.
+fn native_teams_messages(catalogs: &NativeCatalogs) -> Result<BTreeSet<Id>> {
+    // Author entities for the account this pile posts as. An author's
+    // `teams::user_id` and an auth profile's `teams::auth_user_id` are both
+    // content-derived LongString handles, so equal Graph user ids are equal
+    // handle values and the join needs no blob reads.
+    let own_authors: BTreeSet<Id> = find!(
+        author: Id,
+        pattern!(&catalogs.teams, [
+            {
+                ?author @
+                metadata::tag: archive::kind_author,
+                teams::source: _?source,
+                teams::user_id: _?user,
+            },
+            {
+                _?profile @
+                metadata::tag: teams::kind_auth_profile,
+                teams::source: _?source,
+                teams::auth_user_id: _?user,
+            }
+        ])
+    )
+    .collect();
+
+    let mut present = BTreeSet::new();
+    let mut deleted = BTreeSet::new();
+    for (message, state) in find!(
+        (message: Id, state: Inline<inlineencodings::ShortString>),
+        pattern!(&catalogs.teams, [{
+            _?observation @
+            metadata::tag: teams::kind_message_observation,
+            teams::message: ?message,
+            teams::message_state: ?state,
+        }])
+    ) {
+        let state = String::try_from_inline(&state)
+            .map_err(|error| anyhow!("decode Teams observation state: {error:?}"))?;
+        match state.as_str() {
+            "present" => {
+                present.insert(message);
+            }
+            "deleted" => {
+                deleted.insert(message);
+            }
+            other => bail!("unknown Teams observation state '{other}'"),
+        }
+    }
+    for message in find!(
+        message: Id,
+        pattern!(&catalogs.teams, [{
+            _?tombstone @
+            metadata::tag: teams::kind_message_tombstone,
+            teams::message: ?message,
+        }])
+    ) {
+        deleted.insert(message);
+    }
+
+    // Our own sends come back through the next delta pull. They must not wake
+    // anybody, exactly as a persona's own peer sends and goal edits do not
+    // wake its watcher. Attribution is also what separates a message from
+    // Graph's authorless chat events (`<systemEventMessage/>` for a member
+    // added, a chat renamed, ...): news is somebody writing to us, so an
+    // unattributed observation is never news, and can never be mistaken for a
+    // colleague when we cannot even check it against our own account.
+    let mut own = BTreeSet::new();
+    let mut from_others = BTreeSet::new();
+    for (message, author) in find!(
+        (message: Id, author: Id),
+        pattern!(&catalogs.teams, [{
+            _?observation @
+            metadata::tag: teams::kind_message_observation,
+            teams::message: ?message,
+            archive::author: ?author,
+        }])
+    ) {
+        if own_authors.contains(&author) {
+            own.insert(message);
+        } else {
+            from_others.insert(message);
+        }
+    }
+
+    present.retain(|message| {
+        from_others.contains(message) && !own.contains(message) && !deleted.contains(message)
+    });
+    Ok(present)
+}
+
+/// Newest observation of one logical Teams message, with the display name and
+/// body worth printing when it turns up as news.
+fn teams_message_detail(catalogs: &NativeCatalogs, message: Id) -> Result<(String, String)> {
+    let newest = find!(
+        (modified: IntervalValue, observation: Id),
+        pattern!(&catalogs.teams, [{
+            ?observation @
+            metadata::tag: teams::kind_message_observation,
+            teams::message: message,
+            teams::modified_at: ?modified,
+        }])
+    )
+    .map(|(modified, observation)| (interval_key(modified), observation))
+    .max();
+    let Some((_, observation)) = newest else {
+        return Ok(("(unknown)".to_owned(), "(no observation)".to_owned()));
+    };
+    let author = find!(
+        handle: teams_model::TextHandle,
+        pattern!(&catalogs.teams, [{ observation @ teams::author_name: ?handle }])
+    )
+    .next()
+    .map(|handle| teams_model::read_text(&catalogs.reader, handle, "Teams author display name"))
+    .transpose()?
+    .unwrap_or_else(|| "(unknown)".to_owned());
+    let content = find!(
+        handle: teams_model::TextHandle,
+        pattern!(&catalogs.teams, [{ observation @ archive::content: ?handle }])
+    )
+    .next()
+    .map(|handle| teams_model::read_text(&catalogs.reader, handle, "Teams message content"))
+    .transpose()?
+    .unwrap_or_else(|| "(no content)".to_owned());
+    Ok((author, content))
 }
 
 /// Render the same unread native Mail projection that drives `orient wait`.
@@ -892,6 +1040,7 @@ fn load_watched_view(
     let mail_unread = native_unread_mail(catalogs, persona_id)?
         .into_keys()
         .collect();
+    let teams_messages = native_teams_messages(catalogs)?;
 
     let roster = status_roster(catalogs)?;
     let attention_keys = attention_keys(catalogs, persona_id)?;
@@ -964,6 +1113,7 @@ fn load_watched_view(
     Ok(orient_model::WatchedView {
         unread,
         mail_unread,
+        teams: teams_messages,
         goals_view: goal_lines.join("\n"),
         roster,
         notes,
@@ -986,6 +1136,9 @@ fn view_news(
     }
     for mail in new.mail_unread.difference(&old.mail_unread) {
         reasons.push(format!("new mail [{}]", fmt_id(*mail)));
+    }
+    for message in new.teams.difference(&old.teams) {
+        reasons.push(format!("new Teams message [{}]", fmt_id(*message)));
     }
 
     let parse = |view: &str| -> HashMap<String, (String, String, String)> {
@@ -1304,8 +1457,8 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
     }
 }
 
-/// Print only the *novel* content behind the news — new messages and Mail,
-/// plus newly-arrived roster members — so a woken watcher gets what changed,
+/// Print only the *novel* content behind the news — new peer messages, Mail
+/// and Teams messages, plus newly-arrived roster members — so a woken watcher gets what changed,
 /// not a full re-dump of the snapshot. The `News:` reason lines are printed by
 /// the caller; this fills in the detail worth reading.
 fn print_news_detail(
@@ -1344,6 +1497,14 @@ fn print_news_detail(
                 summary.from.as_deref().unwrap_or("(no From)"),
                 summary.subject,
             );
+        }
+    }
+    let new_teams: Vec<Id> = new.teams.difference(&old.teams).copied().collect();
+    if !new_teams.is_empty() {
+        println!("\nNew Teams messages:");
+        for message in &new_teams {
+            let (author, content) = teams_message_detail(catalogs, *message)?;
+            println!("- {author}: {content}");
         }
     }
     let new_people: Vec<Id> = new
@@ -1837,6 +1998,7 @@ mod tests {
         orient_model::WatchedView {
             unread: BTreeSet::new(),
             mail_unread: BTreeSet::new(),
+            teams: BTreeSet::new(),
             goals_view: goals_view.into(),
             roster: BTreeSet::new(),
             notes: BTreeMap::new(),
@@ -1922,6 +2084,200 @@ mod tests {
             [format!("new mail [{wire:x}]")]
         );
         assert!(view_news(&unread, &old, me, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn teams_message_growth_wakes_and_disappearance_is_quiet() {
+        let me = ufoid().id;
+        let message = ufoid().id;
+        let old = view("");
+        let mut new = old.clone();
+        new.teams.insert(message);
+        assert_eq!(
+            view_news(&old, &new, me, &BTreeSet::new()),
+            [format!("new Teams message [{message:x}]")]
+        );
+        assert!(view_news(&new, &old, me, &BTreeSet::new()).is_empty());
+    }
+
+    fn teams_observation(
+        source: Id,
+        message_id: &str,
+        author_user_id: &str,
+        author_name: &str,
+        content: &str,
+        seconds: f64,
+    ) -> Fragment {
+        let at = epoch_interval(Epoch::from_unix_seconds(seconds));
+        teams_model::observation_fragment(
+            TEAMS_TENANT,
+            source,
+            teams_model::MessageObservationInput {
+                chat_id: "19:orient-news@thread.v2".to_owned(),
+                message_id: message_id.to_owned(),
+                raw: BTreeSet::from([format!("{{\"id\":\"{message_id}\"}}")]),
+                author_user_id: Some(author_user_id.to_owned()),
+                author_name: Some(author_name.to_owned()),
+                content: Some(content.to_owned()),
+                created_at: Some(at),
+                modified_at: at,
+                deleted_at: None,
+                etag: format!("{message_id}-1"),
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap()
+        .0
+    }
+
+    const TEAMS_TENANT: &str = "orient-news.example";
+    const TEAMS_OWN_USER: &str = "own-graph-user-id";
+
+    #[test]
+    fn colleague_teams_message_wakes_and_our_own_send_is_quiet() {
+        let fixture = TestPile::new();
+        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let persona = ufoid().id;
+        let (relations_fragment, _, _) =
+            relations::person_fragment(persona, profile("persona")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+
+        let source_fragment = teams_model::source_fragment(TEAMS_TENANT);
+        let source = source_fragment.root().unwrap();
+        let (auth_fragment, _) = teams_model::auth_profile_fragment(
+            source,
+            "client-id",
+            TEAMS_OWN_USER,
+            "Chat.ReadWrite offline_access",
+            Some(ufoid().id),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        commit_scope(
+            &mut pile,
+            &signer,
+            TEAMS_SCOPE_ID,
+            source_fragment + auth_fragment,
+        );
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        assert!(baseline.teams.is_empty());
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
+
+        // A colleague's reply is news for every window on this pile.
+        commit_scope(
+            &mut pile,
+            &signer,
+            TEAMS_SCOPE_ID,
+            teams_observation(
+                source,
+                "colleague-1",
+                "colleague-graph-user-id",
+                "Colleague",
+                "<p>did the build land?</p>",
+                10.0,
+            ),
+        );
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let incoming = load_watched_view(&catalogs, persona).unwrap();
+        assert_eq!(incoming.teams.len(), 1);
+        let message = *incoming.teams.iter().next().unwrap();
+        assert_eq!(
+            view_news(&baseline, &incoming, persona, &BTreeSet::new()),
+            [format!("new Teams message [{message:x}]")]
+        );
+        let (author, content) = teams_message_detail(&catalogs, message).unwrap();
+        assert_eq!(author, "Colleague");
+        assert!(content.contains("did the build land?"));
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Fired
+        ));
+
+        // Our own send comes back through the next delta pull. It is the same
+        // shape of record, and it must never wake anyone.
+        commit_scope(
+            &mut pile,
+            &signer,
+            TEAMS_SCOPE_ID,
+            teams_observation(
+                source,
+                "own-1",
+                TEAMS_OWN_USER,
+                "Bulti",
+                "<p>it did</p>",
+                20.0,
+            ),
+        );
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let after_own = load_watched_view(&catalogs, persona).unwrap();
+        assert_eq!(after_own.teams, BTreeSet::from([message]));
+        assert!(view_news(&incoming, &after_own, persona, &BTreeSet::new()).is_empty());
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+
+        // Graph's authorless chat events are not somebody writing to us.
+        let at = epoch_interval(Epoch::from_unix_seconds(25.0));
+        commit_scope(
+            &mut pile,
+            &signer,
+            TEAMS_SCOPE_ID,
+            teams_model::observation_fragment(
+                TEAMS_TENANT,
+                source,
+                teams_model::MessageObservationInput {
+                    chat_id: "19:orient-news@thread.v2".to_owned(),
+                    message_id: "system-1".to_owned(),
+                    raw: BTreeSet::from(["{\"id\":\"system-1\"}".to_owned()]),
+                    author_user_id: None,
+                    author_name: None,
+                    content: Some("<systemEventMessage/>".to_owned()),
+                    created_at: Some(at),
+                    modified_at: at,
+                    deleted_at: None,
+                    etag: "system-1-1".to_owned(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap()
+            .0,
+        );
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let after_event = load_watched_view(&catalogs, persona).unwrap();
+        assert_eq!(after_event.teams, BTreeSet::from([message]));
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+
+        // Re-observing the same colleague message (an edit) changes storage,
+        // not the attention set.
+        commit_scope(
+            &mut pile,
+            &signer,
+            TEAMS_SCOPE_ID,
+            teams_observation(
+                source,
+                "colleague-1",
+                "colleague-graph-user-id",
+                "Colleague",
+                "<p>did the build land? (edited)</p>",
+                30.0,
+            ),
+        );
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let after_edit = load_watched_view(&catalogs, persona).unwrap();
+        assert_eq!(after_edit.teams, BTreeSet::from([message]));
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
+            NewsCheck::Quiet
+        ));
+        pile.close().unwrap();
     }
 
     #[test]

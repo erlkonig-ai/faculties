@@ -29,6 +29,10 @@ pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>
 pub struct WatchedView {
     pub unread: BTreeSet<Id>,
     pub mail_unread: BTreeSet<Id>,
+    /// Logical Teams messages this persona has been shown. Teams carries no
+    /// per-reader read state, so attention is growth of the observed message
+    /// set rather than an unread flag.
+    pub teams: BTreeSet<Id>,
     pub goals_view: String,
     pub roster: BTreeSet<Id>,
     pub notes: BTreeMap<Id, Id>,
@@ -40,6 +44,8 @@ struct WireView {
     unread: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mail_unread: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    teams: Option<Vec<String>>,
     goals_view: String,
     roster: Vec<String>,
     notes: Vec<(String, String)>,
@@ -54,15 +60,21 @@ fn parse_id(value: &str, field: &str) -> Result<Id> {
 }
 
 fn serialize_view_version(view: &WatchedView, version: u8) -> Result<String> {
-    let mail_unread = match version {
-        1 => None,
-        2 => Some(view.mail_unread.iter().copied().map(fmt_id).collect()),
+    let mail = || -> Vec<String> { view.mail_unread.iter().copied().map(fmt_id).collect() };
+    let (mail_unread, teams) = match version {
+        1 => (None, None),
+        2 => (Some(mail()), None),
+        3 => (
+            Some(mail()),
+            Some(view.teams.iter().copied().map(fmt_id).collect()),
+        ),
         other => bail!("unsupported Orient checkpoint view version {other}"),
     };
     serde_json::to_string(&WireView {
         version,
         unread: view.unread.iter().copied().map(fmt_id).collect(),
         mail_unread,
+        teams,
         goals_view: view.goals_view.clone(),
         roster: view.roster.iter().copied().map(fmt_id).collect(),
         notes: view
@@ -76,7 +88,7 @@ fn serialize_view_version(view: &WatchedView, version: u8) -> Result<String> {
 
 /// Serialize one view in its unique current JSON representation.
 pub fn serialize_view(view: &WatchedView) -> Result<String> {
-    serialize_view_version(view, 2)
+    serialize_view_version(view, 3)
 }
 
 /// Parse and require the unique canonical representation.
@@ -84,12 +96,28 @@ pub fn parse_view(encoded: &str) -> Result<WatchedView> {
     let wire: WireView = serde_json::from_str(encoded).context("parse Orient checkpoint view")?;
     let mail_unread = match (wire.version, wire.mail_unread.as_ref()) {
         (1, None) => BTreeSet::new(),
-        (2, Some(values)) => values
+        (2 | 3, Some(values)) => values
             .iter()
             .map(|value| parse_id(value, "unread mail"))
             .collect::<Result<_>>()?,
         (1, Some(_)) => bail!("Orient checkpoint view v1 unexpectedly contains unread Mail"),
-        (2, None) => bail!("Orient checkpoint view v2 lacks unread Mail"),
+        (2 | 3, None) => bail!("Orient checkpoint view v{} lacks unread Mail", wire.version),
+        (other, _) => bail!("unsupported Orient checkpoint view version {other}"),
+    };
+    // A pre-v3 checkpoint predates Teams attention entirely. Its empty set is
+    // the honest reading: everything already in the pile is unobserved, so the
+    // first post-upgrade check reports the standing conversation once.
+    let teams = match (wire.version, wire.teams.as_ref()) {
+        (1 | 2, None) => BTreeSet::new(),
+        (3, Some(values)) => values
+            .iter()
+            .map(|value| parse_id(value, "Teams message"))
+            .collect::<Result<_>>()?,
+        (1 | 2, Some(_)) => bail!(
+            "Orient checkpoint view v{} unexpectedly contains Teams messages",
+            wire.version
+        ),
+        (3, None) => bail!("Orient checkpoint view v3 lacks Teams messages"),
         (other, _) => bail!("unsupported Orient checkpoint view version {other}"),
     };
     let view = WatchedView {
@@ -99,6 +127,7 @@ pub fn parse_view(encoded: &str) -> Result<WatchedView> {
             .map(|value| parse_id(value, "unread message"))
             .collect::<Result<_>>()?,
         mail_unread,
+        teams,
         goals_view: wire.goals_view,
         roster: wire
             .roster
@@ -433,6 +462,7 @@ mod tests {
         let left = WatchedView {
             unread: BTreeSet::from([second, first]),
             mail_unread: BTreeSet::from([first, second]),
+            teams: BTreeSet::from([second, first]),
             goals_view: "goal-state".to_owned(),
             roster: BTreeSet::from([second, first]),
             notes: BTreeMap::from([(second, goal), (first, goal)]),
@@ -440,6 +470,7 @@ mod tests {
         let right = WatchedView {
             unread: [first, second].into_iter().collect(),
             mail_unread: [second, first].into_iter().collect(),
+            teams: [first, second].into_iter().collect(),
             goals_view: "goal-state".to_owned(),
             roster: [first, second].into_iter().collect(),
             notes: [(first, goal), (second, goal)].into_iter().collect(),
@@ -461,9 +492,22 @@ mod tests {
         let parsed = parse_view(&encoded).unwrap();
         assert_eq!(parsed.unread, BTreeSet::from([message]));
         assert!(parsed.mail_unread.is_empty());
+        assert!(parsed.teams.is_empty());
         assert!(serialize_view(&parsed)
             .unwrap()
-            .starts_with(r#"{"version":2,"#));
+            .starts_with(r#"{"version":3,"#));
+    }
+
+    #[test]
+    fn canonical_version_two_view_remains_readable_without_teams() {
+        let wire = Id::new([7; 16]).unwrap();
+        let encoded = format!(
+            r#"{{"version":2,"unread":[],"mail_unread":["{wire:x}"],"goals_view":"","roster":[],"notes":[]}}"#
+        );
+        let parsed = parse_view(&encoded).unwrap();
+        assert_eq!(parsed.mail_unread, BTreeSet::from([wire]));
+        assert!(parsed.teams.is_empty());
+        assert_eq!(serialize_view_version(&parsed, 2).unwrap(), encoded);
     }
 
     #[test]
