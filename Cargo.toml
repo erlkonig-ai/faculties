@@ -135,6 +135,14 @@ imagine = ["dep:mary", "mary/flux", "dep:image"]
 # (FreeBSD build class, 2026-07-21) via --no-default-features.
 audio = ["dep:rodio"]
 voice = ["dep:mary", "mary/speak", "audio"]
+# The `duplex` faculty: a continuously running spoken channel on mary's
+# streaming full-duplex speech model. `mary/personaplex` brings the LM layers
+# (it rides the same layer stack as `speak`), `mary/q4` the 4-bit temporal
+# stack and the streaming codec. `audio` supplies the named-device capture and
+# playback plumbing. Off by default: the model runtime is heavy and only this
+# one binary needs it. NOT YET REALTIME on the measured hardware — see the
+# frame-budget section of the binary's module docs before relying on it.
+duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio"]
 [dependencies]
 # Core: every CLI faculty depends on these.
 anyhow = "1.0"
