@@ -163,6 +163,13 @@ const MAX_BACKLOG_FRAMES: usize = 8;
 /// Text-stream ids carrying no surface text: 0 EPAD, 1 BOS, 2 EOS, 3 PAD.
 const N_TEXT_SPECIALS: i64 = 4;
 const TEXT_PAD: i64 = 3;
+/// `<epad>` — END of a pad run, i.e. the frame that says a word starts next.
+/// The model's own text stream marks a word onset this way, so a schedule that
+/// pads with `<pad>` right up to the word gives it no warning that the silence
+/// is ending. Measured: with a two-frame gap, padding all the way puts the
+/// word onset at rank 113 in the model's own logits; ending the gap with
+/// `<epad>` is what a natural stream looks like there.
+const TEXT_EPAD: i64 = 0;
 
 /// Frames of unbroken padding that close an utterance.
 const DEFAULT_UTTERANCE_GAP: usize = 10;
@@ -279,10 +286,27 @@ struct RunArgs {
     /// Sampling seed.
     #[arg(long, default_value_t = 12_345_678)]
     seed: u64,
-    /// Frames between forced text tokens, matching the speaking cadence of
-    /// the text stream. One token per frame is out of distribution.
-    #[arg(long, default_value_t = 2)]
+    /// Gap frames inserted at each word boundary in a forced line (the last
+    /// of them `<epad>`). Where the gaps GO is set by `--cadence`; this sets
+    /// how long they are, and therefore the SPEAKING RATE.
+    ///
+    /// 3 is the default because it is the only value that satisfies all three
+    /// things we can measure. It puts the schedule at 69% `<pad>`, matching
+    /// the ~65% density the model's own text stream runs at; it keeps the
+    /// forced tokens inside the model's own distribution (word onset p50 rank
+    /// 10, continuation p50 rank 1); and it produces 2.83-3.00 words per
+    /// second, which is ordinary English speech. Shorter gaps score just as
+    /// well on rank — onset p50 4 at gap 1 — but talk at 3.6-4.0 words per
+    /// second, which is a rushed delivery that no rank statistic can see.
+    #[arg(long, default_value_t = 3)]
     pace: usize,
+    /// Where the gaps in a forced line fall. `word-onset` (the default) puts
+    /// them only between words, which is how the model's own text stream is
+    /// shaped; `uniform` puts them after every word piece, splitting
+    /// multi-piece words across silence; `dense` uses none. Judge with the
+    /// forced-token rank this command reports, not by ear.
+    #[arg(long, default_value = "word-onset")]
+    cadence: String,
     /// Feed the model digital silence on the input channel while it speaks,
     /// so an endpoint without echo cancellation does not hear itself.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -963,6 +987,85 @@ const PREBUFFER_FRAMES: usize = 5;
 /// a reason to wedge the loop forever.
 const PACE_DEADLINE: Duration = Duration::from_millis(500);
 
+/// How a line of text is laid out across frames on the inner-monologue
+/// stream. The control for the rank measurement below — see
+/// [`cadence_schedule`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cadence {
+    /// Gap frames at WORD ONSETS only; word pieces run consecutively.
+    WordOnset,
+    /// Gap frames after EVERY piece, word-internal ones included.
+    Uniform,
+    /// One token per frame, no gaps at all.
+    Dense,
+}
+
+/// Lay a line of text out across frames for the model's stream 0.
+///
+/// **Placement, not density, is what makes a forced token feel native.** The
+/// model's own text stream runs word PIECES consecutively and puts its gaps at
+/// WORD ONSETS. A schedule that pads after every piece looks correctly sparse
+/// on average while being off-distribution *inside* every multi-piece word —
+/// a place the model has no gap in its training distribution at all, so it is
+/// dragged exactly where it is most confident. That is a different failure
+/// from packing too densely and the average PAD fraction cannot see it: a
+/// uniform gap of 2 is 67% PAD, SPARSER than the word-onset schedule this
+/// model was measured to endorse (~42% PAD), and still wrong.
+///
+/// The measurement that separates them is the forced token's rank in the
+/// model's own logits for that frame — rank 0 means it wanted the token
+/// anyway, a large rank means it is being fought. `duplex run` reports the
+/// distribution; `--cadence` selects between the three layouts so the claim
+/// stays checkable rather than asserted. Measured on two sentences, median
+/// rank of a WITHIN-WORD piece:
+///
+/// | layout | continuation | onset |
+/// |---|---|---|
+/// | uniform, gap 2 | **24125** | 73 |
+/// | word onset, gap 3, `<epad>`-terminated | **1** | 10 |
+///
+/// A uniform gap is not merely suboptimal — 24125 of 32000 is as hard as this
+/// model can be fought, on every multi-piece word, for a whole utterance.
+///
+/// The gap ENDS with `<epad>`, not `<pad>`, because that is how the model's
+/// own stream announces an oncoming word; padding right up to the onset costs
+/// an order of magnitude of onset rank (113 vs 7 at gap 2).
+///
+/// Rank alone does not pick the gap LENGTH: every gap from 1 to 3 sits in the
+/// endorsed regime, but only 3 speaks at a natural rate. See `--pace`.
+///
+/// SPM marks a word onset with a leading U+2581 on the piece.
+#[cfg(feature = "duplex")]
+fn cadence_schedule(
+    spm: &mary::models::personaplex::spm::SpmTokenizer,
+    line: &str,
+    gap: usize,
+    cadence: Cadence,
+) -> Vec<i64> {
+    const WORD_MARK: &[u8] = "\u{2581}".as_bytes();
+    let ids = spm.encode(line);
+    let mut out = Vec::with_capacity(ids.len() * (1 + gap));
+    for (k, &t) in ids.iter().enumerate() {
+        out.push(t);
+        let pad_here = match cadence {
+            Cadence::Dense => false,
+            Cadence::Uniform => true,
+            Cadence::WordOnset => ids
+                .get(k + 1)
+                .map(|&n| spm.piece_bytes(n).starts_with(WORD_MARK))
+                .unwrap_or(false),
+        };
+        if pad_here {
+            // ... <pad> ... <epad> word: the last gap frame announces the
+            // onset rather than looking like more silence.
+            for g in 0..gap {
+                out.push(if g + 1 == gap { TEXT_EPAD } else { TEXT_PAD });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(feature = "duplex")]
 type Codes = [u32; mary::models::personaplex::mimi::config::NUM_CODEBOOKS];
 
@@ -1390,6 +1493,12 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         "f16" => WeightFmt::F16,
         other => bail!("unknown weight format {other} (expected q4, q8 or f16)"),
     };
+    let cadence = match args.cadence.as_str() {
+        "word-onset" => Cadence::WordOnset,
+        "uniform" => Cadence::Uniform,
+        "dense" => Cadence::Dense,
+        other => bail!("unknown cadence {other} (expected word-onset, uniform or dense)"),
+    };
     let floor_policy = match args.floor.as_str() {
         "listen" => Floor::Listen,
         "converse" => Floor::Converse,
@@ -1487,7 +1596,6 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     let mut encoder_state = pipeline.encoder.stream_state();
     let mut queued: VecDeque<i64> = VecDeque::new();
     let mut injected_text: VecDeque<String> = VecDeque::new();
-    let mut pace_countdown = 0usize;
     let mut spoken = String::new();
     let mut spoken_was_injected = false;
     let mut pad_run = 0usize;
@@ -1502,6 +1610,25 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     let mut heard_peak = 0f32;
     let mut heard_total = 0f64;
     let mut heard_frames = 0usize;
+
+    // Is the model being DRAGGED? At each forced frame, where the token we are
+    // about to force sits in the model's own ranking from the previous frame.
+    // Rank 0 means it would have chosen that token itself; a large rank means
+    // the schedule is off its distribution. This is the probe's measure, and
+    // it is the honest one — an ear cannot tell "wrong words" from "right
+    // words in a shape the model never sees", and a waveform statistic cannot
+    // either. Kept always-on: one pass over the logit row is ~0.1% of a frame.
+    // Split by what the token IS, because the two halves mean different
+    // things. The first piece of a word is unpredictable BY CONSTRUCTION — the
+    // model cannot know which word we chose — so a high rank there is the
+    // price of forcing arbitrary text, not evidence of a bad schedule. A
+    // within-word continuation is the opposite: the model is confident about
+    // how a word it has already started will finish, so a high rank THERE is
+    // the schedule genuinely fighting it. That is the number a cadence change
+    // should move.
+    let mut rank_onset: Vec<usize> = Vec::new();
+    let mut rank_cont: Vec<usize> = Vec::new();
+    let mut rank_pad: Vec<usize> = Vec::new();
 
     let mut frame_index = 0usize;
     let mut step_total = 0f64;
@@ -1536,7 +1663,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             }
             for line in drain_inject(session) {
                 println!("duplex: to say — {line}");
-                queued.extend(spm.encode(&line));
+                queued.extend(cadence_schedule(&spm, &line, args.pace, cadence));
                 injected_text.push_back(line);
             }
         }
@@ -1614,23 +1741,20 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         //   speaking  — the injected line, paced to the text stream's cadence.
         //   otherwise — the floor policy decides whether it may find its own
         //               words; under `listen` it may only backchannel.
+        let was_speaking_injected = !queued.is_empty();
         let (forced_text, forced_audio) = if held {
             (Some(TEXT_PAD), Some(&SILENCE))
         } else if !queued.is_empty() {
-            if pace_countdown == 0 {
-                pace_countdown = args.pace;
-                (queued.pop_front(), None)
-            } else {
-                pace_countdown -= 1;
-                (Some(TEXT_PAD), None)
-            }
+            // `queued` is a FRAME schedule, not a token list: the gaps are
+            // already in it, placed by `cadence_schedule`.
+            (queued.pop_front(), None)
         } else {
             match floor_policy {
                 Floor::Listen => (Some(TEXT_PAD), None),
                 Floor::Converse => (None, None),
             }
         };
-        let was_speaking_injected = !queued.is_empty() || pace_countdown > 0;
+
 
         let trace = pipeline.step(Some(&heard), forced_audio, forced_text);
         let elapsed = step_start.elapsed().as_secs_f64() * 1e3;
@@ -1639,6 +1763,43 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         step_times.push(elapsed);
         if elapsed > 80.0 {
             over_budget += 1;
+        }
+
+        // Is the model being DRAGGED? Where the token we forced sits in the
+        // model's own ranking for that frame. Rank 0 means it wanted the token
+        // anyway; a large rank means the schedule is off its distribution. An
+        // ear cannot tell "wrong words" from "right words in a shape the model
+        // never sees", and no waveform statistic can either — this can.
+        //
+        // It is THIS step's logit row, not the previous one: the step both
+        // reads the row and consumes the token it was handed, so the row and
+        // the token are the same frame's. That is not an assumption — both
+        // pairings were scored side by side, and only this one puts a
+        // within-word continuation where it obviously belongs (p50 rank 1,
+        // against 14910 for the previous row). Kept always-on: one pass over
+        // the logit row is ~0.1% of a frame.
+        //
+        // Split by what the token IS, because the halves mean different
+        // things. The first piece of a word is ours to choose, so the model
+        // cannot fully anticipate it and a moderate rank there is the price of
+        // forcing arbitrary text. A within-word continuation is the opposite —
+        // the model is confident how a word it already started will finish, so
+        // a high rank THERE is the schedule genuinely fighting it, and that is
+        // the number a cadence change has to move.
+        if was_speaking_injected {
+            if let Some(t) = forced_text {
+                if !trace.text_logits.is_empty() && (t as usize) < trace.text_logits.len() {
+                    let lv = trace.text_logits[t as usize];
+                    let rank = trace.text_logits.iter().filter(|&&v| v > lv).count();
+                    if t < N_TEXT_SPECIALS {
+                        rank_pad.push(rank);
+                    } else if spm.piece_bytes(t).starts_with("\u{2581}".as_bytes()) {
+                        rank_onset.push(rank);
+                    } else {
+                        rank_cont.push(rank);
+                    }
+                }
+            }
         }
 
         if let Some(out) = trace.out.as_ref() {
@@ -1768,6 +1929,37 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         mouth.underruns(),
         stalled
     );
+    // Was the model dragged? Report the schedule alongside its cost, so a
+    // cadence claim is checkable against the model rather than against ears.
+    let quantiles = |v: &mut Vec<usize>| -> (usize, usize, usize) {
+        v.sort_unstable();
+        let at = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+        (at(0.50), at(0.90), at(0.99))
+    };
+    if rank_onset.is_empty() && rank_cont.is_empty() {
+        println!("  forced-token rank: nothing was forced");
+    } else {
+        let total = rank_onset.len() + rank_cont.len() + rank_pad.len();
+        println!(
+            "  forced-token rank in the model's own logits ({} cadence, gap {}, {} forced frames, {:.0}% PAD):",
+            args.cadence,
+            args.pace,
+            total,
+            100.0 * rank_pad.len() as f64 / total.max(1) as f64,
+        );
+        for (what, v) in [
+            ("word continuation", &mut rank_cont),
+            ("word onset       ", &mut rank_onset),
+            ("pad              ", &mut rank_pad),
+        ] {
+            if v.is_empty() {
+                continue;
+            }
+            let n = v.len();
+            let (a, b, c) = quantiles(v);
+            println!("   {what}  p50 {a:>6}  p90 {b:>6}  p99 {c:>6}  (n={n})");
+        }
+    }
     drop(capture);
     mouth.finish()?;
     ledger.finish();
