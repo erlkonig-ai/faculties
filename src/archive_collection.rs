@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
+use triblespace::core::collection::descriptor::Reach;
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::exact_derived::{
@@ -378,9 +379,16 @@ pub fn ensure_succinct_index(
     let result = (|| {
         let team = collection_team(&collection)?;
         let archive = ArchiveSnapshot::from_collection(&mut collection, schema::DEFAULT_SCOPE_ID)?;
+        // Two reaches: the archive root's, taken from the one registry that
+        // decides it, and this derived index's own. A derivation does not
+        // inherit its source's reach -- an index over private material still
+        // describes that material -- so the index states its own, and states
+        // it privately.
         let algebra = SuccinctArchiveCollection::new(
             crate::collection_names::require_name(schema::DEFAULT_SCOPE_ID),
             team,
+            crate::collection_names::require_reach(schema::DEFAULT_SCOPE_ID),
+            Reach::Private,
         );
         let source = algebra.source_descriptor();
         let target = algebra.descriptor();
@@ -1831,7 +1839,7 @@ mod tests {
         let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, team);
         succinctarchive_union::validate_derive(
             &source,
-            &succinctarchive_union::descriptor(archive_bm25::source_collection(team)),
+            &succinctarchive_union::descriptor(archive_bm25::source_collection(team), Reach::Private),
             &derive,
             &input,
             &output,

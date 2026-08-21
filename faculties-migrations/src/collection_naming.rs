@@ -35,6 +35,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use faculties::storage::{load_signer, open_pile_strict};
+use triblespace::core::collection::descriptor::Reach;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 pub use triblespace::core::collection::records::CollectionName;
@@ -292,7 +293,15 @@ pub fn plan(
         }
         let named = CollectionName::new(&name)
             .map_err(|error| anyhow::anyhow!("{name} is not a legal collection name: {error}"))?;
-        let new = prospective_handle(simplearchive_union::descriptor(&named, team).facts());
+        // The migration re-seats data into the collection the running build
+        // would open, so this reach has to be the one
+        // `collection_names::table` gives that name. It plans by name rather
+        // than by scope and cannot consult the registry, so if a faculty is
+        // ever published, this constant is the second place that has to move,
+        // and a mismatch shows up as a rename to a handle nothing opens.
+        let new = prospective_handle(
+            simplearchive_union::descriptor(&named, team, Reach::Private).facts(),
+        );
         let rename = Rename {
             old,
             new,
@@ -344,7 +353,7 @@ pub fn publish(
     let mut written = BTreeSet::new();
     for rename in &report.renames {
         let named = CollectionName::new(&rename.name).expect("plan checked this");
-        let descriptor = simplearchive_union::descriptor(&named, team);
+        let descriptor = simplearchive_union::descriptor(&named, team, Reach::Private);
         // The handle comes from the store, not from a second hash beside it.
         let new = store
             .put::<SimpleArchive, _>(descriptor.facts().clone())

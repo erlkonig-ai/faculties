@@ -13,6 +13,7 @@
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use triblespace::core::collection::descriptor::Reach;
 use triblespace::core::collection::records::CollectionName;
 use triblespace::core::collection::{simplearchive_union, Collection};
 use triblespace::core::id::Id;
@@ -24,39 +25,68 @@ use crate::schemas::{
     web, wiki,
 };
 
-/// Every root collection this build writes, by the scope that used to anchor it.
+/// Every root collection this build writes: the scope that used to anchor it,
+/// the name it is known by, and how far it travels.
 ///
 /// A faculty that is missing here cannot be opened at all, which is the point:
 /// a nameless collection is one the pile cannot describe, and shipping one
-/// silently is how the old scope model stayed opaque for so long.
-pub fn table() -> Vec<(Id, &'static str)> {
+/// silently is how the old scope model stayed opaque for so long. Reach sits
+/// in the same row for the same reason -- it is part of the collection's
+/// identity, so adding a faculty makes you state it rather than inherit a
+/// default you never saw.
+///
+/// **Everything here is [`Reach::Private`], and that is a decision rather than
+/// a default.** Two things force it. First, all of these collections already
+/// exist: their handles were computed from descriptors that named no reach, so
+/// declaring one public would not publish the collection, it would *rename*
+/// it, and every commit already written would belong to a collection nothing
+/// looks up any more. Publishing existing material is a re-commit into the new
+/// collection, deliberately, not a one-word edit here.
+///
+/// Second, and more interesting: most of the ones that plausibly want to
+/// travel do not want [`Reach::Public`]. `message`, `status`, `relations` and
+/// `teams` coordinate peers on one team; what they want is "this team and
+/// no one else", which is a reach law that does not exist yet. Declaring them
+/// public to approximate it would be worse than declaring nothing.
+///
+/// The ones worth naming individually:
+///
+/// - `secrets` is not a migration candidate. It stays put permanently.
+/// - `memory` and `memory-comb` are the journal, first-person and personal.
+/// - `compass` and `wiki` are the two JP has floated sharing. Neither becomes
+///   public here: his own design for compass is a collection that shares its
+///   goals but not the personal notes attached to them, which is *two*
+///   collections, not one made public. A public sibling is the shape, and
+///   reach in the descriptor is what makes a sibling safe to keep in the same
+///   pile.
+pub fn table() -> Vec<(Id, &'static str, Reach)> {
     vec![
-        (atlas::DEFAULT_SCOPE_ID, "atlas"),
-        (blockdag::DEFAULT_SCOPE_ID, "blockdag"),
-        (body::DEFAULT_SCOPE_ID, "body"),
-        (cognition::DEFAULT_SCOPE_ID, "cognition"),
-        (compass::DEFAULT_SCOPE_ID, "compass"),
-        (decide::DEFAULT_SCOPE_ID, "decide"),
-        (discord::DEFAULT_SCOPE_ID, "discord"),
-        (embeddings::DEFAULT_SCOPE_ID, "embeddings"),
-        (files::DEFAULT_SCOPE_ID, "files"),
-        (habit::DEFAULT_SCOPE_ID, "habit"),
-        (headspace::DEFAULT_SCOPE_ID, "headspace"),
-        (mail::DEFAULT_SCOPE_ID, "mail"),
-        (memory::DEFAULT_SCOPE_ID, "memory"),
-        (memory::DEFAULT_COMB_SCOPE_ID, "memory-comb"),
-        (message::DEFAULT_SCOPE_ID, "message"),
-        (orient::DEFAULT_SCOPE_ID, "orient"),
-        (planner::DEFAULT_SCOPE_ID, "planner"),
-        (posture::DEFAULT_POLICY_SCOPE_ID, "posture-policy"),
-        (posture::DEFAULT_SCAN_SCOPE_ID, "posture-scan"),
-        (relations::DEFAULT_SCOPE_ID, "relations"),
-        (crate::secrets::schema::DEFAULT_SCOPE_ID, "secrets"),
-        (status::DEFAULT_SCOPE_ID, "status"),
-        (teams::DEFAULT_SCOPE_ID, "teams"),
-        (voice::COLLECTION_SCOPE_ID, "voice"),
-        (web::DEFAULT_SCOPE_ID, "web"),
-        (wiki::DEFAULT_SCOPE_ID, "wiki"),
+        (atlas::DEFAULT_SCOPE_ID, "atlas", Reach::Private),
+        (blockdag::DEFAULT_SCOPE_ID, "blockdag", Reach::Private),
+        (body::DEFAULT_SCOPE_ID, "body", Reach::Private),
+        (cognition::DEFAULT_SCOPE_ID, "cognition", Reach::Private),
+        (compass::DEFAULT_SCOPE_ID, "compass", Reach::Private),
+        (decide::DEFAULT_SCOPE_ID, "decide", Reach::Private),
+        (discord::DEFAULT_SCOPE_ID, "discord", Reach::Private),
+        (embeddings::DEFAULT_SCOPE_ID, "embeddings", Reach::Private),
+        (files::DEFAULT_SCOPE_ID, "files", Reach::Private),
+        (habit::DEFAULT_SCOPE_ID, "habit", Reach::Private),
+        (headspace::DEFAULT_SCOPE_ID, "headspace", Reach::Private),
+        (mail::DEFAULT_SCOPE_ID, "mail", Reach::Private),
+        (memory::DEFAULT_SCOPE_ID, "memory", Reach::Private),
+        (memory::DEFAULT_COMB_SCOPE_ID, "memory-comb", Reach::Private),
+        (message::DEFAULT_SCOPE_ID, "message", Reach::Private),
+        (orient::DEFAULT_SCOPE_ID, "orient", Reach::Private),
+        (planner::DEFAULT_SCOPE_ID, "planner", Reach::Private),
+        (posture::DEFAULT_POLICY_SCOPE_ID, "posture-policy", Reach::Private),
+        (posture::DEFAULT_SCAN_SCOPE_ID, "posture-scan", Reach::Private),
+        (relations::DEFAULT_SCOPE_ID, "relations", Reach::Private),
+        (crate::secrets::schema::DEFAULT_SCOPE_ID, "secrets", Reach::Private),
+        (status::DEFAULT_SCOPE_ID, "status", Reach::Private),
+        (teams::DEFAULT_SCOPE_ID, "teams", Reach::Private),
+        (voice::COLLECTION_SCOPE_ID, "voice", Reach::Private),
+        (web::DEFAULT_SCOPE_ID, "web", Reach::Private),
+        (wiki::DEFAULT_SCOPE_ID, "wiki", Reach::Private),
     ]
 }
 
@@ -64,10 +94,34 @@ pub fn table() -> Vec<(Id, &'static str)> {
 pub fn name_for(scope: Id) -> Option<CollectionName> {
     table()
         .into_iter()
-        .find(|(candidate, _)| *candidate == scope)
-        .map(|(_, name)| {
+        .find(|(candidate, _, _)| *candidate == scope)
+        .map(|(_, name, _)| {
             CollectionName::new(name).expect("a name in this table is a legal collection name")
         })
+}
+
+/// How far one scope's collection travels, or `None` if this build does not
+/// know the scope.
+pub fn reach_for(scope: Id) -> Option<Reach> {
+    table()
+        .into_iter()
+        .find(|(candidate, _, _)| *candidate == scope)
+        .map(|(_, _, reach)| reach)
+}
+
+/// How far one scope's collection travels, or a panic naming the missing scope.
+///
+/// Loud for the same reason [`require_name`] is: reach is part of the
+/// descriptor, so guessing it would compute a handle for a collection nothing
+/// else can find. That failure looks like an empty faculty rather than an
+/// error, which is exactly the kind of silence worth refusing to produce.
+pub fn require_reach(scope: Id) -> Reach {
+    reach_for(scope).unwrap_or_else(|| {
+        panic!(
+            "no reach for scope {scope:X}; add it to \
+             faculties::collection_names::table"
+        )
+    })
 }
 
 /// The name for one scope, or a panic naming the scope that is missing.
@@ -92,7 +146,7 @@ pub fn require_name(scope: Id) -> CollectionName {
 /// means that has to say so by passing `signer.verifying_key()` — defaulting to
 /// it here would quietly root every collection at whichever key was writing.
 pub fn root_descriptor(scope: Id, team: VerifyingKey) -> Fragment {
-    simplearchive_union::descriptor(&require_name(scope), team)
+    simplearchive_union::descriptor(&require_name(scope), team, require_reach(scope))
 }
 
 /// Open one scope's collection as a TEAM OF ONE.
@@ -108,7 +162,13 @@ pub fn root_descriptor(scope: Id, team: VerifyingKey) -> Fragment {
 /// places for that judgement to quietly diverge.
 pub fn open<S>(storage: S, scope: Id, signer: SigningKey) -> Collection<S> {
     let team = signer.verifying_key();
-    Collection::new(storage, &require_name(scope), team, signer)
+    Collection::new(
+        storage,
+        &require_name(scope),
+        team,
+        signer,
+        require_reach(scope),
+    )
 }
 
 #[cfg(test)]
