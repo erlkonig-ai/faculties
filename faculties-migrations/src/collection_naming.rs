@@ -37,8 +37,9 @@ use anyhow::{bail, Context, Result};
 use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
+pub use triblespace::core::collection::records::CollectionName;
 use triblespace::core::collection::records::{
-    collection_recipe, collection_representation, CollectionHandle, CollectionName,
+    collection_recipe, collection_representation, CollectionHandle,
 };
 use triblespace::core::collection::simplearchive_union::{self, TRIBLE_SET_UNION_RECIPE_V1};
 use triblespace::core::collection::{
@@ -82,7 +83,7 @@ pub struct Rename {
     /// The anchor it is leaving.
     pub scope: Id,
     /// The name it takes within its team.
-    pub name: &'static str,
+    pub name: String,
     /// Signed states to re-commit under `new`.
     pub commits: usize,
 }
@@ -162,6 +163,25 @@ pub fn name_for(scope: Id) -> Option<&'static str> {
         .map(|(_, name)| name)
 }
 
+/// A scope this build cannot know about, named by whoever does.
+///
+/// The built-in table is written against schema constants, which reaches every
+/// faculty in this repository and nothing outside it. A pile can hold
+/// collections belonging to a consumer that lives elsewhere -- a private
+/// repository, or one that simply is not a dependency -- and this crate has no
+/// way to learn their names and no business depending on them to.
+///
+/// So the caller supplies them. That keeps a private consumer's constants in
+/// its own repository, where they belong, instead of copying an id into a
+/// public crate and hoping the two never drift.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtraName {
+    /// The scope to name.
+    pub scope: Id,
+    /// What to call it.
+    pub name: CollectionName,
+}
+
 /// One inline value for `attribute` on any entity in `facts`.
 fn one(facts: &TribleSet, attribute: Id) -> Option<Id> {
     facts
@@ -209,7 +229,11 @@ fn prospective_handle(facts: &TribleSet) -> CollectionHandle {
 }
 
 /// Work out what would move, without writing.
-pub fn plan(pile: &Path, key: Option<&Path>) -> Result<CollectionNamingReport> {
+pub fn plan(
+    pile: &Path,
+    key: Option<&Path>,
+    extra: &[ExtraName],
+) -> Result<CollectionNamingReport> {
     let signer = load_signer(pile, key).context("a re-commit needs the durable signing key")?;
     // A team of one: this pile's own durable identity is its team root. That
     // is the honest anchor for a pile nobody else writes to, and promoting it
@@ -237,10 +261,18 @@ pub fn plan(pile: &Path, key: Option<&Path>) -> Result<CollectionNamingReport> {
             report.already_named += 1;
             continue;
         };
-        let Some(name) = name_for(scope) else {
-            report
-                .unnamed
-                .push((old, format!("this build has no name for scope {scope:X}")));
+        let supplied = extra
+            .iter()
+            .find(|entry| entry.scope == scope)
+            .map(|entry| entry.name.as_str().to_owned());
+        let Some(name) = supplied.or_else(|| name_for(scope).map(str::to_owned)) else {
+            report.unnamed.push((
+                old,
+                format!(
+                    "this build has no name for scope {scope:X}; \
+                     supply one with --name {scope:X}=<name> if you know it"
+                ),
+            ));
             continue;
         };
         // Only the SimpleArchive set-union kind is re-seated. Anything else
@@ -258,14 +290,14 @@ pub fn plan(pile: &Path, key: Option<&Path>) -> Result<CollectionNamingReport> {
             ));
             continue;
         }
-        let named = CollectionName::new(name)
+        let named = CollectionName::new(&name)
             .map_err(|error| anyhow::anyhow!("{name} is not a legal collection name: {error}"))?;
         let new = prospective_handle(simplearchive_union::descriptor(&named, team).facts());
         let rename = Rename {
             old,
             new,
             scope,
-            name,
+            name: name.clone(),
             commits: commits.len(),
         };
         // Signing is deterministic over the same transcript, so a state that
@@ -295,10 +327,14 @@ pub fn plan(pile: &Path, key: Option<&Path>) -> Result<CollectionNamingReport> {
 /// Every commit keeps its data and metadata handles and is signed afresh for
 /// the new collection, because a commit's signature covers the collection it
 /// is about. The blobs it points at are already resident and are not copied.
-pub fn publish(pile: &Path, key: Option<&Path>) -> Result<CollectionNamingReport> {
+pub fn publish(
+    pile: &Path,
+    key: Option<&Path>,
+    extra: &[ExtraName],
+) -> Result<CollectionNamingReport> {
     let signer = load_signer(pile, key).context("a re-commit needs the durable signing key")?;
     let team = signer.verifying_key();
-    let report = plan(pile, key)?;
+    let report = plan(pile, key, extra)?;
     if report.renames.is_empty() {
         return Ok(report);
     }
@@ -307,7 +343,7 @@ pub fn publish(pile: &Path, key: Option<&Path>) -> Result<CollectionNamingReport
     let by_collection = collections_with_commits(&mut store)?;
     let mut written = BTreeSet::new();
     for rename in &report.renames {
-        let named = CollectionName::new(rename.name).expect("plan checked this");
+        let named = CollectionName::new(&rename.name).expect("plan checked this");
         let descriptor = simplearchive_union::descriptor(&named, team);
         // The handle comes from the store, not from a second hash beside it.
         let new = store

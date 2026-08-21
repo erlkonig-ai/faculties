@@ -96,6 +96,15 @@ enum Command {
         /// Report what would move, without writing.
         #[arg(long)]
         dry_run: bool,
+        /// Name a scope this build does not know, as `<32-hex>=<name>`.
+        ///
+        /// The built-in table is written against this repository's schema
+        /// constants, which cannot reach a consumer that lives elsewhere. Its
+        /// constants stay in its own repository and it names its own scopes
+        /// here, rather than a private id being copied into a public crate
+        /// where the two would quietly drift apart.
+        #[arg(long = "name", value_name = "HEX=NAME")]
+        names: Vec<String>,
     },
 
     /// Give Compass's status register the identity it never had:
@@ -424,11 +433,30 @@ fn status_register(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()>
     Ok(())
 }
 
-fn collection_naming(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
+fn collection_naming(
+    pile: &Path,
+    key: Option<&Path>,
+    dry_run: bool,
+    names: &[String],
+) -> Result<()> {
+    let extra = names
+        .iter()
+        .map(|spec| {
+            let (hex, name) = spec
+                .split_once('=')
+                .with_context(|| format!("--name wants <32-hex>=<name>, got {spec:?}"))?;
+            let scope = triblespace::core::id::Id::from_hex(hex)
+                .ok_or_else(|| anyhow::anyhow!("{hex:?} is not a 32-character hex id"))?;
+            let name = collection_naming::CollectionName::new(name)
+                .map_err(|error| anyhow::anyhow!("{name:?} is not a legal name: {error}"))?;
+            Ok(collection_naming::ExtraName { scope, name })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let report = if dry_run {
-        collection_naming::plan(pile, key).context("plan the collection naming")?
+        collection_naming::plan(pile, key, &extra).context("plan the collection naming")?
     } else {
-        collection_naming::publish(pile, key).context("publish the collection naming")?
+        collection_naming::publish(pile, key, &extra).context("publish the collection naming")?
     };
 
     println!("Collection naming: scope anchors become names within a team");
@@ -452,7 +480,7 @@ fn collection_naming(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<(
         let mut by_name: std::collections::BTreeMap<&str, (usize, usize)> =
             std::collections::BTreeMap::new();
         for rename in &report.renames {
-            let entry = by_name.entry(rename.name).or_insert((0, 0));
+            let entry = by_name.entry(rename.name.as_str()).or_insert((0, 0));
             entry.0 += 1;
             entry.1 += rename.commits;
         }
@@ -631,8 +659,8 @@ fn main() -> Result<()> {
         Some(Command::PostureFindings { dry_run }) => {
             posture_findings(&cli.pile, cli.key.as_deref(), dry_run)
         }
-        Some(Command::CollectionNaming { dry_run }) => {
-            collection_naming(&cli.pile, cli.key.as_deref(), dry_run)
+        Some(Command::CollectionNaming { dry_run, names }) => {
+            collection_naming(&cli.pile, cli.key.as_deref(), dry_run, &names)
         }
         Some(Command::NodeIdentity { nickname, dry_run }) => {
             node_identity(&cli.pile, cli.key.as_deref(), &nickname, dry_run)
