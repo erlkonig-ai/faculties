@@ -300,6 +300,18 @@ struct RunArgs {
     /// second, which is a rushed delivery that no rank statistic can see.
     #[arg(long, default_value_t = 3)]
     pace: usize,
+    /// Write one line per frame — index, the stream-0 token, and what kind of
+    /// token it was — so the audio can be read against what the text stream
+    /// was doing at that instant. The way to find out whether the model puts
+    /// anything in the gaps it is given: breath, a filled pause, laughter.
+    #[arg(long)]
+    trace: Option<PathBuf>,
+    /// Under `--cadence model`, how many frames the model may hold silence
+    /// mid-line before we start the next word for it. A backstop, not a
+    /// rhythm: every time it fires we have taken the timing back, and the run
+    /// summary reports how often that happened.
+    #[arg(long, default_value_t = 25)]
+    nudge_after: usize,
     /// Where the gaps in a forced line fall. `word-onset` (the default) puts
     /// them only between words, which is how the model's own text stream is
     /// shaped; `uniform` puts them after every word piece, splitting
@@ -998,6 +1010,8 @@ enum Cadence {
     Uniform,
     /// One token per frame, no gaps at all.
     Dense,
+    /// No schedule at all: the model picks the moments, we supply the words.
+    Model,
 }
 
 /// Lay a line of text out across frames for the model's stream 0.
@@ -1044,11 +1058,16 @@ fn cadence_schedule(
 ) -> Vec<i64> {
     const WORD_MARK: &[u8] = "\u{2581}".as_bytes();
     let ids = spm.encode(line);
+    // Nothing to lay out: under `Model` the queue is just the words, and the
+    // gaps come from the model one frame at a time.
+    if cadence == Cadence::Model {
+        return ids;
+    }
     let mut out = Vec::with_capacity(ids.len() * (1 + gap));
     for (k, &t) in ids.iter().enumerate() {
         out.push(t);
         let pad_here = match cadence {
-            Cadence::Dense => false,
+            Cadence::Model | Cadence::Dense => false,
             Cadence::Uniform => true,
             Cadence::WordOnset => ids
                 .get(k + 1)
@@ -1497,7 +1516,10 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         "word-onset" => Cadence::WordOnset,
         "uniform" => Cadence::Uniform,
         "dense" => Cadence::Dense,
-        other => bail!("unknown cadence {other} (expected word-onset, uniform or dense)"),
+        "model" => Cadence::Model,
+        other => {
+            bail!("unknown cadence {other} (expected model, word-onset, uniform or dense)")
+        }
     };
     let floor_policy = match args.floor.as_str() {
         "listen" => Floor::Listen,
@@ -1562,6 +1584,17 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     // The device reports its queue one decode hop at a time, so a target below
     // one hop can never be met and a target of exactly one hop lets the queue
     // reach the device's last sample; two hops keeps a full hop in front of it.
+    let nudge_after = args.nudge_after;
+    let mut trace_out = match args.trace.as_ref() {
+        Some(path) => {
+            let mut f = std::fs::File::create(path)
+                .with_context(|| format!("open the frame trace {}", path.display()))?;
+            use std::io::Write;
+            writeln!(f, "frame\ttoken\tclass\tsource")?;
+            Some(f)
+        }
+        None => None,
+    };
     let lead_target = args.lead.unwrap_or(2 * args.decode_hop).max(1) as u64;
     let mut stalled = 0usize;
 
@@ -1629,6 +1662,17 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     let mut rank_onset: Vec<usize> = Vec::new();
     let mut rank_cont: Vec<usize> = Vec::new();
     let mut rank_pad: Vec<usize> = Vec::new();
+    // The RHYTHM actually produced: frames from one word to the next. A fixed
+    // schedule makes this a constant by construction; letting the model choose
+    // the moments is only worth anything if it is not.
+    let mut word_gaps: Vec<usize> = Vec::new();
+    let mut since_word = 0usize;
+    // Free timing, watched: how often the model picked the moment itself, and
+    // how often it sat on PAD long enough that we had to start the word for
+    // it. A nudge is us imposing rhythm again, so it is counted, not hidden.
+    let mut model_chose = 0usize;
+    let mut nudged = 0usize;
+    let mut wait_frames = 0usize;
 
     let mut frame_index = 0usize;
     let mut step_total = 0f64;
@@ -1742,8 +1786,16 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         //   otherwise — the floor policy decides whether it may find its own
         //               words; under `listen` it may only backchannel.
         let was_speaking_injected = !queued.is_empty();
+        // Arbitration only while a line is draining and the floor is ours.
+        // A held floor is an explicit instruction to be silent and must not be
+        // handed back to the model's judgement.
+        let free_timing = cadence == Cadence::Model && was_speaking_injected && !held;
         let (forced_text, forced_audio) = if held {
             (Some(TEXT_PAD), Some(&SILENCE))
+        } else if free_timing {
+            // The queue is drained inside the arbiter, at the moment the model
+            // asks for a word — not here, on a schedule.
+            (None, None)
         } else if !queued.is_empty() {
             // `queued` is a FRAME schedule, not a token list: the gaps are
             // already in it, placed by `cadence_schedule`.
@@ -1756,7 +1808,46 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         };
 
 
-        let trace = pipeline.step(Some(&heard), forced_audio, forced_text);
+        // Two ways to put a word on stream 0, and they divide the labour
+        // differently. Forcing a token supplies WHAT is said and WHEN; under
+        // `--cadence model` we supply only the what, and the model keeps the
+        // when — its own pauses, their lengths, its own `<epad>` placement.
+        let trace = if free_timing {
+            let queue = &mut queued;
+            let waited = &mut wait_frames;
+            let chose = &mut model_chose;
+            let nudges = &mut nudged;
+            let mut decide = |_logits: &[f32], sampled: i64| -> i64 {
+                if sampled >= N_TEXT_SPECIALS {
+                    // It decided to speak. The moment is its own; the word is
+                    // ours.
+                    *waited = 0;
+                    *chose += 1;
+                    queue.pop_front().unwrap_or(sampled)
+                } else if *waited >= nudge_after {
+                    // It has held silence longer than we are willing to wait.
+                    // Start the word for it and count that we did.
+                    *waited = 0;
+                    *nudges += 1;
+                    queue.pop_front().unwrap_or(sampled)
+                } else {
+                    // PAD or EPAD: leave it exactly as sampled. This is the
+                    // whole point — the pause is the model's.
+                    *waited += 1;
+                    sampled
+                }
+            };
+            pipeline.step_arbitrated(Some(&heard), forced_audio, &mut decide)
+        } else {
+            pipeline.step(Some(&heard), forced_audio, forced_text)
+        };
+        // What actually went to the depformer this frame, whichever path chose
+        // it. Under arbitration this is the substituted token, not the sample.
+        let chosen: Option<i64> = if free_timing {
+            Some(trace.next_text)
+        } else {
+            forced_text
+        };
         let elapsed = step_start.elapsed().as_secs_f64() * 1e3;
         step_total += elapsed;
         step_max = step_max.max(elapsed);
@@ -1787,7 +1878,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         // a high rank THERE is the schedule genuinely fighting it, and that is
         // the number a cadence change has to move.
         if was_speaking_injected {
-            if let Some(t) = forced_text {
+            if let Some(t) = chosen {
                 if !trace.text_logits.is_empty() && (t as usize) < trace.text_logits.len() {
                     let lv = trace.text_logits[t as usize];
                     let rank = trace.text_logits.iter().filter(|&&v| v > lv).count();
@@ -1799,6 +1890,34 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
                         rank_cont.push(rank);
                     }
                 }
+            }
+        }
+        if let Some(f) = trace_out.as_mut() {
+            use std::io::Write;
+            let t = chosen.unwrap_or(-1);
+            let class = if t < 0 {
+                "none"
+            } else if t == TEXT_EPAD {
+                "epad"
+            } else if t < N_TEXT_SPECIALS {
+                "pad"
+            } else if spm.piece_bytes(t).starts_with("\u{2581}".as_bytes()) {
+                "onset"
+            } else {
+                "cont"
+            };
+            let source = if free_timing { "model" } else { "schedule" };
+            let _ = writeln!(f, "{frame_index}\t{t}\t{class}\t{source}");
+        }
+
+        // Rhythm, measured wherever it came from.
+        if was_speaking_injected {
+            match chosen {
+                Some(t) if t >= N_TEXT_SPECIALS => {
+                    word_gaps.push(since_word);
+                    since_word = 0;
+                }
+                _ => since_word += 1,
             }
         }
 
@@ -1959,6 +2078,26 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             let (a, b, c) = quantiles(v);
             println!("   {what}  p50 {a:>6}  p90 {b:>6}  p99 {c:>6}  (n={n})");
         }
+    }
+    if !word_gaps.is_empty() {
+        let n = word_gaps.len();
+        let spread = {
+            let mut u: Vec<usize> = word_gaps.clone();
+            u.sort_unstable();
+            u.dedup();
+            u.len()
+        };
+        let mean = word_gaps.iter().sum::<usize>() as f64 / n as f64;
+        let (g50, g90, g99) = quantiles(&mut word_gaps);
+        println!(
+            "  rhythm — frames from one word to the next: p50 {g50}  p90 {g90}               p99 {g99}  mean {mean:.2}  ({spread} distinct values over {n} words)"
+        );
+    }
+    if model_chose + nudged > 0 {
+        println!(
+            "  timing: the model chose the moment {model_chose} times, we started              the word for it {nudged} times ({:.0}% ours)",
+            100.0 * nudged as f64 / (model_chose + nudged) as f64
+        );
     }
     drop(capture);
     mouth.finish()?;
