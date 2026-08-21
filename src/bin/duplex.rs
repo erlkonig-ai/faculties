@@ -290,6 +290,9 @@ struct RunArgs {
     /// of them `<epad>`). Where the gaps GO is set by `--cadence`; this sets
     /// how long they are, and therefore the SPEAKING RATE.
     ///
+    /// Only applies to the SCHEDULED cadences. Under the default `model`
+    /// cadence there is no schedule to space out — the gaps are the model's.
+    ///
     /// 3 is the default because it is the only value that satisfies all three
     /// things we can measure. It puts the schedule at 69% `<pad>`, matching
     /// the ~65% density the model's own text stream runs at; it keeps the
@@ -312,12 +315,14 @@ struct RunArgs {
     /// summary reports how often that happened.
     #[arg(long, default_value_t = 25)]
     nudge_after: usize,
-    /// Where the gaps in a forced line fall. `word-onset` (the default) puts
-    /// them only between words, which is how the model's own text stream is
-    /// shaped; `uniform` puts them after every word piece, splitting
-    /// multi-piece words across silence; `dense` uses none. Judge with the
-    /// forced-token rank this command reports, not by ear.
-    #[arg(long, default_value = "word-onset")]
+    /// Who decides WHEN each word lands. `model` (the default) decides
+    /// nothing: the model samples stream 0 itself and we substitute our words
+    /// onto the frames it chose to speak, so the pauses and their lengths are
+    /// its own. The rest impose a schedule and are kept as controls for the
+    /// rhythm and rank numbers this command reports — `word-onset` puts a
+    /// fixed gap between words, `uniform` puts one after every word piece
+    /// (which splits multi-piece words across silence), `dense` uses none.
+    #[arg(long, default_value = "model")]
     cadence: String,
     /// Feed the model digital silence on the input channel while it speaks,
     /// so an endpoint without echo cancellation does not hear itself.
@@ -1047,6 +1052,11 @@ enum Cadence {
 ///
 /// Rank alone does not pick the gap LENGTH: every gap from 1 to 3 sits in the
 /// endorsed regime, but only 3 speaks at a natural rate. See `--pace`.
+///
+/// All of which is why the DEFAULT is [`Cadence::Model`] and none of these:
+/// every fixed gap is a metronome, and picking its length is guesswork at a
+/// distribution the model already holds. These layouts remain as controls, so
+/// the rhythm and rank numbers above stay reproducible.
 ///
 /// SPM marks a word onset with a leading U+2581 on the piece.
 #[cfg(feature = "duplex")]
