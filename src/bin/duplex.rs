@@ -21,6 +21,12 @@
 //!
 //! Codec decode and playback run on their own thread, off the frame clock.
 //!
+//! With `--no-input` there is no microphone, so THE SPEAKER IS THE CLOCK
+//! instead: the loop waits until the playback device has drained the model's
+//! lead below `--lead` frames before producing the next one. Both are the
+//! same discipline — take the period from the hardware that will actually
+//! move the samples, never from a `sleep` (see [`Mouth::pace`]).
+//!
 //! ## The two operations an agent gets
 //!
 //! * `duplex read` — everything said since the cursor, attributed. Reading
@@ -50,30 +56,42 @@
 //! hold up its own end, which is a different product and should be a deliberate
 //! choice.
 //!
-//! ## Where the frame budget goes (measured, and it does not yet fit)
+//! ## Where the frame budget goes (measured)
 //!
-//! The budget is 80 ms per frame. Measured end to end on an M-series laptop,
-//! 400-600 frame sessions, a named capture device driving the clock:
-//! **p50 ~100 ms, p90 ~130-165 ms, p99 ~170-220 ms, i.e. 0.72-0.77x
-//! realtime**, with ~70-97% of frames over budget. The loop stays CURRENT
-//! rather than drifting — it discards capture backlog past
-//! `MAX_BACKLOG_FRAMES` — but playback still starves, which is audible as
-//! rebuffering inside a word.
+//! The budget is 80 ms per frame, and the two directions of the channel do
+//! NOT cost the same, because only one of them pays for the codec encoder.
 //!
-//! The reason is structural, not incidental. Of the four stages in a frame,
-//! only the temporal transformer runs on the GPU; the depth transformer and
-//! BOTH codec directions are host-CPU lanes in the model library today. The
-//! model library's own budget model allots temporal ~15.6 ms (GPU) + depth
-//! ~21.6 ms (CPU) + codec ~5 ms (CPU) + submission ~5 ms, so two thirds of
-//! the budget is CPU work before contention. Adding the in-line streaming
-//! codec encode to the loop moved the measured mean from ~74 ms to ~101 ms —
-//! about 27 ms per frame for one CPU stage.
+//! **Generation only (`--no-input`) fits, with room to spare.** Measured on an
+//! M-series laptop, 900-frame sessions with real injected utterances, an
+//! otherwise quiet machine: **p50 29-30 ms, p90 38-39 ms, p99 43-49 ms, max
+//! 74 ms — 0 of 900 frames over budget, 0 playback underruns, and 900 frames
+//! of audio in 71.7 s of wall clock, i.e. 1.00x realtime.** The same loop
+//! driving a Bluetooth handsfree endpoint measured p50 29.8 ms over 700
+//! frames, again with nothing over budget and nothing underrunning.
 //!
-//! So: this closes the loop and it is honest about its clock, but the path to
-//! realtime is porting the depth transformer and the codec to the GPU, not
-//! tuning anything here. `--decode-context` / `--decode-hop` are exposed
-//! because the codec decoder has no streaming state and re-decodes its
-//! context on every hop; they trade boundary artifacts against CPU load.
+//! **Full duplex does not fit yet**, and the gap is one stage: the in-line
+//! streaming codec ENCODE on the input path, which moved the measured mean
+//! from ~74 ms to ~101 ms when it was added — about 27 ms per frame. Of the
+//! four stages in a frame, only the temporal transformer runs on the GPU; the
+//! depth transformer and both codec directions are host-CPU lanes in the
+//! model library today. The model library's own budget model allots temporal
+//! ~15.6 ms (GPU) + depth ~21.6 ms (CPU) + codec ~5 ms (CPU) + submission
+//! ~5 ms. Generation clears the budget because it never touches the encoder;
+//! listening is what has to be paid for, and the way to pay for it is porting
+//! the encoder to the GPU, not tuning anything here.
+//!
+//! **What the frame is really exposed to is CPU CONTENTION, not its own
+//! cost.** The same generation-only session measured p50 29.4 ms on an idle
+//! machine and p50 90.3 ms — 63% of frames over budget — with a load average
+//! of 21 from unrelated compile jobs. Two thirds of the frame is host-CPU
+//! work, so a busy machine, not a slow model, is what makes this stutter.
+//! Any timing taken here without recording the load average is not a
+//! measurement of this loop.
+//!
+//! `--decode-context` / `--decode-hop` are exposed because the codec decoder
+//! has no streaming state and re-decodes its context on every hop; they trade
+//! boundary artifacts against CPU load. The context default is DEEP for a
+//! reason measured here — see [`DEFAULT_DECODE_CONTEXT`].
 //!
 //! ## Bluetooth handsfree channels, and why the stream is never closed
 //!
@@ -137,9 +155,6 @@ use clap::{Parser, Subcommand};
 const FRAME_SAMPLES: usize = 1920;
 /// The model's canonical sample rate.
 const SAMPLE_RATE: u32 = 24_000;
-/// Frame period.
-const FRAME: Duration = Duration::from_millis(80);
-
 /// How far the capture ring may run ahead before the loop discards the
 /// backlog. The model's step count IS its clock, so a loop that falls behind
 /// the world cannot catch up by stepping faster — it can only skip forward.
@@ -235,13 +250,19 @@ struct RunArgs {
     #[arg(long, env = "PERSONAPLEX_VOICE_PROMPT")]
     voice_prompt: PathBuf,
     /// EXACT name of the capture device. Held open for the whole session.
-    #[arg(long)]
+    /// Not needed with `--no-input`.
+    #[arg(long, default_value = "")]
     input: String,
     /// EXACT name of the playback device.
     #[arg(long)]
     output: String,
-    /// Weight format for the temporal stack.
-    #[arg(long, default_value = "q4")]
+    /// Weight format for the temporal stack. `q8` is the default because on
+    /// an Apple GPU it is not slower than `q4` — at these shapes the matvecs
+    /// are dispatch-bound rather than bandwidth-bound, and the hardware has
+    /// no FP4 units, so 4-bit is pure dequantization overhead there — while
+    /// costing far less fidelity. `q4` is expected to pay on parts that DO
+    /// have FP4 hardware.
+    #[arg(long, default_value = "q8")]
     fmt: String,
     /// Whether the model may hold up its own end of the conversation.
     /// `listen` forces its text stream to padding, so it hears everything,
@@ -282,17 +303,27 @@ struct RunArgs {
     /// Also tee everything spoken to this WAV file.
     #[arg(long)]
     wav: Option<PathBuf>,
-    /// Frames of context the codec decoder re-decodes on every hop.
+    /// Frames of context the codec decoder re-decodes on every hop. Deep by
+    /// default — the decoder's transformer has a 250-frame window and no
+    /// streaming state, so a shallow context makes the hop boundary audible.
     #[arg(long, default_value_t = DEFAULT_DECODE_CONTEXT)]
     decode_context: usize,
     /// New frames emitted per decode call.
     #[arg(long, default_value_t = DEFAULT_DECODE_HOP)]
     decode_hop: usize,
-    /// Do not open the capture device; feed digital silence instead. For
-    /// checking the model, the speaker and the transcript on a machine whose
-    /// microphone is busy.
+    /// Do not open the capture device; feed digital silence instead. This is
+    /// the GENERATION-ONLY channel — the model speaks and is not listened to
+    /// — and it is also what to use on a handsfree endpoint whose microphone
+    /// is already held open by something else. With no microphone the
+    /// SPEAKER becomes the frame clock (see `--lead`).
     #[arg(long)]
     no_input: bool,
+    /// Generation-only clock: frames of audio the model may run ahead of the
+    /// speaker before it waits. The floor is one decode hop, since the device
+    /// reports its queue a hop at a time; two hops is what keeps a hop of
+    /// audio in front of the device at all times.
+    #[arg(long)]
+    lead: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -892,7 +923,33 @@ impl Resampler {
 /// The codec decoder has no streaming state, so context is re-decoded on
 /// every hop: the decoder does `(context + hop) / hop` times realtime work.
 /// At 25 and 2 that is 13.5x, which is why these are knobs and not constants.
-const DEFAULT_DECODE_CONTEXT: usize = 8;
+/// Frames of already-spoken context the codec decoder re-decodes before the
+/// new ones, so that the frames it emits are not decoded from a cold start.
+///
+/// **This has to be deep, and 8 was far too shallow.** The Mimi decoder has
+/// no streaming state, so every hop re-runs the whole graph from zero — and
+/// that graph contains an 8-layer transformer with a CAUSAL SLIDING WINDOW OF
+/// 250 FRAMES. Handing it 8 frames of context truncates its attention by a
+/// factor of thirty, so the same codes decode to a different waveform
+/// depending on which hop they land in, and the splice between hops is
+/// audible. Measured as the median sample-to-sample jump AT a hop boundary
+/// over the same statistic away from one, in loud regions of matched runs:
+///
+/// | temporal fmt | context | boundary ÷ interior |
+/// |---|---|---|
+/// | q4  |  8 | 2.63 |
+/// | q8  |  8 | 2.23 |
+/// | f16 |  8 | 1.06 |
+/// | q8  | 64 | **0.95** |
+///
+/// At 64 the boundary is statistically indistinguishable from the interior,
+/// i.e. the splice is gone. The convolutional stack needs only a handful of
+/// frames (its receptive field is ~3-4 frames at 12.5 Hz), so this depth buys
+/// the TRANSFORMER's context, not the convs'. It costs about 6 ms per frame
+/// on the decode thread, which is off the frame clock and affordable: a q8
+/// session at context 64 measured p50 35.6 ms of an 80 ms budget, 1.00x
+/// realtime with nothing over budget.
+const DEFAULT_DECODE_CONTEXT: usize = 64;
 /// New frames emitted per decode call.
 const DEFAULT_DECODE_HOP: usize = 4;
 /// The model may lead the speaker by at most this much. Growing latency is a
@@ -901,6 +958,10 @@ const DECODE_QUEUE_FRAMES: usize = 16;
 /// Frames buffered before playback starts. The model produces at realtime, so
 /// this covers device start-up, not a production deficit.
 const PREBUFFER_FRAMES: usize = 5;
+/// Longest the generation clock will wait on the speaker before producing the
+/// next frame anyway. A device that stops consuming is a fault to surface, not
+/// a reason to wedge the loop forever.
+const PACE_DEADLINE: Duration = Duration::from_millis(500);
 
 #[cfg(feature = "duplex")]
 type Codes = [u32; mary::models::personaplex::mimi::config::NUM_CODEBOOKS];
@@ -916,6 +977,15 @@ struct Mouth {
     worker: Option<std::thread::JoinHandle<Result<()>>>,
     dropped: Arc<AtomicU64>,
     underruns: Arc<AtomicU64>,
+    /// Frames the speaker has finished playing. The lead is derived from this
+    /// and the push count rather than published directly, so that a stale
+    /// reading errs towards WAITING — see [`Mouth::pace`].
+    played: Arc<AtomicU64>,
+    /// Frames handed to the mouth. Owned by the generation loop, which is the
+    /// only pusher.
+    pushed: std::cell::Cell<u64>,
+    /// Whether the prebuffer is full and the device is actually consuming.
+    playing: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "duplex")]
@@ -931,8 +1001,12 @@ impl Mouth {
         let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
         let dropped = Arc::new(AtomicU64::new(0));
         let underruns = Arc::new(AtomicU64::new(0));
+        let played = Arc::new(AtomicU64::new(0));
+        let playing = Arc::new(AtomicBool::new(false));
         let worker = {
             let underruns = Arc::clone(&underruns);
+            let played = Arc::clone(&played);
+            let playing = Arc::clone(&playing);
             std::thread::Builder::new()
                 .name("duplex-mouth".into())
                 .spawn(move || {
@@ -943,6 +1017,8 @@ impl Mouth {
                         frame_rx,
                         ready_tx,
                         underruns,
+                        played,
+                        playing,
                         context_frames,
                         hop_frames,
                     )
@@ -959,6 +1035,9 @@ impl Mouth {
             worker: Some(worker),
             dropped,
             underruns,
+            played,
+            pushed: std::cell::Cell::new(0),
+            playing,
         })
     }
 
@@ -966,10 +1045,11 @@ impl Mouth {
         let Some(sender) = self.frames.as_ref() else {
             return;
         };
-        if let Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) =
-            sender.try_send(codes)
-        {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        match sender.try_send(codes) {
+            Ok(()) => self.pushed.set(self.pushed.get() + 1),
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -979,6 +1059,56 @@ impl Mouth {
 
     fn underruns(&self) -> u64 {
         self.underruns.load(Ordering::Relaxed)
+    }
+
+    /// Frames of audio handed to the speaker that it has not played yet.
+    ///
+    /// Derived rather than published, and that direction is load-bearing: the
+    /// decode thread cannot publish while it is INSIDE a decode call, so any
+    /// reading here may be stale. Because `pushed` is owned by the caller and
+    /// only `played` can lag, a stale reading OVERSTATES the lead and the
+    /// pacer waits — the safe way to be wrong. Publishing the lead directly
+    /// failed the other way: a lead frozen below the target let the loop
+    /// free-run for a whole decode call and overflow the frame queue (138 of
+    /// 900 frames dropped in one measured session).
+    fn lead(&self) -> u64 {
+        self.pushed
+            .get()
+            .saturating_sub(self.played.load(Ordering::Relaxed))
+    }
+
+    /// THE SPEAKER IS THE CLOCK. Block until the device has drained the
+    /// model's lead below `target` frames, then let the next frame be
+    /// generated.
+    ///
+    /// A generation-only session has no microphone to take its period from,
+    /// and a `sleep(FRAME - work)` is NOT a substitute: `thread::sleep`
+    /// overshoots by a millisecond or four every time and the error only ever
+    /// accumulates in one direction, so the loop produces 80 ms of audio every
+    /// ~84 ms — a ~5% production deficit that drains any prebuffer and then
+    /// stutters forever. (Measured: 400 frames of audio took 33.6 s of wall
+    /// clock and underran 11 times, with the model itself using 37 ms of its
+    /// 80 ms budget.) Waiting on the DEVICE instead takes the period from the
+    /// hardware that will actually play the samples, so there is no second
+    /// clock to drift against — the same reason the duplex loop takes its
+    /// period from the microphone.
+    ///
+    /// Returns `false` if the deadline expired with the device still full,
+    /// which means playback has stalled rather than that the model is fast.
+    fn pace(&self, target: u64) -> bool {
+        // Before the prebuffer is full nothing is being consumed, so there is
+        // nothing to pace against: fill it as fast as the model can.
+        if !self.playing.load(Ordering::Relaxed) {
+            return true;
+        }
+        let deadline = Instant::now() + PACE_DEADLINE;
+        while self.lead() >= target {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
     }
 
     fn finish(mut self) -> Result<()> {
@@ -1002,6 +1132,8 @@ fn mouth_worker(
     frames: Receiver<Codes>,
     ready: mpsc::Sender<std::result::Result<(), String>>,
     underruns: Arc<AtomicU64>,
+    played: Arc<AtomicU64>,
+    playing: Arc<AtomicBool>,
     context_frames: usize,
     hop_frames: usize,
 ) -> Result<()> {
@@ -1056,10 +1188,34 @@ fn mouth_worker(
         player.append(SamplesBuffer::new(mono, rate, slice));
     };
 
-    while let Ok(frame) = frames.recv() {
+    // Frames the device has FINISHED, which is what the generation clock
+    // paces against (see [`Mouth::pace`]). `player.len()` counts QUEUED
+    // SOURCES and the one being played counts until its last sample is gone,
+    // so `emitted - len·hop` UNDERSTATES what has been played by at most one
+    // hop — the direction that makes the pacer wait rather than run ahead.
+    let publish = |player: &rodio::Player, emitted: usize| {
+        played.store(
+            (emitted.saturating_sub(player.len() * hop_frames)) as u64,
+            Ordering::Relaxed,
+        );
+    };
+
+    loop {
+        // A timed receive so the lead stays live while the model is thinking:
+        // a producer that only republished on its own writes would tell the
+        // pacer the queue is full for as long as it takes to fill it.
+        let frame = match frames.recv_timeout(Duration::from_millis(2)) {
+            Ok(frame) => frame,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                publish(&player, emitted);
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         history.push_back(frame);
         pending += 1;
         if pending < hop_frames {
+            publish(&player, emitted);
             continue;
         }
         // An empty queue after playback started means the decoder fell behind
@@ -1076,7 +1232,9 @@ fn mouth_worker(
         if !started && emitted >= PREBUFFER_FRAMES {
             player.play();
             started = true;
+            playing.store(true, Ordering::Relaxed);
         }
+        publish(&player, emitted);
     }
     if pending > 0 {
         emit(&history, pending);
@@ -1291,11 +1449,24 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         prompt.total_steps()
     );
 
+    // Generation-only pacing: how far the model may run ahead of the speaker.
+    // The device reports its queue one decode hop at a time, so a target below
+    // one hop can never be met and a target of exactly one hop lets the queue
+    // reach the device's last sample; two hops keeps a full hop in front of it.
+    let lead_target = args.lead.unwrap_or(2 * args.decode_hop).max(1) as u64;
+    let mut stalled = 0usize;
+
     // The capture stream is opened last and held for the whole session. On a
     // handsfree endpoint this open IS the channel.
     let capture = if args.no_input {
-        println!("duplex: no capture device requested — feeding silence");
+        println!(
+            "duplex: generation only — no capture device, the speaker is the clock \
+             (lead {lead_target} frames = {} ms)",
+            lead_target * 80
+        );
         None
+    } else if args.input.is_empty() {
+        bail!("--input names the capture device; pass one, or --no-input to generate only")
     } else {
         println!("duplex: opening '{}' …", args.input);
         let capture = open_capture(&args.input)?;
@@ -1337,7 +1508,6 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     let mut step_max = 0f64;
     let mut over_budget = 0usize;
     let mut step_times: Vec<f64> = Vec::new();
-    let mut frame_wall = Instant::now();
     let mut last_control_poll = Instant::now();
 
     println!("duplex: live. `duplex read` to catch up, `duplex say` to speak, Ctrl-C to stop.");
@@ -1381,18 +1551,16 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
                 }
             },
             None => {
-                // No device means no device clock. Pace the synthetic one to
-                // the frame period MINUS the work already done, or the loop
-                // is non-realtime by construction and every downstream
-                // starvation number is an artifact of this sleep.
-                let spent = frame_wall.elapsed();
-                if spent < FRAME {
-                    std::thread::sleep(FRAME - spent);
+                // No microphone means no clock on the input side — so THE
+                // SPEAKER IS THE CLOCK. Never a `sleep(FRAME - work)`: that
+                // is a second clock, it overshoots in one direction only, and
+                // the deficit lands as rebuffering. See [`Mouth::pace`].
+                if !mouth.pace(lead_target) {
+                    stalled += 1;
                 }
                 None
             }
         };
-        frame_wall = Instant::now();
 
         // The far end's turn structure is the only thing this model can
         // honestly report about them: presence and duration, never words.
@@ -1521,7 +1689,8 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             let skipped = capture.as_ref().map(Capture::skipped).unwrap_or(0);
             println!(
                 "  [clock] {:.1}s | step mean {:.1} ms max {:.1} ms | {} over budget | \
-                 {} in skipped | {} out dropped | {} underruns | ear rms mean {:.4} peak {:.4}",
+                 {} in skipped | {} out dropped | {} underruns | lead {} | \
+                 ear rms mean {:.4} peak {:.4}",
                 session_start.elapsed().as_secs_f64(),
                 step_total / frame_index as f64,
                 step_max,
@@ -1529,6 +1698,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
                 skipped,
                 mouth.dropped(),
                 mouth.underruns(),
+                mouth.lead(),
                 heard_total / heard_frames.max(1) as f64,
                 heard_peak
             );
@@ -1582,7 +1752,8 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         "duplex: {} frames of audio in {:.1}s wall — {:.2}x realtime\n\
          \x20 step ms: p50 {:.1}  p90 {:.1}  p99 {:.1}  max {:.1}  mean {:.1} \
          (budget 80)\n\
-         \x20 {} of {} frames over budget ({:.0}%), {} playback underruns",
+         \x20 {} of {} frames over budget ({:.0}%), {} playback underruns, \
+         {} speaker stalls",
         frame_index,
         wall,
         (frame_index as f64 * 0.08) / wall.max(1e-9),
@@ -1594,7 +1765,8 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         over_budget,
         frame_index,
         100.0 * over_budget as f64 / frame_index.max(1) as f64,
-        mouth.underruns()
+        mouth.underruns(),
+        stalled
     );
     drop(capture);
     mouth.finish()?;
