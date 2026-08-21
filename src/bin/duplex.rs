@@ -2011,8 +2011,19 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             }
         }
 
-        // An utterance ends where the text stream goes quiet.
-        if pad_run >= args.utterance_gap && !spoken.trim().is_empty() {
+        // An utterance ends where the text stream goes quiet — but NOT while
+        // a line is still being said. A quiet stretch is only an ending when
+        // there is nothing left to say; until the queue is drained it is a
+        // pause inside the line.
+        //
+        // This became load-bearing when the model took over the timing. A
+        // scheduled cadence bounded every gap at `--pace` frames, so a pause
+        // could never reach `--utterance-gap`; the model's own pauses run to
+        // 25 frames, well past it, and the rule then cut one sentence into six
+        // transcript entries mid-line. The audio and the words were never
+        // affected, but the pile recorded fragments and the injected-line
+        // bookkeeping advanced once per fragment.
+        if queued.is_empty() && pad_run >= args.utterance_gap && !spoken.trim().is_empty() {
             let line = spoken.trim().to_owned();
             let speaker = if spoken_was_injected {
                 Speaker::Agent
