@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **`converse` — a half-duplex talk-loop bridge.** Three seams that already
+  existed are now joined into one spoken loop: a listener appends utterances
+  to a jsonl log, `converse run` tails it, takes one brain turn per utterance,
+  and speaks the reply through `voice say|shout`. Turn-taking is a PAUSE FILE
+  held for the whole speech window rather than an open/close of the capture
+  stream — closing a Bluetooth microphone renegotiates its profile and clips
+  the next sentence, so the stream stays open and the listener discards audio
+  while the file exists. The guard removes the file on drop, so an error path
+  cannot leave the ears permanently deaf. `--brain echo` closes the loop with
+  no model endpoint at all, which makes the plumbing testable from a file with
+  no audio hardware; empty-segment artefacts (a transcript that parrots its
+  own prompt, sub-second blips, one-character results) are filtered with the
+  reason recorded per turn. Devices are named on both ends and neither end
+  consults the system default: connecting a Bluetooth endpoint renumbers the
+  device list, and an index or a default can silently land on a dead virtual
+  channel.
+
 - **Compass importance is one shared partial order.** `compass list` already
   understood explicit `prioritize` assertions, but its private topological
   sort assigned every unrelated goal a different rank, so the advertised
