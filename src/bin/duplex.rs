@@ -309,6 +309,36 @@ struct RunArgs {
     /// anything in the gaps it is given: breath, a filled pause, laughter.
     #[arg(long)]
     trace: Option<PathBuf>,
+    /// Under `--cadence model`, the fewest frames allowed between one word
+    /// ONSET and the next. `0` (the default) imposes nothing and leaves the
+    /// rhythm entirely the model's.
+    ///
+    /// A floor, never a schedule: it can only DELAY a word the model wanted
+    /// to start, never bring one forward, so the long pauses it chooses stay
+    /// exactly as long. Within-word pieces are untouched — those run
+    /// consecutively in real speech and stretching them is the original bug.
+    /// It was built to trade back some of the speed of model timing (~4.0
+    /// words/s against ordinary English's 2.5-3.0) without flattening the
+    /// variation. **Measured, it does not work, and the reason is worth
+    /// keeping.** A floor of 3 was predicted to lift the fastest third of
+    /// onset gaps and land a mean of 3.92 frames. It produced a mean of
+    /// **8.38**, a shortest gap of 4 rather than 3, and the same two
+    /// sentences took 33.2 s against model timing's 18.3 s — slower than the
+    /// fixed schedule it was meant to improve on.
+    ///
+    /// Holding PAD on a frame where the model asked for a word does not delay
+    /// that word by a frame. The PAD enters the model's own history and
+    /// conditions what follows, so it drops into a pause and then EXTENDS it
+    /// on its own: the intervention compounds instead of applying once. That
+    /// is the same property that makes forcing work at all — a token we
+    /// substitute is one it then owns — pointing the other way.
+    ///
+    /// Left in, defaulted off, as the reproduction for that finding. The
+    /// summary counts every frame it holds back. Note also that lengthening
+    /// pauses this way trips `--utterance-gap`, which chops one line into
+    /// several transcript entries (the audio stays whole).
+    #[arg(long, default_value_t = 0)]
+    min_word_gap: usize,
     /// Under `--cadence model`, how many frames the model may hold silence
     /// mid-line before we start the next word for it. A backstop, not a
     /// rhythm: every time it fires we have taken the timing back, and the run
@@ -1595,6 +1625,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     // one hop can never be met and a target of exactly one hop lets the queue
     // reach the device's last sample; two hops keeps a full hop in front of it.
     let nudge_after = args.nudge_after;
+    let min_word_gap = args.min_word_gap;
     let mut trace_out = match args.trace.as_ref() {
         Some(path) => {
             let mut f = std::fs::File::create(path)
@@ -1683,6 +1714,10 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     let mut model_chose = 0usize;
     let mut nudged = 0usize;
     let mut wait_frames = 0usize;
+    // Frames we held PAD because the model wanted the next word sooner than
+    // `--min-word-gap` allows, and frames since the last onset went out.
+    let mut held_back = 0usize;
+    let mut since_onset = usize::MAX / 2;
 
     let mut frame_index = 0usize;
     let mut step_total = 0f64;
@@ -1827,23 +1862,51 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             let waited = &mut wait_frames;
             let chose = &mut model_chose;
             let nudges = &mut nudged;
+            let held = &mut held_back;
+            let gap = &mut since_onset;
+            let spm_ref = &spm;
+            let onset = move |t: i64| {
+                t >= N_TEXT_SPECIALS
+                    && spm_ref.piece_bytes(t).starts_with("\u{2581}".as_bytes())
+            };
             let mut decide = |_logits: &[f32], sampled: i64| -> i64 {
                 if sampled >= N_TEXT_SPECIALS {
                     // It decided to speak. The moment is its own; the word is
-                    // ours.
+                    // ours — unless a floor is set and it wants to start the
+                    // next WORD sooner than that allows. Then we hold, which
+                    // is us imposing rhythm again, so it is counted.
+                    let next_onset = queue.front().copied().map(onset).unwrap_or(false);
+                    if min_word_gap > 0 && next_onset && *gap < min_word_gap {
+                        *gap += 1;
+                        *held += 1;
+                        return TEXT_PAD;
+                    }
                     *waited = 0;
                     *chose += 1;
-                    queue.pop_front().unwrap_or(sampled)
+                    let t = queue.pop_front().unwrap_or(sampled);
+                    if onset(t) {
+                        *gap = 0;
+                    } else {
+                        *gap += 1;
+                    }
+                    t
                 } else if *waited >= nudge_after {
                     // It has held silence longer than we are willing to wait.
                     // Start the word for it and count that we did.
                     *waited = 0;
                     *nudges += 1;
-                    queue.pop_front().unwrap_or(sampled)
+                    let t = queue.pop_front().unwrap_or(sampled);
+                    if onset(t) {
+                        *gap = 0;
+                    } else {
+                        *gap += 1;
+                    }
+                    t
                 } else {
                     // PAD or EPAD: leave it exactly as sampled. This is the
                     // whole point — the pause is the model's.
                     *waited += 1;
+                    *gap += 1;
                     sampled
                 }
             };
@@ -2100,14 +2163,17 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         let mean = word_gaps.iter().sum::<usize>() as f64 / n as f64;
         let (g50, g90, g99) = quantiles(&mut word_gaps);
         println!(
-            "  rhythm — frames from one word to the next: p50 {g50}  p90 {g90}               p99 {g99}  mean {mean:.2}  ({spread} distinct values over {n} words)"
+            "  rhythm — frames from one word to the next: p50 {g50}  p90 {g90}  p99 {g99}  mean {mean:.2}  ({spread} distinct values over {n} words)"
         );
     }
     if model_chose + nudged > 0 {
         println!(
-            "  timing: the model chose the moment {model_chose} times, we started              the word for it {nudged} times ({:.0}% ours)",
+            "  timing: the model chose the moment {model_chose} times, we started it {nudged} times ({:.0}% ours)",
             100.0 * nudged as f64 / (model_chose + nudged) as f64
         );
+        if held_back > 0 {
+            println!("          and held it back {held_back} frames for --min-word-gap {min_word_gap}");
+        }
     }
     drop(capture);
     mouth.finish()?;
