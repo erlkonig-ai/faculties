@@ -45,7 +45,7 @@ git clone https://github.com/erlkonig-ai/mary
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
 git -C triblespace-rs checkout 8eb734bc27b9dc860109deba929508701f07adcc
 git -C mary checkout 84857d64b81f7f5f90a30630e220896c3da2e8b8
-git -C cubecl-fork checkout f299aed551ec97bf28b779bfed6e88a484a167e4
+git -C cubecl-fork checkout 75635270eed8cfacd1cd0f171f2f6b45a5e65b9c
 cd faculties
 cargo build --release --workspace --bins --locked
 scripts/install-release-cohort target/release

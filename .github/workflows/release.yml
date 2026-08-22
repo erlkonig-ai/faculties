@@ -59,7 +59,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/cubecl
-          ref: f299aed551ec97bf28b779bfed6e88a484a167e4
+          ref: 75635270eed8cfacd1cd0f171f2f6b45a5e65b9c
           path: cubecl-fork
 
       - name: Install rust toolchain
