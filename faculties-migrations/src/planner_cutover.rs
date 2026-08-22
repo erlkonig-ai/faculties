@@ -35,12 +35,15 @@ use triblespace::core::trible::{Fragment, Trible, TribleSet};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::inlineencodings;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate, ProjectedLegacyCommit,
+};
 use faculties::planner::{self, EventDraft, IntervalValue, STATUS_CANCELLED};
 use faculties::schemas::planner::{
     event, note, DEFAULT_SCOPE_ID, KIND_EVENT_ID, KIND_NOTE_ID, LEGACY_BRANCH_NAME,
 };
+use faculties::storage::publish_fragments;
 
 /// One native collection commit corresponding to one exact authored legacy
 /// commit.
@@ -1094,14 +1097,16 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
-    use triblespace::core::repo::{BlobStore, BlobStoreMeta, PinStore, Repository};
+    use triblespace::core::repo::{BlobStore, BlobStoreMeta};
     use triblespace::macros::{entity, id_hex};
     use triblespace::prelude::{ExclusiveId, TryToInline};
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{
+        FrozenTestSource, TestBranchSpec, TestDeltaSpec, TestSourceSpec,
+    };
     use faculties::planner::{STATUS_CONFIRMED, TRANSP_OPAQUE};
+    use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     const OLD_EVENT_A: Id = id_hex!("B1000000000000000000000000000001");
     const OLD_EVENT_B: Id = id_hex!("B1000000000000000000000000000002");
@@ -1202,7 +1207,8 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
     struct Fixture {
         _directory: TestDirectory,
-        source: std::path::PathBuf,
+        source_path: std::path::PathBuf,
+        source: FrozenTestSource,
         destination: std::path::PathBuf,
         source_key: std::path::PathBuf,
         destination_key: std::path::PathBuf,
@@ -1210,73 +1216,59 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
     fn fixture(event_b_uid: &str) -> Fixture {
         let directory = TestDirectory::new();
-        let source = directory.0.join("legacy.pile");
+        let source_path = directory.0.join("legacy.pile");
         let destination = directory.0.join("target.pile");
         let source_key = directory.0.join("source.key");
         let destination_key = directory.0.join("target.key");
-        File::create(&source).unwrap();
+        File::create(&source_path).unwrap();
         File::create(&destination).unwrap();
-
-        let storage = open_pile_strict(&source).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0x51; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-
-        let mut root = repository.pull(branch).unwrap();
-        root.commit(
-            vocabulary()
-                + legacy_event(OLD_EVENT_A, "uid-a", STATUS_CONFIRMED, 1.0)
-                + legacy_event(OLD_EVENT_B, event_b_uid, STATUS_CANCELLED, 2.0),
-            "root",
-        );
-        repository.push(&mut root).unwrap();
-
-        let mut authored_empty = repository.pull(branch).unwrap();
-        authored_empty.commit(Fragment::empty(), "authored empty");
-        repository.push(&mut authored_empty).unwrap();
-
-        let mut left = repository.pull(branch).unwrap();
-        let mut right = repository.pull(branch).unwrap();
         let mut semantic_metadata = Fragment::empty();
         let detail = semantic_metadata.put::<UTF8String, _>("semantic provenance".to_owned());
         semantic_metadata += entity! {
             metadata::tag: &METADATA_MARKER,
             metadata::description: detail,
         };
-        left.commit_with_metadata(
-            legacy_note(OLD_NOTE_A, OLD_EVENT_A, "left note", 3.0),
-            semantic_metadata,
-            "left fork",
-        );
-        right.commit(
-            legacy_note(OLD_NOTE_B, OLD_EVENT_B, "right note", 4.0),
-            "right fork",
-        );
-        repository.push(&mut left).unwrap();
-        repository.push(&mut right).unwrap();
-
-        let mut joined = repository.pull(branch).unwrap();
-        joined.commit(legacy_cancellation(OLD_EVENT_A), "causal rejoin");
-        repository.push(&mut joined).unwrap();
-
-        // An exact repeated assertion is an authored occurrence, not a new
-        // semantic fact. It exercises overlap without weakening preservation.
-        let mut redundant = repository.pull(branch).unwrap();
-        redundant.commit(
-            entity! { ExclusiveId::force_ref(&OLD_EVENT_A) @ event::summary: "event-a" },
-            "redundant overlap",
-        );
-        repository.push(&mut redundant).unwrap();
-        repository.close().unwrap();
-
-        initialize_signer(&source, Some(&source_key)).unwrap();
+        initialize_signer(&source_path, Some(&source_key)).unwrap();
         initialize_signer(&destination, Some(&destination_key)).unwrap();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x50; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x51; 32]),
+            vec![
+                TestDeltaSpec::authored(
+                    vocabulary()
+                        + legacy_event(OLD_EVENT_A, "uid-a", STATUS_CONFIRMED, 1.0)
+                        + legacy_event(OLD_EVENT_B, event_b_uid, STATUS_CANCELLED, 2.0),
+                    "root",
+                ),
+                TestDeltaSpec::authored(Fragment::empty(), "authored empty"),
+                TestDeltaSpec::authored(
+                    legacy_note(OLD_NOTE_A, OLD_EVENT_A, "left note", 3.0),
+                    "left fork",
+                )
+                .with_metadata(semantic_metadata)
+                .with_parents([1]),
+                TestDeltaSpec::authored(
+                    legacy_note(OLD_NOTE_B, OLD_EVENT_B, "right note", 4.0),
+                    "right fork",
+                )
+                .with_parents([1]),
+                TestDeltaSpec::merge([2, 3]),
+                TestDeltaSpec::authored(legacy_cancellation(OLD_EVENT_A), "causal rejoin"),
+                // An exact repeated assertion is an authored occurrence, not a
+                // new semantic fact. It exercises overlap without weakening
+                // preservation.
+                TestDeltaSpec::authored(
+                    entity! { ExclusiveId::force_ref(&OLD_EVENT_A) @ event::summary: "event-a" },
+                    "redundant overlap",
+                ),
+            ],
+        )])
+        .freeze(&source_path)
+        .unwrap();
         Fixture {
             _directory: directory,
+            source_path,
             source,
             destination,
             source_key,
@@ -1294,8 +1286,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             .copied()
             .filter(|commit| commit.public_key().raw == signer.verifying_key().to_bytes())
             .collect();
-        let mut collection =
-            faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
+        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         let reader = collection.storage_mut().reader().unwrap();
         let pile = collection.into_storage();
@@ -1306,10 +1297,10 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn authored_fragments_metadata_exports_and_blobs_are_preserved_exactly() {
         let fixture = fixture("uid-b");
-        let frozen = freeze_source(&fixture.source).unwrap();
+        let frozen = &fixture.source.source;
         let branch = frozen.legacy_branch(LEGACY_BRANCH_NAME).unwrap().unwrap();
         let mut projected =
-            project_legacy_authored_commits(&frozen, &branch, validate_legacy_payloads).unwrap();
+            project_legacy_authored_commits(frozen, &branch, validate_legacy_payloads).unwrap();
         projected.sort_unstable_by_key(|commit| commit.source);
 
         // Exercise all Fragment channels directly. The historical repository
@@ -1359,7 +1350,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         assert!(final_blobs.metadata(metadata_sentinel).unwrap().is_some());
 
         publish(
-            &frozen,
+            frozen,
             &plan,
             &fixture.destination,
             Some(&fixture.destination_key),
@@ -1375,9 +1366,9 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn plan_is_additive_deterministic_and_preserves_overlap_occurrences() {
         let fixture = fixture("uid-b");
-        let frozen = freeze_source(&fixture.source).unwrap();
-        let forward = plan(&frozen).unwrap();
-        let again = plan(&frozen).unwrap();
+        let frozen = &fixture.source.source;
+        let forward = plan(frozen).unwrap();
+        let again = plan(frozen).unwrap();
         assert_eq!(forward, again);
         forward.verify_conservation().unwrap();
 
@@ -1406,7 +1397,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
         let branch = frozen.legacy_branch(LEGACY_BRANCH_NAME).unwrap().unwrap();
         let mut projected =
-            project_legacy_authored_commits(&frozen, &branch, validate_legacy_payloads).unwrap();
+            project_legacy_authored_commits(frozen, &branch, validate_legacy_payloads).unwrap();
         projected.reverse();
         let mut reversed_branch = branch.clone();
         reversed_branch.deltas.reverse();
@@ -1417,13 +1408,13 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn detached_target_and_in_place_publication_are_exact_and_idempotent() {
         let fixture = fixture("uid-b");
-        let source_before = fs::read(&fixture.source).unwrap();
-        let frozen = freeze_source(&fixture.source).unwrap();
-        let plan = plan(&frozen).unwrap();
-        assert_eq!(fs::read(&fixture.source).unwrap(), source_before);
+        let source_before = fs::read(&fixture.source_path).unwrap();
+        let frozen = &fixture.source.source;
+        let plan = plan(frozen).unwrap();
+        assert_eq!(fs::read(&fixture.source_path).unwrap(), source_before);
 
         let first = publish(
-            &frozen,
+            frozen,
             &plan,
             &fixture.destination,
             Some(&fixture.destination_key),
@@ -1431,7 +1422,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         .unwrap();
         let target_length = fs::metadata(&fixture.destination).unwrap().len();
         let second = publish(
-            &frozen,
+            frozen,
             &plan,
             &fixture.destination,
             Some(&fixture.destination_key),
@@ -1506,70 +1497,71 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         assert!(target_commits
             .iter()
             .all(|commit| commit.collection() == expected_collection));
-        assert_eq!(fs::read(&fixture.source).unwrap(), source_before);
+        assert_eq!(fs::read(&fixture.source_path).unwrap(), source_before);
 
-        let in_place_first =
-            publish(&frozen, &plan, &fixture.source, Some(&fixture.source_key)).unwrap();
-        let in_place_length = fs::metadata(&fixture.source).unwrap().len();
-        let in_place_second =
-            publish(&frozen, &plan, &fixture.source, Some(&fixture.source_key)).unwrap();
+        let in_place_first = publish(
+            frozen,
+            &plan,
+            &fixture.source_path,
+            Some(&fixture.source_key),
+        )
+        .unwrap();
+        let in_place_length = fs::metadata(&fixture.source_path).unwrap().len();
+        let in_place_second = publish(
+            frozen,
+            &plan,
+            &fixture.source_path,
+            Some(&fixture.source_key),
+        )
+        .unwrap();
         assert_eq!(in_place_first, in_place_second);
         assert_eq!(
-            fs::metadata(&fixture.source).unwrap().len(),
+            fs::metadata(&fixture.source_path).unwrap().len(),
             in_place_length
         );
 
         let (in_place_facts, in_place_reader, _) =
-            materialize(&fixture.source, &fixture.source_key);
+            materialize(&fixture.source_path, &fixture.source_key);
         assert_eq!(in_place_facts, plan.materialized_facts());
         planner::validate_catalog(&in_place_reader, &in_place_facts).unwrap();
-        let mut pile = open_pile_strict(&fixture.source).unwrap();
-        assert!(pile.pins().unwrap().next().is_some());
-        pile.close().unwrap();
     }
 
-    fn concurrent_genesis_source() -> (TestDirectory, std::path::PathBuf) {
+    fn concurrent_genesis_source() -> (TestDirectory, FrozenTestSource) {
         let directory = TestDirectory::new();
         let path = directory.0.join("fork-conflict.pile");
         File::create(&path).unwrap();
-        let storage = open_pile_strict(&path).unwrap();
-        let mut repository = Repository::new(
-            storage,
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x60; 16]).unwrap(),
             SigningKey::from_bytes(&[0x62; 32]),
-            Fragment::empty(),
-        )
+            vec![
+                TestDeltaSpec::authored(vocabulary(), "vocabulary"),
+                TestDeltaSpec::authored(
+                    legacy_event(OLD_EVENT_A, "forked", STATUS_CONFIRMED, 1.0),
+                    "left genesis",
+                )
+                .with_parents([0]),
+                TestDeltaSpec::authored(
+                    legacy_event(OLD_EVENT_A, "forked", STATUS_CONFIRMED, 1.0),
+                    "right genesis",
+                )
+                .with_parents([0]),
+                TestDeltaSpec::merge([1, 2]),
+            ],
+        )])
+        .freeze(&path)
         .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut root = repository.pull(branch).unwrap();
-        root.commit(vocabulary(), "vocabulary");
-        repository.push(&mut root).unwrap();
-
-        let mut left = repository.pull(branch).unwrap();
-        let mut right = repository.pull(branch).unwrap();
-        left.commit(
-            legacy_event(OLD_EVENT_A, "forked", STATUS_CONFIRMED, 1.0),
-            "left genesis",
-        );
-        right.commit(
-            legacy_event(OLD_EVENT_A, "forked", STATUS_CONFIRMED, 1.0),
-            "right genesis",
-        );
-        repository.push(&mut left).unwrap();
-        repository.push(&mut right).unwrap();
-        repository.close().unwrap();
-        (directory, path)
+        (directory, source)
     }
 
     #[test]
     fn duplicate_uids_and_concurrent_genesis_forks_fail_before_publication() {
         let duplicate = fixture("uid-a");
-        let frozen = freeze_source(&duplicate.source).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        let error = plan(&duplicate.source.source).unwrap_err();
         assert!(format!("{error:#}").contains("share UID"));
 
-        let (_directory, path) = concurrent_genesis_source();
-        let frozen = freeze_source(&path).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        let (_directory, source) = concurrent_genesis_source();
+        let error = plan(&source.source).unwrap_err();
         assert!(format!("{error:#}").contains("concurrent genesis assertions"));
     }
 
@@ -1578,34 +1570,28 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         let directory = TestDirectory::new();
         let path = directory.0.join("note-overlap.pile");
         File::create(&path).unwrap();
-        let storage = open_pile_strict(&path).unwrap();
-        let mut repository = Repository::new(
-            storage,
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x61; 16]).unwrap(),
             SigningKey::from_bytes(&[0x63; 32]),
-            Fragment::empty(),
-        )
+            vec![
+                TestDeltaSpec::authored(
+                    vocabulary() + legacy_event(OLD_EVENT_A, "one", STATUS_CONFIRMED, 1.0),
+                    "event",
+                ),
+                TestDeltaSpec::authored(
+                    legacy_note(OLD_NOTE_A, OLD_EVENT_A, "same", 2.0),
+                    "first note",
+                ),
+                TestDeltaSpec::authored(
+                    legacy_note(OLD_NOTE_B, OLD_EVENT_A, "same", 2.0),
+                    "second note",
+                ),
+            ],
+        )])
+        .freeze(&path)
         .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        workspace.commit(
-            vocabulary() + legacy_event(OLD_EVENT_A, "one", STATUS_CONFIRMED, 1.0),
-            "event",
-        );
-        repository.push(&mut workspace).unwrap();
-        workspace.commit(
-            legacy_note(OLD_NOTE_A, OLD_EVENT_A, "same", 2.0),
-            "first note",
-        );
-        repository.push(&mut workspace).unwrap();
-        workspace.commit(
-            legacy_note(OLD_NOTE_B, OLD_EVENT_A, "same", 2.0),
-            "second note",
-        );
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let frozen = freeze_source(&path).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&frozen.source).unwrap();
         assert_eq!(plan.report().legacy_notes, 2);
         assert_eq!(plan.report().canonical_notes, 1);
         assert_eq!(plan.note_ids()[&OLD_NOTE_A], plan.note_ids()[&OLD_NOTE_B]);
@@ -1644,28 +1630,23 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             .root()
             .unwrap();
 
-        let storage = open_pile_strict(&path).unwrap();
-        let mut repository = Repository::new(
-            storage,
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x65; 16]).unwrap(),
             SigningKey::from_bytes(&[0x64; 32]),
-            Fragment::empty(),
-        )
+            vec![
+                TestDeltaSpec::authored(
+                    vocabulary()
+                        + legacy_event(event_id, "already-intrinsic", STATUS_CONFIRMED, 1.0)
+                        + legacy_note(note_id, event_id, "same", 2.0),
+                    "already intrinsic",
+                ),
+                TestDeltaSpec::authored(legacy_cancellation(event_id), "legacy cancellation"),
+            ],
+        )])
+        .freeze(&path)
         .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        workspace.commit(
-            vocabulary()
-                + legacy_event(event_id, "already-intrinsic", STATUS_CONFIRMED, 1.0)
-                + legacy_note(note_id, event_id, "same", 2.0),
-            "already intrinsic",
-        );
-        repository.push(&mut workspace).unwrap();
-        workspace.commit(legacy_cancellation(event_id), "legacy cancellation");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let frozen = freeze_source(&path).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&frozen.source).unwrap();
         assert_eq!(plan.event_ids()[&event_id], event_id);
         assert_eq!(plan.note_ids()[&note_id], note_id);
         assert!(plan.report().overlapping_shadow_facts > 0);
@@ -1676,7 +1657,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             .intersect(plan.original_facts())
             .is_empty());
         let catalog =
-            planner::validate_catalog(frozen.reader(), &plan.materialized_facts()).unwrap();
+            planner::validate_catalog(frozen.source.reader(), &plan.materialized_facts()).unwrap();
         assert_eq!(catalog.events.len(), 1);
         assert_eq!(catalog.notes.len(), 1);
         assert!(catalog.is_cancelled(event_id));

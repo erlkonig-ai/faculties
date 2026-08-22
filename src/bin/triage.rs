@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::cognition as cognition_model;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::memory::{self as memory_model, ChunkContent, MemoryCatalog};
 use faculties::message as message_model;
 use faculties::relations as relations_model;
@@ -25,6 +25,7 @@ use faculties::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::triage::cog;
 use faculties::secrets::schema as secrets_schema;
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
     collect_reason_state, ExecRequestRow, ExecState, ModelChatState, ModelResultRow,
@@ -37,7 +38,6 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type Interval = Inline<inlineencodings::NsTAIInterval>;
@@ -1216,15 +1216,13 @@ mod tests {
     use super::*;
 
     use std::fs::File;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
-    use ed25519_dalek::SigningKey;
-    use faculties::storage::initialize_signer;
     use faculties::headspace::{self, Resolution};
     use faculties::memory::{ChunkDraft, ChunkDraftContent, RetractionDraft};
     use faculties::schemas::triage::{exec, KIND_EXEC_REQUEST_ID};
+    use faculties::storage::initialize_signer;
     use triblespace::core::metadata;
-    use triblespace::core::repo::{Repository, Workspace};
     use triblespace::macros::entity;
 
     fn test_id(byte: u8) -> Id {
@@ -1287,41 +1285,6 @@ mod tests {
             }))
             .unwrap()
         }
-    }
-
-    fn push_legacy_branch(pile_path: &Path, name: &str, fragment: Fragment) {
-        let pile = open_pile_strict(pile_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x77; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(name, None).unwrap();
-        let mut workspace: Workspace<_> = repository.pull(branch).unwrap();
-        workspace.commit(fragment, "legacy shadow");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-    }
-
-    #[test]
-    fn same_named_legacy_branch_cannot_shadow_collection_data() {
-        let fixture = Fixture::new();
-        let canonical = test_id(0x11);
-        let legacy = test_id(0x12);
-        fixture.publish(
-            COGNITION_SCOPE_ID,
-            exec_request(canonical, "canonical collection", 10.0),
-        );
-        push_legacy_branch(
-            &fixture.pile,
-            "cognition",
-            exec_request(legacy, "legacy branch", 20.0),
-        );
-
-        let snapshot = fixture.snapshot();
-        let cognition = snapshot.cognition().unwrap();
-        let state = collect_exec_state(&cognition.reader, &cognition.facts).unwrap();
-
-        assert_eq!(state.requests.len(), 1);
-        assert_eq!(state.requests[&canonical].command, "canonical collection");
-        assert!(!state.requests.contains_key(&legacy));
     }
 
     fn chunk(text: &str, predecessors: impl IntoIterator<Item = Id>, start: f64) -> (Fragment, Id) {

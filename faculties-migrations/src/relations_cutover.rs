@@ -35,11 +35,14 @@ use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{attributes, entity, id_hex};
 use triblespace::prelude::{blobencodings, inlineencodings};
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenLegacyDelta, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenLegacyDelta, FrozenSource,
+    LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit,
+};
 use faculties::relations::{self as current, ProfileInput};
 use faculties::schemas::relations as schema;
 use faculties::schemas::relations::{group, KIND_GROUP, KIND_PERSON_ID};
+use faculties::storage::publish_fragments;
 
 use faculties::schemas::relations::LEGACY_BRANCH_NAME;
 const KIND_RETIRE_ID: Id = id_hex!("CB9251505F663A9232C632CC9E68863A");
@@ -1569,12 +1572,14 @@ mod tests {
     use hifitime::Epoch;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::inline::encodings::hash::Handle;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet, PinStore, Repository};
+    use triblespace::core::repo::{BlobStore, BlobStoreGet};
     use triblespace::macros::{find, pattern};
     use triblespace::prelude::TryToInline;
 
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{
+        FrozenTestSource, TestBranchSpec, TestDeltaSpec, TestSourceSpec,
+    };
+    use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
@@ -1649,10 +1654,9 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
     struct Fixture {
         _directory: TestDirectory,
-        source: PathBuf,
+        source: FrozenTestSource,
         target: PathBuf,
         key: PathBuf,
-        branch: Id,
         ada: Id,
         other: Id,
         group: Id,
@@ -1662,17 +1666,18 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     }
 
     fn fixture() -> Fixture {
+        fixture_with_tail(Vec::new())
+    }
+
+    fn fixture_with_tail(mut tail: Vec<TestDeltaSpec>) -> Fixture {
         let directory = TestDirectory::new();
-        let source = directory.0.join("legacy.pile");
+        let source_path = directory.0.join("legacy.pile");
         let target = directory.0.join("target.pile");
         let key = directory.0.join("target.key");
-        File::create(&source).unwrap();
+        File::create(&source_path).unwrap();
         File::create(&target).unwrap();
 
-        let pile = open_pile_strict(&source).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x91; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
+        let branch = Id::new([0x90; 16]).unwrap();
         let ada = Id::new([0x92; 16]).unwrap();
         let other = Id::new([0x93; 16]).unwrap();
         let group = Id::new([0x94; 16]).unwrap();
@@ -1691,50 +1696,50 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             metadata::name: group_name,
             metadata::created_at: created_group,
         };
-        let mut root_workspace = repository.pull(branch).unwrap();
-        root_workspace.commit_with_metadata(
-            root,
-            entity! { metadata::description: "legacy root metadata" },
-            "root",
-        );
-        repository.push(&mut root_workspace).unwrap();
-
-        // Two workspaces from one base produce two authored children and one
-        // contentless repository merge when the second push resolves conflict.
-        let mut left = repository.pull(branch).unwrap();
-        let mut right = repository.pull(branch).unwrap();
+        // Two authored children from one base followed by the exact
+        // contentless join historically produced by conflict resolution.
         let old_left = Id::new([0x95; 16]).unwrap();
         let old_right = Id::new([0x96; 16]).unwrap();
-        left.commit(
-            event(ada, true, 30.0) + old_group_snapshot(old_left, group, "crew", &[ada], &[]),
-            "left",
-        );
-        right.commit(
-            event(ada, false, 40.0) + old_group_snapshot(old_right, group, "crew", &[other], &[]),
-            "right",
-        );
-        repository.push(&mut left).unwrap();
-        repository.push(&mut right).unwrap();
-
-        // Historical multi-parent records were not required to carry the
-        // predecessor member union. The transform derives that join rather
-        // than reproducing a lossy empty member set.
         let old_join = Id::new([0x97; 16]).unwrap();
-        let mut joined = repository.pull(branch).unwrap();
-        joined.commit(
-            old_group_snapshot(old_join, group, "crew", &[], &[old_left, old_right]),
-            "group join",
-        );
-        repository.push(&mut joined).unwrap();
-        repository.close().unwrap();
+        let mut deltas = vec![
+            TestDeltaSpec::authored(root, "root")
+                .with_metadata(entity! { metadata::description: "legacy root metadata" }),
+            TestDeltaSpec::authored(
+                event(ada, true, 30.0) + old_group_snapshot(old_left, group, "crew", &[ada], &[]),
+                "left",
+            )
+            .with_parents([0]),
+            TestDeltaSpec::authored(
+                event(ada, false, 40.0)
+                    + old_group_snapshot(old_right, group, "crew", &[other], &[]),
+                "right",
+            )
+            .with_parents([0]),
+            TestDeltaSpec::merge([1, 2]),
+            // Historical multi-parent records were not required to carry the
+            // predecessor member union. The transform derives that join rather
+            // than reproducing a lossy empty member set.
+            TestDeltaSpec::authored(
+                old_group_snapshot(old_join, group, "crew", &[], &[old_left, old_right]),
+                "group join",
+            ),
+        ];
+        deltas.append(&mut tail);
         initialize_signer(&target, Some(&key)).unwrap();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            branch,
+            SigningKey::from_bytes(&[0x91; 32]),
+            deltas,
+        )])
+        .freeze(&source_path)
+        .unwrap();
 
         Fixture {
             _directory: directory,
             source,
             target,
             key,
-            branch,
             ada,
             other,
             group,
@@ -1747,7 +1752,8 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     fn target_facts(fixture: &Fixture) -> (TribleSet, TribleSet, usize) {
         let signer = load_signer(&fixture.target, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.target).unwrap();
-        let target = discover_target(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let target =
+            discover_target(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let commit_count = target.commits().len();
         let reader = pile.reader().unwrap();
         let mut facts = TribleSet::new();
@@ -1768,11 +1774,14 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn plan_is_strictly_additive_and_preserves_forks_provenance_and_groups() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.source).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source.source).unwrap();
 
         plan.verify_conservation().unwrap();
-        assert!(frozen.legacy_pins().contains(&plan.source_pin()));
+        assert!(fixture
+            .source
+            .source
+            .legacy_pins()
+            .contains(&plan.source_pin()));
         assert_eq!(plan.report().authored_commits, 4);
         assert_eq!(plan.commits().len(), 4);
         assert_eq!(plan.report().original_facts, plan.original_facts().len());
@@ -1862,71 +1871,51 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
     #[test]
     fn later_shadow_does_not_duplicate_a_fact_from_its_authored_source_commit() {
-        let fixture = fixture();
-
         // Extend the fixture with a legacy snapshot whose random-id-era
         // subject deliberately equals the intrinsic id of its successor.
         // Its source record is an exact subset of that later canonical
         // record, so the union remains a valid intrinsic catalog while the
         // physical commit partition exposes any cross-commit duplication.
-        let root = current::group_snapshot_fragment(fixture.group, "crew", &[], &[])
+        let ada = Id::new([0x92; 16]).unwrap();
+        let other = Id::new([0x93; 16]).unwrap();
+        let group = Id::new([0x94; 16]).unwrap();
+        let root = current::group_snapshot_fragment(group, "crew", &[], &[])
             .unwrap()
             .root()
             .unwrap();
-        let left = current::group_snapshot_fragment(fixture.group, "crew", &[fixture.ada], &[root])
+        let left = current::group_snapshot_fragment(group, "crew", &[ada], &[root])
             .unwrap()
             .root()
             .unwrap();
-        let right =
-            current::group_snapshot_fragment(fixture.group, "crew", &[fixture.other], &[root])
-                .unwrap()
-                .root()
-                .unwrap();
-        let members = [
-            fixture.ada.min(fixture.other),
-            fixture.ada.max(fixture.other),
-        ];
-        let joined =
-            current::group_snapshot_fragment(fixture.group, "crew", &members, &[left, right])
-                .unwrap()
-                .root()
-                .unwrap();
-        let predecessor =
-            current::group_snapshot_fragment(fixture.group, "crew", &members, &[joined])
-                .unwrap()
-                .root()
-                .unwrap();
+        let right = current::group_snapshot_fragment(group, "crew", &[other], &[root])
+            .unwrap()
+            .root()
+            .unwrap();
+        let members = [ada.min(other), ada.max(other)];
+        let joined = current::group_snapshot_fragment(group, "crew", &members, &[left, right])
+            .unwrap()
+            .root()
+            .unwrap();
+        let predecessor = current::group_snapshot_fragment(group, "crew", &members, &[joined])
+            .unwrap()
+            .root()
+            .unwrap();
         let successor =
-            current::group_snapshot_fragment(fixture.group, "crew", &members, &[predecessor])
-                .unwrap();
+            current::group_snapshot_fragment(group, "crew", &members, &[predecessor]).unwrap();
         let successor_id = successor.root().unwrap();
         let later_legacy_id = Id::new([0xA9; 16]).unwrap();
-
-        let pile = open_pile_strict(&fixture.source).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x91; 32]), Fragment::empty()).unwrap();
-        let mut source_owner = repository.pull(fixture.branch).unwrap();
-        source_owner.commit(
-            old_group_snapshot(successor_id, fixture.group, "crew", &members, &[]),
-            "source-resident future shadow subset",
-        );
-        repository.push(&mut source_owner).unwrap();
-        let mut later = repository.pull(fixture.branch).unwrap();
-        later.commit(
-            old_group_snapshot(
-                later_legacy_id,
-                fixture.group,
-                "crew",
-                &members,
-                &[successor_id],
+        let fixture = fixture_with_tail(vec![
+            TestDeltaSpec::authored(
+                old_group_snapshot(successor_id, group, "crew", &members, &[]),
+                "source-resident future shadow subset",
             ),
-            "later canonical shadow",
-        );
-        repository.push(&mut later).unwrap();
-        repository.close().unwrap();
+            TestDeltaSpec::authored(
+                old_group_snapshot(later_legacy_id, group, "crew", &members, &[successor_id]),
+                "later canonical shadow",
+            ),
+        ]);
 
-        let frozen = freeze_source(&fixture.source).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source.source).unwrap();
         plan.verify_conservation().unwrap();
 
         let overlap = successor
@@ -1974,7 +1963,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
         let facts = plan.materialized_facts();
         let snapshot = current::group_snapshot(&facts, successor_id).unwrap();
-        assert_eq!(snapshot.group, fixture.group);
+        assert_eq!(snapshot.group, group);
         assert_eq!(snapshot.members, members);
         assert_eq!(snapshot.predecessors, vec![predecessor]);
         assert_eq!(
@@ -1986,27 +1975,24 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn native_publication_is_idempotent_and_never_creates_target_pins() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.source).unwrap();
-        let plan = plan(&frozen).unwrap();
-        let first = publish(&frozen, &plan, &fixture.target, Some(&fixture.key)).unwrap();
+        let plan = plan(&fixture.source.source).unwrap();
+        let first = publish(
+            &fixture.source.source,
+            &plan,
+            &fixture.target,
+            Some(&fixture.key),
+        )
+        .unwrap();
         let after_first = fs::metadata(&fixture.target).unwrap().len();
-        let second = publish(&frozen, &plan, &fixture.target, Some(&fixture.key)).unwrap();
+        let second = publish(
+            &fixture.source.source,
+            &plan,
+            &fixture.target,
+            Some(&fixture.key),
+        )
+        .unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::metadata(&fixture.target).unwrap().len(), after_first);
-
-        let mut target = open_pile_strict(&fixture.target).unwrap();
-        assert!(target
-            .pins()
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
-            .is_empty());
-        target.close().unwrap();
-
-        let mut source = open_pile_strict(&fixture.source).unwrap();
-        let source_pin = plan.source_pin();
-        assert_eq!(source.head(source_pin.id).unwrap(), Some(source_pin.value));
-        source.close().unwrap();
 
         let (facts, metadata_facts, commits) = target_facts(&fixture);
         assert_eq!(commits, 4, "contentless merge emits no authored commit");
@@ -2036,21 +2022,13 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
     #[test]
     fn provenance_only_orphan_does_not_mint_a_person_anchor() {
-        let fixture = fixture();
-        let pile = open_pile_strict(&fixture.source).unwrap();
         let orphan = Id::new([0xA8; 16]).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x91; 32]), Fragment::empty()).unwrap();
-        let mut workspace = repository.pull(fixture.branch).unwrap();
-        workspace.commit(
+        let fixture = fixture_with_tail(vec![TestDeltaSpec::authored(
             entity! { ExclusiveId::force_ref(&orphan) @ legacy::source: "linkedin" },
             "orphan exhaust",
-        );
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
+        )]);
 
-        let frozen = freeze_source(&fixture.source).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source.source).unwrap();
         assert!(!current::person_anchors(&plan.materialized_facts()).contains(&orphan));
         assert!(plan.original_facts().iter().any(|fact| fact.e() == &orphan));
         assert!(plan

@@ -20,7 +20,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::Blob;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
@@ -28,13 +28,16 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use triblespace_search::succinct::SuccinctBM25Blob;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{load_signer, open_pile_strict};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate,
+};
 use faculties::memory;
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::memory::{
     self as schema, ctx, search_index, KIND_CHUNK_ID, KIND_RETRACTION, KIND_SEARCH_INDEX,
 };
+use faculties::storage::{load_signer, open_pile_strict};
 
 /// Historical pre-exact-TF Memory BM25 attribute.  The stopped-world reader
 /// accepts it solely as rebuildable legacy exhaust; native Memory never emits
@@ -1247,9 +1250,10 @@ pub fn publish(
     let signer = load_signer(target, key)?;
     let mut pile = open_pile_strict(target)?;
     let result = (|| {
-        let existing = faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer.clone())
-            .materialize()
-            .context("materialize prior native Memory collection")?;
+        let existing =
+            faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer.clone())
+                .materialize()
+                .context("materialize prior native Memory collection")?;
         let reader = pile.reader().context("open Memory migration reader")?;
         memory::validate_catalog(&reader, &existing)
             .context("validate prior native Memory collection")?;
@@ -1263,8 +1267,11 @@ pub fn publish(
 
         let mut published = Vec::with_capacity(plan.commits.len());
         {
-            let mut collection =
-                faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer.clone());
+            let mut collection = faculties::collection_names::open(
+                &mut pile,
+                schema::DEFAULT_SCOPE_ID,
+                signer.clone(),
+            );
             for commit in &plan.commits {
                 published.push(
                     collection
@@ -1308,11 +1315,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ed25519_dalek::SigningKey;
-    use triblespace::core::collection::Collection;
-    use triblespace::core::repo::{BlobStore, Repository};
+    use triblespace::core::repo::BlobStore;
 
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -1583,12 +1589,6 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         initialize_signer(&pile_path, Some(&key_path)).unwrap();
 
         let legacy_signer = SigningKey::from_bytes(&[0x91; 32]);
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut repository = Repository::new(pile, legacy_signer, Fragment::empty()).unwrap();
-        let branch = *repository
-            .create_branch(schema::LEGACY_MEMORY_BRANCH_NAME, None)
-            .unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
         let legacy_id = Id::new([0x92; 16]).unwrap();
         let mut legacy = Fragment::empty();
         let summary = legacy.put::<blobencodings::UTF8String, _>("legacy memory".to_owned());
@@ -1600,12 +1600,18 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             metadata::created_at: point(30.0),
         };
         let original = legacy.facts().clone();
-        workspace.commit(legacy, "legacy Memory event");
-        workspace.commit(Fragment::empty(), "authored empty Memory event");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let source = freeze_source(&pile_path).unwrap();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            schema::LEGACY_MEMORY_BRANCH_NAME,
+            Id::new([0x91; 16]).unwrap(),
+            legacy_signer,
+            vec![
+                TestDeltaSpec::authored(legacy, "legacy Memory event"),
+                TestDeltaSpec::authored(Fragment::empty(), "authored empty Memory event"),
+            ],
+        )])
+        .freeze(&pile_path)
+        .unwrap()
+        .source;
         let plan = plan(&source).unwrap();
         assert_eq!(plan.report().authored_commits, 2);
         assert_eq!(plan.original_facts(), &original);
@@ -1642,7 +1648,8 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let actual = {
-            let mut collection = faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer);
+            let mut collection =
+                faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer);
             collection.materialize().unwrap()
         };
         let reader = pile.reader().unwrap();

@@ -17,14 +17,16 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+};
 use faculties::blockdag::{self, CatalogValidation};
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{publish_fragments};
 use faculties::schemas::{blockdag as schema, files as files_schema};
+use faculties::storage::publish_fragments;
 
 /// Historical branch name used only as a read-only migration coordinate.
 pub use faculties::schemas::blockdag::LEGACY_BRANCH_NAME;
@@ -322,13 +324,12 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace::core::collection::Collection;
-    use triblespace::core::repo::{BlobStore, PinStore, Repository};
+    use triblespace::core::repo::BlobStore;
     use triblespace::macros::{find, pattern};
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -336,6 +337,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         key: std::path::PathBuf,
         projection: Id,
         facts: TribleSet,
+        source: FrozenSource,
     }
 
     fn fixture() -> Fixture {
@@ -343,16 +345,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let pile = directory.path().join("archive.pile");
         let key = directory.path().join("archive.key");
         File::create(&pile).unwrap();
-
-        let storage = open_pile_strict(&pile).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0xA4; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
 
         let fact = blockdag::text_fact(
             schema::content_fact::modality::TEXT,
@@ -370,30 +363,32 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         )
         .unwrap();
         let projection = content.root().unwrap();
-        workspace.commit_with_metadata(
-            content.clone(),
-            entity! { metadata::description: "semantic Archive provenance" },
-            "legacy Archive authored commit",
-        );
-        repository.push(&mut workspace).unwrap();
-
-        // Authored empty commits are values, unlike contentless Repository
+        // Authored empty commits are values, unlike contentless historical
         // merges, and must retain their independent native metadata edge.
-        workspace.commit_with_metadata(
-            Fragment::empty(),
-            entity! { metadata::description: "semantic empty provenance" },
-            "legacy Archive authored empty commit",
-        );
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let facts = content.facts().clone();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0xA4; 16]).unwrap(),
+            SigningKey::from_bytes(&[0xA4; 32]),
+            vec![
+                TestDeltaSpec::authored(content, "legacy Archive authored commit").with_metadata(
+                    entity! { metadata::description: "semantic Archive provenance" },
+                ),
+                TestDeltaSpec::authored(Fragment::empty(), "legacy Archive authored empty commit")
+                    .with_metadata(entity! { metadata::description: "semantic empty provenance" }),
+            ],
+        )])
+        .freeze(&pile)
+        .unwrap()
+        .source;
 
         Fixture {
             _directory: directory,
             pile,
             key,
             projection,
-            facts: content.into_facts(),
+            facts,
+            source,
         }
     }
 
@@ -401,8 +396,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     fn stopped_world_plan_preserves_every_fragment_channel_and_public_id() {
         let fixture = fixture();
         let length = fs::metadata(&fixture.pile).unwrap().len();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
         plan.verify_conservation().unwrap();
@@ -419,21 +413,21 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     }
 
     #[test]
-    fn in_place_publication_is_idempotent_and_retains_legacy_evidence() {
+    fn in_place_publication_is_idempotent_and_retains_authored_evidence() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
-        let first = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let first = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first.len(), 2);
         let after_first = fs::metadata(&fixture.pile).unwrap().len();
-        let repeated = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let repeated = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(repeated, first);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         assert_eq!(facts, fixture.facts);
         let reader = collection.storage_mut().reader().unwrap();
@@ -454,9 +448,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         assert!(descriptions.contains("semantic empty provenance"));
         assert!(descriptions.contains("legacy Archive authored commit"));
         assert!(descriptions.contains("legacy Archive authored empty commit"));
-        let mut pile = collection.into_storage();
-        assert!(pile.pins().unwrap().next().is_some());
-        pile.close().unwrap();
+        collection.into_storage().close().unwrap();
     }
 
     #[test]

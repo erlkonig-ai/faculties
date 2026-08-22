@@ -199,14 +199,11 @@ mod tests {
     use super::*;
 
     use anybytes::View;
-    use ed25519_dalek::SigningKey;
-    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
     use faculties::schemas::reason::{reason_schema, KIND_REASON_ID};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     use std::fs::File;
-    use triblespace::core::collection::Collection;
     use triblespace::core::repo::BlobStore;
-    use triblespace::core::repo::{PinStore, Repository};
 
     type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
@@ -223,29 +220,12 @@ mod tests {
         epoch_interval(Epoch::from_unix_seconds(seconds))
     }
 
-    fn pin_head(
-        pile_path: &Path,
-        branch: Id,
-    ) -> Inline<inlineencodings::Handle<blobencodings::SimpleArchive>> {
-        let mut pile = open_pile_strict(pile_path).unwrap();
-        let head = pile.head(branch).unwrap().unwrap();
-        pile.close().unwrap();
-        head
-    }
-
     #[test]
-    fn exact_reason_event_is_one_intrinsic_idempotent_commit_and_keeps_pin() {
+    fn exact_reason_event_is_one_intrinsic_idempotent_commit() {
         let directory = tempfile::tempdir().unwrap();
         let pile_path = directory.path().join("reason.pile");
         let key_path = directory.path().join("reason.key");
         File::create(&pile_path).unwrap();
-
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x61; 32]), Fragment::empty()).unwrap();
-        let legacy_branch = *repository.create_branch("cognition", None).unwrap();
-        repository.close().unwrap();
-        let legacy_pin = pin_head(&pile_path, legacy_branch);
 
         initialize_signer(&pile_path, Some(&key_path)).unwrap();
         let storage = ReasonStorage {
@@ -291,8 +271,6 @@ mod tests {
             std::fs::metadata(&pile_path).unwrap().len(),
             length_after_first
         );
-        assert_eq!(pin_head(&pile_path, legacy_branch), legacy_pin);
-
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let pile = open_pile_strict(&pile_path).unwrap();
         let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);

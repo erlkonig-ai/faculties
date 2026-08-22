@@ -37,7 +37,6 @@ use std::path::Path;
 
 use faculties::schemas::compass::{board, DEFAULT_SCOPE_ID, KIND_STATUS_ID};
 use faculties::storage::{load_signer, open_pile_strict, publish_fragments};
-use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
@@ -117,7 +116,10 @@ pub fn plan(pile: &Path, key: Option<&Path>) -> Result<(TribleSet, StatusRegiste
         .materialize()
         .context("materialize the Compass collection")
         .map(|facts| status_register_delta(&facts));
-    let close = collection.into_storage().close().map_err(anyhow::Error::from);
+    let close = collection
+        .into_storage()
+        .close()
+        .map_err(anyhow::Error::from);
     match (result, close) {
         (Ok(plan), Ok(())) => Ok(plan),
         (Ok(_), Err(error)) => Err(error.context("close Compass pile")),

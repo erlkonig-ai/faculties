@@ -37,7 +37,7 @@ use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::freeze_source;
+use crate::collection_cutover::{freeze_source, FrozenSource};
 use faculties::schemas::teams::LEGACY_BRANCH_NAME;
 
 /// The retired Teams OAuth vocabulary, repeated here rather than imported so
@@ -242,6 +242,10 @@ impl TeamsCredentialReport {
 /// evidence, not a guess.
 pub fn plan(pile: &Path) -> Result<TeamsCredentialReport> {
     let source = freeze_source(pile).context("freeze legacy source for Teams credentials")?;
+    plan_source(&source)
+}
+
+fn plan_source(source: &FrozenSource) -> Result<TeamsCredentialReport> {
     let Some(branch) = source
         .legacy_branch(LEGACY_BRANCH_NAME)
         .context("resolve legacy Teams branch")?
@@ -504,15 +508,16 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;
-    use triblespace::core::repo::Repository;
     use triblespace::macros::entity;
 
     use super::*;
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use faculties::storage::open_pile_strict;
 
     struct Fixture {
         _directory: TempDir,
         pile: PathBuf,
+        source: FrozenSource,
     }
 
     /// A legacy Teams branch carrying one older and one newer credential of
@@ -521,12 +526,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("teams.pile");
         File::create(&pile_path).unwrap();
-
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x71; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
+        let mut deltas = Vec::new();
 
         for (index, day) in [(0u8, 1i64), (1, 5)] {
             let config = Id::new([0x30 + index; 16]).unwrap();
@@ -562,14 +562,22 @@ mod tests {
                 legacy::token_type: token_type,
                 legacy::scope: scope,
             };
-            workspace.commit(fragment, "legacy oauth");
+            deltas.push(TestDeltaSpec::authored(fragment, "legacy oauth"));
         }
-        repository.push(&mut workspace).unwrap();
-        repository.into_storage().close().unwrap();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x71; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x71; 32]),
+            deltas,
+        )])
+        .freeze(&pile_path)
+        .unwrap()
+        .source;
 
         Fixture {
             _directory: directory,
             pile: pile_path,
+            source,
         }
     }
 
@@ -577,7 +585,7 @@ mod tests {
     fn plan_reports_every_credential_newest_first_without_writing() {
         let fixture = fixture();
         let before = std::fs::metadata(&fixture.pile).unwrap().len();
-        let report = plan(&fixture.pile).unwrap();
+        let report = plan_source(&fixture.source).unwrap();
 
         assert!(!report.legacy_branch_missing);
         assert_eq!(report.credentials.len(), 4);
@@ -605,7 +613,7 @@ mod tests {
     #[test]
     fn export_writes_owner_only_files_and_refuses_to_overwrite() {
         let fixture = fixture();
-        let report = plan(&fixture.pile).unwrap();
+        let report = plan_source(&fixture.source).unwrap();
         let out = fixture.pile.parent().unwrap().join("out");
 
         let written = export(&report, &out).unwrap();

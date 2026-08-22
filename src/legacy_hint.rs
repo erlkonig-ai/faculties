@@ -32,12 +32,10 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::collection::{
-    simplearchive_union, Collection, CollectionRecord, CollectionStore,
-};
+use triblespace::core::collection::{Collection, CollectionRecord, CollectionStore};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
@@ -261,7 +259,8 @@ pub fn legacy_migration_hint(pile: &mut Pile, scope: Id, team: VerifyingKey) -> 
 /// that migration surface back into the library it was moved out of.
 ///
 /// Minted with `trible genid` on 2026-08-07, retired 2026-08-20.
-const RETIRED_COLLECTION_SCOPE: Id = triblespace::macros::id_hex!("D3418873C70392E3ADAA05C00E11A583");
+const RETIRED_COLLECTION_SCOPE: Id =
+    triblespace::macros::id_hex!("D3418873C70392E3ADAA05C00E11A583");
 
 /// Whether any collection in this pile is still anchored by a scope.
 ///
@@ -290,7 +289,10 @@ fn any_scope_anchored_collection(pile: &mut Pile) -> Option<bool> {
         let Ok(facts) = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) else {
             continue;
         };
-        if facts.iter().any(|fact| *fact.a() == RETIRED_COLLECTION_SCOPE) {
+        if facts
+            .iter()
+            .any(|fact| *fact.a() == RETIRED_COLLECTION_SCOPE)
+        {
             return Some(true);
         }
     }
@@ -434,12 +436,12 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;
-    use triblespace::core::repo::Repository;
+    use triblespace::core::collection::simplearchive_union;
     use triblespace::macros::entity;
     use triblespace::prelude::*;
 
     use super::*;
-    use crate::schemas::compass::{board, DEFAULT_SCOPE_ID, KIND_GOAL_ID, LEGACY_BRANCH_NAME};
+    use crate::schemas::compass::{board, DEFAULT_SCOPE_ID, KIND_GOAL_ID};
 
     fn signer() -> SigningKey {
         SigningKey::from_bytes(&[0x37; 32])
@@ -456,16 +458,16 @@ mod tests {
         fragment
     }
 
-    /// Write one authored commit onto the pre-collection `compass` branch,
-    /// exactly as the old faculty did.
+    /// Restore a byte-for-byte pile written by the v0.46 Repository API.
+    ///
+    /// Keeping the historical bytes as the oracle tests the reader boundary
+    /// without retaining a second mutable legacy writer in test code.
     fn write_legacy_branch(path: &std::path::Path) {
-        let pile = Pile::open(path).unwrap();
-        let mut repository = Repository::new(pile, signer(), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        workspace.commit(goal_fragment("legacy goal"), "legacy goal");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
+        std::fs::write(
+            path,
+            include_bytes!("../tests/fixtures/legacy_compass_v046.pile"),
+        )
+        .unwrap();
     }
 
     fn new_pile(directory: &TempDir) -> std::path::PathBuf {
@@ -481,7 +483,10 @@ mod tests {
         write_legacy_branch(&path);
 
         let mut pile = Pile::open(&path).unwrap();
-        assert_eq!(native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_team()), Some(true));
+        assert_eq!(
+            native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_team()),
+            Some(true)
+        );
         let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team())
             .expect("a legacy-only pile must say so");
         pile.close().unwrap();
@@ -513,8 +518,14 @@ mod tests {
             .commit(goal_fragment("native goal"))
             .unwrap();
 
-        assert_eq!(native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_team()), Some(false));
-        assert_eq!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()), None);
+        assert_eq!(
+            native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_team()),
+            Some(false)
+        );
+        assert_eq!(
+            legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()),
+            None
+        );
         pile.close().unwrap();
     }
 
@@ -603,10 +614,17 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         // A brand new pile has neither side.
-        assert_eq!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()), None);
+        assert_eq!(
+            legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()),
+            None
+        );
         // A scope with no legacy predecessor never speaks, even when empty.
         assert_eq!(
-            legacy_migration_hint(&mut pile, crate::schemas::orient::DEFAULT_SCOPE_ID, test_team()),
+            legacy_migration_hint(
+                &mut pile,
+                crate::schemas::orient::DEFAULT_SCOPE_ID,
+                test_team()
+            ),
             None
         );
         pile.close().unwrap();

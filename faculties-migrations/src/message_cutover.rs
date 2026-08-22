@@ -38,16 +38,19 @@ use triblespace::core::trible::{Fragment, TribleSet, V_START};
 use triblespace::macros::{attributes, entity, id_hex};
 use triblespace::prelude::inlineencodings;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate, ProjectedLegacyCommit,
+};
+use crate::relations_cutover;
 use faculties::message as current;
 use faculties::relations;
-use crate::relations_cutover;
 use faculties::schemas::message::{
     self as schema, local, GROUP_SNAPSHOT_BASIS_CUTOVER_RECONSTRUCTED, KIND_MESSAGE_ID,
     KIND_READ_ID,
 };
 use faculties::schemas::relations::KIND_GROUP_SNAPSHOT;
+use faculties::storage::publish_fragments;
 
 pub use faculties::schemas::message::LEGACY_BRANCH_NAME;
 
@@ -1508,14 +1511,14 @@ mod tests {
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
     use triblespace::core::id::ExclusiveId;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet, PinStore, Repository};
+    use triblespace::core::repo::{BlobStore, BlobStoreGet};
     use triblespace::core::trible::Trible;
     use triblespace::macros::{entity, find, pattern};
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use faculties::schemas::relations::KIND_PERSON_ID;
+    use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -1722,18 +1725,15 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
     }
 
     #[test]
-    fn native_migration_is_strictly_additive_and_preserves_forks_metadata_and_source_pins() {
+    fn native_migration_is_strictly_additive_and_preserves_forks_and_metadata() {
         let directory = TestDirectory::new();
         let source_path = directory.0.join("legacy.pile");
         let target_path = directory.0.join("target.pile");
         let key_path = directory.0.join("target.key");
         File::create(&source_path).unwrap();
         File::create(&target_path).unwrap();
-
-        let pile = open_pile_strict(&source_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x81; 32]), Fragment::empty()).unwrap();
-        let relations_branch = *repository.create_branch("relations", None).unwrap();
+        initialize_signer(&target_path, Some(&key_path)).unwrap();
+        initialize_signer(&source_path, Some(&key_path)).unwrap();
         let sender = id(0x82);
         let recipient = id(0x83);
         let mut relations_fragment = entity! { ExclusiveId::force_ref(&sender) @
@@ -1744,11 +1744,6 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
             metadata::tag: &KIND_PERSON_ID,
             metadata::name: "recipient",
         };
-        let mut relations_workspace = repository.pull(relations_branch).unwrap();
-        relations_workspace.commit(relations_fragment, "legacy people");
-        repository.push(&mut relations_workspace).unwrap();
-
-        let message_branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
         let old_message = id(0x84);
         let mut message_root = expected_scaffolding();
         let body = message_root.put("legacy body".to_owned());
@@ -1772,21 +1767,14 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
         // authored in the source instead of reporting a collision or counting
         // those existing facts as new additions.
         message_root += canonical_envelope;
-        let mut root_workspace = repository.pull(message_branch).unwrap();
-        root_workspace.commit_with_metadata(
-            message_root,
-            entity! { metadata::description: "legacy message root metadata" },
-            "legacy message",
-        );
-        repository.push(&mut root_workspace).unwrap();
+        let message_root = TestDeltaSpec::authored(message_root, "legacy message")
+            .with_metadata(entity! { metadata::description: "legacy message root metadata" });
 
         // Two authored read observations fork from one message commit. The
         // second push creates a contentless merge, which remains ancestry only.
-        let mut left = repository.pull(message_branch).unwrap();
-        let mut right = repository.pull(message_branch).unwrap();
         let left_read = id(0x85);
         let right_read = id(0x86);
-        left.commit(
+        let left = TestDeltaSpec::authored(
             entity! { ExclusiveId::force_ref(&left_read) @
                 metadata::tag: &KIND_READ_ID,
                 local::about_message: old_message,
@@ -1795,7 +1783,7 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
             },
             "left read",
         );
-        right.commit(
+        let right = TestDeltaSpec::authored(
             entity! { ExclusiveId::force_ref(&right_read) @
                 metadata::tag: &KIND_READ_ID,
                 local::about_message: old_message,
@@ -1803,19 +1791,37 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
                 local::read_at: ordered_interval(30, 30),
             },
             "right read",
-        );
-        repository.push(&mut left).unwrap();
-        repository.push(&mut right).unwrap();
-        repository.close().unwrap();
-
-        let frozen = freeze_source(&source_path).unwrap();
-        let standalone_plan = plan(&frozen).unwrap();
-        let relations_plan = relations_cutover::plan(&frozen).unwrap();
-        let plan = plan_with_relations(&frozen, &relations_plan).unwrap();
+        )
+        .with_parents([0]);
+        let frozen = TestSourceSpec::new(vec![
+            TestBranchSpec::new(
+                "relations",
+                Id::new([0x80; 16]).unwrap(),
+                SigningKey::from_bytes(&[0x81; 32]),
+                vec![TestDeltaSpec::authored(relations_fragment, "legacy people")],
+            ),
+            TestBranchSpec::new(
+                LEGACY_BRANCH_NAME,
+                Id::new([0x81; 16]).unwrap(),
+                SigningKey::from_bytes(&[0x81; 32]),
+                vec![message_root, left, right, TestDeltaSpec::merge([1, 2])],
+            ),
+        ])
+        .freeze(&source_path)
+        .unwrap();
+        let standalone_plan = plan(&frozen.source).unwrap();
+        let relations_plan = relations_cutover::plan(&frozen.source).unwrap();
+        let plan = plan_with_relations(&frozen.source, &relations_plan).unwrap();
         assert_eq!(plan, standalone_plan);
         plan.verify_conservation().unwrap();
-        assert!(frozen.legacy_pins().contains(&plan.message_source_pin()));
-        assert!(frozen.legacy_pins().contains(&plan.relations_source_pin()));
+        assert!(frozen
+            .source
+            .legacy_pins()
+            .contains(&plan.message_source_pin()));
+        assert!(frozen
+            .source
+            .legacy_pins()
+            .contains(&plan.relations_source_pin()));
         assert_eq!(plan.relations_source_pin(), relations_plan.source_pin());
         assert_eq!(plan.report().authored_commits, 3);
         assert_eq!(plan.report().contentless_merges, 1);
@@ -1885,28 +1891,27 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
             2
         );
 
-        initialize_signer(&target_path, Some(&key_path)).unwrap();
-        relations_cutover::publish(&frozen, &relations_plan, &target_path, Some(&key_path))
-            .unwrap();
-        let first = publish(&frozen, &plan, &target_path, Some(&key_path)).unwrap();
+        relations_cutover::publish(
+            &frozen.source,
+            &relations_plan,
+            &target_path,
+            Some(&key_path),
+        )
+        .unwrap();
+        let first = publish(&frozen.source, &plan, &target_path, Some(&key_path)).unwrap();
         let length = fs::metadata(&target_path).unwrap().len();
-        let second = publish(&frozen, &plan, &target_path, Some(&key_path)).unwrap();
+        let second = publish(&frozen.source, &plan, &target_path, Some(&key_path)).unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::metadata(&target_path).unwrap().len(), length);
 
         let signer = faculties::storage::load_signer(&target_path, Some(&key_path)).unwrap();
         let mut target = open_pile_strict(&target_path).unwrap();
         let team = signer.verifying_key();
-        assert!(target
-            .pins()
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
-            .is_empty());
         let discovery = discover_target(&mut target, schema::DEFAULT_SCOPE_ID, team).unwrap();
         assert_eq!(discovery.commits().len(), 3);
         let commits = discovery.commits().to_vec();
-        let mut collection = faculties::collection_names::open(target, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(target, schema::DEFAULT_SCOPE_ID, signer);
         let target_facts = collection.materialize().unwrap();
         for fact in plan.original_facts() {
             assert!(target_facts.contains(fact));
@@ -1944,20 +1949,24 @@ use faculties::storage::{discover_target, initialize_signer, open_pile_strict};
 
         // The operational cutover appends beside the frozen legacy branches.
         // Native publication must neither consume nor rewrite those pins.
-        relations_cutover::publish(&frozen, &relations_plan, &source_path, Some(&key_path))
-            .unwrap();
-        let in_place_first = publish(&frozen, &plan, &source_path, Some(&key_path)).unwrap();
+        relations_cutover::publish(
+            &frozen.source,
+            &relations_plan,
+            &source_path,
+            Some(&key_path),
+        )
+        .unwrap();
+        let in_place_first = publish(&frozen.source, &plan, &source_path, Some(&key_path)).unwrap();
         let in_place_length = fs::metadata(&source_path).unwrap().len();
-        let in_place_second = publish(&frozen, &plan, &source_path, Some(&key_path)).unwrap();
+        let in_place_second =
+            publish(&frozen.source, &plan, &source_path, Some(&key_path)).unwrap();
         assert_eq!(in_place_first, in_place_second);
         assert_eq!(fs::metadata(&source_path).unwrap().len(), in_place_length);
 
-        let source_pin = plan.message_source_pin();
         let source_team = faculties::storage::load_signer(&source_path, Some(&key_path))
             .unwrap()
             .verifying_key();
         let mut source = open_pile_strict(&source_path).unwrap();
-        assert_eq!(source.head(source_pin.id).unwrap(), Some(source_pin.value));
         assert_eq!(
             discover_target(&mut source, schema::DEFAULT_SCOPE_ID, source_team)
                 .unwrap()

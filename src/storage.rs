@@ -29,14 +29,13 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::IntoBlob;
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
-    discover_collection_records, Collection, CollectionCommit, CollectionDerive, CollectionMerge,
+    discover_collection_records, CollectionCommit, CollectionDerive, CollectionMerge,
     CollectionRecordDiagnostic, CollectionStore,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, ReadError};
-use triblespace::core::trible::Fragment;
 use triblespace::core::signing_key_file;
-
+use triblespace::core::trible::Fragment;
 
 /// Canonical records currently known for one scoped target collection.
 ///
@@ -109,8 +108,7 @@ where
     // for hashing a descriptor it did not store, because a handle computed
     // beside a store instead of by it can name a collection whose descriptor is
     // absent. Discovery only ever compares against this one.
-    let collection =
-        IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
+    let collection = IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
     let records =
         discover_collection_records(store).context("discover native collection records")?;
     let commits = records
@@ -247,7 +245,7 @@ pub fn open_pile_strict(path: &Path) -> Result<Pile> {
 /// The signer is loaded before the pile is touched. Facts become collection
 /// data, metafacts become signed commit metadata, and the fragment's shared
 /// blob store supplies attachments referenced by either channel. Publication
-/// is performed only by [`Collection<Pile>::commit`](Collection::commit),
+/// is performed only by [`triblespace::core::collection::Collection::commit`],
 /// whose record identity makes exact replay idempotent.
 pub fn publish_fragment(
     pile_path: &Path,
@@ -264,7 +262,8 @@ pub fn publish_fragment(
 /// Publish a deterministic sequence of complete fragments into one collection.
 ///
 /// This is the authored-commit migration path: the target pile is opened once,
-/// each input crosses the same narrow [`Collection::commit`] boundary, and the
+/// each input crosses the same narrow
+/// [`triblespace::core::collection::Collection::commit`] boundary, and the
 /// pile is closed even if a later publication fails. Replaying a prefix or the
 /// whole sequence is idempotent because both blobs and collection records are
 /// content addressed.
@@ -343,15 +342,15 @@ mod tests {
 
     use anybytes::View;
     use ed25519_dalek::SigningKey;
-    use triblespace::core::blob::encodings::utf8string::UTF8String;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace::core::blob::encodings::utf8string::UTF8String;
+    use triblespace::core::collection::CollectionStore;
     use triblespace::core::collection::{empty_metadata_handle, CollectionRecord};
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
     use triblespace::core::metadata;
-    use triblespace::core::collection::CollectionStore;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet, PinStore};
+    use triblespace::core::repo::{BlobStore, BlobStoreGet};
     use triblespace::core::trible::TribleSet;
     use triblespace::macros::entity;
 
@@ -425,7 +424,6 @@ mod tests {
         assert_eq!(fs::read(&files.pile).unwrap(), unsupported);
     }
 
-
     #[test]
     fn target_discovery_uses_descriptor_handle_without_registry_record() {
         // Two REAL scopes rather than two arbitrary ids: a root is anchored by
@@ -490,7 +488,6 @@ mod tests {
         assert!(store.blobs.is_empty());
     }
 
-
     #[test]
     fn publication_conserves_both_fact_channels_and_attachments_and_replays_idempotently() {
         let files = TestFiles::new();
@@ -511,9 +508,13 @@ mod tests {
             .verifying_key();
         let target_scope = crate::schemas::wiki::DEFAULT_SCOPE_ID;
         let other_scope = crate::schemas::compass::DEFAULT_SCOPE_ID;
-        let first =
-            publish_fragment(&files.pile, Some(&files.key), target_scope, fragment.clone())
-                .unwrap();
+        let first = publish_fragment(
+            &files.pile,
+            Some(&files.key),
+            target_scope,
+            fragment.clone(),
+        )
+        .unwrap();
         let after_first = fs::metadata(&files.pile).unwrap().len();
 
         let unrelated = entity! { _ @ metadata::tag: &id(9) };
@@ -528,12 +529,6 @@ mod tests {
         assert_eq!(after_replay, before_replay);
 
         let mut pile = open_pile_strict(&files.pile).unwrap();
-        assert!(pile
-            .pins()
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
-            .is_empty());
         let target = discover_target(&mut pile, target_scope, team).unwrap();
         assert_eq!(
             target.descriptor().facts(),
@@ -574,7 +569,6 @@ mod tests {
         assert_eq!(&*metadata_text, "metadata attachment");
         pile.close().unwrap();
     }
-
 
     #[test]
     fn missing_signer_fails_before_the_pile_is_touched() {

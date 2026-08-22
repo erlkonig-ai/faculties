@@ -9,12 +9,9 @@ use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 
-use ed25519_dalek::SigningKey;
-use faculties::schemas::compass::{board, KIND_GOAL_ID, LEGACY_BRANCH_NAME};
+use faculties::schemas::compass::{board, KIND_GOAL_ID};
 use faculties::storage::{initialize_signer, open_pile_strict};
-use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
-use triblespace::core::repo::Repository;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
 
@@ -29,20 +26,16 @@ fn goal_fragment(title: &str) -> Fragment {
     fragment
 }
 
-/// Write one authored commit onto the pre-collection `compass` branch, exactly
-/// as the old faculty did, and give the pile a durable signer.
+/// Restore a byte-for-byte v0.46 `compass` branch and give the pile a durable
+/// native signer. The historical bytes keep this compatibility test honest
+/// without retaining a mutable legacy writer API.
 fn legacy_only_pile(directory: &Path) -> std::path::PathBuf {
     let pile_path = directory.join("legacy.pile");
-    File::create(&pile_path).unwrap();
-
-    let storage = open_pile_strict(&pile_path).unwrap();
-    let mut repository =
-        Repository::new(storage, SigningKey::from_bytes(&[0x2C; 32]), Fragment::empty()).unwrap();
-    let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-    let mut workspace = repository.pull(branch).unwrap();
-    workspace.commit(goal_fragment("a goal from before the cutover"), "legacy goal");
-    repository.push(&mut workspace).unwrap();
-    repository.close().unwrap();
+    std::fs::write(
+        &pile_path,
+        include_bytes!("fixtures/legacy_compass_v046.pile"),
+    )
+    .unwrap();
 
     initialize_signer(&pile_path, None).unwrap();
     pile_path

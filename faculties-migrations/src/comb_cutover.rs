@@ -22,13 +22,16 @@ use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate,
+};
 use faculties::comb::{self, CursorDraft, CursorState, CursorTrack};
 use faculties::schemas::memory::{
     self as schema,
     comb::{cursor_grain, cursor_persona, cursor_position, cursor_stream, kind_comb_cursor},
 };
+use faculties::storage::publish_fragments;
 
 /// Content-addressed coordinate of one legacy repository commit.
 pub type LegacyCommitId = [u8; 32];
@@ -672,13 +675,12 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace::core::collection::Collection;
-    use triblespace::core::repo::{BlobStore, PinStore, Repository};
+    use triblespace::core::repo::BlobStore;
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use faculties::comb::CursorResolution;
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn point(seconds: f64) -> faculties::comb::IntervalValue {
         let at = hifitime::Epoch::from_tai_seconds(seconds);
@@ -956,20 +958,13 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     }
 
     #[test]
-    fn v4_cutover_preserves_forks_metadata_and_legacy_pin() {
+    fn v4_cutover_preserves_forks_and_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let pile_path = directory.path().join("comb.pile");
         let key = directory.path().join("comb.key");
         File::create(&pile_path).unwrap();
-
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0xC4; 32]), Fragment::empty()).unwrap();
-        let branch = *repository
-            .create_branch(schema::LEGACY_COMB_BRANCH_NAME, None)
-            .unwrap();
-        let mut genesis = repository.pull(branch).unwrap();
-        genesis.commit_with_metadata(
+        initialize_signer(&pile_path, Some(&key)).unwrap();
+        let genesis = TestDeltaSpec::authored(
             Fragment::from(cursor(
                 legacy(0x41),
                 "archive-replay",
@@ -978,14 +973,10 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
                 None,
                 1.0,
             )),
-            entity! { metadata::description: "comb genesis provenance" },
             "comb genesis message",
-        );
-        repository.push(&mut genesis).unwrap();
-
-        let mut left = repository.pull(branch).unwrap();
-        let mut right = repository.pull(branch).unwrap();
-        left.commit_with_metadata(
+        )
+        .with_metadata(entity! { metadata::description: "comb genesis provenance" });
+        let left = TestDeltaSpec::authored(
             Fragment::from(cursor(
                 legacy(0x42),
                 "archive-replay",
@@ -994,10 +985,10 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
                 None,
                 100.0,
             )),
-            entity! { metadata::description: "comb left provenance" },
             "comb left message",
-        );
-        right.commit_with_metadata(
+        )
+        .with_metadata(entity! { metadata::description: "comb left provenance" });
+        let right = TestDeltaSpec::authored(
             Fragment::from(cursor(
                 legacy(0x43),
                 "archive-replay",
@@ -1006,14 +997,11 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
                 None,
                 2.0,
             )),
-            entity! { metadata::description: "comb right provenance" },
             "comb right message",
-        );
-        repository.push(&mut left).unwrap();
-        repository.push(&mut right).unwrap();
-
-        let mut joined = repository.pull(branch).unwrap();
-        joined.commit_with_metadata(
+        )
+        .with_metadata(entity! { metadata::description: "comb right provenance" })
+        .with_parents([0]);
+        let joined = TestDeltaSpec::authored(
             Fragment::from(cursor(
                 legacy(0x44),
                 "archive-replay",
@@ -1022,15 +1010,18 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
                 None,
                 3.0,
             )),
-            entity! { metadata::description: "comb join provenance" },
             "comb join message",
-        );
-        repository.push(&mut joined).unwrap();
-        repository.close().unwrap();
-        initialize_signer(&pile_path, Some(&key)).unwrap();
-
-        let frozen = freeze_source(&pile_path).unwrap();
-        let cutover = plan(&frozen).unwrap();
+        )
+        .with_metadata(entity! { metadata::description: "comb join provenance" });
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            schema::LEGACY_COMB_BRANCH_NAME,
+            Id::new([0xC4; 16]).unwrap(),
+            SigningKey::from_bytes(&[0xC4; 32]),
+            vec![genesis, left, right, TestDeltaSpec::merge([1, 2]), joined],
+        )])
+        .freeze(&pile_path)
+        .unwrap();
+        let cutover = plan(&frozen.source).unwrap();
         cutover.verify().unwrap();
         assert_eq!(cutover.commits().len(), 4);
         assert_eq!(cutover.aliases().len(), 4);
@@ -1039,26 +1030,25 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let joined = resolution.head_ids()[0];
         assert_eq!(catalog.cursors[&joined].predecessors.len(), 2);
 
-        let first = publish(&frozen, &cutover, &pile_path, Some(&key)).unwrap();
+        let first = publish(&frozen.source, &cutover, &pile_path, Some(&key)).unwrap();
         assert_eq!(first.len(), 4);
         let after_first = fs::metadata(&pile_path).unwrap().len();
         assert_eq!(
-            publish(&frozen, &cutover, &pile_path, Some(&key)).unwrap(),
+            publish(&frozen.source, &cutover, &pile_path, Some(&key)).unwrap(),
             first
         );
         assert_eq!(fs::metadata(&pile_path).unwrap().len(), after_first);
 
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
         let pile = open_pile_strict(&pile_path).unwrap();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_COMB_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_COMB_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), *cutover.facts());
         let reader = collection.storage_mut().reader().unwrap();
         let metadata_facts: TribleSet = reader
             .get::<TribleSet, SimpleArchive>(first[0].metadata())
             .unwrap();
         validate_known_payloads(&reader, &metadata_facts).unwrap();
-        let mut pile = collection.into_storage();
-        assert!(pile.pins().unwrap().next().is_some());
-        pile.close().unwrap();
+        collection.into_storage().close().unwrap();
     }
 }

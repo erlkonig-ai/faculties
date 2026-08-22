@@ -14,7 +14,7 @@ use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::encodings::shortstring::ShortString;
 use triblespace::core::inline::{Inline, InlineEncoding};
@@ -24,12 +24,17 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::core::trible::intrinsic_entity_id_v1;
 use triblespace::prelude::*;
 
-use faculties::body::{self, BodyCatalog, CaptureRow, IntentRow, IntervalValue, RawHandle, TextHandle};
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{load_signer, open_pile_strict};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate, ProjectedLegacyCommit,
+};
+use faculties::body::{
+    self, BodyCatalog, CaptureRow, IntentRow, IntervalValue, RawHandle, TextHandle,
+};
 use faculties::schemas::body::{
     self as schema, KIND_CAPTURE, KIND_INTENT, LEGACY_BODY_BRANCH_NAME, LEGACY_SENSES_BRANCH_NAME,
 };
+use faculties::storage::{load_signer, open_pile_strict};
 
 /// Historical Body tag for an utterance before Voice became its own faculty.
 pub const LEGACY_KIND_UTTERANCE: Id =
@@ -746,11 +751,10 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
-    use triblespace::core::repo::Repository;
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn point(seconds: f64) -> IntervalValue {
         let epoch = Epoch::from_tai_seconds(seconds);
@@ -821,35 +825,39 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("body.pile");
         File::create(&path).unwrap();
-        let pile = open_pile_strict(&path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x42; 32]), Fragment::empty()).unwrap();
-        let body_branch = *repository
-            .create_branch(LEGACY_BODY_BRANCH_NAME, None)
-            .unwrap();
-        let senses_branch = *repository
-            .create_branch(LEGACY_SENSES_BRANCH_NAME, None)
-            .unwrap();
+        let key = directory.path().join("body.key");
+        initialize_signer(&path, Some(&key)).unwrap();
 
         let (old_capture, vision) = legacy_vision();
         let (old_intent, intent) = legacy_intent();
         let (_, utterance) = legacy_utterance();
-
-        let mut body_workspace = repository.pull(body_branch).unwrap();
-        body_workspace.commit(vision.clone() + intent + utterance, "historical Body root");
-        repository.push(&mut body_workspace).unwrap();
-        let mut authored_empty = repository.pull(body_branch).unwrap();
-        authored_empty.commit(Fragment::empty(), "historical Body empty");
-        repository.push(&mut authored_empty).unwrap();
-
-        let mut senses_workspace = repository.pull(senses_branch).unwrap();
-        senses_workspace.commit(vision, "historical Senses snapshot");
-        repository.push(&mut senses_workspace).unwrap();
-        repository.close().unwrap();
-
-        let key = directory.path().join("body.key");
-        initialize_signer(&path, Some(&key)).unwrap();
-        let frozen = freeze_source(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[0x42; 32]);
+        let frozen = TestSourceSpec::new(vec![
+            TestBranchSpec::new(
+                LEGACY_BODY_BRANCH_NAME,
+                Id::new([0x42; 16]).unwrap(),
+                signer.clone(),
+                vec![
+                    TestDeltaSpec::authored(
+                        vision.clone() + intent + utterance,
+                        "historical Body root",
+                    ),
+                    TestDeltaSpec::authored(Fragment::empty(), "historical Body empty"),
+                ],
+            ),
+            TestBranchSpec::new(
+                LEGACY_SENSES_BRANCH_NAME,
+                Id::new([0x43; 16]).unwrap(),
+                signer,
+                vec![TestDeltaSpec::authored(
+                    vision,
+                    "historical Senses snapshot",
+                )],
+            ),
+        ])
+        .freeze(&path)
+        .unwrap()
+        .source;
         let plan = plan(&frozen).unwrap();
         assert_eq!(plan.source_pins().len(), 2);
         assert_eq!(plan.commits().len(), 3);
@@ -878,7 +886,8 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         assert_eq!(published.len(), plan.commits().len());
         let signer = load_signer(&path, Some(&key)).unwrap();
         let pile = open_pile_strict(&path).unwrap();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let materialized = collection.materialize().unwrap();
         assert_eq!(materialized, facts);
         let reader = collection.storage_mut().reader().unwrap();
@@ -891,22 +900,27 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("body.pile");
         File::create(&path).unwrap();
-        let pile = open_pile_strict(&path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x43; 32]), Fragment::empty()).unwrap();
-        repository
-            .create_branch(LEGACY_BODY_BRANCH_NAME, None)
-            .unwrap();
-        let senses_branch = *repository
-            .create_branch(LEGACY_SENSES_BRANCH_NAME, None)
-            .unwrap();
         let (_, utterance) = legacy_utterance();
-        let mut senses = repository.pull(senses_branch).unwrap();
-        senses.commit(utterance, "misplaced historical speech");
-        repository.push(&mut senses).unwrap();
-        repository.close().unwrap();
-
-        let frozen = freeze_source(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[0x43; 32]);
+        let frozen = TestSourceSpec::new(vec![
+            TestBranchSpec::empty(
+                LEGACY_BODY_BRANCH_NAME,
+                Id::new([0x44; 16]).unwrap(),
+                signer.clone(),
+            ),
+            TestBranchSpec::new(
+                LEGACY_SENSES_BRANCH_NAME,
+                Id::new([0x45; 16]).unwrap(),
+                signer,
+                vec![TestDeltaSpec::authored(
+                    utterance,
+                    "misplaced historical speech",
+                )],
+            ),
+        ])
+        .freeze(&path)
+        .unwrap()
+        .source;
         let error = plan(&frozen).unwrap_err();
         assert!(format!("{error:#}").contains("without a complete authored record witness"));
     }

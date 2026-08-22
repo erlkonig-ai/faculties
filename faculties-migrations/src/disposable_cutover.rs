@@ -26,7 +26,7 @@ use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
-    discover_collection_records, Collection, CollectionCommit, DiscoveredCollectionRecords,
+    discover_collection_records, CollectionCommit, DiscoveredCollectionRecords,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, PileReader};
@@ -251,7 +251,8 @@ fn build_world(
         let baseline = snapshots(&mut pile, signer, publications)?;
         let mut returned = BTreeMap::new();
         for publication in publications {
-            let mut collection = faculties::collection_names::open(&mut pile, publication.scope, signer.clone());
+            let mut collection =
+                faculties::collection_names::open(&mut pile, publication.scope, signer.clone());
             let mut commits = Vec::new();
             for fragment in publication.fragments {
                 commits.push(
@@ -285,7 +286,8 @@ fn snapshots(
     publications
         .iter()
         .map(|publication| {
-            let mut collection = faculties::collection_names::open(&mut *pile, publication.scope, signer.clone());
+            let mut collection =
+                faculties::collection_names::open(&mut *pile, publication.scope, signer.clone());
             let (facts, commits, _) = collection
                 .snapshot()
                 .with_context(|| format!("snapshot {} collection", publication.name))?
@@ -614,8 +616,8 @@ mod tests {
     use triblespace::macros::entity;
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer};
+    use crate::collection_cutover::freeze_source;
+    use faculties::storage::initialize_signer;
 
     /// A REAL scope, not a synthetic id. A root is anchored by a name now, so
     /// an id this build has never named is one it cannot open at all; which
@@ -647,7 +649,8 @@ use faculties::storage::{initialize_signer};
 
         fn publish(&self, fragment: Fragment) -> CollectionCommit {
             let pile = open_pile_strict(&self.live).unwrap();
-            let mut collection = faculties::collection_names::open(pile, SCOPE, self.signer.clone());
+            let mut collection =
+                faculties::collection_names::open(pile, SCOPE, self.signer.clone());
             let commit = collection.commit(fragment).unwrap();
             collection.close().unwrap();
             commit
@@ -659,7 +662,8 @@ use faculties::storage::{initialize_signer};
 
         fn facts(&self) -> TribleSet {
             let pile = open_pile_strict(&self.live).unwrap();
-            let mut collection = faculties::collection_names::open(pile, SCOPE, self.signer.clone());
+            let mut collection =
+                faculties::collection_names::open(pile, SCOPE, self.signer.clone());
             let facts = collection.snapshot().unwrap().into_facts();
             collection.close().unwrap();
             facts

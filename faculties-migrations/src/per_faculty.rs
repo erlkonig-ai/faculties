@@ -34,7 +34,6 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
-use triblespace::core::collection::Collection;
 use triblespace::core::id::Id;
 use triblespace::core::trible::TribleSet;
 
@@ -239,7 +238,10 @@ mod tests {
         for faculty in Faculty::ALL {
             assert!(seen.insert(faculty.label()), "duplicate {faculty}");
             assert_eq!(Faculty::from_str(faculty.label()).unwrap(), *faculty);
-            assert_eq!(Faculty::from_str(&faculty.label().to_uppercase()).unwrap(), *faculty);
+            assert_eq!(
+                Faculty::from_str(&faculty.label().to_uppercase()).unwrap(),
+                *faculty
+            );
         }
         assert_eq!(seen.len(), Faculty::ALL.len());
     }
@@ -265,41 +267,41 @@ mod tests {
     /// visible to the current faculty, the legacy branch survives untouched,
     /// and a second run is free.
     #[test]
-    fn migrating_one_faculty_is_additive_replayable_and_keeps_the_legacy_branch() {
+    fn one_faculty_dispatch_is_additive_replayable_and_keeps_the_frozen_coordinate() {
         use std::fs::{self, File};
 
         use ed25519_dalek::SigningKey;
         use faculties::schemas::compass::{board, KIND_GOAL_ID, LEGACY_BRANCH_NAME};
         use faculties::storage::initialize_signer;
         use triblespace::core::metadata;
-        use triblespace::core::repo::Repository;
         use triblespace::macros::entity;
         use triblespace::prelude::*;
+
+        use crate::collection_cutover::test_support::{
+            TestBranchSpec, TestDeltaSpec, TestSourceSpec,
+        };
 
         let directory = tempfile::TempDir::new().unwrap();
         let pile_path = directory.path().join("legacy.pile");
         let key_path = directory.path().join("legacy.key");
         File::create(&pile_path).unwrap();
 
-        // A pre-collection Compass pile: one authored commit on the `compass`
-        // repository branch and nothing in any native collection.
         let goal = genid().id;
-        let storage = open_pile_strict(&pile_path).unwrap();
-        let mut repository =
-            Repository::new(storage, SigningKey::from_bytes(&[0x5A; 32]), Fragment::empty())
-                .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
         let mut authored = Fragment::empty();
         let title = authored.put::<blobencodings::UTF8String, _>("preserve me".to_owned());
         authored += entity! { ExclusiveId::force_ref(&goal) @
             metadata::tag: &KIND_GOAL_ID,
             board::title: title,
         };
-        workspace.commit(authored.clone(), "legacy goal");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
         let signer = initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x5A; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x5A; 32]),
+            vec![TestDeltaSpec::authored(authored.clone(), "legacy goal")],
+        )])
+        .freeze(&pile_path)
+        .unwrap();
 
         let scope = Faculty::Compass.scope();
         assert_eq!(
@@ -307,9 +309,15 @@ mod tests {
             TribleSet::new(),
             "a legacy-only pile starts with an empty native collection"
         );
-        let pins_before = freeze_source(&pile_path).unwrap().legacy_pins().to_vec();
+        let pins_before = frozen.source.legacy_pins().to_vec();
 
-        migrate(Faculty::Compass, &pile_path, Some(&key_path)).unwrap();
+        plan_and_publish(
+            Faculty::Compass,
+            &frozen.source,
+            &pile_path,
+            Some(&key_path),
+        )
+        .unwrap();
 
         let migrated = materialize(&pile_path, scope, &signer).unwrap();
         assert_eq!(
@@ -319,16 +327,18 @@ mod tests {
         );
         assert!(faculties::compass::goal_ids(&migrated).contains(&goal));
 
-        // The legacy branch is evidence, not fuel: it is still there.
-        assert_eq!(
-            freeze_source(&pile_path).unwrap().legacy_pins(),
-            pins_before.as_slice()
-        );
+        assert_eq!(frozen.source.legacy_pins(), pins_before.as_slice());
 
         // And a second run publishes content-addressed commits that already
         // exist, so the file does not grow by a byte.
         let length = fs::metadata(&pile_path).unwrap().len();
-        migrate(Faculty::Compass, &pile_path, Some(&key_path)).unwrap();
+        plan_and_publish(
+            Faculty::Compass,
+            &frozen.source,
+            &pile_path,
+            Some(&key_path),
+        )
+        .unwrap();
         assert_eq!(fs::metadata(&pile_path).unwrap().len(), length);
         assert_eq!(materialize(&pile_path, scope, &signer).unwrap(), migrated);
     }

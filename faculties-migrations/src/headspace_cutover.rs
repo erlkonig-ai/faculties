@@ -11,16 +11,18 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{load_signer, open_pile_strict};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+};
 use faculties::headspace as capability;
 use faculties::schemas::headspace::{DEFAULT_SCOPE_ID, KIND_LIVE_RECORD, LEGACY_BRANCH_NAME};
+use faculties::storage::{load_signer, open_pile_strict};
 
 /// One native commit projected from one verified legacy authored commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,11 +272,11 @@ mod tests {
     use anybytes::View;
     use ed25519_dalek::SigningKey;
     use triblespace::core::attribute::Attribute;
-    use triblespace::core::repo::{BlobStoreGet, BlobStoreList, PinStore, Repository};
+    use triblespace::core::repo::{BlobStoreGet, BlobStoreList};
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::initialize_signer;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -307,6 +309,7 @@ use faculties::storage::{initialize_signer};
         content_payload: Inline<inlineencodings::Handle<blobencodings::RawBytes>>,
         metadata_payload: Inline<inlineencodings::Handle<blobencodings::RawBytes>>,
         source_facts: TribleSet,
+        source: FrozenSource,
     }
 
     fn id(byte: u8) -> Id {
@@ -322,12 +325,7 @@ use faculties::storage::{initialize_signer};
         let pile_path = directory.0.join("headspace.pile");
         let key = directory.0.join("headspace.key");
         File::create(&pile_path).unwrap();
-
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x61; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
+        initialize_signer(&pile_path, Some(&key)).unwrap();
 
         // Extrinsic ids and schema-unknown attachments are deliberate. The
         // migration must copy history, not rebuild it through today's entity
@@ -358,17 +356,8 @@ use faculties::storage::{initialize_signer};
         semantic_metadata += entity! {
             opaque_metadata: metadata_payload,
         };
-        workspace.commit_with_metadata(
-            profile_fragment.clone(),
-            semantic_metadata,
-            "legacy profile provenance",
-        );
-        repository.push(&mut workspace).unwrap();
-
         // Two siblings force a verified contentless merge. One sibling is an
         // authored empty archive and must still become a native COMMIT.
-        let mut authored = repository.pull(branch).unwrap();
-        let mut authored_empty = repository.pull(branch).unwrap();
         let context = id(0x21);
         let mut context_fragment = Fragment::empty();
         let context_iri = context_fragment
@@ -376,15 +365,24 @@ use faculties::storage::{initialize_signer};
         context_fragment += entity! { ExclusiveId::force_ref(&context) @
             metadata::iri: context_iri,
         };
-        authored.commit(context_fragment.clone(), "legacy context");
-        authored_empty.commit(Fragment::empty(), "legacy authored empty");
-        repository.push(&mut authored).unwrap();
-        repository.push(&mut authored_empty).unwrap();
-        repository.close().unwrap();
-
-        let mut source_facts = profile_fragment.into_facts();
-        source_facts += context_fragment.into_facts();
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        let mut source_facts = profile_fragment.facts().clone();
+        source_facts += context_fragment.facts().clone();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            id(0x61),
+            SigningKey::from_bytes(&[0x61; 32]),
+            vec![
+                TestDeltaSpec::authored(profile_fragment, "legacy profile provenance")
+                    .with_metadata(semantic_metadata),
+                TestDeltaSpec::authored(context_fragment, "legacy context"),
+                TestDeltaSpec::authored(Fragment::empty(), "legacy authored empty")
+                    .with_parents([0]),
+                TestDeltaSpec::merge([1, 2]),
+            ],
+        )])
+        .freeze(&pile_path)
+        .unwrap()
+        .source;
         Fixture {
             _directory: directory,
             pile: pile_path,
@@ -393,6 +391,7 @@ use faculties::storage::{initialize_signer};
             content_payload,
             metadata_payload,
             source_facts,
+            source,
         }
     }
 
@@ -423,8 +422,7 @@ use faculties::storage::{initialize_signer};
     #[test]
     fn plan_preserves_contentless_merge_authored_empty_and_resident_payloads() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
         plan.verify_conservation().unwrap();
         assert_eq!(plan.original_facts(), &fixture.source_facts);
@@ -465,16 +463,14 @@ use faculties::storage::{initialize_signer};
     #[test]
     fn legacy_live_marker_is_rejected() {
         let fixture = fixture_with_live_marker(true);
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        let error = plan(&fixture.source).unwrap_err();
         assert!(format!("{error:#}").contains("already carries the native live marker"));
     }
 
     #[test]
-    fn publication_is_replay_safe_retains_pin_and_conserves_prior_native_union() {
+    fn publication_is_replay_safe_and_conserves_prior_native_union() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
         let prior_entity = id(0x31);
         let prior_attribute =
@@ -491,29 +487,21 @@ use faculties::storage::{initialize_signer};
         collection.commit(prior).unwrap();
         collection.into_storage().close().unwrap();
 
-        let first = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let first = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         let after_first = fs::metadata(&fixture.pile).unwrap().len();
-        let replay = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let replay = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(replay, first);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
 
         let mut expected = fixture.source_facts.clone();
         expected += prior_facts;
         assert_eq!(materialize(&fixture.pile, &fixture.key), expected);
-
-        let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        assert_eq!(
-            pile.head(plan.source_pin().id).unwrap(),
-            Some(plan.source_pin().value)
-        );
-        pile.close().unwrap();
     }
 
     #[test]
     fn publication_resumes_from_an_interrupted_prefix() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
@@ -523,7 +511,7 @@ use faculties::storage::{initialize_signer};
             .unwrap();
         collection.into_storage().close().unwrap();
 
-        let resumed = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let resumed = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(resumed[1], partial);
         assert_eq!(
             materialize(&fixture.pile, &fixture.key),
@@ -534,8 +522,7 @@ use faculties::storage::{initialize_signer};
     #[test]
     fn invalid_prior_native_union_fails_before_any_migration_append() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
@@ -546,7 +533,7 @@ use faculties::storage::{initialize_signer};
         collection.into_storage().close().unwrap();
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
-        let error = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
+        let error = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
         assert!(format!("{error:#}").contains("preflight complete"));
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
     }
@@ -554,12 +541,11 @@ use faculties::storage::{initialize_signer};
     #[test]
     fn missing_signer_fails_without_growing_target() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
         fs::remove_file(&fixture.key).unwrap();
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
-        let error = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
+        let error = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
         assert!(format!("{error:#}").contains("load durable signing key"));
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
     }

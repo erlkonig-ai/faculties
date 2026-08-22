@@ -14,9 +14,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::collection::CollectionCommit;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+};
 use faculties::schemas::compass::DEFAULT_SCOPE_ID;
+use faculties::storage::publish_fragments;
 
 pub use faculties::schemas::compass::LEGACY_BRANCH_NAME;
 
@@ -77,9 +79,12 @@ pub fn plan(source: &FrozenSource) -> Result<CompassMigrationPlan> {
     let branch = source
         .legacy_branch(LEGACY_BRANCH_NAME)?
         .ok_or_else(|| anyhow!("frozen source has no legacy Compass branch"))?;
-    let mut projected =
-        project_legacy_authored_commits(source, &branch, faculties::compass::validate_known_payloads)
-            .context("project frozen Compass authored commits")?;
+    let mut projected = project_legacy_authored_commits(
+        source,
+        &branch,
+        faculties::compass::validate_known_payloads,
+    )
+    .context("project frozen Compass authored commits")?;
     projected.sort_unstable_by_key(|commit| commit.source);
 
     for pair in projected.windows(2) {
@@ -145,15 +150,13 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
-    use triblespace::core::collection::Collection;
     use triblespace::core::metadata;
-    use triblespace::core::repo::Repository;
     use triblespace::macros::entity;
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use faculties::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -185,6 +188,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         goal: Id,
         note: Id,
         source_facts: TribleSet,
+        frozen: FrozenSource,
     }
 
     fn fixture() -> Fixture {
@@ -192,16 +196,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let pile = directory.0.join("compass.pile");
         let key = directory.0.join("compass.key");
         File::create(&pile).unwrap();
-
-        let storage = open_pile_strict(&pile).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0x61; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
         let goal = genid().id;
         let note = genid().id;
         let status = genid().id;
@@ -223,13 +218,6 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             board::status: "doing",
             metadata::created_at: first_time,
         };
-        workspace.commit_with_metadata(
-            first.clone(),
-            entity! { metadata::description: "legacy Compass provenance" },
-            "legacy goal",
-        );
-        repository.push(&mut workspace).unwrap();
-
         let second_time = Epoch::from_unix_seconds(20.0);
         let second_time: Inline<inlineencodings::NsTAIInterval> =
             (second_time, second_time).try_to_inline().unwrap();
@@ -241,13 +229,21 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             board::note: body,
             metadata::created_at: second_time,
         };
-        workspace.commit(second.clone(), "legacy note");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let mut source_facts = first.into_facts();
-        source_facts += second.into_facts();
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let mut source_facts = first.facts().clone();
+        source_facts += second.facts().clone();
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x61; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x61; 32]),
+            vec![
+                TestDeltaSpec::authored(first, "legacy goal")
+                    .with_metadata(entity! { metadata::description: "legacy Compass provenance" }),
+                TestDeltaSpec::authored(second, "legacy note"),
+            ],
+        )])
+        .freeze(&pile)
+        .unwrap()
+        .source;
         Fixture {
             _directory: directory,
             pile,
@@ -255,14 +251,14 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             goal,
             note,
             source_facts,
+            frozen,
         }
     }
 
     #[test]
     fn plan_is_strictly_additive_and_preserves_public_ids() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.frozen).unwrap();
 
         plan.verify_conservation().unwrap();
         assert_eq!(plan.original_facts(), &fixture.source_facts);
@@ -272,14 +268,13 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     }
 
     #[test]
-    fn publication_is_idempotent_and_retains_legacy_coordinates() {
+    fn publication_is_idempotent() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.frozen).unwrap();
 
-        let first = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let first = publish(&fixture.frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         let length = fs::metadata(&fixture.pile).unwrap().len();
-        let second = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let second = publish(&fixture.frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
 

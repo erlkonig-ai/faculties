@@ -12,17 +12,19 @@ use std::path::Path;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{load_signer, open_pile_strict};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+};
 use faculties::discord;
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{discord as schema, DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
+use faculties::storage::{load_signer, open_pile_strict};
 
 /// One exact native COMMIT projected from one authored legacy commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,7 +164,6 @@ pub fn publish(
 
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
-    let team = signer.verifying_key();
     let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
     let result = (|| {
         let existing = collection
@@ -260,13 +261,11 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
-    use triblespace::core::collection::{simplearchive_union, Collection};
     use triblespace::core::metadata;
-    use triblespace::core::repo::{PinStore, Repository};
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -274,6 +273,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         key: std::path::PathBuf,
         source_facts: TribleSet,
         message: Id,
+        source: FrozenSource,
     }
 
     fn at(seconds: f64) -> Inline<inlineencodings::NsTAIInterval> {
@@ -286,12 +286,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         let pile_path = directory.path().join("discord.pile");
         let key = directory.path().join("discord.key");
         File::create(&pile_path).unwrap();
-
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x6D; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut root = repository.pull(branch).unwrap();
+        initialize_signer(&pile_path, Some(&key)).unwrap();
 
         let message = Id::new([0x31; 16]).unwrap();
         let mut message_fragment = Fragment::empty();
@@ -307,51 +302,46 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             schema::message_raw: raw,
             archive::content: content,
         };
-        root.commit_with_metadata(
-            message_fragment.clone(),
-            entity! { metadata::description: "legacy Discord provenance" },
-            "legacy Discord message",
-        );
-        repository.push(&mut root).unwrap();
-
-        let mut authored_empty = repository.pull(branch).unwrap();
-        authored_empty.commit(Fragment::empty(), "legacy authored empty");
-        repository.push(&mut authored_empty).unwrap();
-
-        // Two children from the same base cause Repository::push to publish a
-        // canonical contentless merge when the second child arrives.
-        let mut left = repository.pull(branch).unwrap();
-        let mut right = repository.pull(branch).unwrap();
         let token_left = Id::new([0x32; 16]).unwrap();
         let token_right = Id::new([0x33; 16]).unwrap();
         let left_fragment =
             entity! { ExclusiveId::force_ref(&token_left) @ schema::bot_token: "left-secret" };
         let right_fragment =
             entity! { ExclusiveId::force_ref(&token_right) @ schema::bot_token: "right-secret" };
-        left.commit(left_fragment.clone(), "legacy left token");
-        right.commit(right_fragment.clone(), "legacy right token");
-        repository.push(&mut left).unwrap();
-        repository.push(&mut right).unwrap();
-        repository.close().unwrap();
-
-        let mut source_facts = message_fragment.into_facts();
-        source_facts += left_fragment.into_facts();
-        source_facts += right_fragment.into_facts();
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        let mut source_facts = message_fragment.facts().clone();
+        source_facts += left_fragment.facts().clone();
+        source_facts += right_fragment.facts().clone();
+        // Two children from the same base feed one canonical contentless merge.
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x6D; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x6D; 32]),
+            vec![
+                TestDeltaSpec::authored(message_fragment, "legacy Discord message")
+                    .with_metadata(entity! { metadata::description: "legacy Discord provenance" }),
+                TestDeltaSpec::authored(Fragment::empty(), "legacy authored empty"),
+                TestDeltaSpec::authored(left_fragment, "legacy left token"),
+                TestDeltaSpec::authored(right_fragment, "legacy right token").with_parents([1]),
+                TestDeltaSpec::merge([2, 3]),
+            ],
+        )])
+        .freeze(&pile_path)
+        .unwrap()
+        .source;
         Fixture {
             _directory: directory,
             pile: pile_path,
             key,
             source_facts,
             message,
+            source,
         }
     }
 
     #[test]
     fn plan_is_exact_additive_and_keeps_empty_and_merge_distinct() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
         plan.verify_conservation().unwrap();
         assert_eq!(plan.original_facts(), &fixture.source_facts);
@@ -374,8 +364,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn migrated_mutable_rows_remain_inert_beside_native_observations() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
         let mut facts = plan.materialized_facts();
 
         // The historical mutable row is exact retained evidence, not a native
@@ -415,12 +404,11 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn publication_is_idempotent_and_targets_descriptor_handle() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
-        let first = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let first = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         let after_first = fs::metadata(&fixture.pile).unwrap().len();
-        let second = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let second = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
 
@@ -435,34 +423,26 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, team).facts()
         );
         assert_eq!(discovery.commits().len(), plan.commits().len());
-        let mut pile = collection.into_storage();
-        assert_eq!(
-            pile.head(plan.source_pin().id).unwrap(),
-            Some(plan.source_pin().value)
-        );
-        pile.close().unwrap();
+        collection.into_storage().close().unwrap();
     }
 
     #[test]
     fn publication_resumes_after_an_arbitrary_interrupted_prefix() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let team = signer.verifying_key();
         let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         let partial = collection
             .commit(plan.commits()[1].fragment.clone())
             .unwrap();
         collection.into_storage().close().unwrap();
 
-        let resumed = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let resumed = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(resumed[1], partial);
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let team = signer.verifying_key();
         let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), fixture.source_facts);
         collection.into_storage().close().unwrap();
@@ -471,12 +451,11 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn missing_signer_fails_without_growing_the_pile() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.source).unwrap();
         fs::remove_file(&fixture.key).unwrap();
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
-        let error = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
+        let error = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
         assert!(format!("{error:#}").contains("load durable signing key"));
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
     }

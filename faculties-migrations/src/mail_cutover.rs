@@ -14,19 +14,22 @@ use std::path::Path;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{load_signer, open_pile_strict};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate, ProjectedLegacyCommit,
+};
 use faculties::mail::{self, BytesHandle, IntervalValue, TextHandle};
 use faculties::schemas::mail::{
     self as schema, imported_legacy, IMPORT_DRAFT, IMPORT_RECEIVED, IMPORT_SENT,
 };
 use faculties::schemas::message::{local as legacy_read, KIND_READ_ID};
+use faculties::storage::{load_signer, open_pile_strict};
 
 /// Provenance of one native Mail migration commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -557,9 +560,10 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
-    use triblespace::core::repo::{BlobStoreList, Repository};
+    use triblespace::core::repo::BlobStoreList;
 
     use super::*;
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use faculties::storage::{initialize_signer, publish_fragment};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
@@ -587,7 +591,7 @@ mod tests {
 
     struct Fixture {
         _directory: TestDirectory,
-        source: std::path::PathBuf,
+        source: FrozenSource,
         target: std::path::PathBuf,
         key: std::path::PathBuf,
         source_facts: TribleSet,
@@ -629,17 +633,8 @@ mod tests {
         let key = directory.0.join("target.key");
         File::create(&source).unwrap();
         File::create(&target).unwrap();
-
-        let pile = open_pile_strict(&source).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x61; 32]), Fragment::empty()).unwrap();
-        let branch = *repository
-            .create_branch(schema::LEGACY_BRANCH_NAME, None)
-            .unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
         let (message, message_id) = legacy_message("legacy@example.test");
         let message_facts = message.facts().clone();
-        workspace.commit(message, "legacy message");
         let read_id = Id::new([0x44; 16]).unwrap();
         let read = entity! { ExclusiveId::force_ref(&read_id) @
             metadata::tag: &KIND_READ_ID,
@@ -649,12 +644,21 @@ mod tests {
             metadata::created_at: at(2),
         };
         let read_facts = read.facts().clone();
-        workspace.commit(read, "legacy read");
-        workspace.commit(Fragment::empty(), "authored empty");
-        workspace.commit(Fragment::empty(), "authored empty");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
         initialize_signer(&target, Some(&key)).unwrap();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            schema::LEGACY_BRANCH_NAME,
+            Id::new([0x61; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x61; 32]),
+            vec![
+                TestDeltaSpec::authored(message, "legacy message"),
+                TestDeltaSpec::authored(read, "legacy read"),
+                TestDeltaSpec::authored(Fragment::empty(), "authored empty"),
+                TestDeltaSpec::authored(Fragment::empty(), "authored empty"),
+            ],
+        )])
+        .freeze(&source)
+        .unwrap()
+        .source;
 
         let mut source_facts = message_facts;
         source_facts += read_facts;
@@ -674,15 +678,6 @@ mod tests {
         let key = directory.0.join("split-target.key");
         File::create(&source).unwrap();
         File::create(&target).unwrap();
-
-        let pile = open_pile_strict(&source).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x62; 32]), Fragment::empty()).unwrap();
-        let branch = *repository
-            .create_branch(schema::LEGACY_BRANCH_NAME, None)
-            .unwrap();
-        let mut left = repository.pull(branch).unwrap();
-        let mut right = repository.pull(branch).unwrap();
         let (message, _) = legacy_message("joined@example.test");
         let (_, facts, _, blobs) = message.into_parts();
         let left_facts: TribleSet = facts
@@ -701,18 +696,27 @@ mod tests {
         let right_facts = facts.difference(&left_facts);
         assert!(!left_facts.is_empty());
         assert!(!right_facts.is_empty());
-        left.commit(
-            Fragment::from_facts_and_blobs(left_facts, blobs.clone()),
-            "legacy left half",
-        );
-        right.commit(
-            Fragment::from_facts_and_blobs(right_facts, blobs),
-            "legacy right half",
-        );
-        repository.push(&mut left).unwrap();
-        repository.push(&mut right).unwrap();
-        repository.close().unwrap();
         initialize_signer(&target, Some(&key)).unwrap();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            schema::LEGACY_BRANCH_NAME,
+            Id::new([0x62; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x62; 32]),
+            vec![
+                TestDeltaSpec::authored(
+                    Fragment::from_facts_and_blobs(left_facts, blobs.clone()),
+                    "legacy left half",
+                ),
+                TestDeltaSpec::authored(
+                    Fragment::from_facts_and_blobs(right_facts, blobs),
+                    "legacy right half",
+                )
+                .with_parents([]),
+                TestDeltaSpec::merge([0, 1]),
+            ],
+        )])
+        .freeze(&source)
+        .unwrap()
+        .source;
 
         Fixture {
             _directory: directory,
@@ -726,7 +730,8 @@ mod tests {
     fn materialize(path: &Path, key: &Path) -> TribleSet {
         let signer = load_signer(path, Some(key)).unwrap();
         let pile = open_pile_strict(path).unwrap();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         collection.into_storage().close().unwrap();
         facts
@@ -735,8 +740,8 @@ mod tests {
     #[test]
     fn plan_is_strictly_additive_and_preserves_authored_empty_commits() {
         let fixture = fixture();
-        let source = crate::collection_cutover::freeze_source(&fixture.source).unwrap();
-        let plan = plan(&source).unwrap();
+        let source = &fixture.source;
+        let plan = plan(source).unwrap();
         plan.verify_conservation().unwrap();
         assert_eq!(plan.original_facts(), &fixture.source_facts);
         assert_eq!(plan.report().authored_commits, 4);
@@ -751,7 +756,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let projected =
-            project_legacy_authored_commits(&source, &branch, validate_known_payloads).unwrap();
+            project_legacy_authored_commits(source, &branch, validate_known_payloads).unwrap();
         for expected in projected {
             let actual = plan
                 .commits()
@@ -787,13 +792,13 @@ mod tests {
     #[test]
     fn sibling_authors_join_through_a_distinct_normalization_commit() {
         let fixture = split_merge_fixture();
-        let source = crate::collection_cutover::freeze_source(&fixture.source).unwrap();
+        let source = &fixture.source;
         let branch = source
             .legacy_branch(schema::LEGACY_BRANCH_NAME)
             .unwrap()
             .unwrap();
         let head = branch.head.unwrap();
-        let plan = plan(&source).unwrap();
+        let plan = plan(source).unwrap();
 
         assert_eq!(plan.original_facts(), &fixture.source_facts);
         assert_eq!(plan.report().authored_commits, 2);
@@ -808,7 +813,7 @@ mod tests {
         }));
         plan.verify_conservation().unwrap();
 
-        publish(&source, &plan, &fixture.target, Some(&fixture.key)).unwrap();
+        publish(source, &plan, &fixture.target, Some(&fixture.key)).unwrap();
         assert_eq!(
             materialize(&fixture.target, &fixture.key),
             plan.materialized_facts()
@@ -818,9 +823,9 @@ mod tests {
     #[test]
     fn publication_is_idempotent_and_conserves_the_exact_candidate() {
         let fixture = fixture();
-        let source = crate::collection_cutover::freeze_source(&fixture.source).unwrap();
-        let plan = plan(&source).unwrap();
-        let published = publish(&source, &plan, &fixture.target, Some(&fixture.key)).unwrap();
+        let source = &fixture.source;
+        let plan = plan(source).unwrap();
+        let published = publish(source, &plan, &fixture.target, Some(&fixture.key)).unwrap();
         assert_eq!(published.len(), plan.commits().len());
         assert_eq!(
             published
@@ -832,7 +837,7 @@ mod tests {
             "distinct legacy authored coordinates must not collapse"
         );
         let length = fs::metadata(&fixture.target).unwrap().len();
-        publish(&source, &plan, &fixture.target, Some(&fixture.key)).unwrap();
+        publish(source, &plan, &fixture.target, Some(&fixture.key)).unwrap();
         assert_eq!(fs::metadata(&fixture.target).unwrap().len(), length);
         assert_eq!(
             materialize(&fixture.target, &fixture.key),
@@ -843,8 +848,8 @@ mod tests {
     #[test]
     fn interrupted_prefix_replay_converges() {
         let fixture = fixture();
-        let source = crate::collection_cutover::freeze_source(&fixture.source).unwrap();
-        let plan = plan(&source).unwrap();
+        let source = &fixture.source;
+        let plan = plan(source).unwrap();
         publish_fragment(
             &fixture.target,
             Some(&fixture.key),
@@ -852,7 +857,7 @@ mod tests {
             plan.commits()[0].fragment.clone(),
         )
         .unwrap();
-        publish(&source, &plan, &fixture.target, Some(&fixture.key)).unwrap();
+        publish(source, &plan, &fixture.target, Some(&fixture.key)).unwrap();
         assert_eq!(
             materialize(&fixture.target, &fixture.key),
             plan.materialized_facts()
@@ -862,8 +867,8 @@ mod tests {
     #[test]
     fn preflight_conflict_appends_nothing() {
         let fixture = fixture();
-        let source = crate::collection_cutover::freeze_source(&fixture.source).unwrap();
-        let plan = plan(&source).unwrap();
+        let source = &fixture.source;
+        let plan = plan(source).unwrap();
         let malformed = entity! { metadata::tag: &schema::KIND_WIRE_MESSAGE };
         publish_fragment(
             &fixture.target,
@@ -873,7 +878,7 @@ mod tests {
         )
         .unwrap();
         let length = fs::metadata(&fixture.target).unwrap().len();
-        assert!(publish(&source, &plan, &fixture.target, Some(&fixture.key)).is_err());
+        assert!(publish(source, &plan, &fixture.target, Some(&fixture.key)).is_err());
         assert_eq!(fs::metadata(&fixture.target).unwrap().len(), length);
     }
 }

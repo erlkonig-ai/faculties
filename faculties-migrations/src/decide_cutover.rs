@@ -27,10 +27,15 @@ use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::View;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate, ProjectedLegacyCommit,
+};
 use faculties::decide::{self as capability, FactorSide, IntervalValue, TextHandle};
-use faculties::schemas::decide::{self as schema, decide, factor, KIND_CON, KIND_DECISION, KIND_PRO};
+use faculties::schemas::decide::{
+    self as schema, decide, factor, KIND_CON, KIND_DECISION, KIND_PRO,
+};
+use faculties::storage::publish_fragments;
 
 pub use faculties::schemas::decide::LEGACY_BRANCH_NAME;
 
@@ -859,17 +864,15 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
-    use triblespace::core::collection::Collection;
-    use triblespace::core::repo::Repository;
     use triblespace::macros::entity;
     use triblespace::prelude::{ufoid, BlobStore, ExclusiveId, TryToInline};
 
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     struct Fixture {
         _directory: tempfile::TempDir,
-        source: PathBuf,
+        source: FrozenSource,
         destination: PathBuf,
         key: PathBuf,
         decision: Id,
@@ -926,48 +929,42 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         fragment
     }
 
-    fn fixture() -> Fixture {
+    fn fixture_with_tail(tail: Option<TestDeltaSpec>) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("legacy.pile");
+        let source_path = directory.path().join("legacy.pile");
         let destination = directory.path().join("candidate.pile");
         let key = directory.path().join("candidate.key");
-        File::create(&source).unwrap();
+        File::create(&source_path).unwrap();
         File::create(&destination).unwrap();
-        let storage = open_pile_strict(&source).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0x91; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let decision = Id::new([0x92; 16]).unwrap();
-
-        let mut root = repository.pull(branch).unwrap();
-        root.commit(proposal(decision, "choose"), "proposal");
-        repository.push(&mut root).unwrap();
-
-        let mut left = repository.pull(branch).unwrap();
-        let mut right = repository.pull(branch).unwrap();
-        left.commit(
-            legacy_factor(decision, FactorSide::Pro, "benefit", 2.0),
-            "pro fork",
-        );
-        right.commit(
-            legacy_factor(decision, FactorSide::Con, "risk", 3.0),
-            "con fork",
-        );
-        repository.push(&mut left).unwrap();
-        repository.push(&mut right).unwrap();
-
-        let mut joined = repository.pull(branch).unwrap();
-        joined.commit(resolution(decision, "proceed", 4.0), "joined resolution");
-        repository.push(&mut joined).unwrap();
-        let mut empty = repository.pull(branch).unwrap();
-        empty.commit(Fragment::empty(), "authored empty");
-        repository.push(&mut empty).unwrap();
-        repository.close().unwrap();
         initialize_signer(&destination, Some(&key)).unwrap();
+        let decision = Id::new([0x92; 16]).unwrap();
+        let mut deltas = vec![
+            TestDeltaSpec::authored(proposal(decision, "choose"), "proposal"),
+            TestDeltaSpec::authored(
+                legacy_factor(decision, FactorSide::Pro, "benefit", 2.0),
+                "pro fork",
+            ),
+            TestDeltaSpec::authored(
+                legacy_factor(decision, FactorSide::Con, "risk", 3.0),
+                "con fork",
+            )
+            .with_parents([0]),
+            TestDeltaSpec::merge([1, 2]),
+            TestDeltaSpec::authored(resolution(decision, "proceed", 4.0), "joined resolution"),
+            TestDeltaSpec::authored(Fragment::empty(), "authored empty"),
+        ];
+        if let Some(tail) = tail {
+            deltas.push(tail);
+        }
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x91; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x91; 32]),
+            deltas,
+        )])
+        .freeze(&source_path)
+        .unwrap()
+        .source;
         Fixture {
             _directory: directory,
             source,
@@ -975,6 +972,10 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             key,
             decision,
         }
+    }
+
+    fn fixture() -> Fixture {
+        fixture_with_tail(None)
     }
 
     struct TestView {
@@ -990,7 +991,8 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             .unwrap()
             .commits()
             .len();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         let reader = collection.storage_mut().reader().unwrap();
         collection.into_storage().close().unwrap();
@@ -1004,12 +1006,17 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn repository_ancestry_recovers_evidence_and_preserves_authored_empty() {
         let fixture = fixture();
-        let source = freeze_source(&fixture.source).unwrap();
-        let planned = plan(&source).unwrap();
+        let planned = plan(&fixture.source).unwrap();
         assert_eq!(planned.commits().len(), 5);
         assert_eq!(planned.report().authored_empty_commits, 1);
         planned.verify_conservation().unwrap();
-        publish(&source, &planned, &fixture.destination, Some(&fixture.key)).unwrap();
+        publish(
+            &fixture.source,
+            &planned,
+            &fixture.destination,
+            Some(&fixture.key),
+        )
+        .unwrap();
         let view = materialized(&fixture);
         capability::validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(planned
@@ -1032,36 +1039,35 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn exact_replay_is_idempotent_in_the_fixed_decide_collection() {
         let fixture = fixture();
-        let source = freeze_source(&fixture.source).unwrap();
-        let planned = plan(&source).unwrap();
-        let first = publish(&source, &planned, &fixture.destination, Some(&fixture.key)).unwrap();
-        let second = publish(&source, &planned, &fixture.destination, Some(&fixture.key)).unwrap();
+        let planned = plan(&fixture.source).unwrap();
+        let first = publish(
+            &fixture.source,
+            &planned,
+            &fixture.destination,
+            Some(&fixture.key),
+        )
+        .unwrap();
+        let second = publish(
+            &fixture.source,
+            &planned,
+            &fixture.destination,
+            Some(&fixture.key),
+        )
+        .unwrap();
         assert_eq!(first, second);
         assert_eq!(materialized(&fixture).commits, planned.commits().len());
     }
 
     #[test]
     fn split_resolution_pair_fails_closed_before_candidate_creation() {
-        let fixture = fixture();
-        let storage = open_pile_strict(&fixture.source).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0x94; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = repository.ensure_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        workspace.commit(
-            entity! { ExclusiveId::force_ref(&fixture.decision) @
+        let decision = Id::new([0x92; 16]).unwrap();
+        let fixture = fixture_with_tail(Some(TestDeltaSpec::authored(
+            entity! { ExclusiveId::force_ref(&decision) @
                 metadata::finished_at: at(9.0)
             },
             "malformed split finish",
-        );
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-        let frozen = freeze_source(&fixture.source).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        )));
+        let error = plan(&fixture.source).unwrap_err();
         assert!(format!("{error:#}").contains("pairing is ambiguous"));
         assert_eq!(std::fs::metadata(&fixture.destination).unwrap().len(), 0);
     }

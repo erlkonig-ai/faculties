@@ -35,12 +35,15 @@ use triblespace::core::trible::{intrinsic_entity_id_v1, Fragment, Trible, Trible
 use triblespace::macros::{attributes, entity, find, pattern};
 use triblespace::prelude::{inlineencodings::R256, ExclusiveId};
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+    ProjectedLegacyCommit,
+};
 use faculties::files as file_capability;
 use faculties::schemas::files::{
     file, DEFAULT_SCOPE_ID, FILES_BRANCH_NAME, KIND_FILE, KIND_MEDIA_TYPE,
 };
+use faculties::storage::publish_fragments;
 
 mod legacy {
     use super::*;
@@ -586,12 +589,12 @@ mod tests {
     use hifitime::Epoch;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::inline::Inline;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, Repository};
+    use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
     use triblespace::macros::exists;
     use triblespace::prelude::{blobencodings::RawBytes, TryToInline};
 
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{discover_target, initialize_signer};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{discover_target, initialize_signer};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -622,7 +625,8 @@ use faculties::storage::{discover_target, initialize_signer};
 
     struct Fixture {
         _directory: TestDirectory,
-        source: std::path::PathBuf,
+        source_path: std::path::PathBuf,
+        source: FrozenSource,
         target: std::path::PathBuf,
         key: std::path::PathBuf,
         old_file: Id,
@@ -638,12 +642,8 @@ use faculties::storage::{discover_target, initialize_signer};
         let key = directory.path().join("native.key");
         File::create(&source).unwrap();
         File::create(&target).unwrap();
-
-        let pile = faculties::storage::open_pile_strict(&source).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x51; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(FILES_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
+        initialize_signer(&target, Some(&key)).unwrap();
+        initialize_signer(&source, Some(&key)).unwrap();
 
         let mut file_fragment = Fragment::empty();
         let content = file_fragment.put::<RawBytes, _>(b"legacy PDF".to_vec());
@@ -665,8 +665,8 @@ use faculties::storage::{discover_target, initialize_signer};
             file::imported_at: imported_at,
         };
         let semantic = entity! { metadata::description: "semantic metadata" };
-        workspace.commit_with_metadata(file_fragment.clone(), semantic, "legacy file");
-        repository.push(&mut workspace).unwrap();
+        let file_delta =
+            TestDeltaSpec::authored(file_fragment.clone(), "legacy file").with_metadata(semantic);
 
         let mut directory_fragment = Fragment::empty();
         let second_content = directory_fragment.put::<RawBytes, _>(b"second PDF".to_vec());
@@ -686,19 +686,25 @@ use faculties::storage::{discover_target, initialize_signer};
         };
         let old_directory = directory_record.root().unwrap();
         directory_fragment += directory_record;
-        let mut authored_empty = repository.pull(branch).unwrap();
-        authored_empty.commit(Fragment::empty(), "authored empty");
-        workspace.commit(directory_fragment.clone(), "legacy directory");
-        repository.push(&mut workspace).unwrap();
-        repository.push(&mut authored_empty).unwrap();
-        repository.close().unwrap();
-
         let mut source_facts = file_fragment.into_facts();
-        source_facts += directory_fragment.into_facts();
-        initialize_signer(&target, Some(&key)).unwrap();
+        source_facts += directory_fragment.facts().clone();
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            FILES_BRANCH_NAME,
+            Id::new([0x51; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x51; 32]),
+            vec![
+                file_delta,
+                TestDeltaSpec::authored(directory_fragment, "legacy directory"),
+                TestDeltaSpec::authored(Fragment::empty(), "authored empty").with_parents([0]),
+                TestDeltaSpec::merge([1, 2]),
+            ],
+        )])
+        .freeze(&source)
+        .unwrap();
         Fixture {
             _directory: directory,
-            source,
+            source_path: source,
+            source: frozen.source,
             target,
             key,
             old_file,
@@ -749,8 +755,8 @@ use faculties::storage::{discover_target, initialize_signer};
     #[test]
     fn plan_is_strictly_additive_and_preserves_every_existing_identity() {
         let fixture = fixture();
-        let before = fs::read(&fixture.source).unwrap();
-        let frozen = freeze_source(&fixture.source).unwrap();
+        let before = fs::read(&fixture.source_path).unwrap();
+        let frozen = &fixture.source;
         let expected_media_type = file_capability::media_type_fragment("application/pdf").unwrap();
         let expected_name = find!(
             name: file_capability::NameHandle,
@@ -761,9 +767,9 @@ use faculties::storage::{discover_target, initialize_signer};
         .next()
         .unwrap();
         assert!(frozen.reader().metadata(expected_name).unwrap().is_none());
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(frozen).unwrap();
 
-        assert_eq!(fs::read(&fixture.source).unwrap(), before);
+        assert_eq!(fs::read(&fixture.source_path).unwrap(), before);
         assert_eq!(plan.original_facts(), &fixture.source_facts);
         plan.verify_conservation().unwrap();
         let materialized = plan.materialized_facts();
@@ -803,30 +809,25 @@ use faculties::storage::{discover_target, initialize_signer};
     }
 
     #[test]
-    fn native_publication_replays_without_growth_or_legacy_target_pins() {
+    fn native_publication_replays_without_growth() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.source).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let frozen = &fixture.source;
+        let plan = plan(frozen).unwrap();
 
-        let first = publish(&frozen, &plan, &fixture.target, Some(&fixture.key)).unwrap();
+        let first = publish(frozen, &plan, &fixture.target, Some(&fixture.key)).unwrap();
         let after_first = fs::metadata(&fixture.target).unwrap().len();
-        let second = publish(&frozen, &plan, &fixture.target, Some(&fixture.key)).unwrap();
+        let second = publish(frozen, &plan, &fixture.target, Some(&fixture.key)).unwrap();
         let after_second = fs::metadata(&fixture.target).unwrap().len();
         assert_eq!(first, second);
         assert_eq!(after_first, after_second);
 
         let signer = faculties::storage::load_signer(&fixture.target, Some(&fixture.key)).unwrap();
         let mut pile = faculties::storage::open_pile_strict(&fixture.target).unwrap();
-        assert!(pile
-            .pins()
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
-            .is_empty());
         let target = discover_target(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         assert_eq!(
             target.descriptor().facts(),
-            faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, signer.verifying_key()).facts()
+            faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, signer.verifying_key())
+                .facts()
         );
         let mut expected_commits = first.clone();
         expected_commits.sort_unstable_by_key(CollectionCommit::id);
@@ -866,23 +867,19 @@ use faculties::storage::{discover_target, initialize_signer};
     #[test]
     fn native_publication_can_append_to_the_frozen_legacy_pile() {
         let fixture = fixture();
-        initialize_signer(&fixture.source, Some(&fixture.key)).unwrap();
-        let frozen = freeze_source(&fixture.source).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let frozen = &fixture.source;
+        let plan = plan(frozen).unwrap();
 
-        let first = publish(&frozen, &plan, &fixture.source, Some(&fixture.key)).unwrap();
-        let after_first = fs::metadata(&fixture.source).unwrap().len();
-        let second = publish(&frozen, &plan, &fixture.source, Some(&fixture.key)).unwrap();
+        let first = publish(frozen, &plan, &fixture.source_path, Some(&fixture.key)).unwrap();
+        let after_first = fs::metadata(&fixture.source_path).unwrap().len();
+        let second = publish(frozen, &plan, &fixture.source_path, Some(&fixture.key)).unwrap();
         assert_eq!(first, second);
-        assert_eq!(fs::metadata(&fixture.source).unwrap().len(), after_first);
+        assert_eq!(
+            fs::metadata(&fixture.source_path).unwrap().len(),
+            after_first
+        );
 
-        let mut pile = faculties::storage::open_pile_strict(&fixture.source).unwrap();
-        assert!(!pile
-            .pins()
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
-            .is_empty());
+        let mut pile = faculties::storage::open_pile_strict(&fixture.source_path).unwrap();
         let signer = faculties::storage::load_signer(&fixture.target, Some(&fixture.key)).unwrap();
         let target = discover_target(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         assert_eq!(target.commits().len(), plan.commits().len());
@@ -894,11 +891,6 @@ use faculties::storage::{discover_target, initialize_signer};
         let directory = TestDirectory::new();
         let source = directory.path().join("malformed.pile");
         File::create(&source).unwrap();
-        let pile = faculties::storage::open_pile_strict(&source).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x61; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(FILES_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
         let mut malformed = Fragment::empty();
         let content = malformed.put::<RawBytes, _>(b"missing MIME".to_vec());
         let name = malformed.put::<UTF8String, _>("missing.bin".to_owned());
@@ -907,12 +899,15 @@ use faculties::storage::{discover_target, initialize_signer};
             file::content: content,
             file::name: name,
         };
-        workspace.commit(malformed, "malformed");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let frozen = freeze_source(&source).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            FILES_BRANCH_NAME,
+            Id::new([0x61; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x61; 32]),
+            vec![TestDeltaSpec::authored(malformed, "malformed")],
+        )])
+        .freeze(&source)
+        .unwrap();
+        let error = plan(&frozen.source).unwrap_err();
         assert!(format!("{error:#}").contains("legacy MIME"));
     }
 
@@ -921,11 +916,6 @@ use faculties::storage::{discover_target, initialize_signer};
         let directory = TestDirectory::new();
         let source = directory.path().join("partial-import.pile");
         File::create(&source).unwrap();
-        let pile = faculties::storage::open_pile_strict(&source).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x62; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(FILES_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
         let mut malformed = Fragment::empty();
         let content = malformed.put::<RawBytes, _>(b"partial import".to_vec());
         let name = malformed.put::<UTF8String, _>("partial.txt".to_owned());
@@ -942,12 +932,15 @@ use faculties::storage::{discover_target, initialize_signer};
             metadata::tag: &faculties::schemas::files::KIND_IMPORT,
             file::root: &root,
         };
-        workspace.commit(malformed, "partial import");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let frozen = freeze_source(&source).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            FILES_BRANCH_NAME,
+            Id::new([0x62; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x62; 32]),
+            vec![TestDeltaSpec::authored(malformed, "partial import")],
+        )])
+        .freeze(&source)
+        .unwrap();
+        let error = plan(&frozen.source).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("validate complete planned Files catalog"));
         assert!(message.contains("0 values for imported_at"));

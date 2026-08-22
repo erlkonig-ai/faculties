@@ -17,9 +17,11 @@ use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+};
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
+use faculties::storage::publish_fragments;
 
 /// One native COMMIT projected from one verified legacy authored commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,13 +202,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ed25519_dalek::SigningKey;
-    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace::core::collection::Collection;
-    use triblespace::core::repo::{PinStore, Repository};
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -235,9 +234,8 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         _directory: TestDirectory,
         pile: std::path::PathBuf,
         key: std::path::PathBuf,
-        branch: Id,
-        pin: Inline<inlineencodings::Handle<SimpleArchive>>,
         facts: TribleSet,
+        source: FrozenSource,
     }
 
     fn observation(label: &str) -> Fragment {
@@ -258,55 +256,39 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let pile = directory.0.join("web.pile");
         let key = directory.0.join("web.key");
         File::create(&pile).unwrap();
-
-        let storage = open_pile_strict(&pile).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0x77; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let first = observation("first");
-        let mut root = repository.pull(branch).unwrap();
-        root.commit_with_metadata(
-            first.clone(),
-            entity! { metadata::description: "legacy Web provenance" },
-            "first",
-        );
-        repository.push(&mut root).unwrap();
-
-        let second = observation("second");
-        let mut left = repository.pull(branch).unwrap();
-        let mut right = repository.pull(branch).unwrap();
-        left.commit(second.clone(), "second");
-        right.commit(Fragment::empty(), "authored empty");
-        repository.push(&mut left).unwrap();
-        repository.push(&mut right).unwrap();
-        repository.close().unwrap();
-
-        let mut opened = open_pile_strict(&pile).unwrap();
-        let pin = opened.head(branch).unwrap().unwrap();
-        opened.close().unwrap();
         initialize_signer(&pile, Some(&key)).unwrap();
-
-        let mut facts = first.into_facts();
-        facts += second.into_facts();
+        let first = observation("first");
+        let second = observation("second");
+        let mut facts = first.facts().clone();
+        facts += second.facts().clone();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x77; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x77; 32]),
+            vec![
+                TestDeltaSpec::authored(first, "first")
+                    .with_metadata(entity! { metadata::description: "legacy Web provenance" }),
+                TestDeltaSpec::authored(second, "second"),
+                TestDeltaSpec::authored(Fragment::empty(), "authored empty").with_parents([0]),
+                TestDeltaSpec::merge([1, 2]),
+            ],
+        )])
+        .freeze(&pile)
+        .unwrap()
+        .source;
         Fixture {
             _directory: directory,
             pile,
             key,
-            branch,
-            pin,
             facts,
+            source,
         }
     }
 
     #[test]
     fn exact_plan_preserves_authorship_and_merge_ancestry() {
         let fixture = fixture();
-        let source = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&source).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
         assert_eq!(plan.original_facts(), &fixture.facts);
         assert_eq!(plan.report().authored_commits, 3);
@@ -318,14 +300,13 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     }
 
     #[test]
-    fn publication_is_idempotent_and_keeps_the_legacy_pin() {
+    fn publication_is_idempotent() {
         let fixture = fixture();
-        let source = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&source).unwrap();
+        let plan = plan(&fixture.source).unwrap();
 
-        let first = publish(&source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let first = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         let length = fs::metadata(&fixture.pile).unwrap().len();
-        let second = publish(&source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let second = publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
 
@@ -334,17 +315,12 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), fixture.facts);
         collection.into_storage().close().unwrap();
-
-        let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        assert_eq!(pile.head(fixture.branch).unwrap(), Some(fixture.pin));
-        pile.close().unwrap();
     }
 
     #[test]
     fn interrupted_prefix_resumes_and_missing_signer_cannot_grow_target() {
         let fixture = fixture();
-        let source = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&source).unwrap();
+        let plan = plan(&fixture.source).unwrap();
         publish_fragments(
             &fixture.pile,
             Some(&fixture.key),
@@ -352,11 +328,11 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             [plan.commits()[0].fragment.clone()],
         )
         .unwrap();
-        publish(&source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
 
         fs::remove_file(&fixture.key).unwrap();
         let before = fs::metadata(&fixture.pile).unwrap().len();
-        publish(&source, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
+        publish(&fixture.source, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
     }
 }

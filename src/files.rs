@@ -22,14 +22,14 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
-use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
 
+use crate::legacy_hint::open_scope;
 use crate::schemas::embeddings;
 use crate::schemas::files::{file, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_MEDIA_TYPE};
-use crate::legacy_hint::open_scope;
 
 pub type ContentHandle = Inline<Handle<RawBytes>>;
 pub type NameHandle = Inline<Handle<UTF8String>>;
@@ -934,8 +934,7 @@ pub fn media_type_fragment(media_type: &str) -> Result<Fragment> {
 /// `name` is a leaf name supplied by the caller, not a filesystem path. The
 /// returned [`Fragment`] owns the content, name, and media-type-name blobs, so
 /// callers can safely compose it into a larger fragment and publish that one
-/// ownership unit through either the native collection API or a legacy
-/// [`Workspace`](triblespace::core::repo::Workspace).
+/// ownership unit through the native collection API.
 pub fn stage<T>(bytes: T, name: impl Into<String>, media_type: &str) -> Result<Fragment>
 where
     T: triblespace::core::blob::IntoBlob<RawBytes>,
@@ -1012,7 +1011,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet, Repository};
+    use triblespace::core::repo::{BlobStore, BlobStoreGet};
 
     fn content_of(fragment: &Fragment) -> ContentHandle {
         find!(
@@ -1511,15 +1510,12 @@ mod tests {
     }
 
     #[test]
-    fn complete_fragment_survives_legacy_workspace_commit_and_checkout() {
-        let mut repo = Repository::new(
+    fn complete_fragment_survives_native_collection_commit_and_materialization() {
+        let mut collection = crate::collection_names::open(
             MemoryRepo::default(),
+            crate::schemas::files::DEFAULT_SCOPE_ID,
             SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        )
-        .expect("repository");
-        let branch = *repo.create_branch("files", None).expect("branch");
-        let mut workspace = repo.pull(branch).expect("workspace");
+        );
         let file = stage(
             b"slides".to_vec(),
             "deck.pptx",
@@ -1528,14 +1524,12 @@ mod tests {
         .unwrap();
         let file_id = file.root().expect("file root");
 
-        // Legacy Repository callers must preserve the returned Fragment as the
-        // ownership unit: collapsing it into a TribleSet would discard its
-        // attachment store before Workspace::commit can persist the closure.
-        workspace.commit(file, "store canonical file");
-        repo.push(&mut workspace).expect("push");
-
-        let mut reopened = repo.pull(branch).expect("reopen");
-        let catalog = reopened.checkout(..).expect("checkout").into_facts();
+        // The Fragment is the ownership unit: collapsing it into a TribleSet
+        // would discard its attachment store before Collection::commit can
+        // persist the closure.
+        collection.commit(file).expect("commit canonical file");
+        let catalog = collection.materialize().expect("materialize files");
+        let reader = collection.storage_mut().reader().expect("blob reader");
         let content_handle = find!(
             content: ContentHandle,
             pattern!(&catalog, [{ file_id @ file::content: ?content }])
@@ -1549,17 +1543,17 @@ mod tests {
         .next()
         .expect("persisted file name handle");
         let name_handle = media_type_name_handle(&catalog, file_id).expect("canonical media type");
-        let name: anybytes::View<str> = reopened
+        let name: anybytes::View<str> = reader
             .get::<anybytes::View<str>, UTF8String>(name_handle)
             .expect("persisted media type name");
         assert_eq!(
             name.as_ref(),
             "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         );
-        let content: anybytes::Bytes = reopened.get(content_handle).expect("persisted content");
+        let content: anybytes::Bytes = reader.get(content_handle).expect("persisted content");
         assert_eq!(content.as_ref(), b"slides");
         let file_name: anybytes::View<str> =
-            reopened.get(file_name_handle).expect("persisted file name");
+            reader.get(file_name_handle).expect("persisted file name");
         assert_eq!(file_name.as_ref(), "deck.pptx");
     }
 }

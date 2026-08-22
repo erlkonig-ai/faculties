@@ -25,35 +25,31 @@ use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::{ExclusiveId, Id};
 use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::{Inline };
+use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{ BlobStoreGet };
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::entity;
 use triblespace::prelude::{blobencodings, inlineencodings};
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate, ProjectedLegacyCommit,
+};
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::posture::{
     self as schema, posture, EXEMPLAR_BENIGN, EXEMPLAR_PROTECTED, KIND_CHANNEL, KIND_EXEMPLAR,
     KIND_POLICY_REVISION, KIND_TERM,
 };
+use faculties::storage::publish_fragments;
 
-use faculties::schemas::posture::LEGACY_BRANCH_NAME;
 use faculties::posture_policy::{
-    at_most_one,
-    canonicalize_legacy_exemplar,
-    canonicalize_legacy_term,
-    exactly_one,
-    id_values,
-    inline_values,
-    read_text,
-    require_attributes,
-    require_canonical_channel,
+    at_most_one, canonicalize_legacy_exemplar, canonicalize_legacy_term, exactly_one, id_values,
+    inline_values, read_text, require_attributes, require_canonical_channel,
     validate_policy_catalog_union,
 };
+use faculties::schemas::posture::LEGACY_BRANCH_NAME;
 
 type TextHandle = Inline<Handle<UTF8String>>;
 type EmbeddingHandle = Inline<Handle<Embedding768>>;
@@ -84,14 +80,12 @@ mod v4_tests {
     use std::path::PathBuf;
 
     use ed25519_dalek::SigningKey;
-    use triblespace::core::collection::{simplearchive_union, Collection};
     use triblespace::core::inline::encodings::shortstring::ShortString;
-    use triblespace::core::repo::Repository;
     use triblespace::macros::{attributes, id_hex};
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     attributes! {
         "EA000000000000000000000000000001" unsafe as unexpected_v4: ShortString;
@@ -101,7 +95,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
     struct Fixture {
         _directory: tempfile::TempDir,
-        source: PathBuf,
+        source: FrozenSource,
         destination: PathBuf,
         key: PathBuf,
         branch: Id,
@@ -144,22 +138,16 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         };
     }
 
-    fn fixture() -> Fixture {
+    fn fixture_with_tail(tail: Option<TestDeltaSpec>) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source.pile");
+        let source_path = directory.path().join("source.pile");
         let destination = directory.path().join("candidate.pile");
         let key = directory.path().join("candidate.key");
-        File::create(&source).unwrap();
+        File::create(&source_path).unwrap();
         File::create(&destination).unwrap();
+        initialize_signer(&destination, Some(&key)).unwrap();
 
-        let storage = open_pile_strict(&source).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0xE1; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
+        let branch = Id::new([0xE1; 16]).unwrap();
         let channel = ExclusiveId::force(Id::new([0xE2; 16]).unwrap());
 
         let mut first = Fragment::empty();
@@ -172,14 +160,6 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             "project-sunrise",
             Some("fixture rationale"),
         );
-        let mut workspace = repository.pull(branch).unwrap();
-        workspace.commit(first, "first policy assertion");
-        repository.push(&mut workspace).unwrap();
-
-        let mut empty = repository.pull(branch).unwrap();
-        empty.commit(Fragment::empty(), "authored empty");
-        repository.push(&mut empty).unwrap();
-
         let mut last = Fragment::empty();
         let exemplar = ExclusiveId::force(Id::new([0xE4; 16]).unwrap());
         legacy_exemplar(
@@ -188,15 +168,24 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             *channel,
             "A sufficiently descriptive benign fixture passage.",
         );
-        let mut workspace = repository.pull(branch).unwrap();
-        workspace.commit_with_metadata(
-            last,
-            entity! { metadata::tag: &METADATA_MARKER_V4 },
-            "legacy exemplar",
-        );
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-        initialize_signer(&destination, Some(&key)).unwrap();
+        let mut deltas = vec![
+            TestDeltaSpec::authored(first, "first policy assertion"),
+            TestDeltaSpec::authored(Fragment::empty(), "authored empty"),
+            TestDeltaSpec::authored(last, "legacy exemplar")
+                .with_metadata(entity! { metadata::tag: &METADATA_MARKER_V4 }),
+        ];
+        if let Some(tail) = tail {
+            deltas.push(tail);
+        }
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            branch,
+            SigningKey::from_bytes(&[0xE1; 32]),
+            deltas,
+        )])
+        .freeze(&source_path)
+        .unwrap()
+        .source;
 
         Fixture {
             _directory: directory,
@@ -207,11 +196,14 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         }
     }
 
+    fn fixture() -> Fixture {
+        fixture_with_tail(None)
+    }
+
     #[test]
     fn additive_plan_conserves_every_fact_and_authored_empty_commit() {
         let fixture = fixture();
-        let source = freeze_source(&fixture.source).unwrap();
-        let plan = plan(&source).unwrap();
+        let plan = plan(&fixture.source).unwrap();
         plan.verify_conservation().unwrap();
 
         assert_eq!(plan.source_pin().id, fixture.branch);
@@ -232,8 +224,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
     #[test]
     fn complete_union_validator_keeps_legacy_exhaust_inert_and_rejects_malformed_records() {
         let fixture = fixture();
-        let source = freeze_source(&fixture.source).unwrap();
-        let plan = plan(&source).unwrap();
+        let plan = plan(&fixture.source).unwrap();
         let staged = plan
             .commits()
             .iter()
@@ -243,7 +234,8 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             });
 
         let validated =
-            validate_policy_catalog_union(source.reader(), &TribleSet::new(), &staged).unwrap();
+            validate_policy_catalog_union(fixture.source.reader(), &TribleSet::new(), &staged)
+                .unwrap();
         assert_eq!(validated, plan.materialized_facts());
         assert!(plan
             .original_facts()
@@ -255,9 +247,12 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         malformed_legacy += entity! { ExclusiveId::force_ref(&legacy_term) @
             unexpected_v4: "near-match",
         };
-        let error =
-            validate_policy_catalog_union(source.reader(), &TribleSet::new(), &malformed_legacy)
-                .unwrap_err();
+        let error = validate_policy_catalog_union(
+            fixture.source.reader(),
+            &TribleSet::new(),
+            &malformed_legacy,
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("unexpected attribute"));
 
         let materialized = plan.materialized_facts();
@@ -274,22 +269,36 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         malformed_canonical += entity! { ExclusiveId::force_ref(&canonical_term) @
             posture::role: &EXEMPLAR_BENIGN,
         };
-        let error =
-            validate_policy_catalog_union(source.reader(), &TribleSet::new(), &malformed_canonical)
-                .unwrap_err();
+        let error = validate_policy_catalog_union(
+            fixture.source.reader(),
+            &TribleSet::new(),
+            &malformed_canonical,
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("expected exactly one"));
     }
 
     #[test]
     fn publication_targets_v4_descriptor_handle_is_idempotent_and_keeps_source_pin() {
         let fixture = fixture();
-        let source = freeze_source(&fixture.source).unwrap();
-        let original_pin = source.legacy_pins().to_vec();
-        let plan = plan(&source).unwrap();
-        let first = publish(&source, &plan, &fixture.destination, Some(&fixture.key)).unwrap();
+        let original_pin = fixture.source.legacy_pins().to_vec();
+        let plan = plan(&fixture.source).unwrap();
+        let first = publish(
+            &fixture.source,
+            &plan,
+            &fixture.destination,
+            Some(&fixture.key),
+        )
+        .unwrap();
         assert_eq!(first.len(), 3);
         let after_first = fs::metadata(&fixture.destination).unwrap().len();
-        let second = publish(&source, &plan, &fixture.destination, Some(&fixture.key)).unwrap();
+        let second = publish(
+            &fixture.source,
+            &plan,
+            &fixture.destination,
+            Some(&fixture.key),
+        )
+        .unwrap();
         assert_eq!(first, second);
         assert_eq!(
             fs::metadata(&fixture.destination).unwrap().len(),
@@ -298,8 +307,16 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
         let signer = load_signer(&fixture.destination, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.destination).unwrap();
-        let discovery = discover_target(&mut pile, schema::DEFAULT_POLICY_SCOPE_ID, signer.verifying_key()).unwrap();
-        let expected = faculties::collection_names::root_descriptor(schema::DEFAULT_POLICY_SCOPE_ID, signer.verifying_key());
+        let discovery = discover_target(
+            &mut pile,
+            schema::DEFAULT_POLICY_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        let expected = faculties::collection_names::root_descriptor(
+            schema::DEFAULT_POLICY_SCOPE_ID,
+            signer.verifying_key(),
+        );
         assert_eq!(discovery.descriptor().facts(), expected.facts());
         // Written out rather than reached for: core deliberately offers no
         // helper for hashing a descriptor it did not store.
@@ -312,57 +329,41 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             .commits()
             .iter()
             .all(|commit| commit.collection() == expected_collection));
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_POLICY_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_POLICY_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), plan.materialized_facts());
         collection.into_storage().close().unwrap();
 
-        let refreshed = freeze_source(&fixture.source).unwrap();
-        assert_eq!(refreshed.legacy_pins(), original_pin.as_slice());
+        assert_eq!(fixture.source.legacy_pins(), original_pin.as_slice());
     }
 
     #[test]
     fn unknown_legacy_shape_is_rejected_instead_of_inferred() {
-        let fixture = fixture();
-        let storage = open_pile_strict(&fixture.source).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0xE1; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
         let channel = Id::new([0xE2; 16]).unwrap();
         let mut fragment = Fragment::empty();
         let term = ExclusiveId::force(Id::new([0xE7; 16]).unwrap());
         legacy_term(&mut fragment, &term, channel, "second-term", None);
         fragment += entity! { &term @ unexpected_v4: "near-match" };
-        let mut workspace = repository.pull(fixture.branch).unwrap();
-        workspace.commit(fragment, "malformed policy assertion");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let source = freeze_source(&fixture.source).unwrap();
-        assert!(format!("{:#}", plan(&source).unwrap_err()).contains("unexpected attribute"));
+        let fixture = fixture_with_tail(Some(TestDeltaSpec::authored(
+            fragment,
+            "malformed policy assertion",
+        )));
+        assert!(
+            format!("{:#}", plan(&fixture.source).unwrap_err()).contains("unexpected attribute")
+        );
     }
 
     #[test]
     fn scan_shaped_legacy_history_is_rejected_by_the_reviewed_policy_transform() {
-        let fixture = fixture();
-        let storage = open_pile_strict(&fixture.source).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0xE1; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
         let mut fragment = Fragment::empty();
         fragment += entity! { metadata::tag: schema::KIND_SCAN };
-        let mut workspace = repository.pull(fixture.branch).unwrap();
-        workspace.commit(fragment, "unreviewed scan shape");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let source = freeze_source(&fixture.source).unwrap();
-        assert!(format!("{:#}", plan(&source).unwrap_err()).contains("unrecognized tag set"));
+        let fixture = fixture_with_tail(Some(TestDeltaSpec::authored(
+            fragment,
+            "unreviewed scan shape",
+        )));
+        assert!(
+            format!("{:#}", plan(&fixture.source).unwrap_err()).contains("unrecognized tag set")
+        );
     }
 }
 

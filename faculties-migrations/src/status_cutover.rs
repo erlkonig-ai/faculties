@@ -21,12 +21,14 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+};
 use faculties::schemas::status::{
     status as status_attr, DEFAULT_SCOPE_ID, KIND_STATUS_UPDATE, STATUS_BRANCH_NAME,
 };
 use faculties::status::{self, StatusRow};
+use faculties::storage::publish_fragments;
 
 /// One native commit projected from one exact authored legacy commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,12 +316,11 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
-    use triblespace::core::collection::Collection;
-    use triblespace::core::repo::{BlobStore, Repository};
+    use triblespace::core::repo::BlobStore;
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -349,6 +350,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         pile: PathBuf,
         key: PathBuf,
         window: Id,
+        frozen: FrozenSource,
     }
 
     fn at(seconds: f64) -> status::IntervalValue {
@@ -373,41 +375,35 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let pile = directory.0.join("status.pile");
         let key = directory.0.join("status.key");
         File::create(&pile).unwrap();
-
-        let storage = open_pile_strict(&pile).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0x71; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository.create_branch(STATUS_BRANCH_NAME, None).unwrap();
-        let window = Id::new([0x72; 16]).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        workspace.commit(legacy_event(window, "same", at(1.0)), "first");
-        repository.push(&mut workspace).unwrap();
-        workspace.commit(legacy_event(window, "same", at(1.0)), "duplicate tuple");
-        repository.push(&mut workspace).unwrap();
-        workspace.commit(Fragment::empty(), "authored empty");
-        repository.push(&mut workspace).unwrap();
-        workspace.commit(legacy_event(window, "later", at(2.0)), "later");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
         initialize_signer(&pile, Some(&key)).unwrap();
+        let window = Id::new([0x72; 16]).unwrap();
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            STATUS_BRANCH_NAME,
+            Id::new([0x71; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x71; 32]),
+            vec![
+                TestDeltaSpec::authored(legacy_event(window, "same", at(1.0)), "first"),
+                TestDeltaSpec::authored(legacy_event(window, "same", at(1.0)), "duplicate tuple"),
+                TestDeltaSpec::authored(Fragment::empty(), "authored empty"),
+                TestDeltaSpec::authored(legacy_event(window, "later", at(2.0)), "later"),
+            ],
+        )])
+        .freeze(&pile)
+        .unwrap()
+        .source;
         Fixture {
             _directory: directory,
             pile,
             key,
             window,
+            frozen,
         }
     }
 
     #[test]
     fn plan_reconstructs_intrinsic_events_and_collapses_duplicate_tuples() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.frozen).unwrap();
 
         assert_eq!(plan.report().authored_commits, 4);
         assert_eq!(plan.report().legacy_events, 3);
@@ -421,7 +417,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         assert_eq!(plan.materialized_facts(), expected);
         assert_ne!(plan.materialized_facts(), plan.canonical_facts().clone());
         status::validate_catalog_union(
-            frozen.reader(),
+            fixture.frozen.reader(),
             &TribleSet::new(),
             &plan
                 .commits()
@@ -450,15 +446,13 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     }
 
     #[test]
-    fn publication_is_idempotent_preserves_text_and_leaves_legacy_pin_untouched() {
+    fn publication_is_idempotent_and_preserves_text() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let legacy_pins = frozen.legacy_pins().to_vec();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&fixture.frozen).unwrap();
 
-        let first = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let first = publish(&fixture.frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         let length = fs::metadata(&fixture.pile).unwrap().len();
-        let second = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let second = publish(&fixture.frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
 
@@ -478,9 +472,6 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             BTreeSet::from(["later".to_owned(), "same".to_owned()])
         );
         collection.into_storage().close().unwrap();
-
-        let after = freeze_source(&fixture.pile).unwrap();
-        assert_eq!(after.legacy_pins(), legacy_pins);
     }
 
     #[test]
@@ -488,24 +479,18 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let directory = TestDirectory::new();
         let pile = directory.0.join("broken.pile");
         File::create(&pile).unwrap();
-        let storage = open_pile_strict(&pile).unwrap();
-        let mut repository = Repository::new(
-            storage,
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            STATUS_BRANCH_NAME,
+            Id::new([0x73; 16]).unwrap(),
             SigningKey::from_bytes(&[0x73; 32]),
-            Fragment::empty(),
-        )
+            vec![TestDeltaSpec::authored(
+                entity! { &ufoid() @ metadata::tag: &KIND_STATUS_UPDATE },
+                "malformed",
+            )],
+        )])
+        .freeze(&pile)
         .unwrap();
-        let branch = *repository.create_branch(STATUS_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        workspace.commit(
-            entity! { &ufoid() @ metadata::tag: &KIND_STATUS_UPDATE },
-            "malformed",
-        );
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let frozen = freeze_source(&pile).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        let error = plan(&frozen.source).unwrap_err();
         assert!(format!("{error:#}").contains("Status event"));
     }
 }

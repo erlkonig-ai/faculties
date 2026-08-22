@@ -45,7 +45,7 @@ use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::freeze_source;
+use crate::collection_cutover::{freeze_source, FrozenSource};
 use faculties::secrets::schema::LEGACY_BRANCH_NAME;
 
 /// The retired Mail vocabulary, repeated here rather than imported so the
@@ -187,6 +187,10 @@ impl MailCredentialReport {
 /// not a guess.
 pub fn plan(pile: &Path) -> Result<MailCredentialReport> {
     let source = freeze_source(pile).context("freeze legacy source for the Mail account")?;
+    plan_source(&source)
+}
+
+fn plan_source(source: &FrozenSource) -> Result<MailCredentialReport> {
     let Some(branch) = source
         .legacy_branch(LEGACY_BRANCH_NAME)
         .context("resolve legacy Secrets branch")?
@@ -310,10 +314,12 @@ pub struct RecoveredAccount {
 /// `password` is the Secrets root password — the legacy envelope predates the
 /// identity/scope/grant ceremony and is keyed on it directly.
 pub fn open(account: &LegacyAccount, password: &[u8]) -> Result<RecoveredAccount> {
-    let envelope = account
-        .envelope
-        .as_deref()
-        .ok_or_else(|| anyhow!("retired Mail account {:x} has no readable envelope", account.entity))?;
+    let envelope = account.envelope.as_deref().ok_or_else(|| {
+        anyhow!(
+            "retired Mail account {:x} has no readable envelope",
+            account.entity
+        )
+    })?;
     let json = unlock(password, envelope)
         .with_context(|| format!("open retired Mail account {:x}", account.entity))?;
     let body: AccountBody = serde_json::from_slice(&json)
@@ -369,10 +375,10 @@ mod tests {
     use dryoc::types::*;
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;
-    use triblespace::core::repo::Repository;
     use triblespace::macros::entity;
 
     use super::*;
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use faculties::storage::open_pile_strict;
 
     const PW: &[u8] = b"root-password";
@@ -393,6 +399,7 @@ mod tests {
     struct Fixture {
         _directory: TempDir,
         pile: PathBuf,
+        source: FrozenSource,
     }
 
     /// A legacy Secrets branch carrying an older and a newer account record,
@@ -402,17 +409,9 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("mail.pile");
         File::create(&pile_path).unwrap();
+        let mut deltas = Vec::new();
 
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x71; 32]), Fragment::empty()).unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-
-        for (index, day, address) in [
-            (0u8, 1i64, "old@example.org"),
-            (1, 5, "new@example.org"),
-        ] {
+        for (index, day, address) in [(0u8, 1i64, "old@example.org"), (1, 5, "new@example.org")] {
             let account = Id::new([0x50 + index; 16]).unwrap();
             let at = Epoch::from_unix_seconds((1_700_000_000 + day * 86_400) as f64);
             let at_value = (at, at).try_to_inline().unwrap();
@@ -430,27 +429,35 @@ mod tests {
                 legacy::address: address,
                 legacy::r#box: envelope,
             };
-            workspace.commit(fragment, "legacy mail account");
+            deltas.push(TestDeltaSpec::authored(fragment, "legacy mail account"));
         }
 
         // The active pointer names the older address.
         let pointer = Id::new([0x60; 16]).unwrap();
         let at = Epoch::from_unix_seconds((1_700_000_000 + 6 * 86_400) as f64);
         let at_value = (at, at).try_to_inline().unwrap();
-        workspace.commit(
+        deltas.push(TestDeltaSpec::authored(
             entity! { ExclusiveId::force_ref(&pointer) @
                 metadata::tag: &legacy::KIND_ACTIVE,
                 metadata::created_at: at_value,
                 legacy::address: "old@example.org",
             },
             "legacy mail active",
-        );
-        repository.push(&mut workspace).unwrap();
-        repository.into_storage().close().unwrap();
+        ));
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x71; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x71; 32]),
+            deltas,
+        )])
+        .freeze(&pile_path)
+        .unwrap()
+        .source;
 
         Fixture {
             _directory: directory,
             pile: pile_path,
+            source,
         }
     }
 
@@ -458,7 +465,7 @@ mod tests {
     fn plan_reports_every_account_without_writing_or_unsealing() {
         let fixture = fixture();
         let before = std::fs::metadata(&fixture.pile).unwrap().len();
-        let report = plan(&fixture.pile).unwrap();
+        let report = plan_source(&fixture.source).unwrap();
 
         assert!(!report.legacy_branch_missing);
         assert_eq!(report.accounts.len(), 2);
@@ -474,7 +481,8 @@ mod tests {
 
     #[test]
     fn open_recovers_the_sealed_settings_and_refuses_a_wrong_password() {
-        let report = plan(&fixture().pile).unwrap();
+        let fixture = fixture();
+        let report = plan_source(&fixture.source).unwrap();
         let selected = report.selected().unwrap();
 
         let recovered = open(selected, PW).unwrap();
@@ -492,12 +500,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let fixture = fixture();
-        let report = plan(&fixture.pile).unwrap();
+        let report = plan_source(&fixture.source).unwrap();
         let recovered = open(report.selected().unwrap(), PW).unwrap();
         let out = fixture.pile.parent().unwrap().join("out");
 
         let written = export(&recovered, &out).unwrap();
-        let mode = std::fs::metadata(&written.path).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&written.path)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(
             std::fs::read_to_string(&written.path).unwrap(),
@@ -511,7 +522,8 @@ mod tests {
 
     #[test]
     fn a_recovered_account_never_renders_its_password() {
-        let report = plan(&fixture().pile).unwrap();
+        let fixture = fixture();
+        let report = plan_source(&fixture.source).unwrap();
         let recovered = open(report.selected().unwrap(), PW).unwrap();
         let rendered = format!("{recovered:?}");
         assert!(!rendered.contains("mailbox-secret"), "{rendered}");

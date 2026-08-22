@@ -16,8 +16,6 @@ use triblespace::prelude::Inline;
 use triblespace::prelude::{Fragment, Id, TribleSet};
 
 use crate::collection_cutover::{FrozenSource, LegacyPinCoordinate};
-use faculties::schemas;
-use faculties::secrets;
 use crate::{
     archive_cutover, atlas_cutover, body_cutover, cognition_cutover, comb_cutover, compass_cutover,
     decide_cutover, discord_cutover, files_cutover, habit_cutover, headspace_cutover, mail_cutover,
@@ -25,6 +23,8 @@ use crate::{
     relations_cutover, secrets_cutover, status_cutover, teams_cutover, voice_cutover, web_cutover,
     wiki_cutover,
 };
+use faculties::schemas;
+use faculties::secrets;
 use faculties::{
     atlas, blockdag, body, cognition, comb, compass, decide, discord, files, habits, headspace,
     mail, memory, message, planner, relations, status, teams, voice, wiki,
@@ -901,13 +901,12 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace::core::collection::Collection;
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
     use triblespace::core::repo::pile::Pile;
-    use triblespace::core::repo::{BlobStore, Repository};
+    use triblespace::core::repo::BlobStore;
 
-    use crate::collection_cutover::freeze_source;
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestSourceSpec};
 
     fn pin(byte: u8) -> LegacyPinCoordinate {
         LegacyPinCoordinate {
@@ -1129,13 +1128,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.pile");
         File::create(&path).unwrap();
-        let pile = Pile::open(&path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0xA5; 32]), Fragment::empty()).unwrap();
-        repository.create_branch("empty", None).unwrap();
-        repository.close().unwrap();
-
-        let source = freeze_source(&path).unwrap();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::empty(
+            "empty",
+            Id::new([0xA5; 16]).unwrap(),
+            SigningKey::from_bytes(&[0xA5; 32]),
+        )])
+        .freeze(&path)
+        .unwrap()
+        .source;
         let absent = plan_if_branch_present(&source, "absent", |_| -> Result<()> {
             panic!("an absent branch must not run its typed planner")
         })

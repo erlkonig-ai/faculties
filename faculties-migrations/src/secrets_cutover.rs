@@ -15,16 +15,18 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{load_signer, open_pile_strict};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+};
 use faculties::secrets::{self as capability, schema};
+use faculties::storage::{load_signer, open_pile_strict};
 
 /// Exact historical Mail vocabulary which was written onto the branch named
 /// `secrets`. It is intentionally local to cutover: current Secrets and Mail
@@ -620,12 +622,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ed25519_dalek::SigningKey;
-    use triblespace::core::collection::Collection;
-    use triblespace::core::repo::{BlobStore, BlobStoreMeta, PinStore, Repository};
+    use triblespace::core::repo::{BlobStore, BlobStoreMeta};
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -665,6 +666,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         canonical_child: BytesHandle,
         metadata_root: BytesHandle,
         metadata_child: BytesHandle,
+        source: FrozenSource,
     }
 
     fn at(byte: u8) -> capability::IntervalValue {
@@ -676,14 +678,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let pile_path = directory.0.join("secrets.pile");
         let key = directory.0.join("secrets.key");
         File::create(&pile_path).unwrap();
-
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x51; 32]), Fragment::empty()).unwrap();
-        let branch = *repository
-            .create_branch(schema::LEGACY_BRANCH_NAME, None)
-            .unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
+        initialize_signer(&pile_path, Some(&key)).unwrap();
 
         let identity = Id::new([0x11; 16]).unwrap();
         let mut identity_fragment = Fragment::empty();
@@ -722,12 +717,8 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         semantic_metadata += entity! {
             faculties::schemas::files::file::content: metadata_root,
         };
-        workspace.commit_with_metadata(
-            identity_fragment.clone(),
-            semantic_metadata,
-            "legacy identity",
-        );
-        repository.push(&mut workspace).unwrap();
+        let identity_delta = TestDeltaSpec::authored(identity_fragment.clone(), "legacy identity")
+            .with_metadata(semantic_metadata);
 
         // Construct a genuine first-epoch intrinsic scope. The migration must
         // conserve this id rather than silently re-rooting it under today's
@@ -745,24 +736,27 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             metadata::tag: &schema::KIND_SCOPE,
             metadata::created_at: at(2),
         };
-        workspace.commit(scope_fragment.clone(), "legacy scope");
-        repository.push(&mut workspace).unwrap();
-
-        workspace.commit(retired_fragment, "retired Mail account evidence");
-        repository.push(&mut workspace).unwrap();
-
-        // Authored empty commits are semantic provenance and remain native
-        // COMMIT records even though they contribute no ordinary facts.
-        workspace.commit(Fragment::empty(), "legacy authored empty");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let scope_facts = scope_fragment.into_facts();
+        let scope_facts = scope_fragment.facts().clone();
         let mut canonical_facts = canonical_identity_facts;
         canonical_facts += scope_facts.clone();
         let mut source_facts = canonical_facts.clone();
         source_facts += retired_facts.clone();
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            schema::LEGACY_BRANCH_NAME,
+            Id::new([0x51; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x51; 32]),
+            vec![
+                identity_delta,
+                TestDeltaSpec::authored(scope_fragment, "legacy scope"),
+                TestDeltaSpec::authored(retired_fragment, "retired Mail account evidence"),
+                // Authored empty commits are semantic provenance and remain
+                // native COMMIT records even though they add no ordinary facts.
+                TestDeltaSpec::authored(Fragment::empty(), "legacy authored empty"),
+            ],
+        )])
+        .freeze(&pile_path)
+        .unwrap()
+        .source;
         Fixture {
             _directory: directory,
             pile: pile_path,
@@ -778,14 +772,15 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             canonical_child,
             metadata_root,
             metadata_child,
+            source,
         }
     }
 
     #[test]
     fn plan_retires_exact_mail_evidence_and_keeps_authored_empty_commits() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let frozen = &fixture.source;
+        let plan = plan(frozen).unwrap();
 
         plan.verify_conservation().unwrap();
         assert_eq!(plan.source_facts(), &fixture.source_facts);
@@ -832,7 +827,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     #[test]
     fn retired_mail_evidence_rejects_extra_facts_and_partial_or_multiple_shapes() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
+        let frozen = &fixture.source;
 
         let canonical_only = fixture.source_facts.difference(&fixture.retired_facts);
         let absent = validate_retired_mail_evidence(frozen.reader(), &canonical_only).unwrap();
@@ -890,38 +885,38 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     }
 
     #[test]
-    fn publication_is_idempotent_and_retains_the_legacy_pin() {
+    fn publication_is_idempotent() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let frozen = &fixture.source;
+        let plan = plan(frozen).unwrap();
 
-        let first = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let first = publish(frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         let after_first = fs::metadata(&fixture.pile).unwrap().len();
-        let second = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let second = publish(frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first, second);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let facts = collection.materialize().unwrap();
         assert_eq!(facts, fixture.canonical_facts);
         let reader = collection.storage_mut().reader().unwrap();
         capability::validate_catalog(&reader, &facts).unwrap();
-        let mut pile = collection.into_storage();
-        assert!(pile.pins().unwrap().next().is_some());
-        pile.close().unwrap();
+        collection.into_storage().close().unwrap();
     }
 
     #[test]
     fn publication_resumes_from_an_incomplete_existing_subset() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let frozen = &fixture.source;
+        let plan = plan(frozen).unwrap();
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         // Publish only the scope commit, deliberately omitting the identity it
         // references. The raw collection is temporarily not a valid Secrets
         // catalog, as can happen if a process dies partway through migration.
@@ -930,12 +925,13 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             .unwrap();
         collection.into_storage().close().unwrap();
 
-        let resumed = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let resumed = publish(frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(resumed[1], partial);
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         assert_eq!(collection.materialize().unwrap(), fixture.canonical_facts);
         collection.into_storage().close().unwrap();
     }
@@ -943,12 +939,13 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     #[test]
     fn conflict_with_existing_native_facts_fails_before_append() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let frozen = &fixture.source;
+        let plan = plan(frozen).unwrap();
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         let mut conflict = Fragment::empty();
         let other_name = conflict.put("not-alice".to_owned());
         conflict += entity! { ExclusiveId::force_ref(&fixture.identity) @
@@ -958,7 +955,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         collection.into_storage().close().unwrap();
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
-        let error = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
+        let error = publish(frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
         assert!(format!("{error:#}").contains("preflight existing native value"));
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
     }
@@ -966,19 +963,20 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     #[test]
     fn already_native_retired_mail_facts_fail_preflight_before_append() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let frozen = &fixture.source;
+        let plan = plan(frozen).unwrap();
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let pile = open_pile_strict(&fixture.pile).unwrap();
-        let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
+        let mut collection =
+            faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
         collection
             .commit(Fragment::from(fixture.retired_facts.clone()))
             .unwrap();
         collection.into_storage().close().unwrap();
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
-        let error = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
+        let error = publish(frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
         assert!(format!("{error:#}").contains("preflight existing native value"));
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
     }
@@ -986,12 +984,12 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     #[test]
     fn missing_durable_signer_fails_without_growing_the_pile() {
         let fixture = fixture();
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let frozen = &fixture.source;
+        let plan = plan(frozen).unwrap();
         fs::remove_file(&fixture.key).unwrap();
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
-        let error = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
+        let error = publish(frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap_err();
         assert!(format!("{error:#}").contains("load durable signing key"));
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
     }

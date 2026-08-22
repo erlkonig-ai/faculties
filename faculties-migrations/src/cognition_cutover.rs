@@ -12,18 +12,20 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+};
 use faculties::cognition;
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{load_signer, open_pile_strict};
 use faculties::schemas::cognition::{DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
 use faculties::schemas::triage;
+use faculties::storage::{load_signer, open_pile_strict};
 
 const LEGACY_MAIN_BRANCH_NAME: &str = "main";
 
@@ -483,11 +485,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use triblespace::core::id::ExclusiveId;
-    use triblespace::core::repo::Repository;
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
 
     const THOUGHT: Id = triblespace::macros::id_hex!("C1000000000000000000000000000001");
     const REQUEST: Id = triblespace::macros::id_hex!("C1000000000000000000000000000002");
@@ -522,28 +522,35 @@ use faculties::storage::{open_pile_strict};
         fragment
     }
 
-    fn populate(path: &Path, mismatched_context: bool) {
+    fn populate(path: &Path, mismatched_context: bool) -> FrozenSource {
         File::create(path).unwrap();
-        let pile = open_pile_strict(path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0xC1; 32]), Fragment::empty()).unwrap();
-        repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let main = *repository
-            .create_branch(LEGACY_MAIN_BRANCH_NAME, None)
-            .unwrap();
-        let mut workspace = repository.pull(main).unwrap();
-        workspace.commit(pair(mismatched_context), "historical cognition pair");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
+        let signer = SigningKey::from_bytes(&[0xC1; 32]);
+        TestSourceSpec::new(vec![
+            TestBranchSpec::empty(
+                LEGACY_BRANCH_NAME,
+                Id::new([0xC1; 16]).unwrap(),
+                signer.clone(),
+            ),
+            TestBranchSpec::new(
+                LEGACY_MAIN_BRANCH_NAME,
+                Id::new([0xC2; 16]).unwrap(),
+                signer,
+                vec![TestDeltaSpec::authored(
+                    pair(mismatched_context),
+                    "historical cognition pair",
+                )],
+            ),
+        ])
+        .freeze(path)
+        .unwrap()
+        .source
     }
 
     #[test]
     fn plan_consumes_empty_cognition_and_preserves_strict_main_pair() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cognition.pile");
-        populate(&path, false);
-
-        let frozen = freeze_source(&path).unwrap();
+        let frozen = populate(&path, false);
         let plan = plan(&frozen).unwrap();
         assert_eq!(plan.source_pins().len(), 2);
         assert_eq!(plan.report().authored_commits, 1);
@@ -556,9 +563,7 @@ use faculties::storage::{open_pile_strict};
     fn main_request_must_retain_the_exact_thought_context() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cognition.pile");
-        populate(&path, true);
-
-        let frozen = freeze_source(&path).unwrap();
+        let frozen = populate(&path, true);
         let error = plan(&frozen).unwrap_err();
         assert!(format!("{error:#}").contains("does not retain its thought context"));
     }

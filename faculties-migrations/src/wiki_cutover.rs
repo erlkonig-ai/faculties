@@ -14,9 +14,12 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
+    ProjectedLegacyCommit,
+};
 use faculties::schemas::wiki::{DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
+use faculties::storage::publish_fragments;
 use faculties::wiki_additive::{plan_additive, LegacyDelta};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,12 +261,12 @@ mod tests {
     use hifitime::Epoch;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::inline::encodings::hash::Handle;
-    use triblespace::core::repo::{BlobStoreGet, CommitHandle, PinStore, Repository};
+    use triblespace::core::repo::{BlobStoreGet, CommitHandle};
     use triblespace::macros::exists;
 
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use faculties::schemas::wiki::{attrs, KIND_VERSION_ID};
+    use faculties::storage::{discover_target, initialize_signer, load_signer, open_pile_strict};
 
     fn at(seconds: f64) -> Inline<inlineencodings::NsTAIInterval> {
         let epoch = Epoch::from_tai_seconds(seconds);
@@ -426,7 +429,9 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         assert_eq!(plan.report().versions, 2);
         assert_eq!(plan.report().added_facts, 1);
 
-        let model = faculties::wiki::load_catalog(&materialized).unwrap().revisions;
+        let model = faculties::wiki::load_catalog(&materialized)
+            .unwrap()
+            .revisions;
         let entry = model.entry_containing(state_a).unwrap();
         assert_eq!(
             entry
@@ -515,53 +520,42 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         File::create(&source_path).unwrap();
         File::create(&target_path).unwrap();
 
-        let storage = open_pile_strict(&source_path).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0x41; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut main = repository.pull(branch).unwrap();
         let page = genid().id;
         let first = genid().id;
         let second = genid().id;
         let first_fragment = version(first, page, "one", 1.0);
-        main.commit(first_fragment.clone(), "first Wiki version");
-        repository.push(&mut main).unwrap();
-
-        let mut authored_empty = repository.pull(branch).unwrap();
-        authored_empty.commit(Fragment::empty(), "authored empty");
         let second_fragment = version(second, page, "two", 2.0);
-        main.commit(second_fragment.clone(), "second Wiki version");
-        repository.push(&mut main).unwrap();
-        repository.push(&mut authored_empty).unwrap();
-        repository.close().unwrap();
         initialize_signer(&target_path, Some(&key_path)).unwrap();
+        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0x41; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x41; 32]),
+            vec![
+                TestDeltaSpec::authored(first_fragment.clone(), "first Wiki version"),
+                TestDeltaSpec::authored(second_fragment.clone(), "second Wiki version"),
+                TestDeltaSpec::authored(Fragment::empty(), "authored empty").with_parents([0]),
+                TestDeltaSpec::merge([1, 2]),
+            ],
+        )])
+        .freeze(&source_path)
+        .unwrap();
 
         let source_bytes = fs::read(&source_path).unwrap();
-        let frozen = freeze_source(&source_path).unwrap();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(&frozen.source).unwrap();
         assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
         assert_eq!(plan.report().authored_commits, 3);
         assert_eq!(plan.report().added_facts, 1);
 
-        let first_publish = publish(&frozen, &plan, &target_path, Some(&key_path)).unwrap();
+        let first_publish = publish(&frozen.source, &plan, &target_path, Some(&key_path)).unwrap();
         let length = fs::metadata(&target_path).unwrap().len();
-        let second_publish = publish(&frozen, &plan, &target_path, Some(&key_path)).unwrap();
+        let second_publish = publish(&frozen.source, &plan, &target_path, Some(&key_path)).unwrap();
         assert_eq!(first_publish, second_publish);
         assert_eq!(fs::metadata(&target_path).unwrap().len(), length);
 
         let signer = load_signer(&target_path, Some(&key_path)).unwrap();
         let mut target = open_pile_strict(&target_path).unwrap();
-        assert!(target
-            .pins()
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
-            .is_empty());
-        let discovered = discover_target(&mut target, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let discovered =
+            discover_target(&mut target, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         assert_eq!(
             discovered.descriptor(),
             &faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, signer.verifying_key())

@@ -36,13 +36,16 @@ use triblespace::core::repo::{self, BlobStoreGet};
 use triblespace::macros::{attributes, find, pattern};
 use triblespace::prelude::*;
 
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate};
-use faculties::storage::{publish_fragments};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate,
+};
 use faculties::habits::{self, DeclaredState, IntervalValue, TextHandle};
 use faculties::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
     MAX_LABEL_BYTES, STATE_ACTIVE, STATE_PAUSED,
 };
+use faculties::storage::publish_fragments;
 
 pub use faculties::schemas::habit::LEGACY_BRANCH_NAME;
 
@@ -897,14 +900,13 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
-    use triblespace::core::collection::Collection;
-    use triblespace::core::repo::{BlobStore, Repository};
+    use triblespace::core::repo::BlobStore;
     use triblespace::macros::entity;
 
     use super::*;
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use faculties::habits::Activation;
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -933,6 +935,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         _directory: TestDirectory,
         pile: PathBuf,
         key: PathBuf,
+        source: FrozenSource,
     }
 
     fn id(byte: u8) -> Id {
@@ -1012,26 +1015,24 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let pile = directory.0.join("habit.pile");
         let key = directory.0.join("habit.key");
         File::create(&pile).unwrap();
-
-        let storage = open_pile_strict(&pile).unwrap();
-        let mut repository = Repository::new(
-            storage,
-            SigningKey::from_bytes(&[0xA1; 32]),
-            Fragment::empty(),
-        )
-        .unwrap();
-        let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let mut workspace = repository.pull(branch).unwrap();
-        for (fragment, message) in commits {
-            workspace.commit(fragment, message);
-            repository.push(&mut workspace).unwrap();
-        }
-        repository.close().unwrap();
         initialize_signer(&pile, Some(&key)).unwrap();
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            LEGACY_BRANCH_NAME,
+            Id::new([0xA1; 16]).unwrap(),
+            SigningKey::from_bytes(&[0xA1; 32]),
+            commits
+                .into_iter()
+                .map(|(fragment, message)| TestDeltaSpec::authored(fragment, message))
+                .collect(),
+        )])
+        .freeze(&pile)
+        .unwrap()
+        .source;
         Fixture {
             _directory: directory,
             pile,
             key,
+            source,
         }
     }
 
@@ -1084,9 +1085,9 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             (Fragment::empty(), "authored empty"),
         ]);
 
-        let frozen = freeze_source(&fixture.pile).unwrap();
+        let frozen = &fixture.source;
         let legacy_pins = frozen.legacy_pins().to_vec();
-        let plan = plan(&frozen).unwrap();
+        let plan = plan(frozen).unwrap();
         assert_eq!(
             plan.report(),
             &HabitMigrationReport {
@@ -1123,9 +1124,9 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
                 .any(|fact| fact.e() == &legacy));
         }
 
-        let first_publish = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let first_publish = publish(frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         let published_length = fs::metadata(&fixture.pile).unwrap().len();
-        let second_publish = publish(&frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
+        let second_publish = publish(frozen, &plan, &fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(first_publish, second_publish);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), published_length);
 
@@ -1158,8 +1159,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             .completions()
             .any(|completion| completion.habit == new[0].id));
 
-        let after = freeze_source(&fixture.pile).unwrap();
-        assert_eq!(after.legacy_pins(), legacy_pins);
+        assert_eq!(fixture.source.legacy_pins(), legacy_pins);
     }
 
     #[test]
@@ -1179,8 +1179,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             ),
         ]);
 
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        let error = plan(&fixture.source).unwrap_err();
         assert!(format!("{error:#}").contains("conflicting state events in arbitration second"));
     }
 
@@ -1194,8 +1193,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             (completion(id(0x52), habit, at(2.0)), "unexpected writer"),
         ]);
 
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        let error = plan(&fixture.source).unwrap_err();
         assert!(format!("{error:#}").contains("irreducible meaning"));
     }
 
@@ -1209,8 +1207,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         };
         let fixture = fixture(vec![(definition, "habit add")]);
 
-        let frozen = freeze_source(&fixture.pile).unwrap();
-        let error = plan(&frozen).unwrap_err();
+        let error = plan(&fixture.source).unwrap_err();
         assert!(format!("{error:#}").contains("unknown push/pull field set"));
     }
 }

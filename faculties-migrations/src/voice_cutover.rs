@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::metadata as core_metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
@@ -22,10 +22,13 @@ use triblespace::core::repo::{BlobStore, BlobStoreMeta};
 use triblespace::prelude::*;
 
 use crate::body_cutover;
-use crate::collection_cutover::{project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit};
-use faculties::storage::{load_signer, open_pile_strict};
+use crate::collection_cutover::{
+    project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
+    LegacyPinCoordinate, ProjectedLegacyCommit,
+};
 use faculties::schemas::body::LEGACY_BODY_BRANCH_NAME;
 use faculties::schemas::voice::{self as schema, COLLECTION_SCOPE_ID, LEGACY_BRANCH_NAME};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::voice;
 
 const BODY_PRIVATE_CHANNEL: &str = "computer";
@@ -728,18 +731,17 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use triblespace::core::metadata;
-    use triblespace::core::repo::Repository;
     use triblespace::core::trible::intrinsic_entity_id_v1;
 
     use super::*;
-    use faculties::body::{self, IntentRow};
     use crate::body_cutover::{legacy_utterance, LEGACY_KIND_UTTERANCE};
-    use crate::collection_cutover::{freeze_source};
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use faculties::body::{self, IntentRow};
     use faculties::schemas::body::{capture, KIND_INTENT};
     use faculties::schemas::voice::{
         route, utterance, CHANNEL_SAY, CHANNEL_SHOUT, KIND_ROUTE, KIND_UTTERANCE,
     };
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn point(seconds: f64) -> voice::IntervalValue {
         let epoch = Epoch::from_tai_seconds(seconds);
@@ -832,40 +834,39 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("voice.pile");
         File::create(&path).unwrap();
-        let pile = open_pile_strict(&path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x61; 32]), Fragment::empty()).unwrap();
-        let voice_branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let body_branch = *repository
-            .create_branch(LEGACY_BODY_BRANCH_NAME, None)
-            .unwrap();
+        let key = directory.path().join("voice.key");
+        initialize_signer(&path, Some(&key)).unwrap();
 
         let (old_route, route_record) = legacy_route();
         let (old_voice, utterance_record) = legacy_voice_utterance();
         let (old_body, body_utterance) = legacy_body_utterance();
         let (_, body_intent) = legacy_body_intent();
 
-        let mut voice_root = repository.pull(voice_branch).unwrap();
-        voice_root.commit(route_record, "historical Voice route");
-        repository.push(&mut voice_root).unwrap();
-        let mut voice_words = repository.pull(voice_branch).unwrap();
-        voice_words.commit(utterance_record, "historical Voice utterance");
-        repository.push(&mut voice_words).unwrap();
-        let mut voice_empty = repository.pull(voice_branch).unwrap();
-        voice_empty.commit(Fragment::empty(), "historical Voice empty");
-        repository.push(&mut voice_empty).unwrap();
-
-        let mut body = repository.pull(body_branch).unwrap();
-        body.commit(
-            body_utterance + body_intent,
-            "historical Body speech and intent",
-        );
-        repository.push(&mut body).unwrap();
-        repository.close().unwrap();
-
-        let key = directory.path().join("voice.key");
-        initialize_signer(&path, Some(&key)).unwrap();
-        let frozen = freeze_source(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[0x61; 32]);
+        let frozen = TestSourceSpec::new(vec![
+            TestBranchSpec::new(
+                LEGACY_BRANCH_NAME,
+                Id::new([0x61; 16]).unwrap(),
+                signer.clone(),
+                vec![
+                    TestDeltaSpec::authored(route_record, "historical Voice route"),
+                    TestDeltaSpec::authored(utterance_record, "historical Voice utterance"),
+                    TestDeltaSpec::authored(Fragment::empty(), "historical Voice empty"),
+                ],
+            ),
+            TestBranchSpec::new(
+                LEGACY_BODY_BRANCH_NAME,
+                Id::new([0x62; 16]).unwrap(),
+                signer,
+                vec![TestDeltaSpec::authored(
+                    body_utterance + body_intent,
+                    "historical Body speech and intent",
+                )],
+            ),
+        ])
+        .freeze(&path)
+        .unwrap()
+        .source;
         let plan = plan(&frozen).unwrap();
         assert_eq!(plan.source_pins().len(), 2);
         assert_eq!(plan.commits().len(), 4);
@@ -928,22 +929,34 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         File::create(&source_path).unwrap();
         File::create(&target_path).unwrap();
 
-        let pile = open_pile_strict(&source_path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x64; 32]), Fragment::empty()).unwrap();
-        let voice_branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        repository
-            .create_branch(LEGACY_BODY_BRANCH_NAME, None)
-            .unwrap();
-        let mut voice = repository.pull(voice_branch).unwrap();
-        voice.commit(Fragment::empty(), "identical authored-empty Voice metadata");
-        voice.commit(Fragment::empty(), "identical authored-empty Voice metadata");
-        repository.push(&mut voice).unwrap();
-        repository.close().unwrap();
         initialize_signer(&target_path, Some(&key)).unwrap();
-
-        let frozen = freeze_source(&source_path).unwrap();
-        let branch = frozen.legacy_branch(LEGACY_BRANCH_NAME).unwrap().unwrap();
+        let signer = SigningKey::from_bytes(&[0x64; 32]);
+        let fixture = TestSourceSpec::new(vec![
+            TestBranchSpec::new(
+                LEGACY_BRANCH_NAME,
+                Id::new([0x64; 16]).unwrap(),
+                signer.clone(),
+                vec![
+                    TestDeltaSpec::authored(
+                        Fragment::empty(),
+                        "identical authored-empty Voice metadata",
+                    ),
+                    TestDeltaSpec::authored(
+                        Fragment::empty(),
+                        "identical authored-empty Voice metadata",
+                    ),
+                ],
+            ),
+            TestBranchSpec::empty(
+                LEGACY_BODY_BRANCH_NAME,
+                Id::new([0x65; 16]).unwrap(),
+                signer,
+            ),
+        ])
+        .freeze(&source_path)
+        .unwrap();
+        let frozen = &fixture.source;
+        let branch = fixture.branch(LEGACY_BRANCH_NAME);
         let projected =
             project_legacy_authored_commits(&frozen, &branch, voice::validate_known_payloads)
                 .unwrap();
@@ -1066,13 +1079,6 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("squashed-body.pile");
         File::create(&path).unwrap();
-        let pile = open_pile_strict(&path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x62; 32]), Fragment::empty()).unwrap();
-        repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        let body_branch = *repository
-            .create_branch(LEGACY_BODY_BRANCH_NAME, None)
-            .unwrap();
 
         let mut squash = Fragment::empty();
         for index in 0..9 {
@@ -1081,23 +1087,30 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             squash += legacy_body_utterance_at(&text, audio.as_bytes(), 10.0 + index as f64).1;
         }
         squash += legacy_body_intent_at("intent inside squash", 30.0).1;
-        let mut body = repository.pull(body_branch).unwrap();
-        body.commit(squash, "squashed body");
-        repository.push(&mut body).unwrap();
-
-        let mut unrelated = repository.pull(body_branch).unwrap();
-        unrelated.commit(
-            legacy_body_intent_at("later non-voice body work", 31.0).1,
-            "body only",
-        );
-        repository.push(&mut unrelated).unwrap();
-        repository.close().unwrap();
-
-        let frozen = freeze_source(&path).unwrap();
-        let body = frozen
-            .legacy_branch(LEGACY_BODY_BRANCH_NAME)
-            .unwrap()
-            .unwrap();
+        let signer = SigningKey::from_bytes(&[0x62; 32]);
+        let fixture = TestSourceSpec::new(vec![
+            TestBranchSpec::empty(
+                LEGACY_BRANCH_NAME,
+                Id::new([0x66; 16]).unwrap(),
+                signer.clone(),
+            ),
+            TestBranchSpec::new(
+                LEGACY_BODY_BRANCH_NAME,
+                Id::new([0x67; 16]).unwrap(),
+                signer,
+                vec![
+                    TestDeltaSpec::authored(squash, "squashed body"),
+                    TestDeltaSpec::authored(
+                        legacy_body_intent_at("later non-voice body work", 31.0).1,
+                        "body only",
+                    ),
+                ],
+            ),
+        ])
+        .freeze(&path)
+        .unwrap();
+        let frozen = &fixture.source;
+        let body = fixture.branch(LEGACY_BODY_BRANCH_NAME);
         let projected_body = project_legacy_authored_commits(
             &frozen,
             &body,
@@ -1158,29 +1171,34 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("route-generation.pile");
         File::create(&path).unwrap();
-        let pile = open_pile_strict(&path).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x63; 32]), Fragment::empty()).unwrap();
-        let voice_branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
-        repository
-            .create_branch(LEGACY_BODY_BRANCH_NAME, None)
-            .unwrap();
-
-        for (priority, device) in ["AirPods Max", "AirPods Pro", "Headphones"]
+        let routes = ["AirPods Max", "AirPods Pro", "Headphones"]
             .into_iter()
             .enumerate()
-        {
-            let mut route = repository.pull(voice_branch).unwrap();
-            route.commit(
-                legacy_route_entry(device, priority as u64, 40.0).1,
-                &format!("route entry {priority}"),
-            );
-            repository.push(&mut route).unwrap();
-        }
-        repository.close().unwrap();
-
-        let frozen = freeze_source(&path).unwrap();
-        let voice_branch = frozen.legacy_branch(LEGACY_BRANCH_NAME).unwrap().unwrap();
+            .map(|(priority, device)| {
+                TestDeltaSpec::authored(
+                    legacy_route_entry(device, priority as u64, 40.0).1,
+                    format!("route entry {priority}"),
+                )
+            })
+            .collect();
+        let signer = SigningKey::from_bytes(&[0x63; 32]);
+        let fixture = TestSourceSpec::new(vec![
+            TestBranchSpec::new(
+                LEGACY_BRANCH_NAME,
+                Id::new([0x68; 16]).unwrap(),
+                signer.clone(),
+                routes,
+            ),
+            TestBranchSpec::empty(
+                LEGACY_BODY_BRANCH_NAME,
+                Id::new([0x69; 16]).unwrap(),
+                signer,
+            ),
+        ])
+        .freeze(&path)
+        .unwrap();
+        let frozen = &fixture.source;
+        let voice_branch = fixture.branch(LEGACY_BRANCH_NAME);
         let projected_voice =
             project_legacy_authored_commits(&frozen, &voice_branch, voice::validate_known_payloads)
                 .unwrap();

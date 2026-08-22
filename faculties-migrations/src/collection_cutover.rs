@@ -27,21 +27,20 @@ use std::os::unix::fs::MetadataExt;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 
+use faculties::storage::open_pile_strict;
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, IntoBlob, MemoryBlobStore};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{ PileReader };
+use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{self, BlobStore, BlobStoreGet, CommitHandle, PinSnapshotSource};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{entity, find, pattern};
-use faculties::storage::{open_pile_strict };
-
 
 /// Semantic identity of the legacy coordinates seen by a migration.
 ///
@@ -859,20 +858,468 @@ fn fingerprint_legacy_pins(pins: &[LegacyPinCoordinate]) -> SourceFingerprint {
     }
 }
 
+/// Declarative immutable legacy fixtures for migration unit tests.
+///
+/// The fixture writes only ordinary blobs. It deliberately does not implement
+/// `PinStore`, append pin records, or recreate Repository's mutable
+/// create/pull/push/CAS protocol. Once all blobs exist, it injects the final
+/// legacy coordinates directly into a [`FrozenSource`]. This keeps tests about
+/// the read-only migration boundary instead of preserving the writer being
+/// retired.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::{BTreeSet, VecDeque};
+    use std::path::Path;
+
+    use anyhow::{bail, Context, Result};
+    use ed25519_dalek::{Signer, SigningKey};
+    use hifitime::Epoch;
+
+    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace::core::blob::encodings::utf8string::UTF8String;
+    use triblespace::core::blob::{Blob, IntoBlob};
+    use triblespace::core::id::Id;
+    use triblespace::core::inline::encodings::hash::Handle;
+    use triblespace::core::inline::{Inline, TryToInline};
+    use triblespace::core::metadata;
+    use triblespace::core::repo::{self, BlobStore, BlobStorePut, CommitHandle};
+    use triblespace::core::trible::{Fragment, TribleSet};
+    use triblespace::macros::entity;
+
+    use faculties::storage::open_pile_strict;
+
+    use super::{
+        fingerprint_legacy_pins, legacy_commit_subject, FrozenLegacyBranch, FrozenLegacyDelta,
+        FrozenLegacyDeltaData, FrozenSource, PhysicalSourceFingerprint,
+    };
+
+    /// Parent selection for one immutable historical delta.
+    pub(crate) enum TestParents {
+        /// Use the immediately preceding delta, or no parent for the first.
+        Previous,
+        /// Use these earlier delta indices, in any order.
+        Indices(Vec<usize>),
+    }
+
+    /// One authored legacy commit or canonical contentless merge.
+    pub(crate) enum TestDeltaSpec {
+        Authored {
+            content: Fragment,
+            metadata: Option<Fragment>,
+            message: Option<String>,
+            parents: TestParents,
+        },
+        Merge {
+            parents: Vec<usize>,
+        },
+    }
+
+    impl TestDeltaSpec {
+        /// A normal linear authored commit with empty semantic metadata.
+        pub(crate) fn authored(content: impl Into<Fragment>, message: impl Into<String>) -> Self {
+            Self::Authored {
+                content: content.into(),
+                metadata: Some(Fragment::empty()),
+                message: Some(message.into()),
+                parents: TestParents::Previous,
+            }
+        }
+
+        /// Attach one-off semantic metadata, matching legacy
+        /// `Workspace::commit_with_metadata` without constructing a workspace.
+        pub(crate) fn with_metadata(mut self, metadata: impl Into<Fragment>) -> Self {
+            let Self::Authored { metadata: slot, .. } = &mut self else {
+                panic!("contentless legacy merges cannot carry semantic metadata");
+            };
+            *slot = Some(metadata.into());
+            self
+        }
+
+        /// Replace the default linear parent with explicit earlier deltas.
+        pub(crate) fn with_parents(mut self, parents: impl IntoIterator<Item = usize>) -> Self {
+            let Self::Authored { parents: slot, .. } = &mut self else {
+                panic!("use TestDeltaSpec::merge for a contentless merge");
+            };
+            *slot = TestParents::Indices(parents.into_iter().collect());
+            self
+        }
+
+        /// A deterministic unsigned contentless merge of earlier deltas.
+        pub(crate) fn merge(parents: impl IntoIterator<Item = usize>) -> Self {
+            Self::Merge {
+                parents: parents.into_iter().collect(),
+            }
+        }
+    }
+
+    /// One named immutable legacy branch DAG.
+    pub(crate) struct TestBranchSpec {
+        pub(crate) name: String,
+        pub(crate) branch: Id,
+        pub(crate) signing_key: SigningKey,
+        pub(crate) deltas: Vec<TestDeltaSpec>,
+        /// Defaults to the final delta. `None` is valid only for an empty DAG.
+        pub(crate) head: Option<usize>,
+    }
+
+    impl TestBranchSpec {
+        pub(crate) fn new(
+            name: impl Into<String>,
+            branch: Id,
+            signing_key: SigningKey,
+            deltas: Vec<TestDeltaSpec>,
+        ) -> Self {
+            let head = deltas.len().checked_sub(1);
+            Self {
+                name: name.into(),
+                branch,
+                signing_key,
+                deltas,
+                head,
+            }
+        }
+
+        pub(crate) fn empty(name: impl Into<String>, branch: Id, signing_key: SigningKey) -> Self {
+            Self::new(name, branch, signing_key, Vec::new())
+        }
+    }
+
+    /// A one-shot source declaration. Multiple branches share one immutable
+    /// reader but never a mutable repository object.
+    pub(crate) struct TestSourceSpec {
+        pub(crate) branches: Vec<TestBranchSpec>,
+    }
+
+    impl TestSourceSpec {
+        pub(crate) fn new(branches: Vec<TestBranchSpec>) -> Self {
+            Self { branches }
+        }
+
+        pub(crate) fn freeze(self, path: &Path) -> Result<FrozenTestSource> {
+            let mut pile = open_pile_strict(path)
+                .with_context(|| format!("open immutable legacy fixture {}", path.display()))?;
+            let mut branches = Vec::with_capacity(self.branches.len());
+            let mut pins = Vec::with_capacity(self.branches.len());
+
+            for spec in self.branches {
+                let built = build_branch(&mut pile, spec)?;
+                pins.push(built.branch.pin_coordinate());
+                branches.push((built.name, built.branch));
+            }
+            pins.sort_unstable();
+
+            let reader = pile
+                .reader()
+                .context("snapshot immutable legacy fixture blobs")?;
+            pile.close()
+                .context("close immutable legacy fixture pile")?;
+            let physical_fingerprint = PhysicalSourceFingerprint::capture(path)?;
+            let fingerprint = fingerprint_legacy_pins(&pins);
+
+            Ok(FrozenTestSource {
+                source: FrozenSource {
+                    fingerprint,
+                    physical_fingerprint,
+                    legacy_pins: pins,
+                    reader,
+                },
+                branches,
+            })
+        }
+    }
+
+    /// Frozen source plus direct access to the branches declared by a unit
+    /// test. Use `source.legacy_branch(name)` only when discovery itself is the
+    /// behavior under test.
+    pub(crate) struct FrozenTestSource {
+        pub(crate) source: FrozenSource,
+        branches: Vec<(String, FrozenLegacyBranch)>,
+    }
+
+    impl FrozenTestSource {
+        pub(crate) fn branch(&self, name: &str) -> &FrozenLegacyBranch {
+            let mut matching = self
+                .branches
+                .iter()
+                .filter(|(candidate, _)| candidate == name);
+            let branch = &matching
+                .next()
+                .unwrap_or_else(|| panic!("fixture has no legacy branch named {name}"))
+                .1;
+            assert!(
+                matching.next().is_none(),
+                "fixture has multiple legacy branches named {name}"
+            );
+            branch
+        }
+    }
+
+    struct BuiltBranch {
+        name: String,
+        branch: FrozenLegacyBranch,
+    }
+
+    fn build_branch(
+        pile: &mut triblespace::core::repo::pile::Pile,
+        spec: TestBranchSpec,
+    ) -> Result<BuiltBranch> {
+        if spec.deltas.is_empty() && spec.head.is_some() {
+            bail!("empty legacy fixture branch cannot select a head");
+        }
+        if let Some(head) = spec.head {
+            if head >= spec.deltas.len() {
+                bail!(
+                    "legacy fixture branch {} selects absent delta {head}",
+                    spec.name
+                );
+            }
+        }
+
+        let mut deltas: Vec<FrozenLegacyDelta> = Vec::with_capacity(spec.deltas.len());
+        let mut commit_blobs: Vec<Blob<SimpleArchive>> = Vec::with_capacity(spec.deltas.len());
+        let mut parent_indices = Vec::with_capacity(spec.deltas.len());
+
+        for (index, delta) in spec.deltas.into_iter().enumerate() {
+            let (indices, content, metadata, message) = match delta {
+                TestDeltaSpec::Authored {
+                    content,
+                    metadata,
+                    message,
+                    parents,
+                } => {
+                    let indices = match parents {
+                        TestParents::Previous if index == 0 => Vec::new(),
+                        TestParents::Previous => vec![index - 1],
+                        TestParents::Indices(indices) => indices,
+                    };
+                    (indices, Some(content), metadata, message)
+                }
+                TestDeltaSpec::Merge { parents } => (parents, None, None, None),
+            };
+            if indices.iter().any(|parent| *parent >= index) {
+                bail!(
+                    "legacy fixture branch {} delta {index} refers to a non-earlier parent",
+                    spec.name
+                );
+            }
+            let parents: Vec<_> = indices
+                .iter()
+                .map(|parent| deltas[*parent].commit)
+                .collect();
+
+            let (facts, content_blob) = match content {
+                Some(content) => {
+                    let (facts, blob) = store_fragment_archive(pile, content)?;
+                    (facts, Some(blob))
+                }
+                None => (TribleSet::new(), None),
+            };
+            let metadata_handle = metadata
+                .map(|metadata| {
+                    store_fragment_archive(pile, metadata).map(|(_, blob)| blob.get_handle())
+                })
+                .transpose()?;
+            let message_handle = message
+                .map(|message| {
+                    let blob: Blob<UTF8String> = message.to_blob();
+                    pile.put::<UTF8String, _>(blob)
+                        .context("store immutable legacy commit message")
+                })
+                .transpose()?;
+            let commit_metadata = legacy_commit_metadata(
+                &spec.signing_key,
+                parents.iter().copied(),
+                message_handle,
+                content_blob.clone(),
+                metadata_handle,
+                index,
+            );
+            let commit_blob = commit_metadata.clone().to_blob();
+            let commit = pile
+                .put::<SimpleArchive, _>(commit_blob.clone())
+                .context("store immutable legacy commit wrapper")?;
+            let subject = legacy_commit_subject(&commit_metadata, commit)?;
+            let verified_facts = facts.clone();
+            deltas.push(FrozenLegacyDelta {
+                commit,
+                parents,
+                subject,
+                facts,
+                commit_metadata,
+                content: content_blob.as_ref().map(Blob::get_handle),
+                frozen: FrozenLegacyDeltaData {
+                    content: content_blob,
+                    verified_facts,
+                },
+            });
+            commit_blobs.push(commit_blob);
+            parent_indices.push(indices);
+        }
+
+        let reachable = reachable_indices(spec.head, &parent_indices);
+        let frozen_deltas = deltas
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| reachable.contains(index))
+            .map(|(_, delta)| delta.clone())
+            .collect();
+        let head = spec.head.map(|index| deltas[index].commit);
+
+        let name_blob: Blob<UTF8String> = spec.name.clone().to_blob();
+        let name_handle = pile
+            .put::<UTF8String, _>(name_blob)
+            .context("store immutable legacy branch name")?;
+        let branch_metadata = match spec.head {
+            Some(head) => legacy_branch_metadata(
+                &spec.signing_key,
+                spec.branch,
+                name_handle,
+                Some(commit_blobs[head].clone()),
+            ),
+            None => legacy_branch_unsigned(spec.branch, name_handle, None),
+        };
+        let pin = pile
+            .put::<SimpleArchive, _>(branch_metadata)
+            .context("store immutable legacy branch metadata")?;
+
+        Ok(BuiltBranch {
+            name: spec.name,
+            branch: FrozenLegacyBranch {
+                branch: spec.branch,
+                pin,
+                head,
+                deltas: frozen_deltas,
+            },
+        })
+    }
+
+    /// Reproduce the immutable v0.46 commit envelope without retaining its
+    /// mutable repository writer. The migration reader still verifies this
+    /// exact public wire shape.
+    fn legacy_commit_metadata(
+        signing_key: &SigningKey,
+        parents: impl IntoIterator<Item = CommitHandle>,
+        message: Option<Inline<Handle<UTF8String>>>,
+        content: Option<Blob<SimpleArchive>>,
+        semantic_metadata: Option<Inline<Handle<SimpleArchive>>>,
+        ordinal: usize,
+    ) -> TribleSet {
+        let (content_handle, signed_by, signature, created_at) = match content.as_ref() {
+            Some(blob) => {
+                let at = Epoch::from_tai_seconds(ordinal as f64 + 1.0);
+                let timestamp: Inline<_> = (at, at).try_to_inline().expect("point interval");
+                (
+                    Some(blob.get_handle()),
+                    Some(signing_key.verifying_key()),
+                    Some(signing_key.sign(&blob.bytes)),
+                    Some(timestamp),
+                )
+            }
+            None => (None, None, None, None),
+        };
+        let parents: Vec<_> = parents.into_iter().collect();
+        entity! {
+            metadata::created_at?: created_at,
+            repo::content?: content_handle,
+            triblespace::core::attestation::signed_by?: signed_by,
+            triblespace::core::attestation::signature_r?: signature,
+            triblespace::core::attestation::signature_s?: signature,
+            repo::message?: message,
+            metadata::archive?: semantic_metadata,
+            repo::parent*: parents,
+        }
+        .into()
+    }
+
+    fn legacy_branch_metadata(
+        signing_key: &SigningKey,
+        branch: Id,
+        name: Inline<Handle<UTF8String>>,
+        head: Option<Blob<SimpleArchive>>,
+    ) -> TribleSet {
+        let (head_handle, signed_by, signature) = match head.as_ref() {
+            Some(blob) => (
+                Some(blob.get_handle()),
+                Some(signing_key.verifying_key()),
+                Some(signing_key.sign(&blob.bytes)),
+            ),
+            None => (None, None, None),
+        };
+        let at = Epoch::from_tai_seconds(1.0);
+        let updated_at: Inline<_> = (at, at).try_to_inline().expect("point interval");
+        entity! {
+            repo::branch: branch,
+            repo::head?: head_handle,
+            triblespace::core::attestation::signed_by?: signed_by,
+            triblespace::core::attestation::signature_r?: signature,
+            triblespace::core::attestation::signature_s?: signature,
+            metadata::name: name,
+            metadata::updated_at: updated_at,
+        }
+        .into()
+    }
+
+    fn legacy_branch_unsigned(
+        branch: Id,
+        name: Inline<Handle<UTF8String>>,
+        head: Option<Blob<SimpleArchive>>,
+    ) -> TribleSet {
+        let head_handle = head.as_ref().map(Blob::get_handle);
+        let at = Epoch::from_tai_seconds(1.0);
+        let updated_at: Inline<_> = (at, at).try_to_inline().expect("point interval");
+        entity! {
+            repo::branch: branch,
+            repo::head?: head_handle,
+            metadata::name: name,
+            metadata::updated_at: updated_at,
+        }
+        .into()
+    }
+
+    fn store_fragment_archive(
+        pile: &mut triblespace::core::repo::pile::Pile,
+        fragment: Fragment,
+    ) -> Result<(TribleSet, Blob<SimpleArchive>)> {
+        let (facts, mut blobs) = fragment.into_facts_and_blobs();
+        let reader = blobs
+            .reader()
+            .expect("MemoryBlobStore reader is infallible");
+        for (_handle, blob) in reader {
+            pile.put::<triblespace::core::blob::encodings::UnknownBlob, _>(blob)
+                .context("store immutable legacy attachment")?;
+        }
+        let archive = facts.clone().to_blob();
+        pile.put::<SimpleArchive, _>(archive.clone())
+            .context("store immutable legacy archive")?;
+        Ok((facts, archive))
+    }
+
+    fn reachable_indices(head: Option<usize>, parents: &[Vec<usize>]) -> BTreeSet<usize> {
+        let mut reachable = BTreeSet::new();
+        let mut pending: VecDeque<_> = head.into_iter().collect();
+        while let Some(index) = pending.pop_front() {
+            if reachable.insert(index) {
+                pending.extend(parents[index].iter().copied());
+            }
+        }
+        reachable
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use std::fs::{File, OpenOptions};
-    use std::path::PathBuf;
     use std::io::{Seek, SeekFrom, Write};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ed25519_dalek::SigningKey;
     use triblespace::core::blob::encodings::utf8string::UTF8String;
     use triblespace::core::metadata;
-    use triblespace::core::repo::{BlobStorePut, PinStore, PushResult, Repository};
+    use triblespace::core::repo::BlobStorePut;
     use triblespace::macros::entity;
 
+    use super::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use super::*;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
@@ -880,7 +1327,6 @@ mod tests {
     struct TestFiles {
         directory: PathBuf,
         pile: PathBuf,
-        key: PathBuf,
     }
 
     impl TestFiles {
@@ -894,12 +1340,7 @@ mod tests {
             fs::create_dir_all(&directory).unwrap();
             let pile = directory.join("test.pile");
             File::create(&pile).unwrap();
-            let key = directory.join("test.key");
-            Self {
-                directory,
-                pile,
-                key,
-            }
+            Self { directory, pile }
         }
     }
 
@@ -914,27 +1355,29 @@ mod tests {
     }
 
     #[test]
-    fn frozen_source_is_read_only_and_captures_semantic_coordinates() {
+    fn immutable_fixture_captures_semantic_coordinates_without_pin_records() {
         let files = TestFiles::new();
         let pin_id = id(7);
-        let pin_facts = entity! { _ @ metadata::tag: &id(8) }.into_facts();
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        let value = pile.put::<SimpleArchive, _>(pin_facts.clone()).unwrap();
-        assert!(matches!(
-            pile.update(pin_id, None, Some(value)).unwrap(),
-            PushResult::Success()
-        ));
-        pile.close().unwrap();
-
+        let fixture = TestSourceSpec::new(vec![TestBranchSpec::empty(
+            "coordinates",
+            pin_id,
+            SigningKey::from_bytes(&[0x58; 32]),
+        )])
+        .freeze(&files.pile)
+        .unwrap();
+        let frozen = &fixture.source;
+        let value = fixture.branch("coordinates").pin;
         let before = fs::read(&files.pile).unwrap();
-        let frozen = freeze_source(&files.pile).unwrap();
         assert_eq!(fs::read(&files.pile).unwrap(), before);
         assert_eq!(
             frozen.legacy_pins(),
             &[LegacyPinCoordinate { id: pin_id, value }]
         );
         let from_snapshot: TribleSet = frozen.reader().get(value).unwrap();
-        assert_eq!(from_snapshot, pin_facts);
+        assert_eq!(
+            repo::branch::branch_entity(&from_snapshot, pin_id).is_ok(),
+            true
+        );
 
         let physical = frozen.physical_fingerprint();
         assert_eq!(physical.length, before.len() as u64);
@@ -946,19 +1389,18 @@ mod tests {
     fn projection_reuses_the_frozen_verified_content_blob() {
         const BRANCH: &str = "single-decode";
         let files = TestFiles::new();
-        let pile = open_pile_strict(&files.pile).unwrap();
-        let mut repository =
-            Repository::new(pile, SigningKey::from_bytes(&[0x5A; 32]), Fragment::empty()).unwrap();
-        let branch_id = *repository.create_branch(BRANCH, None).unwrap();
         let expected = entity! { _ @ metadata::tag: &id(12) };
         let expected_facts = expected.facts().clone();
-        let mut workspace = repository.pull(branch_id).unwrap();
-        workspace.commit(expected, "frozen once");
-        repository.push(&mut workspace).unwrap();
-        repository.close().unwrap();
-
-        let source = freeze_source(&files.pile).unwrap();
-        let branch = source.legacy_branch(BRANCH).unwrap().unwrap();
+        let fixture = TestSourceSpec::new(vec![TestBranchSpec::new(
+            BRANCH,
+            id(10),
+            SigningKey::from_bytes(&[0x5A; 32]),
+            vec![TestDeltaSpec::authored(expected, "frozen once")],
+        )])
+        .freeze(&files.pile)
+        .unwrap();
+        let source = &fixture.source;
+        let branch = fixture.branch(BRANCH);
         let delta = branch
             .deltas
             .iter()
@@ -1092,6 +1534,4 @@ mod tests {
         let error = frozen.assert_unchanged(&files.pile).unwrap_err();
         assert!(format!("{error:#}").contains("was replaced after freezing"));
     }
-
 }
-
