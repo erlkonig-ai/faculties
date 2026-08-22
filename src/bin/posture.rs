@@ -6872,6 +6872,7 @@ mod tests {
             &faculties::collection_names::require_name(DEFAULT_SCAN_SCOPE_ID),
             team,
             ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]),
+            faculties::collection_names::require_reach(DEFAULT_SCAN_SCOPE_ID),
         );
         foreign.commit(fragment).unwrap();
         foreign.into_storage().close().unwrap();

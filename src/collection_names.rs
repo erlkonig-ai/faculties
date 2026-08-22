@@ -13,7 +13,7 @@
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use triblespace::core::collection::descriptor::Reach;
+use triblespace::core::collection::reach;
 use triblespace::core::collection::records::CollectionName;
 use triblespace::core::collection::{simplearchive_union, Collection};
 use triblespace::core::id::Id;
@@ -35,7 +35,7 @@ use crate::schemas::{
 /// identity, so adding a faculty makes you state it rather than inherit a
 /// default you never saw.
 ///
-/// **Everything here is [`Reach::Private`], and that is a decision rather than
+/// **Everything here is [`reach::private`], and that is a decision rather than
 /// a default.** Two things force it. First, all of these collections already
 /// exist: their handles were computed from descriptors that named no reach, so
 /// declaring one public would not publish the collection, it would *rename*
@@ -44,7 +44,7 @@ use crate::schemas::{
 /// collection, deliberately, not a one-word edit here.
 ///
 /// Second, and more interesting: most of the ones that plausibly want to
-/// travel do not want [`Reach::Public`]. `message`, `status`, `relations` and
+/// travel do not want [`reach::public`]. `message`, `status`, `relations` and
 /// `teams` coordinate peers on one team; what they want is "this team and
 /// no one else", which is a reach law that does not exist yet. Declaring them
 /// public to approximate it would be worse than declaring nothing.
@@ -59,34 +59,34 @@ use crate::schemas::{
 ///   collections, not one made public. A public sibling is the shape, and
 ///   reach in the descriptor is what makes a sibling safe to keep in the same
 ///   pile.
-pub fn table() -> Vec<(Id, &'static str, Reach)> {
+pub fn table() -> Vec<(Id, &'static str, Fragment)> {
     vec![
-        (atlas::DEFAULT_SCOPE_ID, "atlas", Reach::Private),
-        (blockdag::DEFAULT_SCOPE_ID, "blockdag", Reach::Private),
-        (body::DEFAULT_SCOPE_ID, "body", Reach::Private),
-        (cognition::DEFAULT_SCOPE_ID, "cognition", Reach::Private),
-        (compass::DEFAULT_SCOPE_ID, "compass", Reach::Private),
-        (decide::DEFAULT_SCOPE_ID, "decide", Reach::Private),
-        (discord::DEFAULT_SCOPE_ID, "discord", Reach::Private),
-        (embeddings::DEFAULT_SCOPE_ID, "embeddings", Reach::Private),
-        (files::DEFAULT_SCOPE_ID, "files", Reach::Private),
-        (habit::DEFAULT_SCOPE_ID, "habit", Reach::Private),
-        (headspace::DEFAULT_SCOPE_ID, "headspace", Reach::Private),
-        (mail::DEFAULT_SCOPE_ID, "mail", Reach::Private),
-        (memory::DEFAULT_SCOPE_ID, "memory", Reach::Private),
-        (memory::DEFAULT_COMB_SCOPE_ID, "memory-comb", Reach::Private),
-        (message::DEFAULT_SCOPE_ID, "message", Reach::Private),
-        (orient::DEFAULT_SCOPE_ID, "orient", Reach::Private),
-        (planner::DEFAULT_SCOPE_ID, "planner", Reach::Private),
-        (posture::DEFAULT_POLICY_SCOPE_ID, "posture-policy", Reach::Private),
-        (posture::DEFAULT_SCAN_SCOPE_ID, "posture-scan", Reach::Private),
-        (relations::DEFAULT_SCOPE_ID, "relations", Reach::Private),
-        (crate::secrets::schema::DEFAULT_SCOPE_ID, "secrets", Reach::Private),
-        (status::DEFAULT_SCOPE_ID, "status", Reach::Private),
-        (teams::DEFAULT_SCOPE_ID, "teams", Reach::Private),
-        (voice::COLLECTION_SCOPE_ID, "voice", Reach::Private),
-        (web::DEFAULT_SCOPE_ID, "web", Reach::Private),
-        (wiki::DEFAULT_SCOPE_ID, "wiki", Reach::Private),
+        (atlas::DEFAULT_SCOPE_ID, "atlas", reach::private()),
+        (blockdag::DEFAULT_SCOPE_ID, "blockdag", reach::private()),
+        (body::DEFAULT_SCOPE_ID, "body", reach::private()),
+        (cognition::DEFAULT_SCOPE_ID, "cognition", reach::private()),
+        (compass::DEFAULT_SCOPE_ID, "compass", reach::private()),
+        (decide::DEFAULT_SCOPE_ID, "decide", reach::private()),
+        (discord::DEFAULT_SCOPE_ID, "discord", reach::private()),
+        (embeddings::DEFAULT_SCOPE_ID, "embeddings", reach::private()),
+        (files::DEFAULT_SCOPE_ID, "files", reach::private()),
+        (habit::DEFAULT_SCOPE_ID, "habit", reach::private()),
+        (headspace::DEFAULT_SCOPE_ID, "headspace", reach::private()),
+        (mail::DEFAULT_SCOPE_ID, "mail", reach::private()),
+        (memory::DEFAULT_SCOPE_ID, "memory", reach::private()),
+        (memory::DEFAULT_COMB_SCOPE_ID, "memory-comb", reach::private()),
+        (message::DEFAULT_SCOPE_ID, "message", reach::private()),
+        (orient::DEFAULT_SCOPE_ID, "orient", reach::private()),
+        (planner::DEFAULT_SCOPE_ID, "planner", reach::private()),
+        (posture::DEFAULT_POLICY_SCOPE_ID, "posture-policy", reach::private()),
+        (posture::DEFAULT_SCAN_SCOPE_ID, "posture-scan", reach::private()),
+        (relations::DEFAULT_SCOPE_ID, "relations", reach::private()),
+        (crate::secrets::schema::DEFAULT_SCOPE_ID, "secrets", reach::private()),
+        (status::DEFAULT_SCOPE_ID, "status", reach::private()),
+        (teams::DEFAULT_SCOPE_ID, "teams", reach::private()),
+        (voice::COLLECTION_SCOPE_ID, "voice", reach::private()),
+        (web::DEFAULT_SCOPE_ID, "web", reach::private()),
+        (wiki::DEFAULT_SCOPE_ID, "wiki", reach::private()),
     ]
 }
 
@@ -102,7 +102,7 @@ pub fn name_for(scope: Id) -> Option<CollectionName> {
 
 /// How far one scope's collection travels, or `None` if this build does not
 /// know the scope.
-pub fn reach_for(scope: Id) -> Option<Reach> {
+pub fn reach_for(scope: Id) -> Option<Fragment> {
     table()
         .into_iter()
         .find(|(candidate, _, _)| *candidate == scope)
@@ -115,7 +115,7 @@ pub fn reach_for(scope: Id) -> Option<Reach> {
 /// descriptor, so guessing it would compute a handle for a collection nothing
 /// else can find. That failure looks like an empty faculty rather than an
 /// error, which is exactly the kind of silence worth refusing to produce.
-pub fn require_reach(scope: Id) -> Reach {
+pub fn require_reach(scope: Id) -> Fragment {
     reach_for(scope).unwrap_or_else(|| {
         panic!(
             "no reach for scope {scope:X}; add it to \
@@ -181,7 +181,7 @@ mod tests {
     fn every_name_is_legal_and_no_two_scopes_share_one() {
         let mut names = BTreeSet::new();
         let mut scopes = BTreeSet::new();
-        for (scope, name) in table() {
+        for (scope, name, _reach) in table() {
             assert!(
                 CollectionName::new(name).is_ok(),
                 "{name} is not a legal collection name"

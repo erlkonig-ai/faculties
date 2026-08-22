@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::collection::descriptor::Reach;
+use triblespace::core::collection::reach;
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::exact_derived::{
@@ -388,7 +388,7 @@ pub fn ensure_succinct_index(
             crate::collection_names::require_name(schema::DEFAULT_SCOPE_ID),
             team,
             crate::collection_names::require_reach(schema::DEFAULT_SCOPE_ID),
-            Reach::Private,
+            reach::private(),
         );
         let source = algebra.source_descriptor();
         let target = algebra.descriptor();
@@ -1839,7 +1839,7 @@ mod tests {
         let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, team);
         succinctarchive_union::validate_derive(
             &source,
-            &succinctarchive_union::descriptor(archive_bm25::source_collection(team), Reach::Private),
+            &succinctarchive_union::descriptor(archive_bm25::source_collection(team), reach::private()),
             &derive,
             &input,
             &output,
@@ -2025,19 +2025,14 @@ mod tests {
         let block_commit = collection.commit(block_element).unwrap();
         let remainder_commit = collection.commit(remainder_element).unwrap();
         let source = collection.descriptor().clone();
-        let reader = collection.storage_mut().reader().unwrap();
-        let block_blob: Blob<SimpleArchive> = reader
-            .get(Handle::<SimpleArchive>::from_hash(block_commit.data()))
-            .unwrap();
-        let remainder_blob: Blob<SimpleArchive> = reader
-            .get(Handle::<SimpleArchive>::from_hash(remainder_commit.data()))
-            .unwrap();
-        drop(reader);
+        // A merge names two states of the collection, and the commits that
+        // made them already put their bytes in the store, so it takes their
+        // data handles rather than blobs fetched back out.
         let (_, union) = simplearchive_union::publish_merge(
             collection.storage_mut(),
             &source,
-            &block_blob,
-            &remainder_blob,
+            block_commit.data(),
+            remainder_commit.data(),
         )
         .unwrap();
 

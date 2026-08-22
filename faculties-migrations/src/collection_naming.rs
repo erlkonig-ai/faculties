@@ -35,7 +35,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::descriptor::Reach;
+use triblespace::core::collection::reach;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 pub use triblespace::core::collection::records::CollectionName;
@@ -300,7 +300,7 @@ pub fn plan(
         // ever published, this constant is the second place that has to move,
         // and a mismatch shows up as a rename to a handle nothing opens.
         let new = prospective_handle(
-            simplearchive_union::descriptor(&named, team, Reach::Private).facts(),
+            simplearchive_union::descriptor(&named, team, reach::private()).facts(),
         );
         let rename = Rename {
             old,
@@ -353,7 +353,7 @@ pub fn publish(
     let mut written = BTreeSet::new();
     for rename in &report.renames {
         let named = CollectionName::new(&rename.name).expect("plan checked this");
-        let descriptor = simplearchive_union::descriptor(&named, team, Reach::Private);
+        let descriptor = simplearchive_union::descriptor(&named, team, reach::private());
         // The handle comes from the store, not from a second hash beside it.
         let new = store
             .put::<SimpleArchive, _>(descriptor.facts().clone())
