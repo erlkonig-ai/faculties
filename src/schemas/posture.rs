@@ -271,14 +271,14 @@ pub mod posture {
     use super::*;
     attributes! {
         /// Channel → its name ("github-public", "client-deliverable").
-        "0CB41E9330855B39E59686D54CD091DE" unsafe as channel_name: inlineencodings::Handle<blobencodings::LongString>;
+        "0CB41E9330855B39E59686D54CD091DE" unsafe as channel_name: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Term → the string to look for. Matched case-insensitively.
-        "2618BF2D4418EA1D006815517CA41927" unsafe as term: inlineencodings::Handle<blobencodings::LongString>;
+        "2618BF2D4418EA1D006815517CA41927" unsafe as term: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Term → the channel it is protected FROM.
         "6860CCB7DCCEA0BE95BC07A35DCD5CBE" unsafe as in_channel: inlineencodings::GenId;
         /// Term → why it is protected. Carried because a bare wordlist rots:
         /// nobody dares remove an entry whose reason nobody recorded.
-        "0B86BA9EB3A1B6FD0C70AC7B75A24E06" unsafe as why: inlineencodings::Handle<blobencodings::LongString>;
+        "0B86BA9EB3A1B6FD0C70AC7B75A24E06" unsafe as why: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Policy revision → one exact term or exemplar member. Repeated.
         ///
         /// Minted with `trible genid` on 2026-08-08:
@@ -294,19 +294,19 @@ pub mod posture {
         /// Finding → the document it was found in.
         "81AD29AAC2A2E3C60207E433B5BB35D7" unsafe as document: inlineencodings::GenId;
         /// Document → its path as scanned.
-        "46DCFC71243F75A716E96933671AF2AD" unsafe as path: inlineencodings::Handle<blobencodings::LongString>;
+        "46DCFC71243F75A716E96933671AF2AD" unsafe as path: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Finding → the named coordinate inside its carrier, for material the
         /// carrier's bytes do not literally spell ("docProps/core.xml:creator",
         /// a path a blob is stored under). A byte-addressable finding carries
         /// [`posture::span_start`]/[`posture::span_end`] instead, and exactly
         /// one of the two forms is present.
-        "8D48ED59152DEC32A8AE9E60816499B1" unsafe as locator: inlineencodings::Handle<blobencodings::LongString>;
+        "8D48ED59152DEC32A8AE9E60816499B1" unsafe as locator: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Sighting → the material itself. This is the sensitive payload, and
         /// the reason a posture pile is at least as confidential as what it
         /// scanned. Evidence, never identity: for a byte range in a
         /// content-addressed carrier the material IS the bytes, so recording it
         /// twice would only let the two disagree.
-        "2DD2823925C7DDA38CE3A5ECA82CAD52" unsafe as value: inlineencodings::Handle<blobencodings::LongString>;
+        "2DD2823925C7DDA38CE3A5ECA82CAD52" unsafe as value: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Finding → which content-addressing scheme its carrier uses
         /// ([`CARRIER_GIT_BLOB`], [`CARRIER_CONTAINER_MEMBER`],
         /// [`CARRIER_GIT_COMMIT`]).
@@ -320,7 +320,7 @@ pub mod posture {
         ///
         /// Minted with `trible genid` on 2026-08-18:
         /// `44D5736640286A9FE38527C1AEF0B7EA`.
-        "44D5736640286A9FE38527C1AEF0B7EA" as carrier: inlineencodings::Handle<blobencodings::LongString>;
+        "44D5736640286A9FE38527C1AEF0B7EA" as carrier: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Finding → first byte of the material inside its carrier, inclusive.
         ///
         /// Minted with `trible genid` on 2026-08-18:
@@ -344,13 +344,13 @@ pub mod posture {
         ///
         /// Minted with `trible genid` on 2026-08-18:
         /// `B44C8144A5118C08D824DDA80B45C8AF`.
-        "B44C8144A5118C08D824DDA80B45C8AF" as seen_in: inlineencodings::Handle<blobencodings::LongString>;
+        "B44C8144A5118C08D824DDA80B45C8AF" as seen_in: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Sighting → the human coordinate exactly as observed ("patch
         /// abc1234:src/lib.rs:12"). Display exhaust; nothing reads it back.
         ///
         /// Minted with `trible genid` on 2026-08-18:
         /// `81BAE4F185ABA41A2BC656CFD6827D31`.
-        "81BAE4F185ABA41A2BC656CFD6827D31" as evidence: inlineencodings::Handle<blobencodings::LongString>;
+        "81BAE4F185ABA41A2BC656CFD6827D31" as evidence: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Scan → one exact sighting in its Merkle observation set. Findings
         /// enter the root through their sightings, which name them.
         ///
@@ -358,7 +358,7 @@ pub mod posture {
         /// `E009BEED48735BF41AE6460E7BAF9B92`.
         "E009BEED48735BF41AE6460E7BAF9B92" as scan_sighting: inlineencodings::GenId;
         /// Scan → the root path it was pointed at.
-        "8CAF5292A19C695755E3CBD9E1BD4F2E" unsafe as target: inlineencodings::Handle<blobencodings::LongString>;
+        "8CAF5292A19C695755E3CBD9E1BD4F2E" unsafe as target: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Scan → a modality it DID apply.
         "A4E0193BBC1935D183A7447A93CE8B08" unsafe as checked: inlineencodings::GenId;
         /// Scan → a modality it did NOT apply. The anti-"clean" attribute: a
@@ -382,7 +382,7 @@ pub mod posture {
         ///
         /// Minted with `trible genid` on 2026-08-08:
         /// `6E46C2DC054717AF129BD0D2CC730D69`.
-        "6E46C2DC054717AF129BD0D2CC730D69" unsafe as detail: inlineencodings::Handle<blobencodings::LongString>;
+        "6E46C2DC054717AF129BD0D2CC730D69" unsafe as detail: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Legacy bridge → the pre-2026-08-18 occurrence id, the deterministic
         /// identity of `(modality, path, locator, value)`. Never written on a
         /// finding again: `commit:path:line` in the locator meant a rebase

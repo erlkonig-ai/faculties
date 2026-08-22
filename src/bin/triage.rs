@@ -39,7 +39,7 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 use faculties::legacy_hint::open_scope;
 
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type Interval = Inline<inlineencodings::NsTAIInterval>;
 
 #[derive(Parser)]
@@ -347,7 +347,7 @@ fn first_line(text: &str) -> String {
 fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
     let view: View<str> = reader
         .get(handle)
-        .with_context(|| format!("read LongString {}", hex::encode(handle.raw)))?;
+        .with_context(|| format!("read UTF8String {}", hex::encode(handle.raw)))?;
     Ok(view.to_string())
 }
 

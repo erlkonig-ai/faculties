@@ -11,7 +11,7 @@ use std::path::Path;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{Collection, CollectionCommit};
@@ -40,7 +40,7 @@ pub mod legacy_utterance {
     use super::*;
 
     attributes! {
-        "09792243FE6C424FD80D7EF7E48EBAEA" unsafe as pub text: Handle<LongString>;
+        "09792243FE6C424FD80D7EF7E48EBAEA" unsafe as pub text: Handle<UTF8String>;
         "33892D142FCB2ED2D40B9724847B3859" unsafe as pub channel: ShortString;
     }
 }
@@ -543,7 +543,7 @@ pub(crate) fn validate_legacy_body_payloads(reader: &PileReader, facts: &TribleS
             || fact.a() == &legacy_utterance::text.id()
             || fact.a() == &metadata::description.id()
         {
-            let handle = *fact.v::<Handle<LongString>>();
+            let handle = *fact.v::<Handle<UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "strictly read historical Body text {}",
@@ -774,8 +774,8 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     fn legacy_vision() -> (Id, Fragment) {
         let mut fragment = Fragment::empty();
         let frame = fragment.put::<blobencodings::RawBytes, _>(vec![1, 2, 3]);
-        let pose = fragment.put::<blobencodings::LongString, _>("{}".to_owned());
-        let note = fragment.put::<blobencodings::LongString, _>("kept".to_owned());
+        let pose = fragment.put::<blobencodings::UTF8String, _>("{}".to_owned());
+        let note = fragment.put::<blobencodings::UTF8String, _>("kept".to_owned());
         fragment += body::capture_record(&CaptureRow {
             id: KIND_CAPTURE,
             created_at: point(1.0),
@@ -792,7 +792,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn legacy_intent() -> (Id, Fragment) {
         let mut fragment = Fragment::empty();
-        let text = fragment.put::<blobencodings::LongString, _>("lean in".to_owned());
+        let text = fragment.put::<blobencodings::UTF8String, _>("lean in".to_owned());
         fragment += body::intent_record(&IntentRow {
             id: KIND_INTENT,
             created_at: point(2.0),
@@ -803,7 +803,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn legacy_utterance() -> (Id, Fragment) {
         let mut fragment = Fragment::empty();
-        let text = fragment.put::<blobencodings::LongString, _>("hello".to_owned());
+        let text = fragment.put::<blobencodings::UTF8String, _>("hello".to_owned());
         let audio = fragment.put::<blobencodings::RawBytes, _>(b"wav".to_vec());
         fragment += legacy_utterance_record(&LegacyBodyUtteranceRow {
             id: LEGACY_KIND_UTTERANCE,

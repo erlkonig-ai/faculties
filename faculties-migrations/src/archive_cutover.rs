@@ -17,7 +17,7 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
@@ -284,7 +284,7 @@ fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()>
             None
         };
         if let Some(field) = text_field {
-            let handle = *fact.v::<Handle<LongString>>();
+            let handle = *fact.v::<Handle<UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "strictly read legacy Archive {field} {}",
@@ -443,7 +443,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
                 .get::<TribleSet, SimpleArchive>(commit.metadata())
                 .unwrap();
             for handle in find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(&metadata, [{ _?record @ metadata::description: ?value }])
             ) {
                 let value: View<str> = reader.get(handle).unwrap();

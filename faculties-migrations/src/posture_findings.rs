@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use anybytes::View;
 use anyhow::{anyhow, Context, Result};
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::collection::{Collection, CollectionCommit};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -58,7 +58,7 @@ use faculties::schemas::posture::{
 };
 use faculties::storage::{load_signer, open_pile_strict, publish_fragment};
 
-type TextHandle = Inline<Handle<LongString>>;
+type TextHandle = Inline<Handle<UTF8String>>;
 
 /// One legacy finding that could not be re-identified, and why.
 #[derive(Clone, Debug)]

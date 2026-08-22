@@ -32,7 +32,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::{
@@ -384,7 +384,7 @@ type SimpleArchiveBlob = triblespace::core::blob::Blob<SimpleArchive>;
 /// rather than decoding each one. A duplicated name is treated as "cannot
 /// tell" and stays silent.
 fn legacy_branch_head(pile: &mut Pile, name: &str) -> Option<CommitHandle> {
-    let wanted: Inline<Handle<LongString>> = name.to_owned().to_blob().get_handle();
+    let wanted: Inline<Handle<UTF8String>> = name.to_owned().to_blob().get_handle();
     let snapshot = pile.snapshot_pin_heads().ok()?;
     let pins: Vec<(Id, Inline<Handle<SimpleArchive>>)> = snapshot
         .iter_ordered()
@@ -403,7 +403,7 @@ fn legacy_branch_head(pile: &mut Pile, name: &str) -> Option<CommitHandle> {
         let named = facts.iter().any(|fact| {
             fact.e() == &entity
                 && fact.a() == &metadata::name.id()
-                && *fact.v::<Handle<LongString>>() == wanted
+                && *fact.v::<Handle<UTF8String>>() == wanted
         });
         if !named {
             continue;
@@ -447,7 +447,7 @@ mod tests {
 
     fn goal_fragment(title: &str) -> Fragment {
         let mut fragment = Fragment::empty();
-        let handle = fragment.put::<blobencodings::LongString, _>(title.to_owned());
+        let handle = fragment.put::<blobencodings::UTF8String, _>(title.to_owned());
         let goal = genid();
         fragment += entity! { &goal @
             metadata::tag: &KIND_GOAL_ID,

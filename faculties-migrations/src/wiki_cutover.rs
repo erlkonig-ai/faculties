@@ -288,8 +288,8 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
     fn version(id: Id, fragment: Id, body: &str, seconds: f64) -> Fragment {
         let mut output = Fragment::empty();
-        let title = output.put::<blobencodings::LongString, _>("Title".to_owned());
-        let content = output.put::<blobencodings::LongString, _>(body.to_owned());
+        let title = output.put::<blobencodings::UTF8String, _>("Title".to_owned());
+        let content = output.put::<blobencodings::UTF8String, _>(body.to_owned());
         output += entity! { ExclusiveId::force_ref(&id) @
             metadata::tag: &KIND_VERSION_ID,
             attrs::fragment: fragment,
@@ -595,7 +595,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             .flat_map(|commit| {
                 let facts: TribleSet = reader.get(commit.metadata()).unwrap();
                 find!(
-                    description: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+                    description: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
                     pattern!(&facts, [{
                         _?metadata @ metadata::description: ?description
                     }])

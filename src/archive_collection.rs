@@ -26,7 +26,7 @@ use triblespace::core::collection::{
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
@@ -47,7 +47,7 @@ use triblespace::core::collection::{
 use triblespace::core::repo::BlobStoreMeta;
 use crate::legacy_hint::open_scope;
 
-type TextHandle = Inline<Handle<LongString>>;
+type TextHandle = Inline<Handle<UTF8String>>;
 type RawHandle = Inline<Handle<RawBytes>>;
 type ArchiveBm25 = PortableBM25Index<inlineencodings::GenId, WordHash>;
 /// Canonical payload of one ordinal-bearing Archive content part.

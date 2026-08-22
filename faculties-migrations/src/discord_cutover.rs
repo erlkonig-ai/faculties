@@ -234,7 +234,7 @@ fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()>
     ];
     for fact in facts {
         if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "strictly read legacy Discord text payload {}",
@@ -296,11 +296,11 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         let message = Id::new([0x31; 16]).unwrap();
         let mut message_fragment = Fragment::empty();
         let external =
-            message_fragment.put::<blobencodings::LongString, _>("100000000000000001".to_owned());
+            message_fragment.put::<blobencodings::UTF8String, _>("100000000000000001".to_owned());
         let content = message_fragment
-            .put::<blobencodings::LongString, _>("legacy Discord content".to_owned());
+            .put::<blobencodings::UTF8String, _>("legacy Discord content".to_owned());
         let raw =
-            message_fragment.put::<blobencodings::LongString, _>("{\"legacy\":true}".to_owned());
+            message_fragment.put::<blobencodings::UTF8String, _>("{\"legacy\":true}".to_owned());
         message_fragment += entity! { ExclusiveId::force_ref(&message) @
             metadata::tag: archive::kind_message,
             schema::message_id: external,

@@ -780,7 +780,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn legacy_voice_utterance() -> (Id, Fragment) {
         let mut fragment = Fragment::empty();
-        let text = fragment.put::<blobencodings::LongString, _>("voice words".to_owned());
+        let text = fragment.put::<blobencodings::UTF8String, _>("voice words".to_owned());
         let audio = fragment.put::<blobencodings::RawBytes, _>(b"voice wav".to_vec());
         fragment += entity! {
             metadata::tag: &KIND_UTTERANCE,
@@ -795,7 +795,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn legacy_body_utterance_at(text_value: &str, audio_value: &[u8], at: f64) -> (Id, Fragment) {
         let mut fragment = Fragment::empty();
-        let text = fragment.put::<blobencodings::LongString, _>(text_value.to_owned());
+        let text = fragment.put::<blobencodings::UTF8String, _>(text_value.to_owned());
         let audio = fragment.put::<blobencodings::RawBytes, _>(audio_value.to_vec());
         fragment += entity! {
             metadata::tag: &LEGACY_KIND_UTTERANCE,
@@ -814,7 +814,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn legacy_body_intent_at(text_value: &str, at: f64) -> (Id, Fragment) {
         let mut fragment = Fragment::empty();
-        let text = fragment.put::<blobencodings::LongString, _>(text_value.to_owned());
+        let text = fragment.put::<blobencodings::UTF8String, _>(text_value.to_owned());
         fragment += body::intent_record(&IntentRow {
             id: KIND_INTENT,
             created_at: point(at),
@@ -1213,9 +1213,9 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     #[test]
     fn nonempty_migration_partitions_obey_live_voice_boundaries() {
-        let first_text = Inline::<inlineencodings::Handle<blobencodings::LongString>>::new([1; 32]);
+        let first_text = Inline::<inlineencodings::Handle<blobencodings::UTF8String>>::new([1; 32]);
         let second_text =
-            Inline::<inlineencodings::Handle<blobencodings::LongString>>::new([2; 32]);
+            Inline::<inlineencodings::Handle<blobencodings::UTF8String>>::new([2; 32]);
         let first = voice::utterance_record(CHANNEL_SAY, first_text, None, None, point(5.0));
         let second = voice::utterance_record(CHANNEL_SHOUT, second_text, None, None, point(6.0));
 

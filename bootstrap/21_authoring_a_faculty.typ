@@ -22,7 +22,7 @@ pub const KIND_NOTE: Id = id_hex!("<32 hex from trible genid>");
 pub mod myverb {
     use super::*;
     attributes! {
-        "<hex>" as text: inlineencodings::Handle<blobencodings::LongString>;
+        "<hex>" as text: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 ```
@@ -68,7 +68,7 @@ let current = collection.materialize()?;
 let reader = collection.storage_mut().reader()?;
 
 let mut change = Fragment::empty();
-let body = change.put::<LongString, _>(body);
+let body = change.put::<UTF8String, _>(body);
 change += entity! {
     metadata::tag: &KIND_NOTE,
     myverb::text: body,

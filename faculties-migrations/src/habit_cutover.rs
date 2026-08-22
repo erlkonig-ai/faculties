@@ -442,7 +442,7 @@ fn legacy_commit_messages(
 
 fn validate_legacy_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
     for fact in facts.iter().filter(|fact| fact.a() == &attrs::nudge.id()) {
-        let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+        let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
         let _: View<str> = reader.get(handle).with_context(|| {
             format!("read legacy Habit nudge {}", hex::encode_upper(handle.raw))
         })?;
@@ -461,7 +461,7 @@ fn validate_legacy_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()
                 .try_from_inline()
                 .map_err(|error| anyhow!("decode push-era Habit condition: {error:?}"))?;
         } else {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "read pull-era Habit condition {}",
@@ -759,7 +759,7 @@ fn validate_kind_names(facts: &TribleSet, required: bool, expected: &mut TribleS
         }
         if let Some(handle) = handles.first().copied() {
             // The historical `ensure_metadata` writer recorded only the
-            // deterministic LongString handle and did not necessarily retain
+            // deterministic UTF8String handle and did not necessarily retain
             // the corresponding blob. Compare that content address directly;
             // requiring a payload would reject a byte-exact writer output.
             let known: BTreeSet<TextHandle> = allowed
@@ -952,7 +952,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             (KIND_STATE_ID, LEGACY_STATE_LABEL),
         ] {
             // This intentionally reproduces the historical writer bug: only
-            // the LongString handle is retained, not the kind-name blob.
+            // the UTF8String handle is retained, not the kind-name blob.
             let name: TextHandle = name.to_owned().to_blob().get_handle();
             fragment += entity! { ExclusiveId::force_ref(&kind) @
                 metadata::name: name,

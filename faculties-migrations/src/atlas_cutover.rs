@@ -221,9 +221,9 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn atlas_fragment(entity: Id, label: &str) -> Fragment {
         let mut fragment = Fragment::empty();
-        let name = fragment.put::<blobencodings::LongString, _>(label.to_owned());
+        let name = fragment.put::<blobencodings::UTF8String, _>(label.to_owned());
         let description =
-            fragment.put::<blobencodings::LongString, _>(format!("Description for {label}"));
+            fragment.put::<blobencodings::UTF8String, _>(format!("Description for {label}"));
         let formatter = fragment.put::<blobencodings::WasmCode, _>(vec![0, 97, 115, 109]);
         fragment += entity! { ExclusiveId::force_ref(&entity) @
             metadata::name: name,

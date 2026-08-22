@@ -52,7 +52,7 @@ use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{NsTAIInterval, U256BE};
 use triblespace::prelude::{TryFromInline, View};
 use GORBIE::card_ctx::GRID_ROW_MODULE;
@@ -64,7 +64,7 @@ use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView, SourceKey, WidgetContext};
 
 /// Handle to a long-string blob (titles, bodies, notes).
-type TextHandle = Inline<Handle<LongString>>;
+type TextHandle = Inline<Handle<UTF8String>>;
 
 // ── Rendering constants ──────────────────────────────────────────────
 
@@ -339,7 +339,7 @@ impl MultiLive {
 fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> String {
     dataset
         .reader
-        .get::<View<str>, LongString>(h)
+        .get::<View<str>, UTF8String>(h)
         .map(|v| {
             let s: &str = v.as_ref();
             s.to_string()

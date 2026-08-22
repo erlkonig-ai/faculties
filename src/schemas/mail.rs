@@ -55,11 +55,11 @@ pub mod account {
     use super::*;
     attributes! {
         "320DD00D58ADC89A41419A70C281D234" unsafe as of: inlineencodings::GenId;
-        "FB3FD9CE766CB77D20A221740EC4F1E1" unsafe as address: inlineencodings::Handle<blobencodings::LongString>;
-        "B30AF29D86ADCBA02EA32484F4366A53" unsafe as display_name: inlineencodings::Handle<blobencodings::LongString>;
-        "B4C2DEFAAF165750556F434DA2A31B99" unsafe as pop_endpoint: inlineencodings::Handle<blobencodings::LongString>;
-        "18CC5707CEBBF42AF2BC5099CC5523C1" unsafe as smtp_endpoint: inlineencodings::Handle<blobencodings::LongString>;
-        "B30A3C09EDE7FD84FBC92BD62E2B27B3" unsafe as username: inlineencodings::Handle<blobencodings::LongString>;
+        "FB3FD9CE766CB77D20A221740EC4F1E1" unsafe as address: inlineencodings::Handle<blobencodings::UTF8String>;
+        "B30AF29D86ADCBA02EA32484F4366A53" unsafe as display_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "B4C2DEFAAF165750556F434DA2A31B99" unsafe as pop_endpoint: inlineencodings::Handle<blobencodings::UTF8String>;
+        "18CC5707CEBBF42AF2BC5099CC5523C1" unsafe as smtp_endpoint: inlineencodings::Handle<blobencodings::UTF8String>;
+        "B30A3C09EDE7FD84FBC92BD62E2B27B3" unsafe as username: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Exact immutable `schemas::secrets::KIND_SECRET` version containing
         /// the mailbox password. Mail never owns or interprets its envelope.
         "2902B62BBC51167E42689D95ED417F87" unsafe as credential: inlineencodings::GenId;
@@ -70,7 +70,7 @@ pub mod account {
 pub mod wire {
     use super::*;
     attributes! {
-        "38F9B28DAE56DB810B2F6866F94E01D8" unsafe as claimed_message_id: inlineencodings::Handle<blobencodings::LongString>;
+        "38F9B28DAE56DB810B2F6866F94E01D8" unsafe as claimed_message_id: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Exact raw-byte digest used only when no Message-ID was claimed.
         /// Minted with `trible genid` on 2026-08-08.
         "F6DCFD2B486D1238D202380FDA50CDA0" unsafe as raw_digest: inlineencodings::Hash<inlineencodings::Blake3>;
@@ -85,7 +85,7 @@ pub mod observation {
         /// Exact immutable AccountConfig used for this maildrop session.
         /// Minted with `trible genid` on 2026-08-08.
         "C17C00F2BD0C6DAE9598052A809B21A7" unsafe as config: inlineencodings::GenId;
-        "9AE9A14BA205663A0B85166D6982DC23" unsafe as uidl: inlineencodings::Handle<blobencodings::LongString>;
+        "9AE9A14BA205663A0B85166D6982DC23" unsafe as uidl: inlineencodings::Handle<blobencodings::UTF8String>;
         "C6AA568EBF7BE4D7E98A74C6472710E6" unsafe as raw: inlineencodings::Handle<blobencodings::RawBytes>;
         "BEB35E6ED9637B6FB7EC74C3F604DCBC" unsafe as attempt: inlineencodings::GenId;
     }
@@ -134,9 +134,9 @@ pub mod imported_legacy {
         "B9865C959C0C385F430C2E4ADC266118" unsafe as to: inlineencodings::GenId;
         "EB20C324A8462E4D6DB8FDD14F435A1F" unsafe as cc: inlineencodings::GenId;
         "E4453C82084106CE5FD853AFC76F730F" unsafe as bcc: inlineencodings::GenId;
-        "D7D98E74C89105452D7F0FAAD6323F9D" unsafe as subject: inlineencodings::Handle<blobencodings::LongString>;
-        "145DD52BBB0EC5F467C5F5CE2DA10360" unsafe as body: inlineencodings::Handle<blobencodings::LongString>;
-        "940B053EF570710BB715373A7CD2DE13" unsafe as message_id: inlineencodings::Handle<blobencodings::LongString>;
+        "D7D98E74C89105452D7F0FAAD6323F9D" unsafe as subject: inlineencodings::Handle<blobencodings::UTF8String>;
+        "145DD52BBB0EC5F467C5F5CE2DA10360" unsafe as body: inlineencodings::Handle<blobencodings::UTF8String>;
+        "940B053EF570710BB715373A7CD2DE13" unsafe as message_id: inlineencodings::Handle<blobencodings::UTF8String>;
         "4020F38EAC780EAD45327874F119DF1C" unsafe as in_reply_to: inlineencodings::GenId;
         "8B037BC0D9EDCD9A2493D2615EFC707F" unsafe as reference: inlineencodings::GenId;
         "BDC561B8D6A649E9B41E065349B38592" unsafe as sent_at: inlineencodings::NsTAIInterval;
@@ -158,12 +158,12 @@ pub mod projection {
     attributes! {
         "021346C625E37449536532D1D253DC55" unsafe as source: inlineencodings::GenId;
         "B3195D91897505CE52FAA710B64F8C39" unsafe as recipe: inlineencodings::GenId;
-        "693A0C65EC874D4B813D5DE471862A56" unsafe as from: inlineencodings::Handle<blobencodings::LongString>;
-        "2CD915F6C5EBFF88462EDB6431CC7308" unsafe as to: inlineencodings::Handle<blobencodings::LongString>;
-        "2CEDE5781A15AA63BC8A96B53BA5CCCF" unsafe as cc: inlineencodings::Handle<blobencodings::LongString>;
-        "3B0EE9C4A32A12F0E5ECED7DD7A1C2C2" unsafe as bcc: inlineencodings::Handle<blobencodings::LongString>;
-        "BE300BC73D43B4B2D26BF311C482C93F" unsafe as subject: inlineencodings::Handle<blobencodings::LongString>;
-        "2543D4138A229F661354986DA2F603EE" unsafe as body: inlineencodings::Handle<blobencodings::LongString>;
+        "693A0C65EC874D4B813D5DE471862A56" unsafe as from: inlineencodings::Handle<blobencodings::UTF8String>;
+        "2CD915F6C5EBFF88462EDB6431CC7308" unsafe as to: inlineencodings::Handle<blobencodings::UTF8String>;
+        "2CEDE5781A15AA63BC8A96B53BA5CCCF" unsafe as cc: inlineencodings::Handle<blobencodings::UTF8String>;
+        "3B0EE9C4A32A12F0E5ECED7DD7A1C2C2" unsafe as bcc: inlineencodings::Handle<blobencodings::UTF8String>;
+        "BE300BC73D43B4B2D26BF311C482C93F" unsafe as subject: inlineencodings::Handle<blobencodings::UTF8String>;
+        "2543D4138A229F661354986DA2F603EE" unsafe as body: inlineencodings::Handle<blobencodings::UTF8String>;
         "A0BBB3FB11DEB55F2E4D75FD27B0A684" unsafe as claimed_date: inlineencodings::NsTAIInterval;
         "4D6E52687548D8B41C8A540DC99579A9" unsafe as in_reply_to: inlineencodings::GenId;
         "189D3AF85498E7D5ECB1C8DAA86476D9" unsafe as reference: inlineencodings::GenId;
@@ -187,12 +187,12 @@ pub mod draft {
     attributes! {
         "646194A0B50EF9F3F129E51881B31E85" unsafe as nonce: inlineencodings::GenId;
         "FDE5CB39B0E017A71D8A0A52A47E293A" unsafe as account: inlineencodings::GenId;
-        "451A23145E0B80752BA13EE8482474E5" unsafe as envelope_from: inlineencodings::Handle<blobencodings::LongString>;
-        "63FF1B0500E80CC4DF919A6DF1D1CD17" unsafe as to: inlineencodings::Handle<blobencodings::LongString>;
-        "CD2F3A03057E48AA8B558778B56B3E41" unsafe as cc: inlineencodings::Handle<blobencodings::LongString>;
-        "A4680AC9889A23DCC9A871CF25D7322A" unsafe as bcc: inlineencodings::Handle<blobencodings::LongString>;
-        "60DF1AE4A259395C0CA110465FF7B500" unsafe as subject: inlineencodings::Handle<blobencodings::LongString>;
-        "7920F1CD7A5F3D8ADB961EE3E9A6CA73" unsafe as body: inlineencodings::Handle<blobencodings::LongString>;
+        "451A23145E0B80752BA13EE8482474E5" unsafe as envelope_from: inlineencodings::Handle<blobencodings::UTF8String>;
+        "63FF1B0500E80CC4DF919A6DF1D1CD17" unsafe as to: inlineencodings::Handle<blobencodings::UTF8String>;
+        "CD2F3A03057E48AA8B558778B56B3E41" unsafe as cc: inlineencodings::Handle<blobencodings::UTF8String>;
+        "A4680AC9889A23DCC9A871CF25D7322A" unsafe as bcc: inlineencodings::Handle<blobencodings::UTF8String>;
+        "60DF1AE4A259395C0CA110465FF7B500" unsafe as subject: inlineencodings::Handle<blobencodings::UTF8String>;
+        "7920F1CD7A5F3D8ADB961EE3E9A6CA73" unsafe as body: inlineencodings::Handle<blobencodings::UTF8String>;
         "F596F0814D0C8538A6D798963753C929" unsafe as attachment: inlineencodings::GenId;
         "25D38A7A459E9D7B68CDBEABB0F2D3F6" unsafe as in_reply_to: inlineencodings::GenId;
         "A0FBC3F6F8FD8A92C16552DED6B3F4C1" unsafe as reference: inlineencodings::GenId;
@@ -209,10 +209,10 @@ pub mod attempt {
         "BC66E92E360DAA9B6EF0389D365B3C4A" unsafe as decision: inlineencodings::GenId;
         "77C530AC217B612DC54FDD53FFC48600" unsafe as decision_head: inlineencodings::GenId;
         "A9CA78DB98FC3F75C8C273FB84A15266" unsafe as raw: inlineencodings::Handle<blobencodings::RawBytes>;
-        "45F9F4DF528B5F6FA7344B6770FEF9EA" unsafe as envelope_from: inlineencodings::Handle<blobencodings::LongString>;
-        "CA8CA2B31C496E5AD1D933E569F45D6E" unsafe as to: inlineencodings::Handle<blobencodings::LongString>;
-        "E507E852C0170BE65F55782244310BC0" unsafe as cc: inlineencodings::Handle<blobencodings::LongString>;
-        "BA6376213674C97DCFD99CCBAAEBFE70" unsafe as bcc: inlineencodings::Handle<blobencodings::LongString>;
+        "45F9F4DF528B5F6FA7344B6770FEF9EA" unsafe as envelope_from: inlineencodings::Handle<blobencodings::UTF8String>;
+        "CA8CA2B31C496E5AD1D933E569F45D6E" unsafe as to: inlineencodings::Handle<blobencodings::UTF8String>;
+        "E507E852C0170BE65F55782244310BC0" unsafe as cc: inlineencodings::Handle<blobencodings::UTF8String>;
+        "BA6376213674C97DCFD99CCBAAEBFE70" unsafe as bcc: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -220,7 +220,7 @@ pub mod acceptance {
     use super::*;
     attributes! {
         "376CB5933AF5E407211DBC71D7F8906B" unsafe as attempt: inlineencodings::GenId;
-        "A1F7D5AD807A405E4655E9C745975D0A" unsafe as response: inlineencodings::Handle<blobencodings::LongString>;
+        "A1F7D5AD807A405E4655E9C745975D0A" unsafe as response: inlineencodings::Handle<blobencodings::UTF8String>;
         "77D9DC08DF92F2B55AF9FDDADA9203FF" unsafe as response_code: inlineencodings::U256BE;
     }
 }

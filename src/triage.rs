@@ -31,7 +31,7 @@ use crate::schemas::triage::{
 };
 use crate::secrets::{self as secrets_model};
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type Interval = Inline<inlineencodings::NsTAIInterval>;
 
 /// One immutable collection value from a single frozen pile prefix.
@@ -350,7 +350,7 @@ where
 {
     let view: View<str> = reader
         .get(handle)
-        .with_context(|| format!("read LongString {}", hex::encode(handle.raw)))?;
+        .with_context(|| format!("read UTF8String {}", hex::encode(handle.raw)))?;
     Ok(view.to_string())
 }
 

@@ -21,7 +21,7 @@ use crate::schemas::voice::{
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type PriorityValue = Inline<inlineencodings::U256BE>;
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type AudioHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 
 pub const AUDIO_WAV_MIME: &str = "audio/wav";
@@ -221,7 +221,7 @@ pub fn utterance_fragment(
         bail!("new Voice utterance timestamp must be a point interval");
     }
     let mut fragment = Fragment::empty();
-    let text = fragment.put::<blobencodings::LongString, _>(text.to_owned());
+    let text = fragment.put::<blobencodings::UTF8String, _>(text.to_owned());
     let audio = audio.map(|bytes| fragment.put::<blobencodings::RawBytes, _>(bytes));
     fragment += utterance_record(
         channel,
@@ -621,7 +621,7 @@ pub fn validate_candidate(
 pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
     for fact in facts {
         if fact.a() == &utterance::text.id() || fact.a() == &metadata::description.id() {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: anybytes::View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "read historical Voice text payload {}",

@@ -265,7 +265,7 @@ mod tests {
 
         let id = Id::new([0x41; 16]).unwrap();
         let mut fragment = Fragment::empty();
-        let name = fragment.put::<blobencodings::LongString, _>("Alpha".to_owned());
+        let name = fragment.put::<blobencodings::UTF8String, _>("Alpha".to_owned());
         fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name };
         publish_fragment(&pile, Some(&key), DEFAULT_SCOPE_ID, fragment).unwrap();
         let before_reads = std::fs::metadata(&pile).unwrap().len();

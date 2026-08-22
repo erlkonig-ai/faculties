@@ -966,7 +966,7 @@ fn validate_legacy_memory_payloads(reader: &PileReader, facts: &TribleSet) -> Re
             || fact.a() == &metadata::source.id()
             || fact.a() == &metadata::source_module.id();
         if atlas_text {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: anybytes::View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "read legacy Memory metadata text {}",
@@ -982,7 +982,7 @@ fn validate_legacy_memory_payloads(reader: &PileReader, facts: &TribleSet) -> Re
                 )
             })?;
         } else if fact.a() == &ctx::summary.id() || fact.a() == &ctx::lens.id() {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: anybytes::View<str> = reader.get(handle).with_context(|| {
                 format!("read legacy Memory text {}", hex::encode_upper(handle.raw))
             })?;
@@ -1019,10 +1019,10 @@ fn attach_memory_payloads(reader: &PileReader, fragment: &mut Fragment) -> Resul
     let text: BTreeSet<memory::TextHandle> = facts
         .iter()
         .filter(|fact| fact.a() == &ctx::summary.id() || fact.a() == &ctx::lens.id())
-        .map(|fact| *fact.v::<inlineencodings::Handle<blobencodings::LongString>>())
+        .map(|fact| *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>())
         .collect();
     for handle in text {
-        let blob: Blob<blobencodings::LongString> = reader.get(handle).with_context(|| {
+        let blob: Blob<blobencodings::UTF8String> = reader.get(handle).with_context(|| {
             format!(
                 "attach planned Memory text {}",
                 hex::encode_upper(handle.raw)
@@ -1591,7 +1591,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let mut workspace = repository.pull(branch).unwrap();
         let legacy_id = Id::new([0x92; 16]).unwrap();
         let mut legacy = Fragment::empty();
-        let summary = legacy.put::<blobencodings::LongString, _>("legacy memory".to_owned());
+        let summary = legacy.put::<blobencodings::UTF8String, _>("legacy memory".to_owned());
         legacy += entity! { ExclusiveId::force_ref(&legacy_id) @
             metadata::tag: &KIND_CHUNK_ID,
             ctx::summary: summary,

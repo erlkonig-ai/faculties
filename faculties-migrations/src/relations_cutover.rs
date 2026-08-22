@@ -23,7 +23,7 @@ use std::path::Path;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::{ExclusiveId, Id};
 use triblespace::core::inline::encodings::shortstring::ShortString;
@@ -53,15 +53,15 @@ mod legacy {
         "299E28A10114DC8C3B1661CD90CB8DF6" unsafe as label_norm: inlineencodings::ShortString;
         "3E8812F6D22B2C93E2BCF0CE3C8C1979" unsafe as alias_norm: inlineencodings::ShortString;
         "32B22FBA3EC2ADC3FFEB48483FE8961F" unsafe as affinity: inlineencodings::ShortString;
-        "F0AD0BBFAC4C4C899637573DC965622E" unsafe as first_name: inlineencodings::Handle<blobencodings::LongString>;
-        "764DD765142B3F4725B614BD3B9118EC" unsafe as last_name: inlineencodings::Handle<blobencodings::LongString>;
-        "DC0916CB5F640984EFE359A33105CA9A" unsafe as display_name: inlineencodings::Handle<blobencodings::LongString>;
+        "F0AD0BBFAC4C4C899637573DC965622E" unsafe as first_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "764DD765142B3F4725B614BD3B9118EC" unsafe as last_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "DC0916CB5F640984EFE359A33105CA9A" unsafe as display_name: inlineencodings::Handle<blobencodings::UTF8String>;
         "9B3329149D54CB9A8E8075E4AA862649" unsafe as teams_user_id: inlineencodings::ShortString;
         "B563A063474CBE62ED25A8D0E9A1853C" unsafe as email: inlineencodings::ShortString;
         "9C2B10C740FCF7064A46F9B43D1FE278" unsafe as phone: inlineencodings::ShortString;
-        "E3D486BD7C9C088D908DF1B9E1F4D925" unsafe as company: inlineencodings::Handle<blobencodings::LongString>;
-        "173B771D35FEE90B83F2731DD3C59EF8" unsafe as position: inlineencodings::Handle<blobencodings::LongString>;
-        "5A71C103E026FC1AC01E35EDAC274A5C" unsafe as profile_url: inlineencodings::Handle<blobencodings::LongString>;
+        "E3D486BD7C9C088D908DF1B9E1F4D925" unsafe as company: inlineencodings::Handle<blobencodings::UTF8String>;
+        "173B771D35FEE90B83F2731DD3C59EF8" unsafe as position: inlineencodings::Handle<blobencodings::UTF8String>;
+        "5A71C103E026FC1AC01E35EDAC274A5C" unsafe as profile_url: inlineencodings::Handle<blobencodings::UTF8String>;
         "686FD344CD64C3F9C981C4028B1B6B9E" unsafe as source: inlineencodings::ShortString;
         "0FCF3A17B2EBE7243BDDD791B901E2D6" unsafe as same_as: inlineencodings::GenId;
         "A89DC2F250432322D429D0E51316B6F3" unsafe as distinct_from: inlineencodings::GenId;
@@ -72,7 +72,7 @@ mod legacy {
         // shortname was the label; the then-current name attribute was display
         // text.  Both remain in the live squashed history.
         "2E26F8BA886495A8DF04ACF0ED3ACBD4" unsafe as historical_shortname: inlineencodings::ShortString;
-        "25031BF40F16F7F492213DEC04B644B9" unsafe as historical_display_name: inlineencodings::Handle<blobencodings::LongString>;
+        "25031BF40F16F7F492213DEC04B644B9" unsafe as historical_display_name: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -442,7 +442,7 @@ fn longs(
     reader: &PileReader,
     facts: &TribleSet,
     entity: Id,
-    attribute: &Attribute<inlineencodings::Handle<LongString>>,
+    attribute: &Attribute<inlineencodings::Handle<UTF8String>>,
 ) -> Result<BTreeSet<String>> {
     inline_values(facts, entity, attribute)
         .into_iter()
@@ -499,7 +499,7 @@ fn validate_legacy_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()
         &legacy::historical_display_name,
     ] {
         for fact in facts.iter().filter(|fact| fact.a() == &attribute.id()) {
-            let handle = *fact.v::<inlineencodings::Handle<LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "read legacy Relations payload {}",
@@ -2025,7 +2025,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         let mut target = open_pile_strict(&fixture.target).unwrap();
         let reader = target.reader().unwrap();
         let descriptions: BTreeSet<String> = find!(
-            description: Inline<inlineencodings::Handle<LongString>>,
+            description: Inline<inlineencodings::Handle<UTF8String>>,
             pattern!(&metadata_facts, [{ _?entity @ metadata::description: ?description }])
         )
         .map(|handle| reader.get::<View<str>, _>(handle).unwrap().to_string())

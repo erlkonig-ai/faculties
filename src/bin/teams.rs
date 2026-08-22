@@ -22,7 +22,7 @@ use triblespace::core::collection::{Collection, CollectionCommit};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
@@ -861,9 +861,9 @@ fn resolve_auth_config(
     Ok(TeamsBridgeConfig {
         source_id,
         tenant,
-        client_id: read_longstring(&session.reader, record.client_id, "Teams auth client id")?,
-        user_id: read_longstring(&session.reader, record.user_id, "Teams auth user id")?,
-        scopes: read_longstring(&session.reader, record.scopes, "Teams auth scopes")?,
+        client_id: read_utf8string(&session.reader, record.client_id, "Teams auth client id")?,
+        user_id: read_utf8string(&session.reader, record.user_id, "Teams auth user id")?,
+        scopes: read_utf8string(&session.reader, record.scopes, "Teams auth scopes")?,
         profile,
         client_secret_version: record.client_secret_version,
         delegated_token_version: record.delegated_token_version,
@@ -1305,23 +1305,23 @@ fn load_context(
     };
     let name = one_optional(
         find!(
-            name: Inline<Handle<LongString>>,
+            name: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ context_id @ metadata::name: ?name }])
         )
         .collect(),
         "Teams presentation name",
     )?
-    .map(|handle| read_longstring(reader, handle, "Teams presentation name"))
+    .map(|handle| read_utf8string(reader, handle, "Teams presentation name"))
     .transpose()?;
     let boundary = one_optional(
         find!(
-            boundary: Inline<Handle<LongString>>,
+            boundary: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ context_id @ metadata::description: ?boundary }])
         )
         .collect(),
         "Teams presentation boundary",
     )?
-    .map(|handle| read_longstring(reader, handle, "Teams presentation boundary"))
+    .map(|handle| read_utf8string(reader, handle, "Teams presentation boundary"))
     .transpose()?;
     Ok(TeamsPresentationContext { name, boundary })
 }
@@ -1457,15 +1457,15 @@ fn show_auth_status(session: &TeamsSession<'_>, tenant: Option<&str>) -> Result<
                 println!("auth_profile: {profile:x}");
                 println!(
                     "client_id: {}",
-                    read_longstring(&session.reader, record.client_id, "Teams client id")?
+                    read_utf8string(&session.reader, record.client_id, "Teams client id")?
                 );
                 println!(
                     "user_id: {}",
-                    read_longstring(&session.reader, record.user_id, "Teams user id")?
+                    read_utf8string(&session.reader, record.user_id, "Teams user id")?
                 );
                 println!(
                     "scopes: {}",
-                    read_longstring(&session.reader, record.scopes, "Teams scopes")?
+                    read_utf8string(&session.reader, record.scopes, "Teams scopes")?
                 );
                 println!(
                     "client_secret_version: {}",
@@ -1533,7 +1533,7 @@ fn load_chat_map(
 ) -> Result<HashMap<Id, String>> {
     let mut map = HashMap::new();
     for (chat_id, handle) in find!(
-        (chat: Id, chat_id: Inline<Handle<LongString>>),
+        (chat: Id, chat_id: Inline<Handle<UTF8String>>),
         pattern!(catalog, [{
             ?chat @
             metadata::tag: teams::kind_chat,
@@ -1541,7 +1541,7 @@ fn load_chat_map(
             teams::chat_id: ?chat_id,
         }])
     ) {
-        let value = read_longstring(reader, handle, "Teams chat id")?;
+        let value = read_utf8string(reader, handle, "Teams chat id")?;
         map.insert(chat_id, value);
     }
     Ok(map)
@@ -1554,7 +1554,7 @@ fn load_message_external_map(
 ) -> Result<HashMap<Id, String>> {
     let mut map = HashMap::new();
     for (message_id, handle) in find!(
-        (message: Id, external: Inline<Handle<LongString>>),
+        (message: Id, external: Inline<Handle<UTF8String>>),
         pattern!(catalog, [
             {
                 ?message @
@@ -1569,7 +1569,7 @@ fn load_message_external_map(
             }
         ])
     ) {
-        let value = read_longstring(reader, handle, "Teams message id")?;
+        let value = read_utf8string(reader, handle, "Teams message id")?;
         map.insert(message_id, value);
     }
     Ok(map)
@@ -1584,9 +1584,9 @@ fn load_known_messages(
     for (message_id, message_external, chat_id, chat_external) in find!(
         (
             message: Id,
-            message_external: Inline<Handle<LongString>>,
+            message_external: Inline<Handle<UTF8String>>,
             chat: Id,
-            chat_external: Inline<Handle<LongString>>
+            chat_external: Inline<Handle<UTF8String>>
         ),
         pattern!(catalog, [
             {
@@ -1605,17 +1605,17 @@ fn load_known_messages(
     ) {
         known.insert(KnownMessage {
             message_id,
-            message_external_id: read_longstring(reader, message_external, "Teams message id")?,
+            message_external_id: read_utf8string(reader, message_external, "Teams message id")?,
             chat_id,
-            chat_external_id: read_longstring(reader, chat_external, "Teams chat id")?,
+            chat_external_id: read_utf8string(reader, chat_external, "Teams chat id")?,
         });
     }
     Ok(known.into_iter().collect())
 }
 
-fn read_longstring(
+fn read_utf8string(
     reader: &PileReader,
-    handle: Inline<Handle<LongString>>,
+    handle: Inline<Handle<UTF8String>>,
     field: &str,
 ) -> Result<String> {
     let view: anybytes::View<str> = reader
@@ -1694,7 +1694,7 @@ fn login_device_code_collection(
     };
     let inherited_client_version = match previous.as_ref() {
         Some(profile)
-            if read_longstring(
+            if read_utf8string(
                 &session.reader,
                 profile.client_id,
                 "predecessor Teams auth client id",
@@ -2351,11 +2351,11 @@ struct ReadOptions {
 struct ReadMessage {
     message_id: Id,
     chat_id: Id,
-    author_names: BTreeSet<Inline<Handle<LongString>>>,
+    author_names: BTreeSet<Inline<Handle<UTF8String>>>,
     deleted: bool,
     created_at: Inline<NsTAIInterval>,
     created_at_key: i128,
-    content: Option<Inline<Handle<LongString>>>,
+    content: Option<Inline<Handle<UTF8String>>>,
     attachments: BTreeSet<Id>,
 }
 
@@ -2384,8 +2384,8 @@ struct AttachmentExportCandidate {
     source_id: String,
     source_kind: Option<String>,
     data_handle: Inline<Handle<RawBytes>>,
-    name: Option<Inline<Handle<LongString>>>,
-    media_type: Option<Inline<Handle<LongString>>>,
+    name: Option<Inline<Handle<UTF8String>>>,
+    media_type: Option<Inline<Handle<UTF8String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2395,11 +2395,11 @@ struct AttachmentRow {
     chat_id: Id,
     created_at: Inline<NsTAIInterval>,
     created_at_key: i128,
-    source_id: Option<Inline<Handle<LongString>>>,
+    source_id: Option<Inline<Handle<UTF8String>>>,
     source_kind: Option<Inline<ShortString>>,
-    source_pointers: BTreeSet<Inline<Handle<LongString>>>,
-    name: Option<Inline<Handle<LongString>>>,
-    media_type: Option<Inline<Handle<LongString>>>,
+    source_pointers: BTreeSet<Inline<Handle<UTF8String>>>,
+    name: Option<Inline<Handle<UTF8String>>>,
+    media_type: Option<Inline<Handle<UTF8String>>>,
     size: Option<Inline<U256BE>>,
 }
 
@@ -2477,14 +2477,14 @@ fn read_message_observation(
     )?;
     let content = one_optional(
         find!(
-            content: Inline<Handle<LongString>>,
+            content: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ observation_id @ archive::content: ?content }])
         )
         .collect(),
         "Teams message content",
     )?;
     let author_names = find!(
-        name: Inline<Handle<LongString>>,
+        name: Inline<Handle<UTF8String>>,
         pattern!(catalog, [{ observation_id @ teams::author_name: ?name }])
     )
     .collect::<BTreeSet<_>>();
@@ -2550,7 +2550,7 @@ fn read_messages(
         messages.reverse();
     }
     for message in messages {
-        let content = read_longstring(
+        let content = read_utf8string(
             &view.reader,
             message.content.expect("present observation has content"),
             "Teams message content",
@@ -2558,7 +2558,7 @@ fn read_messages(
         let mut author_names = message
             .author_names
             .into_iter()
-            .map(|handle| read_longstring(&view.reader, handle, "Teams author display name"))
+            .map(|handle| read_utf8string(&view.reader, handle, "Teams author display name"))
             .collect::<Result<Vec<_>>>()?;
         author_names.sort();
         author_names.dedup();
@@ -2682,7 +2682,7 @@ fn list_attachments(
             .unwrap_or_else(|| format!("{}", row.message_id));
         let source_id = row
             .source_id
-            .map(|handle| read_longstring(&view.reader, handle, "Teams attachment source id"))
+            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment source id"))
             .transpose()?
             .unwrap_or_default();
         let source_kind = row
@@ -2693,17 +2693,17 @@ fn list_attachments(
         let mut source_pointers = row
             .source_pointers
             .into_iter()
-            .map(|handle| read_longstring(&view.reader, handle, "Teams attachment pointer"))
+            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment pointer"))
             .collect::<Result<Vec<_>>>()?;
         source_pointers.sort();
         source_pointers.dedup();
         let name = row
             .name
-            .map(|handle| read_longstring(&view.reader, handle, "Teams attachment name"))
+            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment name"))
             .transpose()?;
         let media_type = row
             .media_type
-            .map(|handle| read_longstring(&view.reader, handle, "Teams attachment media type"))
+            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment media type"))
             .transpose()?;
         let size = row.size.map(inline_u256_to_u128).transpose()?;
         println!(
@@ -2745,7 +2745,7 @@ fn attachment_rows(
         for attachment_id in message.attachments {
             let source_id = one_required(
                 find!(
-                    value: Inline<Handle<LongString>>,
+                    value: Inline<Handle<UTF8String>>,
                     pattern!(catalog, [{ attachment_id @ archive::attachment_source_id: ?value }])
                 )
                 .collect(),
@@ -2760,7 +2760,7 @@ fn attachment_rows(
                 "Teams attachment kind",
             )?;
             let source_pointers = find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ attachment_id @ archive::attachment_source_pointer: ?value }])
             )
             .collect::<BTreeSet<_>>();
@@ -2774,7 +2774,7 @@ fn attachment_rows(
             )?;
             let occurrence_name = one_optional(
                 find!(
-                    value: Inline<Handle<LongString>>,
+                    value: Inline<Handle<UTF8String>>,
                     pattern!(catalog, [{ attachment_id @ archive::attachment_name: ?value }])
                 )
                 .collect(),
@@ -2841,7 +2841,7 @@ fn export_attachment(
     )?;
     let mut candidates = Vec::new();
     for row in rows {
-        let source = read_longstring(
+        let source = read_utf8string(
             &view.reader,
             row.source_id.expect("attachment row has source id"),
             "Teams attachment source id",
@@ -2900,14 +2900,14 @@ fn export_attachment(
     let candidate = candidates.remove(0);
     let media_type = candidate
         .media_type
-        .map(|handle| read_longstring(&view.reader, handle, "attachment media type"))
+        .map(|handle| read_utf8string(&view.reader, handle, "attachment media type"))
         .transpose()?;
     let mut filename = options
         .filename
         .or_else(|| {
             candidate
                 .name
-                .map(|handle| read_longstring(&view.reader, handle, "attachment name"))
+                .map(|handle| read_utf8string(&view.reader, handle, "attachment name"))
                 .transpose()
                 .ok()
                 .flatten()
@@ -3338,7 +3338,7 @@ fn build_page_fragment(
                 .root()
                 .expect("Teams message tombstone has one root");
             fragment += tombstone;
-            let raw = fragment.put::<LongString, _>(message.raw_json);
+            let raw = fragment.put::<UTF8String, _>(message.raw_json);
             fragment += entity! { ExclusiveId::force_ref(&tombstone_id) @
                 teams::message_state: "deleted",
                 teams::message_raw: raw,
@@ -3353,7 +3353,7 @@ fn build_page_fragment(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|external| {
-                let external = fragment.put::<LongString, _>(external.to_owned());
+                let external = fragment.put::<UTF8String, _>(external.to_owned());
                 let author = entity! {
                     metadata::tag: archive::kind_author,
                     teams::source: source_id,
@@ -3377,8 +3377,8 @@ fn build_page_fragment(
         let content = message
             .content
             .as_ref()
-            .map(|content| fragment.put::<LongString, _>(content.to_owned()));
-        let etag = fragment.put::<LongString, _>(
+            .map(|content| fragment.put::<UTF8String, _>(content.to_owned()));
+        let etag = fragment.put::<UTF8String, _>(
             message
                 .etag
                 .as_ref()
@@ -3388,7 +3388,7 @@ fn build_page_fragment(
         let author_name = message
             .author_display_name
             .as_ref()
-            .map(|name| fragment.put::<LongString, _>(name.to_owned()));
+            .map(|name| fragment.put::<UTF8String, _>(name.to_owned()));
         let state = if message.deleted {
             "deleted"
         } else {
@@ -3404,7 +3404,7 @@ fn build_page_fragment(
             .root()
             .expect("Teams message observation has one root");
         fragment += observation;
-        let raw = fragment.put::<LongString, _>(message.raw_json);
+        let raw = fragment.put::<UTF8String, _>(message.raw_json);
         fragment += entity! { ExclusiveId::force_ref(&observation_id) @
             teams::message_state: state,
             metadata::created_at?: message.created_at,
@@ -3427,7 +3427,7 @@ fn stage_message_identity(
     chat_external_id: &str,
     message_external_id: &str,
 ) -> KnownMessage {
-    let chat_external = fragment.put::<LongString, _>(chat_external_id.to_owned());
+    let chat_external = fragment.put::<UTF8String, _>(chat_external_id.to_owned());
     let chat = entity! {
         metadata::tag: teams::kind_chat,
         teams::source: source_id,
@@ -3436,7 +3436,7 @@ fn stage_message_identity(
     let chat_id = chat.root().expect("Teams chat fragment has one root");
     *fragment += chat;
 
-    let message_external = fragment.put::<LongString, _>(message_external_id.to_owned());
+    let message_external = fragment.put::<UTF8String, _>(message_external_id.to_owned());
     let logical = entity! {
         metadata::tag: archive::kind_message,
         teams::chat: chat_id,
@@ -3497,17 +3497,17 @@ fn build_attachment_fragment(
         bail!("Teams attachment has an empty source id");
     }
     let mut fragment = Fragment::empty();
-    let source_handle = fragment.put::<LongString, _>(source_id.to_owned());
+    let source_handle = fragment.put::<UTF8String, _>(source_id.to_owned());
     let name = source
         .name
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(|name| fragment.put::<LongString, _>(name.to_owned()));
+        .map(|name| fragment.put::<UTF8String, _>(name.to_owned()));
     let source_pointer = source
         .source_url
         .as_ref()
-        .map(|url| fragment.put::<LongString, _>(url.to_owned()));
+        .map(|url| fragment.put::<UTF8String, _>(url.to_owned()));
 
     let mut content_type = source.content_type.clone();
     let bytes = match source.content_bytes.clone() {
@@ -4104,7 +4104,7 @@ mod tests {
         assert_eq!(current.len(), 1);
         assert!(!current[0].deleted);
         assert_eq!(
-            read_longstring(&view.reader, current[0].content.unwrap(), "test content").unwrap(),
+            read_utf8string(&view.reader, current[0].content.unwrap(), "test content").unwrap(),
             "edited"
         );
         assert_eq!(
@@ -4211,7 +4211,7 @@ mod tests {
         let current = current_messages(&restored_view.facts, source).unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(
-            read_longstring(
+            read_utf8string(
                 &restored_view.reader,
                 current[0].content.unwrap(),
                 "restored content",
@@ -4337,7 +4337,7 @@ mod tests {
         let observation = *observations.first().unwrap();
         assert_eq!(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(&view.facts, [{ observation @ teams::author_name: ?value }])
             )
             .collect::<BTreeSet<_>>()
@@ -4355,7 +4355,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(&view.facts, [{ attachment @ archive::attachment_source_pointer: ?value }])
             )
             .collect::<BTreeSet<_>>()
@@ -4479,7 +4479,7 @@ mod tests {
         let current = current_messages(&view.facts, source).unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(
-            read_longstring(&view.reader, current[0].content.unwrap(), "test content").unwrap(),
+            read_utf8string(&view.reader, current[0].content.unwrap(), "test content").unwrap(),
             "left"
         );
     }

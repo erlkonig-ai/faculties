@@ -7,7 +7,7 @@
 //! bottom used only by raw source receipts is excluded so provenance volume
 //! cannot perturb corpus statistics. Content parts are occurrences, so the
 //! same content fact at two ordinals contributes twice. Every selected
-//! `LongString` payload is tokenized with [`hash_tokens`], and repeated
+//! `UTF8String` payload is tokenized with [`hash_tokens`], and repeated
 //! documents join by pointwise maximum in the portable carrier.
 //!
 //! Importer receipts are deliberately outside the projection. The recipe
@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{bail, Result};
 
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use ed25519_dalek::VerifyingKey;
@@ -67,7 +67,7 @@ enum DeriveValidation {
 
 #[derive(Debug)]
 struct ProjectionPlan {
-    documents: BTreeMap<Id, Vec<Inline<Handle<LongString>>>>,
+    documents: BTreeMap<Id, Vec<Inline<Handle<UTF8String>>>>,
 }
 
 /// The archive-block-text BM25 law, as a describable type.
@@ -158,12 +158,12 @@ fn derive_for_validation(
             missing = true;
             continue;
         }
-        let blob: Blob<LongString> = reader.get(handle)?;
+        let blob: Blob<UTF8String> = reader.get(handle)?;
         let text: View<str> = match blob.bytes.clone().view() {
             Ok(text) => text,
             Err(error) => {
                 return Ok(DeriveValidation::Rejected(format!(
-                    "resident LongString payload {} is not UTF-8: {error}",
+                    "resident UTF8String payload {} is not UTF-8: {error}",
                     hex::encode_upper(handle.raw),
                 )))
             }
@@ -338,7 +338,7 @@ fn validate_part(entity: Id, rows: &[Trible]) -> std::result::Result<(u64, Id), 
 fn validate_content_fact(
     entity: Id,
     rows: &[Trible],
-) -> std::result::Result<Vec<Inline<Handle<LongString>>>, String> {
+) -> std::result::Result<Vec<Inline<Handle<UTF8String>>>, String> {
     let identity = [
         schema::content_fact::modality.id(),
         schema::content_fact::direction.id(),
@@ -416,7 +416,7 @@ fn validate_content_fact(
 
     Ok(payloads
         .into_iter()
-        .map(Inline::<Handle<LongString>>::new)
+        .map(Inline::<Handle<UTF8String>>::new)
         .collect())
 }
 

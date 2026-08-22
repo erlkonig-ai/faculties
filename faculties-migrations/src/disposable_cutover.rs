@@ -609,7 +609,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
-    use triblespace::core::blob::encodings::longstring::LongString;
+    use triblespace::core::blob::encodings::utf8string::UTF8String;
     use triblespace::core::metadata;
     use triblespace::macros::entity;
 
@@ -668,7 +668,7 @@ use faculties::storage::{initialize_signer};
 
     fn text_fragment(tag: u8, text: &str) -> Fragment {
         let mut fragment = Fragment::empty();
-        let text = fragment.put::<LongString, _>(text.to_owned());
+        let text = fragment.put::<UTF8String, _>(text.to_owned());
         fragment += entity! {
             metadata::tag: Id::new([tag; 16]).unwrap(),
             metadata::description: text,
@@ -715,7 +715,7 @@ use faculties::storage::{initialize_signer};
                     .iter()
                     .find(|fact| fact.a() == &metadata::description.id())
                     .unwrap()
-                    .v::<triblespace::prelude::inlineencodings::Handle<LongString>>();
+                    .v::<triblespace::prelude::inlineencodings::Handle<UTF8String>>();
                 let _: anybytes::View<str> = reader.get(handle)?;
                 Ok(())
             },

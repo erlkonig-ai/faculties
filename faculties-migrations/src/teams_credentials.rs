@@ -33,7 +33,7 @@ use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::metadata;
 use triblespace::macros::{attributes, id_hex};
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
@@ -47,13 +47,13 @@ mod legacy {
 
     attributes! {
         "5F10520477A04E5FB322C85CC78C6762" unsafe as pub local_kind: GenId;
-        "438A29922F91F873A69C3856AA7A553F" unsafe as pub access_token: Handle<LongString>;
-        "60C85DD37D09D3D27BC6BFA0E8040EA9" unsafe as pub refresh_token: Handle<LongString>;
-        "0F7784BBDA2EE5B9009DE688472D6F24" unsafe as pub token_type: Handle<LongString>;
-        "139B46989D7F56C7DFE6259FD74479AC" unsafe as pub scope: Handle<LongString>;
-        "34ACCCECE281E1A0E191EEEBE7E47A23" unsafe as pub tenant: Handle<LongString>;
-        "8C6CA6A45DCA9F78420BC216A83F4C22" unsafe as pub client_id: Handle<LongString>;
-        "0E734F66EBBA45ED022D1EE539B11EBE" unsafe as pub client_secret: Handle<LongString>;
+        "438A29922F91F873A69C3856AA7A553F" unsafe as pub access_token: Handle<UTF8String>;
+        "60C85DD37D09D3D27BC6BFA0E8040EA9" unsafe as pub refresh_token: Handle<UTF8String>;
+        "0F7784BBDA2EE5B9009DE688472D6F24" unsafe as pub token_type: Handle<UTF8String>;
+        "139B46989D7F56C7DFE6259FD74479AC" unsafe as pub scope: Handle<UTF8String>;
+        "34ACCCECE281E1A0E191EEEBE7E47A23" unsafe as pub tenant: Handle<UTF8String>;
+        "8C6CA6A45DCA9F78420BC216A83F4C22" unsafe as pub client_id: Handle<UTF8String>;
+        "0E734F66EBBA45ED022D1EE539B11EBE" unsafe as pub client_secret: Handle<UTF8String>;
         // Teams published this expiry before the April 2026 timestamp
         // migration moved new writes to `metadata::expires_at`.
         "706CC590BF4684CA8FA00E4123C43124" unsafe as pub expires_at: NsTAIInterval;
@@ -263,7 +263,7 @@ pub fn plan(pile: &Path) -> Result<TeamsCredentialReport> {
 
     let reader = source.reader();
     let mut unreadable_payloads = 0;
-    let mut text = |handle: Inline<Handle<LongString>>| -> Option<String> {
+    let mut text = |handle: Inline<Handle<UTF8String>>| -> Option<String> {
         match reader.get::<anybytes::View<str>, _>(handle) {
             Ok(view) => Some(view.as_ref().to_owned()),
             Err(_) => {
@@ -298,11 +298,11 @@ pub fn plan(pile: &Path) -> Result<TeamsCredentialReport> {
         }
     }
 
-    let single = |entity: &Id, attribute: Id| -> Option<Inline<Handle<LongString>>> {
+    let single = |entity: &Id, attribute: Id| -> Option<Inline<Handle<UTF8String>>> {
         let mut values = facts
             .iter()
             .filter(|fact| fact.e() == entity && fact.a() == &attribute)
-            .map(|fact| *fact.v::<Handle<LongString>>())
+            .map(|fact| *fact.v::<Handle<UTF8String>>())
             .collect::<Vec<_>>();
         values.dedup();
         match values.as_slice() {
@@ -373,7 +373,7 @@ pub fn plan(pile: &Path) -> Result<TeamsCredentialReport> {
     let mut user_ids = facts
         .iter()
         .filter(|fact| fact.a() == &faculties::schemas::teams::teams::user_id.id())
-        .map(|fact| *fact.v::<Handle<LongString>>())
+        .map(|fact| *fact.v::<Handle<UTF8String>>())
         .collect::<Vec<_>>();
     user_ids.dedup();
     let user_ids = user_ids
@@ -537,13 +537,13 @@ mod tests {
             let expiry_value = (expiry, expiry).try_to_inline().unwrap();
 
             let mut fragment = Fragment::empty();
-            let tenant = fragment.put::<LongString, _>("tenant-guid".to_owned());
-            let client_id = fragment.put::<LongString, _>("client-guid".to_owned());
-            let client_secret = fragment.put::<LongString, _>(format!("client-secret-{index}"));
-            let access = fragment.put::<LongString, _>(format!("access-{index}"));
-            let refresh = fragment.put::<LongString, _>(format!("refresh-{index}"));
-            let token_type = fragment.put::<LongString, _>("Bearer".to_owned());
-            let scope = fragment.put::<LongString, _>("Chat.Read User.Read".to_owned());
+            let tenant = fragment.put::<UTF8String, _>("tenant-guid".to_owned());
+            let client_id = fragment.put::<UTF8String, _>("client-guid".to_owned());
+            let client_secret = fragment.put::<UTF8String, _>(format!("client-secret-{index}"));
+            let access = fragment.put::<UTF8String, _>(format!("access-{index}"));
+            let refresh = fragment.put::<UTF8String, _>(format!("refresh-{index}"));
+            let token_type = fragment.put::<UTF8String, _>("Bearer".to_owned());
+            let scope = fragment.put::<UTF8String, _>("Chat.Read User.Read".to_owned());
             fragment += entity! { ExclusiveId::force_ref(&config) @
                 legacy::local_kind: legacy::KIND_CONFIG,
                 metadata::created_at: at_value,

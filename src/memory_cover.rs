@@ -23,7 +23,7 @@ use hifitime::Epoch;
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 use triblespace_search::bm25::BM25Builder;
@@ -40,8 +40,8 @@ use crate::schemas::memory::{ctx, KIND_CHUNK_ID};
 // self-contained. memory.rs re-imports these via `use faculties::memory_cover::…`.
 // ---------------------------------------------------------------------------
 
-pub fn chunk_summary_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<LongString>>> {
-    find!(h: Inline<Handle<LongString>>, pattern!(space, [{ id @ ctx::summary: ?h }])).next()
+pub fn chunk_summary_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<UTF8String>>> {
+    find!(h: Inline<Handle<UTF8String>>, pattern!(space, [{ id @ ctx::summary: ?h }])).next()
 }
 
 /// The raw image bytes handle of a WORDLESS image memory chunk, if it is one.
@@ -62,8 +62,8 @@ pub fn chunk_span_str(space: &TribleSet, id: Id) -> String {
 
 /// A chunk's lens-theme handle, if it is a thematic lens (not part of the
 /// chronological spine). Presence is what excludes it from the temporal cover.
-pub fn chunk_lens_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<LongString>>> {
-    find!(h: Inline<Handle<LongString>>, pattern!(space, [{ id @ ctx::lens: ?h }])).next()
+pub fn chunk_lens_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<UTF8String>>> {
+    find!(h: Inline<Handle<UTF8String>>, pattern!(space, [{ id @ ctx::lens: ?h }])).next()
 }
 
 pub fn chunk_start_at(space: &TribleSet, id: Id) -> Option<Inline<NsTAIInterval>> {

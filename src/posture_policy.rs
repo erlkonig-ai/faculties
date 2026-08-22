@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
@@ -34,7 +34,7 @@ use crate::schemas::posture::{
     KIND_POLICY_REVISION, KIND_TERM,
 };
 
-type TextHandle = Inline<Handle<LongString>>;
+type TextHandle = Inline<Handle<UTF8String>>;
 
 pub fn validate_policy_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
     validate_policy_catalog_with::<PileReader>(reader, None, facts)
@@ -561,7 +561,7 @@ where
         ]
         .contains(fact.a())
         {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             read_text_with(reader, staged, handle, "text").with_context(|| {
                 format!(
                     "read Posture text payload {}",

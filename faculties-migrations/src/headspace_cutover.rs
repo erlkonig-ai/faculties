@@ -339,7 +339,7 @@ use faculties::storage::{initialize_signer};
             Attribute::<inlineencodings::Handle<blobencodings::RawBytes>>::anchored(id(0x13));
         let mut profile_fragment = Fragment::empty();
         let name = profile_fragment
-            .put::<blobencodings::LongString, _>("legacy headspace profile".to_owned());
+            .put::<blobencodings::UTF8String, _>("legacy headspace profile".to_owned());
         let content_payload =
             profile_fragment.put::<blobencodings::RawBytes, _>(b"future content payload".to_vec());
         profile_fragment += entity! { ExclusiveId::force_ref(&profile) @
@@ -372,7 +372,7 @@ use faculties::storage::{initialize_signer};
         let context = id(0x21);
         let mut context_fragment = Fragment::empty();
         let context_iri = context_fragment
-            .put::<blobencodings::LongString, _>("urn:legacy:headspace:context".to_owned());
+            .put::<blobencodings::UTF8String, _>("urn:legacy:headspace:context".to_owned());
         context_fragment += entity! { ExclusiveId::force_ref(&context) @
             metadata::iri: context_iri,
         };
@@ -453,7 +453,7 @@ use faculties::storage::{initialize_signer};
                 .iter()
                 .filter(|fact| fact.a() == &metadata::description.id())
             {
-                let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+                let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
                 let value: View<str> = reader.get(handle).unwrap();
                 descriptions.push(value.to_string());
             }

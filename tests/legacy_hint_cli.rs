@@ -20,7 +20,7 @@ use triblespace::prelude::*;
 
 fn goal_fragment(title: &str) -> Fragment {
     let mut fragment = Fragment::empty();
-    let handle = fragment.put::<blobencodings::LongString, _>(title.to_owned());
+    let handle = fragment.put::<blobencodings::UTF8String, _>(title.to_owned());
     let goal = genid();
     fragment += entity! { &goal @
         metadata::tag: &KIND_GOAL_ID,

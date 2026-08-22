@@ -14,14 +14,14 @@ use hifitime::Epoch;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 use crate::schemas::archive::archive;
 use crate::schemas::discord::discord;
 
-pub type TextHandle = Inline<Handle<LongString>>;
+pub type TextHandle = Inline<Handle<UTF8String>>;
 
 /// Validate and decode Discord's canonical decimal representation of a
 /// snowflake. Zero is not a Discord object id; coverage boundaries may use

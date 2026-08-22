@@ -46,7 +46,7 @@ pub mod board {
     use super::*;
 
     attributes! {
-        "EE18CEC15C18438A2FAB670E2E46E00C" unsafe as title: inlineencodings::Handle<blobencodings::LongString>;
+        "EE18CEC15C18438A2FAB670E2E46E00C" unsafe as title: inlineencodings::Handle<blobencodings::UTF8String>;
         // TODO: migrate to metadata::tag (GenId) — tags should be entities with
         // their own ID + metadata::name, not inline strings. See wiki.rs TagIndex
         // for the correct pattern. This ShortString tag is a legacy design mistake.
@@ -68,16 +68,16 @@ pub mod board {
         // Optional acting persona (relations person id) on status and note
         // events. This is attribution only; it has no workflow semantics.
         "34718CDC13D0E3D8750DB58105390AB3" unsafe as by: inlineencodings::GenId;
-        "47351DF00B3DDA96CB305157CD53D781" unsafe as note: inlineencodings::Handle<blobencodings::LongString>;
+        "47351DF00B3DDA96CB305157CD53D781" unsafe as note: inlineencodings::Handle<blobencodings::UTF8String>;
         // Opaque, exact references attached to a note. Repeated handles keep
         // the ledger queryable without assigning any interpretation here.
-        "FD59B704D0F1D06AF14102ADCB5F6FF0" unsafe as reference: inlineencodings::Handle<blobencodings::LongString>;
+        "FD59B704D0F1D06AF14102ADCB5F6FF0" unsafe as reference: inlineencodings::Handle<blobencodings::UTF8String>;
         "B88842D9D00361A0F2728C478C79D75C" unsafe as higher: inlineencodings::GenId;
         "18F3446C9E9281A248D370A56395A3F0" unsafe as lower: inlineencodings::GenId;
     }
 }
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 pub fn interval_key(interval: IntervalValue) -> i128 {

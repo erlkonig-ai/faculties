@@ -9,7 +9,7 @@ use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
 /// Text handle type for wiki content/title blobs.
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
 /// Stable scope of the authored Wiki collection.
 ///
@@ -72,8 +72,8 @@ pub mod attrs {
         "FF2DD2D2E71E8CD4AC45C0667FECAF4A" as revision: inlineencodings::GenId;
         "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as author: inlineencodings::GenId;
         "EBFC56D50B748E38A14F5FC768F1B9C1" unsafe as fragment: inlineencodings::GenId;
-        "6DBBE746B7DD7A4793CA098AB882F553" unsafe as content: inlineencodings::Handle<blobencodings::LongString>;
-        "78BABEF1792531A2E51A372D96FE5F3E" unsafe as title: inlineencodings::Handle<blobencodings::LongString>;
+        "6DBBE746B7DD7A4793CA098AB882F553" unsafe as content: inlineencodings::Handle<blobencodings::UTF8String>;
+        "78BABEF1792531A2E51A372D96FE5F3E" unsafe as title: inlineencodings::Handle<blobencodings::UTF8String>;
         "DEAFB7E307DF72389AD95A850F24BAA5" unsafe as links_to: inlineencodings::GenId;
         // Content-hash reference: `files:<64-char-blake3>` points to file bytes directly.
         "C61CA2F2A70103FD79E97C2F88B854D8" unsafe as references_file_content: inlineencodings::Handle<blobencodings::RawBytes>;

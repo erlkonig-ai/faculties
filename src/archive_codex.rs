@@ -809,7 +809,7 @@ mod tests {
     use triblespace::core::repo::pile::{Pile, PileReader};
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
     use triblespace::macros::{find, pattern};
-    use triblespace::prelude::blobencodings::{LongString, RawBytes};
+    use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;
@@ -1004,8 +1004,8 @@ mod tests {
             .count(),
             3
         );
-        let thinking_payloads: Vec<Inline<Handle<LongString>>> = find!(
-            payload: Inline<Handle<LongString>>,
+        let thinking_payloads: Vec<Inline<Handle<UTF8String>>> = find!(
+            payload: Inline<Handle<UTF8String>>,
             pattern!(fragment.facts(), [
                 {
                     _?fact @ schema::content_fact::modality:
@@ -1023,7 +1023,7 @@ mod tests {
         let mut blobs = fragment.blobs().clone();
         let blob_reader = blobs.reader().unwrap();
         let reasoning = blob_reader
-            .get::<View<str>, LongString>(thinking_payloads[0])
+            .get::<View<str>, UTF8String>(thinking_payloads[0])
             .unwrap();
         assert_eq!(reasoning.as_ref(), "I should answer directly.");
         assert!(!exists!(pattern!(fragment.facts(), [{

@@ -27,7 +27,7 @@ use crate::schemas::habit::{
 };
 use crate::legacy_hint::open_scope;
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type ScriptHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 

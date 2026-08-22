@@ -15,7 +15,7 @@ use triblespace::prelude::*;
 
 use crate::schemas::status::{status, KIND_STATUS_UPDATE};
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 /// One complete immutable Status event.
@@ -384,7 +384,7 @@ mod tests {
         )
         .contains("read Status text payload"));
 
-        let invalid = Blob::<blobencodings::LongString>::new(Bytes::from(vec![0xFF]));
+        let invalid = Blob::<blobencodings::UTF8String>::new(Bytes::from(vec![0xFF]));
         let invalid_handle = invalid.get_handle();
         storage.blobs.insert(invalid);
         let reader = storage.reader().unwrap();

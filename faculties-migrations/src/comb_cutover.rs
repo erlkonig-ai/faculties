@@ -18,7 +18,7 @@ use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
@@ -650,7 +650,7 @@ fn transform_branch(source: &FrozenSource, branch: &FrozenLegacyBranch) -> Resul
 fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
     for fact in facts {
         if fact.a() == &metadata::name.id() || fact.a() == &metadata::description.id() {
-            let handle = *fact.v::<Handle<LongString>>();
+            let handle = *fact.v::<Handle<UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "strictly read legacy Comb metadata text {}",

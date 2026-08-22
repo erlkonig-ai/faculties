@@ -5,7 +5,7 @@
 //! produces.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
 use triblespace::prelude::*;
 
@@ -23,14 +23,14 @@ pub mod web_schema {
 
     // Attribute IDs minted with: `trible genid`
     attributes! {
-        "0CA16690DE44435B773224C275FD4E76" unsafe as query: Handle<LongString>;
+        "0CA16690DE44435B773224C275FD4E76" unsafe as query: Handle<UTF8String>;
         "D0A6B39F715FE17935540232656CE0A3" unsafe as provider: ShortString;
         "D50E38414AB7068C78602DD56C785634" unsafe as result: GenId;
 
-        "099BE36C62777693D66A5F6183ABE9F2" unsafe as url: Handle<LongString>;
-        "A88A91F1F794A30088AB1E4913812D6B" unsafe as title: Handle<LongString>;
-        "6C149EFDDCFEAE8EC101A362035F75D7" unsafe as snippet: Handle<LongString>;
-        "A16BCA98FDE2E8E15F599F3D76E7CDC8" unsafe as content: Handle<LongString>;
+        "099BE36C62777693D66A5F6183ABE9F2" unsafe as url: Handle<UTF8String>;
+        "A88A91F1F794A30088AB1E4913812D6B" unsafe as title: Handle<UTF8String>;
+        "6C149EFDDCFEAE8EC101A362035F75D7" unsafe as snippet: Handle<UTF8String>;
+        "A16BCA98FDE2E8E15F599F3D76E7CDC8" unsafe as content: Handle<UTF8String>;
     }
 
     #[allow(non_upper_case_globals)]

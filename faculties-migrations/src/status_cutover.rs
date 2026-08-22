@@ -358,7 +358,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn legacy_event(window: Id, text: &str, at: status::IntervalValue) -> Fragment {
         let mut fragment = Fragment::empty();
-        let text = fragment.put::<blobencodings::LongString, _>(text.to_owned());
+        let text = fragment.put::<blobencodings::UTF8String, _>(text.to_owned());
         fragment += entity! { &ufoid() @
             metadata::tag: &KIND_STATUS_UPDATE,
             status_attr::window: window,

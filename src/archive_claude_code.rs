@@ -41,7 +41,7 @@ use hifitime::Epoch;
 use rayon::prelude::*;
 use triblespace::core::blob::Bytes;
 use triblespace::core::import::scanner as sc;
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
@@ -627,7 +627,7 @@ fn build_block_ids(
 }
 
 fn source_projection_id(source: &SourceKey, raw_digest: [u8; 32], block: Id) -> Id {
-    let locator: Inline<Handle<LongString>> =
+    let locator: Inline<Handle<UTF8String>> =
         Handle::from_hash(Inline::new(Blake3::digest(source.locator().as_bytes())));
     let raw_record: Inline<Handle<RawBytes>> = Handle::from_hash(Inline::new(raw_digest));
     entity! { _ @
@@ -1795,7 +1795,7 @@ mod tests {
     use triblespace::core::metadata;
     use triblespace::core::repo::pile::{Pile, PileReader};
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
-    use triblespace::prelude::blobencodings::{LongString, RawBytes};
+    use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;
@@ -1857,7 +1857,7 @@ mod tests {
         let mut fragment = fragment.clone();
         let reader = fragment.blobs_mut().reader().unwrap();
         for (block, payload) in find!(
-            (block: Id, payload: Inline<Handle<LongString>>),
+            (block: Id, payload: Inline<Handle<UTF8String>>),
             pattern!(fragment.facts(), [
                 { ?block @ schema::block::contains: _?part },
                 { _?part @ schema::content_part::fact: _?fact },

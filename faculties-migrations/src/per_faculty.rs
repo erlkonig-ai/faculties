@@ -291,7 +291,7 @@ mod tests {
         let branch = *repository.create_branch(LEGACY_BRANCH_NAME, None).unwrap();
         let mut workspace = repository.pull(branch).unwrap();
         let mut authored = Fragment::empty();
-        let title = authored.put::<blobencodings::LongString, _>("preserve me".to_owned());
+        let title = authored.put::<blobencodings::UTF8String, _>("preserve me".to_owned());
         authored += entity! { ExclusiveId::force_ref(&goal) @
             metadata::tag: &KIND_GOAL_ID,
             board::title: title,

@@ -24,7 +24,7 @@
 //! they connect to that baseline cover.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{GenId, Handle, U256BE};
 use triblespace::prelude::*;
 
@@ -61,30 +61,30 @@ pub mod discord {
         /// External Discord snowflake for a guild (server). Stored
         /// as a string — Discord ids are u64 but the REST API
         /// ships them as strings to survive JavaScript clients.
-        "9E8EC81F5C14805CCFD4930A4B877138" unsafe as pub guild_id: Handle<LongString>;
+        "9E8EC81F5C14805CCFD4930A4B877138" unsafe as pub guild_id: Handle<UTF8String>;
         /// External Discord snowflake for a channel.
-        "7C943A11E09C922989CAFE22B92E9A51" unsafe as pub channel_id: Handle<LongString>;
+        "7C943A11E09C922989CAFE22B92E9A51" unsafe as pub channel_id: Handle<UTF8String>;
         /// External Discord snowflake for a message.
-        "758C42164B566C2AFECBCD7129163A34" unsafe as pub message_id: Handle<LongString>;
+        "758C42164B566C2AFECBCD7129163A34" unsafe as pub message_id: Handle<UTF8String>;
         /// External Discord snowflake for a user.
-        "2A74F35C6720A0C60BF43D30DF272F85" unsafe as pub user_id: Handle<LongString>;
+        "2A74F35C6720A0C60BF43D30DF272F85" unsafe as pub user_id: Handle<UTF8String>;
         /// Full Discord JSON body of a message. Stored raw so
         /// future code can derive additional fields without
         /// re-fetching.
         #[allow(dead_code)]
-        "5B9DCF6170CD775FC5DA22C8DB96599D" unsafe as pub message_raw: Handle<LongString>;
+        "5B9DCF6170CD775FC5DA22C8DB96599D" unsafe as pub message_raw: Handle<UTF8String>;
         /// Bot token (passed to the REST API as `Authorization:
         /// Bot <token>`). One token per bot identity; a caller
         /// who operates multiple bots would tag the token entity
         /// with a different `kind` or a user-scoped id.
         #[allow(dead_code)]
-        "E20FEC3E1714D5EDC556936AE1C0F463" unsafe as pub bot_token: Handle<LongString>;
+        "E20FEC3E1714D5EDC556936AE1C0F463" unsafe as pub bot_token: Handle<UTF8String>;
         /// Per-channel pagination cursor — the snowflake of the
         /// newest message we ingested. Next sync fetches
-        /// `?after=<cursor>`. Stored as a LongString handle for
+        /// `?after=<cursor>`. Stored as a UTF8String handle for
         /// consistency with the other snowflake attributes.
         #[allow(dead_code)]
-        "3C510E125ACE09DC9B297D533C0F13B7" unsafe as pub cursor_last_message_id: Handle<LongString>;
+        "3C510E125ACE09DC9B297D533C0F13B7" unsafe as pub cursor_last_message_id: Handle<UTF8String>;
         /// Exclusive lower endpoint of one fully persisted numeric coverage
         /// interval.
         ///

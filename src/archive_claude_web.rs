@@ -1047,7 +1047,7 @@ mod tests {
     use tempfile::TempDir;
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
     use triblespace::macros::{exists, pattern};
-    use triblespace::prelude::blobencodings::{LongString, RawBytes};
+    use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;
@@ -1143,7 +1143,7 @@ mod tests {
                     .expect("source projection has one root");
                 let (locator, raw, block) = find!(
                     (
-                        locator: Inline<Handle<LongString>>,
+                        locator: Inline<Handle<UTF8String>>,
                         raw: Inline<Handle<RawBytes>>,
                         block: Id
                     ),
@@ -1462,7 +1462,7 @@ mod tests {
                 let projection = projected.fragment.root().unwrap();
                 let (locator, block) = find!(
                     (
-                        locator: Inline<Handle<LongString>>,
+                        locator: Inline<Handle<UTF8String>>,
                         block: Id
                     ),
                     pattern!(&projected.fragment, [{

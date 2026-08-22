@@ -208,7 +208,7 @@ mod tests {
     use triblespace::core::repo::BlobStore;
     use triblespace::core::repo::{PinStore, Repository};
 
-    type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+    type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
     #[test]
     fn cli_definition_is_consistent() {

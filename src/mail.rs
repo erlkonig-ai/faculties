@@ -33,7 +33,7 @@ use crate::schemas::mail::{
 use crate::schemas::message::local as legacy_read;
 use crate::secrets::{self, SecretsCatalog};
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 pub type DigestValue = Inline<inlineencodings::Hash<inlineencodings::Blake3>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -1524,7 +1524,7 @@ fn validate_source_text_payloads<Overlay: BlobStoreGet>(
     let handles: BTreeSet<TextHandle> = source_facts
         .iter()
         .filter(|fact| attributes.contains(fact.a()))
-        .map(|fact| *fact.v::<inlineencodings::Handle<blobencodings::LongString>>())
+        .map(|fact| *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>())
         .collect();
     for handle in handles {
         text_union(reader, overlay, handle)?;
@@ -2592,7 +2592,7 @@ fn validate_legacy_evidence<Overlay: BlobStoreGet>(
                     fact.a()
                 );
             }
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: String = text_union(reader, overlay, handle)?;
         }
         expected += record;
@@ -2667,7 +2667,7 @@ fn text_values(
     let handles: BTreeSet<TextHandle> = facts
         .iter()
         .filter(|fact| fact.e() == &id && fact.a() == &attribute)
-        .map(|fact| *fact.v::<inlineencodings::Handle<blobencodings::LongString>>())
+        .map(|fact| *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>())
         .collect();
     handles
         .into_iter()

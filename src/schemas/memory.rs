@@ -5,7 +5,7 @@
 //! that wants to read memory chunks from a pile.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
@@ -65,7 +65,7 @@ pub mod archive_schema {
     use super::*;
     attributes! {
         "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as author: GenId;
-        "E63EE961ABDB1D1BEC0789FDAFFB9501" unsafe as author_name: Handle<LongString>;
+        "E63EE961ABDB1D1BEC0789FDAFFB9501" unsafe as author_name: Handle<UTF8String>;
     }
 }
 
@@ -73,7 +73,7 @@ pub mod archive_import_schema {
     use super::*;
     attributes! {
         "E997DCAAF43BAA04790FCB0FA0FBFE3A" unsafe as source_format: ShortString;
-        "87B587A3906056038FD767F4225274F9" unsafe as source_conversation_id: Handle<LongString>;
+        "87B587A3906056038FD767F4225274F9" unsafe as source_conversation_id: Handle<UTF8String>;
     }
 }
 
@@ -188,7 +188,7 @@ pub mod comb {
 pub mod ctx {
     use super::*;
     attributes! {
-        "3292CF0B3B6077991D8ECE6E2973D4B6" unsafe as summary: Handle<LongString>;
+        "3292CF0B3B6077991D8ECE6E2973D4B6" unsafe as summary: Handle<UTF8String>;
         "502F7D33822A90366F0F0ADA0556177F" unsafe as start_at: NsTAIInterval;
         "DF84E872EB68FBFCA63D760F27FD8A6F" unsafe as end_at: NsTAIInterval;
         /// Contextualised cross-reference to another chunk, extracted from
@@ -221,7 +221,7 @@ pub mod ctx {
         /// the eras it overlaps. They are read on their own axis via
         /// `memory lens <theme>`. This is what lets memory be a many-threaded
         /// weave — overlapping views over the same time — instead of one tree.
-        "B53D37A3BE552B0F47E279D69AB7ECD3" unsafe as lens: Handle<LongString>;
+        "B53D37A3BE552B0F47E279D69AB7ECD3" unsafe as lens: Handle<UTF8String>;
         /// The raw image bytes of a WORDLESS image memory chunk. A chunk with
         /// this attribute is a memory whose content is a picture, not prose —
         /// no `ctx::summary` is required. It shares the same time-coordinate

@@ -23,7 +23,7 @@ use crate::schemas::relations::{
     KIND_IDENTITY_VERDICT, KIND_PERSON_ID, KIND_PERSON_LIFECYCLE, KIND_PERSON_PROFILE,
 };
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 /// One queryable observation of when a stable person or group anchor was
 /// created in a source system.
 pub type ObservedAt = Inline<inlineencodings::NsTAIInterval>;

@@ -22,7 +22,7 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
@@ -32,7 +32,7 @@ use crate::schemas::files::{file, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_M
 use crate::legacy_hint::open_scope;
 
 pub type ContentHandle = Inline<Handle<RawBytes>>;
-pub type NameHandle = Inline<Handle<LongString>>;
+pub type NameHandle = Inline<Handle<UTF8String>>;
 pub type ImportTime = Inline<NsTAIInterval>;
 pub const DEFAULT_MEDIA_TYPE: &str = "application/octet-stream";
 
@@ -614,7 +614,7 @@ pub fn validate_known_payloads<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -
             || fact.a() == &metadata::name.id()
             || fact.a() == &metadata::description.id()
         {
-            let handle = *fact.v::<Handle<LongString>>();
+            let handle = *fact.v::<Handle<UTF8String>>();
             let _: anybytes::View<str> = reader.get(handle).map_err(|error| {
                 anyhow!(
                     "strictly read Files text {}: {error:?}",
@@ -921,7 +921,7 @@ pub fn validate_catalog<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Resul
 pub fn media_type_fragment(media_type: &str) -> Result<Fragment> {
     let media_type = normalize_media_type(media_type)?;
     let mut fragment = Fragment::empty();
-    let name = fragment.put::<LongString, _>(media_type);
+    let name = fragment.put::<UTF8String, _>(media_type);
     fragment += entity! {
         metadata::tag: &KIND_MEDIA_TYPE,
         metadata::name: name,
@@ -943,8 +943,8 @@ where
     let media_type = normalize_media_type(media_type)?;
     let mut fragment = Fragment::empty();
     let content = fragment.put::<RawBytes, _>(bytes);
-    let name = fragment.put::<LongString, _>(leaf_name(&name.into()));
-    let media_type_name = fragment.put::<LongString, _>(media_type);
+    let name = fragment.put::<UTF8String, _>(leaf_name(&name.into()));
+    let media_type_name = fragment.put::<UTF8String, _>(media_type);
     let media_type = entity! {
         metadata::tag: &KIND_MEDIA_TYPE,
         metadata::name: media_type_name,
@@ -1045,7 +1045,7 @@ mod tests {
     fn imported_file_fragment(path: &str) -> (Fragment, Id, Id) {
         let mut fragment = stage(b"imported bytes".to_vec(), "report.txt", "text/plain").unwrap();
         let root = fragment.root().unwrap();
-        let source_path = fragment.put::<LongString, _>(path.to_owned());
+        let source_path = fragment.put::<UTF8String, _>(path.to_owned());
         let instant = Epoch::from_tai_seconds(42.0);
         let imported_at: ImportTime = (instant, instant).try_to_inline().unwrap();
         let import = entity! {
@@ -1077,8 +1077,8 @@ mod tests {
     fn catalog_preserves_set_valued_legacy_file_provenance() {
         let mut fragment = stage(b"legacy bytes".to_vec(), "legacy.txt", "text/plain").unwrap();
         let file_id = fragment.root().unwrap();
-        let first_path = fragment.put::<LongString, _>("mail:first".to_owned());
-        let second_path = fragment.put::<LongString, _>("mail:second".to_owned());
+        let first_path = fragment.put::<UTF8String, _>("mail:first".to_owned());
+        let second_path = fragment.put::<UTF8String, _>("mail:second".to_owned());
         let first_time = Epoch::from_tai_seconds(41.0);
         let first_time: ImportTime = (first_time, first_time).try_to_inline().unwrap();
         let second_time = Epoch::from_tai_seconds(42.0);
@@ -1121,7 +1121,7 @@ mod tests {
     fn catalog_rejects_provenance_or_roots_on_untyped_entities() {
         let mut with_path = stage(b"typed".to_vec(), "typed.txt", "text/plain").unwrap();
         let unknown = Id::new([0x53; 16]).unwrap();
-        let path = with_path.put::<LongString, _>("unknown:path".to_owned());
+        let path = with_path.put::<UTF8String, _>("unknown:path".to_owned());
         with_path += entity! { ExclusiveId::force_ref(&unknown) @ file::source_path: path };
         let mut blobs = with_path.blobs().clone();
         let reader = blobs.reader().unwrap();
@@ -1161,7 +1161,7 @@ mod tests {
         assert!(format!("{error:#}").contains("2 values for imported_at"));
 
         let (mut conflicting, _, import_id) = imported_file_fragment("/tmp/report.txt");
-        let alternate = conflicting.put::<LongString, _>("/tmp/alternate.txt".to_owned());
+        let alternate = conflicting.put::<UTF8String, _>("/tmp/alternate.txt".to_owned());
         conflicting +=
             entity! { ExclusiveId::force_ref(&import_id) @ file::source_path: alternate };
         let mut blobs = conflicting.blobs().clone();
@@ -1195,7 +1195,7 @@ mod tests {
     fn catalog_rejects_competing_file_name_and_content() {
         let mut fragment = stage(b"named".to_vec(), "record.txt", "text/plain").unwrap();
         let file_id = fragment.root().unwrap();
-        let competing = fragment.put::<LongString, _>("alternate.txt".to_owned());
+        let competing = fragment.put::<UTF8String, _>("alternate.txt".to_owned());
         fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::name: competing };
         let mut blobs = fragment.blobs().clone();
         let reader = blobs.reader().unwrap();
@@ -1498,7 +1498,7 @@ mod tests {
         let mut blobs = file.blobs().clone();
         let reader = blobs.reader().expect("fragment blob reader");
         let name: anybytes::View<str> = reader
-            .get::<anybytes::View<str>, LongString>(name_handle)
+            .get::<anybytes::View<str>, UTF8String>(name_handle)
             .expect("staged media type name");
         assert_eq!(
             name.as_ref(),
@@ -1550,7 +1550,7 @@ mod tests {
         .expect("persisted file name handle");
         let name_handle = media_type_name_handle(&catalog, file_id).expect("canonical media type");
         let name: anybytes::View<str> = reopened
-            .get::<anybytes::View<str>, LongString>(name_handle)
+            .get::<anybytes::View<str>, UTF8String>(name_handle)
             .expect("persisted media type name");
         assert_eq!(
             name.as_ref(),

@@ -17,7 +17,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
@@ -43,7 +43,7 @@ const RETIRED_OAUTH_SECRET_ATTRIBUTES: [Id; 3] = [
     id_hex!("0E734F66EBBA45ED022D1EE539B11EBE"),
 ];
 
-pub type TextHandle = Inline<Handle<LongString>>;
+pub type TextHandle = Inline<Handle<UTF8String>>;
 
 /// One usable head of the source-scoped receipt DAG.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,7 +107,7 @@ pub struct CurrentMessage {
 /// Construct the intrinsic source entity for one concrete tenant.
 pub fn source_fragment(tenant: &str) -> Fragment {
     let mut source = Fragment::empty();
-    let tenant = source.put::<LongString, _>(canonical_tenant(tenant));
+    let tenant = source.put::<UTF8String, _>(canonical_tenant(tenant));
     source += entity! {
         metadata::tag: teams::kind_source,
         teams::tenant_id: tenant,
@@ -130,8 +130,8 @@ pub fn context_fragment(
     }
     let predecessors = predecessors.into_iter().collect::<BTreeSet<_>>();
     let mut fragment = Fragment::empty();
-    let name = fragment.put::<LongString, _>(name.to_owned());
-    let boundary = fragment.put::<LongString, _>(boundary.to_owned());
+    let name = fragment.put::<UTF8String, _>(name.to_owned());
+    let boundary = fragment.put::<UTF8String, _>(boundary.to_owned());
     fragment += entity! {
         metadata::tag: teams::kind_context,
         teams::source: source,
@@ -204,9 +204,9 @@ pub fn auth_profile_fragment(
     let record = AuthProfileRecord {
         id: source,
         source,
-        client_id: fragment.put::<LongString, _>(client_id),
-        user_id: fragment.put::<LongString, _>(user_id),
-        scopes: fragment.put::<LongString, _>(scopes),
+        client_id: fragment.put::<UTF8String, _>(client_id),
+        user_id: fragment.put::<UTF8String, _>(user_id),
+        scopes: fragment.put::<UTF8String, _>(scopes),
         client_secret_version,
         delegated_token_version,
         predecessors: predecessors.into_iter().collect(),
@@ -398,7 +398,7 @@ pub fn observation_fragment(
     if fragment.root() != Some(expected_source) {
         bail!("Teams tenant/source identity mismatch while constructing observation");
     }
-    let chat_external = fragment.put::<LongString, _>(input.chat_id);
+    let chat_external = fragment.put::<UTF8String, _>(input.chat_id);
     let chat = entity! {
         metadata::tag: teams::kind_chat,
         teams::source: expected_source,
@@ -406,7 +406,7 @@ pub fn observation_fragment(
     };
     let chat_id = chat.root().expect("Teams chat has one root");
     fragment += chat;
-    let message_external = fragment.put::<LongString, _>(input.message_id);
+    let message_external = fragment.put::<UTF8String, _>(input.message_id);
     let message = entity! {
         metadata::tag: archive::kind_message,
         teams::chat: chat_id,
@@ -421,7 +421,7 @@ pub fn observation_fragment(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|external| {
-            let external = fragment.put::<LongString, _>(external.to_owned());
+            let external = fragment.put::<UTF8String, _>(external.to_owned());
             let author = entity! {
                 metadata::tag: archive::kind_author,
                 teams::source: expected_source,
@@ -439,7 +439,7 @@ pub fn observation_fragment(
         if !matches!(kind, "attachment" | "hosted-content") || source_id.is_empty() {
             bail!("invalid Teams attachment source evidence");
         }
-        let source_handle = fragment.put::<LongString, _>(source_id.to_owned());
+        let source_handle = fragment.put::<UTF8String, _>(source_id.to_owned());
         let name_text = attachment
             .name
             .as_deref()
@@ -448,7 +448,7 @@ pub fn observation_fragment(
             .map(str::to_owned);
         let name = name_text
             .as_ref()
-            .map(|name| fragment.put::<LongString, _>(name.clone()));
+            .map(|name| fragment.put::<UTF8String, _>(name.clone()));
         let occurrence = entity! {
             metadata::tag: archive::kind_attachment,
             archive::attachment_source_id: source_handle,
@@ -461,7 +461,7 @@ pub fn observation_fragment(
         let pointers = attachment
             .source_pointers
             .into_iter()
-            .map(|pointer| fragment.put::<LongString, _>(pointer))
+            .map(|pointer| fragment.put::<UTF8String, _>(pointer))
             .collect::<BTreeSet<_>>();
         let (file_id, size) = if let Some(materialization) = attachment.materialization {
             let file_name = materialization.file_name.trim();
@@ -485,7 +485,7 @@ pub fn observation_fragment(
         attachment_ids.insert(occurrence_id);
     }
 
-    let etag = fragment.put::<LongString, _>(input.etag);
+    let etag = fragment.put::<UTF8String, _>(input.etag);
     let observation = entity! {
         metadata::tag: teams::kind_message_observation,
         teams::message: message_id,
@@ -497,17 +497,17 @@ pub fn observation_fragment(
     let raw = input
         .raw
         .into_iter()
-        .map(|raw| fragment.put::<LongString, _>(raw))
+        .map(|raw| fragment.put::<UTF8String, _>(raw))
         .collect::<BTreeSet<_>>();
     let author_name = input
         .author_name
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(|name| fragment.put::<LongString, _>(name.to_owned()));
+        .map(|name| fragment.put::<UTF8String, _>(name.to_owned()));
     let content = input
         .content
-        .map(|content| fragment.put::<LongString, _>(content));
+        .map(|content| fragment.put::<UTF8String, _>(content));
     let state = if deleted { "deleted" } else { "present" };
     fragment += entity! { ExclusiveId::force_ref(&observation_id) @
         teams::message_state: state,
@@ -524,7 +524,7 @@ pub fn observation_fragment(
 
 /// Canonical, inspectable coordinate of the exact frozen legacy source.
 ///
-/// This deliberately serializes the branch/pin/head values into a LongString
+/// This deliberately serializes the branch/pin/head values into a UTF8String
 /// instead of storing raw repository handles as trible values. Conservative
 /// blob discovery therefore retains the coordinate, not the secret-bearing
 /// legacy commit closure which the cutover is replacing.
@@ -572,7 +572,7 @@ pub fn legacy_snapshot_fragment(
     }
     let observations = observations.into_iter().collect::<BTreeSet<_>>();
     let mut fragment = Fragment::empty();
-    let coordinate = fragment.put::<LongString, _>(coordinate.to_owned());
+    let coordinate = fragment.put::<UTF8String, _>(coordinate.to_owned());
     let generation: Inline<U256BE> = 0_u128.to_inline();
     fragment += entity! {
         metadata::tag: teams::kind_legacy_snapshot,
@@ -600,8 +600,8 @@ pub fn coverage_fragment(
     let predecessors = predecessors.into_iter().collect::<BTreeSet<_>>();
     let observations = observations.into_iter().collect::<BTreeSet<_>>();
     let mut fragment = Fragment::empty();
-    let request = fragment.put::<LongString, _>(request.to_owned());
-    let cursor = fragment.put::<LongString, _>(cursor.to_owned());
+    let request = fragment.put::<UTF8String, _>(request.to_owned());
+    let cursor = fragment.put::<UTF8String, _>(cursor.to_owned());
     let generation: Inline<U256BE> = generation.to_inline();
     fragment += entity! {
         metadata::tag: teams::kind_coverage,
@@ -650,13 +650,13 @@ pub fn coverage_head(
     )?)?;
     let cursor = one_optional(
         find!(
-            cursor: Inline<Handle<LongString>>,
+            cursor: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ id @ teams::coverage_cursor: ?cursor }])
         )
         .collect(),
         "Teams coverage cursor",
     )?
-    .map(|cursor| read_longstring(reader, cursor, "Teams coverage cursor"))
+    .map(|cursor| read_utf8string(reader, cursor, "Teams coverage cursor"))
     .transpose()?;
     Ok(Some(CoverageHead {
         id,
@@ -876,7 +876,7 @@ pub fn source_label(reader: &PileReader, catalog: &TribleSet, source: Id) -> Res
         .collect(),
         "Teams source tenant",
     )?;
-    read_longstring(reader, handle, "Teams source tenant")
+    read_utf8string(reader, handle, "Teams source tenant")
 }
 
 /// Decode every source-scoped chat identity without choosing among conflicting
@@ -904,7 +904,7 @@ pub fn chat_labels(
             let handle = one_required(values, &format!("Teams chat {chat:x} external id"))?;
             Ok((
                 chat,
-                read_longstring(reader, handle, "Teams chat external id")?,
+                read_utf8string(reader, handle, "Teams chat external id")?,
             ))
         })
         .collect()
@@ -1393,9 +1393,9 @@ fn entity_facts(facts: &TribleSet, entity: Id) -> TribleSet {
         .collect()
 }
 
-fn read_longstring(
+fn read_utf8string(
     reader: &PileReader,
-    handle: Inline<Handle<LongString>>,
+    handle: Inline<Handle<UTF8String>>,
     field: &str,
 ) -> Result<String> {
     let view: anybytes::View<str> = reader
@@ -1406,7 +1406,7 @@ fn read_longstring(
 
 /// Decode one Teams text attachment with field-specific context.
 pub fn read_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result<String> {
-    read_longstring(reader, handle, field)
+    read_utf8string(reader, handle, field)
 }
 
 /// Validate a prospective signed member before it reaches append-only storage.
@@ -1521,7 +1521,7 @@ pub fn validate_commit_fragment(facts: &TribleSet) -> Result<()> {
 fn validate_source_identity(facts: &TribleSet, source: Id) -> Result<()> {
     let tenant = one_required(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ source @ teams::tenant_id: ?value }])
         )
         .collect(),
@@ -1549,7 +1549,7 @@ fn validate_chat_identity(facts: &TribleSet, chat: Id, sources: &BTreeSet<Id>) -
     }
     let external = one_required(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ chat @ teams::chat_id: ?value }])
         )
         .collect(),
@@ -1578,7 +1578,7 @@ fn validate_author_identity(facts: &TribleSet, author: Id, sources: &BTreeSet<Id
     }
     let external = one_required(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ author @ teams::user_id: ?value }])
         )
         .collect(),
@@ -1607,7 +1607,7 @@ fn validate_message_identity(facts: &TribleSet, message: Id, chats: &BTreeSet<Id
     }
     let external = one_required(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ message @ teams::message_id: ?value }])
         )
         .collect(),
@@ -1647,7 +1647,7 @@ fn validate_receipt_identity_local(
     let generation_value = inline_u256_to_u128(generation)?;
     let request = one_optional(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ receipt @ teams::coverage_request: ?value }])
         )
         .collect(),
@@ -1655,7 +1655,7 @@ fn validate_receipt_identity_local(
     )?;
     let cursor = one_optional(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ receipt @ teams::coverage_cursor: ?value }])
         )
         .collect(),
@@ -1676,7 +1676,7 @@ fn validate_receipt_identity_local(
     .collect::<BTreeSet<_>>();
     let coordinate = one_optional(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ receipt @ teams::snapshot_source_coordinate: ?value }])
         )
         .collect(),
@@ -1767,7 +1767,7 @@ fn validate_attachment_file_structure(facts: &TribleSet, attachments: &BTreeSet<
     for media_type in &media_types {
         let name = one_required(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(facts, [{ *media_type @ metadata::name: ?value }])
             )
             .collect(),
@@ -1791,7 +1791,7 @@ fn validate_attachment_file_structure(facts: &TribleSet, attachments: &BTreeSet<
         )?;
         let name = one_required(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(facts, [{ file_id @ file::name: ?value }])
             )
             .collect(),
@@ -1829,7 +1829,7 @@ fn validate_fragment_payloads(
     let text_attributes = text_attributes();
     for fact in fragment.facts() {
         if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<Handle<LongString>>();
+            let handle = *fact.v::<Handle<UTF8String>>();
             let text: anybytes::View<str> = if local
                 .metadata(handle)
                 .context("inspect staged Teams text payload")?
@@ -1912,13 +1912,13 @@ pub fn validate_catalog(reader: &PileReader, catalog: &TribleSet) -> Result<()> 
     for source in sources {
         let tenant = one_required(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(&active, [{ source @ teams::tenant_id: ?value }])
             )
             .collect(),
             "Teams source tenant",
         )?;
-        let tenant = read_longstring(reader, tenant, "Teams source tenant")?;
+        let tenant = read_utf8string(reader, tenant, "Teams source tenant")?;
         if tenant.is_empty() || tenant != canonical_tenant(&tenant) || is_generic_tenant(&tenant) {
             bail!("Teams source {source:x} has a non-canonical tenant identity");
         }
@@ -1929,13 +1929,13 @@ pub fn validate_catalog(reader: &PileReader, catalog: &TribleSet) -> Result<()> 
     ) {
         let coordinate = one_required(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(&active, [{ snapshot @ teams::snapshot_source_coordinate: ?value }])
             )
             .collect(),
             "Teams legacy snapshot source coordinate",
         )?;
-        let coordinate = read_longstring(reader, coordinate, "Teams legacy source coordinate")?;
+        let coordinate = read_utf8string(reader, coordinate, "Teams legacy source coordinate")?;
         if !is_canonical_snapshot_source_coordinate(&coordinate) {
             bail!("Teams legacy snapshot {snapshot:x} has a non-canonical source coordinate");
         }
@@ -1943,9 +1943,9 @@ pub fn validate_catalog(reader: &PileReader, catalog: &TribleSet) -> Result<()> 
     for source in auth_profile_sources(&active) {
         for profile in auth_profile_ids(&active, source) {
             let record = auth_profile(&active, profile)?;
-            let client_id = read_longstring(reader, record.client_id, "Teams auth client id")?;
-            let user_id = read_longstring(reader, record.user_id, "Teams auth user id")?;
-            let scopes = read_longstring(reader, record.scopes, "Teams auth scopes")?;
+            let client_id = read_utf8string(reader, record.client_id, "Teams auth client id")?;
+            let user_id = read_utf8string(reader, record.user_id, "Teams auth user id")?;
+            let scopes = read_utf8string(reader, record.scopes, "Teams auth scopes")?;
             if canonical_nonempty(&client_id, "Teams client id")? != client_id
                 || canonical_nonempty(&user_id, "Teams user id")? != user_id
                 || canonical_auth_scopes(&scopes)? != scopes
@@ -2195,7 +2195,7 @@ fn validate_known_payloads(reader: &PileReader, catalog: &TribleSet) -> Result<(
     let text_attributes = text_attributes();
     for fact in catalog {
         if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<Handle<LongString>>();
+            let handle = *fact.v::<Handle<UTF8String>>();
             let _: anybytes::View<str> = reader.get(handle).with_context(|| {
                 format!("read Teams text payload {}", hex::encode_upper(handle.raw))
             })?;
@@ -2309,7 +2309,7 @@ fn validate_attachment(catalog: &TribleSet, attachment: Id, messages: &BTreeSet<
     }
     let source = one_required(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ attachment @ archive::attachment_source_id: ?value }])
         )
         .collect(),
@@ -2330,14 +2330,14 @@ fn validate_attachment(catalog: &TribleSet, attachment: Id, messages: &BTreeSet<
     }
     let name = one_optional(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ attachment @ archive::attachment_name: ?value }])
         )
         .collect(),
         "Teams attachment name",
     )?;
     let _pointers = find!(
-        value: Inline<Handle<LongString>>,
+        value: Inline<Handle<UTF8String>>,
         pattern!(catalog, [{ attachment @ archive::attachment_source_pointer: ?value }])
     )
     .collect::<BTreeSet<_>>();
@@ -2434,13 +2434,13 @@ fn validate_observation(
         bail!("Teams observation {observation:x} names an unknown author");
     }
     let _author_names = find!(
-        value: Inline<Handle<LongString>>,
+        value: Inline<Handle<UTF8String>>,
         pattern!(catalog, [{ observation @ teams::author_name: ?value }])
     )
     .collect::<BTreeSet<_>>();
     let content = one_optional(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ observation @ archive::content: ?value }])
         )
         .collect(),
@@ -2448,7 +2448,7 @@ fn validate_observation(
     )?;
     let etag = one_required(
         find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ observation @ teams::etag: ?value }])
         )
         .collect(),
@@ -2476,7 +2476,7 @@ fn validate_observation(
         }
     }
     let raw = find!(
-        value: Inline<Handle<LongString>>,
+        value: Inline<Handle<UTF8String>>,
         pattern!(catalog, [{ observation @ teams::message_raw: ?value }])
     )
     .collect::<BTreeSet<_>>();
@@ -2528,7 +2528,7 @@ fn validate_tombstone(catalog: &TribleSet, tombstone: Id, messages: &BTreeSet<Id
         bail!("invalid Teams tombstone state {state:?}");
     }
     if find!(
-        value: Inline<Handle<LongString>>,
+        value: Inline<Handle<UTF8String>>,
         pattern!(catalog, [{ tombstone @ teams::message_raw: ?value }])
     )
     .next()
@@ -2588,7 +2588,7 @@ fn validate_coverage(
         let generation = inline_u256_to_u128(generation_inline)?;
         let request = one_optional(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ receipt @ teams::coverage_request: ?value }])
             )
             .collect(),
@@ -2596,7 +2596,7 @@ fn validate_coverage(
         )?;
         let cursor = one_optional(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ receipt @ teams::coverage_cursor: ?value }])
             )
             .collect(),
@@ -2612,7 +2612,7 @@ fn validate_coverage(
         )?;
         let coordinate = one_optional(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ receipt @ teams::snapshot_source_coordinate: ?value }])
             )
             .collect(),
@@ -2763,7 +2763,7 @@ fn validate_contexts(catalog: &TribleSet, sources: &BTreeSet<Id>) -> Result<()> 
         )?;
         let name = one_required(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ *context @ metadata::name: ?value }])
             )
             .collect(),
@@ -2771,7 +2771,7 @@ fn validate_contexts(catalog: &TribleSet, sources: &BTreeSet<Id>) -> Result<()> 
         )?;
         let boundary = one_required(
             find!(
-                value: Inline<Handle<LongString>>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ *context @ metadata::description: ?value }])
             )
             .collect(),

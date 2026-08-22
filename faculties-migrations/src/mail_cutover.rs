@@ -497,7 +497,7 @@ fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()>
     ]);
     for fact in facts {
         if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader
                 .get(handle)
                 .with_context(|| format!("read legacy Mail text {}", hex::encode(handle.raw)))?;
@@ -603,9 +603,9 @@ mod tests {
             "From: Alice <alice@example.test>\r\nTo: jp@example.test\r\nMessage-ID: <{message_id}>\r\nDate: Mon, 10 Aug 2026 00:00:01 +0000\r\nSubject: Legacy\r\n\r\nbody"
         );
         let mut fragment = Fragment::empty();
-        let message_id_handle = fragment.put::<blobencodings::LongString, _>(message_id.to_owned());
-        let subject = fragment.put::<blobencodings::LongString, _>("Legacy".to_owned());
-        let body = fragment.put::<blobencodings::LongString, _>("body".to_owned());
+        let message_id_handle = fragment.put::<blobencodings::UTF8String, _>(message_id.to_owned());
+        let subject = fragment.put::<blobencodings::UTF8String, _>("Legacy".to_owned());
+        let body = fragment.put::<blobencodings::UTF8String, _>("body".to_owned());
         let raw = fragment.put::<blobencodings::RawBytes, _>(raw.into_bytes());
         let id = entity! { imported_legacy::message_id: message_id_handle }
             .root()

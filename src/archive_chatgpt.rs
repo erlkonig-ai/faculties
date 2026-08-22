@@ -21,7 +21,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::import::scanner as sc;
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
@@ -1046,7 +1046,7 @@ fn projected_identity(fragment: &mut Fragment) -> Result<(Id, View<str>, Id)> {
         .root()
         .ok_or_else(|| anyhow!("projected source fragment is not singly rooted"))?;
     let locator = find!(
-        (locator: Inline<Handle<LongString>>),
+        (locator: Inline<Handle<UTF8String>>),
         pattern!(&*fragment, [{
             projection @ schema::source_projection::source_locator: ?locator
         }])

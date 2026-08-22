@@ -41,7 +41,7 @@ pub mod checkpoint {
 
         /// Canonical serialized `WatchedView` value.
         /// Minted with `trible genid` on 2026-08-11.
-        "55D805540D0E44B2779FC5116BB66B3F" as view: inlineencodings::Handle<blobencodings::LongString>;
+        "55D805540D0E44B2779FC5116BB66B3F" as view: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 

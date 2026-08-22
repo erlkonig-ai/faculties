@@ -50,7 +50,7 @@ pub mod local {
     attributes! {
         "42C4DB210F7EAFAF38F179ADCB4A9D5B" unsafe as from: inlineencodings::GenId;
         "95D58D3E68A43979F8AA51415541414C" unsafe as to: inlineencodings::GenId;
-        "23075866B369B5F393D43B30649469F6" unsafe as body: inlineencodings::Handle<blobencodings::LongString>;
+        "23075866B369B5F393D43B30649469F6" unsafe as body: inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Exact immutable Relations group snapshot witnessed at send time.
         /// Present exactly when `to` is a group anchor.

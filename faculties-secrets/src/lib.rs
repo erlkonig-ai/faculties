@@ -60,7 +60,7 @@ use crate::schema::{
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 
 const ED25519_PUBLIC_KEY_BYTES: usize = 32;

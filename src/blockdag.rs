@@ -23,7 +23,7 @@ use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreList};
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
@@ -57,7 +57,7 @@ pub struct ProjectionAnnotations {
     pub source_path: Option<String>,
 }
 
-type TextHandle = Inline<Handle<LongString>>;
+type TextHandle = Inline<Handle<UTF8String>>;
 type RawHandle = Inline<Handle<RawBytes>>;
 type IntervalValue = Inline<NsTAIInterval>;
 type OrdinalValue = Inline<U256BE>;
@@ -127,7 +127,7 @@ pub fn vocabulary_fragment() -> Fragment {
         .iter()
         .chain(schema::content_fact::direction::SPECS)
     {
-        let name = fragment.put::<LongString, _>(name.to_owned());
+        let name = fragment.put::<UTF8String, _>(name.to_owned());
         fragment += entity! { ExclusiveId::force_ref(&id) @
             metadata::tag: &metadata::KIND_TAG,
             metadata::name: name,
@@ -162,7 +162,7 @@ pub fn source_snapshot(
 ) -> Result<Fragment> {
     let byte_length: Inline<U256BE> = byte_length.to_inline();
     let mut fragment = Fragment::empty();
-    let locator = fragment.put::<LongString, _>(locator.into());
+    let locator = fragment.put::<UTF8String, _>(locator.into());
     fragment += entity! { _ @
         schema::source_projection::source_namespace: &namespace,
         schema::source_projection::source_locator: locator,
@@ -172,7 +172,7 @@ pub fn source_snapshot(
     let mut fragment = attach_kind(fragment, schema::source_snapshot::KIND, "source snapshot")?;
     if let Some(source_path) = source_path {
         let snapshot = rooted(&fragment, "source snapshot")?;
-        let path = fragment.put::<LongString, _>(source_path);
+        let path = fragment.put::<UTF8String, _>(source_path);
         fragment += entity! { ExclusiveId::force_ref(&snapshot) @
             files_schema::file::source_path: path,
         };
@@ -192,10 +192,10 @@ pub fn text_fact_view(modality: Id, direction: Id, text: anybytes::View<str>) ->
 
 fn text_fact_blob<T>(modality: Id, direction: Id, text: T) -> Result<Fragment>
 where
-    T: triblespace::core::blob::IntoBlob<LongString>,
+    T: triblespace::core::blob::IntoBlob<UTF8String>,
 {
     let mut fragment = Fragment::empty();
-    let payload = fragment.put::<LongString, _>(text);
+    let payload = fragment.put::<UTF8String, _>(text);
     fragment += entity! { _ @
         schema::content_fact::modality: &modality,
         schema::content_fact::direction: &direction,
@@ -274,10 +274,10 @@ fn asset_pointer_fact_blob<P>(
     size: Option<u128>,
 ) -> Result<Fragment>
 where
-    P: triblespace::core::blob::IntoBlob<LongString>,
+    P: triblespace::core::blob::IntoBlob<UTF8String>,
 {
     let mut fragment = Fragment::empty();
-    let pointer = fragment.put::<LongString, _>(pointer);
+    let pointer = fragment.put::<UTF8String, _>(pointer);
     let media_type = media_type
         .map(files::media_type_fragment)
         .transpose()?
@@ -384,12 +384,12 @@ fn source_projection_blob<L, T>(
     block: Fragment,
 ) -> Result<Fragment>
 where
-    L: triblespace::core::blob::IntoBlob<LongString>,
+    L: triblespace::core::blob::IntoBlob<UTF8String>,
     T: triblespace::core::blob::IntoBlob<RawBytes>,
 {
     rooted(&block, "block")?;
     let mut fragment = Fragment::empty();
-    let source_locator = fragment.put::<LongString, _>(source_locator);
+    let source_locator = fragment.put::<UTF8String, _>(source_locator);
     let raw_record = fragment.put::<RawBytes, _>(raw_record);
     fragment += entity! { _ @
         schema::source_projection::source_namespace: &source_namespace,
@@ -413,16 +413,16 @@ pub fn annotate_source_projection(
     let root = rooted(&projection, "source projection")?;
     let raw_author = annotations
         .raw_author
-        .map(|value| projection.put::<LongString, _>(value));
+        .map(|value| projection.put::<UTF8String, _>(value));
     let raw_role = annotations
         .raw_role
-        .map(|value| projection.put::<LongString, _>(value));
+        .map(|value| projection.put::<UTF8String, _>(value));
     let raw_model = annotations
         .raw_model
-        .map(|value| projection.put::<LongString, _>(value));
+        .map(|value| projection.put::<UTF8String, _>(value));
     let source_path = annotations
         .source_path
-        .map(|value| projection.put::<LongString, _>(value));
+        .map(|value| projection.put::<UTF8String, _>(value));
 
     projection += entity! { ExclusiveId::force_ref(&root) @
         schema::source_projection::semantic_predecessor_support*:
@@ -1200,11 +1200,11 @@ fn read_text_attachment(
     if let Some(overlay) = overlay {
         if overlay
             .contains_blob(handle)
-            .map_err(|error| format!("inspect staged LongString attachment: {error}"))?
+            .map_err(|error| format!("inspect staged UTF8String attachment: {error}"))?
         {
             let value: anybytes::View<str> = overlay.get(handle).map_err(|error| {
                 format!(
-                    "invalid staged LongString attachment {}: {error}",
+                    "invalid staged UTF8String attachment {}: {error}",
                     hex::encode(handle.raw)
                 )
             })?;
@@ -1213,13 +1213,13 @@ fn read_text_attachment(
     }
     if !reader
         .contains_blob(handle)
-        .map_err(|error| format!("inspect resident LongString attachment: {error}"))?
+        .map_err(|error| format!("inspect resident UTF8String attachment: {error}"))?
     {
         return Ok(None);
     }
     let value: anybytes::View<str> = reader.get(handle).map_err(|error| {
         format!(
-            "invalid resident LongString attachment {}: {error}",
+            "invalid resident UTF8String attachment {}: {error}",
             hex::encode(handle.raw)
         )
     })?;
@@ -1234,11 +1234,11 @@ fn text_attachment_present(
     if let Some(overlay) = overlay {
         if overlay
             .contains_blob(handle)
-            .map_err(|error| format!("inspect staged LongString attachment: {error}"))?
+            .map_err(|error| format!("inspect staged UTF8String attachment: {error}"))?
         {
             let _: anybytes::View<str> = overlay.get(handle).map_err(|error| {
                 format!(
-                    "invalid staged LongString attachment {}: {error}",
+                    "invalid staged UTF8String attachment {}: {error}",
                     hex::encode(handle.raw)
                 )
             })?;
@@ -1247,7 +1247,7 @@ fn text_attachment_present(
     }
     reader
         .contains_blob(handle)
-        .map_err(|error| format!("inspect resident LongString attachment: {error}"))
+        .map_err(|error| format!("inspect resident UTF8String attachment: {error}"))
 }
 
 fn raw_attachment_present(
@@ -1669,7 +1669,7 @@ mod tests {
     fn archive_vocabulary_is_queryable_collection_data() {
         let mut vocabulary = vocabulary_fragment();
         let text = schema::content_fact::modality::TEXT;
-        let alias = vocabulary.put::<LongString, _>("written text".to_owned());
+        let alias = vocabulary.put::<UTF8String, _>("written text".to_owned());
         vocabulary += entity! { ExclusiveId::force_ref(&text) @
             metadata::name: alias,
         };
@@ -2030,7 +2030,7 @@ mod tests {
         let fact = text("identity");
         let fact_id = fact.root().unwrap();
         let payload = find!(
-            payload: Inline<Handle<LongString>>,
+            payload: Inline<Handle<UTF8String>>,
             pattern!(&fact, [{
                 fact_id @ schema::content_fact::payload: ?payload
             }])

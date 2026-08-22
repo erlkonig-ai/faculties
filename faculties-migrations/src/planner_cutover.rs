@@ -22,7 +22,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::Id;
@@ -984,8 +984,8 @@ fn validate_legacy_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()
             || fact.a() == &event::description.id()
             || fact.a() == &note::note_text.id()
         {
-            let handle = *fact.v::<inlineencodings::Handle<LongString>>();
-            let _: Blob<LongString> = reader.get(handle).with_context(|| {
+            let handle = *fact.v::<inlineencodings::Handle<UTF8String>>();
+            let _: Blob<UTF8String> = reader.get(handle).with_context(|| {
                 format!(
                     "read frozen legacy Planner text {}",
                     hex::encode_upper(handle.raw)
@@ -1161,7 +1161,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             (KIND_EVENT_ID, "planner-event"),
             (KIND_NOTE_ID, "planner-note"),
         ] {
-            let label = fragment.put::<LongString, _>(label.to_owned());
+            let label = fragment.put::<UTF8String, _>(label.to_owned());
             fragment += entity! { ExclusiveId::force_ref(&kind) @ metadata::name: label };
         }
         fragment
@@ -1169,8 +1169,8 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
     fn legacy_event(id: Id, uid: &str, status: &str, created_at: f64) -> Fragment {
         let mut fragment = Fragment::empty();
-        let uid = fragment.put::<LongString, _>(uid.to_owned());
-        let description = fragment.put::<LongString, _>(format!("description-{id:x}"));
+        let uid = fragment.put::<UTF8String, _>(uid.to_owned());
+        let description = fragment.put::<UTF8String, _>(format!("description-{id:x}"));
         fragment += entity! { ExclusiveId::force_ref(&id) @
             metadata::tag: &KIND_EVENT_ID,
             metadata::created_at: at(created_at),
@@ -1186,7 +1186,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
     fn legacy_note(id: Id, event_id: Id, text: &str, created_at: f64) -> Fragment {
         let mut fragment = Fragment::empty();
-        let text = fragment.put::<LongString, _>(text.to_owned());
+        let text = fragment.put::<UTF8String, _>(text.to_owned());
         fragment += entity! { ExclusiveId::force_ref(&id) @
             metadata::tag: &KIND_NOTE_ID,
             metadata::created_at: at(created_at),
@@ -1242,7 +1242,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         let mut left = repository.pull(branch).unwrap();
         let mut right = repository.pull(branch).unwrap();
         let mut semantic_metadata = Fragment::empty();
-        let detail = semantic_metadata.put::<LongString, _>("semantic provenance".to_owned());
+        let detail = semantic_metadata.put::<UTF8String, _>("semantic provenance".to_owned());
         semantic_metadata += entity! {
             metadata::tag: &METADATA_MARKER,
             metadata::description: detail,
@@ -1321,12 +1321,12 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             entity! { ExclusiveId::force_ref(&EXTRA_META_ENTITY) @ metadata::tag: &METADATA_MARKER }
                 .into_facts();
         enriched.blobs_mut().union(original.blobs().clone());
-        let sentinel = enriched.put::<LongString, _>("unreferenced resident closure".to_owned());
+        let sentinel = enriched.put::<UTF8String, _>("unreferenced resident closure".to_owned());
         projected[0].content = enriched;
 
         let mut enriched_metadata = projected[0].metadata.clone();
         let metadata_sentinel =
-            enriched_metadata.put::<LongString, _>("metadata resident closure".to_owned());
+            enriched_metadata.put::<UTF8String, _>("metadata resident closure".to_owned());
         *enriched_metadata.metafacts_mut() += entity! {
             ExclusiveId::force_ref(&EXTRA_META_ENTITY) @ metadata::description: metadata_sentinel
         }

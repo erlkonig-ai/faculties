@@ -11,7 +11,7 @@ use std::path::Path;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::collection::{Collection, CollectionCommit};
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
@@ -35,11 +35,11 @@ mod legacy {
 
     attributes! {
         "C1FFE9D4FEC549C09C96639665561DFE" unsafe as model: inlineencodings::ShortString;
-        "B6BF5BEE9961D6C0F4F825088DD2C3F2" unsafe as request_context: inlineencodings::Handle<blobencodings::LongString>;
+        "B6BF5BEE9961D6C0F4F825088DD2C3F2" unsafe as request_context: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,7 +314,7 @@ fn validate_main_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> 
         .iter()
         .filter(|fact| fact.a() == &legacy::request_context.id())
     {
-        let handle = *fact.v::<inlineencodings::Handle<LongString>>();
+        let handle = *fact.v::<inlineencodings::Handle<UTF8String>>();
         let _: View<str> = reader.get(handle).with_context(|| {
             format!(
                 "strictly read historical cognition payload {}",
@@ -500,9 +500,9 @@ use faculties::storage::{open_pile_strict};
     fn pair(mismatched_context: bool) -> Fragment {
         let mut fragment = Fragment::empty();
         let thought_context =
-            fragment.put::<LongString, _>(r#"[{"role":"user","content":"hello"}]"#.to_owned());
+            fragment.put::<UTF8String, _>(r#"[{"role":"user","content":"hello"}]"#.to_owned());
         let request_context = if mismatched_context {
-            fragment.put::<LongString, _>(r#"[{"role":"user","content":"different"}]"#.to_owned())
+            fragment.put::<UTF8String, _>(r#"[{"role":"user","content":"different"}]"#.to_owned())
         } else {
             thought_context
         };

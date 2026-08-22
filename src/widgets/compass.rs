@@ -28,7 +28,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::View;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
@@ -41,7 +41,7 @@ use crate::schemas::compass::{
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 /// Handle to a long-string blob (titles, notes).
-type TextHandle = Inline<Handle<LongString>>;
+type TextHandle = Inline<Handle<UTF8String>>;
 
 // ── ID / time helpers ────────────────────────────────────────────────
 
@@ -179,7 +179,7 @@ impl CompassLive {
     fn text(&self, dataset: DatasetView<'_>, h: TextHandle) -> String {
         dataset
             .reader
-            .get::<View<str>, LongString>(h)
+            .get::<View<str>, UTF8String>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
                 s.to_string()
@@ -302,7 +302,7 @@ fn goal_matches_search(
     )
     .next()
     {
-        if let Ok(v) = dataset.reader.get::<View<str>, LongString>(handle) {
+        if let Ok(v) = dataset.reader.get::<View<str>, UTF8String>(handle) {
             if v.as_ref().to_lowercase().contains(needle) {
                 return true;
             }
@@ -779,7 +779,7 @@ fn render_goal_card(
                 )
                 .next()
                 {
-                    if let Ok(v) = dataset.reader.get::<View<str>, LongString>(handle) {
+                    if let Ok(v) = dataset.reader.get::<View<str>, UTF8String>(handle) {
                         let base = egui::TextFormat {
                             font_id: egui::TextStyle::Monospace.resolve(ui.style()),
                             color: ui.visuals().text_color(),
@@ -853,7 +853,7 @@ fn render_goal_card(
                         }])
                     )
                     .next()
-                    .and_then(|(h,)| dataset.reader.get::<View<str>, LongString>(h).ok())
+                    .and_then(|(h,)| dataset.reader.get::<View<str>, UTF8String>(h).ok())
                     .map(|v| truncate_inline(v.as_ref(), 16))
                     .unwrap_or_else(|| fmt_id_full(lower_id));
                     render_chip(

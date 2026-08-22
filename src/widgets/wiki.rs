@@ -33,7 +33,7 @@ use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
@@ -42,7 +42,7 @@ use crate::widgets::storage::{DatasetRevision, DatasetView};
 use crate::wiki::{EntryRecord, RevisionRecord, WikiCatalog};
 
 /// Handle to a long-string blob living in a pile.
-type TextHandle = Inline<Handle<LongString>>;
+type TextHandle = Inline<Handle<UTF8String>>;
 
 /// Handle to a file-bytes blob living in a pile.
 type FileHandle = crate::files::ContentHandle;
@@ -1860,8 +1860,8 @@ mod tests {
         let first = Id::new([0xb1; 16]).unwrap();
         let second = Id::new([0xb2; 16]).unwrap();
         let mut fragment = Fragment::empty();
-        let title = fragment.put::<LongString, _>("legacy title".to_owned());
-        let content = fragment.put::<LongString, _>("legacy content".to_owned());
+        let title = fragment.put::<UTF8String, _>("legacy title".to_owned());
+        let content = fragment.put::<UTF8String, _>("legacy content".to_owned());
         fragment += entity! { ExclusiveId::force_ref(&first) @
             metadata::tag: &KIND_VERSION_ID,
             attrs::fragment: fragment_id,

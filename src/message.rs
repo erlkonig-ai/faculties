@@ -21,7 +21,7 @@ use crate::schemas::message::{
 };
 use crate::schemas::relations::KIND_GROUP_SNAPSHOT;
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 /// One exact address selected from Relations.

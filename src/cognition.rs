@@ -27,7 +27,7 @@ use crate::schemas::triage::{cog, context, exec, model_chat, KIND_EXEC_RESULT_ID
 use crate::legacy_hint::open_scope;
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type RawHandle = Inline<inlineencodings::Handle<blobencodings::UnknownBlob>>;
 
 // Stable attributes currently authored by `drive` but not yet owned by a
@@ -395,7 +395,7 @@ where
 {
     for fact in facts {
         if let Some(field) = long_string_field(*fact.a()) {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             read_text_overlay(reader, overlay, handle).with_context(|| {
                 format!("read {field} payload {}", hex::encode_upper(handle.raw))
             })?;
@@ -415,7 +415,7 @@ where
 {
     for fact in facts {
         if let Some(field) = long_string_field(*fact.a()) {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let value: std::result::Result<View<str>, _> = store.get(handle);
             value.map_err(|_| {
                 anyhow!(

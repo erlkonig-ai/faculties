@@ -45,11 +45,11 @@ pub mod attrs {
 
         /// Text shown when the intention is due.
         "1E82BD7E8EFEA00FD3FAB3ECEFD0BA33" unsafe as nudge:
-            inlineencodings::Handle<blobencodings::LongString>;
+            inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Author-written condition source, parsed when the catalog is read.
         "134ECC925E8547B46AF67D6DC29B5F5C" unsafe as condition:
-            inlineencodings::Handle<blobencodings::LongString>;
+            inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Habit definition governed by a completion or state assertion.
         "F00FAA4B44DB1E79E36055410B476C42" unsafe as of: inlineencodings::GenId;

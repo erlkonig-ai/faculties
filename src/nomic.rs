@@ -125,7 +125,7 @@ mod tests {
     use mary::format::{attrs, F32Array, U64Array};
     use tempfile::NamedTempFile;
     use triblespace::core::repo::pile::Pile;
-    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::*;
 
     const WORDPIECE: &str = r###"{
@@ -149,7 +149,7 @@ mod tests {
         let leaf_id = leaf.root().expect("tensor leaf root");
         fragment += leaf;
 
-        let tensor_name = fragment.put::<LongString, _>(tensor_name.to_owned());
+        let tensor_name = fragment.put::<UTF8String, _>(tensor_name.to_owned());
         let member = entity! { _ @
             attrs::safetensor_path: tensor_name,
             attrs::weight: &leaf_id,
@@ -157,8 +157,8 @@ mod tests {
         let member_id = member.root().expect("model member root");
         fragment += member;
 
-        let model_name = fragment.put::<LongString, _>(format!("{source}.safetensors"));
-        let source = fragment.put::<LongString, _>(source.to_owned());
+        let model_name = fragment.put::<UTF8String, _>(format!("{source}.safetensors"));
+        let source = fragment.put::<UTF8String, _>(source.to_owned());
         fragment += entity! { _ @
             attrs::model_name: model_name,
             attrs::source: source,

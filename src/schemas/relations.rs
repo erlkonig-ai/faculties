@@ -71,7 +71,7 @@ pub mod group {
 }
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
 /// Attributes of an intrinsic, full-state person profile snapshot.
 pub mod profile {
@@ -84,28 +84,28 @@ pub mod profile {
 
         /// Exact aliases in this profile snapshot.
         /// Minted with `trible genid` on 2026-08-08.
-        "8663728605F1212E3B454D0E7F09FB76" unsafe as alias: inlineencodings::Handle<blobencodings::LongString>;
+        "8663728605F1212E3B454D0E7F09FB76" unsafe as alias: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Exact affinity/relationship labels in this profile snapshot.
         /// Minted with `trible genid` on 2026-08-08.
-        "96101F2E1A20978BEBD12BB97D6E84F6" unsafe as affinity: inlineencodings::Handle<blobencodings::LongString>;
+        "96101F2E1A20978BEBD12BB97D6E84F6" unsafe as affinity: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Tenant-scoped external Teams identifiers.
         /// Minted with `trible genid` on 2026-08-08.
-        "9DBA8FAEF649E33919BC708F943F0C2D" unsafe as teams_user_id: inlineencodings::Handle<blobencodings::LongString>;
+        "9DBA8FAEF649E33919BC708F943F0C2D" unsafe as teams_user_id: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Exact email-address set.
         /// Minted with `trible genid` on 2026-08-08.
-        "962F91429CE0432204B12E9A041E56A8" unsafe as email: inlineencodings::Handle<blobencodings::LongString>;
+        "962F91429CE0432204B12E9A041E56A8" unsafe as email: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Exact phone-number set.
         /// Minted with `trible genid` on 2026-08-08.
-        "140A6AAD3F1845694F33B00D97B9AF40" unsafe as phone: inlineencodings::Handle<blobencodings::LongString>;
+        "140A6AAD3F1845694F33B00D97B9AF40" unsafe as phone: inlineencodings::Handle<blobencodings::UTF8String>;
 
-        // These LongString attributes retain their already-published meaning;
+        // These UTF8String attributes retain their already-published meaning;
         // only their subject moves from the mutable anchor to a sealed profile.
-        "F0AD0BBFAC4C4C899637573DC965622E" unsafe as first_name: inlineencodings::Handle<blobencodings::LongString>;
-        "764DD765142B3F4725B614BD3B9118EC" unsafe as last_name: inlineencodings::Handle<blobencodings::LongString>;
-        "DC0916CB5F640984EFE359A33105CA9A" unsafe as display_name: inlineencodings::Handle<blobencodings::LongString>;
-        "E3D486BD7C9C088D908DF1B9E1F4D925" unsafe as company: inlineencodings::Handle<blobencodings::LongString>;
-        "173B771D35FEE90B83F2731DD3C59EF8" unsafe as position: inlineencodings::Handle<blobencodings::LongString>;
-        "5A71C103E026FC1AC01E35EDAC274A5C" unsafe as profile_url: inlineencodings::Handle<blobencodings::LongString>;
+        "F0AD0BBFAC4C4C899637573DC965622E" unsafe as first_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "764DD765142B3F4725B614BD3B9118EC" unsafe as last_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "DC0916CB5F640984EFE359A33105CA9A" unsafe as display_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "E3D486BD7C9C088D908DF1B9E1F4D925" unsafe as company: inlineencodings::Handle<blobencodings::UTF8String>;
+        "173B771D35FEE90B83F2731DD3C59EF8" unsafe as position: inlineencodings::Handle<blobencodings::UTF8String>;
+        "5A71C103E026FC1AC01E35EDAC274A5C" unsafe as profile_url: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -372,18 +372,18 @@ pub mod relations {
         "299E28A10114DC8C3B1661CD90CB8DF6" unsafe as label_norm: inlineencodings::ShortString;
         "3E8812F6D22B2C93E2BCF0CE3C8C1979" unsafe as alias_norm: inlineencodings::ShortString;
         "32B22FBA3EC2ADC3FFEB48483FE8961F" unsafe as affinity: inlineencodings::ShortString;
-        "F0AD0BBFAC4C4C899637573DC965622E" unsafe as first_name: inlineencodings::Handle<blobencodings::LongString>;
-        "764DD765142B3F4725B614BD3B9118EC" unsafe as last_name: inlineencodings::Handle<blobencodings::LongString>;
-        "DC0916CB5F640984EFE359A33105CA9A" unsafe as display_name: inlineencodings::Handle<blobencodings::LongString>;
+        "F0AD0BBFAC4C4C899637573DC965622E" unsafe as first_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "764DD765142B3F4725B614BD3B9118EC" unsafe as last_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "DC0916CB5F640984EFE359A33105CA9A" unsafe as display_name: inlineencodings::Handle<blobencodings::UTF8String>;
         "9B3329149D54CB9A8E8075E4AA862649" unsafe as teams_user_id: inlineencodings::ShortString;
         "B563A063474CBE62ED25A8D0E9A1853C" unsafe as email: inlineencodings::ShortString;
         "9C2B10C740FCF7064A46F9B43D1FE278" unsafe as phone: inlineencodings::ShortString;
         // Generic contact facts (enrich every person, any source — booth leads,
         // mail senders, LinkedIn connections). LinkedIn-specific data stays in
         // the linkedin faculty; these are first-class here.
-        "E3D486BD7C9C088D908DF1B9E1F4D925" unsafe as company: inlineencodings::Handle<blobencodings::LongString>;
-        "173B771D35FEE90B83F2731DD3C59EF8" unsafe as position: inlineencodings::Handle<blobencodings::LongString>;
-        "5A71C103E026FC1AC01E35EDAC274A5C" unsafe as profile_url: inlineencodings::Handle<blobencodings::LongString>;
+        "E3D486BD7C9C088D908DF1B9E1F4D925" unsafe as company: inlineencodings::Handle<blobencodings::UTF8String>;
+        "173B771D35FEE90B83F2731DD3C59EF8" unsafe as position: inlineencodings::Handle<blobencodings::UTF8String>;
+        "5A71C103E026FC1AC01E35EDAC274A5C" unsafe as profile_url: inlineencodings::Handle<blobencodings::UTF8String>;
         // Provenance: where this person came from ("linkedin" | "mail" | "summit" | …).
         "686FD344CD64C3F9C981C4028B1B6B9E" unsafe as source: inlineencodings::ShortString;
         // Identity resolution (non-destructive). Append-only stores can't

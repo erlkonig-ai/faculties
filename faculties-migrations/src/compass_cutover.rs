@@ -210,7 +210,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
             (first_time, first_time).try_to_inline().unwrap();
 
         let mut first = Fragment::empty();
-        let title = first.put::<blobencodings::LongString, _>("Preserve me".to_owned());
+        let title = first.put::<blobencodings::UTF8String, _>("Preserve me".to_owned());
         first += entity! { ExclusiveId::force_ref(&goal) @
             metadata::tag: &KIND_GOAL_ID,
             board::title: title,
@@ -234,7 +234,7 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
         let second_time: Inline<inlineencodings::NsTAIInterval> =
             (second_time, second_time).try_to_inline().unwrap();
         let mut second = Fragment::empty();
-        let body = second.put::<blobencodings::LongString, _>("exact old note".to_owned());
+        let body = second.put::<blobencodings::UTF8String, _>("exact old note".to_owned());
         second += entity! { ExclusiveId::force_ref(&note) @
             metadata::tag: &KIND_NOTE_ID,
             board::task: &goal,

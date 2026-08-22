@@ -25,7 +25,7 @@ use crate::schemas::compass::{
     KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
 };
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 fn validate_short(label: &str, value: &str) -> Result<()> {
@@ -109,7 +109,7 @@ fn require_point(entity: Id, field: &str, value: IntervalValue) -> Result<()> {
 pub fn kind_catalog_fragment() -> Fragment {
     let mut fragment = Fragment::empty();
     for (id, label) in KIND_SPECS {
-        let name = fragment.put::<blobencodings::LongString, _>(label.to_owned());
+        let name = fragment.put::<blobencodings::UTF8String, _>(label.to_owned());
         fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name };
     }
     fragment
@@ -126,7 +126,7 @@ pub fn goal_fragment(
 ) -> Result<Fragment> {
     let tags = canonical_tags(tags)?;
     let mut fragment = Fragment::empty();
-    let title = fragment.put::<blobencodings::LongString, _>(title.into());
+    let title = fragment.put::<blobencodings::UTF8String, _>(title.into());
     fragment += entity! { ExclusiveId::force_ref(&goal) @
         metadata::tag: &KIND_GOAL_ID,
         board::title: title,
@@ -179,10 +179,10 @@ pub fn note_fragment(
     let references = sorted_strings(references);
     let supersedes = sorted_ids(supersedes);
     let mut fragment = Fragment::empty();
-    let body = fragment.put::<blobencodings::LongString, _>(body.into());
+    let body = fragment.put::<blobencodings::UTF8String, _>(body.into());
     let references: Vec<TextHandle> = references
         .into_iter()
-        .map(|value| fragment.put::<blobencodings::LongString, _>(value))
+        .map(|value| fragment.put::<blobencodings::UTF8String, _>(value))
         .collect();
     fragment += entity! { ExclusiveId::force_ref(&note) @
         metadata::tag: &KIND_NOTE_ID,
@@ -873,7 +873,7 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
             || fact.a() == &board::note.id()
             || fact.a() == &board::reference.id()
         {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "read Compass text payload {}",
@@ -910,7 +910,7 @@ pub fn validate_candidate(
             || fact.a() == &board::note.id()
             || fact.a() == &board::reference.id()
         {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = overlay.get(handle).with_context(|| {
                 format!(
                     "read staged Compass text payload {}",
@@ -1159,7 +1159,7 @@ mod tests {
     fn new_extrinsic_goal_requires_complete_occurrence_time() {
         let goal = genid().id;
         let mut incomplete = Fragment::empty();
-        let title = incomplete.put::<blobencodings::LongString, _>("incomplete".to_owned());
+        let title = incomplete.put::<blobencodings::UTF8String, _>("incomplete".to_owned());
         incomplete += entity! { ExclusiveId::force_ref(&goal) @
             metadata::tag: &KIND_GOAL_ID,
             board::title: title,
@@ -1189,7 +1189,7 @@ mod tests {
     fn newly_introduced_compass_owned_field_requires_exactly_one_compass_kind() {
         let entity = genid().id;
         let mut orphan = Fragment::empty();
-        let title = orphan.put::<blobencodings::LongString, _>("orphan".to_owned());
+        let title = orphan.put::<blobencodings::UTF8String, _>("orphan".to_owned());
         orphan += entity! { ExclusiveId::force_ref(&entity) @ board::title: title };
 
         // A frozen legacy view remains inspectable, but no writer may add this

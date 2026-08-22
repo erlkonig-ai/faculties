@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -58,8 +58,8 @@ mod legacy {
         "174944957EC01DF2C10D470DBCE4263F" unsafe as unread_msg: inlineencodings::GenId;
         "850E03FC2C26ABF7FAC129903B60F069" unsafe as unread_mail: inlineencodings::GenId;
         "5D3327421EB2F0D92FD50CF32D5A513C" unsafe as roster_member: inlineencodings::GenId;
-        "7D7D457CA0184919497E2585CF779125" unsafe as goals_view: inlineencodings::Handle<LongString>;
-        "673BA8486630927882901829C286FA15" unsafe as notes_view: inlineencodings::Handle<LongString>;
+        "7D7D457CA0184919497E2585CF779125" unsafe as goals_view: inlineencodings::Handle<UTF8String>;
+        "673BA8486630927882901829C286FA15" unsafe as notes_view: inlineencodings::Handle<UTF8String>;
 
         "C5BEDFE3A37A1432FEE9B7BA6231E456" unsafe as wm_request: inlineencodings::GenId;
         "2234DDA93FEB2F265C25F7EBB24D4297" unsafe as wm_head: inlineencodings::GenId;
@@ -112,7 +112,7 @@ pub fn validate_retired(source: &FrozenSource) -> Result<RetiredOrientPins> {
 #[derive(Default)]
 struct Attachments {
     archives: BTreeSet<Inline<Handle<SimpleArchive>>>,
-    texts: BTreeSet<Inline<Handle<LongString>>>,
+    texts: BTreeSet<Inline<Handle<UTF8String>>>,
 }
 
 impl Attachments {
@@ -133,7 +133,7 @@ impl Attachments {
         for handle in &self.texts {
             let _: View<str> = reader.get(*handle).with_context(|| {
                 format!(
-                    "read legacy Orient LongString {}",
+                    "read legacy Orient UTF8String {}",
                     hex::encode_upper(handle.raw)
                 )
             })?;
@@ -564,7 +564,7 @@ fn optional_archive(
 fn optional_text(
     facts: &[&Trible],
     entity: Id,
-    attribute: &Attribute<Handle<LongString>>,
+    attribute: &Attribute<Handle<UTF8String>>,
     field: &str,
     attachments: &mut Attachments,
 ) -> Result<()> {

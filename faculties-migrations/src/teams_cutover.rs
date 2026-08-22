@@ -20,7 +20,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::macros::{attributes, id_hex};
-use triblespace::prelude::blobencodings::{LongString, RawBytes, WasmCode};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes, WasmCode};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
@@ -47,14 +47,14 @@ mod legacy {
         // Teams published this expiry attribute before the April 2026
         // timestamp migration moved new writes to `metadata::expires_at`.
         "706CC590BF4684CA8FA00E4123C43124" unsafe as pub expires_at: NsTAIInterval;
-        "57AABA4FBA3A5EC6EF28DC80CD6E0919" unsafe as pub delta_link: Handle<LongString>;
-        "438A29922F91F873A69C3856AA7A553F" unsafe as pub access_token: Handle<LongString>;
-        "60C85DD37D09D3D27BC6BFA0E8040EA9" unsafe as pub refresh_token: Handle<LongString>;
-        "0F7784BBDA2EE5B9009DE688472D6F24" unsafe as pub token_type: Handle<LongString>;
-        "139B46989D7F56C7DFE6259FD74479AC" unsafe as pub scope: Handle<LongString>;
-        "34ACCCECE281E1A0E191EEEBE7E47A23" unsafe as pub tenant: Handle<LongString>;
-        "8C6CA6A45DCA9F78420BC216A83F4C22" unsafe as pub client_id: Handle<LongString>;
-        "0E734F66EBBA45ED022D1EE539B11EBE" unsafe as pub client_secret: Handle<LongString>;
+        "57AABA4FBA3A5EC6EF28DC80CD6E0919" unsafe as pub delta_link: Handle<UTF8String>;
+        "438A29922F91F873A69C3856AA7A553F" unsafe as pub access_token: Handle<UTF8String>;
+        "60C85DD37D09D3D27BC6BFA0E8040EA9" unsafe as pub refresh_token: Handle<UTF8String>;
+        "0F7784BBDA2EE5B9009DE688472D6F24" unsafe as pub token_type: Handle<UTF8String>;
+        "139B46989D7F56C7DFE6259FD74479AC" unsafe as pub scope: Handle<UTF8String>;
+        "34ACCCECE281E1A0E191EEEBE7E47A23" unsafe as pub tenant: Handle<UTF8String>;
+        "8C6CA6A45DCA9F78420BC216A83F4C22" unsafe as pub client_id: Handle<UTF8String>;
+        "0E734F66EBBA45ED022D1EE539B11EBE" unsafe as pub client_secret: Handle<UTF8String>;
         "B0D18159D6035C576AE6B5D871AB4D63" unsafe as pub attachment_data: Handle<RawBytes>;
         "EEFDB32D37B7B2834D99ACCF159B6507" unsafe as pub attachment_mime: ShortString;
     }
@@ -567,7 +567,7 @@ fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()>
     .collect::<HashSet<_>>();
     for fact in facts {
         if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<Handle<LongString>>();
+            let handle = *fact.v::<Handle<UTF8String>>();
             let _: anybytes::View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "read frozen Teams text payload {}",
@@ -678,14 +678,14 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
 
         let chat = Id::new([0x11; 16]).unwrap();
         let mut chat_fragment = Fragment::empty();
-        let chat_external = chat_fragment.put::<LongString, _>("legacy-chat".to_owned());
+        let chat_external = chat_fragment.put::<UTF8String, _>("legacy-chat".to_owned());
         chat_fragment += entity! { ExclusiveId::force_ref(&chat) @
             metadata::tag: teams::kind_chat,
             teams::chat_id: chat_external,
         };
         if shared_public_user {
             let author = Id::new([0x12; 16]).unwrap();
-            let user = chat_fragment.put::<LongString, _>("historical-user".to_owned());
+            let user = chat_fragment.put::<UTF8String, _>("historical-user".to_owned());
             chat_fragment += entity! { ExclusiveId::force_ref(&author) @
                 metadata::tag: archive::kind_author,
                 teams::user_id: user,
@@ -701,13 +701,13 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         let token = Id::new([0x22; 16]).unwrap();
         let config = Id::new([0x23; 16]).unwrap();
         let mut token_fragment = Fragment::empty();
-        let secret = token_fragment.put::<LongString, _>("historical-secret".to_owned());
-        let refresh = token_fragment.put::<LongString, _>("historical-refresh".to_owned());
-        let tenant = token_fragment.put::<LongString, _>("historical-tenant".to_owned());
-        let client = token_fragment.put::<LongString, _>("historical-client".to_owned());
+        let secret = token_fragment.put::<UTF8String, _>("historical-secret".to_owned());
+        let refresh = token_fragment.put::<UTF8String, _>("historical-refresh".to_owned());
+        let tenant = token_fragment.put::<UTF8String, _>("historical-tenant".to_owned());
+        let client = token_fragment.put::<UTF8String, _>("historical-client".to_owned());
         let client_secret =
-            token_fragment.put::<LongString, _>("historical-client-secret".to_owned());
-        let user = token_fragment.put::<LongString, _>("historical-user".to_owned());
+            token_fragment.put::<UTF8String, _>("historical-client-secret".to_owned());
+        let user = token_fragment.put::<UTF8String, _>("historical-user".to_owned());
         let at = hifitime::Epoch::from_tai_seconds(1.0);
         let at = (at, at).try_to_inline().unwrap();
         token_fragment += entity! { ExclusiveId::force_ref(&token) @
@@ -757,9 +757,9 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
             };
         }
         if matches!(expiry_vocabulary, LegacyExpiryVocabulary::Both) {
-            let name = token_fragment.put::<LongString, _>("kind_config".to_owned());
+            let name = token_fragment.put::<UTF8String, _>("kind_config".to_owned());
             let description =
-                token_fragment.put::<LongString, _>("Teams app configuration kind.".to_owned());
+                token_fragment.put::<UTF8String, _>("Teams app configuration kind.".to_owned());
             token_fragment += entity! { ExclusiveId::force_ref(&config) @
                 metadata::name: name,
                 metadata::description: description,
@@ -896,21 +896,21 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         let plan = plan(&frozen).unwrap();
         let retained = plan.materialized_facts();
         let user_handle = find!(
-            value: Inline<Handle<LongString>>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(&retained, [{ _?author @ teams::user_id: ?value }])
         )
         .next()
         .expect("retained author user id");
 
         assert!(plan.retired_facts().iter().any(|fact| {
-            fact.a() == &teams::user_id.id() && fact.v::<Handle<LongString>>() == &user_handle
+            fact.a() == &teams::user_id.id() && fact.v::<Handle<UTF8String>>() == &user_handle
         }));
         assert!(plan.commits().iter().any(|commit| {
             let mut blobs = commit.fragment.blobs().clone();
             blobs
                 .reader()
                 .unwrap()
-                .get::<anybytes::View<str>, LongString>(user_handle)
+                .get::<anybytes::View<str>, UTF8String>(user_handle)
                 .is_ok()
         }));
         for commit in plan.commits() {
@@ -1041,7 +1041,7 @@ use faculties::storage::{discover_target, initialize_signer, load_signer, open_p
         .unwrap();
         let context_id = context.root().unwrap();
         context += source;
-        let other_name = context.put::<LongString, _>("Other".to_owned());
+        let other_name = context.put::<UTF8String, _>("Other".to_owned());
         context += entity! { ExclusiveId::force_ref(&context_id) @ metadata::name: other_name };
         collection.commit(context).unwrap();
         collection.into_storage().close().unwrap();

@@ -28,7 +28,7 @@ use triblespace::prelude::*;
 use crate::schemas::memory::{ctx, KIND_CHUNK_ID, KIND_RETRACTION};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type ImageHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

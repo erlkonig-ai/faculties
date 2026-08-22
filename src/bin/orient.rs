@@ -453,7 +453,7 @@ fn native_unread_mail(catalogs: &NativeCatalogs, persona: Id) -> Result<BTreeMap
 fn native_teams_messages(catalogs: &NativeCatalogs) -> Result<BTreeSet<Id>> {
     // Author entities for the account this pile posts as. An author's
     // `teams::user_id` and an auth profile's `teams::auth_user_id` are both
-    // content-derived LongString handles, so equal Graph user ids are equal
+    // content-derived UTF8String handles, so equal Graph user ids are equal
     // handle values and the join needs no blob reads.
     let own_authors: BTreeSet<Id> = find!(
         author: Id,

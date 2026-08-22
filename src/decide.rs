@@ -22,7 +22,7 @@ use crate::schemas::decide::{
 };
 pub use crate::schemas::decide::{result_name, result_tag, RESULT_BENIGN, RESULT_TAGS};
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

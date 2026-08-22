@@ -29,7 +29,7 @@ pub mod config {
     use super::*;
     attributes! {
         "D1DC11B303725409AB8A30C6B59DB2D7" unsafe as persona_id: inlineencodings::GenId;
-        "950B556A74F71AC7CB008AB23FBB6544" unsafe as system_prompt: inlineencodings::Handle<blobencodings::LongString>;
+        "950B556A74F71AC7CB008AB23FBB6544" unsafe as system_prompt: inlineencodings::Handle<blobencodings::UTF8String>;
         "79E1B50756FB64A30916E9353225E179" unsafe as active_model_profile_id: inlineencodings::GenId;
         "6691CF3F872C6107DCFAD0BCF7CDC1A0" unsafe as model_profile_id: inlineencodings::GenId;
         "F9CEA1A2E81D738BB125B4D144B7A746" unsafe as model_context_window_tokens: inlineencodings::U256BE;
@@ -59,15 +59,15 @@ pub mod exec {
     use super::*;
     attributes! {
         "AA2F34973589295FA70B538D92CD30F8" unsafe as kind: inlineencodings::GenId;
-        "79DD6A1A02E598033EDCE5C667E8E3E6" unsafe as command_text: inlineencodings::Handle<blobencodings::LongString>;
+        "79DD6A1A02E598033EDCE5C667E8E3E6" unsafe as command_text: inlineencodings::Handle<blobencodings::UTF8String>;
         "C4C3870642CAB5F55E7E575B1A62E640" unsafe as about_request: inlineencodings::GenId;
         // Published by historical worker event records before this shared
         // schema owned the read path. Literal pinning preserves that identity.
         "79474B948670C7D0322C309EB65219F8" unsafe as attempt: inlineencodings::U256BE;
         "B68F9025545C7E616EB90C6440220348" unsafe as exit_code: inlineencodings::U256BE;
-        "CA7AF66AAF5105EC15625ED14E1A2AC0" unsafe as stdout_text: inlineencodings::Handle<blobencodings::LongString>;
-        "BE4D1876B22EAF93AAD1175DB76D1C72" unsafe as stderr_text: inlineencodings::Handle<blobencodings::LongString>;
-        "E9C77284C7DDCF522A8AC4622FE3FB11" unsafe as error: inlineencodings::Handle<blobencodings::LongString>;
+        "CA7AF66AAF5105EC15625ED14E1A2AC0" unsafe as stdout_text: inlineencodings::Handle<blobencodings::UTF8String>;
+        "BE4D1876B22EAF93AAD1175DB76D1C72" unsafe as stderr_text: inlineencodings::Handle<blobencodings::UTF8String>;
+        "E9C77284C7DDCF522A8AC4622FE3FB11" unsafe as error: inlineencodings::Handle<blobencodings::UTF8String>;
         "90307D583A8F085828E1007AE432BF86" unsafe as about_thought: inlineencodings::GenId;
     }
 }
@@ -80,9 +80,9 @@ pub mod model_chat {
         // Published model-attempt identity; see the Exec attempt note above.
         "8CAEF4617646F8C9E90BC9A3ED3D0496" unsafe as attempt: inlineencodings::U256BE;
         "DA8E31E47919337B3E00724EBE32D14E" unsafe as about_thought: inlineencodings::GenId;
-        "B1B904590F0FA70AD1BA247F3D23A6CC" unsafe as output_text: inlineencodings::Handle<blobencodings::LongString>;
-        "567E35DACDB00C799E75AEED0B6EFDF7" unsafe as reasoning_text: inlineencodings::Handle<blobencodings::LongString>;
-        "9E9B829C473E416E9150D4B94A6A2DC4" unsafe as error: inlineencodings::Handle<blobencodings::LongString>;
+        "B1B904590F0FA70AD1BA247F3D23A6CC" unsafe as output_text: inlineencodings::Handle<blobencodings::UTF8String>;
+        "567E35DACDB00C799E75AEED0B6EFDF7" unsafe as reasoning_text: inlineencodings::Handle<blobencodings::UTF8String>;
+        "9E9B829C473E416E9150D4B94A6A2DC4" unsafe as error: inlineencodings::Handle<blobencodings::UTF8String>;
         "115637F43C28E6ABE3A1B0C4095CAC03" unsafe as input_tokens: inlineencodings::U256BE;
         "F17EB3EABC10A0210403B807BEB25D08" unsafe as output_tokens: inlineencodings::U256BE;
         "B680DCFAB2E8D1413E450C89AB156197" unsafe as cache_creation_input_tokens: inlineencodings::U256BE;
@@ -93,9 +93,9 @@ pub mod model_chat {
 pub mod reason {
     use super::*;
     attributes! {
-        "B10329D5D1087D15A3DAFF7A7CC50696" unsafe as text: inlineencodings::Handle<blobencodings::LongString>;
+        "B10329D5D1087D15A3DAFF7A7CC50696" unsafe as text: inlineencodings::Handle<blobencodings::UTF8String>;
         "E6B1C728F1AE9F46CAB4DBB60D1A9528" unsafe as about_turn: inlineencodings::GenId;
-        "514F4FE9F560FB155450462C8CF50749" unsafe as command_text: inlineencodings::Handle<blobencodings::LongString>;
+        "514F4FE9F560FB155450462C8CF50749" unsafe as command_text: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -103,7 +103,7 @@ pub mod context {
     use super::*;
     attributes! {
         "81E520987033BE71EB0AFFA8297DE613" unsafe as kind: inlineencodings::GenId;
-        "3292CF0B3B6077991D8ECE6E2973D4B6" unsafe as summary: inlineencodings::Handle<blobencodings::LongString>;
+        "3292CF0B3B6077991D8ECE6E2973D4B6" unsafe as summary: inlineencodings::Handle<blobencodings::UTF8String>;
         "502F7D33822A90366F0F0ADA0556177F" unsafe as start_at: inlineencodings::NsTAIInterval;
         "DF84E872EB68FBFCA63D760F27FD8A6F" unsafe as end_at: inlineencodings::NsTAIInterval;
         "CB97C36A32DEC70E0D1149E7C5D88588" unsafe as left: inlineencodings::GenId;
@@ -117,6 +117,6 @@ pub mod cog {
     use super::*;
     attributes! {
         "07F063ECF1DC9FB3C1984BDB10B98BFA" unsafe as kind: inlineencodings::GenId;
-        "FA6090FB00EEE2F5EF1E51F1F68EA5B8" unsafe as context: inlineencodings::Handle<blobencodings::LongString>;
+        "FA6090FB00EEE2F5EF1E51F1F68EA5B8" unsafe as context: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }

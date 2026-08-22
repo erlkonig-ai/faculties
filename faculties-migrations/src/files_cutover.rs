@@ -20,7 +20,7 @@ use std::path::Path;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{BlobEncoding, TryFromBlob};
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::Id;
@@ -290,7 +290,7 @@ fn plan_projected(
 
     for file_id in &file_ids {
         let name_fact = exactly_one_fact(&original, *file_id, file::name.id(), "file name")?;
-        let name_handle = *name_fact.v::<Handle<LongString>>();
+        let name_handle = *name_fact.v::<Handle<UTF8String>>();
         let name: View<str> = reader
             .get(name_handle)
             .with_context(|| format!("read filename attachment for {file_id:x}"))?;
@@ -513,7 +513,7 @@ fn validate_existing_media_type(
         bail!("file points at non-media-type entity {media_type:x}");
     };
     let name_fact = exactly_one_fact(facts, media_type, metadata::name.id(), "media-type name")?;
-    let handle = *name_fact.v::<Handle<LongString>>();
+    let handle = *name_fact.v::<Handle<UTF8String>>();
     let name: View<str> = reader
         .get(handle)
         .with_context(|| format!("read media-type name for {media_type:x}"))?;
@@ -537,7 +537,7 @@ fn validate_existing_media_type(
 fn media_type_fragment(media_type: &str) -> Result<Fragment> {
     let media_type = file_capability::normalize_media_type(media_type)?;
     let mut fragment = Fragment::empty();
-    let name = fragment.put::<LongString, _>(media_type);
+    let name = fragment.put::<UTF8String, _>(media_type);
     fragment += entity! {
         metadata::tag: &KIND_MEDIA_TYPE,
         metadata::name: name,
@@ -647,7 +647,7 @@ use faculties::storage::{discover_target, initialize_signer};
 
         let mut file_fragment = Fragment::empty();
         let content = file_fragment.put::<RawBytes, _>(b"legacy PDF".to_vec());
-        let name = file_fragment.put::<LongString, _>("report.pdf".to_owned());
+        let name = file_fragment.put::<UTF8String, _>("report.pdf".to_owned());
         let file_record = entity! {
             metadata::tag: &KIND_FILE,
             file::content: content,
@@ -656,7 +656,7 @@ use faculties::storage::{discover_target, initialize_signer};
         };
         let old_file = file_record.root().unwrap();
         file_fragment += file_record;
-        let source_path = file_fragment.put::<LongString, _>("mail:legacy-report".to_owned());
+        let source_path = file_fragment.put::<UTF8String, _>("mail:legacy-report".to_owned());
         let imported_at = Epoch::from_tai_seconds(41.0);
         let imported_at: file_capability::ImportTime =
             (imported_at, imported_at).try_to_inline().unwrap();
@@ -670,7 +670,7 @@ use faculties::storage::{discover_target, initialize_signer};
 
         let mut directory_fragment = Fragment::empty();
         let second_content = directory_fragment.put::<RawBytes, _>(b"second PDF".to_vec());
-        let second_name = directory_fragment.put::<LongString, _>("appendix.pdf".to_owned());
+        let second_name = directory_fragment.put::<UTF8String, _>("appendix.pdf".to_owned());
         let second_file = entity! {
             metadata::tag: &KIND_FILE,
             file::content: second_content,
@@ -850,7 +850,7 @@ use faculties::storage::{discover_target, initialize_signer};
         validate_known_payloads(&reader, &materialized).unwrap();
         validate_known_payloads(&reader, &materialized_metadata).unwrap();
         let descriptions: BTreeSet<String> = find!(
-            description: Inline<Handle<LongString>>,
+            description: Inline<Handle<UTF8String>>,
             pattern!(&materialized_metadata, [{
                 _?metadata @ metadata::description: ?description
             }])
@@ -901,7 +901,7 @@ use faculties::storage::{discover_target, initialize_signer};
         let mut workspace = repository.pull(branch).unwrap();
         let mut malformed = Fragment::empty();
         let content = malformed.put::<RawBytes, _>(b"missing MIME".to_vec());
-        let name = malformed.put::<LongString, _>("missing.bin".to_owned());
+        let name = malformed.put::<UTF8String, _>("missing.bin".to_owned());
         malformed += entity! {
             metadata::tag: &KIND_FILE,
             file::content: content,
@@ -928,7 +928,7 @@ use faculties::storage::{discover_target, initialize_signer};
         let mut workspace = repository.pull(branch).unwrap();
         let mut malformed = Fragment::empty();
         let content = malformed.put::<RawBytes, _>(b"partial import".to_vec());
-        let name = malformed.put::<LongString, _>("partial.txt".to_owned());
+        let name = malformed.put::<UTF8String, _>("partial.txt".to_owned());
         let file = entity! {
             metadata::tag: &KIND_FILE,
             file::content: content,
@@ -960,7 +960,7 @@ use faculties::storage::{discover_target, initialize_signer};
         File::create(&path).unwrap();
         let mut pile = faculties::storage::open_pile_strict(&path).unwrap();
         let name = pile
-            .put::<LongString, _>("application/pdf".to_owned())
+            .put::<UTF8String, _>("application/pdf".to_owned())
             .unwrap();
         let facts = entity! {
             metadata::tag: &KIND_MEDIA_TYPE,
@@ -980,7 +980,7 @@ use faculties::storage::{discover_target, initialize_signer};
         File::create(&path).unwrap();
         let mut pile = faculties::storage::open_pile_strict(&path).unwrap();
         let name = pile
-            .put::<LongString, _>("application/octet-stream".to_owned())
+            .put::<UTF8String, _>("application/octet-stream".to_owned())
             .unwrap();
         let current = entity! {
             metadata::tag: &KIND_MEDIA_TYPE,
@@ -1011,7 +1011,7 @@ use faculties::storage::{discover_target, initialize_signer};
         File::create(&path).unwrap();
         let mut pile = faculties::storage::open_pile_strict(&path).unwrap();
         let name = pile
-            .put::<LongString, _>("application/pdf".to_owned())
+            .put::<UTF8String, _>("application/pdf".to_owned())
             .unwrap();
         let extrinsic = Id::new([0x71; 16]).unwrap();
         let facts = entity! { ExclusiveId::force_ref(&extrinsic) @

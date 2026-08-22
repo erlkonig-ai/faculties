@@ -182,7 +182,7 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
 
     for fact in facts {
         if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "strictly read frozen Web text payload {}",
@@ -242,8 +242,8 @@ use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 
     fn observation(label: &str) -> Fragment {
         let mut fragment = Fragment::empty();
-        let query = fragment.put::<blobencodings::LongString, _>(label.to_owned());
-        let url = fragment.put::<blobencodings::LongString, _>(format!("https://{label}.test"));
+        let query = fragment.put::<blobencodings::UTF8String, _>(label.to_owned());
+        let url = fragment.put::<blobencodings::UTF8String, _>(format!("https://{label}.test"));
         fragment += entity! { _ @
             metadata::tag: &web_schema::kind_search,
             web_schema::query: query,

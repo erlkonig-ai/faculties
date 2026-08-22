@@ -25,7 +25,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::{ExclusiveId, Id};
 use triblespace::core::inline::encodings::hash::Handle;
@@ -805,7 +805,7 @@ fn validate_legacy_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()
         .iter()
         .filter(|fact| fact.a() == &local::body.id() || fact.a() == &metadata::name.id())
     {
-        let handle = *fact.v::<Handle<LongString>>();
+        let handle = *fact.v::<Handle<UTF8String>>();
         let _: anybytes::View<str> = reader.get(handle).with_context(|| {
             format!(
                 "strictly read legacy Message text payload {}",

@@ -22,7 +22,7 @@ use faculties::legacy_hint::open_scope;
 
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type EmbHandle = Inline<inlineencodings::Handle<Embedding>>;
 /// Handle into the nomic-embed-multimodal-7b dense space (3584-d). A distinct
 /// type from `EmbHandle` (CLIP-512) so the two spaces index independently and
@@ -2204,7 +2204,7 @@ mod tests {
         let leaf_id = leaf.root().unwrap();
         fragment += leaf;
 
-        let tensor_name = fragment.put::<blobencodings::LongString, _>(tensor_name.to_owned());
+        let tensor_name = fragment.put::<blobencodings::UTF8String, _>(tensor_name.to_owned());
         let member = entity! { _ @
             attrs::kind: "vector",
             attrs::safetensor_path: tensor_name,
@@ -2216,7 +2216,7 @@ mod tests {
         let root = entity! { _ @ attrs::member: &member_id };
         let root_id = root.root().unwrap();
         fragment += root;
-        let source = fragment.put::<blobencodings::LongString, _>(source.to_owned());
+        let source = fragment.put::<blobencodings::UTF8String, _>(source.to_owned());
         fragment += entity! { ExclusiveId::force_ref(&root_id) @
             attrs::source: source,
             attrs::quantization: "native",

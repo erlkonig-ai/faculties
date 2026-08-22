@@ -35,7 +35,7 @@ use crate::schemas::headspace::{
 };
 use crate::secrets::SecretsCatalog;
 
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type CountValue = Inline<inlineencodings::U256BE>;
 
 /// One complete model-profile value.
@@ -1045,7 +1045,7 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
 
     for fact in facts {
         if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "read frozen Headspace text payload {}",

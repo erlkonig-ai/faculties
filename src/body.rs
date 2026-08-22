@@ -17,7 +17,7 @@ use crate::schemas::body::{capture, intent, KIND_CAPTURE, KIND_INTENT};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type DimensionValue = Inline<inlineencodings::U256BE>;
 
 /// One exact deliberate capture projected from the Body collection.
@@ -449,8 +449,8 @@ mod tests {
     fn vision() -> Fragment {
         let mut fragment = Fragment::empty();
         let frame = fragment.put::<blobencodings::RawBytes, _>(vec![1, 2, 3]);
-        let pose = fragment.put::<blobencodings::LongString, _>("{}".to_owned());
-        let note = fragment.put::<blobencodings::LongString, _>("kept".to_owned());
+        let pose = fragment.put::<blobencodings::UTF8String, _>("{}".to_owned());
+        let note = fragment.put::<blobencodings::UTF8String, _>("kept".to_owned());
         fragment += capture_record(&CaptureRow {
             id: KIND_CAPTURE,
             created_at: at(1.0),
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn strict_catalog_accepts_canonical_capture_and_intent_records() {
         let mut all = vision();
-        let pose = all.put::<blobencodings::LongString, _>("touch".to_owned());
+        let pose = all.put::<blobencodings::UTF8String, _>("touch".to_owned());
         all += capture_record(&CaptureRow {
             id: KIND_CAPTURE,
             created_at: at(2.0),
@@ -481,7 +481,7 @@ mod tests {
             pose,
         });
         let audio = all.put::<blobencodings::RawBytes, _>(vec![4, 5]);
-        let pose = all.put::<blobencodings::LongString, _>("audio-pose".to_owned());
+        let pose = all.put::<blobencodings::UTF8String, _>("audio-pose".to_owned());
         all += capture_record(&CaptureRow {
             id: KIND_CAPTURE,
             created_at: at(3.0),
@@ -493,7 +493,7 @@ mod tests {
             note: None,
             pose,
         });
-        let text = all.put::<blobencodings::LongString, _>("lean in".to_owned());
+        let text = all.put::<blobencodings::UTF8String, _>("lean in".to_owned());
         all += intent_record(&IntentRow {
             id: KIND_INTENT,
             created_at: at(4.0),

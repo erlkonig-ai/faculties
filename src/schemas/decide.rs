@@ -86,7 +86,7 @@ pub mod decide {
         /// Free-form outcome carried by an intrinsic resolution snapshot.
         /// This retains the already-published meaning.
         "384E8074DB17FFE12FAFFB4344A6D196" unsafe as outcome:
-            inlineencodings::Handle<blobencodings::LongString>;
+            inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Stable decision anchor described by an immutable genesis.
         /// Minted with `trible genid` on 2026-08-08.

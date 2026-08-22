@@ -21,7 +21,7 @@ use std::path::Path;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::{ExclusiveId, Id};
 use triblespace::core::inline::encodings::hash::Handle;
@@ -55,7 +55,7 @@ use faculties::posture_policy::{
     validate_policy_catalog_union,
 };
 
-type TextHandle = Inline<Handle<LongString>>;
+type TextHandle = Inline<Handle<UTF8String>>;
 type EmbeddingHandle = Inline<Handle<Embedding768>>;
 
 /// Conservation census for one complete historical Posture rewrite.
@@ -938,7 +938,7 @@ fn validate_legacy_known_payloads(reader: &PileReader, facts: &TribleSet) -> Res
         ]
         .contains(fact.a())
         {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "read legacy Posture text payload {}",

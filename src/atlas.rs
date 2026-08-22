@@ -10,11 +10,11 @@ use anyhow::{anyhow, Result};
 use triblespace::core::blob::Blob;
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::prelude::blobencodings::{LongString, WasmCode};
+use triblespace::prelude::blobencodings::{UTF8String, WasmCode};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
-pub type TextHandle = Inline<Handle<LongString>>;
+pub type TextHandle = Inline<Handle<UTF8String>>;
 
 /// All inspectable metadata attached to one named Atlas entity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,7 +94,7 @@ pub fn validate_known_payloads<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -
 
     for fact in facts {
         if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<Handle<LongString>>();
+            let handle = *fact.v::<Handle<UTF8String>>();
             let _: anybytes::View<str> = reader.get(handle).map_err(|error| {
                 anyhow!(
                     "read Atlas text payload {}: {error:?}",
@@ -208,10 +208,10 @@ mod tests {
         let id = Id::new([0x41; 16]).unwrap();
         let member = Id::new([0x42; 16]).unwrap();
         let mut fragment = Fragment::empty();
-        let alpha = fragment.put::<LongString, _>("Alpha".to_owned());
-        let beta = fragment.put::<LongString, _>("Beta".to_owned());
-        let first = fragment.put::<LongString, _>("First description".to_owned());
-        let second = fragment.put::<LongString, _>("Second description".to_owned());
+        let alpha = fragment.put::<UTF8String, _>("Alpha".to_owned());
+        let beta = fragment.put::<UTF8String, _>("Beta".to_owned());
+        let first = fragment.put::<UTF8String, _>("First description".to_owned());
+        let second = fragment.put::<UTF8String, _>("Second description".to_owned());
         fragment += entity! { ExclusiveId::force_ref(&id) @
             metadata::name: beta,
             metadata::description: second,

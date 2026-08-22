@@ -825,7 +825,7 @@ mod tests {
         let context = storage.context();
         let view = context.dataset(SourceKey::Reason).unwrap();
         let text = find!(
-            text: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+            text: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
             pattern!(view.facts, [{ metadata::tag: crate::schemas::reason::KIND_REASON_ID,
                                     crate::schemas::reason::reason_schema::text: ?text }])
         )

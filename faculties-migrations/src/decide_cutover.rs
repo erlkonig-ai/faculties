@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::wasmcode::WasmCode;
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::CollectionCommit;
@@ -286,7 +286,7 @@ fn validate_legacy_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()
             None
         };
         if let Some(field) = text_field {
-            let handle = *fact.v::<Handle<LongString>>();
+            let handle = *fact.v::<Handle<UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "read legacy Decide {field} payload {}",

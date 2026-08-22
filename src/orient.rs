@@ -22,7 +22,7 @@ use crate::schemas::orient::{
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
 /// Complete semantic wake state for one persona.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -226,7 +226,7 @@ pub fn checkpoint_fragment(
 ) -> Result<(Fragment, Id)> {
     point_time(at)?;
     let mut fragment = Fragment::empty();
-    let handle = fragment.put::<blobencodings::LongString, _>(serialize_view(view)?);
+    let handle = fragment.put::<blobencodings::UTF8String, _>(serialize_view(view)?);
     let record = checkpoint_record(persona, handle, at);
     let event = record
         .root()

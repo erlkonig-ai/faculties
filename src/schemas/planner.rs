@@ -50,7 +50,7 @@ pub mod event {
         // particular). Self-created events synthesise a UID like
         // `<entity-id>@triblespace`.
         "E9BA10B4508134CAB1B2A2831D0A0553" unsafe as ical_uid:
-            inlineencodings::Handle<blobencodings::LongString>;
+            inlineencodings::Handle<blobencodings::UTF8String>;
         // Short title — fits the column width of `planner list`
         // and `orient` views without truncation.
         "8E91381379F0567B9E318E253A1D19E6" unsafe as summary: inlineencodings::ShortString;
@@ -58,7 +58,7 @@ pub mod event {
         // blob handle so multi-paragraph descriptions don't
         // bloat the trible store.
         "8A9ADE8F45D85B74F97712C33967A830" unsafe as description:
-            inlineencodings::Handle<blobencodings::LongString>;
+            inlineencodings::Handle<blobencodings::UTF8String>;
         // The event's time window: NsTAIInterval (inclusive bounds,
         // 32 bytes, range-scannable via byte-lex order). For
         // instantaneous events use start == end. For all-day
@@ -109,7 +109,7 @@ pub mod note {
     attributes! {
         "A7971D096F0FE50C896338802A8A3B1A" unsafe as note_about: inlineencodings::GenId;
         "4DFEEF75B29536E5F77DFFC54D7B5130" unsafe as note_text:
-            inlineencodings::Handle<blobencodings::LongString>;
+            inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 

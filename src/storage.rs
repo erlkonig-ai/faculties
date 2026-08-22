@@ -343,7 +343,7 @@ mod tests {
 
     use anybytes::View;
     use ed25519_dalek::SigningKey;
-    use triblespace::core::blob::encodings::longstring::LongString;
+    use triblespace::core::blob::encodings::utf8string::UTF8String;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::collection::{empty_metadata_handle, CollectionRecord};
     use triblespace::core::inline::encodings::hash::Handle;
@@ -561,14 +561,14 @@ mod tests {
         let content_handle = actual_facts
             .iter()
             .find(|fact| fact.e() == &content_root && fact.a() == &metadata::name.id())
-            .map(|fact| *fact.v::<Handle<LongString>>())
+            .map(|fact| *fact.v::<Handle<UTF8String>>())
             .expect("content attachment handle");
         let content: View<str> = reader.get(content_handle).unwrap();
         assert_eq!(&*content, "content attachment");
         let metadata_handle = actual_metafacts
             .iter()
             .find(|fact| fact.e() == &metadata_root && fact.a() == &metadata::name.id())
-            .map(|fact| *fact.v::<Handle<LongString>>())
+            .map(|fact| *fact.v::<Handle<UTF8String>>())
             .expect("metadata attachment handle");
         let metadata_text: View<str> = reader.get(metadata_handle).unwrap();
         assert_eq!(&*metadata_text, "metadata attachment");

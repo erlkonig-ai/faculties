@@ -15,7 +15,7 @@
 //! source page or a change to attachment identity.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
@@ -41,22 +41,22 @@ pub mod teams {
         /// A message observation's containing logical chat.
         "1E525B603A0060D9FA132B3D4EE9538A" unsafe as pub chat: GenId;
         /// Microsoft-local chat id. The entity is globally scoped by `source`.
-        "B6089037C04529F55D2A2D1A668DBE95" unsafe as pub chat_id: Handle<LongString>;
+        "B6089037C04529F55D2A2D1A668DBE95" unsafe as pub chat_id: Handle<UTF8String>;
         /// Microsoft-local message id. Identity also includes the chat.
-        "02D2C105E35BD5DD6CF7A1F1B74BA686" unsafe as pub message_id: Handle<LongString>;
+        "02D2C105E35BD5DD6CF7A1F1B74BA686" unsafe as pub message_id: Handle<UTF8String>;
         /// One raw Graph representation of a semantic message observation.
-        "1DE123824D5BDA58F92CD002FCFB2BFF" unsafe as pub message_raw: Handle<LongString>;
+        "1DE123824D5BDA58F92CD002FCFB2BFF" unsafe as pub message_raw: Handle<UTF8String>;
         /// Logical message which owns an attachment observation.
         "617A66047DCBBDDED1BC5167336FADE0" unsafe as pub attachment_message: GenId;
         /// Graph attachment collection (`attachment` or `hosted-content`).
         "E0FC3B5C541A7DA9C56158D41B322623" unsafe as pub attachment_kind: ShortString;
         /// Microsoft-local user id. The entity is globally scoped by `source`.
-        "5820C49A7A8B4ADBCA4637E3AE2499EB" unsafe as pub user_id: Handle<LongString>;
+        "5820C49A7A8B4ADBCA4637E3AE2499EB" unsafe as pub user_id: Handle<UTF8String>;
 
         /// Tenant-qualified Microsoft Graph source named by an entity.
         "0F0DB4037A0C4F7070D684AF92480F82" unsafe as pub source: GenId;
         /// Exact Microsoft tenant id used to derive a source entity.
-        "DA46346DEC18824BF6D175014AA25A1E" unsafe as pub tenant_id: Handle<LongString>;
+        "DA46346DEC18824BF6D175014AA25A1E" unsafe as pub tenant_id: Handle<UTF8String>;
         /// Logical message represented by an immutable observation entity.
         "F5D32FC62D82A20CE84D515A873BB46A" unsafe as pub message: GenId;
         /// Graph `lastModifiedDateTime` of a message observation.
@@ -64,15 +64,15 @@ pub mod teams {
         /// Graph `deletedDateTime`, when the observation is a deletion.
         "ADE52EF46FBBE5BA5422FD22267ACD54" unsafe as pub deleted_at: NsTAIInterval;
         /// Graph message version/etag; with modified time it names a source version.
-        "92BC318B2A215D7BE08795B213C44324" unsafe as pub etag: Handle<LongString>;
+        "92BC318B2A215D7BE08795B213C44324" unsafe as pub etag: Handle<UTF8String>;
         /// Display name observed for the author in this message version.
-        "69A8805536179FB6E4447B59854FA608" unsafe as pub author_name: Handle<LongString>;
+        "69A8805536179FB6E4447B59854FA608" unsafe as pub author_name: Handle<UTF8String>;
         /// Monotone diagnostic depth of a coverage receipt.
         "DE8DE9AAC084A323393944238E143E18" unsafe as pub coverage_generation: U256BE;
         /// Exact request URL consumed by one Graph page.
-        "26A7228FBA3678FB356A76D62197CE23" unsafe as pub coverage_request: Handle<LongString>;
+        "26A7228FBA3678FB356A76D62197CE23" unsafe as pub coverage_request: Handle<UTF8String>;
         /// Opaque next/delta URL produced by one Graph page.
-        "6E435B4201F7E8487EBBE60EFD724079" unsafe as pub coverage_cursor: Handle<LongString>;
+        "6E435B4201F7E8487EBBE60EFD724079" unsafe as pub coverage_cursor: Handle<UTF8String>;
         /// `next` for an incomplete round, `delta` for a completed round.
         "CCDB0B26489A4AE7C7FD3385F7489AD8" unsafe as pub coverage_kind: ShortString;
         /// Message observation or source tombstone carried by a page.
@@ -81,7 +81,7 @@ pub mod teams {
         ///
         /// Minted with `trible genid` on 2026-08-09:
         /// `6E52C046D67BF9446A161A1E3068917E`.
-        "6E52C046D67BF9446A161A1E3068917E" unsafe as pub snapshot_source_coordinate: Handle<LongString>;
+        "6E52C046D67BF9446A161A1E3068917E" unsafe as pub snapshot_source_coordinate: Handle<UTF8String>;
         /// `present` or `deleted`; every message observation has exactly one.
         "F8164FF23A7A499756F9A150CA1F587E" unsafe as pub message_state: ShortString;
 
@@ -89,17 +89,17 @@ pub mod teams {
         ///
         /// Minted with `trible genid` on 2026-08-12:
         /// `35CED3BE8703D51670F55A0A7D7379A2`.
-        "35CED3BE8703D51670F55A0A7D7379A2" as pub auth_client_id: Handle<LongString>;
+        "35CED3BE8703D51670F55A0A7D7379A2" as pub auth_client_id: Handle<UTF8String>;
         /// User id whose chats are tracked by an auth-profile snapshot.
         ///
         /// Minted with `trible genid` on 2026-08-12:
         /// `70B7AD9A1FE24A186F6E45DF979AE4C1`.
-        "70B7AD9A1FE24A186F6E45DF979AE4C1" as pub auth_user_id: Handle<LongString>;
+        "70B7AD9A1FE24A186F6E45DF979AE4C1" as pub auth_user_id: Handle<UTF8String>;
         /// Canonical space-delimited delegated OAuth scopes.
         ///
         /// Minted with `trible genid` on 2026-08-12:
         /// `3EE1F37036587FA6F678B66474747C50`.
-        "3EE1F37036587FA6F678B66474747C50" as pub auth_scopes: Handle<LongString>;
+        "3EE1F37036587FA6F678B66474747C50" as pub auth_scopes: Handle<UTF8String>;
         /// Exact encrypted Secrets version containing the app client secret.
         ///
         /// Minted with `trible genid` on 2026-08-12:

@@ -19,7 +19,7 @@ use crate::schemas::planner::{
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type SequenceValue = Inline<inlineencodings::U256BE>;
 
 pub const STATUS_CONFIRMED: &str = "CONFIRMED";
@@ -708,7 +708,7 @@ pub fn load_catalog(space: &TribleSet) -> Result<PlannerCatalog> {
     Ok(catalog)
 }
 
-/// Strictly read a LongString attachment.
+/// Strictly read a UTF8String attachment.
 pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
     let text: anybytes::View<str> = reader.get(handle).context("read Planner text")?;
     Ok(text.to_string())
@@ -751,7 +751,7 @@ pub fn validate_candidate(
             || fact.a() == &event::description.id()
             || fact.a() == &note::note_text.id()
         {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let text: anybytes::View<str> = if local_reader.metadata(handle)?.is_some() {
                 local_reader
                     .get(handle)

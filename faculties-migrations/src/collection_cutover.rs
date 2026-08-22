@@ -28,7 +28,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, IntoBlob, MemoryBlobStore};
@@ -278,7 +278,7 @@ impl FrozenSource {
     /// checked before a value is returned. This method never reopens or
     /// mutates the source pile.
     pub fn legacy_branch(&self, name: &str) -> Result<Option<FrozenLegacyBranch>> {
-        let wanted: Inline<Handle<triblespace::core::blob::encodings::longstring::LongString>> =
+        let wanted: Inline<Handle<triblespace::core::blob::encodings::utf8string::UTF8String>> =
             name.to_owned().to_blob().get_handle();
         let mut matches = Vec::new();
         for pin in &self.legacy_pins {
@@ -655,7 +655,7 @@ where
     };
 
     if let Some(handle) = message {
-        let blob: Blob<LongString> = reader.get(handle).with_context(|| {
+        let blob: Blob<UTF8String> = reader.get(handle).with_context(|| {
             format!(
                 "strictly read frozen legacy commit message {}",
                 hex::encode_upper(handle.raw)
@@ -868,7 +868,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ed25519_dalek::SigningKey;
-    use triblespace::core::blob::encodings::longstring::LongString;
+    use triblespace::core::blob::encodings::utf8string::UTF8String;
     use triblespace::core::metadata;
     use triblespace::core::repo::{BlobStorePut, PinStore, PushResult, Repository};
     use triblespace::macros::entity;
@@ -993,9 +993,9 @@ mod tests {
         detached
             .put::<SimpleArchive, _>(attached_blob)
             .expect("copy attached semantic metadata");
-        let message_blob: Blob<LongString> = source.reader().get(message).unwrap();
+        let message_blob: Blob<UTF8String> = source.reader().get(message).unwrap();
         detached
-            .put::<LongString, _>(message_blob)
+            .put::<UTF8String, _>(message_blob)
             .expect("copy legacy message");
         let detached_reader = detached.reader().unwrap();
         assert!(detached_reader

@@ -23,7 +23,7 @@
 //! exact values are kept here beside the protocol they identify.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::UTF8String;
 pub use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
@@ -90,12 +90,12 @@ pub mod content_fact {
         /// IDENTITY. Reified `in`, `out`, or `ambient` direction entity.
         "3A42C2348E452E2C2E98B6C576576947" unsafe as pub direction: GenId;
         /// IDENTITY for text, thinking, and textual tool payloads.
-        "6CA37B269D7900D866824EB5560E747B" unsafe as pub payload: Handle<LongString>;
+        "6CA37B269D7900D866824EB5560E747B" unsafe as pub payload: Handle<UTF8String>;
         /// IDENTITY when media bytes are resident.
         "EEA16296F288D635B9BA4F603827E109" unsafe as pub blob: Handle<RawBytes>;
         /// IDENTITY when bytes are not held. External pointers are meaningful
         /// only together with `asset_namespace`.
-        "91FB71A7D25EC34E208DA622DD680481" unsafe as pub asset_pointer: Handle<LongString>;
+        "91FB71A7D25EC34E208DA622DD680481" unsafe as pub asset_pointer: Handle<UTF8String>;
         /// IDENTITY with `asset_pointer`. Source namespace of the external
         /// pointer, preventing unrelated vendors from sharing an id string.
         "9B38698BD76DB91C8ED478D304375286" unsafe as pub asset_namespace: GenId;
@@ -199,7 +199,7 @@ pub mod source_projection {
         "3D9FCD3A68CBFBCFD7375E35D63FB87D" unsafe as pub source_namespace: GenId;
         /// IDENTITY. Vendor id scoped by session, or an append-stable fallback
         /// coordinate. Never a movable filesystem path by itself.
-        "5F3F80B819EBFB04E2AF20852F9FE3E3" unsafe as pub source_locator: Handle<LongString>;
+        "5F3F80B819EBFB04E2AF20852F9FE3E3" unsafe as pub source_locator: Handle<UTF8String>;
         /// IDENTITY. Exact raw source record bytes.
         "584415CC85A866E45B91C2673C7F794E" unsafe as pub raw_record: Handle<RawBytes>;
         /// IDENTITY. Canonical block produced by this projection.
@@ -220,11 +220,11 @@ pub mod source_projection {
         /// the occurrence.
         "EBE88D7DDF43CCC594A695504B599AA5" unsafe as pub experiencer: GenId;
         /// NONIDENTITY. Exact vendor author label retained for provenance.
-        "01BA2CB9FF56564100D64C81D0391E28" unsafe as pub raw_author: Handle<LongString>;
+        "01BA2CB9FF56564100D64C81D0391E28" unsafe as pub raw_author: Handle<UTF8String>;
         /// NONIDENTITY. Exact vendor role label retained for provenance.
-        "2874AFE6553B4E044D4EBFB8FA89A641" unsafe as pub raw_role: Handle<LongString>;
+        "2874AFE6553B4E044D4EBFB8FA89A641" unsafe as pub raw_role: Handle<UTF8String>;
         /// NONIDENTITY. Exact vendor model label retained for provenance.
-        "CEB26C9520076D245DF83F77D994A800" unsafe as pub raw_model: Handle<LongString>;
+        "CEB26C9520076D245DF83F77D994A800" unsafe as pub raw_model: Handle<UTF8String>;
     }
 
     /// Nonidentity kind marker attached after intrinsic receipt construction.

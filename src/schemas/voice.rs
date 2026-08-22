@@ -25,7 +25,7 @@
 //! leak a private utterance into a room.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, ShortString, U256BE};
 use triblespace::prelude::*;
 
@@ -59,7 +59,7 @@ pub mod utterance {
     use super::*;
     attributes! {
         /// The words spoken.
-        "F38AD7DD14F63E61BEE1E036FC74FBEA" unsafe as pub text: Handle<LongString>;
+        "F38AD7DD14F63E61BEE1E036FC74FBEA" unsafe as pub text: Handle<UTF8String>;
         /// Channel: "say" (private) | "shout" (aloud).
         "4BD1230C0AA831B3A53D2FB4E5A53583" unsafe as pub channel: ShortString;
         /// The synthesized audio, content-addressed.

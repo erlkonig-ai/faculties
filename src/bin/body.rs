@@ -41,7 +41,7 @@ use triblespace::prelude::*;
 use faculties::legacy_hint::open_scope;
 
 type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
 const DEFAULT_DAEMON: &str = "http://localhost:8000";
 // The reachy venv's interpreter. `python3` resolves via PATH by default (set

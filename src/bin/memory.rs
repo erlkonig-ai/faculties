@@ -33,7 +33,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 use faculties::legacy_hint::open_scope;
@@ -317,7 +317,7 @@ impl MemoryStorage<'_> {
 fn chunk_oneline(reader: &PileReader, space: &TribleSet, id: Id) -> String {
     if let Some(h) = chunk_summary_handle(space, id) {
         return reader
-            .get::<View<str>, LongString>(h)
+            .get::<View<str>, UTF8String>(h)
             .ok()
             .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
             .unwrap_or_default();
@@ -488,7 +488,7 @@ fn cmd_embed(storage: MemoryStorage<'_>) -> Result<()> {
     // bytes (nomic-vision). Both land on the same `embeddings::attr::embedding`
     // because nomic text+vision share one 768-d space.
     enum Src {
-        Text(Inline<Handle<LongString>>),
+        Text(Inline<Handle<UTF8String>>),
         Image(Inline<Handle<RawBytes>>),
     }
 
@@ -1540,7 +1540,7 @@ fn cmd_lens(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         let theme: String = loaded
             .memory
             .reader
-            .get::<View<str>, LongString>(lh)
+            .get::<View<str>, UTF8String>(lh)
             .context("read lens theme")?
             .as_ref()
             .to_string();
@@ -1578,7 +1578,7 @@ fn cmd_lens(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         println!("{} lens memor(ies):", lenses.len());
         for (theme, s, e, id) in &lenses {
             let first = chunk_summary_handle(space, *id)
-                .and_then(|h| loaded.memory.reader.get::<View<str>, LongString>(h).ok())
+                .and_then(|h| loaded.memory.reader.get::<View<str>, UTF8String>(h).ok())
                 .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
                 .unwrap_or_default();
             println!(
@@ -2450,7 +2450,7 @@ fn print_archive_meta(reader: &PileReader, archive: &TribleSet, archive_msg_id: 
         println!("  author: {author:x}");
     }
     if let Some((handle,)) = find!(
-        (handle: Inline<Handle<LongString>>),
+        (handle: Inline<Handle<UTF8String>>),
         pattern!(archive, [{
             archive_msg_id @ archive_schema::source_projection::raw_author: ?handle,
         }])
@@ -2473,7 +2473,7 @@ fn print_archive_meta(reader: &PileReader, archive: &TribleSet, archive_msg_id: 
         println!("  source_namespace: {namespace:x}");
     }
     if let Some((handle,)) = find!(
-        (handle: Inline<Handle<LongString>>),
+        (handle: Inline<Handle<UTF8String>>),
         pattern!(archive, [{
             archive_msg_id @ archive_schema::source_projection::source_locator: ?handle,
         }])
@@ -2498,7 +2498,7 @@ fn print_archive_meta(reader: &PileReader, archive: &TribleSet, archive_msg_id: 
             println!("  legacy_author: {author:x}");
         }
         if let Some(handle) = find!(
-            handle: Inline<Handle<LongString>>,
+            handle: Inline<Handle<UTF8String>>,
             pattern!(archive, [{ archive_msg_id @ legacy_archive_schema::author_name: ?handle }])
         )
         .next()

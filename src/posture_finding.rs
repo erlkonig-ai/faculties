@@ -33,7 +33,7 @@ use crate::schemas::posture::{
     posture, CARRIER_CONTAINER_MEMBER, CARRIER_GIT_BLOB, CARRIER_GIT_COMMIT, KIND_FINDING,
 };
 
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
 /// The content-addressed unit a finding's material sits in.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

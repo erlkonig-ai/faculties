@@ -17,7 +17,7 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
 use triblespace_paths::{PathExpr, PathIndex, Step};
 
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "compass", about = "A small TribleSpace kanban faculty")]

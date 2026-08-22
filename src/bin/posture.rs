@@ -67,7 +67,7 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
 use faculties::legacy_hint::open_scope;
 
-type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 #[derive(Parser)]
@@ -2226,7 +2226,7 @@ where
     let text_attributes = text_attribute_ids();
     for fact in facts {
         if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             read_text_with(reader, staged, handle, "text")
                 .with_context(|| format!("read Posture text payload for {}", fmt_id(*fact.e())))?;
         } else if fact.a() == &embeddings::attr::embedding.id() {

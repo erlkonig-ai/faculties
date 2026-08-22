@@ -334,10 +334,10 @@ fn stage_canonical_payloads(
             let handle = *fact.v::<inlineencodings::Handle<blobencodings::RawBytes>>();
             roots.insert(handle.raw);
         } else if attribute == &metadata::name.id() {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             roots.insert(handle.raw);
         } else if attribute == &metadata::description.id() {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             roots.insert(handle.raw);
         }
     }
@@ -602,7 +602,7 @@ fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()>
                 )
             })?;
         } else if attribute == &metadata::name.id() {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: anybytes::View<str> = reader.get(handle).with_context(|| {
                 format!(
                     "strictly read legacy Secrets name payload {}",

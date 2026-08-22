@@ -202,7 +202,7 @@ fn id_values(
 fn text_values(
     space: &TribleSet,
     entity: Id,
-    attribute: &Attribute<inlineencodings::Handle<blobencodings::LongString>>,
+    attribute: &Attribute<inlineencodings::Handle<blobencodings::UTF8String>>,
 ) -> BTreeSet<TextHandle> {
     find!(
         value: TextHandle,
@@ -719,7 +719,7 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
             || fact.a() == &attrs::content.id()
             || fact.a() == &metadata::name.id()
         {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::LongString>>();
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!("read Wiki text payload {}", hex::encode_upper(handle.raw))
             })?;
@@ -858,7 +858,7 @@ pub fn tag_record(name: &str) -> Result<(Fragment, Id, String)> {
         bail!("Wiki tag name must not be empty");
     }
     let mut fragment = Fragment::empty();
-    let handle = fragment.put::<blobencodings::LongString, _>(normalized.clone());
+    let handle = fragment.put::<blobencodings::UTF8String, _>(normalized.clone());
     if let Some((id, _)) = TAG_SPECS.iter().find(|(_, label)| *label == normalized) {
         fragment += entity! { ExclusiveId::force_ref(id) @ metadata::name: handle };
         Ok((fragment, *id, normalized))
@@ -1134,7 +1134,7 @@ mod tests {
         );
 
         let mut bad_tag = Fragment::empty();
-        let handle = bad_tag.put::<blobencodings::LongString, _>(" Mixed ".to_owned());
+        let handle = bad_tag.put::<blobencodings::UTF8String, _>(" Mixed ".to_owned());
         bad_tag += entity! { metadata::name: handle };
         let tag = bad_tag.root().unwrap();
         let mut tagged = draft(author, "tagged", []);
