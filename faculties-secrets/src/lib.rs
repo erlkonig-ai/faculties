@@ -1679,7 +1679,7 @@ mod tests {
     use std::path::Path;
 
     use triblespace::core::collection::records::CollectionName;
-    use triblespace::core::collection::{discover_collection_records, Collection};
+    use triblespace::core::collection::{discover_collection_records, reach, Collection};
     use triblespace::core::repo::pile::{Pile, PileReader};
     use triblespace::core::repo::BlobStore;
 
@@ -1698,7 +1698,7 @@ mod tests {
         let signer = SigningKey::generate(&mut OsRng);
         let team = signer.verifying_key();
         let name = CollectionName::new("secrets").expect("`secrets` is a legal collection name");
-        Collection::new(pile, &name, team, signer)
+        Collection::new(pile, &name, team, signer, reach::private())
     }
 
     fn test_view(collection: &mut Collection<Pile>) -> TestView {
