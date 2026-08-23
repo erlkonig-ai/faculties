@@ -104,9 +104,9 @@ All notable changes to this project will be documented in this file.
   never holds a secret in the clear. Live authentication was meant to restart
   at a source-scoped auth profile naming exact encrypted Secrets versions —
   and nothing built that restart, so on a migrated pile the Teams collection
-  has no auth profile, the Secrets collection has no identity, and every
-  `teams` command fails with `Teams auth-profile source ... is missing` while
-  the credentials sit unreferenced on the legacy branch. `migrations
+  has no auth profile, and every `teams` command fails with `Teams auth-profile
+  source ... is missing` while the credentials sit unreferenced on the legacy
+  branch. `migrations
   teams-credentials` is the bridge. It reads the frozen legacy branch and
   reports every surviving credential row newest-first — kind, time, payload
   *lengths*, tenant, client id, the delegated scopes, and the signed-in
@@ -114,10 +114,11 @@ All notable changes to this project will be documented in this file.
   which is the one value `teams auth set --user-id` cannot otherwise recover
   without a fresh login. With `--export <DIR>` it materializes the newest
   credential of each kind into `0600` files shaped for the two commands that
-  own that write: `teams login --client-secret @file` and `secrets secret add
-  ... @file`. It never writes to the pile and never prints a secret — sealing
-  a credential means an identity and its password, an interactive act a
-  migration has no business performing.
+  own that write: `teams login --vault <id> --client-secret @file` and `secrets
+  secret add --vault <id> --name <name> --value @file`. It never writes to the
+  pile and never prints a secret — selecting an exact vault epoch and its
+  direct-key recipients belongs to the durable signer, not to a source-reading
+  migration.
 
 - **Compass's status register has an identity.** A goal's current status was
   the greatest `(created_at, event id)` among the status events hanging off

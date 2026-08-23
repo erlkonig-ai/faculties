@@ -179,7 +179,7 @@ enum Command {
     /// missing auth-profile source while the credentials sit on the legacy
     /// branch. This reads them, never writes to the pile, and with `--export`
     /// materializes the newest of each into `0600` files shaped for
-    /// `teams login` and `secrets secret add`.
+    /// `teams login --vault <id>` and `secrets secret add --vault <id>`.
     TeamsCredentials {
         /// Directory to receive the plaintext credential files. Without it,
         /// nothing leaves the pile and only the shape is reported.
@@ -285,7 +285,9 @@ fn teams_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
     for file in &written {
         println!("  {}  — {}", file.path.display(), file.purpose);
     }
-    println!("\nThese are live secrets in the clear. Publish them and delete the files.");
+    println!(
+        "\nThese are live secrets in the clear. Select one exact ready vault epoch, publish them with its id, and delete the files."
+    );
     Ok(())
 }
 

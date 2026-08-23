@@ -287,7 +287,7 @@ pub fn validate_candidate_views(
     .context("validate Status candidate")?;
     let teams_facts = required_view(views, "Teams", schemas::teams::DEFAULT_SCOPE_ID)?;
     teams::validate_catalog(reader, teams_facts).context("validate Teams candidate")?;
-    teams::validate_auth_secret_references(teams_facts, &secrets_catalog)
+    validate_frozen_v1_teams_secret_references(teams_facts, &secrets_catalog)
         .context("validate Teams candidate exact Secrets references")?;
     voice::validate_catalog(
         reader,
@@ -317,6 +317,33 @@ pub fn validate_candidate_views(
     )
     .context("validate Mail candidate cross-collection references")?;
 
+    Ok(())
+}
+
+/// Preserve the stopped-world activation invariant against its exact frozen
+/// v1 Secrets candidate. Live Teams deliberately accepts only a discovered v2
+/// vault snapshot; the retired fixed collection remains local to migration.
+fn validate_frozen_v1_teams_secret_references(
+    teams_facts: &TribleSet,
+    secrets_catalog: &secrets::SecretsCatalog,
+) -> Result<()> {
+    for source in teams::auth_profile_sources(teams_facts) {
+        for profile in teams::auth_profile_ids(teams_facts, source) {
+            let record = teams::auth_profile(teams_facts, profile)?;
+            for (label, secret) in [
+                ("client secret", record.client_secret_version),
+                ("delegated token bundle", record.delegated_token_version),
+            ] {
+                if let Some(secret) = secret {
+                    if !secrets_catalog.secrets.contains_key(&secret) {
+                        bail!(
+                            "Teams auth profile {profile:x} names unknown {label} Secrets version {secret:x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -940,6 +967,37 @@ mod tests {
         .into_iter()
         .map(|scope| (scope, TribleSet::new()))
         .collect()
+    }
+
+    #[test]
+    fn frozen_activation_keeps_its_exact_v1_teams_reference_invariant_local() {
+        let source_identity = teams::source_fragment("tenant.example");
+        let source = source_identity.root().unwrap();
+        let missing = Id::new([0xE6; 16]).unwrap();
+        let (profile, _) = teams::auth_profile_fragment(
+            source,
+            "client",
+            "user",
+            "offline_access",
+            None,
+            Some(missing),
+            [],
+        )
+        .unwrap();
+        let mut teams_facts = source_identity;
+        teams_facts += profile;
+
+        let error = validate_frozen_v1_teams_secret_references(
+            teams_facts.facts(),
+            &secrets::SecretsCatalog::default(),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("unknown delegated token bundle"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&format!("{missing:x}")), "{rendered}");
     }
 
     #[test]

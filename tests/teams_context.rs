@@ -141,7 +141,12 @@ fn outward_mutation_identity_gate_runs_before_auth_or_network() {
 #[test]
 fn plaintext_oauth_sidecar_flags_are_not_cli_surface() {
     let pile = TestPile::new();
-    for removed in ["--token", "--token-command", "--auth-file"] {
+    for removed in [
+        "--token",
+        "--token-command",
+        "--auth-file",
+        "--secrets-identity",
+    ] {
         let rejected = run(
             &pile,
             &[
@@ -169,6 +174,8 @@ fn literal_client_secret_is_rejected_without_echoing_it() {
             "tenant.example",
             "--client-id",
             "client-id",
+            "--vault",
+            "01010101010101010101010101010101",
             "--client-secret",
             "do-not-echo-this-secret",
         ],

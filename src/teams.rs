@@ -25,7 +25,7 @@ use crate::files;
 use crate::schemas::archive::archive;
 use crate::schemas::files::{file, KIND_FILE, KIND_MEDIA_TYPE};
 use crate::schemas::teams::teams;
-use crate::secrets::SecretsCatalog;
+use crate::secrets::v2::SecretsSnapshot;
 
 const SNAPSHOT_COORDINATE_PREFIX: &str = "teams-legacy-snapshot-v1:";
 
@@ -311,11 +311,11 @@ pub fn auth_profile_head(catalog: &TribleSet, source: Id) -> AuthProfileHead {
     }
 }
 
-/// Validate exact auth-profile references against one materialized Secrets
-/// collection. This deliberately performs no name or timestamp resolution.
-pub fn validate_auth_secret_references(
+/// Validate exact auth-profile references against one discovered Secrets
+/// vault snapshot. This deliberately performs no name or timestamp resolution.
+pub fn validate_auth_secret_references<R>(
     teams_catalog: &TribleSet,
-    secrets_catalog: &SecretsCatalog,
+    secrets: &SecretsSnapshot<R>,
 ) -> Result<()> {
     for source in auth_profile_sources(teams_catalog) {
         for profile in auth_profile_ids(teams_catalog, source) {
@@ -325,7 +325,7 @@ pub fn validate_auth_secret_references(
                 ("delegated token bundle", record.delegated_token_version),
             ] {
                 if let Some(secret) = secret {
-                    if !secrets_catalog.secrets.contains_key(&secret) {
+                    if !secrets.contains(secret) {
                         bail!(
                             "Teams auth profile {profile:x} names unknown {label} Secrets version {secret:x}"
                         );
@@ -2906,6 +2906,7 @@ pub fn context_head_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::BlobStorePut;
@@ -2933,6 +2934,61 @@ mod tests {
             .to_string()
             .contains("retired plaintext OAuth evidence"));
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn auth_reference_validation_uses_exact_vault_snapshot_ids() {
+        let signer = SigningKey::from_bytes(&[0x31; 32]);
+        let recipients = BTreeSet::from([signer.verifying_key().to_bytes()]);
+        let vault = Id::new([0x32; 16]).unwrap();
+        let sealed =
+            crate::secrets::v2::seal_version("same-name", b"exact", &recipients, point(2.0))
+                .unwrap();
+        let exact = sealed.secret;
+        let later =
+            crate::secrets::v2::seal_version("same-name", b"later", &recipients, point(3.0))
+                .unwrap();
+        assert_ne!(exact, later.secret);
+        let mut vault_fragment =
+            crate::secrets::v2::vault_header_fragment(vault, "teams", point(1.0)).unwrap();
+        vault_fragment += sealed.fragment;
+        vault_fragment += later.fragment;
+        let vault_facts = vault_fragment.facts().clone();
+        let reader = vault_fragment.blobs_mut().reader().unwrap();
+        let secrets = SecretsSnapshot::new(reader, [(vault, vault_facts)]).unwrap();
+        assert_eq!(secrets.open(exact, &signer).unwrap(), b"exact");
+
+        let source_identity = source_fragment("tenant.example");
+        let source = source_identity.root().unwrap();
+        let (profile, _) = auth_profile_fragment(
+            source,
+            "client",
+            "user",
+            "offline_access",
+            None,
+            Some(exact),
+            [],
+        )
+        .unwrap();
+        let mut teams = source_identity;
+        teams += profile;
+        validate_auth_secret_references(teams.facts(), &secrets).unwrap();
+
+        let unknown = Id::new([0x33; 16]).unwrap();
+        let (profile, _) = auth_profile_fragment(
+            source,
+            "client",
+            "user",
+            "offline_access",
+            None,
+            Some(unknown),
+            [],
+        )
+        .unwrap();
+        let mut dangling = source_fragment("tenant.example");
+        dangling += profile;
+        let error = validate_auth_secret_references(dangling.facts(), &secrets).unwrap_err();
+        assert!(format!("{error:#}").contains(&format!("{unknown:x}")));
     }
 
     #[test]

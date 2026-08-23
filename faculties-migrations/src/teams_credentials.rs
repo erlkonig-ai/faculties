@@ -8,18 +8,19 @@
 //! Secrets versions.
 //!
 //! Nothing built that restart. On a migrated pile the native Teams collection
-//! has no auth profile and the Secrets collection has no identity, so every
-//! `teams` command fails with "Teams auth-profile source ... is missing" and
-//! the legacy credentials sit unreferenced on the legacy branch.
+//! has no auth profile, so every `teams` command fails with "Teams auth-profile
+//! source ... is missing" and the legacy credentials sit unreferenced on the
+//! legacy branch.
 //!
 //! This module is the bridge, and it is deliberately **not** a pile writer.
-//! Moving a credential into the current shape means sealing it to a Secrets
-//! recipient, which requires an identity and its password — an interactive
-//! act a migration cannot perform, and should not. So this reads the frozen
-//! legacy branch, reports exactly which credential rows survive, and on
-//! request materializes their plaintext into `0600` files shaped for the two
-//! commands that do own that write: `teams login --client-secret @file` and
-//! `secrets secret add ... @file`.
+//! Moving a credential into the current shape means selecting one exact ready
+//! vault epoch and sealing to its current direct-key recipients. That choice
+//! belongs to the durable signer acting through the live commands, not to a
+//! source-reading migration. So this reads the frozen legacy branch, reports
+//! exactly which credential rows survive, and on request materializes their
+//! plaintext into `0600` files shaped for the two commands that own that write:
+//! `teams login --vault <id> --client-secret @file` and `secrets secret add
+//! --vault <id> --name <name> --value @file`.
 //!
 //! It opens the pile read-only, appends nothing, and prints no secret.
 
@@ -415,7 +416,8 @@ pub struct ExportedFile {
 /// The shape `teams` seals into a delegated-token Secrets version.
 ///
 /// Kept structurally identical to `bin/teams.rs`'s `DelegatedTokenBundle` so
-/// an exported file can be handed straight to `secrets secret add`.
+/// an exported file can be handed straight to `secrets secret add --vault
+/// <id> --name <name> --value @<file>`.
 #[derive(serde::Serialize)]
 struct DelegatedTokenBundle<'a> {
     access_token: &'a str,
@@ -464,7 +466,7 @@ pub fn export(report: &TeamsCredentialReport, dir: &Path) -> Result<Vec<Exported
         write(
             format!("teams-client-secret-{:x}.txt", config.entity),
             secret.trim().as_bytes(),
-            "app client secret, for `teams login --client-secret @<file>`",
+            "app client secret, for `teams login --vault <id> --client-secret @<file>`",
             config.entity,
         )?;
     }
@@ -491,7 +493,7 @@ pub fn export(report: &TeamsCredentialReport, dir: &Path) -> Result<Vec<Exported
         write(
             format!("teams-delegated-token-{:x}.json", token.entity),
             &serde_json::to_vec_pretty(&bundle).context("encode delegated-token bundle")?,
-            "delegated token bundle, for `secrets secret add ... @<file>`",
+            "delegated token bundle, for `secrets secret add --vault <id> --name <name> --value @<file>`",
             token.entity,
         )?;
     }
