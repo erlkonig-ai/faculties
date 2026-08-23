@@ -58,5 +58,6 @@ pub mod teams_cutover;
 pub mod voice_cutover;
 pub mod web_cutover;
 pub mod wiki_cutover;
+pub mod write_authority;
 
 pub mod per_faculty;

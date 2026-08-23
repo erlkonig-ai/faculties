@@ -14,6 +14,8 @@
 //!   is the whole-pile path and the one to prefer.
 //! - `migrate-legacy <faculty>` migrates one faculty's branch in place, which
 //!   is what that faculty's own `migrate-legacy` subcommand used to do.
+//! - `faculty-write-authority` additively grants this pile's durable signer
+//!   WRITE access to the closed faculty-root manifest in this build.
 //! - `status-register` gives Compass's status register the identity it never
 //!   had, on the events written before that identity existed.
 //! - `node-identity` names this pile's own signing key as a Secrets identity,
@@ -35,6 +37,7 @@ use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
     activation_cutover, collection_cutover, collection_naming, disposable_cutover,
     mail_credentials, node_identity, posture_findings, status_register, teams_credentials,
+    write_authority,
 };
 
 #[derive(Parser)]
@@ -105,6 +108,18 @@ enum Command {
         /// where the two would quietly drift apart.
         #[arg(long = "name", value_name = "HEX=NAME")]
         names: Vec<String>,
+    },
+
+    /// Grant this pile's durable team-of-one key WRITE authority over every
+    /// exact root collection configured by the current Faculties build.
+    ///
+    /// Additive and closed: targets come only from the build's collection-name
+    /// table. Existing data and COMMITs are untouched; pre-naming, unknown,
+    /// and foreign-team collections receive nothing.
+    FacultyWriteAuthority {
+        /// Report the exact deterministic grants without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Give Compass's status register the identity it never had:
@@ -308,7 +323,8 @@ fn mail_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
 
     let password = faculties::secrets::password::read("unlock the retired Mail account envelope")?;
     let recovered = mail_credentials::open(selected, &password)?;
-    let written = mail_credentials::export(&recovered, export).context("export mailbox password")?;
+    let written =
+        mail_credentials::export(&recovered, export).context("export mailbox password")?;
     println!("\nwrote (mode 0600):");
     println!("  {}  — {}", written.path.display(), written.purpose);
     println!("\nrecovered settings (not secrets — `mail account set` needs them back):");
@@ -345,7 +361,10 @@ fn node_identity(pile: &Path, key: Option<&Path>, nickname: &str, dry_run: bool)
     };
     println!("Node identity");
     println!("pile                     : {}", pile.display());
-    println!("this node's key          : {}", hex::encode(report.local_public_key));
+    println!(
+        "this node's key          : {}",
+        hex::encode(report.local_public_key)
+    );
     println!("nodes attested by pile   : {}", report.nodes.len());
     println!("  of those, unnamed      : {}", report.unnamed_nodes());
     println!("identities on a node key : {}", report.node_identities);
@@ -412,7 +431,11 @@ fn node_identity(pile: &Path, key: Option<&Path>, nickname: &str, dry_run: bool)
 }
 
 fn status_register(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
-    let (delta, report) = status_register::plan(pile, key)?;
+    let report = if dry_run {
+        status_register::plan(pile, key)?.1
+    } else {
+        status_register::publish(pile, key)?
+    };
     println!("Compass status-register identities");
     println!("pile                     : {}", pile.display());
     println!("complete status events   : {}", report.complete_events);
@@ -428,7 +451,6 @@ fn status_register(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()>
         println!("\n(dry run — nothing written)");
         return Ok(());
     }
-    status_register::publish(pile, key, &delta)?;
     println!("\nwrote {} identities", report.facts);
     Ok(())
 }
@@ -520,7 +542,14 @@ fn collection_naming(
 }
 
 fn posture_findings(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
-    let plan = posture_findings::plan(pile, key).context("plan Posture finding bridges")?;
+    let (plan, published) = if dry_run {
+        (
+            posture_findings::plan(pile, key).context("plan Posture finding bridges")?,
+            None,
+        )
+    } else {
+        posture_findings::publish(pile, key).context("publish Posture finding bridges")?
+    };
     println!("Posture finding identity bridges");
     println!("pile          : {}", pile.display());
     println!("legacy findings examined : {}", plan.examined());
@@ -551,9 +580,63 @@ fn posture_findings(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()
         println!("\n(dry run — nothing written)");
         return Ok(());
     }
-    match posture_findings::publish(pile, key, plan).context("publish Posture finding bridges")? {
+    match published {
         Some(commit) => println!("\nwrote bridge COMMIT {:X}", commit.id()),
         None => println!("\nnothing to write"),
+    }
+    Ok(())
+}
+
+fn faculty_write_authority(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
+    let report = if dry_run {
+        write_authority::plan(pile, key).context("plan faculty WRITE authority")?
+    } else {
+        write_authority::publish(pile, key).context("publish faculty WRITE authority")?
+    };
+
+    println!("Faculty team-of-one WRITE authority");
+    println!("pile               : {}", pile.display());
+    println!(
+        "team root          : {}",
+        hex::encode_upper(report.team_root())
+    );
+    println!("configured roots   : {}", report.rows().len());
+    println!("accepted           : {}", report.accepted());
+    println!("missing            : {}", report.missing());
+    println!("authority diagnostics: {}", report.diagnostics().len());
+    println!("foreign roots ignored: {}", report.ignored_foreign_roots());
+    println!("unknown roots ignored: {}", report.ignored_unknown_roots());
+    if !dry_run {
+        println!("published this run : {}", report.published().len());
+    }
+
+    println!();
+    for row in report.rows() {
+        let state = if row.accepted() {
+            "accepted"
+        } else {
+            "would publish"
+        };
+        let target = if row.target_commits() == 0 {
+            "prospective".to_owned()
+        } else {
+            format!("{} target COMMIT(s)", row.target_commits())
+        };
+        println!(
+            "  {:<16} {}  grant {:X}  {state}; {target}",
+            row.name(),
+            hex::encode(row.resource().raw),
+            row.commit().id(),
+        );
+    }
+    for diagnostic in report.diagnostics() {
+        println!("  diagnostic: {diagnostic:?}");
+    }
+
+    if dry_run {
+        println!("\nDry run: nothing was written. Re-run without --dry-run to append.");
+    } else if report.published().is_empty() {
+        println!("\nAll configured WRITE grants were already accepted; nothing was written.");
     }
     Ok(())
 }
@@ -662,6 +745,9 @@ fn main() -> Result<()> {
         Some(Command::CollectionNaming { dry_run, names }) => {
             collection_naming(&cli.pile, cli.key.as_deref(), dry_run, &names)
         }
+        Some(Command::FacultyWriteAuthority { dry_run }) => {
+            faculty_write_authority(&cli.pile, cli.key.as_deref(), dry_run)
+        }
         Some(Command::NodeIdentity { nickname, dry_run }) => {
             node_identity(&cli.pile, cli.key.as_deref(), &nickname, dry_run)
         }
@@ -671,9 +757,7 @@ fn main() -> Result<()> {
         Some(Command::TeamsCredentials { export }) => {
             teams_credentials(&cli.pile, export.as_deref())
         }
-        Some(Command::MailCredentials { export }) => {
-            mail_credentials(&cli.pile, export.as_deref())
-        }
+        Some(Command::MailCredentials { export }) => mail_credentials(&cli.pile, export.as_deref()),
         Some(Command::Faculties) => {
             list_faculties();
             Ok(())

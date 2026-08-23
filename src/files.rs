@@ -961,7 +961,7 @@ where
     Ok(fragment)
 }
 
-/// Materialize the complete signer-owned Files collection through an already
+/// Materialize the complete WRITE-authorized Files collection through an already
 /// open pile.
 ///
 /// The borrowed collection facade introduces no second pile handle and owns no
@@ -1012,6 +1012,8 @@ mod tests {
     use rand_core::OsRng;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
+
+    use crate::test_support::grant_collection_write_authority;
 
     fn content_of(fragment: &Fragment) -> ContentHandle {
         find!(
@@ -1511,11 +1513,14 @@ mod tests {
 
     #[test]
     fn complete_fragment_survives_native_collection_commit_and_materialization() {
+        let signer = SigningKey::generate(&mut OsRng);
         let mut collection = crate::collection_names::open(
             MemoryRepo::default(),
             crate::schemas::files::DEFAULT_SCOPE_ID,
-            SigningKey::generate(&mut OsRng),
+            signer.clone(),
         );
+        let resource = collection.collection();
+        grant_collection_write_authority(collection.storage_mut(), resource, &signer);
         let file = stage(
             b"slides".to_vec(),
             "deck.pptx",

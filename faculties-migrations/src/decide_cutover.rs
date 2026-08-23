@@ -31,11 +31,11 @@ use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
     LegacyPinCoordinate, ProjectedLegacyCommit,
 };
+use crate::write_authority::publish_fragments;
 use faculties::decide::{self as capability, FactorSide, IntervalValue, TextHandle};
 use faculties::schemas::decide::{
     self as schema, decide, factor, KIND_CON, KIND_DECISION, KIND_PRO,
 };
-use faculties::storage::publish_fragments;
 
 pub use faculties::schemas::decide::LEGACY_BRANCH_NAME;
 

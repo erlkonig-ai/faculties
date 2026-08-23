@@ -1,11 +1,12 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::storage::{load_signer, open_pile_strict};
 use faculties::files as file_capability;
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::embeddings;
 use faculties::schemas::files::{
     file, page, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
 };
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::efmt::consts::ISO8601_DATE;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -18,7 +19,6 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
-use faculties::legacy_hint::open_scope;
 
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -335,7 +335,7 @@ fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
 
 // ── native collection boundary ───────────────────────────────────────────
 
-/// Open the signer-owned Files collection for append-only work, then close its
+/// Open the WRITE-authorized Files collection for append-only work, then close its
 /// pile exactly once. Commands that construct a complete fragment locally do
 /// not pay to reconstruct the existing collection value.
 fn with_files_collection<T>(
@@ -2172,7 +2172,10 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let path = dir.join("test.pile");
             fs::File::create(&path).unwrap();
-            initialize_signer(&path, None).unwrap();
+            let signer = initialize_signer(&path, None).unwrap();
+            let mut pile = open_pile_strict(&path).unwrap();
+            faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+            pile.close().unwrap();
             Self { dir, path }
         }
     }
@@ -2258,7 +2261,8 @@ mod tests {
         pile.close().unwrap();
 
         let frozen =
-            mary::model_collection::load_model_collection_local_latest(&test_pile.path, team).unwrap();
+            mary::model_collection::load_model_collection_local_latest(&test_pile.path, team)
+                .unwrap();
         let selected = mary::selection::load_keymap_from_graph(
             frozen.facts(),
             frozen.reader(),
@@ -2316,7 +2320,8 @@ mod tests {
         assert_eq!(still_tokenizer.token_to_id("later"), None);
 
         let latest =
-            mary::model_collection::load_model_collection_local_latest(&test_pile.path, team).unwrap();
+            mary::model_collection::load_model_collection_local_latest(&test_pile.path, team)
+                .unwrap();
         let latest_selected = mary::selection::load_keymap_from_graph(
             latest.facts(),
             latest.reader(),

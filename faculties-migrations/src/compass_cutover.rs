@@ -17,8 +17,8 @@ use triblespace::prelude::*;
 use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
 };
+use crate::write_authority::publish_fragments;
 use faculties::schemas::compass::DEFAULT_SCOPE_ID;
-use faculties::storage::publish_fragments;
 
 pub use faculties::schemas::compass::LEGACY_BRANCH_NAME;
 

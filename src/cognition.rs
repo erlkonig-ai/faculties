@@ -19,12 +19,12 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
-use crate::storage::{load_signer, open_pile_strict};
+use crate::legacy_hint::open_scope;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::schemas::patience::{exec_schema as patience, KIND_TIMEOUT_EXTENSION_ID};
 use crate::schemas::reason::{reason_schema as reason, KIND_REASON_ID};
 use crate::schemas::triage::{cog, context, exec, model_chat, KIND_EXEC_RESULT_ID};
-use crate::legacy_hint::open_scope;
+use crate::storage::{load_signer, open_pile_strict};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -484,7 +484,8 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 mod tests {
     use std::fs::File;
 
-    use crate::storage::{initialize_signer, load_signer};
+    use crate::storage::load_signer;
+    use crate::test_support::initialize_team_of_one_write_fixture;
 
     use super::*;
 
@@ -503,7 +504,7 @@ mod tests {
         let pile_path = directory.path().join("cognition.pile");
         let key_path = directory.path().join("cognition.key");
         File::create(&pile_path).unwrap();
-        initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        initialize_team_of_one_write_fixture(&pile_path, Some(&key_path));
 
         let event = reason_fragment(
             Some(id(1)),
@@ -592,7 +593,7 @@ mod tests {
         let pile_path = directory.path().join("cognition.pile");
         let key_path = directory.path().join("cognition.key");
         File::create(&pile_path).unwrap();
-        initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        initialize_team_of_one_write_fixture(&pile_path, Some(&key_path));
 
         let valid = reason_fragment(None, None, "valid", None, point(1.0));
         let invalid_id = id(11);

@@ -35,7 +35,7 @@ frontier remains visible. There is no substrate-wide last-writer-wins rule. The
 old fact remains in the append-only source pile: history is exhaust from the
 workflow, never separate bookkeeping.
 
-Valid signer-owned COMMITs are strong retention roots for their resident data
+Strictly valid COMMITs are conservative retention roots for their resident data
 and attachment closure. Local storage is still manageable: conservative GC can
 rewrite retained state into a new pile, and explicit destructive repair can
 amputate a torn tail. Those are storage-policy operations, not silent mutation
@@ -50,14 +50,12 @@ of a published fact.
   - *Trivially mergeable*: concatenation unions the immutable blob and native
     collection-record sets; duplicate content collapses by identity. Retired
     mutable pin logs are not part of this native convergence claim. Physical
-    presence is not admission: current faculties materialize only the COMMITs
-    made by their configured durable signer.
-  - *Transport-capable algebra*: core defines signed, irrevocable
-    *collection-gossip grants* for redistributing one author's COMMITs in one
-    exact collection and their missing blobs. This is distinct from team
-    capability auth. Faculties do not yet publish these grants, and
-    `pile net sync` has not wired the record transport; it still speaks the
-    legacy head/blob protocol.
+    presence is not admission: current faculties materialize only strictly
+    valid COMMITs whose authors have exact positive WRITE authority.
+  - *Transport-capable algebra*: descriptor reach decides whether sparse
+    collection records travel, while positive WRITE authority independently
+    decides semantic admission. Referenced blobs remain lazy and WANTable, so
+    replicas can exchange evidence before paying for its complete closure.
 
 == Further reading
 

@@ -198,6 +198,9 @@ pub fn publish(
     }
     plan.verify_conservation()?;
 
+    crate::write_authority::publish(target, key)
+        .context("initialize WRITE authority before Cognition migration publication")?;
+
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
     let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);

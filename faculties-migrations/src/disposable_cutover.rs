@@ -35,7 +35,7 @@ use triblespace::core::trible::{Fragment, TribleSet};
 
 use crate::activation_cutover::{ActivationPlan, PlannedCollection};
 use crate::collection_cutover::{FrozenSource, PhysicalSourceFingerprint};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{ensure_team_of_one_write_authority, load_signer, open_pile_strict};
 
 /// Result of a completely validated activation attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +126,7 @@ struct ScopeSnapshot {
 struct CandidateWorld {
     baseline_records: DiscoveredCollectionRecords,
     final_records: DiscoveredCollectionRecords,
+    authority: Vec<CollectionCommit>,
     baseline: BTreeMap<Id, ScopeSnapshot>,
     final_scopes: BTreeMap<Id, ScopeSnapshot>,
     returned: BTreeMap<Id, Vec<CollectionCommit>>,
@@ -248,6 +249,12 @@ fn build_world(
     let mut pile = open_pile_strict(candidate)?;
     let result = (|| {
         let baseline_records = discover_collection_records(&mut pile)?;
+        let authority = ensure_team_of_one_write_authority(&mut pile, signer)
+            .context("initialize candidate WRITE authority")?
+            .rows()
+            .iter()
+            .map(|row| row.commit())
+            .collect();
         let baseline = snapshots(&mut pile, signer, publications)?;
         let mut returned = BTreeMap::new();
         for publication in publications {
@@ -269,6 +276,7 @@ fn build_world(
         Ok(CandidateWorld {
             baseline_records,
             final_records,
+            authority,
             baseline,
             final_scopes,
             returned,
@@ -299,6 +307,16 @@ fn snapshots(
 
 fn validate_world(world: &CandidateWorld, publications: &[Publication<'_>]) -> Result<()> {
     let mut expected_commits = commit_map(world.baseline_records.commits());
+    for commit in &world.authority {
+        if let Some(previous) = expected_commits.insert(commit.id(), *commit) {
+            if previous != *commit {
+                bail!(
+                    "WRITE grant COMMIT {:X} collides with baseline",
+                    commit.id()
+                );
+            }
+        }
+    }
     for commit in world.returned.values().flatten() {
         if let Some(previous) = expected_commits.insert(commit.id(), *commit) {
             if previous != *commit {
@@ -311,7 +329,10 @@ fn validate_world(world: &CandidateWorld, publications: &[Publication<'_>]) -> R
         || world.final_records.derives() != world.baseline_records.derives()
         || world.final_records.diagnostics() != world.baseline_records.diagnostics()
     {
-        bail!("final collection-record census is not exactly baseline plus returned COMMITs");
+        bail!(
+            "final collection-record census is not exactly baseline plus WRITE grants and \
+             returned COMMITs"
+        );
     }
 
     for publication in publications {
@@ -639,6 +660,7 @@ mod tests {
             let key = directory.path().join("self.key");
             File::create(&live).unwrap();
             let signer = initialize_signer(&live, Some(&key)).unwrap();
+            crate::write_authority::publish(&live, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 live,

@@ -973,7 +973,7 @@ fn open_utf8_secret(
     };
     let plaintext =
         crate::secrets::open_version(reader, catalog, secret, identity, identity_secret)
-        .with_context(|| format!("open exact {role} Secrets version {secret:x}"))?;
+            .with_context(|| format!("open exact {role} Secrets version {secret:x}"))?;
     String::from_utf8(plaintext)
         .with_context(|| format!("exact {role} Secrets version {secret:x} is not UTF-8"))
         .map(Some)
@@ -1098,6 +1098,7 @@ mod tests {
 
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
     use crate::secrets::{self, schema as secrets_schema};
+    use crate::test_support::grant_team_of_one_write_authority;
 
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -1140,6 +1141,7 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x21; 32]);
+        grant_team_of_one_write_authority(&mut pile, &signer);
         let anchor = test_id(0x11);
         let profile = default_profile(anchor, "default");
         let config = default_config(anchor);
@@ -1195,6 +1197,7 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x22; 32]);
+        grant_team_of_one_write_authority(&mut pile, &signer);
         let anchor = test_id(0x23);
         let profile = default_profile(anchor, "only-profile");
         let mut profile_only = profile_anchor_fragment(anchor);
@@ -1265,6 +1268,7 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x41; 32]);
+        grant_team_of_one_write_authority(&mut pile, &signer);
         let password = b"identity password";
         let identity = secrets::prepare_identity("me", password, at(1)).unwrap();
         let identity_id = identity.id;
@@ -1347,6 +1351,7 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x53; 32]);
+        grant_team_of_one_write_authority(&mut pile, &signer);
         crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
             .commit(fragment)
             .unwrap();
@@ -1373,6 +1378,7 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x62; 32]);
+        grant_team_of_one_write_authority(&mut pile, &signer);
         crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
             .commit(legacy.clone())
             .unwrap();

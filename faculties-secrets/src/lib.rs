@@ -511,8 +511,7 @@ pub fn prepare_identity(
     let public_key = keypair.public_key.to_vec();
     let lockbox = lock_secret_key(password, &keypair.secret_key);
     let id = genid().id;
-    let fragment =
-        identity_fragment(id, nickname, public_key.clone(), Some(lockbox), created_at)?;
+    let fragment = identity_fragment(id, nickname, public_key.clone(), Some(lockbox), created_at)?;
     Ok(PreparedIdentity {
         fragment,
         id,
@@ -873,7 +872,10 @@ fn identity_fragment(
     if sign_pk.len() != ED25519_PUBLIC_KEY_BYTES {
         bail!("Ed25519 public key must be {ED25519_PUBLIC_KEY_BYTES} bytes");
     }
-    if lockbox.as_ref().is_some_and(|bytes| bytes.len() != LOCKBOX_BYTES) {
+    if lockbox
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() != LOCKBOX_BYTES)
+    {
         bail!("identity lockbox must be {LOCKBOX_BYTES} bytes");
     }
     let mut fragment = Fragment::empty();
@@ -1678,6 +1680,7 @@ mod tests {
     use std::fs::File;
     use std::path::Path;
 
+    use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
     use triblespace::core::collection::records::CollectionName;
     use triblespace::core::collection::{discover_collection_records, reach, Collection};
     use triblespace::core::repo::pile::{Pile, PileReader};
@@ -1698,7 +1701,16 @@ mod tests {
         let signer = SigningKey::generate(&mut OsRng);
         let team = signer.verifying_key();
         let name = CollectionName::new("secrets").expect("`secrets` is a legal collection name");
-        Collection::new(pile, &name, team, signer, reach::private())
+        let mut collection = Collection::new(pile, &name, team, signer.clone(), reach::private());
+        let resource = collection.collection();
+        authority::publish_grant(
+            collection.storage_mut(),
+            team,
+            &signer,
+            AuthorityGrant::root(team, resource, ACTION_WRITE, AuthorityMode::Invoke),
+        )
+        .unwrap();
+        collection
     }
 
     fn test_view(collection: &mut Collection<Pile>) -> TestView {
@@ -1867,12 +1879,8 @@ mod tests {
         let alice = prepare_identity("alice", b"alice correct horse", at(1)).unwrap();
         let alice_id = alice.id;
         let node_key = SigningKey::generate(&mut OsRng);
-        let node = prepare_node_identity(
-            "node",
-            node_key.verifying_key().as_bytes(),
-            at(2),
-        )
-        .unwrap();
+        let node =
+            prepare_node_identity("node", node_key.verifying_key().as_bytes(), at(2)).unwrap();
         let node_id = node.id;
         let mut foundation = alice.fragment;
         foundation += node.fragment;
@@ -1886,8 +1894,12 @@ mod tests {
         assert!(base_catalog.identities[&node_id].is_node_identity());
         assert!(!base_catalog.identities[&alice_id].is_node_identity());
         assert_eq!(
-            identity_by_public_key(&base.reader, &base_catalog, node_key.verifying_key().as_bytes())
-                .unwrap(),
+            identity_by_public_key(
+                &base.reader,
+                &base_catalog,
+                node_key.verifying_key().as_bytes()
+            )
+            .unwrap(),
             Some(node_id)
         );
 
@@ -1974,7 +1986,10 @@ mod tests {
             &IdentitySecret::Password(b"guess".to_vec()),
         )
         .unwrap_err();
-        assert!(format!("{by_password:#}").contains("keeps no lockbox"), "{by_password:#}");
+        assert!(
+            format!("{by_password:#}").contains("keeps no lockbox"),
+            "{by_password:#}"
+        );
         collection.into_storage().close().unwrap();
     }
 
@@ -1984,8 +1999,8 @@ mod tests {
     fn revoking_a_node_leaves_its_wrap_on_the_rotation_worklist() {
         let (mut fragment, alice, _bob, scope) = fixture();
         let node_key = SigningKey::generate(&mut OsRng);
-        let node = prepare_node_identity("node", node_key.verifying_key().as_bytes(), at(4))
-            .unwrap();
+        let node =
+            prepare_node_identity("node", node_key.verifying_key().as_bytes(), at(4)).unwrap();
         let node_id = node.id;
         fragment += node.fragment;
         let grant = id(10);
@@ -2021,8 +2036,9 @@ mod tests {
         let mut collection = test_collection(&pile);
         let node_key = SigningKey::generate(&mut OsRng);
         let public = node_key.verifying_key();
-        let mut fragment =
-            prepare_node_identity("node", public.as_bytes(), at(1)).unwrap().fragment;
+        let mut fragment = prepare_node_identity("node", public.as_bytes(), at(1))
+            .unwrap()
+            .fragment;
         fragment += prepare_node_identity("node-again", public.as_bytes(), at(2))
             .unwrap()
             .fragment;
@@ -2262,7 +2278,14 @@ mod tests {
         let catalog = validate_catalog(&after.reader, &after.facts).unwrap();
         assert_eq!(catalog.scope_creator(scope), Some(alice));
         let records = discover_collection_records(collection.storage_mut()).unwrap();
-        assert_eq!(records.commits().len(), 1);
+        assert_eq!(
+            records
+                .commits()
+                .iter()
+                .filter(|commit| commit.collection() == collection.collection())
+                .count(),
+            1
+        );
         collection.into_storage().close().unwrap();
     }
 }

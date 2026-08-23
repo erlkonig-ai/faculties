@@ -20,12 +20,12 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
-use crate::storage::{load_signer, open_pile_strict};
+use crate::legacy_hint::open_scope;
 use crate::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
     MAX_LABEL_BYTES, SCRIPT_TOKEN, STATE_ACTIVE, STATE_PAUSED,
 };
-use crate::legacy_hint::open_scope;
+use crate::storage::{load_signer, open_pile_strict};
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type ScriptHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -52,12 +52,10 @@ pub fn collection_handle(
     key: Option<&Path>,
 ) -> Result<triblespace::core::collection::records::CollectionHandle> {
     let signer = load_signer(pile, key)?;
-    Ok(
-        triblespace::core::blob::IntoBlob::<
-            triblespace::core::blob::encodings::simplearchive::SimpleArchive,
-        >::to_blob(descriptor(signer.verifying_key()).facts().clone())
-        .get_handle(),
-    )
+    Ok(triblespace::core::blob::IntoBlob::<
+        triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+    >::to_blob(descriptor(signer.verifying_key()).facts().clone())
+    .get_handle())
 }
 
 /// One pile-resident executable carried by a standing intention.
@@ -1393,7 +1391,8 @@ mod tests {
 
     use hifitime::Epoch;
 
-    use crate::storage::{initialize_signer, load_signer};
+    use crate::storage::load_signer;
+    use crate::test_support::initialize_team_of_one_write_fixture;
 
     use super::*;
 
@@ -1414,7 +1413,7 @@ mod tests {
             let pile = directory.path().join("habit.pile");
             let key = directory.path().join("habit.key");
             File::create(&pile).unwrap();
-            initialize_signer(&pile, Some(&key)).unwrap();
+            initialize_team_of_one_write_fixture(&pile, Some(&key));
             Self {
                 _directory: directory,
                 pile,

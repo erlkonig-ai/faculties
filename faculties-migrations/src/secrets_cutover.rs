@@ -529,6 +529,9 @@ pub fn publish(
     }
     plan.verify_conservation()?;
 
+    crate::write_authority::publish(target, key)
+        .context("initialize WRITE authority before Secrets migration publication")?;
+
     // Load authority before touching the target, then keep one pile open for
     // exact-union preflight and every idempotent commit. Complete preflight
     // catches conflicts with existing native facts before anything is
@@ -679,6 +682,7 @@ mod tests {
         let key = directory.0.join("secrets.key");
         File::create(&pile_path).unwrap();
         initialize_signer(&pile_path, Some(&key)).unwrap();
+        crate::write_authority::publish(&pile_path, Some(&key)).unwrap();
 
         let identity = Id::new([0x11; 16]).unwrap();
         let mut identity_fragment = Fragment::empty();

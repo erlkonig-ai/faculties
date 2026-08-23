@@ -18,11 +18,11 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
 
+use crate::legacy_hint::open_scope;
 use crate::schemas::wiki::{
     attrs, authorship_fragment, revision_fragment, revision_fragment_from_handles, TextHandle,
     DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION, KIND_VERSION_ID, TAG_SPECS,
 };
-use crate::legacy_hint::open_scope;
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type PublicKeyValue = Inline<inlineencodings::ED25519PublicKey>;
@@ -384,10 +384,7 @@ fn validate_graph(revisions: &BTreeMap<Id, RevisionRecord>) -> Result<()> {
 /// every revision is only a scoping convenience: a supersedes edge always
 /// unites its endpoints above, so no revision can be observed from outside its
 /// own component and the two framings agree by construction.
-fn entry_records(
-    space: &TribleSet,
-    revisions: &BTreeMap<Id, RevisionRecord>,
-) -> Vec<EntryRecord> {
+fn entry_records(space: &TribleSet, revisions: &BTreeMap<Id, RevisionRecord>) -> Vec<EntryRecord> {
     let mut parent: BTreeMap<Id, Id> = revisions.keys().map(|id| (*id, *id)).collect();
 
     fn root(parent: &mut BTreeMap<Id, Id>, id: Id) -> Id {
@@ -441,9 +438,10 @@ fn entry_records(
             })
             .collect();
         roots.sort_unstable();
-        let frontier_ids: Vec<Id> = latest(space, metadata::supersedes.id(), members.iter().copied())
-            .into_iter()
-            .collect();
+        let frontier_ids: Vec<Id> =
+            latest(space, metadata::supersedes.id(), members.iter().copied())
+                .into_iter()
+                .collect();
         let frontier = frontier_ids
             .iter()
             .filter_map(|id| revisions.get(id).cloned())
@@ -944,6 +942,8 @@ mod tests {
 
     use hifitime::Epoch;
 
+    use crate::test_support::grant_team_of_one_write_authority;
+
     fn at(seconds: f64) -> IntervalValue {
         let epoch = Epoch::from_tai_seconds(seconds);
         (epoch, epoch).try_to_inline().unwrap()
@@ -1054,6 +1054,7 @@ mod tests {
         fragment += untagged_fragment;
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        grant_team_of_one_write_authority(&mut pile, &signer);
         crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
             .commit(fragment)
             .unwrap();
@@ -1219,10 +1220,26 @@ mod tests {
         let model = load_catalog(&facts).unwrap().revisions;
         // Both legacy ids keep their identity and their lineage...
         assert!(model.revision(first).is_some());
-        assert_eq!(model.revision(second).unwrap().supersedes.iter().copied().collect::<Vec<_>>(), vec![first]);
+        assert_eq!(
+            model
+                .revision(second)
+                .unwrap()
+                .supersedes
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![first]
+        );
         assert!(!model.revision(first).unwrap().is_native());
         let entry = model.entry_containing(second).unwrap();
-        assert_eq!(entry.frontier.iter().map(|head| head.id).collect::<Vec<_>>(), vec![second]);
+        assert_eq!(
+            entry
+                .frontier
+                .iter()
+                .map(|head| head.id)
+                .collect::<Vec<_>>(),
+            vec![second]
+        );
         // ...and the anchor they were written under names nothing.
         assert!(model.revision(fragment).is_none());
     }

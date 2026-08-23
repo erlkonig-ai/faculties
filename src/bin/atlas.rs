@@ -228,7 +228,9 @@ mod tests {
     use std::fs::File;
 
     use faculties::spec::Arguments;
-    use faculties::storage::{initialize_signer, publish_fragment};
+    use faculties::storage::{
+        ensure_team_of_one_write_authority, initialize_signer, open_pile_strict, publish_fragment,
+    };
     use triblespace::core::metadata;
     use triblespace::prelude::*;
 
@@ -261,7 +263,10 @@ mod tests {
         let pile = directory.path().join("atlas.pile");
         let key = directory.path().join("atlas.key");
         File::create(&pile).unwrap();
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
 
         let id = Id::new([0x41; 16]).unwrap();
         let mut fragment = Fragment::empty();

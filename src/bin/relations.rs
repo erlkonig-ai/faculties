@@ -12,17 +12,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use triblespace::core::collection::Collection;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -1206,7 +1206,9 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::storage::initialize_signer;
+    use faculties::storage::{
+        ensure_team_of_one_write_authority, initialize_signer, open_pile_strict,
+    };
     use std::fs;
 
     fn profile(label: &str) -> ProfileInput {
@@ -1272,7 +1274,10 @@ mod tests {
         let pile = directory.join("relations.pile");
         let key = directory.join("relations.key");
         fs::File::create(&pile).unwrap();
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
         let storage = RelationsStorage {
             pile: &pile,
             key: Some(&key),

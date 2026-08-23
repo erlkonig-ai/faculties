@@ -37,12 +37,12 @@ use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
     LegacyPinCoordinate, ProjectedLegacyCommit,
 };
+use crate::write_authority::publish_fragments;
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::posture::{
     self as schema, posture, EXEMPLAR_BENIGN, EXEMPLAR_PROTECTED, KIND_CHANNEL, KIND_EXEMPLAR,
     KIND_POLICY_REVISION, KIND_TERM,
 };
-use faculties::storage::publish_fragments;
 
 use faculties::posture_policy::{
     at_most_one, canonicalize_legacy_exemplar, canonicalize_legacy_term, exactly_one, id_values,

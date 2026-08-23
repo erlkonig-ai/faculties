@@ -63,7 +63,7 @@ signer. This is the minimal shape:
 ```rust
 let signer = load_signer(&cli.pile, cli.key.as_deref())?;
 let pile = open_pile_strict(&cli.pile)?;
-let mut collection = Collection::new(pile, DEFAULT_SCOPE_ID, signer);
+let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
 let current = collection.materialize()?;
 let reader = collection.storage_mut().reader()?;
 
@@ -82,6 +82,10 @@ collection.into_storage().close()?;
 substrate APIs. `myverb::validate_candidate` is the domain validator you write:
 it checks the exact additive union and staged attachment closure before the
 COMMIT becomes visible.
+
+The collection's team grants WRITE authority explicitly. Bootstrap and the
+migration boundary initialize the closed faculty manifest; an ordinary faculty
+command never manufactures authority merely because it attempted a write.
 
 The fragment carries its facts, metadata, and attachment closure together. The
 COMMIT *is* the publication record—no separate "log that I did this" step. An

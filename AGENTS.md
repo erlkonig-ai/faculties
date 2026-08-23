@@ -7,10 +7,10 @@ human-facing project description and install steps are in
 ## What faculties are
 
 Small CLIs that persist their state in a TribleSpace pile. Each binary lives at
-`src/bin/<name>.rs` and publishes through one or more fixed, signer-owned
-collections. A collection is identified by its semantic descriptor and the
-pile's durable signer; its value is the monotonic union of signed COMMIT
-fragments, not a mutable named branch. Shared domain models, schemas,
+`src/bin/<name>.rs` and publishes through one or more fixed, team-rooted
+collections. A collection is identified by its semantic descriptor; its value
+is the monotonic union of COMMIT fragments signed by keys with exact positive
+WRITE authority, not a mutable named branch. Shared domain models, schemas,
 validation, cutover logic, and GORBIE
 widgets live in `src/lib.rs` (and `src/widgets/` under the `widgets`
 feature).
@@ -63,8 +63,8 @@ as locally signed collection COMMITs. Sources are `bootstrap/*.typ`; their
 declarative manifest and the already-shipped goal/note occurrence anchors live
 in `src/bootstrap.rs`. Import only after explicitly initializing the
 destination's durable signer (`trible pile signing-key init <pile>`). Never
-copy a pre-signed seed pile: signer-owned collections deliberately do not
-authorize its builder key. Run `bootstrap/build.sh` for the fresh-recipient,
+copy a pre-signed seed pile: a destination's explicit WRITE authority does not
+implicitly authorize its builder key. Run `bootstrap/build.sh` for the fresh-recipient,
 exact-replay, and semantic-closure checks.
 
 For each of the 21 seeded Wiki entries, a later bootstrap generation advances

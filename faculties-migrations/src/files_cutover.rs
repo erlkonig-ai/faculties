@@ -36,11 +36,11 @@ use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
     ProjectedLegacyCommit,
 };
+use crate::write_authority::publish_fragments;
 use faculties::files as file_capability;
 use faculties::schemas::files::{
     file, DEFAULT_SCOPE_ID, FILES_BRANCH_NAME, KIND_FILE, KIND_MEDIA_TYPE,
 };
-use faculties::storage::publish_fragments;
 
 mod legacy {
     use super::*;

@@ -32,11 +32,13 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::authority::{resolve_authority, ACTION_WRITE};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::{Collection, CollectionRecord, CollectionStore};
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
@@ -169,15 +171,22 @@ pub fn open_scope<S>(mut storage: S, scope: Id, signer: SigningKey) -> Collectio
 where
     S: BorrowMut<Pile>,
 {
-    warn_once(storage.borrow_mut(), scope, signer.verifying_key());
+    let writer = signer.verifying_key();
+    // Root collections opened here are still explicitly team-of-one. Keeping
+    // both arguments in the diagnostic makes the distinction impossible to
+    // lose when this constructor later accepts a separate operational writer.
+    warn_once(storage.borrow_mut(), scope, writer, writer);
     crate::collection_names::open(storage, scope, signer)
 }
 
 /// Emit the hint for `scope` at most once per process, to stderr.
-fn warn_once(pile: &mut Pile, scope: Id, team: VerifyingKey) {
+fn warn_once(pile: &mut Pile, scope: Id, team: VerifyingKey, writer: VerifyingKey) {
     static WARNED: Mutex<Option<BTreeSet<Id>>> = Mutex::new(None);
 
-    if !LEGACY_SOURCES.iter().any(|(known, _)| *known == scope) {
+    // The WRITE-authority cutover applies to every configured collection,
+    // including roots with no predecessor branch. Unknown scopes still stay
+    // silent: this build cannot truthfully name their migration target.
+    if crate::collection_names::name_for(scope).is_none() {
         return;
     }
     {
@@ -189,9 +198,66 @@ fn warn_once(pile: &mut Pile, scope: Id, team: VerifyingKey) {
             return;
         }
     }
+    if let Some(hint) = write_authority_migration_hint(pile, scope, team, writer) {
+        eprintln!("{hint}");
+        return;
+    }
+    if !LEGACY_SOURCES.iter().any(|(known, _)| *known == scope) {
+        return;
+    }
     if let Some(hint) = legacy_migration_hint(pile, scope, team) {
         eprintln!("{hint}");
     }
+}
+
+/// Explain why this writer's intact native history is currently invisible.
+///
+/// A missing grant alone is not a migration symptom: an unused fresh
+/// collection quite properly has neither commits nor authority. We first find
+/// a strictly verified commit by the exact local writer under the exact named
+/// descriptor, then resolve the team's positive authority. Foreign commits,
+/// invalid signatures, old descriptors, and grants for another resource are
+/// all inert and cannot manufacture this warning.
+///
+/// Like the older branch hint, this is advisory. Failure to enumerate records
+/// or resolve authority returns `None`; a diagnostic never gets to break the
+/// command it is trying to explain.
+pub fn write_authority_migration_hint(
+    pile: &mut Pile,
+    scope: Id,
+    team: VerifyingKey,
+    writer: VerifyingKey,
+) -> Option<String> {
+    let name = crate::collection_names::name_for(scope)?;
+    let collection = IntoBlob::<SimpleArchive>::to_blob(
+        crate::collection_names::root_descriptor(scope, team)
+            .facts()
+            .clone(),
+    )
+    .get_handle();
+    let writer_inline = Inline::<ED25519PublicKey>::new(writer.to_bytes());
+
+    let has_local_history = pile.records().ok()?.any(|record| {
+        let Ok(CollectionRecord::Commit(commit)) = record else {
+            return false;
+        };
+        commit.collection() == collection
+            && commit.public_key() == writer_inline
+            && commit.verify_strict().is_ok()
+    });
+    if !has_local_history {
+        return None;
+    }
+
+    let authority = resolve_authority(pile, team).ok()?;
+    if authority.allows(&writer_inline, ACTION_WRITE, collection) {
+        return None;
+    }
+
+    Some(format!(
+        "note: this pile's native `{name}` collection contains intact commits signed by its local writer, but that writer has no positive WRITE authority for the collection; strict reads therefore leave those commits inert.\n\
+         note: nothing has been lost and no existing commit needs to be rewritten. Run `migrations --pile <this pile> faculty-write-authority --dry-run` to inspect the additive grants, then `migrations --pile <this pile> faculty-write-authority` to publish them."
+    ))
 }
 
 /// The advice an unmigrated pile needs for `scope`, or `None` when there is
@@ -299,15 +365,13 @@ fn any_scope_anchored_collection(pile: &mut Pile) -> Option<bool> {
     Some(false)
 }
 
-/// Whether `scope` has no commits at all, or `None` if the pile's records
-/// cannot be enumerated.
+/// Whether `scope` has no strictly verified, WRITE-authorized commits, or
+/// `None` if its authority or records cannot be observed.
 ///
-/// This reads the pile's in-memory collection-record index and filters by
-/// collection identity only, stopping at the first match. Signatures are
-/// deliberately not verified and the signer is deliberately not matched: the
-/// question is "has anything at all been published into this scope", and
-/// answering it must stay cheaper than the materialization the caller is about
-/// to perform — which enumerates the same index and then verifies.
+/// Unauthorized evidence must be inert diagnostically as well as
+/// semantically. Treating any raw record as "native history exists" lets one
+/// foreign commit suppress the legacy migration hint while the actual reader
+/// quite correctly returns an empty collection.
 fn native_scope_is_empty(pile: &mut Pile, scope: Id, team: VerifyingKey) -> Option<bool> {
     // Written out rather than reached for: this is the handle of a descriptor
     // that has NOT been stored here, and core deliberately offers no helper for
@@ -320,10 +384,14 @@ fn native_scope_is_empty(pile: &mut Pile, scope: Id, team: VerifyingKey) -> Opti
             .clone(),
     )
     .get_handle();
+    let authority = resolve_authority(pile, team).ok()?;
     let records = pile.records().ok()?;
     for record in records {
         if let Ok(CollectionRecord::Commit(commit)) = record {
-            if commit.collection() == collection {
+            if commit.collection() == collection
+                && commit.verify_strict().is_ok()
+                && authority.allows(&commit.public_key(), ACTION_WRITE, collection)
+            {
                 return Some(false);
             }
         }
@@ -506,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn hint_is_silent_once_the_native_scope_has_facts() {
+    fn native_history_without_write_authority_names_the_additive_migration() {
         let directory = TempDir::new().unwrap();
         let path = new_pile(&directory);
         write_legacy_branch(&path);
@@ -514,10 +582,38 @@ mod tests {
         let mut pile = Pile::open(&path).unwrap();
         // Same pile, same intact legacy branch — only the native side changes.
         assert!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()).is_some());
-        open_scope(&mut pile, DEFAULT_SCOPE_ID, signer())
-            .commit(goal_fragment("native goal"))
-            .unwrap();
+        simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &crate::collection_names::root_descriptor(DEFAULT_SCOPE_ID, test_team()),
+            goal_fragment("native goal"),
+            &signer(),
+        )
+        .unwrap();
 
+        assert_eq!(
+            native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_team()),
+            Some(true),
+            "pre-authority evidence is not yet native collection membership"
+        );
+        let hint = write_authority_migration_hint(
+            &mut pile,
+            DEFAULT_SCOPE_ID,
+            test_team(),
+            signer().verifying_key(),
+        )
+        .expect("pre-authority local history must not look empty without explanation");
+        assert!(hint.contains("faculty-write-authority"), "{hint}");
+        assert!(hint.contains("nothing has been lost"), "{hint}");
+        crate::storage::ensure_team_of_one_write_authority(&mut pile, &signer()).unwrap();
+        assert_eq!(
+            write_authority_migration_hint(
+                &mut pile,
+                DEFAULT_SCOPE_ID,
+                test_team(),
+                signer().verifying_key(),
+            ),
+            None
+        );
         assert_eq!(
             native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_team()),
             Some(false)
@@ -526,6 +622,71 @@ mod tests {
             legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()),
             None
         );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn write_authority_hint_covers_configured_scopes_without_legacy_branches() {
+        let directory = TempDir::new().unwrap();
+        let path = new_pile(&directory);
+        let scope = crate::schemas::embeddings::DEFAULT_SCOPE_ID;
+        let mut pile = Pile::open(&path).unwrap();
+        simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &crate::collection_names::root_descriptor(scope, test_team()),
+            goal_fragment("embedded elsewhere"),
+            &signer(),
+        )
+        .unwrap();
+
+        let hint =
+            write_authority_migration_hint(&mut pile, scope, test_team(), signer().verifying_key())
+                .expect("all configured native roots share the WRITE migration");
+        assert!(hint.contains("`embeddings` collection"), "{hint}");
+        assert!(hint.contains("faculty-write-authority"), "{hint}");
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn foreign_or_absent_history_does_not_impersonate_a_local_migration() {
+        let directory = TempDir::new().unwrap();
+        let path = new_pile(&directory);
+        write_legacy_branch(&path);
+        let mut pile = Pile::open(&path).unwrap();
+
+        assert_eq!(
+            write_authority_migration_hint(
+                &mut pile,
+                DEFAULT_SCOPE_ID,
+                test_team(),
+                signer().verifying_key(),
+            ),
+            None,
+            "an unused native scope needs no WRITE grant and no WRITE warning"
+        );
+        assert!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team()).is_some());
+
+        let foreign = SigningKey::from_bytes(&[0x73; 32]);
+        simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &crate::collection_names::root_descriptor(DEFAULT_SCOPE_ID, test_team()),
+            goal_fragment("foreign inert evidence"),
+            &foreign,
+        )
+        .unwrap();
+        assert_eq!(
+            write_authority_migration_hint(
+                &mut pile,
+                DEFAULT_SCOPE_ID,
+                test_team(),
+                signer().verifying_key(),
+            ),
+            None,
+            "a valid foreign commit is not evidence that the local writer needs migration"
+        );
+        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_team())
+            .expect("foreign inert evidence must not suppress the real legacy history");
+        assert!(hint.contains("activate-cutover"), "{hint}");
         pile.close().unwrap();
     }
 

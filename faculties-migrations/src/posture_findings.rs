@@ -107,6 +107,8 @@ impl FindingBridgePlan {
 ///
 /// Pure: it opens repositories read-only and writes nothing.
 pub fn plan(pile: &Path, key: Option<&Path>) -> Result<FindingBridgePlan> {
+    crate::write_authority::require_initialized(pile, key)
+        .context("Posture bridge planning requires initialized WRITE authority")?;
     let signer = load_signer(pile, key)?;
     let store = open_pile_strict(pile)?;
     let mut collection = open_scope(store, DEFAULT_SCAN_SCOPE_ID, signer);
@@ -120,7 +122,10 @@ pub fn plan(pile: &Path, key: Option<&Path>) -> Result<FindingBridgePlan> {
             .context("open Posture scan blob reader")?;
         build(&facts, &reader)
     })();
-    let close = collection.into_storage().close().map_err(anyhow::Error::from);
+    let close = collection
+        .into_storage()
+        .close()
+        .map_err(anyhow::Error::from);
     match (result, close) {
         (Ok(plan), Ok(())) => Ok(plan),
         (Ok(_), Err(error)) => Err(error.context("close Posture pile")),
@@ -130,17 +135,23 @@ pub fn plan(pile: &Path, key: Option<&Path>) -> Result<FindingBridgePlan> {
 
 /// Write the bridges. Exact replay is idempotent, because both the blobs and
 /// the collection record are content addressed.
-pub fn publish(pile: &Path, key: Option<&Path>, plan: FindingBridgePlan) -> Result<Option<CollectionCommit>> {
+pub fn publish(
+    pile: &Path,
+    key: Option<&Path>,
+) -> Result<(FindingBridgePlan, Option<CollectionCommit>)> {
+    crate::write_authority::publish(pile, key)
+        .context("initialize WRITE authority before publishing Posture bridges")?;
+    let plan = plan(pile, key)?;
     if plan.bridged.is_empty() {
-        return Ok(None);
+        return Ok((plan, None));
     }
-    let mut fragment = plan.fragment;
+    let mut fragment = plan.fragment.clone();
     fragment.describe_with(entity! {
         metadata::description: "posture legacy finding identity bridges".to_owned(),
     });
-    publish_fragment(pile, key, DEFAULT_SCAN_SCOPE_ID, fragment)
-        .context("publish Posture finding bridges")
-        .map(Some)
+    let commit = publish_fragment(pile, key, DEFAULT_SCAN_SCOPE_ID, fragment)
+        .context("publish Posture finding bridges")?;
+    Ok((plan, Some(commit)))
 }
 
 fn build(facts: &TribleSet, reader: &PileReader) -> Result<FindingBridgePlan> {
@@ -282,7 +293,12 @@ fn locate(
         .ok_or_else(|| anyhow!("legacy locator names no commit"))?;
     if git_probe(
         repository,
-        &["rev-parse", "--verify", "--quiet", &format!("{sha}^{{commit}}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{sha}^{{commit}}"),
+        ],
         &[1],
     )?
     .is_none()

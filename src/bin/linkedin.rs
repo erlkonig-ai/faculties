@@ -38,12 +38,13 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-#[cfg(test)]
-use faculties::storage;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::relations::{self, Head, ProfileInput};
 use faculties::schemas::linkedin;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
+#[cfg(test)]
+use faculties::storage;
+use faculties::storage::{load_signer, open_pile_strict};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -52,7 +53,6 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::macros::entity;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -267,14 +267,13 @@ impl RelationsStorage<'_> {
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
         let team = signer.verifying_key();
-        let result =
-            storage::discover_target(&mut pile, DEFAULT_SCOPE_ID, team).map(|target| {
-                target
-                    .commits()
-                    .iter()
-                    .filter(|commit| commit.public_key().raw == author)
-                    .count()
-            });
+        let result = storage::discover_target(&mut pile, DEFAULT_SCOPE_ID, team).map(|target| {
+            target
+                .commits()
+                .iter()
+                .filter(|commit| commit.public_key().raw == author)
+                .count()
+        });
         finish_pile(pile, result)
     }
 }
@@ -1290,7 +1289,10 @@ mod tests {
             let pile = directory.path().join("linkedin.pile");
             let key = directory.path().join("linkedin.key");
             File::create(&pile).unwrap();
-            storage::initialize_signer(&pile, Some(&key)).unwrap();
+            let signer = storage::initialize_signer(&pile, Some(&key)).unwrap();
+            let mut store = open_pile_strict(&pile).unwrap();
+            storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+            store.close().unwrap();
             Self {
                 _directory: directory,
                 pile,

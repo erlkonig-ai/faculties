@@ -67,6 +67,7 @@ Create an empty pile and add a few things:
 trible pile create ./self.pile
 trible pile signing-key init ./self.pile
 export PILE=./self.pile
+migrations faculty-write-authority
 
 compass add "ship the demo" --status doing
 wiki create "Hello" "First *typst* fragment."
@@ -112,10 +113,12 @@ compass list                       # 7 hands-on goals in TODO
 ```
 
 The logical seed is built deterministically from the checked-in
-`bootstrap/*.typ` sources, but its two collection COMMITs are signed by
-the recipient's own durable key. No release-builder signature, branch
-identity, or seed private key is transplanted. Re-running `bootstrap
-import` with the same key is exactly idempotent.
+`bootstrap/*.typ` sources. Bootstrap first publishes the closed set of
+team-of-one WRITE grants for this build's faculty roots, then signs the Wiki
+and Compass content COMMITs with the recipient's own durable key. No
+release-builder signature, branch identity, or seed private key is
+transplanted. Re-running `bootstrap import` with the same key is exactly
+idempotent.
 
 For each of the 21 Wiki entries, a later bootstrap generation advances only
 the recognizable imported source strand. Recipient edits are never silently
@@ -173,10 +176,14 @@ Every faculty reads `PILE` from the environment (via clap's native
 env-var support). You can pass `--pile <path>` to override it for a
 single call. Create a pile explicitly with `trible pile create new.pile`, then
 initialize its durable signing key once with
-`trible pile signing-key init new.pile`. Faculties publish independent signed
-COMMITs into fixed, signer-owned collections. A collection descriptor names
-the collection's meaning; its known facts are the validated union of all valid,
-signer-authored COMMITs for that descriptor. There is no mutable head or
+`trible pile signing-key init new.pile` and initialize the build's closed
+faculty WRITE manifest with
+`migrations --pile new.pile faculty-write-authority`. (`bootstrap import`
+performs the authority initialization itself.) Faculties publish independent signed
+COMMITs into fixed, team-rooted collections. A collection descriptor names the
+collection's meaning, team, and reach; its known facts are the validated union
+of all strictly valid COMMITs whose authors have exact positive WRITE authority
+for that descriptor. There is no mutable head or
 CAS update, so independently extended pile copies converge by concatenation,
 all backed by the same content-addressed blob store. Historical branches are
 consulted only by explicit migration commands.

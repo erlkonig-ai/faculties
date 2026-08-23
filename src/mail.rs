@@ -3199,15 +3199,14 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    use crate::storage::{
-        initialize_signer, load_signer, open_pile_strict, publish_fragment,
-    };
     use crate::relations::{self, ProfileInput};
     use crate::schemas::{
         decide as decide_schema, files as files_schema, mail as mail_schema,
         relations as relations_schema,
     };
     use crate::secrets::schema as secrets_schema;
+    use crate::storage::{load_signer, open_pile_strict, publish_fragment};
+    use crate::test_support::initialize_team_of_one_write_fixture;
     use triblespace::core::repo::pile::{Pile, PileReader};
 
     fn id(byte: u8) -> Id {
@@ -3257,7 +3256,7 @@ mod tests {
             let pile = directory.path().join("mail.pile");
             let key = directory.path().join("mail.key");
             File::create(&pile).unwrap();
-            initialize_signer(&pile, Some(&key)).unwrap();
+            initialize_team_of_one_write_fixture(&pile, Some(&key));
             let prepared =
                 secrets::prepare_identity("operator", b"identity password", at(1)).unwrap();
             let secret_identity = prepared.id;
@@ -3980,7 +3979,8 @@ mod tests {
 
         let views = fixture.views();
         let (resolution, resolution_id) =
-            decide::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(3)).unwrap();
+            decide::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(3))
+                .unwrap();
         decide::validate_catalog_union(&views.decide.reader, &views.decide.facts, &resolution)
             .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, resolution);
@@ -4230,7 +4230,8 @@ mod tests {
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, draft.mail);
 
         let (send, send_id) =
-            decide::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(2)).unwrap();
+            decide::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(2))
+                .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, send);
         let views = fixture.views();
         let account = open_account(
@@ -4284,7 +4285,8 @@ mod tests {
         // fork. It prevents a new effect, but it cannot rewrite the evidence
         // of which genuine send head the executor previously observed.
         let (reject, reject_id) =
-            decide::resolution_fragment(draft.decision, "reject", None, true, &[], &[], at(3)).unwrap();
+            decide::resolution_fragment(draft.decision, "reject", None, true, &[], &[], at(3))
+                .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, reject);
         let views = fixture.views();
         assert!(format!(

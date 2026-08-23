@@ -35,9 +35,9 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::reach;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
+use triblespace::core::collection::reach;
 pub use triblespace::core::collection::records::CollectionName;
 use triblespace::core::collection::records::{
     collection_recipe, collection_representation, CollectionHandle,
@@ -50,6 +50,7 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::prelude::attributes;
+use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 use triblespace::core::trible::TribleSet;
 
@@ -229,6 +230,18 @@ fn prospective_handle(facts: &TribleSet) -> CollectionHandle {
     IntoBlob::<SimpleArchive>::to_blob(facts.clone()).get_handle()
 }
 
+fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context("close collection-naming pile")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => Err(error.context(format!(
+            "closing collection-naming pile also failed: {close_error}"
+        ))),
+    }
+}
+
 /// Work out what would move, without writing.
 pub fn plan(
     pile: &Path,
@@ -242,93 +255,131 @@ pub fn plan(
     // by deriving -- rather than a rename.
     let team = signer.verifying_key();
     let mut store = open_pile_strict(pile)?;
-    let by_collection = collections_with_commits(&mut store)?;
-    let existing_by_collection = by_collection.clone();
-    let reader = store.reader().context("open a blob reader")?;
+    let result = (|| {
+        let by_collection = collections_with_commits(&mut store)?;
+        let existing_by_collection = by_collection.clone();
+        let reader = store.reader().context("open a blob reader")?;
 
-    let mut report = CollectionNamingReport::default();
-    for (old, commits) in by_collection {
-        let Ok(blob) = reader.get::<Blob<SimpleArchive>, _>(old.transmute()) else {
-            report
-                .unnamed
-                .push((old, "descriptor blob not resident".into()));
-            continue;
-        };
-        let Ok(facts) = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) else {
-            report.unnamed.push((old, "descriptor does not decode".into()));
-            continue;
-        };
-        let Some(scope) = one(&facts, retired::collection_scope.id()) else {
-            report.already_named += 1;
-            continue;
-        };
-        let supplied = extra
-            .iter()
-            .find(|entry| entry.scope == scope)
-            .map(|entry| entry.name.as_str().to_owned());
-        let Some(name) = supplied.or_else(|| name_for(scope).map(str::to_owned)) else {
-            report.unnamed.push((
+        let mut report = CollectionNamingReport::default();
+        let mut has_local_evidence = false;
+        let mut has_foreign_legacy_evidence = false;
+        for (old, commits) in by_collection {
+            let Ok(blob) = reader.get::<Blob<SimpleArchive>, _>(old.transmute()) else {
+                report
+                    .unnamed
+                    .push((old, "descriptor blob not resident".into()));
+                continue;
+            };
+            let Ok(facts) = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) else {
+                report
+                    .unnamed
+                    .push((old, "descriptor does not decode".into()));
+                continue;
+            };
+            let Some(scope) = one(&facts, retired::collection_scope.id()) else {
+                if matches!(
+                    triblespace::core::collection::descriptor::team(&facts),
+                    Some(Ok(root)) if root == team
+                ) {
+                    has_local_evidence = true;
+                }
+                report.already_named += 1;
+                continue;
+            };
+            let supplied = extra
+                .iter()
+                .find(|entry| entry.scope == scope)
+                .map(|entry| entry.name.as_str().to_owned());
+            let Some(name) = supplied.or_else(|| name_for(scope).map(str::to_owned)) else {
+                report.unnamed.push((
+                    old,
+                    format!(
+                        "this build has no name for scope {scope:X}; \
+                         supply one with --name {scope:X}=<name> if you know it"
+                    ),
+                ));
+                continue;
+            };
+            // Before explicit authority, the collection facade admitted only
+            // the local signer. Preserve that historical boundary: a foreign
+            // self-signed COMMIT beside the same opaque scope was inert and
+            // must not become trusted merely because this migration re-signs
+            // it.
+            let commits = commits
+                .into_iter()
+                .filter(|commit| commit.public_key().raw == team.to_bytes())
+                .collect::<Vec<_>>();
+            if commits.is_empty() {
+                has_foreign_legacy_evidence = true;
+                report.unnamed.push((
+                    old,
+                    "recognized legacy scope has no COMMIT authored by the supplied team-of-one key"
+                        .into(),
+                ));
+                continue;
+            }
+            has_local_evidence = true;
+            // Only the SimpleArchive set-union kind is re-seated. Anything else
+            // would need its own descriptor construction, and inventing one from a
+            // representation this build may not know is exactly the guess the
+            // `unnamed` list exists to refuse.
+            let representation = one(&facts, collection_representation.id());
+            let recipe = one(&facts, collection_recipe.id());
+            if representation != Some(<SimpleArchive as MetaDescribe>::id())
+                || recipe != Some(TRIBLE_SET_UNION_RECIPE_V1)
+            {
+                report.unnamed.push((
+                    old,
+                    "not a SimpleArchive set-union collection; no naming defined".into(),
+                ));
+                continue;
+            }
+            let named = CollectionName::new(&name).map_err(|error| {
+                anyhow::anyhow!("{name} is not a legal collection name: {error}")
+            })?;
+            // The migration re-seats data into the collection the running build
+            // would open, so this reach has to be the one
+            // `collection_names::table` gives that name. It plans by name rather
+            // than by scope and cannot consult the registry, so if a faculty is
+            // ever published, this constant is the second place that has to move,
+            // and a mismatch shows up as a rename to a handle nothing opens.
+            let new = prospective_handle(
+                simplearchive_union::descriptor(&named, team, reach::private()).facts(),
+            );
+            let rename = Rename {
                 old,
-                format!(
-                    "this build has no name for scope {scope:X}; \
-                     supply one with --name {scope:X}=<name> if you know it"
-                ),
-            ));
-            continue;
-        };
-        // Only the SimpleArchive set-union kind is re-seated. Anything else
-        // would need its own descriptor construction, and inventing one from a
-        // representation this build may not know is exactly the guess the
-        // `unnamed` list exists to refuse.
-        let representation = one(&facts, collection_representation.id());
-        let recipe = one(&facts, collection_recipe.id());
-        if representation != Some(<SimpleArchive as MetaDescribe>::id())
-            || recipe != Some(TRIBLE_SET_UNION_RECIPE_V1)
-        {
-            report.unnamed.push((
-                old,
-                "not a SimpleArchive set-union collection; no naming defined".into(),
-            ));
-            continue;
+                new,
+                scope,
+                name: name.clone(),
+                commits: commits.len(),
+            };
+            // Signing is deterministic over the same transcript, so a state that
+            // has already moved has a predictable commit id under the new handle.
+            // If every one is present, this collection is settled rather than
+            // pending, however many times the migration is re-run.
+            let already: &[CollectionCommit] = existing_by_collection
+                .get(&new)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let landed: BTreeSet<_> = already.iter().map(CollectionCommit::id).collect();
+            if commits
+                .iter()
+                .all(|commit| landed.contains(&expected_id(&signer, new, commit)))
+            {
+                report.settled.push(rename);
+            } else {
+                report.renames.push(rename);
+            }
         }
-        let named = CollectionName::new(&name)
-            .map_err(|error| anyhow::anyhow!("{name} is not a legal collection name: {error}"))?;
-        // The migration re-seats data into the collection the running build
-        // would open, so this reach has to be the one
-        // `collection_names::table` gives that name. It plans by name rather
-        // than by scope and cannot consult the registry, so if a faculty is
-        // ever published, this constant is the second place that has to move,
-        // and a mismatch shows up as a rename to a handle nothing opens.
-        let new = prospective_handle(
-            simplearchive_union::descriptor(&named, team, reach::private()).facts(),
-        );
-        let rename = Rename {
-            old,
-            new,
-            scope,
-            name: name.clone(),
-            commits: commits.len(),
-        };
-        // Signing is deterministic over the same transcript, so a state that
-        // has already moved has a predictable commit id under the new handle.
-        // If every one is present, this collection is settled rather than
-        // pending, however many times the migration is re-run.
-        let already: &[CollectionCommit] = existing_by_collection
-            .get(&new)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let landed: BTreeSet<_> = already.iter().map(CollectionCommit::id).collect();
-        if commits
-            .iter()
-            .all(|commit| landed.contains(&expected_id(&signer, new, commit)))
-        {
-            report.settled.push(rename);
-        } else {
-            report.renames.push(rename);
+        if !has_local_evidence && has_foreign_legacy_evidence {
+            bail!(
+                "the supplied key authored none of this pile's recognized legacy collection \
+                 states; refusing to create a parallel named team"
+            );
         }
-    }
-    store.close().map_err(anyhow::Error::from)?;
-    Ok(report)
+        Ok(report)
+    })();
+    finish_pile(store, result)
 }
 
 /// Append the named collections to the pile.
@@ -344,47 +395,75 @@ pub fn publish(
     let signer = load_signer(pile, key).context("a re-commit needs the durable signing key")?;
     let team = signer.verifying_key();
     let report = plan(pile, key, extra)?;
-    if report.renames.is_empty() {
-        return Ok(report);
-    }
 
     let mut store = open_pile_strict(pile)?;
-    let by_collection = collections_with_commits(&mut store)?;
-    let mut written = BTreeSet::new();
-    for rename in &report.renames {
-        let named = CollectionName::new(&rename.name).expect("plan checked this");
-        let descriptor = simplearchive_union::descriptor(&named, team, reach::private());
-        // The handle comes from the store, not from a second hash beside it.
-        let new = store
-            .put::<SimpleArchive, _>(descriptor.facts().clone())
-            .map_err(|error| anyhow::anyhow!("store the named descriptor: {error:?}"))?;
-        if new != rename.new {
-            bail!(
-                "descriptor handle moved between plan and publish for {}",
-                rename.name
-            );
-        }
-        let existing: &[CollectionCommit] = by_collection
-            .get(&rename.old)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        for commit in existing {
-            let reseated =
-                CollectionCommit::sign(&signer, rename.new, commit.data(), commit.metadata());
-            if written.insert(reseated.id()) {
-                store
-                    .insert(CollectionRecord::Commit(reseated))
-                    .map_err(|error| anyhow::anyhow!("append the re-seated commit: {error:?}"))?;
+    let result = (|| {
+        // Preflight authority before storing a descriptor or re-seating a
+        // COMMIT. In particular, an existing foreign team must reject this
+        // key before a newly written local root could make the key appear
+        // legitimate to the guard.
+        faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer)
+            .context("initialize WRITE authority for named faculty roots")?;
+        let by_collection = collections_with_commits(&mut store)?;
+        let mut written = BTreeSet::new();
+        for rename in &report.renames {
+            let named = CollectionName::new(&rename.name).expect("plan checked this");
+            let descriptor = simplearchive_union::descriptor(&named, team, reach::private());
+            // The handle comes from the store, not from a second hash beside it.
+            let new = store
+                .put::<SimpleArchive, _>(descriptor.facts().clone())
+                .map_err(|error| anyhow::anyhow!("store the named descriptor: {error:?}"))?;
+            if new != rename.new {
+                bail!(
+                    "descriptor handle moved between plan and publish for {}",
+                    rename.name
+                );
+            }
+            let existing: &[CollectionCommit] = by_collection
+                .get(&rename.old)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for commit in existing
+                .iter()
+                .filter(|commit| commit.public_key().raw == team.to_bytes())
+            {
+                let reseated =
+                    CollectionCommit::sign(&signer, rename.new, commit.data(), commit.metadata());
+                if written.insert(reseated.id()) {
+                    store
+                        .insert(CollectionRecord::Commit(reseated))
+                        .map_err(|error| {
+                            anyhow::anyhow!("append the re-seated commit: {error:?}")
+                        })?;
+                }
             }
         }
-    }
-    store.close().map_err(anyhow::Error::from)?;
-    Ok(report)
+        Ok(())
+    })();
+    finish_pile(store, result).map(|()| report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs::{self, File};
+
+    use ed25519_dalek::SigningKey;
+    use faculties::storage::initialize_signer;
+    use triblespace::core::metadata;
+    use triblespace::core::trible::Fragment;
+    use triblespace::macros::entity;
+
+    fn legacy_descriptor(scope: Id, team: ed25519_dalek::VerifyingKey) -> Fragment {
+        let mut descriptor = simplearchive_union::descriptor(
+            &CollectionName::new("legacy-root").unwrap(),
+            team,
+            reach::private(),
+        );
+        descriptor += entity! { retired::collection_scope: &scope };
+        descriptor
+    }
 
     /// Every name in the table must be one the descriptor will accept.
     ///
@@ -416,5 +495,71 @@ mod tests {
         for (scope, _) in table() {
             assert!(seen.insert(scope), "{scope:X} appears twice in the table");
         }
+    }
+
+    #[test]
+    fn wrong_key_is_rejected_before_collection_naming_mutates_the_pile() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("self.pile");
+        let key_path = directory.path().join("self.key");
+        File::create(&pile_path).unwrap();
+        let local = initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let descriptor = legacy_descriptor(wiki::DEFAULT_SCOPE_ID, local.verifying_key());
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &descriptor,
+            entity! { _ @ metadata::tag: &Id::new([0x41; 16]).unwrap() },
+            &local,
+        )
+        .unwrap();
+        pile.close().unwrap();
+
+        let foreign_pile = directory.path().join("foreign.pile");
+        let foreign_key = directory.path().join("foreign.key");
+        File::create(&foreign_pile).unwrap();
+        initialize_signer(&foreign_pile, Some(&foreign_key)).unwrap();
+        let before = fs::read(&pile_path).unwrap();
+
+        let error = publish(&pile_path, Some(&foreign_key), &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("refusing to create a parallel named team"));
+        assert_eq!(fs::read(&pile_path).unwrap(), before);
+    }
+
+    #[test]
+    fn naming_reseats_only_the_historically_admitted_local_author() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("self.pile");
+        let key_path = directory.path().join("self.key");
+        File::create(&pile_path).unwrap();
+        let local = initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let foreign = SigningKey::from_bytes(&[0x52; 32]);
+        let descriptor = legacy_descriptor(wiki::DEFAULT_SCOPE_ID, local.verifying_key());
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        for (writer, marker) in [(&local, 0x61), (&foreign, 0x62)] {
+            simplearchive_union::publish_fragment_commit(
+                &mut pile,
+                &descriptor,
+                entity! { _ @ metadata::tag: &Id::new([marker; 16]).unwrap() },
+                writer,
+            )
+            .unwrap();
+        }
+        pile.close().unwrap();
+
+        let report = publish(&pile_path, Some(&key_path), &[]).unwrap();
+        assert_eq!(report.renames.len(), 1);
+        assert_eq!(report.renames[0].commits, 1);
+
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let records = discover_collection_records(&mut pile).unwrap();
+        let moved = records
+            .commits()
+            .iter()
+            .filter(|commit| commit.collection() == report.renames[0].new)
+            .collect::<Vec<_>>();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].public_key().raw, local.verifying_key().to_bytes());
+        pile.close().unwrap();
     }
 }

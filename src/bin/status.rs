@@ -10,17 +10,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::relations::{self, Head, SelectorOutcome};
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID;
 use faculties::status;
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -311,8 +311,8 @@ mod tests {
     use std::fs::{self, File};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use faculties::storage::initialize_signer;
     use faculties::relations::ProfileInput;
+    use faculties::storage::{ensure_team_of_one_write_authority, initialize_signer};
 
     use super::*;
 
@@ -350,7 +350,10 @@ mod tests {
         let pile = directory.0.join("status.pile");
         let key = directory.0.join("status.key");
         File::create(&pile).unwrap();
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
         Fixture {
             _directory: directory,
             pile,
@@ -384,8 +387,11 @@ mod tests {
                 let current = materialize_scope(pile, signer, RELATIONS_SCOPE_ID, "Relations")?;
                 let reader = pile.reader().unwrap();
                 relations::validate_catalog_union(&reader, &current, &fragment)?;
-                let mut collection =
-                    faculties::collection_names::open(&mut *pile, RELATIONS_SCOPE_ID, signer.clone());
+                let mut collection = faculties::collection_names::open(
+                    &mut *pile,
+                    RELATIONS_SCOPE_ID,
+                    signer.clone(),
+                );
                 collection.commit(fragment)?;
                 Ok(())
             })
@@ -438,16 +444,17 @@ mod tests {
         let fixture = fixture();
         let window = Id::new([0x83; 16]).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        {
-            let mut foreign = faculties::collection_names::open(
-                &mut pile,
-                DEFAULT_SCOPE_ID,
-                SigningKey::from_bytes(&[0x84; 32]),
-            );
-            foreign
-                .commit(status::status_fragment(window, "foreign", at(30.0)).unwrap())
-                .unwrap();
-        }
+        let team = load_signer(&fixture.pile, Some(&fixture.key))
+            .unwrap()
+            .verifying_key();
+        let descriptor = faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, team);
+        triblespace::core::collection::simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &descriptor,
+            status::status_fragment(window, "foreign", at(30.0)).unwrap(),
+            &SigningKey::from_bytes(&[0x84; 32]),
+        )
+        .unwrap();
         pile.close().unwrap();
 
         storage(&fixture)
@@ -537,5 +544,4 @@ mod tests {
             })
             .unwrap();
     }
-
 }

@@ -724,8 +724,9 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    use crate::storage::{initialize_signer, open_pile_strict};
     use crate::schemas::memory::DEFAULT_SCOPE_ID;
+    use crate::storage::open_pile_strict;
+    use crate::test_support::initialize_team_of_one_write_fixture;
 
     fn point(seconds: f64) -> IntervalValue {
         let at = hifitime::Epoch::from_tai_seconds(seconds);
@@ -931,10 +932,11 @@ mod tests {
         let pile = directory.path().join("memory.pile");
         let key = directory.path().join("memory.key");
         File::create(&pile).unwrap();
-        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_team_of_one_write_fixture(&pile, Some(&key));
         let mut pile_store = open_pile_strict(&pile).unwrap();
         let before = {
-            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
+            let mut collection =
+                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
             collection.materialize().unwrap()
         };
         let reader = pile_store.reader().unwrap();
@@ -945,11 +947,13 @@ mod tests {
         assert_eq!(catalog.chunks.len(), 1);
 
         {
-            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
+            let mut collection =
+                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
             collection.commit(fragment).unwrap();
         }
         let after = {
-            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer);
+            let mut collection =
+                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer);
             collection.materialize().unwrap()
         };
         let reader = pile_store.reader().unwrap();
@@ -964,18 +968,20 @@ mod tests {
         let pile = directory.path().join("memory.pile");
         let key = directory.path().join("memory.key");
         File::create(&pile).unwrap();
-        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_team_of_one_write_fixture(&pile, Some(&key));
         let mut pile_store = open_pile_strict(&pile).unwrap();
         let (left, left_id) = chunk_fragment(draft("left", [])).unwrap();
         let (right, right_id) = chunk_fragment(draft("right", [])).unwrap();
         let mut initial = left;
         initial += right;
         {
-            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
+            let mut collection =
+                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
             collection.commit(initial).unwrap();
         }
         let current = {
-            let mut collection = crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer);
+            let mut collection =
+                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer);
             collection.materialize().unwrap()
         };
         let reader = pile_store.reader().unwrap();

@@ -43,6 +43,7 @@ use crate::collection_cutover::{
     LegacyPinCoordinate, ProjectedLegacyCommit,
 };
 use crate::relations_cutover;
+use crate::write_authority::publish_fragments;
 use faculties::message as current;
 use faculties::relations;
 use faculties::schemas::message::{
@@ -50,7 +51,6 @@ use faculties::schemas::message::{
     KIND_READ_ID,
 };
 use faculties::schemas::relations::KIND_GROUP_SNAPSHOT;
-use faculties::storage::publish_fragments;
 
 pub use faculties::schemas::message::LEGACY_BRANCH_NAME;
 

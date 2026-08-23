@@ -49,18 +49,18 @@ and durable signer as the Message collection; there is no branch selector.
 
 == Collection and storage
 
-Messages live in one fixed, signer-owned Message collection. Each send or
+Messages live in one fixed, team-rooted Message collection. Each send or
 acknowledgement publishes an immutable fragment through an independent signed
 COMMIT, so the read history is its own audit trail. Commands accept an existing
 durable signing key through `--key` or `TRIBLESPACE_KEY`; ordinary reads and
 writes never create one.
 
 Pile concatenation preserves both record sets physically. Current faculty reads
-admit only COMMITs made by the pile's configured signer, so two processes share
-one logical inbox only when they intentionally share that durable collection
-identity. Foreign-signer COMMITs remain inert evidence rather than silently
-becoming trusted messages. Two distinct sends by the admitted signer remain two
-immutable messages; exact retries converge.
+admit only COMMITs made by keys with exact positive WRITE authority, so two
+processes share one logical inbox only when they intentionally share the team
+root and its authority evidence. Unauthorized COMMITs remain inert evidence
+rather than silently becoming trusted messages. Distinct sends by any admitted
+authors remain distinct immutable messages; exact retries converge.
 
 == Cross-references
 

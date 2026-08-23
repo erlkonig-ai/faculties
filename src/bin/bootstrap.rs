@@ -38,6 +38,7 @@ fn main() -> Result<()> {
 
     let report = faculties::bootstrap::import(&cli.pile, cli.key.as_deref())?;
     println!("bootstrap generation {}", hex::encode(report.generation));
+    println!("faculty WRITE grants {}", report.authority_commits.len());
     println!("wiki COMMIT {:x}", report.wiki_commit.id());
     println!("compass COMMIT {:x}", report.compass_commit.id());
     Ok(())

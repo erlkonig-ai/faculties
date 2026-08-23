@@ -39,10 +39,10 @@ use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenLegacyBranch, FrozenLegacyDelta, FrozenSource,
     LegacyCommitCoordinate, LegacyPinCoordinate, ProjectedLegacyCommit,
 };
+use crate::write_authority::publish_fragments;
 use faculties::relations::{self as current, ProfileInput};
 use faculties::schemas::relations as schema;
 use faculties::schemas::relations::{group, KIND_GROUP, KIND_PERSON_ID};
-use faculties::storage::publish_fragments;
 
 use faculties::schemas::relations::LEGACY_BRANCH_NAME;
 const KIND_RETIRE_ID: Id = id_hex!("CB9251505F663A9232C632CC9E68863A");

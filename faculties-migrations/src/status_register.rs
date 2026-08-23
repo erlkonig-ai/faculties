@@ -109,6 +109,8 @@ pub fn status_register_delta(facts: &TribleSet) -> (TribleSet, StatusRegisterRep
 
 /// What one pile's Compass collection is missing, without writing anything.
 pub fn plan(pile: &Path, key: Option<&Path>) -> Result<(TribleSet, StatusRegisterReport)> {
+    crate::write_authority::require_initialized(pile, key)
+        .context("status-register planning requires initialized WRITE authority")?;
     let signer = load_signer(pile, key)?;
     let store = open_pile_strict(pile)?;
     let mut collection = faculties::collection_names::open(store, DEFAULT_SCOPE_ID, signer);
@@ -131,15 +133,18 @@ pub fn plan(pile: &Path, key: Option<&Path>) -> Result<(TribleSet, StatusRegiste
 ///
 /// Exact replay is idempotent: the delta is empty once every event names its
 /// register, and the collection record is content addressed besides.
-pub fn publish(pile: &Path, key: Option<&Path>, delta: &TribleSet) -> Result<()> {
+pub fn publish(pile: &Path, key: Option<&Path>) -> Result<StatusRegisterReport> {
+    crate::write_authority::publish(pile, key)
+        .context("initialize WRITE authority before publishing Compass identities")?;
+    let (delta, report) = plan(pile, key)?;
     if delta.len() == 0 {
-        return Ok(());
+        return Ok(report);
     }
     let mut fragment = Fragment::empty();
-    fragment += delta.clone();
+    fragment += delta;
     publish_fragments(pile, key, DEFAULT_SCOPE_ID, vec![fragment])
         .context("publish Compass status-register identities")?;
-    Ok(())
+    Ok(report)
 }
 
 #[cfg(test)]

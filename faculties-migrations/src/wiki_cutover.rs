@@ -18,8 +18,8 @@ use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
     ProjectedLegacyCommit,
 };
+use crate::write_authority::publish_fragments;
 use faculties::schemas::wiki::{DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
-use faculties::storage::publish_fragments;
 use faculties::wiki_additive::{plan_additive, LegacyDelta};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

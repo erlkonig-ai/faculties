@@ -381,6 +381,9 @@ pub fn publish(
     }
     plan.verify_conservation()?;
 
+    crate::write_authority::publish(target, key)
+        .context("initialize WRITE authority before Mail migration publication")?;
+
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
     let mut collection = faculties::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer);
@@ -645,6 +648,7 @@ mod tests {
         };
         let read_facts = read.facts().clone();
         initialize_signer(&target, Some(&key)).unwrap();
+        crate::write_authority::publish(&target, Some(&key)).unwrap();
         let source = TestSourceSpec::new(vec![TestBranchSpec::new(
             schema::LEGACY_BRANCH_NAME,
             Id::new([0x61; 16]).unwrap(),
@@ -697,6 +701,7 @@ mod tests {
         assert!(!left_facts.is_empty());
         assert!(!right_facts.is_empty());
         initialize_signer(&target, Some(&key)).unwrap();
+        crate::write_authority::publish(&target, Some(&key)).unwrap();
         let source = TestSourceSpec::new(vec![TestBranchSpec::new(
             schema::LEGACY_BRANCH_NAME,
             Id::new([0x62; 16]).unwrap(),

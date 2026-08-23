@@ -9,9 +9,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::storage::{load_signer, open_pile_strict};
 use faculties::decide;
 use faculties::files;
+use faculties::legacy_hint::open_scope;
 use faculties::mail::{self, AccountConfigInput, DraftInput, Head, SendAttemptInput};
 use faculties::mail_pop;
 use faculties::relations;
@@ -20,6 +20,7 @@ use faculties::schemas::{
     relations as relations_schema,
 };
 use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
 use lettre::transport::smtp::authentication::Credentials;
@@ -28,7 +29,6 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "mail", about = "Immutable email evidence, drafts, and delivery receipts")]
@@ -1338,7 +1338,10 @@ mod tests {
             let pile = directory.path().join("mail-cli.pile");
             let key = directory.path().join("mail-cli.key");
             File::create(&pile).unwrap();
-            initialize_signer(&pile, Some(&key)).unwrap();
+            let signer = initialize_signer(&pile, Some(&key)).unwrap();
+            let mut store = open_pile_strict(&pile).unwrap();
+            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+            store.close().unwrap();
 
             let account = id(70);
             let prepared =
@@ -1358,10 +1361,13 @@ mod tests {
             .unwrap();
             let signer = load_signer(&pile, Some(&key)).unwrap();
             let mut store = open_pile_strict(&pile).unwrap();
-            let secrets_facts =
-                faculties::collection_names::open(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer)
-                    .materialize()
-                    .unwrap();
+            let secrets_facts = faculties::collection_names::open(
+                &mut store,
+                secrets_schema::DEFAULT_SCOPE_ID,
+                signer,
+            )
+            .materialize()
+            .unwrap();
             let secrets_reader = store.reader().unwrap();
             let secrets_catalog =
                 secrets_model::validate_catalog(&secrets_reader, &secrets_facts).unwrap();

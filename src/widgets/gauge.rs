@@ -432,7 +432,8 @@ mod tests {
 
     use std::fs::File;
 
-    use crate::storage::{initialize_signer, open_pile_strict};
+    use crate::storage::open_pile_strict;
+    use crate::test_support::initialize_team_of_one_write_fixture;
     use crate::widgets::storage::{SourceKey, StorageState};
     use crate::wiki::{self, RevisionDraft};
     use hifitime::Epoch;
@@ -470,7 +471,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let pile_path = directory.path().join("gauge.pile");
         File::create(&pile_path).unwrap();
-        let signer = initialize_signer(&pile_path, None).unwrap();
+        let signer = initialize_team_of_one_write_fixture(&pile_path, None);
         let (mut fragment, author) = wiki::author_record(&signer.verifying_key());
         let tag = TAG_SPECS[1].0;
         let root = revision(&mut fragment, author, "root", "root", &[], &[], 1.0);

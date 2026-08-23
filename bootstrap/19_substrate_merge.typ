@@ -1,11 +1,12 @@
 = Substrate 3/4: Monotonic Merge
 
-Why can independently extended pile states under one durable author converge
+Why can independently extended pile states under one team converge
 without a mutable coordinator once they are exchanged? Because native storage
 exposes grow-only sets of blobs, signed COMMIT assertions, and reproducible
-equations. Within each signer-owned collection, the semantic value is a union of
-that signer's admitted fact archives. Foreign-signer COMMITs can coexist in the
-physical pile while remaining inert to the current faculty view.
+equations. Within each team-rooted collection, the semantic value is a union of
+fact archives signed by keys with exact positive WRITE authority. COMMITs from
+unauthorized keys can coexist in the physical pile while remaining inert to the
+current faculty view.
 
 == The shape
 

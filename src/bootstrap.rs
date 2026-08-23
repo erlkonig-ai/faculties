@@ -249,6 +249,11 @@ pub struct PortableSeed {
 #[derive(Clone, Debug)]
 pub struct ImportReport {
     pub generation: [u8; 32],
+    /// Stable canonical WRITE grants for every configured faculty root.
+    ///
+    /// This is the complete set on every run, not merely what the current run
+    /// appended, so bootstrap output remains exact-replay stable.
+    pub authority_commits: Vec<CollectionCommit>,
     pub wiki_commit: CollectionCommit,
     pub compass_commit: CollectionCommit,
 }
@@ -499,14 +504,26 @@ pub fn generation() -> [u8; 32] {
 
 /// Import one locally authored Wiki root and one locally authored Compass root.
 ///
-/// The pile and durable key must already exist. Both candidate unions and all
-/// staged text attachments are validated before either COMMIT is appended.
-/// Replaying with the same key is content-addressed and yields the same two
-/// COMMIT ids.
+/// The pile and durable key must already exist. The closed authority bootstrap
+/// may append first because strict reads need it to observe prior recipient
+/// history; both candidate unions and all staged text attachments are then
+/// validated before either content COMMIT is appended. Replaying with the same
+/// key is content-addressed and yields the same closed grant set plus the same
+/// two content COMMIT ids.
 pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport> {
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
+        // Authority is an independently valid part of recipient
+        // initialization. It must precede the first strict Wiki/Compass read:
+        // without it, intact pre-authority commits are intentionally inert.
+        let authority = crate::storage::ensure_team_of_one_write_authority(&mut pile, &signer)
+            .context("initialize faculty WRITE authority")?;
+        let authority_commits = authority
+            .rows()
+            .iter()
+            .map(|row| row.commit())
+            .collect::<Vec<_>>();
         let (wiki_before, wiki_reader) = wiki_model::materialize_collection(&mut pile, &signer)
             .context("materialize Wiki before bootstrap import")?;
         let (compass_before, compass_reader) = compass::materialize_collection(&mut pile, &signer)
@@ -545,6 +562,7 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
 
         Ok(ImportReport {
             generation: generation(),
+            authority_commits,
             wiki_commit,
             compass_commit,
         })
@@ -694,14 +712,35 @@ mod tests {
     fn import_is_collection_only_and_idempotent() {
         let imported = imported("native");
         let first = imported.report.clone();
+        let bytes_before = std::fs::metadata(&imported.pile).unwrap().len();
         let second = import(&imported.pile, Some(&imported.key)).unwrap();
+        let bytes_after = std::fs::metadata(&imported.pile).unwrap().len();
         assert_eq!(first.generation, second.generation);
+        assert_eq!(first.authority_commits, second.authority_commits);
+        assert_eq!(
+            first.authority_commits.len(),
+            crate::collection_names::table().len()
+        );
         assert_eq!(first.wiki_commit.id(), second.wiki_commit.id());
         assert_eq!(first.compass_commit.id(), second.compass_commit.id());
+        assert_eq!(
+            bytes_before, bytes_after,
+            "exact replay must not grow the pile"
+        );
 
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let records = discover_collection_records(&mut pile).unwrap();
-        assert_eq!(records.commits().len(), 2);
+        assert_eq!(
+            records.commits().len(),
+            crate::collection_names::table().len() + 2
+        );
+        let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
+        let authority =
+            triblespace::core::authority::resolve_authority(&mut pile, signer.verifying_key())
+                .unwrap();
+        for commit in &first.authority_commits {
+            assert!(authority.grant(commit.id()).is_some());
+        }
         pile.close().unwrap();
     }
 
@@ -740,6 +779,7 @@ mod tests {
         staged += local_edit;
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
+        crate::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
         wiki_model::commit_collection(&mut pile, &signer, staged).unwrap();
         pile.close().unwrap();
 
@@ -894,6 +934,7 @@ mod tests {
         .unwrap();
         staged += old_source;
         let mut pile = open_pile_strict(&pile_path).unwrap();
+        crate::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
         wiki_model::commit_collection(&mut pile, &signer, staged).unwrap();
         pile.close().unwrap();
 

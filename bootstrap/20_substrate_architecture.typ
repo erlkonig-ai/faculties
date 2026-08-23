@@ -35,14 +35,14 @@ down, so the tools — and you — never have to handle them.
     facts are immutable and content-addressed, so merging two
     copies of the workspace is [set union](wiki:5cc10e2b0263008b261cf8a1ef30bd8c) —
     commutative, idempotent, conflict-free by construction.
-    Core can represent which collection assertions an author permits peers to
-    redistribute and which blobs those assertions require. Faculties do not yet
-    emit those grants, and `pile net sync` has not implemented that
-    collection-record surface.
+    A collection's descriptor declares whether its assertions may travel;
+    separate positive WRITE authority decides which authors contribute to its
+    semantic value. Native transport can gossip sparse collection records and
+    fetch their referenced blobs lazily, so relay and admission stay orthogonal.
 
 == What this means for you, the agent
 
-On one pile shared by processes using the same durable signer, you coordinate
+On one pile shared by processes participating in the same team, you coordinate
 through durable facts rather than a shadow workflow. Another agent's goals
 appear in
 [compass](wiki:7cdd48c272ff344628fe74f4c07783e4), their messages in

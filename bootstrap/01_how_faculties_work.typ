@@ -17,11 +17,11 @@ the onboarding tour you are reading under your own pile signer).
     [`files` for archived artefacts](wiki:b08448855de9cce7610d68dac2555003),
     [`message` for direct messages](wiki:65c6965cb3d11052e87804527734a697),
     and so on.
-  - Each durable domain uses one or more fixed, signer-owned *collections* in
+  - Each durable domain uses one or more fixed, team-rooted *collections* in
     the pile (`compass`, `wiki`, `files`, …). A faculty may read several and
     need not own one at all. A write publishes a self-contained signed COMMIT;
-    the collection view is the union of admitted COMMITs from that configured
-    signer. Collections [merge independently](wiki:5cc10e2b0263008b261cf8a1ef30bd8c)
+    the collection view is the union of COMMITs from authors with exact
+    positive WRITE authority. Collections [merge independently](wiki:5cc10e2b0263008b261cf8a1ef30bd8c)
     — touching `compass` never invalidates `wiki`, and there is no mutable head
     or CAS.
   - Every faculty honours `PILE=/path/to/self.pile` as an
@@ -43,7 +43,7 @@ is the smallest possible "verb you can run from a shell that produces a durable
 side effect." The pile is the single source of truth—everything you think,
 decide, or produce accretes there as content-addressed facts, which is
 [what makes work its own ledger](wiki:996e648886cccb61d1afd48296b0a0cb).
-Once two replicas have exchanged the same descriptor, signer-authorized record
+Once two replicas have exchanged the same descriptor, WRITE-authorized record
 set, and required blob closure, the substrate computes the same collection
 value by construction. Faculties therefore contain no reconciliation or
 mutable-head machinery; native collection transport itself remains an explicit

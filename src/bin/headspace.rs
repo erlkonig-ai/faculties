@@ -8,15 +8,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
-use faculties::storage::{load_signer, open_pile_strict};
 use faculties::headspace::{self, Catalog, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -998,7 +998,10 @@ mod tests {
         let pile = directory.path().join("headspace.pile");
         let key = directory.path().join("headspace.key");
         File::create(&pile).unwrap();
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
         (directory, pile, key)
     }
 
@@ -1081,13 +1084,20 @@ mod tests {
         let scope = scope_fragment.root().unwrap();
         let mut foundation = identity.fragment;
         foundation += scope_fragment;
-        faculties::collection_names::open(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
-            .commit(foundation)
-            .unwrap();
-        let secrets_facts =
-            faculties::collection_names::open(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
-                .materialize()
-                .unwrap();
+        faculties::collection_names::open(
+            &mut store,
+            secrets_schema::DEFAULT_SCOPE_ID,
+            signer.clone(),
+        )
+        .commit(foundation)
+        .unwrap();
+        let secrets_facts = faculties::collection_names::open(
+            &mut store,
+            secrets_schema::DEFAULT_SCOPE_ID,
+            signer.clone(),
+        )
+        .materialize()
+        .unwrap();
         let reader = store.reader().unwrap();
         let catalog = secrets_model::validate_catalog(&reader, &secrets_facts).unwrap();
         let sealed = secrets_model::seal_version(

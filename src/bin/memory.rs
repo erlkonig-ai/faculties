@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
-use faculties::storage::{load_signer, open_pile_strict};
 use faculties::schemas::embeddings::DEFAULT_SCOPE_ID as EMBEDDINGS_SCOPE_ID;
 #[cfg(feature = "local-embed")]
 use faculties::schemas::embeddings::{self, Embedding768};
@@ -12,9 +11,11 @@ use faculties::schemas::memory::{
     DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID,
 };
 use faculties::schemas::{blockdag as archive_schema, cognition as cognition_schema};
+use faculties::storage::{load_signer, open_pile_strict};
 // The context-cover renderer and its chunk accessors live in the lib module
 // `faculties::memory_cover` so `orient wake` can assemble the same cover
 // in-process. Re-import the pieces this binary still uses elsewhere.
+use faculties::legacy_hint::open_scope;
 use faculties::memory_cover::{
     all_chunk_ids, chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_span_str,
     chunk_start_at, chunk_summary_handle, collect_chunk_spans, epoch_end_from_interval,
@@ -33,10 +34,9 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -2894,7 +2894,6 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-
     struct TestPile {
         pile: PathBuf,
         key: PathBuf,
@@ -2906,8 +2905,12 @@ mod tests {
                 std::env::temp_dir().join(format!("faculties-memory-cover-{}.pile", ufoid().id));
             let key = pile.with_extension("key");
             File::create(&pile).expect("create test pile");
-            faculties::storage::initialize_signer(&pile, Some(&key))
+            let signer = faculties::storage::initialize_signer(&pile, Some(&key))
                 .expect("initialize test signer");
+            let mut store = open_pile_strict(&pile).expect("open test pile");
+            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer)
+                .expect("grant fixture team-of-one WRITE authority");
+            store.close().expect("close authorized test pile");
             Self { pile, key }
         }
 

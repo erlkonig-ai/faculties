@@ -32,18 +32,18 @@ use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use serde_json::{json, Value as JsonValue};
 
-use faculties::storage::{load_signer, open_pile_strict};
 use faculties::discord as discord_model;
 use faculties::files as file_capability;
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{discord, DEFAULT_SCOPE_ID};
+use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::collection::{Collection, CollectionCommit};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
@@ -1224,7 +1224,10 @@ mod tests {
         let pile = directory.path().join("discord.pile");
         let key = directory.path().join("discord.key");
         File::create(&pile).unwrap();
-        faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
         (pile, key)
     }
 

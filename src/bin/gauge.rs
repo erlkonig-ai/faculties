@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::wiki::extract_link_targets;
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki::{self as wiki_model, WikiCatalog};
 use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -94,10 +94,7 @@ impl GaugeModel {
         let mut selectors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
 
         for (index, entry) in records.iter().enumerate() {
-            let label = *entry
-                .roots
-                .first()
-                .expect("admitted Wiki entry has a root");
+            let label = *entry.roots.first().expect("admitted Wiki entry has a root");
             let mut states = Vec::with_capacity(entry.frontier.len());
             for revision in &entry.frontier {
                 let title = wiki_model::read_text(reader, revision.title)?;
@@ -495,8 +492,8 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    use faculties::storage::initialize_signer;
     use faculties::schemas::wiki::TAG_ARCHIVED_ID;
+    use faculties::storage::initialize_signer;
     use faculties::wiki::{author_record, revision_record, tag_record, RevisionDraft};
     use hifitime::Epoch;
 
@@ -512,7 +509,10 @@ mod tests {
             let pile = directory.path().join("gauge.pile");
             let key = directory.path().join("gauge.key");
             File::create(&pile).unwrap();
-            initialize_signer(&pile, Some(&key)).unwrap();
+            let signer = initialize_signer(&pile, Some(&key)).unwrap();
+            let mut store = open_pile_strict(&pile).unwrap();
+            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+            store.close().unwrap();
             Self {
                 _directory: directory,
                 pile,

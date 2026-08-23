@@ -20,8 +20,8 @@ use triblespace::prelude::*;
 use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
 };
+use crate::write_authority::publish_fragments;
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID, LEGACY_BRANCH_NAME};
-use faculties::storage::publish_fragments;
 
 /// One native COMMIT projected from one verified legacy authored commit.
 #[derive(Clone, Debug, Eq, PartialEq)]

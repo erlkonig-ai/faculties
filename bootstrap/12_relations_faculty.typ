@@ -8,17 +8,17 @@ registry.
 
 == Why a separate faculty
 
-Each kind of state lives in its own fixed, signer-owned collection. Relations,
+Each kind of state lives in its own fixed, team-rooted collection. Relations,
 Message, and Compass therefore retain separate semantics while sharing one
 pile. Faculties that need people-references materialize Relations without
 claiming those facts as their own schema.
 
 That separation matters when admitted facts merge. Two `relations add alice`
-operations under the same durable signer mint distinct stable person anchors;
+operations by the same admitted author mint distinct stable person anchors;
 the read model preserves the ambiguity instead of silently choosing one by
 label. Record an explicit same-person or distinct-person identity verdict when
 you know the relationship, and reconcile concurrent profile frontiers
-explicitly when needed. A concatenated foreign-signer COMMIT is retained
+explicitly when needed. A concatenated COMMIT by an unauthorized key is retained
 physically but is not admitted into this collection view. Message can therefore
 reject an ambiguous addressee rather than inheriting inconsistent contact data.
 

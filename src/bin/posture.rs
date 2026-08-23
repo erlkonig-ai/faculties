@@ -34,15 +34,15 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::storage::{discover_target, load_signer, open_pile_strict};
 use faculties::decide::{self, Resolution};
-use faculties::schemas::decide::DEFAULT_SCOPE_ID as DEFAULT_DECIDE_SCOPE_ID;
-use faculties::schemas::embeddings::{self, Embedding768};
+use faculties::legacy_hint::open_scope;
+#[cfg(test)]
+use faculties::posture_finding::Inner;
 use faculties::posture_finding::{
     commit_message_location, finding_entity, finding_id, git_probe, Carrier, GitObjects, Location,
 };
-#[cfg(test)]
-use faculties::posture_finding::Inner;
+use faculties::schemas::decide::DEFAULT_SCOPE_ID as DEFAULT_DECIDE_SCOPE_ID;
+use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::posture::{
     modality, posture, CARRIER_CONTAINER_MEMBER, CARRIER_GIT_BLOB, CARRIER_GIT_COMMIT,
     DEFAULT_POLICY_SCOPE_ID, DEFAULT_SCAN_SCOPE_ID, DOC_UNSUPPORTED, EXEMPLAR_PROTECTED,
@@ -52,6 +52,7 @@ use faculties::schemas::posture::{
 };
 #[cfg(any(feature = "local-embed", test))]
 use faculties::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
+use faculties::storage::{discover_target, load_signer, open_pile_strict};
 use hifitime::Epoch;
 use lopdf::{Dictionary, Document, Object};
 use regex::Regex;
@@ -65,7 +66,6 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -1941,7 +1941,9 @@ impl PostureStorage<'_> {
             DEFAULT_POLICY_SCOPE_ID,
             "policy",
             |collection, current, reader, _| {
-                faculties::posture_policy::validate_policy_catalog_union(reader, current, &fragment)?;
+                faculties::posture_policy::validate_policy_catalog_union(
+                    reader, current, &fragment,
+                )?;
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
                 collection
                     .commit(fragment)
@@ -2752,7 +2754,10 @@ fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
             "sighting document",
         )?;
         if !documents.contains(&document) {
-            bail!("sighting {} references a missing document", fmt_id(*sighting));
+            bail!(
+                "sighting {} references a missing document",
+                fmt_id(*sighting)
+            );
         }
         for scan in &owners {
             if !exists!(pattern!(facts, [{ (*scan) @ posture::scan_document: (document) }])) {
@@ -3273,7 +3278,9 @@ fn settled_findings(
         .collect();
     let justified = states
         .into_iter()
-        .filter_map(|(finding, state)| (state.justified_benign && !state.disputed).then_some(finding))
+        .filter_map(|(finding, state)| {
+            (state.justified_benign && !state.disputed).then_some(finding)
+        })
         .collect();
     Ok(Settled {
         ordinary,
@@ -4205,10 +4212,7 @@ fn append_changed_unsafe_attributes(
     Ok(())
 }
 
-fn unsafe_attribute_claims(
-    hits: &[GitHit],
-    direction: UnsafeAttributeChange,
-) -> BTreeSet<String> {
+fn unsafe_attribute_claims(hits: &[GitHit], direction: UnsafeAttributeChange) -> BTreeSet<String> {
     hits.iter()
         .filter_map(|hit| hit.claim.as_ref())
         .filter(|(change, _)| *change == direction)
@@ -4453,7 +4457,10 @@ fn collect_hits(
     // Commit messages, one record per commit so a hit can name its commit.
     // %x1e separates sha from body, %x1f terminates the record — control
     // characters, so a message can never forge a record boundary.
-    let log = git_required(&repo_root, &git_log_args(revisions, "--format=%H%x1e%B%x1f"))?;
+    let log = git_required(
+        &repo_root,
+        &git_log_args(revisions, "--format=%H%x1e%B%x1f"),
+    )?;
     for rec in log.split('\u{1f}') {
         // `git log` writes a newline after each custom-format record. Remove
         // only that framing; line numbers within the message body are identity.
@@ -5875,7 +5882,10 @@ mod tests {
             let pile = directory.path().join("posture-test.pile");
             let key = directory.path().join("posture-test.key");
             File::create(&pile).unwrap();
-            faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+            let signer = faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+            let mut store = faculties::storage::open_pile_strict(&pile).unwrap();
+            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+            store.close().unwrap();
             Self {
                 _directory: directory,
                 pile,
@@ -5892,13 +5902,8 @@ mod tests {
 
         fn publish_raw(&self, scope: Id, mut fragment: Fragment, description: &str) {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
-            faculties::storage::publish_fragment(
-                &self.pile,
-                Some(&self.key),
-                scope,
-                fragment,
-            )
-            .unwrap();
+            faculties::storage::publish_fragment(&self.pile, Some(&self.key), scope, fragment)
+                .unwrap();
         }
     }
 
@@ -6859,23 +6864,25 @@ mod tests {
             None,
             IMPLEMENTED.iter().copied().collect(),
         );
-        let pile = open_pile_strict(&store.pile).unwrap();
-        // `Collection::new` directly, NOT the team-of-one opener: the whole
-        // point is a signer that is not the team. The foreign key must address
-        // the SAME collection — same name, same team — or this proves only that
-        // two different collections do not see each other, which is trivial.
+        let mut pile = open_pile_strict(&store.pile).unwrap();
+        // Use the explicit low-level publication seam: the high-level
+        // `Collection::commit` correctly refuses this writer. The foreign key
+        // must still address the SAME collection — same name, same team — or
+        // this proves only that two different collections do not see each
+        // other, which is trivial.
         let team = faculties::storage::load_signer(&store.pile, Some(&store.key))
             .unwrap()
             .verifying_key();
-        let mut foreign = Collection::new(
-            pile,
-            &faculties::collection_names::require_name(DEFAULT_SCAN_SCOPE_ID),
-            team,
-            ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]),
-            faculties::collection_names::require_reach(DEFAULT_SCAN_SCOPE_ID),
-        );
-        foreign.commit(fragment).unwrap();
-        foreign.into_storage().close().unwrap();
+        let descriptor = faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, team);
+        let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
+        triblespace::core::collection::simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &descriptor,
+            fragment,
+            &foreign,
+        )
+        .unwrap();
+        pile.close().unwrap();
 
         let view = store.storage().scan_view().unwrap();
         assert!(view.facts.is_empty());
@@ -7052,8 +7059,7 @@ mod tests {
         let directory = git_unsafe_attribute_fixture();
         let before = collect_hits(directory.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
         assert_eq!(before.unsafe_attribute_hits.len(), 1);
-        let before_id =
-            finding_id(
+        let before_id = finding_id(
             modality::UNSAFE_ATTRIBUTE_ID,
             &before.unsafe_attribute_hits[0].location,
         );
@@ -7453,10 +7459,20 @@ mod tests {
             7_000.0
         ));
         // Pre-tag clearances carried the exact word and nothing else.
-        assert!(cleared("legacy prose", LEGACY_BENIGN_OUTCOME, None, 7_100.0));
+        assert!(cleared(
+            "legacy prose",
+            LEGACY_BENIGN_OUTCOME,
+            None,
+            7_100.0
+        ));
         // Everything else is prose a program must not read as clearance.
         assert!(!cleared("near miss", "Benign.", None, 7_200.0));
-        assert!(!cleared("reasoned but untagged", "benign, because X", None, 7_300.0));
+        assert!(!cleared(
+            "reasoned but untagged",
+            "benign, because X",
+            None,
+            7_300.0
+        ));
     }
 
     #[test]

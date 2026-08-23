@@ -827,10 +827,9 @@ mod tests {
     use std::fs::File;
     use std::path::PathBuf;
 
-    use crate::storage::{
-        initialize_signer, load_signer, open_pile_strict, publish_fragment,
-    };
     use crate::schemas::decide::DEFAULT_SCOPE_ID;
+    use crate::storage::{load_signer, open_pile_strict, publish_fragment};
+    use crate::test_support::initialize_team_of_one_write_fixture;
     use hifitime::Epoch;
 
     fn at(second: u8) -> IntervalValue {
@@ -855,7 +854,7 @@ mod tests {
             let pile = directory.path().join("decide.pile");
             let key = directory.path().join("decide.key");
             File::create(&pile).unwrap();
-            initialize_signer(&pile, Some(&key)).unwrap();
+            initialize_team_of_one_write_fixture(&pile, Some(&key));
             Self {
                 _directory: directory,
                 pile,
@@ -907,8 +906,10 @@ mod tests {
 
         let a = genid().id;
         let b = genid().id;
-        let first = resolution_fragment(decision, "yes", None, true, &[b, a, b], &[b, a], at(2)).unwrap();
-        let second = resolution_fragment(decision, " yes ", None, true, &[a, b], &[a, b], at(2)).unwrap();
+        let first =
+            resolution_fragment(decision, "yes", None, true, &[b, a, b], &[b, a], at(2)).unwrap();
+        let second =
+            resolution_fragment(decision, " yes ", None, true, &[a, b], &[a, b], at(2)).unwrap();
         assert_eq!(first.1, second.1);
     }
 
@@ -976,11 +977,26 @@ mod tests {
         let first_pro = add_factor(&fixture, decision, FactorSide::Pro, "benefit", 1);
         let second_pro = add_factor(&fixture, decision, FactorSide::Pro, "other benefit", 2);
         let con = add_factor(&fixture, decision, FactorSide::Con, "risk", 2);
-        let (first, first_id) =
-            resolution_fragment(decision, "proceed", None, false, &[first_pro, con], &[], at(3)).unwrap();
-        let (second, second_id) =
-            resolution_fragment(decision, "proceed", None, false, &[second_pro, con], &[], at(4))
-                .unwrap();
+        let (first, first_id) = resolution_fragment(
+            decision,
+            "proceed",
+            None,
+            false,
+            &[first_pro, con],
+            &[],
+            at(3),
+        )
+        .unwrap();
+        let (second, second_id) = resolution_fragment(
+            decision,
+            "proceed",
+            None,
+            false,
+            &[second_pro, con],
+            &[],
+            at(4),
+        )
+        .unwrap();
         assert_ne!(first_id, second_id);
         fixture.publish(first);
         fixture.publish(second);

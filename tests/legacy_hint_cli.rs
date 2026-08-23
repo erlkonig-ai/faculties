@@ -3,14 +3,16 @@
 //! The unit tests in `faculties::legacy_hint` prove the predicate. This proves
 //! the delivery: someone who upgrades and runs a real faculty against a
 //! pre-collection pile sees the hint, on stderr, without it breaking the
-//! command — and stops seeing it once that scope has native facts.
+//! command — and stops seeing it once that native history has explicit WRITE
+//! authority.
 
 use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 
 use faculties::schemas::compass::{board, KIND_GOAL_ID};
-use faculties::storage::{initialize_signer, open_pile_strict};
+use faculties::storage::{ensure_team_of_one_write_authority, initialize_signer, open_pile_strict};
+use triblespace::core::collection::simplearchive_union;
 use triblespace::core::metadata;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
@@ -89,7 +91,7 @@ fn a_legacy_only_pile_tells_the_operator_how_to_migrate() {
 }
 
 #[test]
-fn the_hint_goes_quiet_once_the_native_scope_has_facts() {
+fn pre_authority_native_history_is_explained_then_becomes_visible() {
     let directory = tempfile::TempDir::new().unwrap();
     let pile_path = legacy_only_pile(directory.path());
 
@@ -98,19 +100,41 @@ fn the_hint_goes_quiet_once_the_native_scope_has_facts() {
 
     let signer = faculties::storage::load_signer(&pile_path, None).unwrap();
     let mut pile = open_pile_strict(&pile_path).unwrap();
-    faculties::collection_names::open(
+    simplearchive_union::publish_fragment_commit(
         &mut pile,
-        faculties::schemas::compass::DEFAULT_SCOPE_ID,
-        signer,
+        &faculties::collection_names::root_descriptor(
+            faculties::schemas::compass::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        ),
+        goal_fragment("a native goal"),
+        &signer,
     )
-    .commit(goal_fragment("a native goal"))
     .unwrap();
     pile.close().unwrap();
 
-    let stderr = String::from_utf8_lossy(&compass_list(&pile_path).stderr).into_owned();
+    let before = compass_list(&pile_path);
+    let stderr = String::from_utf8_lossy(&before.stderr);
+    let stdout = String::from_utf8_lossy(&before.stdout);
+    assert!(before.status.success(), "{stderr}");
+    assert!(stderr.contains("faculty-write-authority"), "{stderr}");
     assert!(
-        !stderr.contains("legacy"),
-        "a migrated scope must say nothing: {stderr}"
+        !stdout.contains("a native goal"),
+        "an ungranted commit must remain inert: {stdout}"
+    );
+
+    let mut pile = open_pile_strict(&pile_path).unwrap();
+    ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+    pile.close().unwrap();
+
+    let after = compass_list(&pile_path);
+    let stderr = String::from_utf8_lossy(&after.stderr);
+    let stdout = String::from_utf8_lossy(&after.stdout);
+    assert!(after.status.success(), "{stderr}");
+    assert!(!stderr.contains("faculty-write-authority"), "{stderr}");
+    assert!(!stderr.contains("legacy `compass`"), "{stderr}");
+    assert!(
+        stdout.contains("a native goal"),
+        "the same historical commit becomes visible after the additive grant: {stdout}"
     );
 }
 

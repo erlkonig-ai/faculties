@@ -83,6 +83,8 @@ pub mod wiki_additive;
 
 #[cfg(test)]
 mod attribute_id_preservation_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// Resolve a free-text argument that may reference a file or stdin, so every
 /// faculty that takes prose content (`memory create`, `message send`,

@@ -11,13 +11,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::{Parser, Subcommand};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::planner::{
     self as planner_model, cancellation_fragment, event_facts, event_fragment, note_fragment,
     read_text, EventDraft, EventRow, IntervalValue, PlannerCatalog, STATUS_CANCELLED,
     STATUS_CONFIRMED, TRANSP_OPAQUE,
 };
 use faculties::schemas::planner::DEFAULT_SCOPE_ID;
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use rrule::{RRuleSet, Tz};
 use triblespace::core::collection::Collection;
@@ -25,7 +26,6 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -183,8 +183,8 @@ impl PlannerStorage<'_> {
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
         let team = signer.verifying_key();
-        let result = faculties::storage::discover_target(&mut pile, DEFAULT_SCOPE_ID, team)
-            .map(|target| {
+        let result =
+            faculties::storage::discover_target(&mut pile, DEFAULT_SCOPE_ID, team).map(|target| {
                 target
                     .commits()
                     .iter()
@@ -945,7 +945,10 @@ mod tests {
         let pile = directory.0.join("planner.pile");
         let key = directory.0.join("planner.key");
         File::create(&pile).unwrap();
-        faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
         (pile, key)
     }
 

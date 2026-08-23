@@ -1967,6 +1967,7 @@ mod tests {
     struct TestPile {
         dir: PathBuf,
         path: PathBuf,
+        signer: SigningKey,
     }
 
     impl TestPile {
@@ -1983,7 +1984,11 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let path = dir.join("test.pile");
             fs::File::create(&path).unwrap();
-            Self { dir, path }
+            let signer = SigningKey::generate(&mut rand_core::OsRng);
+            let mut pile = open_pile_strict(&path).unwrap();
+            faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+            pile.close().unwrap();
+            Self { dir, path, signer }
         }
     }
 
@@ -2148,7 +2153,7 @@ mod tests {
     #[test]
     fn colleague_teams_message_wakes_and_our_own_send_is_quiet() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let (relations_fragment, _, _) =
             relations::person_fragment(persona, profile("persona")).unwrap();
@@ -2309,7 +2314,7 @@ mod tests {
     #[test]
     fn same_view_after_different_collection_history_is_silent() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let (relations_fragment, _, _) =
             relations::person_fragment(persona, profile("persona")).unwrap();
@@ -2346,7 +2351,7 @@ mod tests {
     #[test]
     fn seen_frontier_blocks_relevance_replay_but_wakes_for_a_later_note() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let peer = ufoid().id;
         let goal = ufoid().id;
@@ -2437,7 +2442,7 @@ mod tests {
     #[test]
     fn old_checkpoint_requires_explicit_note_baseline() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let (relations_fragment, _, _) =
             relations::person_fragment(persona, profile("persona")).unwrap();
@@ -2482,7 +2487,7 @@ mod tests {
     #[test]
     fn frontier_migration_rejects_stale_checkpoint_notes_without_appending() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let missing_note = ufoid().id;
         let missing_goal = ufoid().id;
@@ -2519,7 +2524,7 @@ mod tests {
     #[test]
     fn first_persona_baseline_is_silent_and_initializes_frontier() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let (relations_fragment, _, _) =
             relations::person_fragment(persona, profile("persona")).unwrap();
@@ -2553,7 +2558,7 @@ mod tests {
     #[test]
     fn raw_persona_first_poll_survives_reload_without_a_relations_profile() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let input = format!("{persona:x}");
         let mut pile = open_pile_strict(&fixture.path).unwrap();
@@ -2590,7 +2595,7 @@ mod tests {
     #[test]
     fn frontier_migration_baselines_the_snapshot_but_preserves_pending_messages() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let sender = ufoid().id;
         let goal = ufoid().id;
@@ -2682,7 +2687,7 @@ mod tests {
     #[test]
     fn publishing_status_is_what_places_a_window_on_the_roster() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let quiet = ufoid().id;
         let active = ufoid().id;
         let mut relations_fragment = relations::person_fragment(quiet, profile("quiet"))
@@ -2723,7 +2728,7 @@ mod tests {
     #[test]
     fn group_attention_tolerates_unrelated_and_member_forks() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let me = ufoid().id;
         let peer = ufoid().id;
         let addressed = ufoid().id;
@@ -2772,7 +2777,7 @@ mod tests {
     #[test]
     fn habit_cooldown_deadline_wakes_without_pile_growth() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let (definition, habit) =
             habits::habit_fragment("lineage-hygiene", "every 1s", "inspect branches", None, &[])
                 .unwrap();
@@ -2836,7 +2841,7 @@ mod tests {
     #[test]
     fn actual_semantic_message_change_is_news() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let sender = ufoid().id;
         let mut relations_fragment = relations::person_fragment(persona, profile("persona"))
@@ -2874,7 +2879,7 @@ mod tests {
     #[test]
     fn incoming_native_mail_wakes_once_per_wire_and_reading_is_quiet() {
         let fixture = TestPile::new();
-        let signer = SigningKey::generate(&mut rand_core::OsRng);
+        let signer = fixture.signer.clone();
         let persona = ufoid().id;
         let (relations_fragment, _, _) =
             relations::person_fragment(persona, profile("persona")).unwrap();

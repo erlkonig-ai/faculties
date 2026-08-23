@@ -25,17 +25,116 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use triblespace::core::authority::{
+    publish_grant, resolve_authority, AuthorityDiagnostic, AuthorityGrant, AuthorityMode,
+    ACTION_WRITE,
+};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::IntoBlob;
+use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
     discover_collection_records, CollectionCommit, CollectionDerive, CollectionMerge,
     CollectionRecordDiagnostic, CollectionStore,
 };
 use triblespace::core::id::Id;
+use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pile::{Pile, ReadError};
+use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::core::signing_key_file;
-use triblespace::core::trible::Fragment;
+use triblespace::core::trible::{Fragment, TribleSet};
+
+/// One configured faculty root and its deterministic team-of-one WRITE grant.
+///
+/// The row comes from [`crate::collection_names::table`], never from collection
+/// discovery. `target_commits` is therefore only a diagnostic about whether
+/// that configured resource has already been used; it does not decide whether
+/// the resource receives authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TeamOfOneWriteGrantRow {
+    scope: Id,
+    name: &'static str,
+    resource: CollectionHandle,
+    commit: CollectionCommit,
+    target_commits: usize,
+    accepted: bool,
+}
+
+impl TeamOfOneWriteGrantRow {
+    pub const fn scope(&self) -> Id {
+        self.scope
+    }
+
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub const fn resource(&self) -> CollectionHandle {
+        self.resource
+    }
+
+    pub const fn commit(&self) -> CollectionCommit {
+        self.commit
+    }
+
+    pub const fn target_commits(&self) -> usize {
+        self.target_commits
+    }
+
+    pub const fn accepted(&self) -> bool {
+        self.accepted
+    }
+}
+
+/// Exact state of the current build's team-of-one faculty WRITE bootstrap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TeamOfOneWriteAuthorityReport {
+    team_root: [u8; 32],
+    rows: Vec<TeamOfOneWriteGrantRow>,
+    diagnostics: Vec<AuthorityDiagnostic>,
+    published: Vec<Id>,
+    ignored_foreign_roots: usize,
+    ignored_unknown_roots: usize,
+}
+
+impl TeamOfOneWriteAuthorityReport {
+    pub const fn team_root(&self) -> [u8; 32] {
+        self.team_root
+    }
+
+    pub fn rows(&self) -> &[TeamOfOneWriteGrantRow] {
+        &self.rows
+    }
+
+    pub fn diagnostics(&self) -> &[AuthorityDiagnostic] {
+        &self.diagnostics
+    }
+
+    /// Grant records this call actually had to publish.
+    ///
+    /// Plans and exact replays return an empty slice. Consumers that need
+    /// stable output should report [`Self::rows`] instead: their commit ids do
+    /// not depend on whether this was the first run.
+    pub fn published(&self) -> &[Id] {
+        &self.published
+    }
+
+    pub const fn ignored_foreign_roots(&self) -> usize {
+        self.ignored_foreign_roots
+    }
+
+    pub const fn ignored_unknown_roots(&self) -> usize {
+        self.ignored_unknown_roots
+    }
+
+    pub fn accepted(&self) -> usize {
+        self.rows.iter().filter(|row| row.accepted).count()
+    }
+
+    pub fn missing(&self) -> usize {
+        self.rows.len() - self.accepted()
+    }
+}
 
 /// Canonical records currently known for one scoped target collection.
 ///
@@ -240,6 +339,209 @@ pub fn open_pile_strict(path: &Path) -> Result<Pile> {
     Ok(pile)
 }
 
+#[derive(Default)]
+struct FacultyRootObservation {
+    target_commits: BTreeMap<CollectionHandle, usize>,
+    local_known_roots: usize,
+    foreign_known_roots: usize,
+    unknown_named_roots: usize,
+}
+
+/// Observe named roots only to diagnose the migration boundary.
+///
+/// Discovery never supplies grant targets. The closed target set comes from
+/// `collection_names::table`; this pass exists only to count already-used
+/// targets, report ignored roots, and reject the common wrong-`--key` failure
+/// before it grants an otherwise empty parallel team.
+fn observe_faculty_roots(pile: &mut Pile, team: VerifyingKey) -> Result<FacultyRootObservation> {
+    let records =
+        discover_collection_records(pile).context("discover roots before WRITE bootstrap")?;
+    let mut observed = FacultyRootObservation::default();
+    let mut collections = BTreeSet::new();
+    for commit in records.commits() {
+        *observed
+            .target_commits
+            .entry(commit.collection())
+            .or_default() += 1;
+        collections.insert(commit.collection());
+    }
+
+    let known_names = crate::collection_names::table()
+        .into_iter()
+        .map(|(_, name, _)| name)
+        .collect::<BTreeSet<_>>();
+    let reader = pile
+        .reader()
+        .context("open descriptor view before WRITE bootstrap")?;
+    for collection in collections {
+        let Ok(blob): Result<Blob<SimpleArchive>, _> = reader.get(collection) else {
+            continue;
+        };
+        let Ok(facts) = TribleSet::try_from_blob(blob) else {
+            continue;
+        };
+        let Some(Ok(name)) = triblespace::core::collection::descriptor::name(&facts) else {
+            // Pre-naming roots are intentionally not authority targets.
+            continue;
+        };
+        let descriptor_team = triblespace::core::collection::descriptor::team(&facts);
+        if name.as_str() == triblespace::core::authority::AUTHORITY_COLLECTION_NAME {
+            // The authority ledger governs roots, so it is never a grant
+            // target. It is still decisive evidence of which team already
+            // inhabits this pile: ignoring it would let an interrupted
+            // grant-only initialization be silently parallel-rooted by a
+            // different key.
+            match descriptor_team {
+                Some(Ok(root)) if root == team => observed.local_known_roots += 1,
+                Some(Ok(_)) => observed.foreign_known_roots += 1,
+                _ => {}
+            }
+            continue;
+        }
+        if !known_names.contains(name.as_str()) {
+            observed.unknown_named_roots += 1;
+            continue;
+        }
+        match descriptor_team {
+            Some(Ok(root)) if root == team => observed.local_known_roots += 1,
+            Some(Ok(_)) => observed.foreign_known_roots += 1,
+            _ => {}
+        }
+    }
+
+    if observed.local_known_roots == 0 && observed.foreign_known_roots > 0 {
+        anyhow::bail!(
+            "the supplied signing key roots none of this pile's recognized faculty collections, \
+             while {} recognized root(s) belong to another team; refusing to create a parallel \
+             empty authority epoch — use the durable key that named the existing collections",
+            observed.foreign_known_roots
+        );
+    }
+    Ok(observed)
+}
+
+/// Construct the closed, deterministic grant set without touching `pile`.
+///
+/// A scratch store deliberately runs the same public [`publish_grant`] path as
+/// the real publication. This keeps planning from duplicating the authority
+/// collection's signing transcript while guaranteeing that dry-run performs
+/// no `put` against the destination.
+fn expected_team_of_one_write_grants(
+    signer: &SigningKey,
+) -> Result<
+    Vec<(
+        Id,
+        &'static str,
+        CollectionHandle,
+        AuthorityGrant,
+        CollectionCommit,
+    )>,
+> {
+    let team = signer.verifying_key();
+    let mut scratch = MemoryRepo::default();
+    crate::collection_names::table()
+        .into_iter()
+        .map(|(scope, name, _reach)| {
+            let resource = IntoBlob::<SimpleArchive>::to_blob(
+                crate::collection_names::root_descriptor(scope, team).into_facts(),
+            )
+            .get_handle();
+            let grant = AuthorityGrant::root(team, resource, ACTION_WRITE, AuthorityMode::Invoke);
+            let commit = publish_grant(&mut scratch, team, signer, grant)
+                .map_err(|error| anyhow!("prepare {name} WRITE grant: {error}"))?;
+            Ok((scope, name, resource, grant, commit))
+        })
+        .collect()
+}
+
+/// Plan exact self-WRITE authority for every root collection in this build.
+///
+/// The pile is read only. Existing collection records influence reporting and
+/// the wrong-key guard, never the grant set. In particular, pre-naming,
+/// unknown, and foreign-team descriptors remain outside authority.
+pub fn plan_team_of_one_write_authority(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<TeamOfOneWriteAuthorityReport> {
+    let team = signer.verifying_key();
+    let observed = observe_faculty_roots(pile, team)?;
+    let resolution = resolve_authority(pile, team)
+        .map_err(|error| anyhow!("resolve current team authority: {error}"))?;
+    let rows = expected_team_of_one_write_grants(signer)?
+        .into_iter()
+        .map(|(scope, name, resource, grant, commit)| {
+            let accepted = resolution
+                .grant(commit.id())
+                .is_some_and(|accepted| accepted.commit() == commit && accepted.grant() == grant);
+            TeamOfOneWriteGrantRow {
+                scope,
+                name,
+                resource,
+                commit,
+                target_commits: observed
+                    .target_commits
+                    .get(&resource)
+                    .copied()
+                    .unwrap_or_default(),
+                accepted,
+            }
+        })
+        .collect();
+
+    Ok(TeamOfOneWriteAuthorityReport {
+        team_root: team.to_bytes(),
+        rows,
+        diagnostics: resolution.diagnostics().to_vec(),
+        published: Vec::new(),
+        ignored_foreign_roots: observed.foreign_known_roots,
+        ignored_unknown_roots: observed.unknown_named_roots,
+    })
+}
+
+/// Ensure the current build's exact team-of-one self-WRITE grant set.
+///
+/// Missing or incomplete occurrences are replayed through [`publish_grant`].
+/// Dependencies and records are content addressed, so an interrupted prefix
+/// and an exact rerun converge to the same bytes. The final positive fixed
+/// point is resolved again before success is returned.
+pub fn ensure_team_of_one_write_authority(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<TeamOfOneWriteAuthorityReport> {
+    let before = plan_team_of_one_write_authority(pile, signer)?;
+    let team = signer.verifying_key();
+    let expected = expected_team_of_one_write_grants(signer)?;
+    let missing = before
+        .rows
+        .iter()
+        .filter(|row| !row.accepted)
+        .map(|row| row.commit.id())
+        .collect::<BTreeSet<_>>();
+    let mut published = Vec::new();
+    for (_, name, _, grant, expected_commit) in expected {
+        if !missing.contains(&expected_commit.id()) {
+            continue;
+        }
+        let commit = publish_grant(pile, team, signer, grant)
+            .map_err(|error| anyhow!("publish {name} WRITE grant: {error}"))?;
+        if commit != expected_commit {
+            anyhow::bail!("{name} WRITE grant changed identity between planning and publication");
+        }
+        published.push(commit.id());
+    }
+
+    let mut after = plan_team_of_one_write_authority(pile, signer)?;
+    if after.missing() != 0 {
+        anyhow::bail!(
+            "WRITE authority publication left {} of {} configured faculty roots unauthorized",
+            after.missing(),
+            after.rows.len()
+        );
+    }
+    after.published = published;
+    Ok(after)
+}
+
 /// Publish one complete fragment into one scoped native collection.
 ///
 /// The signer is loaded before the pile is touched. Facts become collection
@@ -344,8 +646,10 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::encodings::utf8string::UTF8String;
-    use triblespace::core::collection::CollectionStore;
-    use triblespace::core::collection::{empty_metadata_handle, CollectionRecord};
+    use triblespace::core::collection::records::CollectionName;
+    use triblespace::core::collection::{
+        empty_metadata_handle, reach, simplearchive_union, CollectionRecord,
+    };
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
     use triblespace::core::metadata;
@@ -508,6 +812,22 @@ mod tests {
             .verifying_key();
         let target_scope = crate::schemas::wiki::DEFAULT_SCOPE_ID;
         let other_scope = crate::schemas::compass::DEFAULT_SCOPE_ID;
+        let before_denied = fs::metadata(&files.pile).unwrap().len();
+        let denied = publish_fragment(
+            &files.pile,
+            Some(&files.key),
+            target_scope,
+            fragment.clone(),
+        )
+        .unwrap_err();
+        assert!(format!("{denied:#}").contains("no positive WRITE authority"));
+        assert_eq!(fs::metadata(&files.pile).unwrap().len(), before_denied);
+
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        let signer = load_signer(&files.pile, Some(&files.key)).unwrap();
+        ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+        pile.close().unwrap();
+
         let first = publish_fragment(
             &files.pile,
             Some(&files.key),
@@ -568,6 +888,179 @@ mod tests {
         let metadata_text: View<str> = reader.get(metadata_handle).unwrap();
         assert_eq!(&*metadata_text, "metadata attachment");
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn write_authority_dry_run_and_exact_replay_are_byte_identical() {
+        let files = TestFiles::new();
+        let signer = initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let empty = fs::read(&files.pile).unwrap();
+
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        let plan = plan_team_of_one_write_authority(&mut pile, &signer).unwrap();
+        pile.close().unwrap();
+        assert_eq!(fs::read(&files.pile).unwrap(), empty);
+        assert_eq!(plan.rows().len(), crate::collection_names::table().len());
+        assert_eq!(plan.accepted(), 0);
+        assert_eq!(plan.missing(), plan.rows().len());
+        assert!(plan.published().is_empty());
+        let names = plan
+            .rows()
+            .iter()
+            .map(|row| row.name())
+            .collect::<BTreeSet<_>>();
+        for name in ["memory", "memory-comb", "posture-policy", "posture-scan"] {
+            assert!(names.contains(name));
+        }
+
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        let first = ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+        pile.close().unwrap();
+        assert_eq!(first.published().len(), first.rows().len());
+        assert_eq!(first.accepted(), first.rows().len());
+        assert_eq!(first.missing(), 0);
+        let after_first = fs::read(&files.pile).unwrap();
+
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        let replay = ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+        pile.close().unwrap();
+        assert!(replay.published().is_empty());
+        assert_eq!(replay.rows(), first.rows());
+        assert_eq!(fs::read(&files.pile).unwrap(), after_first);
+    }
+
+    #[test]
+    fn write_authority_rejects_a_foreign_team_key_before_mutation() {
+        let files = TestFiles::new();
+        let local = initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let descriptor = crate::collection_names::root_descriptor(
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            local.verifying_key(),
+        );
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &descriptor,
+            entity! { _ @ metadata::tag: &id(31) },
+            &local,
+        )
+        .unwrap();
+        pile.close().unwrap();
+        let before = fs::read(&files.pile).unwrap();
+
+        let foreign = SigningKey::from_bytes(&[19; 32]);
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        let error = plan_team_of_one_write_authority(&mut pile, &foreign).unwrap_err();
+        pile.close().unwrap();
+        assert!(format!("{error:#}").contains("refusing to create a parallel empty authority"));
+        assert_eq!(fs::read(&files.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn write_authority_rejects_a_foreign_key_after_grant_only_initialization() {
+        let files = TestFiles::new();
+        let local = initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let descriptor = crate::collection_names::root_descriptor(
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            local.verifying_key(),
+        );
+        let resource = collection_of(&descriptor);
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        publish_grant(
+            &mut pile,
+            local.verifying_key(),
+            &local,
+            AuthorityGrant::root(
+                local.verifying_key(),
+                resource,
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .unwrap();
+        pile.close().unwrap();
+        let before = fs::read(&files.pile).unwrap();
+
+        let foreign = SigningKey::from_bytes(&[29; 32]);
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        let error = plan_team_of_one_write_authority(&mut pile, &foreign).unwrap_err();
+        pile.close().unwrap();
+        assert!(format!("{error:#}").contains("refusing to create a parallel empty authority"));
+        assert_eq!(fs::read(&files.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn write_authority_ignores_unknown_and_foreign_roots_without_rewriting_targets() {
+        let files = TestFiles::new();
+        let signer = initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let foreign = SigningKey::from_bytes(&[23; 32]);
+        let local_known = crate::collection_names::root_descriptor(
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        );
+        let foreign_known = crate::collection_names::root_descriptor(
+            crate::schemas::compass::DEFAULT_SCOPE_ID,
+            foreign.verifying_key(),
+        );
+        let unknown = simplearchive_union::descriptor(
+            &CollectionName::new("outside-faculties").unwrap(),
+            signer.verifying_key(),
+            reach::private(),
+        );
+
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        for (descriptor, writer, marker) in [
+            (&local_known, &signer, 41),
+            (&foreign_known, &foreign, 42),
+            (&unknown, &signer, 43),
+        ] {
+            simplearchive_union::publish_fragment_commit(
+                &mut pile,
+                descriptor,
+                entity! { _ @ metadata::tag: &id(marker) },
+                writer,
+            )
+            .unwrap();
+        }
+        let baseline = discover_collection_records(&mut pile)
+            .unwrap()
+            .commits()
+            .to_vec();
+        let report = ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+        let final_commits = discover_collection_records(&mut pile)
+            .unwrap()
+            .commits()
+            .to_vec();
+        pile.close().unwrap();
+
+        assert_eq!(report.ignored_foreign_roots(), 1);
+        assert_eq!(report.ignored_unknown_roots(), 1);
+        assert_eq!(report.rows().len(), crate::collection_names::table().len());
+        assert_eq!(report.accepted(), report.rows().len());
+        assert_eq!(
+            report
+                .rows()
+                .iter()
+                .find(|row| row.name() == "wiki")
+                .unwrap()
+                .target_commits(),
+            1
+        );
+
+        let mut expected = baseline
+            .into_iter()
+            .map(|commit| (commit.id(), commit))
+            .collect::<BTreeMap<_, _>>();
+        for row in report.rows() {
+            expected.insert(row.commit().id(), row.commit());
+        }
+        assert_eq!(
+            final_commits
+                .into_iter()
+                .map(|commit| (commit.id(), commit))
+                .collect::<BTreeMap<_, _>>(),
+            expected
+        );
     }
 
     #[test]

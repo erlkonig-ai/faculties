@@ -5,11 +5,12 @@ use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 #[cfg(feature = "local-embed")]
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
 use faculties::schemas::wiki::{self as schema, extract_link_targets};
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki::{
     self as wiki_model, EntryRecord, RevisionDraft, RevisionReadModel, RevisionRecord, WikiCatalog,
 };
@@ -17,7 +18,6 @@ use hifitime::Epoch;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[cfg(feature = "local-embed")]
 /// Shared embedding scope minted with trible genid on 2026-08-09 and retained
@@ -553,10 +553,8 @@ fn regexes() -> &'static LintPatterns {
         )
         .unwrap(),
         web_links: regex::Regex::new(r"\[([^\]]+)\]\((https?://[^)]+)\)").unwrap(),
-        wiki_references: regex::Regex::new(
-            r"wiki:((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\b",
-        )
-        .unwrap(),
+        wiki_references: regex::Regex::new(r"wiki:((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\b")
+            .unwrap(),
     })
 }
 
@@ -590,7 +588,10 @@ fn lint_line(line: &str, resolver: ReferenceResolver<'_>) -> String {
             format!("#link(\"{scheme}:{resolved}\")[{}]", &captures[1])
         })
         .to_string();
-    let line = patterns.web_links.replace_all(&line, "#link(\"$2\")[$1]").to_string();
+    let line = patterns
+        .web_links
+        .replace_all(&line, "#link(\"$2\")[$1]")
+        .to_string();
     // Every remaining `wiki:` reference — a Typst link target, a link LABEL
     // that repeats the id, a bare prose mention — names its target the same
     // way. This is what retires the legacy anchors: an anchor becomes the
@@ -1613,7 +1614,6 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-
     struct Fixture {
         _directory: tempfile::TempDir,
         pile: PathBuf,
@@ -1626,7 +1626,10 @@ mod tests {
             let pile = directory.path().join("wiki.pile");
             let key = directory.path().join("wiki.key");
             File::create(&pile).unwrap();
-            faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+            let signer = faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+            let mut store = faculties::storage::open_pile_strict(&pile).unwrap();
+            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+            store.close().unwrap();
             Self {
                 _directory: directory,
                 pile,
@@ -1822,8 +1825,7 @@ mod tests {
         );
 
         let target_entry = catalog.revisions.entry_containing(target).unwrap();
-        let incoming =
-            incoming_revisions(&after.reader, &catalog.revisions, target_entry).unwrap();
+        let incoming = incoming_revisions(&after.reader, &catalog.revisions, target_entry).unwrap();
         assert!(
             incoming.contains(&citing),
             "the revision that wrote the citation must be listed"
@@ -1885,7 +1887,10 @@ mod tests {
         let after = storage.view().unwrap();
         let catalog = wiki_model::load_catalog(&after.facts).unwrap();
         let summaries = backlink_summaries(&after.reader, &catalog.revisions).unwrap();
-        assert_eq!(summaries.get(&target).unwrap().tags, BTreeSet::from([citing_tag]));
+        assert_eq!(
+            summaries.get(&target).unwrap().tags,
+            BTreeSet::from([citing_tag])
+        );
     }
 
     #[test]
@@ -2067,7 +2072,6 @@ mod tests {
             format!("see #link(\"wiki:{target:x}\")[the page]")
         );
     }
-
 }
 
 fn main() -> Result<()> {

@@ -922,7 +922,7 @@ pub fn validate_candidate(
     Ok(())
 }
 
-/// Materialize the complete signer-owned Compass collection through an
+/// Materialize the complete WRITE-authorized Compass collection through an
 /// already-open pile.
 pub fn materialize_collection(
     pile: &mut Pile,

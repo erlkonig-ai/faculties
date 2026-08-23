@@ -52,10 +52,11 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::voice::{
     route, CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID, KIND_LIVE_RECORD, KIND_ROUTE,
 };
+use faculties::storage::{load_signer, open_pile_strict};
 use faculties::voice as voice_model;
 use hifitime::efmt::consts::ISO8601;
 use hifitime::efmt::Formatter;
@@ -67,7 +68,6 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 type U256 = Inline<inlineencodings::U256BE>;
 
@@ -1240,8 +1240,10 @@ mod tests {
     use std::fs::File;
     use triblespace::core::repo::BlobStoreGet;
 
-    use faculties::storage::{discover_target, initialize_signer};
     use faculties::schemas::voice::{utterance, KIND_UTTERANCE};
+    use faculties::storage::{
+        discover_target, ensure_team_of_one_write_authority, initialize_signer,
+    };
 
     fn dev(name: &str, default: bool) -> AudioDevice {
         AudioDevice {
@@ -1267,7 +1269,10 @@ mod tests {
         let pile = directory.path().join("voice.pile");
         let key = directory.path().join("voice.key");
         File::create(&pile).unwrap();
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
         let storage = VoiceStorage {
             pile: &pile,
             key: Some(&key),

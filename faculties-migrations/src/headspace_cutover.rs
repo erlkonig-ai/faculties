@@ -209,6 +209,9 @@ pub fn publish(
     }
     plan.verify_conservation()?;
 
+    crate::write_authority::publish(target, key)
+        .context("initialize WRITE authority before Headspace migration publication")?;
+
     // Authority must exist before the target pile is touched. The same open
     // pile owns preflight and every idempotent collection append.
     let signer = load_signer(target, key)?;
@@ -326,6 +329,7 @@ mod tests {
         let key = directory.0.join("headspace.key");
         File::create(&pile_path).unwrap();
         initialize_signer(&pile_path, Some(&key)).unwrap();
+        crate::write_authority::publish(&pile_path, Some(&key)).unwrap();
 
         // Extrinsic ids and schema-unknown attachments are deliberate. The
         // migration must copy history, not rebuild it through today's entity

@@ -627,9 +627,9 @@ pub fn plan(source: &FrozenSource) -> Result<ActivationPlan> {
     // Files, Decide, Relations, and Secrets projections that will accompany
     // it. Mail/Files/Decide may own newly staged payloads, so expose their
     // combined in-memory blob closure to the same validator used at publish.
-    // Existing signer-scoped native facts are intentionally outside this pure
-    // legacy-source plan; disposable activation repeats the predicate over
-    // the authoritative baseline union planned facts before replacement.
+    // Existing WRITE-authorized native facts are intentionally outside this
+    // pure legacy-source plan; disposable activation repeats the predicate
+    // over the authoritative baseline union planned facts before replacement.
     let staged_mail = mail
         .commits()
         .iter()
@@ -977,6 +977,7 @@ mod tests {
         File::create(&path).unwrap();
         let mut pile = Pile::open(&path).unwrap();
         let signer = SigningKey::from_bytes(&[0xE8; 32]);
+        faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
 
         let anchor = Id::new([0xE9; 16]).unwrap();
         let missing_secret = Id::new([0xEA; 16]).unwrap();

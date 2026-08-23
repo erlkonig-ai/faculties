@@ -26,12 +26,12 @@ use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
     LegacyPinCoordinate,
 };
+use crate::write_authority::publish_fragments;
 use faculties::comb::{self, CursorDraft, CursorState, CursorTrack};
 use faculties::schemas::memory::{
     self as schema,
     comb::{cursor_grain, cursor_persona, cursor_position, cursor_stream, kind_comb_cursor},
 };
-use faculties::storage::publish_fragments;
 
 /// Content-addressed coordinate of one legacy repository commit.
 pub type LegacyCommitId = [u8; 32];

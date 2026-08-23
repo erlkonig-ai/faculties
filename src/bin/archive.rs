@@ -16,12 +16,13 @@ use faculties::archive_collection::{
 };
 use faculties::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
 use faculties::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
-use faculties::storage::{load_signer, open_pile_strict};
 use faculties::comb::{
     self as comb_model, CombCatalog, CursorDraft, CursorResolution, CursorState,
 };
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::blockdag as archive_schema;
 use faculties::schemas::memory::DEFAULT_COMB_SCOPE_ID;
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
@@ -31,7 +32,6 @@ use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::{Inline, TryToInline};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{find, pattern};
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -1161,7 +1161,9 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::storage::initialize_signer;
+    use faculties::storage::{
+        ensure_team_of_one_write_authority, initialize_signer, open_pile_strict,
+    };
     use std::fs;
 
     struct Fixture {
@@ -1175,7 +1177,10 @@ mod tests {
         let pile = directory.path().join("archive.pile");
         fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
         Fixture {
             _directory: directory,
             pile,
@@ -1202,18 +1207,10 @@ mod tests {
             .collect();
         assert_eq!(
             commands,
-            [
-                "import",
-                "index",
-                "list",
-                "replay",
-                "search",
-                "show",
-                "thread",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+            ["import", "index", "list", "replay", "search", "show", "thread",]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
         );
         assert!(Cli::try_parse_from([
             "archive",

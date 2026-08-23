@@ -485,7 +485,10 @@ mod tests {
         let pile = directory.path().join("habit.pile");
         let key = directory.path().join("habit.key");
         std::fs::File::create(&pile).unwrap();
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = faculties::storage::open_pile_strict(&pile).unwrap();
+        faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
 
         let (original, original_id) =
             habits::habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();

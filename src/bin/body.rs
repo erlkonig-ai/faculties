@@ -21,10 +21,9 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::storage::{
-    load_signer, open_pile_strict, publish_fragment,
-};
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
+use faculties::storage::{load_signer, open_pile_strict, publish_fragment};
 use hifitime::efmt::consts::ISO8601;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -38,7 +37,6 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -1149,7 +1147,9 @@ mod tests {
     use std::fs::{self, File};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use faculties::storage::initialize_signer;
+    use faculties::storage::{
+        ensure_team_of_one_write_authority, initialize_signer, open_pile_strict,
+    };
 
     use super::*;
 
@@ -1187,7 +1187,10 @@ mod tests {
         let pile = directory.0.join("body.pile");
         let key = directory.0.join("body.key");
         File::create(&pile).unwrap();
-        initialize_signer(&pile, Some(&key)).unwrap();
+        let signer = initialize_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
         let storage = BodyStorage {
             pile: &pile,
             key: Some(&key),

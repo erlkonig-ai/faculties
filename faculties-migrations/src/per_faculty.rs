@@ -15,15 +15,17 @@
 //! surrounding safety argument is written once, here, rather than fifteen
 //! times with fifteen slightly different amounts of checking:
 //!
-//! 1. Load the durable signer **first**. Absent authority fails before any
+//! 1. Load the durable signer **first**. A missing identity fails before any
 //!    legacy state is inspected and before the pile grows by a byte.
 //! 2. Freeze the source. Every writer must already be stopped.
-//! 3. Materialize the target scope's current native value.
-//! 4. Plan, then publish. Publication is exact replay of content-addressed
+//! 3. Construct and validate the complete typed plan without writing.
+//! 4. Initialize the closed faculty WRITE manifest, then materialize the
+//!    target scope's current native value.
+//! 5. Publish the already-validated plan. Publication is exact replay of content-addressed
 //!    commits, so rerunning an interrupted migration appends nothing.
-//! 5. Re-materialize and require the result to be **exactly** the prior native
+//! 6. Re-materialize and require the result to be **exactly** the prior native
 //!    value union the planned facts — no more, no less.
-//! 6. Re-freeze and require the legacy pin table to be byte-identical, which
+//! 7. Re-freeze and require the legacy pin table to be byte-identical, which
 //!    is what proves nothing wrote to the pile while this ran.
 //!
 //! The legacy branch is never deleted, consumed, or rewritten. It stays as
@@ -65,24 +67,27 @@ macro_rules! faculties {
             }
         }
 
-        fn plan_and_publish(
+        fn prepare<'a>(
             faculty: Faculty,
-            source: &FrozenSource,
-            pile: &Path,
-            key: Option<&Path>,
-        ) -> Result<Published> {
+            source: &'a FrozenSource,
+            pile: &'a Path,
+            key: Option<&'a Path>,
+        ) -> Result<Box<dyn FnOnce() -> Result<Published> + 'a>> {
             match faculty {
                 $( Faculty::$variant => {
                     let plan = crate::$module::plan(source)
                         .with_context(|| format!("plan {} migration", $label))?;
                     let facts = plan.$facts().clone();
-                    let commits = crate::$module::publish(source, &plan, pile, key)
-                        .with_context(|| format!("publish {} migration", $label))?;
-                    Ok(Published {
-                        facts,
-                        commits: commits.len(),
-                        report: format!("{:#?}", plan.report()),
-                    })
+                    let report = format!("{:#?}", plan.report());
+                    Ok(Box::new(move || {
+                        let commits = crate::$module::publish(source, &plan, pile, key)
+                            .with_context(|| format!("publish {} migration", $label))?;
+                        Ok(Published {
+                            facts,
+                            commits: commits.len(),
+                            report,
+                        })
+                    }))
                 } ),+
             }
         }
@@ -176,12 +181,22 @@ pub fn migrate(faculty: Faculty, pile: &Path, key: Option<&Path>) -> Result<()> 
         )
     })?;
     let fingerprint = source.fingerprint();
+    // Every typed conservation and shape check runs while the destination is
+    // still byte-identical. The returned closure owns the validated plan and
+    // is the only path that may publish it below.
+    let publish = prepare(faculty, &source, pile, key)?;
+
+    // Migration is an explicit authority-initialization boundary. Ordinary
+    // faculty publication remains strict: it never manufactures a grant just
+    // because a caller attempted a write.
+    crate::write_authority::publish(pile, key)
+        .with_context(|| format!("initialize WRITE authority before migrating {faculty}"))?;
 
     let scope = faculty.scope();
     let before = materialize(pile, scope, &signer)
         .with_context(|| format!("materialize the current native {faculty} collection"))?;
 
-    let published = plan_and_publish(faculty, &source, pile, key)?;
+    let published = publish()?;
 
     let after = materialize(pile, scope, &signer)
         .with_context(|| format!("materialize the migrated native {faculty} collection"))?;
@@ -311,12 +326,13 @@ mod tests {
         );
         let pins_before = frozen.source.legacy_pins().to_vec();
 
-        plan_and_publish(
+        prepare(
             Faculty::Compass,
             &frozen.source,
             &pile_path,
             Some(&key_path),
         )
+        .unwrap()()
         .unwrap();
 
         let migrated = materialize(&pile_path, scope, &signer).unwrap();
@@ -332,12 +348,13 @@ mod tests {
         // And a second run publishes content-addressed commits that already
         // exist, so the file does not grow by a byte.
         let length = fs::metadata(&pile_path).unwrap().len();
-        plan_and_publish(
+        prepare(
             Faculty::Compass,
             &frozen.source,
             &pile_path,
             Some(&key_path),
         )
+        .unwrap()()
         .unwrap();
         assert_eq!(fs::metadata(&pile_path).unwrap().len(), length);
         assert_eq!(materialize(&pile_path, scope, &signer).unwrap(), migrated);
@@ -356,11 +373,17 @@ mod tests {
         let key_path = directory.path().join("empty.key");
         File::create(&pile_path).unwrap();
         initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let before = std::fs::metadata(&pile_path).unwrap().len();
 
         let error = migrate(Faculty::Compass, &pile_path, Some(&key_path)).unwrap_err();
         assert!(
             format!("{error:#}").contains("no legacy Compass branch"),
             "{error:#}"
+        );
+        assert_eq!(
+            std::fs::metadata(&pile_path).unwrap().len(),
+            before,
+            "a rejected source must not initialize authority or grow the pile"
         );
     }
 }

@@ -103,7 +103,10 @@ pub struct NodeIdentityReport {
 impl NodeIdentityReport {
     /// Nodes this pile attests that no Secrets identity names.
     pub fn unnamed_nodes(&self) -> usize {
-        self.nodes.iter().filter(|row| row.identity.is_none()).count()
+        self.nodes
+            .iter()
+            .filter(|row| row.identity.is_none())
+            .count()
     }
 }
 
@@ -118,8 +121,8 @@ fn read_secrets(pile: &mut Pile, signer: &ed25519_dalek::SigningKey) -> Result<S
         .materialize()
         .context("materialize Secrets collection")?;
     let reader = pile.reader().context("open Secrets attachment reader")?;
-    let catalog = secrets_model::validate_catalog(&reader, &facts)
-        .context("validate Secrets collection")?;
+    let catalog =
+        secrets_model::validate_catalog(&reader, &facts).context("validate Secrets collection")?;
     Ok(SecretsView {
         facts,
         reader,
@@ -162,8 +165,7 @@ fn report(pile: &mut Pile, signer: &ed25519_dalek::SigningKey) -> Result<NodeIde
 
     let mut nodes = Vec::new();
     for node in &observed {
-        let identity =
-            identity_by_public_key(&view.reader, &view.catalog, &node.public_key())?;
+        let identity = identity_by_public_key(&view.reader, &view.catalog, &node.public_key())?;
         let name = identity
             .map(|id| entity_name(&view.reader, &view.catalog, id))
             .transpose()?;
@@ -217,6 +219,8 @@ fn report(pile: &mut Pile, signer: &ed25519_dalek::SigningKey) -> Result<NodeIde
 
 /// Work out what binding this node would change, without writing.
 pub fn plan(pile: &Path, key: Option<&Path>) -> Result<NodeIdentityReport> {
+    crate::write_authority::require_initialized(pile, key)
+        .context("node-identity planning requires initialized WRITE authority")?;
     let signer = load_signer(pile, key)
         .context("naming this node's key needs the durable signing key beside the pile")?;
     let mut store = open_pile_strict(pile)?;
@@ -233,6 +237,8 @@ pub fn plan(pile: &Path, key: Option<&Path>) -> Result<NodeIdentityReport> {
 pub fn publish(pile: &Path, key: Option<&Path>, nickname: &str) -> Result<NodeIdentityReport> {
     let signer = load_signer(pile, key)
         .context("naming this node's key needs the durable signing key beside the pile")?;
+    crate::write_authority::publish(pile, key)
+        .context("initialize WRITE authority before inspecting the node identity")?;
     let before = plan(pile, key)?;
     if before.bound.is_some() {
         return Ok(before);
@@ -242,8 +248,7 @@ pub fn publish(pile: &Path, key: Option<&Path>, nickname: &str) -> Result<NodeId
     let mut collection = open_scope(store, DEFAULT_SCOPE_ID, signer.clone());
     let result: Result<()> = (|| {
         let view = read_secrets(collection.storage_mut(), &signer)?;
-        let prepared =
-            prepare_node_identity(nickname, &signer.verifying_key().to_bytes(), now()?)?;
+        let prepared = prepare_node_identity(nickname, &signer.verifying_key().to_bytes(), now()?)?;
         let mut fragment = prepared.fragment;
         validate_candidate(&view.reader, &view.facts, &fragment)
             .context("validate the node identity against the whole collection")?;
@@ -255,7 +260,10 @@ pub fn publish(pile: &Path, key: Option<&Path>, nickname: &str) -> Result<NodeId
             .context("commit the node identity")?;
         Ok(())
     })();
-    let closed = collection.into_storage().close().map_err(anyhow::Error::from);
+    let closed = collection
+        .into_storage()
+        .close()
+        .map_err(anyhow::Error::from);
     result?;
     closed?;
 
@@ -286,6 +294,7 @@ mod tests {
             let pile = directory.path().join("test.pile");
             File::create(&pile).unwrap();
             let signer = initialize_signer(&pile, None).unwrap();
+            crate::write_authority::publish(&pile, None).unwrap();
 
             let store = open_pile_strict(&pile).unwrap();
             let mut collection = open_scope(store, DEFAULT_SCOPE_ID, signer.clone());

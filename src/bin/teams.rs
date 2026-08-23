@@ -27,11 +27,11 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, 
 use triblespace::prelude::*;
 
 use faculties::files as file_capability;
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::archive::{archive, RawBytes};
 use faculties::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
 use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
 use faculties::teams as teams_core;
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
@@ -887,7 +887,9 @@ fn exact_secret_id(catalog: &SecretsCatalog, value: &str, label: &str) -> Result
 fn secrets_identity(session: &TeamsSession<'_>, explicit: Option<&str>) -> Result<Id> {
     let selector = match explicit {
         Some(selector) => Some(selector.to_owned()),
-        None => std::env::var("PERSONA").ok().filter(|value| !value.is_empty()),
+        None => std::env::var("PERSONA")
+            .ok()
+            .filter(|value| !value.is_empty()),
     };
     faculties::secrets_node::acting_identity(
         &session.secrets_reader,
@@ -3785,7 +3787,10 @@ mod tests {
             let pile = dir.join("test.pile");
             fs::File::create(&pile).unwrap();
             let key = dir.join("test.key");
-            initialize_signer(&pile, Some(&key)).unwrap();
+            let signer = initialize_signer(&pile, Some(&key)).unwrap();
+            let mut store = open_pile_strict(&pile).unwrap();
+            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+            store.close().unwrap();
             Self { dir, pile, key }
         }
 
@@ -3884,13 +3889,21 @@ mod tests {
         let scope = scope_fragment.root().unwrap();
         let mut initialization = identity.fragment;
         initialization += scope_fragment;
-        faculties::collection_names::open(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
-            .commit(initialization)
-            .unwrap();
+        faculties::collection_names::open(
+            &mut pile,
+            secrets_schema::DEFAULT_SCOPE_ID,
+            signer.clone(),
+        )
+        .commit(initialization)
+        .unwrap();
 
-        let facts = faculties::collection_names::open(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
-            .materialize()
-            .unwrap();
+        let facts = faculties::collection_names::open(
+            &mut pile,
+            secrets_schema::DEFAULT_SCOPE_ID,
+            signer.clone(),
+        )
+        .materialize()
+        .unwrap();
         let reader = pile.reader().unwrap();
         let catalog = secrets_model::validate_catalog(&reader, &facts).unwrap();
         let client = secrets_model::seal_version(

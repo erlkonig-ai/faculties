@@ -20,7 +20,7 @@ use triblespace::core::trible::TribleSet;
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
 
-use crate::storage::{load_signer, open_pile_strict};
+use crate::legacy_hint::open_scope;
 use crate::schemas::atlas::DEFAULT_SCOPE_ID as ATLAS_SCOPE_ID;
 use crate::schemas::blockdag::DEFAULT_SCOPE_ID as ARCHIVE_SCOPE_ID;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID as COGNITION_SCOPE_ID;
@@ -38,7 +38,7 @@ use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::schema::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
-use crate::legacy_hint::open_scope;
+use crate::storage::{load_signer, open_pile_strict};
 
 /// Stable logical input requested by a widget.
 ///
@@ -552,10 +552,11 @@ fn load_catalog(
                 // Written out rather than reached for: core deliberately offers
                 // no helper for hashing a descriptor it did not store. This one
                 // is a display key for the loaded view, never published under.
-                let collection_id = triblespace::core::blob::IntoBlob::<
-                    triblespace::core::blob::encodings::simplearchive::SimpleArchive,
-                >::to_blob(collection.descriptor().facts().clone())
-                .get_handle();
+                let collection_id =
+                    triblespace::core::blob::IntoBlob::<
+                        triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+                    >::to_blob(collection.descriptor().facts().clone())
+                    .get_handle();
                 let facts = collection
                     .materialize()
                     .map_err(|error| format!("materialize {label} collection: {error}"))?;
@@ -764,9 +765,11 @@ mod tests {
     use triblespace::macros::{entity, find, pattern};
     use triblespace::prelude::*;
 
+    use crate::test_support::initialize_team_of_one_write_fixture;
+
     fn create_pile(path: &Path) {
         File::create(path).unwrap();
-        crate::storage::initialize_signer(path, None).unwrap();
+        initialize_team_of_one_write_fixture(path, None);
     }
 
     fn publish_reason(path: &Path, text: &str, second: f64) {

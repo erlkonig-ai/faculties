@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
-use faculties::storage::{load_signer, open_pile_strict};
 use faculties::headspace;
+use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use faculties::secrets::{self as secrets_model, schema as secrets_schema};
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -20,7 +21,6 @@ use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Provider {
@@ -687,7 +687,9 @@ mod tests {
     use triblespace::macros::{find, pattern};
 
     use super::*;
-    use faculties::storage::initialize_signer;
+    use faculties::storage::{
+        ensure_team_of_one_write_authority, initialize_signer, open_pile_strict,
+    };
 
     #[test]
     fn cli_exposes_one_fixed_collection_without_legacy_coordinates() {
@@ -782,7 +784,10 @@ mod tests {
         let pile_path = directory.path().join("web.pile");
         let key_path = directory.path().join("web.key");
         File::create(&pile_path).unwrap();
-        initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let signer = initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let mut store = open_pile_strict(&pile_path).unwrap();
+        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
+        store.close().unwrap();
 
         WebStorage {
             pile: &pile_path,

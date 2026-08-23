@@ -11,13 +11,13 @@ use std::collections::BTreeSet;
 
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::collection::reach;
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::exact_derived::{
     ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
 };
 use triblespace::core::collection::exact_target_compaction::compact_exact_target;
+use triblespace::core::collection::reach;
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
 use triblespace::core::collection::{
     descriptor as descriptor_facts, simplearchive_union, Collection, CollectionCommit,
@@ -26,7 +26,7 @@ use triblespace::core::collection::{
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
-use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
@@ -34,9 +34,10 @@ use triblespace_search::tokens::{hash_tokens, WordHash};
 
 use crate::archive_bm25;
 use crate::blockdag::{self, CatalogValidation};
-use crate::storage::{load_signer, open_pile_strict};
 use crate::schemas::{blockdag as schema, files as files_schema};
+use crate::storage::{load_signer, open_pile_strict};
 
+use crate::legacy_hint::open_scope;
 #[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 #[cfg(test)]
@@ -45,7 +46,6 @@ use triblespace::core::collection::{
 };
 #[cfg(test)]
 use triblespace::core::repo::BlobStoreMeta;
-use crate::legacy_hint::open_scope;
 
 type TextHandle = Inline<Handle<UTF8String>>;
 type RawHandle = Inline<Handle<RawBytes>>;
@@ -513,8 +513,7 @@ impl ExactDerivedAlgebra<SimpleArchive, PortableBM25Blob> for ArchiveBm25Algebra
         source: &Blob<SimpleArchive>,
     ) -> std::result::Result<(), ExactAlgebraError> {
         if descriptor.facts()
-            != crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, self.team)
-                .facts()
+            != crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, self.team).facts()
         {
             return Err(ExactAlgebraError::Fatal(
                 "source descriptor does not match the Archive collection".to_owned(),
@@ -1392,8 +1391,23 @@ mod tests {
             .get_handle()
     }
 
+    /// Initialize the team-of-one fixture and explicitly authorize its Archive root.
+    fn initialize_archive_fixture(pile: &std::path::Path, key: &std::path::Path) -> SigningKey {
+        let signer = initialize_signer(pile, Some(key)).unwrap();
+        let team = signer.verifying_key();
+        let resource = collection_of(&crate::collection_names::root_descriptor(
+            schema::DEFAULT_SCOPE_ID,
+            team,
+        ));
+        let mut store = open_pile_strict(pile).unwrap();
+        grant_collection_write_authority(&mut store, resource, &signer);
+        store.close().unwrap();
+        signer
+    }
+
     use super::*;
     use crate::storage::initialize_signer;
+    use crate::test_support::grant_collection_write_authority;
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use tempfile::TempDir;
@@ -1500,7 +1514,7 @@ mod tests {
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile, &key);
 
         let fragment = projection("session:staged", "resident only after commit");
         let embedded = first_embedded_handle(&fragment);
@@ -1539,7 +1553,7 @@ mod tests {
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile, &key);
 
         let invalid_id = Id::new([0x42; 16]).unwrap();
         let mut invalid = entity! { ExclusiveId::force_ref(&invalid_id) @
@@ -1576,7 +1590,7 @@ mod tests {
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile, &key);
 
         // Establish the canonical queryable vocabulary so the forged-fragment
         // attempt is the only candidate work in the writer under test.
@@ -1615,7 +1629,7 @@ mod tests {
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile, &key);
 
         let fragment = projection("session:one", "one");
         let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
@@ -1642,7 +1656,7 @@ mod tests {
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile, &key);
 
         let source = b"opaque telemetry and encrypted reasoning\n";
         let chunks = blockdag::source_chunk(0, Bytes::from_source(source.to_vec())).unwrap();
@@ -1695,7 +1709,7 @@ mod tests {
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile, &key);
 
         let first_fragment = projection("session:one", "shared");
         let first_len = first_fragment.facts().len();
@@ -1731,7 +1745,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
 
         let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
         assert_eq!(
@@ -1754,7 +1768,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
 
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
         let pile = open_pile_strict(&pile_path).unwrap();
@@ -1799,7 +1813,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
 
         let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer
@@ -1822,9 +1836,7 @@ mod tests {
         let derive = records
             .derives()
             .iter()
-            .find(|derive| {
-                derive.target() == report.target_collection
-            })
+            .find(|derive| derive.target() == report.target_collection)
             .copied()
             .expect("stored Archive raw-Succinct DERIVE");
         let reader = pile.reader().unwrap();
@@ -1839,7 +1851,10 @@ mod tests {
         let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, team);
         succinctarchive_union::validate_derive(
             &source,
-            &succinctarchive_union::descriptor(archive_bm25::source_collection(team), reach::private()),
+            &succinctarchive_union::descriptor(
+                archive_bm25::source_collection(team),
+                reach::private(),
+            ),
             &derive,
             &input,
             &output,
@@ -1854,7 +1869,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
 
         for (locator, text) in [("session:alpha", "alpha"), ("session:beta", "beta")] {
             let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
@@ -1914,7 +1929,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
 
         for (locator, seconds) in [("session:first", 1.0), ("session:second", 2.0)] {
             let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
@@ -1938,7 +1953,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
 
         let first_fragment = projection("session:first", "alpha");
         let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
@@ -1974,7 +1989,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
 
         // The collection union is a valid Archive, but the tagged block and
         // its part/fact closure live in separate signed elements. With no
@@ -2015,7 +2030,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
 
         let (block_element, remainder_element) =
             projection_split_across_source_elements("session:routed", "routed needle");
@@ -2041,8 +2056,7 @@ mod tests {
         let output = archive_bm25::derive_element(&reader, union.clone()).unwrap();
         let input_data = Handle::<SimpleArchive>::to_hash(union.get_handle());
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let derive =
-            CollectionDerive::new(collection_of(&target), input_data, output_data);
+        let derive = CollectionDerive::new(collection_of(&target), input_data, output_data);
         let algebra = ArchiveBm25Algebra {
             reader,
             team: test_team(&pile_path, &key),
@@ -2080,7 +2094,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
 
         let first = commit_projection(&pile_path, &key, "session:frozen", "frozen needle");
         let frozen =
@@ -2115,7 +2129,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
         commit_projection(&pile_path, &key, "session:first", "first residual");
         commit_projection(&pile_path, &key, "session:second", "second residual");
         let archive =
@@ -2184,7 +2198,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
         let first = commit_projection(&pile_path, &key, "session:shared", "shared data");
         let source = test_source(&pile_path, &key);
         let target = test_target(&pile_path, &key);
@@ -2211,9 +2225,7 @@ mod tests {
             records
                 .derives()
                 .iter()
-                .filter(|claim| {
-                    claim.target() == collection_of(&target)
-                })
+                .filter(|claim| { claim.target() == collection_of(&target) })
                 .count(),
             1,
         );
@@ -2226,7 +2238,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
         let commit = commit_projection(&pile_path, &key, "session:pending", "recover output");
         let source = test_source(&pile_path, &key);
         let target = test_target(&pile_path, &key);
@@ -2238,8 +2250,7 @@ mod tests {
             .unwrap();
         let output = archive_bm25::derive_element(&reader, input).unwrap();
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let pending =
-            CollectionDerive::new(collection_of(&target), commit.data(), output_data);
+        let pending = CollectionDerive::new(collection_of(&target), commit.data(), output_data);
         drop(output);
         drop(reader);
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(pending)).unwrap();
@@ -2284,7 +2295,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        let signer = initialize_signer(&pile_path, Some(&key)).unwrap();
+        let signer = initialize_archive_fixture(&pile_path, &key);
         let source = test_source(&pile_path, &key);
         let target = test_target(&pile_path, &key);
 
@@ -2311,8 +2322,7 @@ mod tests {
             .unwrap();
         let output = archive_bm25::derive_element(&reader, input).unwrap();
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let derive =
-            CollectionDerive::new(collection_of(&target), commit.data(), output_data);
+        let derive = CollectionDerive::new(collection_of(&target), commit.data(), output_data);
         drop(reader);
         pile.put::<PortableBM25Blob, _>(output).unwrap();
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(derive)).unwrap();
@@ -2349,7 +2359,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_signer(&pile_path, Some(&key)).unwrap();
+        initialize_archive_fixture(&pile_path, &key);
         let existing = commit_projection(&pile_path, &key, "session:existing", "existing data");
         let source = test_source(&pile_path, &key);
         let target = test_target(&pile_path, &key);
