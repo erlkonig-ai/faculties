@@ -9,7 +9,7 @@ use faculties::headspace;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
-use faculties::secrets::{self as secrets_model, schema as secrets_schema};
+use faculties::secrets::v2::storage as vaults;
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use reqwest::blocking::Client;
@@ -38,9 +38,6 @@ struct Cli {
     /// Existing durable collection signer. Ordinary commands never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
-    /// Secrets identity used to decrypt exact Headspace credential versions.
-    #[arg(long, env = "SECRETS_IDENTITY")]
-    secrets_identity: Option<String>,
     /// Override the exact Tavily credential referenced by Headspace. Use
     /// @path for file input or @- for stdin.
     #[arg(long)]
@@ -99,7 +96,6 @@ fn run(cli: Cli) -> Result<()> {
     let storage = WebStorage {
         pile: &cli.pile,
         key: cli.key.as_deref(),
-        secrets_identity: cli.secrets_identity.as_deref(),
     };
     let requested_provider = match cmd {
         Command::Search { provider, .. } | Command::Fetch { provider, .. } => *provider,
@@ -268,7 +264,6 @@ fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider>
 struct WebStorage<'a> {
     pile: &'a Path,
     key: Option<&'a Path>,
-    secrets_identity: Option<&'a str>,
 }
 
 struct CollectionView {
@@ -299,19 +294,13 @@ impl WebStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let secrets = self.materialize(
-                &mut pile,
-                &signer,
-                secrets_schema::DEFAULT_SCOPE_ID,
-                "Secrets",
-            )?;
-            let secrets_catalog = secrets_model::validate_catalog(&secrets.reader, &secrets.facts)
-                .context("validate Secrets collection")?;
+            let secrets = vaults::discover_local_vaults(&mut pile, &signer)
+                .context("discover readable Secrets vaults")?;
             let headspace =
                 self.materialize(&mut pile, &signer, HEADSPACE_SCOPE_ID, "Headspace")?;
             let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
                 .context("validate Headspace collection")?;
-            headspace::validate_secret_references(&catalog, &secrets_catalog)
+            headspace::validate_secret_references_v2(&catalog, secrets.snapshot())
                 .context("validate exact Headspace credential references")?;
             let (config, _) = headspace::settled_active(&catalog)
                 .context("resolve active Headspace configuration")?;
@@ -319,33 +308,7 @@ impl WebStorage<'_> {
                 return Ok(ApiKeys::default());
             }
 
-            let selector = self
-                .secrets_identity
-                .map(str::to_owned)
-                .or_else(|| std::env::var("PERSONA").ok())
-                .filter(|value| !value.is_empty());
-            let identity = faculties::secrets_node::acting_identity(
-                &secrets.reader,
-                &secrets_catalog,
-                &signer,
-                selector.as_deref(),
-            )
-            .context(
-                "set --secrets-identity/SECRETS_IDENTITY (or PERSONA) to decrypt Web credentials",
-            )?;
-            let identity_secret = faculties::secrets_node::identity_secret(
-                &secrets_catalog,
-                identity,
-                &signer,
-                "unlock the selected Secrets identity",
-            )?;
-            let opened = headspace::open_active_secrets(
-                &catalog,
-                &secrets.reader,
-                &secrets_catalog,
-                identity,
-                &identity_secret,
-            )?;
+            let opened = headspace::open_active_secrets(&catalog, secrets.snapshot(), &signer)?;
             Ok(ApiKeys {
                 tavily: opened.tavily_api_key,
                 exa: opened.exa_api_key,
@@ -700,7 +663,7 @@ mod tests {
             .map(|argument| argument.get_id().as_str().to_owned())
             .collect::<std::collections::BTreeSet<_>>();
         assert!(arguments.contains("key"));
-        assert!(arguments.contains("secrets_identity"));
+        assert!(!arguments.contains("secrets_identity"));
         assert!(!arguments.contains("branch_id"));
         assert!(!arguments.contains("scope"));
     }
@@ -711,7 +674,6 @@ mod tests {
         let cli = Cli {
             pile: missing.clone(),
             key: None,
-            secrets_identity: None,
             tavily_api_key: Some(" explicit-tavily-key ".to_owned()),
             exa_api_key: None,
             no_store: true,
@@ -722,7 +684,6 @@ mod tests {
             WebStorage {
                 pile: &missing,
                 key: None,
-                secrets_identity: None,
             },
             Provider::Tavily,
         )
@@ -792,7 +753,6 @@ mod tests {
         WebStorage {
             pile: &pile_path,
             key: Some(&key_path),
-            secrets_identity: None,
         }
         .store(
             fetch_fragment(Provider::Exa, "https://example.test", "body"),
