@@ -86,7 +86,7 @@ fragments by id and title. The set covers two shapes:
 *Specific faculties* — read when you reach for one:
 
   - [Files Faculty: Archiving and Citing Artefacts](wiki:b08448855de9cce7610d68dac2555003)
-  - [Teams: Capability-Based Membership](wiki:67477d2173928fd91ef20173eabfeae4)
+  - [Teams: Positive Authority and CONNECT](wiki:67477d2173928fd91ef20173eabfeae4)
   - [Local Messages: Agent-to-Agent Direct Messaging](wiki:65c6965cb3d11052e87804527734a697)
   - [Orient: The Situation-Snapshot Faculty](wiki:ff27b500d93e1d545b7465438a0146e1)
   - [Relations: People and Handle Mappings](wiki:e7e3f672a66b39e0b5b3c0eaf212b1da)
@@ -105,8 +105,7 @@ fragments by id and title. The set covers two shapes:
     Codex, Antigravity); models have no internal clock, so
     coordination is hook-enforced, not remembered
   - [Recipe: Auth Setup for a Multi-Agent Team](wiki:d06247b9d9183721e47a2940806e5d7f) — `trible
-    team` + `pile net` capability auth for the current legacy-head/blob
-    transport; native collection-record transport remains unfinished
+    team` + `pile net` positive CONNECT authority and native collection sync
 
 *Substrate concepts* — the in-depth "why does this work"
 layer. Not needed for day-one productivity; read when you

@@ -76,7 +76,7 @@ const WIKI_SEED: &[WikiSeed] = &[
     },
     WikiSeed {
         anchor: id_hex!("67477D2173928FD91EF20173EABFEAE4"),
-        title: "Teams: Capability-Based Membership",
+        title: "Teams: Positive Authority and CONNECT",
         content: include_str!("../bootstrap/09_teams_faculty.typ"),
         tags: &["bootstrap", "onboarding", "teams", "auth"],
     },

@@ -1,125 +1,111 @@
 = Recipe: Auth Setup for a Multi-Agent Team
 
-How to bootstrap capability auth for the current legacy-head/blob network
-transport without exposing it to anyone else. This is useful infrastructure,
-but it does not yet transport native collection records. The recipe chains
-`trible team`, `trible pile net`, and the env-var configuration the relay reads.
-
-== Why a recipe
-
-Per-faculty docs cover `team create`, `team invite`, etc. in
-isolation. This recipe shows the *order of operations* across
-two machines (founder + invitee) so the handoff doesn't drop
-mid-stream — one missing env var on the relay side and every
-connection silently rejects.
+This recipe bootstraps one team's positive CONNECT authority across two
+machines. The founder publishes a root grant, issues one exact child grant,
+and exports a portable proof bundle. The invitee verifies and imports that
+bundle before native collection synchronization begins. No ambient policy
+database, environment variables, or pre-auth proof fetch is involved.
 
 == The recipe — founder bootstraps, invites one teammate
 
 ```sh
 # === Founder, on machine A ===
 
-# 1. Create the team. ARCHIVE the SECRET line offline before
-#    moving past this prompt.
-trible team create --pile shared.pile --key founder.key
-# → team root pubkey:  d5263a4d...
-# → team root SECRET:  <archive offline; never commit>
-# → founder cap (sig): 4e6e02d5...
-# → expires: 2026-05-28 ...
+# 1. Create the pile and team. Archive the printed root secret offline.
+trible pile create founder.pile
+trible team create --pile founder.pile --key founder.key
+# → team root pubkey: <team-root>
+# → team root SECRET: <archive offline; never commit>
+# → founder grant:    <founder-grant>
+trible pile net identity --key founder.key
+# → node: <founder-node-id>
 
-# 2. Tell the invitee to print their iroh identity:
-#      ssh invitee@machine-b "trible pile net identity --key node.key"
-# → node: c726b586...
+# 2. Invitee creates its local pile and transport key, then sends only the
+#    public identity to the founder.
+trible pile create invitee.pile
+trible pile net identity --key invitee.key
+# → node: <invitee-public-key>
 
-# 3. Issue the invitee's cap.
+# 3. Founder issues a CONNECT child and writes its complete public proof.
 trible team invite \
-  --pile shared.pile \
-  --team-root d5263a4d... \
-  --cap 4e6e02d5... \
+  --pile founder.pile \
+  --team-root <team-root> \
+  --parent <founder-grant> \
   --key founder.key \
-  --invitee c726b586... \
-  --scope read
-# → issued cap (sig): f0f6f41e...
+  --invitee <invitee-public-key> \
+  --out invitee.invite
+# → issued grant:  <invitee-grant>
+# → invite bundle: invitee.invite
 
-# 4. Send the public (team_root, issued_cap_sig) coordinates to the invitee,
-#    AND deliver the issued cap blob plus its complete ancestor closure. A
-#    running issuer daemon pushes that closure to the invitee daemon through
-#    OP_DELIVER_CAP. For an offline first handoff, transfer and import a pile
-#    snapshot containing it. The handle alone cannot authorize a connection.
+# 4. Transfer invitee.invite through any ordinary file channel.
 
 # === Invitee, on machine B ===
 
-# 5. Set the env vars and verify what they'll present:
-export TRIBLE_TEAM_ROOT=d5263a4d...
-export TRIBLE_TEAM_CAP=f0f6f41e...
-trible pile net status --key node.key
-# → node:      c726b586...
-# → team_root: d5263a4d...  (from TRIBLE_TEAM_ROOT)
-# → self_cap:  f0f6f41e...  (from TRIBLE_TEAM_CAP)
+# 5. Verify the proof against the local key and import its descriptor, grant
+#    archives, and signed COMMITs. Repeating this command is harmless.
+trible team join \
+  --pile invitee.pile \
+  --key invitee.key \
+  --invite invitee.invite
+# → team root:      <team-root>
+# → accepted grant: <invitee-grant>
 
-# 6. Rehearse the auth handshake locally before connecting. This succeeds only
-#    after step 4 put the cap blob and complete ancestor closure in this pile.
-trible team show --pile shared.pile --cap "$TRIBLE_TEAM_CAP" \
-  --verify "$TRIBLE_TEAM_ROOT"
-# → ✓ VERIFIED  ←  matches what the relay would report at OP_AUTH
+# 6. Rehearse the exact claim the transport will authenticate.
+trible pile net status invitee.pile \
+  --key invitee.key \
+  --team-root <team-root> \
+  --grant <invitee-grant>
 
-# 7. Connect to the relay (founder). This command currently syncs the legacy
-#    head/blob protocol; transport for native collection records remains a
-#    separate integration boundary.
-#    The gossip mesh
-#    is identified by the team root pubkey (no separate topic
-#    flag) — once `TRIBLE_TEAM_ROOT` is set, both peers join
-#    the same mesh automatically.
-trible pile net sync ./local.pile \
-  --peers <founder-iroh-node-id> \
-  --key node.key
+# 7. Connect and exchange native collection evidence. Referenced content stays
+#    lazy; durable WANTs drive blob, merge-receipt, and derive-receipt fetching.
+trible pile net sync invitee.pile \
+  --peers <founder-node-id> \
+  --key invitee.key \
+  --team-root <team-root> \
+  --grant <invitee-grant>
 ```
+
+The founder must start `pile net sync founder.pile` with the founder key, team
+root, and founder grant; no `--peers` argument is needed when the invitee is
+dialing it. Add `--delegate` while issuing the invite only if the invitee should
+be able to issue further child CONNECT grants. Sync runs until interrupted
+unless `--duration` or `--quiescent-for` sets a bounded stopping policy.
 
 == Why each step
 
-  - *team create first, before anything else*: the team root
-    SECRET is generated here and you can't recover it. Archive
-    BEFORE proceeding.
-  - *Identity exchange via plain text*: pubkeys and cap handles
-    are not secrets. Don't paranoid-encrypt them; do paranoid-
-    encrypt the team root SECRET. A handle is only a coordinate, however; the
-    invitee must also receive the referenced cap and ancestor blobs.
-  - *pile net status before sync*: the diagnostic confirms
-    what would be presented on `OP_AUTH`. Catches "I forgot to
-    `export`" before it produces "connection refused" with no
-    further info.
-  - *team show --verify as rehearsal*: the relay enforces auth
-    at `OP_AUTH` time. `team show --verify` runs the same
-    `verify_chain` locally so you see the result without
-    needing to debug a network round-trip.
-  - *gossip mesh = team root*: the gossip mesh is identified by
-    the team root pubkey directly. One identifier per team
-    handles both auth (cap chain verification) and rendezvous
-    (gossip topic) — there's no way to "join the right team but
-    the wrong gossip channel" because they're the same channel.
+  - *Archive the team-root secret*: it is shown once and deliberately not
+    persisted. Anyone holding it can publish an independent root grant.
+  - *Exchange the invitee's public key*: public keys and invite bundles are not
+    secrets. The invite remains usable only by the private key named at its
+    leaf.
+  - *Transfer one bundle*: it contains the complete bounded root-to-leaf proof,
+    so first contact does not need a pre-auth network exception or an ambient
+    proof store.
+  - *Join before status*: `join` verifies the claim and imports the same
+    immutable evidence that `status` and `sync` later resolve locally.
+  - *Pass root and grant explicitly*: the transport never guesses a team or
+    credential from environment variables or mutable process state.
+  - *Keep gossip distinct from authority*: the team root identifies the gossip
+    topic, while collection descriptors decide what may be relayed and each
+    collection resolver decides which authors have semantic `WRITE` authority.
+    A CONNECT proof grants neither.
 
-== Ending a teammate's renewal
+== Removing access
 
-```sh
-# Find the local renewal-policy entry created when the capability was issued or approved.
-trible team list-issued --pile shared.pile
-
-# Stop renewing that exact (subject, scope) grant.
-trible team retract --pile shared.pile --entry <renewal-entry-id>
-```
-
-Capabilities are deliberately short-lived. Retraction is a local policy
-decision observed by the daemon on its next tick; the existing signed chain
-expires naturally. It does not claim that a monotonic fact already observed by
-another node can be globally revoked or erased.
+There is no renewal or retraction command. Positive grants are grow-only, so
+ending durable access requires a successor team, collection, or key epoch and
+an admission boundary that stops serving the old epoch. Simply issuing a new
+grant under the old team does not invalidate an already accepted proof.
 
 == Cross-references
 
-  - "Teams: Capability-Based Membership" — per-command
-    detail and the env-var fallback semantics
-  - "Recipe: Multi-Agent Coordination" — how agents sharing one
-    natively populated pile perform a hand-off; the current network command
-    does not yet transport those collection records
-  - The `triblespace-rs/book/src/capability-auth.md` chapter
-    has the complete protocol-level reference
+  - [Teams: Positive Authority and CONNECT](wiki:67477d2173928fd91ef20173eabfeae4)
+    — the command surface and authority semantics
+  - [Recipe: Multi-Agent Coordination](wiki:45e1b9bef3ad9836536ab7bce367deb0)
+    — agent hand-offs once the substrate is connected
+  - `triblespace-rs/book/src/capability-auth.md` — complete authority and proof
+    reference
+  - `triblespace-rs/book/src/distributed-sync.md` — sparse gossip, direct RPC,
+    and durable WANT reconciliation
 
 Next stop: [Getting Started: Your First Hour (tour complete)](wiki:44d63d174814371c7468a3e604ed2303).

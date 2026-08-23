@@ -52,20 +52,23 @@ semantics live in the domain model; they are not ambient storage arbitration.
   - No coordinator, no leader election, no lock service.
   - Offline construction followed by deterministic convergence once the same
     authorized record and blob closure is present.
-  - The core algebra specifies which immutable records and blobs are required,
-    and can represent a permanent signed *collection-gossip grant* for
-    redistributing one author's COMMITs in one exact collection. This is not a
-    team capability. Faculties do not yet emit these grants and network
-    transport still needs to implement that surface.
-  - Trust per assertion, not per channel: COMMITs are signed, so
-    provenance survives any gossip path.
+  - Publication reach is part of the immutable collection descriptor. A peer
+    relays a COMMIT only when it can resolve that descriptor and recognizes its
+    declared reach law; a missing or unknown descriptor is a refusal.
+  - Gossip carries sparse signed evidence, not permission or automatic
+    replication. Referenced blobs remain lazy until local WANT policy asks for
+    them.
+  - Trust per assertion, not per channel: COMMITs are signed, so provenance
+    survives any gossip path. Semantic admission still applies exact positive
+    WRITE authority when materializing the collection view.
 
 == Further reading
 
 [Substrate 1/4: What Is a Trible](wiki:4e19893b36bf37d471bb9ea968edac20) and [Substrate 2/4: The Pile](wiki:5232ea531fedfcb17bf15e88c3d52a36) cover the building blocks. The query-language chapter
 of the `triblespace-rs` book covers monotone queries in
 depth; native collection publication binds each COMMIT to an exact descriptor
-and author key, while redistribution permission is a separate signed
-collection-gossip grant.
+and author key. The descriptor's reach law governs redistribution, while the
+collection's authority observation governs which authors contribute to its
+semantic value.
 
 Next stop: [Substrate 4/4: The Architecture — Zero Sync Code](wiki:6e5f38bdfd589cd0359bf668d1af9841).

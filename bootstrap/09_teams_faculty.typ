@@ -1,94 +1,97 @@
-= Teams: Capability-Based Membership
+= Teams: Positive Authority and CONNECT
 
-For multi-agent setups where each agent runs its own pile and
-syncs through a relay, capabilities are how the relay decides
-who's allowed to read or write. The team CLI lives at
-`trible team` (not as a `.rs` faculty — it ships with the
-trible CLI itself, since auth setup is pile-specific).
+For multi-agent setups where each agent runs its own pile, one public,
+grow-only authority collection records who may connect and who may contribute
+to exact collections. Every grant is an ordinary signed `CollectionCommit`:
+the signer is the issuer, the subject is one public key, and the grant names
+one exact action and resource. The team CLI lives at `trible team` because the
+authority model is part of TribleSpace rather than one faculty.
+
+`CONNECT`, collection `WRITE`, and a Secrets vault's `READ` are independent
+actions interpreted by their consumers. None implies another. Gossip reach is
+also separate: it is an immutable property of a collection descriptor, not a
+team permission.
 
 == Quick lifecycle
 
 ```sh
 # Founder, on machine A:
-trible team create --pile shared.pile --key founder.key
-# Prints: team root pubkey, team root SECRET (archive offline),
-#         founder cap (sig) handle, expiry timestamp.
+trible pile create founder.pile
+trible team create --pile founder.pile --key founder.key
+# Prints: team root pubkey, team root SECRET, founder grant.
+# Store the root secret offline; it is not written to the pile or key file.
+trible pile net identity --key founder.key
+# Prints: node: <founder-node-id>
 
-# Invitee, on machine B:
+# Invitee, on machine B, creates or loads its transport key:
+trible pile create invitee.pile
 trible pile net identity --key invitee.key
-# Prints: node: <invitee-pubkey>
+# Prints: node: <invitee-public-key>
 
-# Founder issues invitee's cap:
-trible team invite --pile shared.pile \
-  --team-root <pubkey> --cap <founder-sig> \
-  --key founder.key \
-  --invitee <invitee-pubkey> --scope read
+# Founder issues a child CONNECT grant and packages its complete proof:
+trible team invite --pile founder.pile \
+  --team-root <team-root> --parent <founder-grant> \
+  --key founder.key --invitee <invitee-public-key> \
+  --out invitee.invite
 
-# Make the issued capability blob and its ancestor closure available to the
-# invitee. A running issuer daemon pushes them to the invitee daemon through
-# `OP_DELIVER_CAP`; for an offline handoff, transfer and import a pile snapshot
-# that contains that closure. The printed handle alone is not the capability.
+# Transfer invitee.invite through any ordinary file channel. The invitee
+# verifies the exact claim and idempotently imports the proof evidence:
+trible team join --pile invitee.pile \
+  --key invitee.key --invite invitee.invite
 
-# Invitee connects to the current legacy-head/blob sync transport with the
-# now-local issued cap as their credential. Native collection-record transport
-# is a separate integration boundary and is not claimed by this command yet.
-TRIBLE_TEAM_ROOT=<pubkey> TRIBLE_TEAM_CAP=<issued-sig> \
-trible pile net sync ./self.pile \
+# Inspect the exact grant before connecting:
+trible pile net status invitee.pile \
+  --key invitee.key --team-root <team-root> --grant <invitee-grant>
+
+# Audit accepted grants and inert candidate diagnostics:
+trible team list --pile invitee.pile --team-root <team-root>
+trible team show --pile invitee.pile \
+  --team-root <team-root> --grant <invitee-grant>
+
+# Sync native collection evidence and service durable WANTs:
+trible pile net sync invitee.pile \
+  --key invitee.key --team-root <team-root> --grant <invitee-grant> \
   --peers <founder-node-id>
-
-# Audit at any time:
-trible team list --pile shared.pile
-# Lists each stored cap (issuer → subject, scope, expiry) sorted by
-# soonest-to-expire first.
 ```
+
+`pile net sync` runs until interrupted unless you give it `--duration` or
+`--quiescent-for`. Start the founder side against `founder.pile` with the
+founder key, team root, and founder grant; it does not need a `--peers` argument
+when the invitee is dialing it.
+
+Pass `--delegate` to `team invite` only when the invitee should be able to
+issue attenuated child CONNECT grants. Without it, the child may connect but
+not delegate. An invite bundle is public and self-contained; possession does
+not confer authority because verification binds its leaf to the invitee's
+private-key-backed transport identity.
 
 == Diagnostics
 
-`trible pile net status --key <key>` prints what auth values
-the running peer would present on `OP_AUTH`:
+`trible pile net status` resolves the named grant from the named pile,
+reconstructs its root-to-leaf proof, and checks that the leaf invokes
+`CONNECT` for the supplied key on this team's exact authority collection. It
+uses the same claim shape as the network handshake. There is no environment-
+variable fallback, sentinel credential, implicit team-of-one network
+credential, or automatic key creation on this path.
 
-  - `node`: the iroh identity (your peer id)
-  - `team_root`: from `TRIBLE_TEAM_ROOT` env var, or single-user
-    fallback to your own pubkey
-  - `self_cap`: from `TRIBLE_TEAM_CAP` env var, or all-zeros
-    sentinel (which the relay rejects — that's the right signal
-    that you need to set the env var)
+The authority resolver reports malformed, incomplete, or unauthorized
+candidate grants without letting one bad occurrence suppress independently
+valid grants. This is useful when piles have learned sparse evidence in a
+different order.
 
-Use this when a connection is being rejected and you want to
-double-check what your side is presenting before debugging the
-relay.
+== Removal is an epoch change
 
-== Ending renewal
-
-Capabilities are short-lived. Issuing or approving one also creates a local
-renewal-policy entry; ending that policy lets the peer's capability chain
-expire naturally. There is no misleading global revoke assertion that
-promises to erase a capability another node has already observed.
-
-```sh
-trible team list-issued --pile shared.pile
-trible team retract --pile shared.pile --entry <renewal-entry-id>
-```
-
-The running daemon observes that local decision on its next tick and stops
-renewing the selected `(subject, scope)` grant. Existing signed caps remain
-valid only until their bounded expiry. Treat loss of an active signing key as a
-credential incident during that remaining window.
-
-== When NOT to use this
-
-  - Solo workflows — you're already a team-of-one. The single-user
-    fallback (`team_root = signing_key.verifying_key()`) means
-    nothing else needs to be set up.
-  - Read-only public mirrors — those don't need cap auth, they
-    just need anyone-can-read. Currently the protocol assumes
-    auth on every connection; "public mode" is its own design.
+Positive authority is monotone: an accepted grant does not expire or retract
+inside the same authority epoch. Durable removal therefore means moving the
+relevant team, collection, or key to a successor epoch and enforcing the new
+boundary. This cost is deliberate; it keeps proofs portable and makes pile
+concatenation ordinary set union instead of hidden last-writer arbitration.
 
 == Reference
 
   - User chapter: `triblespace-rs/book/src/capability-auth.md`
-  - Library: `triblespace_core::repo::capability` (with
-    runnable doctests on every primary public fn)
-  - Protocol: `triblespace_net::host::serve_stream`
+  - Library: `triblespace_core::authority`
+  - Transport: `triblespace_net::host` and
+    `triblespace-rs/book/src/distributed-sync.md`
 
 Next stop: [Relations: People and Handle Mappings](wiki:e7e3f672a66b39e0b5b3c0eaf212b1da).

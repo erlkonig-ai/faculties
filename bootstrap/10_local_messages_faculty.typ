@@ -22,10 +22,11 @@ read acknowledgements.
   - Long technical content — messages are conversational. If
     you're writing more than 5 lines, ask whether a fragment
     would serve better.
-  - Real-time chat. Message is an append-only same-pile ledger, and the current
-    `pile net sync` transport does not yet replicate native collection records.
-    Move or concatenate complete pile state through a deployment path that
-    understands those records before expecting messages on another node.
+  - Real-time chat. Message is an append-only ledger, and the current fixed
+    Faculty collection descriptors declare private reach. `pile net sync` can
+    transport native collection evidence, but correctly does not relay these
+    private Message COMMITs. Move or concatenate complete pile state through an
+    intended private deployment path before expecting messages on another node.
 
 == Usage
 
@@ -68,4 +69,4 @@ authors remain distinct immutable messages; exact retries converge.
   - "Tool Selection: Faculties First" — when to reach for
     message vs wiki vs compass
 
-Next stop: [Teams: Capability-Based Membership](wiki:67477d2173928fd91ef20173eabfeae4).
+Next stop: [Teams: Positive Authority and CONNECT](wiki:67477d2173928fd91ef20173eabfeae4).
