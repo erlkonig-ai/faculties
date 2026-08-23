@@ -11,12 +11,13 @@ use ed25519_dalek::SigningKey;
 use faculties::headspace::{self, Catalog, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
-use faculties::secrets::{self as secrets_model, schema as secrets_schema, SecretsCatalog};
+use faculties::secrets::v2::{self as secrets_model, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -32,9 +33,6 @@ struct Cli {
     /// Existing durable collection signer. Ordinary commands never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
-    /// Secrets identity used only when decrypting exact credential versions.
-    #[arg(long, env = "SECRETS_IDENTITY")]
-    secrets_identity: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -150,10 +148,10 @@ struct SecretSetArgs {
     /// Exact existing Secrets version. This repairs an interrupted Secrets-first update.
     #[arg(long, conflicts_with = "value", required_unless_present = "value")]
     version: Option<String>,
-    /// Secrets scope receiving a newly sealed value. An existing unique
-    /// reference defaults to its version's scope.
+    /// Exact vault epoch receiving a newly sealed value. An existing unique
+    /// reference defaults to its version's vault.
     #[arg(long, conflicts_with = "version")]
-    secret_scope: Option<String>,
+    vault: Option<String>,
 }
 
 struct CollectionView {
@@ -164,23 +162,17 @@ struct CollectionView {
 struct Views {
     headspace: CollectionView,
     catalog: Catalog,
-    secrets: CollectionView,
-    secrets_catalog: SecretsCatalog,
+    secrets: vaults::VaultDiscovery,
 }
 
 struct Storage<'a> {
     pile_path: &'a Path,
     pile: RefCell<Option<Pile>>,
     signer: SigningKey,
-    secrets_identity: Option<&'a str>,
 }
 
 impl Storage<'_> {
-    fn open<'a>(
-        pile_path: &'a Path,
-        key: Option<&Path>,
-        secrets_identity: Option<&'a str>,
-    ) -> Result<Storage<'a>> {
+    fn open<'a>(pile_path: &'a Path, key: Option<&Path>) -> Result<Storage<'a>> {
         // Authority is resolved before touching storage. A missing signer can
         // neither create a pile nor append a descriptor.
         let signer = load_signer(pile_path, key)?;
@@ -189,7 +181,6 @@ impl Storage<'_> {
             pile_path,
             pile: RefCell::new(Some(pile)),
             signer,
-            secrets_identity,
         })
     }
 
@@ -208,20 +199,46 @@ impl Storage<'_> {
     }
 
     fn views(&self) -> Result<Views> {
-        let secrets = self.materialize(secrets_schema::DEFAULT_SCOPE_ID, "Secrets")?;
-        let secrets_catalog = secrets_model::validate_catalog(&secrets.reader, &secrets.facts)
-            .context("validate Secrets collection")?;
+        let secrets = {
+            let mut pile = self.pile.borrow_mut();
+            let pile = pile
+                .as_mut()
+                .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
+            vaults::discover_local_vaults(pile, &self.signer)
+                .context("discover readable Secrets vaults")?
+        };
         let headspace = self.materialize(DEFAULT_SCOPE_ID, "Headspace")?;
         let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
             .context("validate Headspace collection")?;
-        headspace::validate_secret_references(&catalog, &secrets_catalog)
+        headspace::validate_secret_references_v2(&catalog, secrets.snapshot())
             .context("validate exact Headspace credential references")?;
         Ok(Views {
             headspace,
             catalog,
             secrets,
-            secrets_catalog,
         })
+    }
+
+    fn add_secret(&self, views: &Views, vault: Id, name: &str, plaintext: &[u8]) -> Result<Id> {
+        let location = views
+            .secrets
+            .location(vault)
+            .ok_or_else(|| anyhow!("vault {vault:x} is not ready for this signer"))?;
+        let mut pile = self.pile.borrow_mut();
+        let pile = pile
+            .as_mut()
+            .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
+        vaults::add_secret(
+            pile,
+            &self.signer,
+            location,
+            views.secrets.snapshot(),
+            name,
+            plaintext,
+            point_now()?,
+        )
+        .map(|(secret, _)| secret)
+        .context("seal and publish Headspace credential version")
     }
 
     fn publish(&self, scope: Id, mut fragment: Fragment, description: &str) -> Result<()> {
@@ -267,11 +284,7 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     };
 
-    let storage = Storage::open(
-        &cli.pile,
-        cli.key.as_deref(),
-        cli.secrets_identity.as_deref(),
-    )?;
+    let storage = Storage::open(&cli.pile, cli.key.as_deref())?;
     let result = dispatch(&storage, command);
     let close = storage.close();
     match (result, close) {
@@ -350,24 +363,29 @@ fn resolve_profile_selector(catalog: &Catalog, raw: &str) -> Result<Id> {
 fn parse_exact_secret(views: &Views, raw: &str, label: &str) -> Result<Id> {
     let id = Id::from_hex(raw.trim())
         .ok_or_else(|| anyhow!("{label} requires one exact 32-hex Secrets version id"))?;
-    if !views.secrets_catalog.secrets.contains_key(&id) {
+    if !views.secrets.snapshot().contains(id) {
         bail!("unknown exact Secrets version {id:x}");
     }
     Ok(id)
 }
 
-fn preflight_headspace(
-    views: &Views,
-    fragment: &Fragment,
-    secrets: &SecretsCatalog,
-) -> Result<Catalog> {
+fn parse_exact_vault(views: &Views, raw: &str) -> Result<Id> {
+    let vault = Id::from_hex(raw.trim())
+        .ok_or_else(|| anyhow!("--vault requires one exact 32-hex vault epoch id"))?;
+    if views.secrets.location(vault).is_none() {
+        bail!("vault {vault:x} is not ready for this signer");
+    }
+    Ok(vault)
+}
+
+fn preflight_headspace(views: &Views, fragment: &Fragment) -> Result<Catalog> {
     let candidate = headspace::validate_catalog_union(
         &views.headspace.reader,
         &views.headspace.facts,
         fragment,
     )
     .context("validate Headspace successor")?;
-    headspace::validate_secret_references(&candidate, secrets)
+    headspace::validate_secret_references_v2(&candidate, views.secrets.snapshot())
         .context("validate successor's exact Secrets references")?;
     Ok(candidate)
 }
@@ -378,7 +396,7 @@ fn publish_headspace(
     fragment: Fragment,
     description: &str,
 ) -> Result<()> {
-    preflight_headspace(views, &fragment, &views.secrets_catalog)?;
+    preflight_headspace(views, &fragment)?;
     storage.publish(DEFAULT_SCOPE_ID, fragment, description)
 }
 
@@ -587,7 +605,7 @@ fn secret_successor(
 }
 
 fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> Result<()> {
-    let mut views = storage.views()?;
+    let views = storage.views()?;
     let current = secret_successor(&views.catalog, role, None)?.current;
     let explicit = args
         .version
@@ -595,96 +613,69 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
         .map(|value| parse_exact_secret(&views, value, "--version"))
         .transpose()?;
 
-    let (secret, staged) = match (args.value.as_deref(), explicit) {
-        (None, Some(secret)) => (secret, None),
+    match (args.value.as_deref(), explicit) {
+        (None, Some(secret)) => {
+            if current == Some(secret) {
+                println!("{role:?} already references exact Secrets version {secret:x}");
+                return Ok(());
+            }
+            let successor = secret_successor(&views.catalog, role, Some(secret))?;
+            publish_headspace(
+                storage,
+                &views,
+                successor.fragment,
+                "headspace: exact credential reference",
+            )?;
+            println!("{role:?} credential version {secret:x}");
+            Ok(())
+        }
         (Some(raw), None) => {
-            let plaintext = faculties::text_arg(raw, "credential")?;
+            let plaintext = Zeroizing::new(faculties::text_arg(raw, "credential")?);
             let plaintext = plaintext.trim();
             if plaintext.is_empty() || plaintext.bytes().any(|byte| byte == 0) {
                 bail!("credential is empty or contains NUL");
             }
-            let scope = match args.secret_scope.as_deref() {
-                Some(selector) => secrets_model::resolve_scope(
-                    &views.secrets.reader,
-                    &views.secrets_catalog,
-                    selector,
-                )?,
+            let vault = match args.vault.as_deref() {
+                Some(selector) => parse_exact_vault(&views, selector)?,
                 None => current
-                    .and_then(|id| views.secrets_catalog.secrets.get(&id))
-                    .map(|row| row.scope)
+                    .and_then(|id| views.secrets.snapshot().lookup(id))
+                    .map(|(vault, _)| vault)
                     .ok_or_else(|| {
-                        anyhow!(
-                            "--secret-scope is required when the role has no unique predecessor version"
-                        )
+                        anyhow!("--vault is required when the role has no predecessor version")
                     })?,
             };
             let profile = headspace::settled_active(&views.catalog)?.0.active_profile;
-            let sealed = secrets_model::seal_version(
-                &views.secrets.reader,
-                &views.secrets_catalog,
-                scope,
+            let secret = storage.add_secret(
+                &views,
+                vault,
                 &secret_label(role, profile),
                 plaintext.as_bytes(),
-                point_now()?,
-            )
-            .context("seal Headspace credential version")?;
-            let secret = sealed.secret;
-            let candidate = secrets_model::validate_candidate(
-                &views.secrets.reader,
-                &views.secrets.facts,
-                &sealed.fragment,
-            )
-            .context("validate staged Headspace credential")?;
-            (secret, Some((sealed.fragment, candidate)))
+            )?;
+            eprintln!(
+                "Published exact credential {secret:x}; if Headspace publication is interrupted, retry with: headspace secret {} set --version {secret:x}",
+                role_name(role)
+            );
+
+            // Refresh through the same open pile before authoring the
+            // reference. Failure leaves a harmless orphan version, never a
+            // dangling Headspace snapshot.
+            drop(views);
+            let refreshed = storage.views()?;
+            if !refreshed.secrets.snapshot().contains(secret) {
+                bail!("published exact Secrets version {secret:x} did not materialize");
+            }
+            let successor = secret_successor(&refreshed.catalog, role, Some(secret))?;
+            publish_headspace(
+                storage,
+                &refreshed,
+                successor.fragment,
+                "headspace: exact credential reference",
+            )?;
+            println!("{role:?} credential version {secret:x}");
+            Ok(())
         }
         _ => unreachable!("clap requires exactly one of --value or --version"),
-    };
-
-    if current == Some(secret) && staged.is_none() {
-        println!("{role:?} already references exact Secrets version {secret:x}");
-        return Ok(());
     }
-
-    let successor = secret_successor(&views.catalog, role, Some(secret))?;
-    let candidate_secrets = staged
-        .as_ref()
-        .map(|(_, catalog)| catalog)
-        .unwrap_or(&views.secrets_catalog);
-    preflight_headspace(&views, &successor.fragment, candidate_secrets)?;
-
-    if let Some((secret_fragment, _)) = staged {
-        storage.publish(
-            secrets_schema::DEFAULT_SCOPE_ID,
-            secret_fragment,
-            "headspace: credential version",
-        )?;
-        eprintln!(
-            "Published exact credential {secret:x}; if Headspace publication is interrupted, retry with: headspace secret {} set --version {secret:x}",
-            role_name(role)
-        );
-        // Refresh through the same open pile before authoring the referencing
-        // edge. Failure leaves a harmless orphan version, never a dangling
-        // Headspace snapshot.
-        views = storage.views()?;
-        if !views.secrets_catalog.secrets.contains_key(&secret) {
-            bail!("published exact Secrets version {secret:x} did not materialize");
-        }
-        let repaired = secret_successor(&views.catalog, role, Some(secret))?;
-        preflight_headspace(&views, &repaired.fragment, &views.secrets_catalog)?;
-        storage.publish(
-            DEFAULT_SCOPE_ID,
-            repaired.fragment,
-            "headspace: exact credential reference",
-        )?;
-    } else {
-        storage.publish(
-            DEFAULT_SCOPE_ID,
-            successor.fragment,
-            "headspace: exact credential reference",
-        )?;
-    }
-    println!("{role:?} credential version {secret:x}");
-    Ok(())
 }
 
 fn unset_secret(storage: &Storage<'_>, role: SecretRole) -> Result<()> {
@@ -727,16 +718,6 @@ fn reconcile(storage: &Storage<'_>, raw: &str) -> Result<()> {
     print_reloaded(storage)
 }
 
-fn resolve_secrets_identity(storage: &Storage<'_>, views: &Views) -> Result<Id> {
-    let selector = match storage.secrets_identity {
-        Some(value) => value.to_owned(),
-        None => std::env::var("PERSONA")
-            .context("set --secrets-identity/SECRETS_IDENTITY when it differs from PERSONA")?,
-    };
-    secrets_model::resolve_identity(&views.secrets.reader, &views.secrets_catalog, &selector)
-        .with_context(|| format!("resolve Secrets identity {selector:?}"))
-}
-
 fn open_display_secrets(storage: &Storage<'_>, views: &Views) -> Result<Option<OpenedSecrets>> {
     let (config, profile) = match headspace::settled_active(&views.catalog) {
         Ok(value) => value,
@@ -749,21 +730,8 @@ fn open_display_secrets(storage: &Storage<'_>, views: &Views) -> Result<Option<O
     {
         return Ok(None);
     }
-    let identity = resolve_secrets_identity(storage, views)?;
-    let identity_secret = faculties::secrets_node::identity_secret(
-        &views.secrets_catalog,
-        identity,
-        &storage.signer,
-        "unlock the selected Secrets identity",
-    )?;
-    headspace::open_active_secrets(
-        &views.catalog,
-        &views.secrets.reader,
-        &views.secrets_catalog,
-        identity,
-        &identity_secret,
-    )
-    .map(Some)
+    headspace::open_active_secrets(&views.catalog, views.secrets.snapshot(), &storage.signer)
+        .map(Some)
 }
 
 fn print_reloaded(storage: &Storage<'_>) -> Result<()> {
@@ -967,13 +935,10 @@ mod tests {
     use std::fs::File;
 
     use faculties::storage::{initialize_signer, open_pile_strict};
-    use triblespace::core::repo::BlobStore;
-
     fn cli(pile: &Path, key: &Path, command: Command) -> Cli {
         Cli {
             pile: pile.to_owned(),
             key: Some(key.to_owned()),
-            secrets_identity: None,
             command: Some(command),
         }
     }
@@ -1006,7 +971,7 @@ mod tests {
     }
 
     fn views<'a>(pile: &'a Path, key: &'a Path) -> (Storage<'a>, Views) {
-        let storage = Storage::open(pile, Some(key), None).unwrap();
+        let storage = Storage::open(pile, Some(key)).unwrap();
         let views = storage.views().unwrap();
         (storage, views)
     }
@@ -1017,7 +982,7 @@ mod tests {
         let pile = directory.path().join("headspace.pile");
         File::create(&pile).unwrap();
         let before = std::fs::metadata(&pile).unwrap().len();
-        assert!(Storage::open(&pile, None, None).is_err());
+        assert!(Storage::open(&pile, None).is_err());
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), before);
     }
 
@@ -1075,44 +1040,26 @@ mod tests {
 
         let signer = load_signer(&pile, Some(&key)).unwrap();
         let mut store = open_pile_strict(&pile).unwrap();
-        let password = b"identity password";
-        let identity =
-            secrets_model::prepare_identity("me", password, point_now().unwrap()).unwrap();
-        let scope_fragment =
-            secrets_model::scope_fragment(identity.id, "headspace-test", point_now().unwrap())
-                .unwrap();
-        let scope = scope_fragment.root().unwrap();
-        let mut foundation = identity.fragment;
-        foundation += scope_fragment;
-        faculties::collection_names::open(
+        let vault = Id::new([0x77; 16]).unwrap();
+        let location = vaults::create_vault(
             &mut store,
-            secrets_schema::DEFAULT_SCOPE_ID,
-            signer.clone(),
+            &signer,
+            vault,
+            "headspace-test",
+            point_now().unwrap(),
         )
-        .commit(foundation)
         .unwrap();
-        let secrets_facts = faculties::collection_names::open(
+        let discovery = vaults::discover_local_vaults(&mut store, &signer).unwrap();
+        let (version, _) = vaults::add_secret(
             &mut store,
-            secrets_schema::DEFAULT_SCOPE_ID,
-            signer.clone(),
-        )
-        .materialize()
-        .unwrap();
-        let reader = store.reader().unwrap();
-        let catalog = secrets_model::validate_catalog(&reader, &secrets_facts).unwrap();
-        let sealed = secrets_model::seal_version(
-            &reader,
-            &catalog,
-            scope,
+            &signer,
+            &location,
+            discovery.snapshot(),
             "hs/model/interrupted",
             b"exact",
             point_now().unwrap(),
         )
         .unwrap();
-        let version = sealed.secret;
-        faculties::collection_names::open(&mut store, secrets_schema::DEFAULT_SCOPE_ID, signer)
-            .commit(sealed.fragment)
-            .unwrap();
         store.close().unwrap();
 
         // Deterministic second half after a crash between collection commits.
@@ -1124,13 +1071,14 @@ mod tests {
                 command: SecretCommand::Set(SecretSetArgs {
                     value: None,
                     version: Some(format!("{version:x}")),
-                    secret_scope: None,
+                    vault: None,
                 }),
             },
         ))
         .unwrap();
         let (storage, repaired) = views(&pile, &key);
-        assert_eq!(repaired.secrets_catalog.secrets.len(), 1);
+        assert_eq!(repaired.secrets.snapshot().vaults().len(), 1);
+        assert!(repaired.secrets.snapshot().contains(version));
         let (_, profile) = headspace::settled_active(&repaired.catalog).unwrap();
         assert_eq!(profile.model_secret_version, Some(version));
         storage.close().unwrap();
@@ -1143,13 +1091,13 @@ mod tests {
                 command: SecretCommand::Set(SecretSetArgs {
                     value: None,
                     version: Some(format!("{version:x}")),
-                    secret_scope: None,
+                    vault: None,
                 }),
             },
         ))
         .unwrap();
         let (storage, replay) = views(&pile, &key);
-        assert_eq!(replay.secrets_catalog.secrets.len(), 1);
+        assert_eq!(replay.secrets.snapshot().vaults().len(), 1);
         assert_eq!(
             headspace::settled_active(&replay.catalog)
                 .unwrap()

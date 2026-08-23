@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
+use ed25519_dalek::SigningKey;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -33,7 +34,7 @@ use crate::schemas::headspace::{
     DEFAULT_SYSTEM_PROMPT, KIND_CONFIG_ID, KIND_LIVE_RECORD, KIND_MODEL_PROFILE_ID,
     KIND_PROFILE_ANCHOR_ID,
 };
-use crate::secrets::SecretsCatalog;
+use crate::secrets::{v2::SecretsSnapshot, SecretsCatalog as LegacySecretsCatalog};
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type CountValue = Inline<inlineencodings::U256BE>;
@@ -916,7 +917,10 @@ pub fn project_result(reader: &PileReader, facts: &TribleSet) -> Result<Catalog>
 ///
 /// Labels and timestamps are intentionally irrelevant: Headspace stores and
 /// validates the exact version ids it will later open.
-pub fn validate_secret_references(catalog: &Catalog, secrets: &SecretsCatalog) -> Result<()> {
+fn validate_secret_references_by(
+    catalog: &Catalog,
+    mut contains: impl FnMut(Id) -> bool,
+) -> Result<()> {
     let mut references = Vec::new();
     for snapshot in catalog.profile_snapshots.values() {
         if let Some(secret) = snapshot.value.model_secret_version {
@@ -932,13 +936,28 @@ pub fn validate_secret_references(catalog: &Catalog, secrets: &SecretsCatalog) -
         }
     }
     for (snapshot, role, secret) in references {
-        if !secrets.secrets.contains_key(&secret) {
+        if !contains(secret) {
             bail!(
                 "Headspace snapshot {snapshot:x} references missing exact {role} Secrets version {secret:x}"
             );
         }
     }
     Ok(())
+}
+
+/// Validate exact references against the aggregate of ready v2 vault epochs.
+pub fn validate_secret_references_v2<R>(
+    catalog: &Catalog,
+    secrets: &SecretsSnapshot<R>,
+) -> Result<()> {
+    validate_secret_references_by(catalog, |secret| secrets.contains(secret))
+}
+
+/// Historical fixed-scope validator retained only while cutover-only callers
+/// are being moved to discovered v2 vault epochs.
+#[doc(hidden)]
+pub fn validate_secret_references(catalog: &Catalog, secrets: &LegacySecretsCatalog) -> Result<()> {
+    validate_secret_references_by(catalog, |secret| secrets.secrets.contains_key(&secret))
 }
 
 /// Resolve the one active config and its one settled profile.
@@ -960,20 +979,18 @@ pub fn settled_active(catalog: &Catalog) -> Result<(&ConfigValue, &ProfileValue)
     Ok((config, profile))
 }
 
-fn open_utf8_secret(
-    reader: &PileReader,
-    catalog: &SecretsCatalog,
+fn open_utf8_secret<R: BlobStoreGet>(
+    secrets: &SecretsSnapshot<R>,
     secret: Option<Id>,
-    identity: Id,
-    identity_secret: &crate::secrets::IdentitySecret,
+    signing_key: &SigningKey,
     role: &str,
 ) -> Result<Option<String>> {
     let Some(secret) = secret else {
         return Ok(None);
     };
-    let plaintext =
-        crate::secrets::open_version(reader, catalog, secret, identity, identity_secret)
-            .with_context(|| format!("open exact {role} Secrets version {secret:x}"))?;
+    let plaintext = secrets
+        .open(secret, signing_key)
+        .with_context(|| format!("open exact {role} Secrets version {secret:x}"))?;
     String::from_utf8(plaintext)
         .with_context(|| format!("exact {role} Secrets version {secret:x} is not UTF-8"))
         .map(Some)
@@ -983,40 +1000,27 @@ fn open_utf8_secret(
 ///
 /// Each lookup is by the exact immutable version id stored in the snapshot;
 /// this function never invokes Secrets' label-based latest-version helper.
-pub fn open_active_secrets(
+pub fn open_active_secrets<R: BlobStoreGet>(
     headspace: &Catalog,
-    secrets_reader: &PileReader,
-    secrets: &SecretsCatalog,
-    identity: Id,
-    identity_secret: &crate::secrets::IdentitySecret,
+    secrets: &SecretsSnapshot<R>,
+    signing_key: &SigningKey,
 ) -> Result<OpenedSecrets> {
-    validate_secret_references(headspace, secrets)?;
+    validate_secret_references_v2(headspace, secrets)?;
     let (config, profile) = settled_active(headspace)?;
     Ok(OpenedSecrets {
         model_api_key: open_utf8_secret(
-            secrets_reader,
             secrets,
             profile.model_secret_version,
-            identity,
-            identity_secret,
+            signing_key,
             "model",
         )?,
         tavily_api_key: open_utf8_secret(
-            secrets_reader,
             secrets,
             config.tavily_secret_version,
-            identity,
-            identity_secret,
+            signing_key,
             "Tavily",
         )?,
-        exa_api_key: open_utf8_secret(
-            secrets_reader,
-            secrets,
-            config.exa_secret_version,
-            identity,
-            identity_secret,
-            "Exa",
-        )?,
+        exa_api_key: open_utf8_secret(secrets, config.exa_secret_version, signing_key, "Exa")?,
     })
 }
 
@@ -1097,7 +1101,7 @@ mod tests {
     use triblespace::core::repo::BlobStore;
 
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
-    use crate::secrets::{self, schema as secrets_schema};
+    use crate::secrets::v2 as secrets;
     use crate::test_support::grant_team_of_one_write_authority;
 
     fn test_id(byte: u8) -> Id {
@@ -1269,49 +1273,18 @@ mod tests {
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x41; 32]);
         grant_team_of_one_write_authority(&mut pile, &signer);
-        let password = b"identity password";
-        let identity = secrets::prepare_identity("me", password, at(1)).unwrap();
-        let identity_id = identity.id;
-        let scope_fragment = secrets::scope_fragment(identity_id, "headspace-test", at(2)).unwrap();
-        let scope = scope_fragment.root().unwrap();
-        let mut foundation = identity.fragment;
-        foundation += scope_fragment;
-        crate::collection_names::open(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
-            .commit(foundation)
-            .unwrap();
-
-        let (secrets_facts, secrets_reader) =
-            materialize(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, &signer);
-        let secrets_catalog = secrets::validate_catalog(&secrets_reader, &secrets_facts).unwrap();
-        let first = secrets::seal_version(
-            &secrets_reader,
-            &secrets_catalog,
-            scope,
-            "hs/model",
-            b"first",
-            at(3),
-        )
-        .unwrap();
+        let vault = test_id(0x40);
+        let recipients = BTreeSet::from([signer.verifying_key().to_bytes()]);
+        let first = secrets::seal_version("hs/model", b"first", &recipients, at(3)).unwrap();
         let first_id = first.secret;
-        crate::collection_names::open(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
-            .commit(first.fragment)
-            .unwrap();
-
-        let (secrets_facts, secrets_reader) =
-            materialize(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, &signer);
-        let secrets_catalog = secrets::validate_catalog(&secrets_reader, &secrets_facts).unwrap();
-        let second = secrets::seal_version(
-            &secrets_reader,
-            &secrets_catalog,
-            scope,
-            "hs/model",
-            b"second",
-            at(4),
-        )
-        .unwrap();
-        crate::collection_names::open(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, signer.clone())
-            .commit(second.fragment)
-            .unwrap();
+        let second = secrets::seal_version("hs/model", b"second", &recipients, at(4)).unwrap();
+        let mut vault_fragment =
+            secrets::vault_header_fragment(vault, "headspace-test", at(2)).unwrap();
+        vault_fragment += first.fragment;
+        vault_fragment += second.fragment;
+        let vault_facts = vault_fragment.facts().clone();
+        let secrets_reader = vault_fragment.blobs_mut().reader().unwrap();
+        let secrets = SecretsSnapshot::new(secrets_reader, [(vault, vault_facts)]).unwrap();
 
         let anchor = test_id(0x42);
         let mut profile = default_profile(anchor, "exact");
@@ -1323,18 +1296,8 @@ mod tests {
 
         let (headspace_facts, headspace_reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let headspace = project_result(&headspace_reader, &headspace_facts).unwrap();
-        let (secrets_facts, secrets_reader) =
-            materialize(&mut pile, secrets_schema::DEFAULT_SCOPE_ID, &signer);
-        let secrets_catalog = secrets::validate_catalog(&secrets_reader, &secrets_facts).unwrap();
-        validate_secret_references(&headspace, &secrets_catalog).unwrap();
-        let opened = open_active_secrets(
-            &headspace,
-            &secrets_reader,
-            &secrets_catalog,
-            identity_id,
-            &crate::secrets::IdentitySecret::Password(password.to_vec()),
-        )
-        .unwrap();
+        validate_secret_references_v2(&headspace, &secrets).unwrap();
+        let opened = open_active_secrets(&headspace, &secrets, &signer).unwrap();
         assert_eq!(opened.model_api_key.as_deref(), Some("first"));
         pile.close().unwrap();
     }
@@ -1357,7 +1320,13 @@ mod tests {
             .unwrap();
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
-        let error = validate_secret_references(&catalog, &SecretsCatalog::default()).unwrap_err();
+        let mut empty = Fragment::empty();
+        let secrets = SecretsSnapshot::new(
+            empty.blobs_mut().reader().unwrap(),
+            Vec::<(Id, TribleSet)>::new(),
+        )
+        .unwrap();
+        let error = validate_secret_references_v2(&catalog, &secrets).unwrap_err();
         assert!(format!("{error:#}").contains("missing exact model"));
         pile.close().unwrap();
     }
