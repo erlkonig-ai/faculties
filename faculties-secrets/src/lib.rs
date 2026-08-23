@@ -51,6 +51,7 @@ use triblespace::prelude::*;
 
 pub mod password;
 pub mod schema;
+pub mod v2;
 
 use crate::schema::{
     grant_issuer, grant_object, grant_relation, grant_retracted_at, grant_subject,
