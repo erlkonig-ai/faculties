@@ -3,7 +3,7 @@
 //! The historical branch contains canonical Secrets facts alongside a retired
 //! four-fact Mail-account record and three-fact active pointer vocabulary.
 //! Planning validates that bounded partition and returns only the retained v1
-//! catalog needed by the direct v2 vault projection. The original bytes,
+//! catalog needed by the direct vault projection. The original bytes,
 //! authored partitions, and provenance already remain in the copied prefix;
 //! they are not rebuilt as an intermediary native collection.
 
@@ -18,7 +18,7 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 use crate::collection_cutover::{FrozenSource, LegacyPinCoordinate};
-use faculties::secrets::{self as capability, schema};
+use crate::legacy_secrets_v1 as legacy;
 
 /// Exact historical Mail vocabulary which was written onto the branch named
 /// `secrets`. It is intentionally local to cutover: current Secrets and Mail
@@ -45,13 +45,13 @@ type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 pub struct SecretsMigrationReport {
     /// Exact fact count at the verified legacy branch head.
     pub source_facts: usize,
-    /// Retained canonical v1 Secrets facts projected directly into v2 vaults.
+    /// Retained canonical legacy Secrets facts projected directly into vaults.
     pub facts: usize,
     /// Exact historical Mail facts validated and deliberately not projected.
     pub retired_facts: usize,
 }
 
-/// Minimal pure boundary between the frozen branch and direct v2 planning.
+/// Minimal pure boundary between the frozen branch and direct vault planning.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretsMigrationPlan {
     source_pin: LegacyPinCoordinate,
@@ -265,7 +265,7 @@ fn validate_retired_mail_evidence(
 /// mutating its pile or reconstructing its authored partitions.
 pub fn plan(source: &FrozenSource) -> Result<SecretsMigrationPlan> {
     let branch = source
-        .legacy_branch(schema::LEGACY_BRANCH_NAME)?
+        .legacy_branch(legacy::COLLECTION_NAME)?
         .ok_or_else(|| anyhow!("frozen source has no legacy Secrets branch"))?;
     let source_pin = branch.pin_coordinate();
     let source_facts = branch
@@ -282,7 +282,7 @@ pub fn plan(source: &FrozenSource) -> Result<SecretsMigrationPlan> {
 
     // Retired Mail evidence never enters the v1 validator and therefore
     // cannot acquire Secrets authorization merely by sharing the old branch.
-    capability::validate_catalog(source.reader(), &retained)
+    legacy::validate_catalog(source.reader(), &retained)
         .context("validate complete retained legacy Secrets catalog")?;
 
     let plan = SecretsMigrationPlan {
@@ -348,7 +348,7 @@ mod tests {
         source: FrozenSource,
     }
 
-    fn at(byte: u8) -> capability::IntervalValue {
+    fn at(byte: u8) -> legacy::IntervalValue {
         Inline::new([byte; 32])
     }
 
@@ -363,18 +363,22 @@ mod tests {
         let identity = Id::new([0x11; 16]).unwrap();
         let mut identity_fragment = Fragment::empty();
         let name = identity_fragment.put("alice".to_owned());
-        let canonical_child =
+        let _canonical_child =
             identity_fragment.put::<blobencodings::RawBytes, _>(b"conservative child".to_vec());
-        let public_key =
-            identity_fragment.put::<blobencodings::RawBytes, _>(canonical_child.raw.to_vec());
+        let public_key = identity_fragment.put::<blobencodings::RawBytes, _>(
+            SigningKey::from_bytes(&[0x11; 32])
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
+        );
         let lockbox =
             identity_fragment.put::<blobencodings::RawBytes, _>(vec![0x33; 16 + 24 + 16 + 64]);
         identity_fragment += entity! { ExclusiveId::force_ref(&identity) @
-            metadata::tag: &schema::KIND_IDENTITY,
+            metadata::tag: &legacy::KIND_IDENTITY,
             metadata::created_at: at(1),
             metadata::name: name,
-            schema::identity_sign_pk: public_key,
-            schema::identity_lockbox: lockbox,
+            legacy::identity_sign_pk: public_key,
+            legacy::identity_lockbox: lockbox,
         };
 
         // The old Mail writer placed account state on this branch. It remains
@@ -407,13 +411,13 @@ mod tests {
         let scope_name = scope_fragment.put("prod".to_owned());
         let creator: Inline<inlineencodings::GenId> = identity.to_inline();
         let scope = triblespace::core::trible::intrinsic_entity_id_v1(vec![
-            (schema::scope_creator.id(), creator.raw),
+            (legacy::scope_creator.id(), creator.raw),
             (metadata::name.id(), scope_name.raw),
         ]);
         scope_fragment += entity! { ExclusiveId::force_ref(&scope) @
-            schema::scope_creator: identity,
+            legacy::scope_creator: identity,
             metadata::name: scope_name,
-            metadata::tag: &schema::KIND_SCOPE,
+            metadata::tag: &legacy::KIND_SCOPE,
             metadata::created_at: at(2),
         };
         let scope_facts = scope_fragment.facts().clone();
@@ -422,7 +426,7 @@ mod tests {
         let mut source_facts = canonical_facts.clone();
         source_facts += retired_facts.clone();
         let source = TestSourceSpec::new(vec![TestBranchSpec::new(
-            schema::LEGACY_BRANCH_NAME,
+            legacy::COLLECTION_NAME,
             Id::new([0x51; 16]).unwrap(),
             SigningKey::from_bytes(&[0x51; 32]),
             vec![
@@ -489,7 +493,7 @@ mod tests {
 
         let mut extra = fixture.source_facts.clone();
         extra += entity! { ExclusiveId::force_ref(&fixture.retired_account) @
-            schema::grant_object: &Id::new([0x71; 16]).unwrap(),
+            legacy::grant_object: &Id::new([0x71; 16]).unwrap(),
         }
         .into_facts();
         let error = validate_retired_mail_evidence(frozen.reader(), &extra).unwrap_err();

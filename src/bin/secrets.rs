@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use faculties::secrets::v2::{self, storage as vaults};
+use faculties::secrets::{self, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use triblespace::core::repo::pile::Pile;
@@ -150,7 +150,7 @@ fn fmt_key(key: VerifyingKey) -> String {
     hex::encode(key.to_bytes())
 }
 
-fn point_now() -> Result<v2::IntervalValue> {
+fn point_now() -> Result<secrets::IntervalValue> {
     let now = Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))?;
     Ok((now, now)
         .try_to_inline()
@@ -219,7 +219,7 @@ fn cmd_vault_list(storage: SecretsStorage<'_>) -> Result<()> {
                 .snapshot()
                 .vault(*vault)
                 .expect("every ready location has one aggregate snapshot");
-            let name = v2::read_text(
+            let name = secrets::read_text(
                 discovery.snapshot().reader(),
                 snapshot.catalog().header.name,
             )?;
@@ -329,7 +329,7 @@ fn cmd_secret_list(storage: SecretsStorage<'_>) -> Result<()> {
         let mut count = 0;
         for (vault, snapshot) in discovery.snapshot().vaults() {
             for secret in snapshot.catalog().secrets.values() {
-                let name = v2::read_text(discovery.snapshot().reader(), secret.name)?;
+                let name = secrets::read_text(discovery.snapshot().reader(), secret.name)?;
                 println!("{}  vault {}  {name}", fmt_id(secret.id), fmt_id(*vault));
                 count += 1;
             }

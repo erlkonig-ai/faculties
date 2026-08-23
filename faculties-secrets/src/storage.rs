@@ -223,7 +223,7 @@ fn discover_team_roots(store: &mut Pile) -> Result<BTreeSet<[u8; 32]>> {
     Ok(teams)
 }
 
-/// Materialize every canonical v2 vault in the pile through its team's exact
+/// Materialize every canonical vault in the pile through its team's exact
 /// `WRITE` authority. Duplicate vault ids across teams, malformed vault-like
 /// descriptors, and invalid vault catalogs are fatal: this is the global
 /// activation invariant, not the fault-isolating local runtime view.

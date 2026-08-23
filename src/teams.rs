@@ -25,7 +25,7 @@ use crate::files;
 use crate::schemas::archive::archive;
 use crate::schemas::files::{file, KIND_FILE, KIND_MEDIA_TYPE};
 use crate::schemas::teams::teams;
-use crate::secrets::v2::SecretsSnapshot;
+use crate::secrets::SecretsSnapshot;
 
 const SNAPSHOT_COORDINATE_PREFIX: &str = "teams-legacy-snapshot-v1:";
 
@@ -2942,15 +2942,13 @@ mod tests {
         let recipients = BTreeSet::from([signer.verifying_key().to_bytes()]);
         let vault = Id::new([0x32; 16]).unwrap();
         let sealed =
-            crate::secrets::v2::seal_version("same-name", b"exact", &recipients, point(2.0))
-                .unwrap();
+            crate::secrets::seal_version("same-name", b"exact", &recipients, point(2.0)).unwrap();
         let exact = sealed.secret;
         let later =
-            crate::secrets::v2::seal_version("same-name", b"later", &recipients, point(3.0))
-                .unwrap();
+            crate::secrets::seal_version("same-name", b"later", &recipients, point(3.0)).unwrap();
         assert_ne!(exact, later.secret);
         let mut vault_fragment =
-            crate::secrets::v2::vault_header_fragment(vault, "teams", point(1.0)).unwrap();
+            crate::secrets::vault_header_fragment(vault, "teams", point(1.0)).unwrap();
         vault_fragment += sealed.fragment;
         vault_fragment += later.fragment;
         let vault_facts = vault_fragment.facts().clone();

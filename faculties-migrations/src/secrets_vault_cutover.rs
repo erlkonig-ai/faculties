@@ -1,5 +1,5 @@
 //! Stopped-world projection from the frozen pre-collection Secrets branch to
-//! one direct-key v2 vault collection per confidentiality epoch.
+//! one direct-key vault collection per confidentiality epoch.
 //!
 //! The copied pile prefix retains the old branch byte-for-byte. Planning
 //! validates every source and target catalog, stages the exact encrypted
@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use faculties::secrets::v2::{self, RecipientPublicKey, VaultCatalog};
+use faculties::secrets::{self, RecipientPublicKey, VaultCatalog};
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
@@ -28,12 +28,12 @@ pub struct VaultMigrationReport {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SecretsV2MigrationReport {
+pub struct SecretsVaultMigrationReport {
     pub source_facts: usize,
     pub vaults: Vec<VaultMigrationReport>,
 }
 
-impl SecretsV2MigrationReport {
+impl SecretsVaultMigrationReport {
     pub fn secret_versions(&self) -> usize {
         self.vaults.iter().map(|vault| vault.secret_versions).sum()
     }
@@ -68,14 +68,14 @@ pub(crate) struct VaultPlan {
 /// Complete read-only preflight.  The plan owns every attachment needed by a
 /// later vault commit; publication never needs the password or plaintext DEK.
 #[derive(Clone)]
-pub struct SecretsV2MigrationPlan {
+pub struct SecretsVaultMigrationPlan {
     team: RecipientPublicKey,
     vaults: Vec<VaultPlan>,
-    report: SecretsV2MigrationReport,
+    report: SecretsVaultMigrationReport,
 }
 
-impl SecretsV2MigrationPlan {
-    pub fn report(&self) -> &SecretsV2MigrationReport {
+impl SecretsVaultMigrationPlan {
+    pub fn report(&self) -> &SecretsVaultMigrationReport {
         &self.report
     }
 
@@ -98,9 +98,9 @@ where
     S: BlobStore + triblespace::core::collection::CollectionStore,
     S::Reader: BlobStoreMeta,
 {
-    v2::vault_collection(pile, vault, team, signer.clone())
+    secrets::vault_collection(pile, vault, team, signer.clone())
         .materialize()
-        .with_context(|| format!("materialize v2 vault {vault:X}"))
+        .with_context(|| format!("materialize vault {vault:X}"))
 }
 
 fn put_text_exact(
@@ -136,34 +136,34 @@ fn stage_existing_payloads(
 ) -> Result<()> {
     let name: anybytes::View<str> = reader
         .get(catalog.header.name)
-        .context("read existing v2 vault name")?;
+        .context("read existing vault name")?;
     let actual = destination.put(name.to_string());
     if actual != catalog.header.name {
-        bail!("existing v2 vault name changed content address while staging");
+        bail!("existing vault name changed content address while staging");
     }
     for secret in catalog.secrets.values() {
         let name: anybytes::View<str> = reader
             .get(secret.name)
-            .with_context(|| format!("read existing v2 secret {} name", secret.id))?;
+            .with_context(|| format!("read existing vault secret {} name", secret.id))?;
         let actual = destination.put(name.to_string());
         if actual != secret.name {
-            bail!("existing v2 secret name changed content address while staging");
+            bail!("existing vault secret name changed content address while staging");
         }
         let body: anybytes::Bytes = reader
             .get(secret.body)
-            .with_context(|| format!("read existing v2 secret {} body", secret.id))?;
+            .with_context(|| format!("read existing vault secret {} body", secret.id))?;
         let actual = destination.put::<blobencodings::RawBytes, _>(body.as_ref().to_vec());
         if actual != secret.body {
-            bail!("existing v2 secret body changed content address while staging");
+            bail!("existing vault secret body changed content address while staging");
         }
     }
     for wrap in catalog.wraps.values() {
         let sealed: anybytes::Bytes = reader
             .get(wrap.sealed_dek)
-            .with_context(|| format!("read existing v2 wrap {} payload", wrap.id))?;
+            .with_context(|| format!("read existing vault wrap {} payload", wrap.id))?;
         let actual = destination.put::<blobencodings::RawBytes, _>(sealed.as_ref().to_vec());
         if actual != wrap.sealed_dek {
-            bail!("existing v2 wrap changed content address while staging");
+            bail!("existing vault wrap changed content address while staging");
         }
     }
     Ok(())
@@ -177,8 +177,8 @@ fn validate_candidate(
 ) -> Result<VaultCatalog> {
     let mut candidate = Fragment::from(existing.clone());
     if !existing.is_empty() {
-        let existing_catalog = v2::load_catalog(vault, existing)
-            .with_context(|| format!("strictly load existing v2 vault {vault:X}"))?;
+        let existing_catalog = secrets::load_catalog(vault, existing)
+            .with_context(|| format!("strictly load existing vault {vault:X}"))?;
         stage_existing_payloads(reader, &existing_catalog, &mut candidate)?;
     }
     candidate += required.clone();
@@ -186,9 +186,9 @@ fn validate_candidate(
     let local = candidate
         .blobs_mut()
         .reader()
-        .context("snapshot complete v2 vault candidate attachments")?;
-    v2::validate_catalog(&local, vault, &facts)
-        .with_context(|| format!("validate complete v2 vault candidate {vault:X}"))
+        .context("snapshot complete vault candidate attachments")?;
+    secrets::validate_catalog(&local, vault, &facts)
+        .with_context(|| format!("validate complete vault candidate {vault:X}"))
 }
 
 fn next_unused_id(used: &mut BTreeSet<Id>) -> Id {
@@ -209,7 +209,7 @@ pub(crate) fn plan_from_legacy_in_store<S>(
     reader: &PileReader,
     source: TribleSet,
     password: Option<&[u8]>,
-) -> Result<SecretsV2MigrationPlan>
+) -> Result<SecretsVaultMigrationPlan>
 where
     S: BlobStore + triblespace::core::collection::CollectionStore,
     S::Reader: BlobStoreMeta,
@@ -224,7 +224,7 @@ where
             .scopes
             .keys()
             .copied()
-            .map(|vault| v2::vault_handle(vault, team)),
+            .map(|vault| secrets::vault_handle(vault, team)),
     )
     .context("preflight dormant COMMITs on direct vault WRITE targets")?;
     let identity_keys = legacy::identity_public_keys(reader, &catalog)?;
@@ -244,7 +244,7 @@ where
     for scope in catalog.scopes.values() {
         if scope.created_at.len() != 1 {
             bail!(
-                "legacy scope {} has {} creation observations; v2 requires exactly one",
+                "legacy scope {} has {} creation observations; a vault requires exactly one",
                 scope.id,
                 scope.created_at.len()
             );
@@ -271,10 +271,10 @@ where
             })
             .collect::<Result<BTreeSet<_>>>()?;
 
-        let mut required = v2::vault_header_fragment(scope.id, &vault_name, created_at)?;
-        let header = v2::load_catalog(scope.id, required.facts())?.header;
+        let mut required = secrets::vault_header_fragment(scope.id, &vault_name, created_at)?;
+        let header = secrets::load_catalog(scope.id, required.facts())?.header;
         if header.name != scope.name {
-            bail!("v2 vault header did not preserve the legacy scope name handle");
+            bail!("vault header did not preserve the legacy scope name handle");
         }
 
         let scoped_secrets = catalog
@@ -285,7 +285,7 @@ where
         for secret in &scoped_secrets {
             let body = legacy::read_bytes(reader, secret.body)
                 .with_context(|| format!("read legacy secret {} encrypted body", secret.id))?;
-            required += v2::encrypted_secret_fragment(
+            required += secrets::encrypted_secret_fragment(
                 secret.id,
                 &secret.name,
                 body.clone(),
@@ -322,7 +322,7 @@ where
             let sealed = legacy::read_bytes(reader, wrap.sealed_dek)
                 .with_context(|| format!("read legacy wrap {} sealed DEK", wrap.id))?;
             required +=
-                v2::recipient_wrap_fragment(wrap.id, wrap.secret, recipient, sealed.clone())?;
+                secrets::recipient_wrap_fragment(wrap.id, wrap.secret, recipient, sealed.clone())?;
             put_bytes_exact(&mut required, wrap.sealed_dek, sealed, "legacy sealed DEK")?;
         }
 
@@ -333,8 +333,8 @@ where
             None
         } else {
             Some(
-                v2::validate_catalog(reader, scope.id, &existing)
-                    .with_context(|| format!("validate existing v2 vault {}", scope.id))?,
+                secrets::validate_catalog(reader, scope.id, &existing)
+                    .with_context(|| format!("validate existing vault {}", scope.id))?,
             )
         };
         let mut holders = BTreeMap::<Id, BTreeSet<RecipientPublicKey>>::new();
@@ -366,7 +366,7 @@ where
                 legacy::recover_dek_for_migration(reader, &catalog, secret.id, signer, password)?;
             for recipient in missing {
                 let sealed = legacy::seal_dek_for_recipient(&dek, recipient)?;
-                required += v2::recipient_wrap_fragment(
+                required += secrets::recipient_wrap_fragment(
                     next_unused_id(&mut used_ids),
                     secret.id,
                     recipient,
@@ -382,14 +382,14 @@ where
             let holders = final_catalog.wrap_holders(secret);
             if !recipients.is_subset(&holders) {
                 bail!(
-                    "v2 vault candidate leaves a current reader without a wrap for secret {secret:X}"
+                    "vault candidate leaves a current reader without a wrap for secret {secret:X}"
                 );
             }
         }
         for secret in final_catalog.secrets.keys().copied() {
             if let Some(previous) = claimed_secrets.insert(secret, scope.id) {
                 bail!(
-                    "secret {secret:X} appears in both v2 vault {previous:X} and {:X}",
+                    "secret {secret:X} appears in both vault {previous:X} and {:X}",
                     scope.id
                 );
             }
@@ -412,11 +412,11 @@ where
         });
     }
 
-    let report = SecretsV2MigrationReport {
+    let report = SecretsVaultMigrationReport {
         source_facts: source.len(),
         vaults: vaults.iter().map(|vault| vault.report.clone()).collect(),
     };
-    Ok(SecretsV2MigrationPlan {
+    Ok(SecretsVaultMigrationPlan {
         team: team.to_bytes(),
         vaults,
         report,

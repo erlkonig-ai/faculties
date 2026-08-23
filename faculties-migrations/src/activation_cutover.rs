@@ -27,15 +27,24 @@ use crate::{
     archive_cutover, atlas_cutover, body_cutover, cognition_cutover, comb_cutover, compass_cutover,
     decide_cutover, discord_cutover, files_cutover, habit_cutover, headspace_cutover, mail_cutover,
     memory_cutover, message_cutover, orient_cutover, planner_cutover, posture_cutover,
-    relations_cutover, secrets_cutover, secrets_v2_cutover, status_cutover, teams_cutover,
+    relations_cutover, secrets_cutover, secrets_vault_cutover, status_cutover, teams_cutover,
     voice_cutover, web_cutover, wiki_cutover,
 };
 use faculties::schemas;
-use faculties::secrets::v2;
+use faculties::secrets;
 use faculties::{
     atlas, blockdag, body, cognition, comb, compass, decide, discord, files, habits, headspace,
     mail, memory, message, planner, relations, status, teams, voice, wiki,
 };
+
+/// Whether direct activation needs the operator's retired root password to
+/// recover a DEK that is available only through a legacy identity lockbox.
+/// The historical marker itself remains private to the migrations crate.
+pub fn requires_legacy_password(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::legacy_secrets_v1::PasswordRequired>()
+        .is_some()
+}
 
 #[derive(Clone, Copy)]
 struct PlannedActivationReader<'a, Overlay> {
@@ -103,7 +112,7 @@ pub enum CandidateViewKey {
 pub enum TargetPolicy {
     Faculty,
     Vault {
-        readers: BTreeSet<v2::RecipientPublicKey>,
+        readers: BTreeSet<secrets::RecipientPublicKey>,
     },
 }
 
@@ -187,9 +196,9 @@ impl PlannedCollection {
         vault: Id,
         fragments: impl IntoIterator<Item = Fragment>,
         expected_facts: TribleSet,
-        readers: BTreeSet<v2::RecipientPublicKey>,
+        readers: BTreeSet<secrets::RecipientPublicKey>,
     ) -> Result<Self> {
-        let name = v2::vault_name(vault);
+        let name = secrets::vault_name(vault);
         let fragments = fragments.into_iter().collect::<Vec<_>>();
         let staged_facts = materialized_facts(&fragments);
         if staged_facts != expected_facts {
@@ -518,11 +527,11 @@ pub fn validate_candidate_views(reader: &PileReader, views: &CandidateViews) -> 
         schemas::relations::DEFAULT_SCOPE_ID,
     )?;
     relations::validate_catalog(reader, relation_facts).context("validate Relations candidate")?;
-    let _all_secrets = v2::SecretsSnapshot::new(reader.clone(), views.vaults.clone())
-        .context("validate global Secrets v2 vault candidate")?;
-    let local_secrets = v2::SecretsSnapshot::new(reader.clone(), views.local_vaults.clone())
-        .context("validate local READ-authorized Secrets v2 vault candidate")?;
-    headspace::validate_secret_references_v2(&headspace_catalog, &local_secrets)
+    let _all_secrets = secrets::SecretsSnapshot::new(reader.clone(), views.vaults.clone())
+        .context("validate global Secrets vault candidate")?;
+    let local_secrets = secrets::SecretsSnapshot::new(reader.clone(), views.local_vaults.clone())
+        .context("validate local READ-authorized Secrets vault candidate")?;
+    headspace::validate_secret_references(&headspace_catalog, &local_secrets)
         .context("validate Headspace candidate exact local Secrets references")?;
     status::validate_catalog(
         reader,
@@ -810,7 +819,7 @@ pub fn plan(
 
     let secret_plan = secrets_cutover::plan(source)
         .context("project pre-collection Secrets activation source")?;
-    let direct = secrets_v2_cutover::plan_from_legacy_in_store(
+    let direct = secrets_vault_cutover::plan_from_legacy_in_store(
         &mut frozen_collections,
         signer,
         source.reader(),
@@ -900,7 +909,7 @@ pub fn plan(
     // Global vault validation sees every frozen authorized vault plus every
     // staged direct projection; runtime references see only the hypothetical
     // final subset for which the durable signer has exact READ.
-    let global = v2::storage::discover_all_vaults_strict(&mut frozen_collections, signer)
+    let global = secrets::storage::discover_all_vaults_strict(&mut frozen_collections, signer)
         .context("discover frozen global Secrets vault baseline")?;
     let mut vault_facts = global
         .snapshot()
@@ -921,8 +930,8 @@ pub fn plan(
             .map_err(|error| anyhow!("resolve frozen local-team Secrets authority: {error}"))?;
     let mut staged_vaults = Fragment::empty();
     for vault in direct.vaults() {
-        let handle = v2::vault_handle(vault.vault, signer.verifying_key());
-        let current = v2::read_authority_recipient_keys(&local_team_authority, handle);
+        let handle = secrets::vault_handle(vault.vault, signer.verifying_key());
+        let current = secrets::read_authority_recipient_keys(&local_team_authority, handle);
         if !current.is_subset(&vault.recipients) {
             bail!(
                 "frozen vault {:X} already has a READ recipient outside the projected legacy effective-recipient set",
@@ -950,7 +959,7 @@ pub fn plan(
         } else if let Some(location) = locations.get(vault) {
             let authority = resolve_authority(&mut frozen_collections, location.team())
                 .map_err(|error| anyhow!("resolve frozen vault {vault:X} authority: {error}"))?;
-            v2::read_authority_recipient_keys(&authority, location.collection())
+            secrets::read_authority_recipient_keys(&authority, location.collection())
         } else {
             BTreeSet::new()
         };
@@ -964,7 +973,7 @@ pub fn plan(
         .blobs_mut()
         .reader()
         .context("snapshot staged direct Secrets attachments")?;
-    let global_secrets = v2::SecretsSnapshot::new(
+    let global_secrets = secrets::SecretsSnapshot::new(
         PlannedActivationReader {
             overlay: &staged_reader,
             source: source.reader(),
@@ -982,7 +991,7 @@ pub fn plan(
             }
         }
     }
-    let local_secrets = v2::SecretsSnapshot::new(
+    let local_secrets = secrets::SecretsSnapshot::new(
         PlannedActivationReader {
             overlay: &staged_reader,
             source: source.reader(),
@@ -995,7 +1004,7 @@ pub fn plan(
     let headspace_catalog =
         headspace::project_result(source.reader(), &headspace.materialized_facts())
             .context("validate planned Headspace catalog")?;
-    headspace::validate_secret_references_v2(&headspace_catalog, &local_secrets)
+    headspace::validate_secret_references(&headspace_catalog, &local_secrets)
         .context("validate planned Headspace local Secrets references")?;
     let teams_facts = teams.materialized_facts();
     teams::validate_catalog(source.reader(), &teams_facts)
@@ -1411,7 +1420,7 @@ mod tests {
         let outsider = SigningKey::from_bytes(&[0xEA; 32]);
         let epoch = Epoch::from_unix_seconds(1.0);
         let created_at = (epoch, epoch).try_to_inline().unwrap();
-        let sealed = v2::seal_version(
+        let sealed = secrets::seal_version(
             "globally-visible",
             b"not locally readable",
             &BTreeSet::from([outsider.verifying_key().to_bytes()]),
@@ -1420,10 +1429,10 @@ mod tests {
         .unwrap();
         let secret = sealed.secret;
         let mut vault_fragment =
-            v2::vault_header_fragment(vault, "global-only", created_at).unwrap();
+            secrets::vault_header_fragment(vault, "global-only", created_at).unwrap();
         vault_fragment += sealed.fragment;
         let vault_facts = vault_fragment.facts().clone();
-        let vault_handle = v2::vault_handle(vault, team);
+        let vault_handle = secrets::vault_handle(vault, team);
         publish_grant(
             &mut pile,
             team,
@@ -1431,7 +1440,7 @@ mod tests {
             AuthorityGrant::root(team, vault_handle, ACTION_WRITE, AuthorityMode::Invoke),
         )
         .unwrap();
-        v2::vault_collection(&mut pile, vault, team, signer.clone())
+        secrets::vault_collection(&mut pile, vault, team, signer.clone())
             .commit(vault_fragment)
             .unwrap();
         publish_grant(
@@ -1441,13 +1450,13 @@ mod tests {
             AuthorityGrant::root(
                 outsider.verifying_key(),
                 vault_handle,
-                v2::ACTION_READ,
+                secrets::ACTION_READ,
                 AuthorityMode::Invoke,
             ),
         )
         .unwrap();
         let authority = resolve_authority(&mut pile, team).unwrap();
-        let local_readers = v2::read_authority_recipient_keys(&authority, vault_handle);
+        let local_readers = secrets::read_authority_recipient_keys(&authority, vault_handle);
         assert!(!local_readers.contains(&team.to_bytes()));
 
         let headspace_anchor = Id::new([0xEB; 16]).unwrap();
@@ -1607,7 +1616,7 @@ mod tests {
         pile.close().unwrap();
 
         let source = TestSourceSpec::new(vec![TestBranchSpec::new(
-            faculties::secrets::schema::LEGACY_BRANCH_NAME,
+            crate::legacy_secrets_v1::COLLECTION_NAME,
             Id::new([0xA4; 16]).unwrap(),
             SigningKey::from_bytes(&[0xA5; 32]),
             vec![TestDeltaSpec::authored(
@@ -1623,7 +1632,7 @@ mod tests {
         assert_eq!(legacy.report().source_facts, 0);
 
         let mut frozen_collections = source.collection_store();
-        let direct = secrets_v2_cutover::plan_from_legacy_in_store(
+        let direct = secrets_vault_cutover::plan_from_legacy_in_store(
             &mut frozen_collections,
             &signer,
             source.reader(),

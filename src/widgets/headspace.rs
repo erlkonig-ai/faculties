@@ -133,7 +133,7 @@ impl HeadspaceLive {
         let result = (|| {
             let catalog = headspace::project_result(headspace_view.reader, headspace_view.facts)
                 .map_err(|error| format!("Headspace collection: {error:#}"))?;
-            headspace::validate_secret_references_v2(&catalog, secrets_view.snapshot)
+            headspace::validate_secret_references(&catalog, secrets_view.snapshot)
                 .map_err(|error| format!("Headspace secret references: {error:#}"))?;
             Ok::<_, String>((load_active_config(&catalog), load_profiles(&catalog)))
         })();

@@ -9,7 +9,7 @@ use faculties::headspace;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
-use faculties::secrets::v2::storage as vaults;
+use faculties::secrets::storage as vaults;
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use reqwest::blocking::Client;
@@ -300,7 +300,7 @@ impl WebStorage<'_> {
                 self.materialize(&mut pile, &signer, HEADSPACE_SCOPE_ID, "Headspace")?;
             let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
                 .context("validate Headspace collection")?;
-            headspace::validate_secret_references_v2(&catalog, secrets.snapshot())
+            headspace::validate_secret_references(&catalog, secrets.snapshot())
                 .context("validate exact Headspace credential references")?;
             let (config, _) = headspace::settled_active(&catalog)
                 .context("resolve active Headspace configuration")?;

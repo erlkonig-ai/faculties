@@ -33,9 +33,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
-    activation_cutover, collection_cutover, collection_naming, disposable_cutover,
-    legacy_secrets_v1, mail_credentials, posture_findings, status_register, teams_credentials,
-    write_authority,
+    activation_cutover, collection_cutover, collection_naming, disposable_cutover, legacy_password,
+    mail_credentials, posture_findings, status_register, teams_credentials, write_authority,
 };
 use zeroize::Zeroizing;
 
@@ -159,7 +158,7 @@ enum Command {
     ///
     /// Reporting needs no password; `--export` needs FACULTIES_SECRETS_PW (or
     /// the configured password file), because the retired envelope predates
-    /// Secrets v2 vault epochs and is keyed on the frozen v1 root password.
+    /// direct Secrets vault epochs and is keyed on the retired root password.
     MailCredentials {
         /// Directory to receive the plaintext mailbox password. Without it,
         /// nothing is unsealed and only the shape is reported.
@@ -304,7 +303,7 @@ fn mail_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
         return Ok(());
     };
 
-    let password = faculties::secrets::password::read("unlock the retired Mail account envelope")?;
+    let password = legacy_password::read("unlock the retired Mail account envelope")?;
     let recovered = mail_credentials::open(selected, &password)?;
     let written =
         mail_credentials::export(&recovered, export).context("export mailbox password")?;
@@ -318,7 +317,7 @@ fn mail_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
     println!("  password      : {} bytes", recovered.password_len);
 
     // Deliberately a worklist, not an action. `mail account set` owns sealing
-    // the password into one exact ready Secrets v2 vault epoch; recovery
+    // the password into one exact ready Secrets vault epoch; recovery
     // cannot choose that authority-scoped destination on the operator's behalf.
     println!("\nto publish it (select one exact ready vault epoch with `secrets vault list`):");
     println!(
@@ -559,12 +558,8 @@ fn activation_plan(
     let password;
     match first {
         Ok(plan) => Ok(plan),
-        Err(error)
-            if error
-                .downcast_ref::<legacy_secrets_v1::PasswordRequired>()
-                .is_some() =>
-        {
-            password = Zeroizing::new(faculties::secrets::password::read(
+        Err(error) if activation_cutover::requires_legacy_password(&error) => {
+            password = Zeroizing::new(legacy_password::read(
                 "re-seal a legacy Secrets DEK during direct activation",
             )?);
             activation_cutover::plan(source, signer, Some(password.as_slice()))

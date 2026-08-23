@@ -39,7 +39,7 @@ use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
-use crate::secrets::v2::{storage as vaults, SecretsSnapshot};
+use crate::secrets::{storage as vaults, SecretsSnapshot};
 use crate::storage::{load_signer, open_pile_strict};
 
 /// Stable logical input requested by a widget.
@@ -742,7 +742,7 @@ fn validate_catalog(
     if sources.contains(&SourceKey::Headspace) {
         let headspace = crate::headspace::project_result(reader, facts(SourceKey::Headspace))
             .map_err(|error| format!("validate Headspace collection: {error:#}"))?;
-        crate::headspace::validate_secret_references_v2(
+        crate::headspace::validate_secret_references(
             &headspace,
             secrets.expect("Headspace source closure includes Secrets"),
         )

@@ -274,7 +274,7 @@ fn planned_grants(
                     ed25519_dalek::VerifyingKey::from_bytes(reader)
                         .context("validate planned vault READ recipient")?,
                     publication.handle,
-                    faculties::secrets::v2::ACTION_READ,
+                    faculties::secrets::ACTION_READ,
                     AuthorityMode::Invoke,
                 ));
             }
@@ -369,7 +369,7 @@ fn build_world(
                     faculty_views.insert(scope, facts);
                 }
                 CandidateViewKey::Vault(vault) => {
-                    let readers = faculties::secrets::v2::read_authority_recipient_keys(
+                    let readers = faculties::secrets::read_authority_recipient_keys(
                         &authority_resolution,
                         handle,
                     );
@@ -384,7 +384,7 @@ fn build_world(
                 }
             }
         }
-        let global = faculties::secrets::v2::storage::discover_all_vaults_strict(&mut pile, signer)
+        let global = faculties::secrets::storage::discover_all_vaults_strict(&mut pile, signer)
             .context("discover complete global candidate vault snapshot")?;
         let mut vault_views = BTreeMap::new();
         let mut local_vault_views = BTreeMap::new();
@@ -393,7 +393,7 @@ fn build_world(
             let authority = resolve_authority(&mut pile, location.team()).map_err(|error| {
                 anyhow!("resolve candidate vault {vault:X} READ authority: {error}")
             })?;
-            let readers = faculties::secrets::v2::read_authority_recipient_keys(
+            let readers = faculties::secrets::read_authority_recipient_keys(
                 &authority,
                 location.collection(),
             );
@@ -785,8 +785,9 @@ mod tests {
     use super::*;
     use crate::collection_cutover::freeze_source;
     use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
-    use crate::{secrets_cutover, secrets_v2_cutover};
-    use faculties::secrets as legacy_secrets;
+    use crate::legacy_secrets_v1 as legacy_secrets;
+    use crate::legacy_secrets_v1::test_support as legacy_fixture;
+    use crate::{secrets_cutover, secrets_vault_cutover};
     use faculties::storage::initialize_signer;
 
     /// A REAL scope, not a synthetic id. A root is anchored by a name now, so
@@ -884,10 +885,10 @@ mod tests {
         fn new(
             vault: Id,
             signer: &SigningKey,
-            readers: BTreeSet<faculties::secrets::v2::RecipientPublicKey>,
+            readers: BTreeSet<faculties::secrets::RecipientPublicKey>,
             fragments: Vec<Fragment>,
         ) -> Self {
-            let name = faculties::secrets::v2::vault_name(vault);
+            let name = faculties::secrets::vault_name(vault);
             let reach = triblespace::core::collection::reach::private();
             let handle =
                 simplearchive_union::descriptor(&name, signer.verifying_key(), reach.clone())
@@ -925,7 +926,7 @@ mod tests {
         }
     }
 
-    fn at(byte: u8) -> faculties::secrets::v2::IntervalValue {
+    fn at(byte: u8) -> faculties::secrets::IntervalValue {
         Inline::new([byte; 32])
     }
 
@@ -933,26 +934,25 @@ mod tests {
         fixture: &Fixture,
     ) -> (Fragment, Id, Id, Vec<u8>, legacy_secrets::BytesHandle) {
         let signer = &fixture.signer;
-        let identity = legacy_secrets::prepare_node_identity(
+        let identity = legacy_fixture::prepare_node_identity(
             "durable-node",
             signer.verifying_key().as_bytes(),
             at(1),
         )
         .unwrap();
         let identity_id = identity.id;
-        let scope_fragment = legacy_secrets::scope_fragment(identity_id, "epoch", at(2)).unwrap();
+        let scope_fragment = legacy_fixture::scope_fragment(identity_id, "epoch", at(2));
         let vault = scope_fragment.root().unwrap();
         let mut foundation = identity.fragment;
         foundation += scope_fragment;
-        foundation += legacy_secrets::grant_fragment(
+        foundation += legacy_fixture::grant_fragment(
             Id::new([0x31; 16]).unwrap(),
             vault,
             "member",
             identity_id,
             identity_id,
             at(3),
-        )
-        .unwrap();
+        );
         let mut pile = open_pile_strict(&fixture.live).unwrap();
         let mut foundation_blobs = foundation.blobs().clone();
         let embedded = foundation_blobs.reader().unwrap();
@@ -961,7 +961,7 @@ mod tests {
         }
         let reader = pile.reader().unwrap();
         let catalog = legacy_secrets::validate_catalog(&reader, foundation.facts()).unwrap();
-        let sealed = legacy_secrets::seal_version(
+        let sealed = legacy_fixture::seal_version(
             &reader,
             &catalog,
             vault,
@@ -977,7 +977,7 @@ mod tests {
         let (_, facts, metafacts, sealed_blobs) = sealed.fragment.into_parts();
         let body_facts = facts
             .iter()
-            .filter(|fact| fact.a() == &legacy_secrets::schema::secret_body.id())
+            .filter(|fact| fact.a() == &legacy_secrets::secret_body.id())
             .copied()
             .collect::<TribleSet>();
         let malformed_body = vec![0_u8; 24 + 16];
@@ -985,29 +985,28 @@ mod tests {
             Fragment::from_parts(facts.difference(&body_facts), metafacts, sealed_blobs);
         let body = sealed.put::<blobencodings::RawBytes, _>(malformed_body.clone());
         sealed += entity! { ExclusiveId::force_ref(&secret) @
-            legacy_secrets::schema::secret_body: body,
+            legacy_secrets::secret_body: body,
         };
         foundation += sealed;
         // This recipient becomes effective only after the original version
         // was sealed, so direct planning must synthesize exactly one DEK wrap
         // without ever authenticating or decrypting the opaque body.
         let late_signer = SigningKey::from_bytes(&[0x32; 32]);
-        let late = legacy_secrets::prepare_node_identity(
+        let late = legacy_fixture::prepare_node_identity(
             "late-reader",
             late_signer.verifying_key().as_bytes(),
             at(5),
         )
         .unwrap();
         foundation += late.fragment;
-        foundation += legacy_secrets::grant_fragment(
+        foundation += legacy_fixture::grant_fragment(
             Id::new([0x32; 16]).unwrap(),
             vault,
             "member",
             late.id,
             identity_id,
             at(6),
-        )
-        .unwrap();
+        );
         (foundation, vault, secret, malformed_body, body)
     }
 
@@ -1018,7 +1017,7 @@ mod tests {
         readers: impl IntoIterator<Item = ed25519_dalek::VerifyingKey>,
     ) {
         let mut pile = open_pile_strict(&fixture.live).unwrap();
-        let handle = faculties::secrets::v2::vault_handle(vault, fixture.signer.verifying_key());
+        let handle = faculties::secrets::vault_handle(vault, fixture.signer.verifying_key());
         publish_grant(
             &mut pile,
             fixture.signer.verifying_key(),
@@ -1031,7 +1030,7 @@ mod tests {
             ),
         )
         .unwrap();
-        faculties::secrets::v2::vault_collection(
+        faculties::secrets::vault_collection(
             &mut pile,
             vault,
             fixture.signer.verifying_key(),
@@ -1047,7 +1046,7 @@ mod tests {
                 AuthorityGrant::root(
                     reader,
                     handle,
-                    faculties::secrets::v2::ACTION_READ,
+                    faculties::secrets::ACTION_READ,
                     AuthorityMode::Invoke,
                 ),
             )
@@ -1115,7 +1114,7 @@ mod tests {
         let fixture = Fixture::new();
         let (legacy, vault, secret, malformed_body, legacy_body) = direct_legacy_fragment(&fixture);
         let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
-            legacy_secrets::schema::LEGACY_BRANCH_NAME,
+            legacy_secrets::COLLECTION_NAME,
             Id::new([0x42; 16]).unwrap(),
             SigningKey::from_bytes(&[0x42; 32]),
             vec![TestDeltaSpec::authored(legacy.clone(), "legacy Secrets")],
@@ -1127,7 +1126,7 @@ mod tests {
 
         let projection = secrets_cutover::plan(&frozen).unwrap();
         let mut store = frozen.collection_store();
-        let direct = secrets_v2_cutover::plan_from_legacy_in_store(
+        let direct = secrets_vault_cutover::plan_from_legacy_in_store(
             &mut store,
             &fixture.signer,
             frozen.reader(),
@@ -1193,7 +1192,7 @@ mod tests {
             .all(|accepted| accepted.grant().resource() != fixed_handle));
         let reader = pile.reader().unwrap();
         assert!(reader.metadata(fixed_handle).unwrap().is_none());
-        let facts = faculties::secrets::v2::vault_collection(
+        let facts = faculties::secrets::vault_collection(
             &mut pile,
             vault,
             fixture.signer.verifying_key(),
@@ -1201,7 +1200,7 @@ mod tests {
         )
         .materialize()
         .unwrap();
-        let catalog = faculties::secrets::v2::validate_catalog(&reader, vault, &facts).unwrap();
+        let catalog = faculties::secrets::validate_catalog(&reader, vault, &facts).unwrap();
         assert_eq!(catalog.secrets[&secret].body, legacy_body);
         let body: anybytes::Bytes = reader.get(catalog.secrets[&secret].body).unwrap();
         assert_eq!(body.as_ref(), malformed_body);
@@ -1210,7 +1209,7 @@ mod tests {
 
         let activated_bytes = fs::read(&fixture.live).unwrap();
         let replay_source = TestSourceSpec::new(vec![TestBranchSpec::new(
-            legacy_secrets::schema::LEGACY_BRANCH_NAME,
+            legacy_secrets::COLLECTION_NAME,
             Id::new([0x42; 16]).unwrap(),
             SigningKey::from_bytes(&[0x42; 32]),
             vec![TestDeltaSpec::authored(legacy, "legacy Secrets")],
@@ -1221,7 +1220,7 @@ mod tests {
         assert_eq!(fs::read(&fixture.live).unwrap(), activated_bytes);
         let replay_projection = secrets_cutover::plan(&replay_source).unwrap();
         let mut replay_store = replay_source.collection_store();
-        let replay = secrets_v2_cutover::plan_from_legacy_in_store(
+        let replay = secrets_vault_cutover::plan_from_legacy_in_store(
             &mut replay_store,
             &fixture.signer,
             replay_source.reader(),
@@ -1258,12 +1257,11 @@ mod tests {
     {
         let fixture = Fixture::new();
         let (legacy, vault, _, _, _) = direct_legacy_fragment(&fixture);
-        let header =
-            faculties::secrets::v2::vault_header_fragment(vault, "dormant", at(5)).unwrap();
+        let header = faculties::secrets::vault_header_fragment(vault, "dormant", at(5)).unwrap();
         let mut pile = open_pile_strict(&fixture.live).unwrap();
         simplearchive_union::publish_fragment_commit(
             &mut pile,
-            &faculties::secrets::v2::vault_descriptor(vault, fixture.signer.verifying_key()),
+            &faculties::secrets::vault_descriptor(vault, fixture.signer.verifying_key()),
             header,
             &fixture.signer,
         )
@@ -1271,7 +1269,7 @@ mod tests {
         pile.close().unwrap();
 
         let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
-            legacy_secrets::schema::LEGACY_BRANCH_NAME,
+            legacy_secrets::COLLECTION_NAME,
             Id::new([0x43; 16]).unwrap(),
             SigningKey::from_bytes(&[0x43; 32]),
             vec![TestDeltaSpec::authored(legacy, "legacy Secrets")],
@@ -1281,7 +1279,7 @@ mod tests {
         .source;
         let projection = secrets_cutover::plan(&frozen).unwrap();
         let mut store = frozen.collection_store();
-        let error = match secrets_v2_cutover::plan_from_legacy_in_store(
+        let error = match secrets_vault_cutover::plan_from_legacy_in_store(
             &mut store,
             &fixture.signer,
             frozen.reader(),
@@ -1299,11 +1297,11 @@ mod tests {
         let mut pile = open_pile_strict(&foreign_fixture.live).unwrap();
         simplearchive_union::publish_fragment_commit(
             &mut pile,
-            &faculties::secrets::v2::vault_descriptor(
+            &faculties::secrets::vault_descriptor(
                 foreign_vault,
                 foreign_fixture.signer.verifying_key(),
             ),
-            faculties::secrets::v2::vault_header_fragment(foreign_vault, "foreign", at(6)).unwrap(),
+            faculties::secrets::vault_header_fragment(foreign_vault, "foreign", at(6)).unwrap(),
             &foreign,
         )
         .unwrap();
@@ -1385,7 +1383,7 @@ mod tests {
         let fixture = Fixture::new();
         let vault = Id::new([0x78; 16]).unwrap();
         let outsider = SigningKey::from_bytes(&[0x78; 32]).verifying_key();
-        let handle = faculties::secrets::v2::vault_handle(vault, fixture.signer.verifying_key());
+        let handle = faculties::secrets::vault_handle(vault, fixture.signer.verifying_key());
         let mut pile = open_pile_strict(&fixture.live).unwrap();
         publish_grant(
             &mut pile,
@@ -1394,7 +1392,7 @@ mod tests {
             AuthorityGrant::root(
                 outsider,
                 handle,
-                faculties::secrets::v2::ACTION_READ,
+                faculties::secrets::ACTION_READ,
                 AuthorityMode::Invoke,
             ),
         )
@@ -1430,15 +1428,15 @@ mod tests {
         let secret = Id::new([0x7A; 16]).unwrap();
         let outsider = SigningKey::from_bytes(&[0x79; 32]).verifying_key();
         let mut fragment =
-            faculties::secrets::v2::vault_header_fragment(vault, "missing-wrap", at(7)).unwrap();
-        fragment += faculties::secrets::v2::encrypted_secret_fragment(
+            faculties::secrets::vault_header_fragment(vault, "missing-wrap", at(7)).unwrap();
+        fragment += faculties::secrets::encrypted_secret_fragment(
             secret,
             "credential",
             vec![0; 24 + 16],
             at(8),
         )
         .unwrap();
-        fragment += faculties::secrets::v2::recipient_wrap_fragment(
+        fragment += faculties::secrets::recipient_wrap_fragment(
             Id::new([0x7B; 16]).unwrap(),
             secret,
             fixture.signer.verifying_key().to_bytes(),
@@ -1470,7 +1468,7 @@ mod tests {
         let vault_a = Id::new([0x7C; 16]).unwrap();
         let vault_b = Id::new([0x7D; 16]).unwrap();
         let duplicate_secret = Id::new([0x7E; 16]).unwrap();
-        let secret_fragment = faculties::secrets::v2::encrypted_secret_fragment(
+        let secret_fragment = faculties::secrets::encrypted_secret_fragment(
             duplicate_secret,
             "duplicate",
             vec![0; 24 + 16],
@@ -1478,14 +1476,14 @@ mod tests {
         )
         .unwrap();
         for (vault, wrap_byte) in [(vault_a, 0x7F), (vault_b, 0x80)] {
-            let mut fragment = faculties::secrets::v2::vault_header_fragment(
+            let mut fragment = faculties::secrets::vault_header_fragment(
                 vault,
                 if vault == vault_a { "one" } else { "two" },
                 at(10),
             )
             .unwrap();
             fragment += secret_fragment.clone();
-            fragment += faculties::secrets::v2::recipient_wrap_fragment(
+            fragment += faculties::secrets::recipient_wrap_fragment(
                 Id::new([wrap_byte; 16]).unwrap(),
                 duplicate_secret,
                 duplicate_fixture.signer.verifying_key().to_bytes(),

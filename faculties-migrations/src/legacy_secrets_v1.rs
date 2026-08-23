@@ -34,33 +34,33 @@ pub const KIND_WRAP: Id = triblespace::macros::id_hex!("EB8549BAF679C5D11ECEDB41
 pub const KIND_SCOPE: Id = triblespace::macros::id_hex!("B2920B23494B9DBD4500158D84432325");
 
 attributes! {
-    "FD0897D627CF18F4E49A93968A8D6301" unsafe as identity_sign_pk:
+    "FD0897D627CF18F4E49A93968A8D6301" unsafe as pub identity_sign_pk:
         inlineencodings::Handle<blobencodings::RawBytes>;
-    "1E4279231655D8C67835865C3AFB629F" unsafe as identity_lockbox:
+    "1E4279231655D8C67835865C3AFB629F" unsafe as pub identity_lockbox:
         inlineencodings::Handle<blobencodings::RawBytes>;
-    "B3F0E5A5FFACC159B651BFDA19EAE18C" unsafe as grant_object:
+    "B3F0E5A5FFACC159B651BFDA19EAE18C" unsafe as pub grant_object:
         inlineencodings::GenId;
-    "22F807F93FADFE092C8CE0698044680B" unsafe as grant_relation:
+    "22F807F93FADFE092C8CE0698044680B" unsafe as pub grant_relation:
         inlineencodings::ShortString;
-    "B44AF03BA7AF04ED81096D7900D70A12" unsafe as grant_subject:
+    "B44AF03BA7AF04ED81096D7900D70A12" unsafe as pub grant_subject:
         inlineencodings::GenId;
-    "B177568BEE389D76D9D71110E9067EF1" unsafe as grant_issuer:
+    "B177568BEE389D76D9D71110E9067EF1" unsafe as pub grant_issuer:
         inlineencodings::GenId;
-    "73CE206E6B9B81CB2BD2388ECC5D3AA8" unsafe as grant_retracted_at:
+    "73CE206E6B9B81CB2BD2388ECC5D3AA8" unsafe as pub grant_retracted_at:
         inlineencodings::NsTAIInterval;
-    "A66C795299212D16BA6BA25BD1D9F983" unsafe as secret_scope:
+    "A66C795299212D16BA6BA25BD1D9F983" unsafe as pub secret_scope:
         inlineencodings::GenId;
-    "8FD8C43D3490ACD6AFAD6D691B748CA3" unsafe as secret_name:
+    "8FD8C43D3490ACD6AFAD6D691B748CA3" unsafe as pub secret_name:
         inlineencodings::ShortString;
-    "7FC38805FDC9FA4D8449497B298B51BB" unsafe as secret_body:
+    "7FC38805FDC9FA4D8449497B298B51BB" unsafe as pub secret_body:
         inlineencodings::Handle<blobencodings::RawBytes>;
-    "D17EC6F6A9F9D6B7A3B9A329A9CFC4CC" unsafe as wrap_secret:
+    "D17EC6F6A9F9D6B7A3B9A329A9CFC4CC" unsafe as pub wrap_secret:
         inlineencodings::GenId;
-    "CAD2A79E7F5B1A870F5814BDEE5C90F8" unsafe as wrap_recipient:
+    "CAD2A79E7F5B1A870F5814BDEE5C90F8" unsafe as pub wrap_recipient:
         inlineencodings::GenId;
-    "B30CE37D4DC3CAACC34D946B3D71E37C" unsafe as wrap_dek:
+    "B30CE37D4DC3CAACC34D946B3D71E37C" unsafe as pub wrap_dek:
         inlineencodings::Handle<blobencodings::RawBytes>;
-    "CE866212934742FF5B27DEF25E366E07" unsafe as scope_creator:
+    "CE866212934742FF5B27DEF25E366E07" unsafe as pub scope_creator:
         inlineencodings::GenId;
 }
 
@@ -880,38 +880,389 @@ pub fn recover_dek_for_migration<R: BlobStoreGet>(
     }
 }
 
-/// Seal one already-recovered v1 DEK to a v2 direct recipient.  This crosses
+/// Seal one already-recovered legacy DEK to a current direct recipient. This crosses
 /// only the KEM boundary and cannot inspect or rewrite the encrypted body.
 pub fn seal_dek_for_recipient(dek: &[u8; 32], recipient: RecipientPublicKey) -> Result<Vec<u8>> {
     let dek = Key::try_from(&dek[..]).context("decode recovered legacy DEK")?;
     let recipient = box_pk_from_ed25519(&recipient)?;
     DryocBox::seal_to_vecbox(&dek, &recipient)
         .map(|sealed| sealed.to_vec())
-        .map_err(|_| anyhow!("seal recovered legacy DEK to v2 recipient failed"))
+        .map_err(|_| anyhow!("seal recovered legacy DEK to direct recipient failed"))
+}
+
+/// Minimal builders for migration fixtures. They deliberately do not form a
+/// supported legacy runtime API: only this crate's tests can name them.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use dryoc::types::NewByteArray;
+
+    use super::*;
+
+    pub(crate) struct PreparedIdentity {
+        pub(crate) fragment: Fragment,
+        pub(crate) id: Id,
+    }
+
+    pub(crate) struct SealedVersion {
+        pub(crate) fragment: Fragment,
+        pub(crate) secret: Id,
+    }
+
+    fn identity_fragment(
+        id: Id,
+        nickname: &str,
+        sign_pk: RecipientPublicKey,
+        lockbox: Option<Vec<u8>>,
+        created_at: IntervalValue,
+    ) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let name = fragment.put(nickname.to_owned());
+        let sign_pk = fragment.put::<blobencodings::RawBytes, _>(sign_pk.to_vec());
+        let lockbox = lockbox.map(|bytes| fragment.put::<blobencodings::RawBytes, _>(bytes));
+        fragment += identity_record(id, created_at, name, sign_pk, lockbox);
+        fragment
+    }
+
+    pub(crate) fn node_identity(
+        id: Id,
+        nickname: &str,
+        signing_key: &SigningKey,
+        created_at: IntervalValue,
+    ) -> Fragment {
+        identity_fragment(
+            id,
+            nickname,
+            signing_key.verifying_key().to_bytes(),
+            None,
+            created_at,
+        )
+    }
+
+    pub(crate) fn prepare_node_identity(
+        nickname: &str,
+        sign_pk: &[u8],
+        created_at: IntervalValue,
+    ) -> Result<PreparedIdentity> {
+        let sign_pk: RecipientPublicKey = sign_pk
+            .try_into()
+            .context("fixture Ed25519 public-key length")?;
+        VerifyingKey::from_bytes(&sign_pk).context("fixture Ed25519 public key")?;
+        let id = genid().id;
+        Ok(PreparedIdentity {
+            fragment: identity_fragment(id, nickname, sign_pk, None, created_at),
+            id,
+        })
+    }
+
+    pub(crate) fn password_identity(
+        id: Id,
+        nickname: &str,
+        signing_key: &SigningKey,
+        password: &[u8],
+        created_at: IntervalValue,
+    ) -> Fragment {
+        let salt = [id.raw()[0]; CRYPTO_PWHASH_SALTBYTES];
+        let nonce_bytes = [id.raw()[1]; 24];
+        let nonce = Nonce::try_from(&nonce_bytes[..]).expect("24-byte fixture nonce");
+        let key = derive_key(password, &salt);
+        let ciphertext =
+            DryocSecretBox::encrypt_to_vecbox(&signing_key.to_keypair_bytes(), &nonce, &key)
+                .to_vec();
+        let mut lockbox = Vec::with_capacity(LOCKBOX_BYTES);
+        lockbox.extend_from_slice(&salt);
+        lockbox.extend_from_slice(&nonce);
+        lockbox.extend_from_slice(&ciphertext);
+        assert_eq!(lockbox.len(), LOCKBOX_BYTES);
+        identity_fragment(
+            id,
+            nickname,
+            signing_key.verifying_key().to_bytes(),
+            Some(lockbox),
+            created_at,
+        )
+    }
+
+    pub(crate) fn scope_fragment(creator: Id, name: &str, created_at: IntervalValue) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let name = fragment.put(name.to_owned());
+        fragment += scope_identity(creator, name);
+        let id = fragment
+            .root()
+            .expect("fixture scope identity exports one root");
+        fragment += scope_record(&ScopeRow {
+            id,
+            creator,
+            created_at: BTreeSet::from([created_at]),
+            name,
+        });
+        fragment
+    }
+
+    pub(crate) fn legacy_scope_fragment(
+        creator: Id,
+        name: &str,
+        created_at: IntervalValue,
+    ) -> (Fragment, Id) {
+        let mut fragment = Fragment::empty();
+        let name = fragment.put(name.to_owned());
+        let (_, id) = scope_identity_epochs(creator, name);
+        fragment += scope_record(&ScopeRow {
+            id,
+            creator,
+            created_at: BTreeSet::from([created_at]),
+            name,
+        });
+        (fragment, id)
+    }
+
+    pub(crate) fn grant_fragment(
+        id: Id,
+        object: Id,
+        relation: &str,
+        subject: Id,
+        issuer: Id,
+        created_at: IntervalValue,
+    ) -> Fragment {
+        grant_record(&GrantRow {
+            id,
+            created_at,
+            object,
+            relation: relation.to_owned(),
+            subject,
+            issuer,
+            retracted_at: BTreeSet::new(),
+        })
+    }
+
+    pub(crate) fn retraction_fragment(grant: Id, at: IntervalValue) -> Fragment {
+        entity! { ExclusiveId::force_ref(&grant) @ grant_retracted_at: at }
+    }
+
+    pub(crate) fn wrap_fragment(
+        id: Id,
+        secret: Id,
+        recipient: Id,
+        recipient_key: RecipientPublicKey,
+        dek: &[u8; 32],
+        created_at: IntervalValue,
+    ) -> Fragment {
+        let dek = Key::try_from(&dek[..]).expect("32-byte fixture DEK");
+        let recipient_key = box_pk_from_ed25519(&recipient_key).expect("valid fixture recipient");
+        let sealed = DryocBox::seal_to_vecbox(&dek, &recipient_key)
+            .expect("seal fixture DEK")
+            .to_vec();
+        let mut fragment = Fragment::empty();
+        let sealed_dek = fragment.put::<blobencodings::RawBytes, _>(sealed);
+        fragment += wrap_record(&WrapRow {
+            id,
+            created_at,
+            secret,
+            recipient,
+            sealed_dek,
+        });
+        fragment
+    }
+
+    pub(crate) fn seal_version<R: BlobStoreGet>(
+        reader: &R,
+        catalog: &Catalog,
+        scope: Id,
+        name: &str,
+        plaintext: &[u8],
+        created_at: IntervalValue,
+    ) -> Result<SealedVersion> {
+        let keys = identity_public_keys(reader, catalog)?;
+        let recipients = catalog.recipients_of(scope);
+        if recipients.is_empty() {
+            bail!("fixture scope has no recipients");
+        }
+        let dek = Key::gen();
+        let nonce = Nonce::gen();
+        let ciphertext = DryocSecretBox::encrypt_to_vecbox(plaintext, &nonce, &dek).to_vec();
+        let mut body = Vec::with_capacity(nonce.len() + ciphertext.len());
+        body.extend_from_slice(&nonce);
+        body.extend_from_slice(&ciphertext);
+
+        let secret = genid().id;
+        let mut fragment = Fragment::empty();
+        let display_name = fragment.put(name.to_owned());
+        let body = fragment.put::<blobencodings::RawBytes, _>(body);
+        fragment += secret_record(&SecretRow {
+            id: secret,
+            created_at,
+            scope,
+            name: name.to_owned(),
+            display_name,
+            body,
+        });
+        for recipient in recipients {
+            let recipient_key = box_pk_from_ed25519(&keys[&recipient])?;
+            let sealed = DryocBox::seal_to_vecbox(&dek, &recipient_key)
+                .map_err(|error| anyhow!("seal fixture DEK: {error:?}"))?
+                .to_vec();
+            let sealed_dek = fragment.put::<blobencodings::RawBytes, _>(sealed);
+            fragment += wrap_record(&WrapRow {
+                id: genid().id,
+                created_at,
+                secret,
+                recipient,
+                sealed_dek,
+            });
+        }
+        Ok(SealedVersion { fragment, secret })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use triblespace::core::repo::BlobStore;
+
     use super::*;
+    use test_support as fixture;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn at(byte: u8) -> IntervalValue {
+        Inline::new([byte; 32])
+    }
 
     #[test]
-    fn frozen_anchors_match_the_retired_runtime_wire_identity() {
-        assert_eq!(KIND_IDENTITY, faculties::secrets::schema::KIND_IDENTITY);
-        assert_eq!(KIND_SCOPE, faculties::secrets::schema::KIND_SCOPE);
-        assert_eq!(KIND_GRANT, faculties::secrets::schema::KIND_GRANT);
-        assert_eq!(KIND_SECRET, faculties::secrets::schema::KIND_SECRET);
-        assert_eq!(KIND_WRAP, faculties::secrets::schema::KIND_WRAP);
+    fn frozen_wire_ids_are_literal_and_self_contained() {
+        for (actual, expected) in [
+            (KIND_IDENTITY, "0B870F06D1B502EBE1259C90234E8BA2"),
+            (KIND_SCOPE, "B2920B23494B9DBD4500158D84432325"),
+            (KIND_GRANT, "BB95E8D2D7DC644B39396A1B6C10ECC6"),
+            (KIND_SECRET, "72B64C9F3644B8016B64820D7F3F23C1"),
+            (KIND_WRAP, "EB8549BAF679C5D11ECEDB416AAD76E3"),
+            (identity_sign_pk.id(), "FD0897D627CF18F4E49A93968A8D6301"),
+            (secret_body.id(), "7FC38805FDC9FA4D8449497B298B51BB"),
+            (wrap_recipient.id(), "CAD2A79E7F5B1A870F5814BDEE5C90F8"),
+        ] {
+            assert_eq!(format!("{actual:X}"), expected);
+        }
+    }
+
+    #[test]
+    fn rooted_delegated_retracted_and_nested_authority_is_preserved() {
+        let alice = id(1);
+        let bob = id(2);
+        let carol = id(3);
+        let alice_key = SigningKey::from_bytes(&[1; 32]);
+        let bob_key = SigningKey::from_bytes(&[2; 32]);
+        let carol_key = SigningKey::from_bytes(&[3; 32]);
+        let mut facts = fixture::node_identity(alice, "alice", &alice_key, at(1));
+        facts += fixture::node_identity(bob, "bob", &bob_key, at(1));
+        facts += fixture::node_identity(carol, "carol", &carol_key, at(1));
+        let root_fragment = fixture::scope_fragment(alice, "root", at(2));
+        let root = root_fragment.root().unwrap();
+        facts += root_fragment;
+        let nested_fragment = fixture::scope_fragment(bob, "nested", at(2));
+        let nested = nested_fragment.root().unwrap();
+        facts += nested_fragment;
+        let first = id(10);
+        let second = id(11);
+        facts += fixture::grant_fragment(first, root, "admin", bob, alice, at(3));
+        facts += fixture::grant_fragment(second, root, "admin", bob, alice, at(4));
+        facts += fixture::retraction_fragment(first, at(5));
+        facts += fixture::grant_fragment(id(12), root, "member", nested, bob, at(6));
+        facts += fixture::grant_fragment(id(13), nested, "member", carol, bob, at(7));
+
+        let catalog = load_catalog(facts.facts()).unwrap();
         assert_eq!(
-            identity_sign_pk.id(),
-            faculties::secrets::schema::identity_sign_pk.id()
+            catalog.recipients_of(root),
+            BTreeSet::from([alice, bob, carol])
         );
-        assert_eq!(
-            secret_body.id(),
-            faculties::secrets::schema::secret_body.id()
+        assert_eq!(catalog.grants[&first].retracted_at.len(), 1);
+
+        facts += fixture::retraction_fragment(second, at(8));
+        let catalog = load_catalog(facts.facts()).unwrap();
+        assert_eq!(catalog.recipients_of(root), BTreeSet::from([alice]));
+    }
+
+    #[test]
+    fn historical_intrinsic_scope_identity_remains_admissible() {
+        let creator = id(1);
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let mut facts = fixture::node_identity(creator, "creator", &key, at(1));
+        let (legacy, legacy_id) = fixture::legacy_scope_fragment(creator, "prod", at(2));
+        let current = fixture::scope_fragment(creator, "prod", at(2));
+        assert_ne!(legacy_id, current.root().unwrap());
+        facts += legacy;
+        let catalog = load_catalog(facts.facts()).unwrap();
+        assert_eq!(catalog.scopes[&legacy_id].creator, creator);
+    }
+
+    #[test]
+    fn malformed_and_conflicting_legacy_shapes_are_rejected() {
+        let alice = id(1);
+        let bob = id(2);
+        let alice_key = SigningKey::from_bytes(&[1; 32]);
+        let bob_key = SigningKey::from_bytes(&[2; 32]);
+        let mut facts = fixture::node_identity(alice, "alice", &alice_key, at(1));
+        facts += fixture::node_identity(bob, "bob", &bob_key, at(1));
+        let scope = fixture::scope_fragment(alice, "prod", at(2));
+        let scope_id = scope.root().unwrap();
+        facts += scope;
+        let grant = id(10);
+        facts += fixture::grant_fragment(grant, scope_id, "member", bob, alice, at(3));
+
+        let mut conflict = facts.clone();
+        conflict += entity! { ExclusiveId::force_ref(&grant) @ grant_relation: "admin" };
+        let error = load_catalog(conflict.facts()).unwrap_err();
+        assert!(format!("{error:#}").contains("2 values for grant_relation"));
+
+        let mut malformed = facts;
+        malformed += entity! { ExclusiveId::force_ref(&alice) @
+            grant_relation: "not-an-identity-field"
+        };
+        let error = load_catalog(malformed.facts()).unwrap_err();
+        assert!(format!("{error:#}")
+            .contains("identity 01010101010101010101010101010101 is not canonical"));
+    }
+
+    #[test]
+    fn signer_and_password_kems_must_agree_and_competing_wraps_fail() {
+        let signer = SigningKey::from_bytes(&[1; 32]);
+        let password_key = SigningKey::from_bytes(&[2; 32]);
+        let signer_id = id(1);
+        let password_id = id(2);
+        let password = b"legacy password";
+        let mut facts = fixture::node_identity(signer_id, "node", &signer, at(1));
+        facts +=
+            fixture::password_identity(password_id, "password", &password_key, password, at(1));
+        let scope = fixture::scope_fragment(signer_id, "prod", at(2));
+        let scope_id = scope.root().unwrap();
+        facts += scope;
+        facts += fixture::grant_fragment(id(10), scope_id, "member", password_id, signer_id, at(3));
+
+        let reader = facts.blobs_mut().reader().unwrap();
+        let catalog = validate_catalog(&reader, facts.facts()).unwrap();
+        let sealed =
+            fixture::seal_version(&reader, &catalog, scope_id, "database", b"opaque", at(4))
+                .unwrap();
+        drop(reader);
+        let secret = sealed.secret;
+        facts += sealed.fragment;
+        let reader = facts.blobs_mut().reader().unwrap();
+        let catalog = validate_catalog(&reader, facts.facts()).unwrap();
+        let recovered =
+            recover_dek_for_migration(&reader, &catalog, secret, &signer, Some(password)).unwrap();
+
+        facts += fixture::wrap_fragment(
+            id(99),
+            secret,
+            password_id,
+            password_key.verifying_key().to_bytes(),
+            &[0xA5; 32],
+            at(5),
         );
-        assert_eq!(
-            wrap_recipient.id(),
-            faculties::secrets::schema::wrap_recipient.id()
-        );
+        let reader = facts.blobs_mut().reader().unwrap();
+        let catalog = validate_catalog(&reader, facts.facts()).unwrap();
+        let error = recover_dek_for_migration(&reader, &catalog, secret, &signer, Some(password))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("competing DEKs"));
+        assert_ne!(recovered.as_slice(), &[0xA5; 32]);
     }
 }

@@ -30,7 +30,7 @@ use faculties::files as file_capability;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::archive::{archive, RawBytes};
 use faculties::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
-use faculties::secrets::v2::{self as secrets_model, storage as secrets_vaults};
+use faculties::secrets::{self as secrets_model, storage as secrets_vaults};
 use faculties::teams as teams_core;
 
 #[derive(Parser)]

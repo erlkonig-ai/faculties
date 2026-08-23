@@ -14,7 +14,7 @@
 //!
 //! This is the bridge, and like [`crate::teams_credentials`] it is deliberately
 //! **not** a pile writer. Publishing the recovered credential means sealing it
-//! into one exact ready Secrets v2 vault epoch and authoring a Mail account,
+//! into one exact ready Secrets vault epoch and authoring a Mail account,
 //! which `mail account set --vault <id>` already does under an operator's
 //! authority. So this reads the frozen legacy branch, reports what survives,
 //! and on request unlocks the envelope and materializes the mailbox password
@@ -47,7 +47,7 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
 use crate::collection_cutover::{freeze_source, FrozenSource};
-use faculties::secrets::schema::LEGACY_BRANCH_NAME;
+use crate::legacy_secrets_v1::COLLECTION_NAME as LEGACY_BRANCH_NAME;
 
 /// The retired Mail vocabulary, repeated here rather than imported so the
 /// recovery path stays readable next to `secrets_cutover`'s own copy.

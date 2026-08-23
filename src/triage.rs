@@ -29,7 +29,7 @@ use crate::schemas::triage::{
     exec, model_chat, reason, KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID,
     KIND_MODEL_IN_PROGRESS_ID, KIND_MODEL_REQUEST_ID, KIND_MODEL_RESULT_ID, KIND_REASON_EVENT_ID,
 };
-use crate::secrets::v2::SecretsSnapshot;
+use crate::secrets::SecretsSnapshot;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type Interval = Inline<inlineencodings::NsTAIInterval>;
@@ -1066,7 +1066,7 @@ pub fn project_headspace(
 ) -> Result<TriageHeadspace> {
     let catalog = headspace::project_result(headspace_view.reader, headspace_view.facts)
         .context("validate Headspace collection")?;
-    headspace::validate_secret_references_v2(&catalog, secrets)
+    headspace::validate_secret_references(&catalog, secrets)
         .context("validate exact Headspace Secrets references")?;
     Ok(project_triage_headspace(&catalog))
 }

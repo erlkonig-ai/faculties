@@ -32,7 +32,7 @@ use crate::schemas::mail::{
     LEGACY_KIND_MESSAGE, LEGACY_KIND_SPAM, RECIPE_RFC5322_V1,
 };
 use crate::schemas::message::local as legacy_read;
-use crate::secrets::v2::SecretsSnapshot;
+use crate::secrets::SecretsSnapshot;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -1919,7 +1919,7 @@ pub fn validate_catalog<R>(
     validate_secret_references(facts, secrets)
 }
 
-/// Validate only Mail's exact immutable references into Secrets v2.
+/// Validate only Mail's exact immutable references into Secrets vaults.
 pub fn validate_secret_references<R>(
     facts: &TribleSet,
     secrets: &SecretsSnapshot<R>,
@@ -3201,7 +3201,7 @@ mod tests {
         decide as decide_schema, files as files_schema, mail as mail_schema,
         relations as relations_schema,
     };
-    use crate::secrets::v2::storage as vaults;
+    use crate::secrets::storage as vaults;
     use crate::storage::{load_signer, open_pile_strict, publish_fragment};
     use crate::test_support::initialize_team_of_one_write_fixture;
     use triblespace::core::repo::pile::{Pile, PileReader};

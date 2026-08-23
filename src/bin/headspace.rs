@@ -11,7 +11,7 @@ use ed25519_dalek::SigningKey;
 use faculties::headspace::{self, Catalog, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
-use faculties::secrets::v2::{self as secrets_model, storage as vaults};
+use faculties::secrets::{self as secrets_model, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use triblespace::core::metadata;
@@ -210,7 +210,7 @@ impl Storage<'_> {
         let headspace = self.materialize(DEFAULT_SCOPE_ID, "Headspace")?;
         let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
             .context("validate Headspace collection")?;
-        headspace::validate_secret_references_v2(&catalog, secrets.snapshot())
+        headspace::validate_secret_references(&catalog, secrets.snapshot())
             .context("validate exact Headspace credential references")?;
         Ok(Views {
             headspace,
@@ -385,7 +385,7 @@ fn preflight_headspace(views: &Views, fragment: &Fragment) -> Result<Catalog> {
         fragment,
     )
     .context("validate Headspace successor")?;
-    headspace::validate_secret_references_v2(&candidate, views.secrets.snapshot())
+    headspace::validate_secret_references(&candidate, views.secrets.snapshot())
         .context("validate successor's exact Secrets references")?;
     Ok(candidate)
 }

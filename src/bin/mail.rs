@@ -19,7 +19,7 @@ use faculties::schemas::{
     decide as decide_schema, files as files_schema, mail as mail_schema,
     relations as relations_schema,
 };
-use faculties::secrets::v2::storage as vaults;
+use faculties::secrets::storage as vaults;
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
@@ -96,7 +96,7 @@ enum AccountCommand {
         /// Mailbox secret. Prefer MAIL_PASS rather than a visible argv value.
         #[arg(long, env = "MAIL_PASS", hide_env_values = true, requires = "vault")]
         password: Option<String>,
-        /// Exact existing Secrets v2 version. This is the repair path when
+        /// Exact existing Secrets version. This is the repair path when
         /// a Secrets-first account update was interrupted before Mail commit.
         #[arg(long, value_parser = parse_id, conflicts_with = "password")]
         credential_version: Option<Id>,

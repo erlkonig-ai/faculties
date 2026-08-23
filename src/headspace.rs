@@ -34,7 +34,7 @@ use crate::schemas::headspace::{
     DEFAULT_SYSTEM_PROMPT, KIND_CONFIG_ID, KIND_LIVE_RECORD, KIND_MODEL_PROFILE_ID,
     KIND_PROFILE_ANCHOR_ID,
 };
-use crate::secrets::v2::SecretsSnapshot;
+use crate::secrets::SecretsSnapshot;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type CountValue = Inline<inlineencodings::U256BE>;
@@ -945,8 +945,8 @@ fn validate_secret_references_by(
     Ok(())
 }
 
-/// Validate exact references against the aggregate of ready v2 vault epochs.
-pub fn validate_secret_references_v2<R>(
+/// Validate exact references against the aggregate of ready vault epochs.
+pub fn validate_secret_references<R>(
     catalog: &Catalog,
     secrets: &SecretsSnapshot<R>,
 ) -> Result<()> {
@@ -998,7 +998,7 @@ pub fn open_active_secrets<R: BlobStoreGet>(
     secrets: &SecretsSnapshot<R>,
     signing_key: &SigningKey,
 ) -> Result<OpenedSecrets> {
-    validate_secret_references_v2(headspace, secrets)?;
+    validate_secret_references(headspace, secrets)?;
     let (config, profile) = settled_active(headspace)?;
     Ok(OpenedSecrets {
         model_api_key: open_utf8_secret(
@@ -1094,7 +1094,7 @@ mod tests {
     use triblespace::core::repo::BlobStore;
 
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
-    use crate::secrets::v2 as secrets;
+    use crate::secrets;
     use crate::test_support::grant_team_of_one_write_authority;
 
     fn test_id(byte: u8) -> Id {
@@ -1289,7 +1289,7 @@ mod tests {
 
         let (headspace_facts, headspace_reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let headspace = project_result(&headspace_reader, &headspace_facts).unwrap();
-        validate_secret_references_v2(&headspace, &secrets).unwrap();
+        validate_secret_references(&headspace, &secrets).unwrap();
         let opened = open_active_secrets(&headspace, &secrets, &signer).unwrap();
         assert_eq!(opened.model_api_key.as_deref(), Some("first"));
         pile.close().unwrap();
@@ -1319,7 +1319,7 @@ mod tests {
             Vec::<(Id, TribleSet)>::new(),
         )
         .unwrap();
-        let error = validate_secret_references_v2(&catalog, &secrets).unwrap_err();
+        let error = validate_secret_references(&catalog, &secrets).unwrap_err();
         assert!(format!("{error:#}").contains("missing exact model"));
         pile.close().unwrap();
     }

@@ -24,7 +24,7 @@ use faculties::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use faculties::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::triage::cog;
-use faculties::secrets::v2::storage::{self as vaults, VaultDiscovery};
+use faculties::secrets::storage::{self as vaults, VaultDiscovery};
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
