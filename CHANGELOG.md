@@ -65,38 +65,18 @@ All notable changes to this project will be documented in this file.
   checkpoint still parses, and its empty Teams set means the first check after
   the upgrade reports the standing conversation once.
 
-- **A node has one key, not two.** Every pile writer already has a durable
-  Ed25519 key beside its pile: it signs the collection commits and is the
-  node's identity. Secrets, separately, minted a *second* Ed25519 key per
-  identity and locked its private half behind a password. There was never a
-  cryptographic reason for two — sealing already converts an identity's
-  Ed25519 key to X25519, so one keypair does both jobs, and the only
-  difference was where the private half rested. But rights management is
-  expressed over node identity, so two identities per node needed a binding,
-  and that binding is exactly what never got built: the Secrets store sat
-  empty for months and the Teams integration was dead for want of it. An
-  identity's lockbox is now optional. Without one it is a *node identity*,
-  opened by the signing key beside the pile — no password, no second key to
-  keep. A record that carries a lockbox is opened by its password exactly as
-  before; the record decides, so neither kind can be handed the other's
-  material. `secrets node list` reads the roster the pile already attests
-  (every commit carries the key that signed it, and only verified commits are
-  discovered), and `secrets node adopt` names one — from public material
-  alone, so naming a node that has written here needs neither its
-  participation nor any key distribution. `--as` is now optional on `scope
-  create`, `grant`, `secret get`, and `secret share`, defaulting to this
-  node's own identity; `teams`, `mail`, `web`, and `headspace` fall through to
-  it when no selector and no `PERSONA` is set. **Naming is not entitlement.**
-  A named node is a principal an admin *may* grant to: `grant` still decides a
-  scope's recipients, `secret add` still seals only to those recipients,
-  `secret get` still needs a wrap addressed to the reader, and `revoke` plus
-  the `secret rotate` worklist mean exactly what they meant. `migrations
-  node-identity --nickname <name>` binds one pile's key. It is additive and
-  narrow — one identity record of public material, existing password-locked
-  identities untouched — and it deliberately stops there, reporting the
-  `secrets grant` and `secrets secret share` commands that finish the job
-  under an admin's authority rather than forging a grant from an admin it does
-  not act as.
+- **Secrets now uses exact vault epochs with direct public-key custody.** One
+  vault epoch is one private collection. Accepted exact `READ` authority for
+  that collection determines its recipient keys, while every encrypted secret
+  version has one immutable exact id. The durable pile signing key is the local
+  decryption key; the live model has no separate Secrets identity, node-adoption
+  record, password lockbox, scope graph, revocation ceremony, or latest-version
+  selector. `secrets vault create|list|members|grant` manages explicit epochs,
+  and `secrets secret add|get|share|list` operates on exact vault or version ids.
+  `migrations secrets-v2` projects the frozen v1 identity/scope collection into
+  one vault per confidentiality epoch, preserves encrypted versions and wraps,
+  grants the exact current readers direct `READ`, and verifies the resulting
+  local aggregate without printing plaintext.
 
 - **The Teams credentials the cutover retired are recoverable.** The collection
   cutover treats the legacy Teams OAuth rows as a bounded retired partition:
@@ -378,16 +358,15 @@ All notable changes to this project will be documented in this file.
   utterances, per-device route commits coalesce into complete generations,
   authored-empty Voice commits remain fact-empty with exact source-coordinate
   provenance, and unrelated Body deltas do not manufacture Voice authority.
-- **Secrets is a fixed native collection with reusable envelope semantics.**
-  The capability algebra, strict catalog, attachment validation, and envelope
-  operations live in `faculties-secrets`; the CLI loads one durable signer,
-  opens the pile once per command, and commits one self-contained `Fragment`
-  without Repository branches, CAS, signer rosters, or scope knobs. Its bounded
-  stopped-world migration preserves canonical Secrets identities, facts,
-  authored partitions, semantic metadata, attachment closure, and
-  authored-empty commits. It separately validates and retires the exact
-  historical Mail account/pointer shape found on the old Secrets branch, while
-  retaining that branch as inert source evidence.
+- **The fixed Secrets v1 root is retained as frozen migration source.** Its
+  strict identity/scope catalog, attachment validation, and envelope operations
+  remain in `faculties-secrets` so the bounded stopped-world migration can
+  preserve canonical facts, authored partitions, semantic metadata, attachment
+  closure, and authored-empty commits exactly. Current runtime reads and writes
+  v2 vault-epoch collections instead; the fixed root is historical evidence,
+  not a live identity/scope CLI surface. The migration also validates and
+  retires the exact historical Mail account/pointer shape found on the old
+  Secrets branch while retaining that branch as inert source evidence.
 - **Decisions are collection-native and preserve concurrent resolution.** A
   stable decision anchor has one immutable intrinsic genesis, while factors are
   additive occurrence records and resolutions form intrinsic predecessor DAGs.
@@ -397,12 +376,12 @@ All notable changes to this project will be documented in this file.
   and agreement quotients heads only by outcome plus forcedness while retaining
   distinct evidence and history. Publication validates the exact ontology,
   attachments, closed acyclic history, and all-head reconciliation.
-- **The reusable Secrets core loads its root password without exporting it to
-  every child process.** `FACULTIES_SECRETS_PW` remains the first source, then
+- **Frozen v1 recovery loads its root password without exporting it to every
+  child process.** `FACULTIES_SECRETS_PW` remains the first source, then
   `FACULTIES_SECRETS_PW_FILE` or the XDG configuration path is read on demand.
   Group- or world-readable files are refused and editor line endings are
-  stripped. The Secrets CLI consumes this shared capability instead of owning
-  another password loader.
+  stripped. Only migration and recovery paths consume this capability; the v2
+  Secrets CLI opens exact vault epochs with the durable signing key.
 - **Posture now runs on two fixed native collections.** Policy and scan
   fragments are committed through descriptor-handle V4 `Collection` records
   under one durable signer, with no live repository, branch, head, or CAS

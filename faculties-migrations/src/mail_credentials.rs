@@ -14,11 +14,12 @@
 //!
 //! This is the bridge, and like [`crate::teams_credentials`] it is deliberately
 //! **not** a pile writer. Publishing the recovered credential means sealing it
-//! to a Secrets scope and authoring a Mail account, which `mail account set`
-//! already does under an operator's authority. So this reads the frozen legacy
-//! branch, reports what survives, and on request unlocks the envelope and
-//! materializes the mailbox password into a `0600` file, alongside the
-//! non-secret settings the operator must pass back on the command line.
+//! into one exact ready Secrets v2 vault epoch and authoring a Mail account,
+//! which `mail account set --vault <id>` already does under an operator's
+//! authority. So this reads the frozen legacy branch, reports what survives,
+//! and on request unlocks the envelope and materializes the mailbox password
+//! into a `0600` file, alongside the non-secret settings the operator must pass
+//! back on the command line.
 //!
 //! The one difference from the Teams recovery is that the legacy rows here are
 //! *not* plaintext: the envelope is argon2id + secretbox keyed on the same root

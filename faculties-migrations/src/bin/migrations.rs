@@ -199,8 +199,8 @@ enum Command {
     /// next to the exact `mail account set` line that consumes it.
     ///
     /// Reporting needs no password; `--export` needs FACULTIES_SECRETS_PW (or
-    /// the configured password file), because the envelope predates the
-    /// identity/scope/grant ceremony and is keyed on the root password.
+    /// the configured password file), because the retired envelope predates
+    /// Secrets v2 vault epochs and is keyed on the frozen v1 root password.
     MailCredentials {
         /// Directory to receive the plaintext mailbox password. Without it,
         /// nothing is unsealed and only the shape is reported.
@@ -358,15 +358,12 @@ fn mail_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
     println!("  SMTP endpoint : {}", recovered.smtp_endpoint);
     println!("  password      : {} bytes", recovered.password_len);
 
-    // Deliberately a worklist, not an action. Sealing the password is an
-    // authorized act `mail account set` already owns, and it needs a Secrets
-    // scope to seal into — which on a pile whose only scope is `teams` does
-    // not exist yet.
-    println!("\nto publish it (the scope only needs creating once):");
-    println!("  secrets scope create --name mail --as <admin>");
-    println!("  secrets grant --object mail --subject <node identity> --as <admin>");
+    // Deliberately a worklist, not an action. `mail account set` owns sealing
+    // the password into one exact ready Secrets v2 vault epoch; recovery
+    // cannot choose that authority-scoped destination on the operator's behalf.
+    println!("\nto publish it (select one exact ready vault epoch with `secrets vault list`):");
     println!(
-        "  MAIL_PASS=\"$(cat {})\" mail account set \\\n    --address {} --display-name {:?} \\\n    --pop-endpoint {} --smtp-endpoint {} \\\n    --secret-scope mail",
+        "  MAIL_PASS=\"$(cat {})\" mail account set \\\n    --address {} --display-name {:?} \\\n    --pop-endpoint {} --smtp-endpoint {} \\\n    --vault <vault-id>",
         written.path.display(),
         recovered.address,
         recovered.display_name,
