@@ -864,7 +864,7 @@ pub fn recover_dek_for_migration<R: BlobStoreGet>(
         let candidate = recover_for_identity(reader, catalog, secret, identity_id, &keypair)?;
         if recovered
             .as_ref()
-            .is_some_and(|previous| previous.as_ref() != candidate.as_ref())
+            .is_some_and(|previous| previous.as_slice() != candidate.as_slice())
         {
             bail!("accessible legacy wraps open to competing DEKs");
         }
