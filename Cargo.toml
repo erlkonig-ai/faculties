@@ -163,8 +163,8 @@ chrono = { version = "0.4.39", features = ["clock"] }  # orient
 comemo = "0.5.1"            # wiki
 ctrlc = "3.5"               # body (graceful close for kept touch loops)
 dirs = "5"                  # wiki
-dryoc = "0.8"               # secrets CLI selftest
 hex = "0.4"                 # gauge
+zeroize = "1.9"             # secrets CLI plaintext lifetime
 humantime = "2.3.0"         # orient, patience
 ical = "0.11"               # planner
 itertools = "0.14"          # wiki

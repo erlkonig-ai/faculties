@@ -3878,7 +3878,6 @@ dependencies = [
  "ctrlc",
  "cubecl",
  "dirs 5.0.1",
- "dryoc",
  "ed25519-dalek",
  "egui",
  "faculties-migrations",
@@ -3916,6 +3915,7 @@ dependencies = [
  "triblespace-search",
  "typst",
  "typst-syntax",
+ "zeroize",
  "zip",
  "zmij",
 ]

@@ -31,6 +31,7 @@ use zeroize::Zeroizing;
 use crate::schema::{secret_body, wrap_dek, wrap_secret, KIND_SECRET, KIND_WRAP};
 
 pub mod schema;
+pub mod storage;
 
 use self::schema::{wrap_recipient_key, KIND_VAULT};
 
@@ -614,7 +615,8 @@ pub fn load_catalog(vault: Id, space: &TribleSet) -> Result<VaultCatalog> {
     })
 }
 
-fn read_text<R: BlobStoreGet>(reader: &R, handle: TextHandle) -> Result<String> {
+/// Read one canonical UTF-8 attachment referenced by a vault record.
+pub fn read_text<R: BlobStoreGet>(reader: &R, handle: TextHandle) -> Result<String> {
     let value: anybytes::View<str> = reader.get(handle).context("read UTF-8 attachment")?;
     Ok(value.to_string())
 }
