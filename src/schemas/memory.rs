@@ -5,7 +5,7 @@
 //! that wants to read memory chunks from a pile.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
@@ -84,10 +84,9 @@ pub mod archive_import_schema {
 /// or persona attribute, and every reader reads all of them. One being, one
 /// memory; many sessions, many cursors.
 ///
-/// Mutation model is coordinate-and-cursor: every advance appends a new
-/// dated cursor entity; readers take the latest `metadata::created_at` per
-/// (stream, persona). The comb's own progress accumulates as auditable
-/// exhaust — no state is ever overwritten.
+/// Cursor snapshots form an intrinsic `metadata::supersedes` DAG per
+/// (stream, persona). Readers expose concurrent heads until a later snapshot
+/// reconciles the live frontier; observation times remain additive exhaust.
 pub mod comb {
     use super::*;
 
@@ -107,81 +106,6 @@ pub mod comb {
         /// Replay granularity as typed (e.g. "2h", "1d", "30d") — stored on
         /// memory-replay cursors so a bare `memory replay` knows its zoom.
         "AEF10362CC939FA43CBED29D84CCAC13" unsafe as cursor_grain: ShortString;
-    }
-
-    use triblespace::core::id::ufoid;
-    use triblespace::core::metadata;
-    use triblespace::macros::{entity, find, pattern};
-
-    fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
-        let (lower, _): (hifitime::Epoch, hifitime::Epoch) = interval.try_from_inline().unwrap();
-        lower.to_tai_duration().total_nanoseconds()
-    }
-
-    /// Latest cursor for (stream, persona): None = never started,
-    /// Some((None, _)) = stopped, Some((Some(key), grain)) = active.
-    pub fn latest(
-        catalog: &TribleSet,
-        stream: &str,
-        persona: &str,
-    ) -> Option<(Option<i128>, Option<String>)> {
-        let mut best: Option<(i128, Option<i128>, Option<String>)> = None;
-        for (cursor_id, c_stream, c_persona, created) in find!(
-            (c: Id, s: String, p: String, t: Inline<NsTAIInterval>),
-            pattern!(catalog, [{
-                ?c @
-                    metadata::tag: kind_comb_cursor,
-                    cursor_stream: ?s,
-                    cursor_persona: ?p,
-                    metadata::created_at: ?t,
-            }])
-        ) {
-            if c_stream != stream || c_persona != persona {
-                continue;
-            }
-            let created_key = interval_key(created);
-            let position = find!(
-                v: Inline<NsTAIInterval>,
-                pattern!(catalog, [{ cursor_id @ cursor_position: ?v }])
-            )
-            .next()
-            .map(interval_key);
-            let grain = find!(
-                g: String,
-                pattern!(catalog, [{ cursor_id @ cursor_grain: ?g }])
-            )
-            .next();
-            match best {
-                Some((prev, _, _)) if prev >= created_key => {}
-                _ => best = Some((created_key, position, grain)),
-            }
-        }
-        best.map(|(_, position, grain)| (position, grain))
-    }
-
-    /// Facts for a cursor advance (append-only latest-wins; the comb's
-    /// progress accumulates as auditable exhaust). `position: None` = stop.
-    pub fn advance_change(
-        stream: &str,
-        persona: &str,
-        position: Option<hifitime::Epoch>,
-        grain: Option<&str>,
-        now: hifitime::Epoch,
-    ) -> TribleSet {
-        let cursor_id = ufoid();
-        let now_val: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
-        let position_val: Option<Inline<NsTAIInterval>> =
-            position.map(|p| (p, p).try_to_inline().unwrap());
-        let mut change = TribleSet::new();
-        change += entity! { &cursor_id @
-            metadata::tag: kind_comb_cursor,
-            cursor_stream: stream,
-            cursor_persona: persona,
-            metadata::created_at: now_val,
-            cursor_position?: position_val,
-            cursor_grain?: grain,
-        };
-        change
     }
 }
 

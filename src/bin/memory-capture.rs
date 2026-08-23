@@ -1,7 +1,5 @@
-//! Minimal native-collection capture target for iterating on the memory widget.
-//! The production Memory faculty now uses a native collection; this notebook
-//! remains an explicit compatibility surface for historical `memory` and
-//! `cognition` branches until the widget itself is ported.
+//! Minimal native-collection capture target for iterating on the Memory widget.
+//! It loads the canonical Memory collection through shared widget storage.
 
 use std::path::PathBuf;
 

@@ -7,12 +7,9 @@
 //! commits; contentless repository merges carry ancestry but create no new
 //! authority.
 //!
-//! This module deliberately does **not** pretend that the live Files CLI has
-//! already cut over. Live reads still need the next neutral seam: authorize
-//! collection commits, resolve validated merge/derive equations, and
-//! materialize the selected physical cover into a queryable snapshot. Until
-//! that exists, retaining `Repository` behind a collection-shaped facade would
-//! merely hide the old pin/CAS model.
+//! The live Files CLI already reads and writes its native collection. This
+//! stopped-world module exists solely to translate a frozen legacy branch into
+//! that representation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
