@@ -47,10 +47,7 @@ impl Bucket {
             "  revisions scanned:              {}",
             self.revisions_scanned
         );
-        println!(
-            "  references naming a revision:   {}",
-            self.revision_refs
-        );
+        println!("  references naming a revision:   {}", self.revision_refs);
         println!(
             "  references naming nothing:      {} across {} revision(s), naming {} distinct id(s)",
             self.unresolvable_refs,
@@ -69,10 +66,7 @@ impl Bucket {
             "    inside fenced code blocks:    {}",
             self.unresolvable_fenced
         );
-        println!(
-            "  truncated (non-32-hex) refs:    {}",
-            self.truncated_refs
-        );
+        println!("  truncated (non-32-hex) refs:    {}", self.truncated_refs);
     }
 }
 
@@ -89,8 +83,8 @@ fn main() -> Result<()> {
         faculties::schemas::wiki::DEFAULT_SCOPE_ID,
         signer,
     )
-        .materialize()
-        .context("materialize Wiki collection")?;
+    .materialize()
+    .context("materialize Wiki collection")?;
     let reader = handle.reader().context("open Wiki attachment reader")?;
     let catalog = wiki_model::load_catalog(&facts)?;
     let model = &catalog.revisions;

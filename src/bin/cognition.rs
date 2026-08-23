@@ -8,11 +8,11 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use faculties::storage::{load_signer, open_pile_strict};
-use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
 use faculties::cognition;
-use triblespace::core::repo::BlobStore;
 use faculties::legacy_hint::open_scope;
+use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
+use faculties::storage::{load_signer, open_pile_strict};
+use triblespace::core::repo::BlobStore;
 
 #[derive(Parser)]
 #[command(

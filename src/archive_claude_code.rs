@@ -41,7 +41,7 @@ use hifitime::Epoch;
 use rayon::prelude::*;
 use triblespace::core::blob::Bytes;
 use triblespace::core::import::scanner as sc;
-use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
@@ -1795,7 +1795,7 @@ mod tests {
     use triblespace::core::metadata;
     use triblespace::core::repo::pile::{Pile, PileReader};
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
-    use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+    use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;

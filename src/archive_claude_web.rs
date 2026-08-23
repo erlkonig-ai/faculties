@@ -1047,7 +1047,7 @@ mod tests {
     use tempfile::TempDir;
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
     use triblespace::macros::{exists, pattern};
-    use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+    use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;

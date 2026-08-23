@@ -5,8 +5,8 @@
 //! that wants to read archived conversations or import provenance from a pile.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::UTF8String;
 pub use triblespace::prelude::blobencodings::RawBytes;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 

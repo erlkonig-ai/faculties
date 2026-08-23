@@ -381,10 +381,7 @@ fn validate_legacy_identity(
 
 /// Strictly load the marker-free historical Voice ontology under the v1
 /// intrinsic-identity rule. This seam exists only for stopped-world cutover.
-pub fn validate_legacy_catalog_v1(
-    reader: &PileReader,
-    facts: &TribleSet,
-) -> Result<VoiceCatalog> {
+pub fn validate_legacy_catalog_v1(reader: &PileReader, facts: &TribleSet) -> Result<VoiceCatalog> {
     let route_ids = tagged_entities(facts, KIND_ROUTE);
     let utterance_ids = tagged_entities(facts, KIND_UTTERANCE);
     if let Some(id) = route_ids.intersection(&utterance_ids).next() {

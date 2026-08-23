@@ -8,18 +8,18 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::legacy_hint::open_scope;
 use faculties::message::{self, IntervalValue, MessageRow};
 use faculties::relations::{self, IdentityComponents};
 use faculties::schemas::message::DEFAULT_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
-use faculties::legacy_hint::open_scope;
 
 #[derive(Parser)]
 #[command(
@@ -93,8 +93,7 @@ impl MessageStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
 
-        let mut relations_collection =
-            open_scope(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.clone());
+        let mut relations_collection = open_scope(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.clone());
         let relations_result = (|| {
             let facts = relations_collection
                 .materialize()

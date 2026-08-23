@@ -18,7 +18,7 @@
 //! future VLA model can ground the moment in the body state that produced it.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, ShortString, U256BE};
 use triblespace::prelude::*;
 

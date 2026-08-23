@@ -75,7 +75,10 @@ fn root(parent: &mut BTreeMap<Id, Id>, id: Id) -> Id {
 fn wiki_frontiers_by_hand(records: &[wiki_model::RevisionRecord]) -> BTreeSet<Vec<Id>> {
     let by_id: BTreeMap<Id, &wiki_model::RevisionRecord> =
         records.iter().map(|record| (record.id, record)).collect();
-    let mut parent: BTreeMap<Id, Id> = records.iter().map(|record| (record.id, record.id)).collect();
+    let mut parent: BTreeMap<Id, Id> = records
+        .iter()
+        .map(|record| (record.id, record.id))
+        .collect();
     for record in records {
         for predecessor in &record.supersedes {
             if parent.contains_key(predecessor) {
@@ -90,7 +93,10 @@ fn wiki_frontiers_by_hand(records: &[wiki_model::RevisionRecord]) -> BTreeSet<Ve
     }
     let mut components: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
     for id in records.iter().map(|record| record.id) {
-        components.entry(root(&mut parent, id)).or_default().push(id);
+        components
+            .entry(root(&mut parent, id))
+            .or_default()
+            .push(id);
     }
     components
         .into_values()
@@ -310,7 +316,11 @@ fn properties(space: &TribleSet) -> Result<()> {
     // permutation of the candidate order can move the answer.
     let mut checked = 0usize;
     for entry in deep.iter().take(500) {
-        let forwards = latest(space, metadata::supersedes.id(), entry.members.iter().copied());
+        let forwards = latest(
+            space,
+            metadata::supersedes.id(),
+            entry.members.iter().copied(),
+        );
         let backwards = latest(
             space,
             metadata::supersedes.id(),
@@ -393,9 +403,7 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
                 metadata::created_at: ?at,
             }])
         )
-        .max_by(|left, right| {
-            (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0))
-        })
+        .max_by(|left, right| (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0)))
         .map(|(event, _, _)| event)
     }
 
@@ -486,9 +494,7 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
     );
     println!("  goals examined: {compared} · goals carrying a status: {with_status}");
     println!("  goals with more than one status event: {multi_event}");
-    println!(
-        "  goals the grouping-as-identity reading loses: {broken_by_a_foreign_kind}"
-    );
+    println!("  goals the grouping-as-identity reading loses: {broken_by_a_foreign_kind}");
     println!("  agreements: {agreed} of {compared}");
     assert!(compared > 0, "no goals examined: the gate would be vacuous");
     assert!(
@@ -509,9 +515,7 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
          the register would have nothing to fix"
     );
     if agreed == compared {
-        println!(
-            "  GATE PASS: the status register == compass's (created_at, event id) max_by"
-        );
+        println!("  GATE PASS: the status register == compass's (created_at, event id) max_by");
         Ok(())
     } else {
         std::process::exit(1);
@@ -522,9 +526,7 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
 /// — and the reader subtracts. This checks the derived index answers exactly
 /// what the live order does over the wiki's revisions.
 fn gate_derived_observed_index(space: &TribleSet) -> Result<()> {
-    use triblespace::core::collection::observed_union::{
-        derive_element, join, ObservedIndex,
-    };
+    use triblespace::core::collection::observed_union::{derive_element, join, ObservedIndex};
 
     let catalog = wiki_model::load_catalog(space)?;
     let entries = catalog.revisions.all_entries();
@@ -546,8 +548,8 @@ fn gate_derived_observed_index(space: &TribleSet) -> Result<()> {
         "the observed-set join is not idempotent on live data"
     );
 
-    let index =
-        ObservedIndex::decode(&derived).map_err(|error| anyhow::anyhow!("decode failed: {error}"))?;
+    let index = ObservedIndex::decode(&derived)
+        .map_err(|error| anyhow::anyhow!("decode failed: {error}"))?;
     let from_index = resolve(&index, members.iter().copied());
     let from_live = latest(space, metadata::supersedes.id(), members.iter().copied());
 

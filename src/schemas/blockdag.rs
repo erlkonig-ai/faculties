@@ -23,8 +23,8 @@
 //! exact values are kept here beside the protocol they identify.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::UTF8String;
 pub use triblespace::prelude::blobencodings::RawBytes;
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 

@@ -430,7 +430,12 @@ pub fn tagged_entities(facts: &TribleSet, tag: Id) -> Result<BTreeSet<Id>> {
     Ok(entities)
 }
 
-pub fn require_tags(facts: &TribleSet, entity: Id, expected: BTreeSet<Id>, kind: &str) -> Result<()> {
+pub fn require_tags(
+    facts: &TribleSet,
+    entity: Id,
+    expected: BTreeSet<Id>,
+    kind: &str,
+) -> Result<()> {
     let actual = id_values(facts, entity, &metadata::tag)?
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -653,4 +658,3 @@ pub fn require_canonical_exemplar(value: &str) -> Result<()> {
     }
     Ok(())
 }
-

@@ -413,9 +413,7 @@ fn main() -> Result<()> {
             all,
             hold_secs,
         }) => cmd_read(&session, peek, all, hold_secs),
-        Some(Command::Say { text, keep_floor }) => {
-            cmd_say(&session, &text.join(" "), keep_floor)
-        }
+        Some(Command::Say { text, keep_floor }) => cmd_say(&session, &text.join(" "), keep_floor),
         Some(Command::Release { keep_cursor }) => cmd_release(&session, keep_cursor),
         Some(Command::Status) => cmd_status(&session),
         Some(Command::Run(args)) => cmd_run(&session, *args),
@@ -522,8 +520,7 @@ fn write_cursor(session: &Path, seq: u64) -> Result<()> {
     let path = session.join(CURSOR_FILE);
     let staged = session.join(".cursor.tmp");
     std::fs::write(&staged, seq.to_string())?;
-    std::fs::rename(&staged, &path)
-        .with_context(|| format!("publish {}", path.display()))?;
+    std::fs::rename(&staged, &path).with_context(|| format!("publish {}", path.display()))?;
     Ok(())
 }
 
@@ -537,8 +534,7 @@ fn take_floor(session: &Path, hold_secs: u64) -> Result<()> {
     let deadline = now_millis() + hold_secs.saturating_mul(1_000);
     let staged = session.join(".hold.tmp");
     std::fs::write(&staged, deadline.to_string())?;
-    std::fs::rename(&staged, session.join(HOLD_FILE))
-        .context("publish the floor hold")?;
+    std::fs::rename(&staged, session.join(HOLD_FILE)).context("publish the floor hold")?;
     let _ = std::fs::remove_file(session.join(RELEASE_FILE));
     Ok(())
 }
@@ -568,8 +564,7 @@ fn give_floor(session: &Path) -> Result<()> {
 /// the loop never observes a half-written file.
 fn inject(session: &Path, text: &str) -> Result<PathBuf> {
     let dir = session.join(INJECT_DIR);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -662,10 +657,16 @@ fn cmd_say(session: &Path, text: &str, keep_floor: bool) -> Result<()> {
         .unwrap_or_else(|| read_cursor(session));
     write_cursor(session, last)?;
     if keep_floor {
-        println!("queued ({}), cursor at {last}, floor still held", published.display());
+        println!(
+            "queued ({}), cursor at {last}, floor still held",
+            published.display()
+        );
     } else {
         give_floor(session)?;
-        println!("queued ({}), cursor at {last}, floor released", published.display());
+        println!(
+            "queued ({}), cursor at {last}, floor released",
+            published.display()
+        );
     }
     Ok(())
 }
@@ -674,7 +675,10 @@ fn cmd_release(session: &Path, keep_cursor: bool) -> Result<()> {
     ensure_session(session)?;
     give_floor(session)?;
     if keep_cursor {
-        println!("floor released, cursor unchanged at {}", read_cursor(session));
+        println!(
+            "floor released, cursor unchanged at {}",
+            read_cursor(session)
+        );
     } else {
         let last = read_lines(session)?
             .last()
@@ -692,7 +696,10 @@ fn cmd_status(session: &Path) -> Result<()> {
     let last = lines.last().map(|line| line.seq).unwrap_or(0);
     println!("session   : {}", session.display());
     println!("transcript: {} lines, latest seq {last}", lines.len());
-    println!("cursor    : {cursor} ({} unread)", last.saturating_sub(cursor));
+    println!(
+        "cursor    : {cursor} ({} unread)",
+        last.saturating_sub(cursor)
+    );
     println!(
         "floor     : {}",
         if floor_held(session) {
@@ -728,7 +735,10 @@ fn cmd_devices() -> Result<()> {
         }
     }
     println!("playback devices (--output):");
-    for device in host.output_devices().context("enumerate playback devices")? {
+    for device in host
+        .output_devices()
+        .context("enumerate playback devices")?
+    {
         let name = device.name().unwrap_or_else(|_| "<unnamed>".into());
         match device.default_output_config() {
             Ok(config) => println!(
@@ -1508,7 +1518,9 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
         faculties::voice::validate_candidate(&reader, &facts, &fragment)?;
         let mut described = fragment.clone();
         described.describe_with(entity! { metadata::description: "duplex spoke" });
-        collection.commit(described).context("commit the utterance")?;
+        collection
+            .commit(described)
+            .context("commit the utterance")?;
         Ok(())
     })();
     let pile = collection.into_storage();
@@ -1585,7 +1597,10 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         args.decode_hop,
     )?;
 
-    println!("duplex: loading the model from {} …", args.weights.display());
+    println!(
+        "duplex: loading the model from {} …",
+        args.weights.display()
+    );
     let load_start = Instant::now();
     let source = mary::persist::personaplex_bundle(&args.weights)
         .with_context(|| format!("load the model from {}", args.weights.display()))?
@@ -1746,7 +1761,11 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             if now_held != held {
                 println!(
                     "duplex: floor {}",
-                    if now_held { "TAKEN — silent" } else { "released" }
+                    if now_held {
+                        "TAKEN — silent"
+                    } else {
+                        "released"
+                    }
                 );
                 held = now_held;
             }
@@ -1852,7 +1871,6 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             }
         };
 
-
         // Two ways to put a word on stream 0, and they divide the labour
         // differently. Forcing a token supplies WHAT is said and WHEN; under
         // `--cadence model` we supply only the what, and the model keeps the
@@ -1866,8 +1884,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             let gap = &mut since_onset;
             let spm_ref = &spm;
             let onset = move |t: i64| {
-                t >= N_TEXT_SPECIALS
-                    && spm_ref.piece_bytes(t).starts_with("\u{2581}".as_bytes())
+                t >= N_TEXT_SPECIALS && spm_ref.piece_bytes(t).starts_with("\u{2581}".as_bytes())
             };
             let mut decide = |_logits: &[f32], sampled: i64| -> i64 {
                 if sampled >= N_TEXT_SPECIALS {
@@ -2183,7 +2200,9 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             100.0 * nudged as f64 / (model_chose + nudged) as f64
         );
         if held_back > 0 {
-            println!("          and held it back {held_back} frames for --min-word-gap {min_word_gap}");
+            println!(
+                "          and held it back {held_back} frames for --min-word-gap {min_word_gap}"
+            );
         }
     }
     drop(capture);

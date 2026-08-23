@@ -19,11 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{bail, Result};
 
-use triblespace::core::blob::encodings::utf8string::UTF8String;
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use ed25519_dalek::VerifyingKey;
-use triblespace::core::trible::Fragment;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
+use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::records::{
     collection_recipe, collection_representation, collection_source, CollectionHandle,
     KIND_COLLECTION_DESCRIPTOR,
@@ -36,10 +35,11 @@ use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::inline::{Inline, InlineEncoding, IntoInline, RawInline, TryFromInline};
 use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::macros::entity;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace::core::trible::Fragment;
 use triblespace::core::trible::{build_intrinsic_entity, IntrinsicEntityRow, Trible, TribleSet};
+use triblespace::macros::entity;
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
 use triblespace_search::tokens::{hash_tokens, WordHash};
 

@@ -23,7 +23,7 @@ use hifitime::Epoch;
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 use triblespace_search::bm25::BM25Builder;

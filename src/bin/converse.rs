@@ -88,7 +88,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Default system context for the brain turn. Deliberately short: the pile's
@@ -268,7 +268,10 @@ fn run(args: RunArgs) -> Result<()> {
         if let Ok(mut f) = std::fs::File::open(&args.log) {
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
             if len < pos {
-                eprintln!("log truncated/rotated ({} -> {} bytes); restarting from 0", pos, len);
+                eprintln!(
+                    "log truncated/rotated ({} -> {} bytes); restarting from 0",
+                    pos, len
+                );
                 pos = 0;
                 partial.clear();
             }
@@ -353,10 +356,13 @@ fn handle_line(
 
     if let Some(reason) = drop_reason {
         println!("[heard ] {text:?} ({dur_s:.2}s) → DROPPED: {reason}");
-        log_turn(&args.out, &serde_json::json!({
-            "utc_ms": now_ms(), "utc_ms_heard": utc_ms, "heard": text,
-            "dur_s": dur_s, "dropped": reason,
-        }));
+        log_turn(
+            &args.out,
+            &serde_json::json!({
+                "utc_ms": now_ms(), "utc_ms_heard": utc_ms, "heard": text,
+                "dur_s": dur_s, "dropped": reason,
+            }),
+        );
         return Ok(false);
     }
 
@@ -405,7 +411,11 @@ fn handle_line(
             false
         }
         Speak::Say | Speak::Shout => {
-            let channel = if args.speak == Speak::Say { "say" } else { "shout" };
+            let channel = if args.speak == Speak::Say {
+                "say"
+            } else {
+                "shout"
+            };
             let status = Proc::new(&args.voice_bin)
                 .args([channel, reply.as_str()])
                 .status()
@@ -421,13 +431,16 @@ fn handle_line(
     *speak_window = Some((speak_start, speak_end));
     let speak_s = t.elapsed().as_secs_f64();
 
-    log_turn(&args.out, &serde_json::json!({
-        "utc_ms": speak_start, "utc_ms_heard": utc_ms,
-        "heard": text, "dur_s": dur_s,
-        "reply": reply, "brain": brain_used, "brain_s": brain_s,
-        "speak": format!("{:?}", args.speak).to_lowercase(), "spoke": spoke,
-        "speak_s": speak_s,
-    }));
+    log_turn(
+        &args.out,
+        &serde_json::json!({
+            "utc_ms": speak_start, "utc_ms_heard": utc_ms,
+            "heard": text, "dur_s": dur_s,
+            "reply": reply, "brain": brain_used, "brain_s": brain_s,
+            "speak": format!("{:?}", args.speak).to_lowercase(), "spoke": spoke,
+            "speak_s": speak_s,
+        }),
+    );
     Ok(true)
 }
 
@@ -494,11 +507,15 @@ struct PauseGuard {
 
 impl PauseGuard {
     fn hold(path: &Path) -> Self {
-        let created = std::fs::write(path, format!("converse pid {}\n", std::process::id())).is_ok();
+        let created =
+            std::fs::write(path, format!("converse pid {}\n", std::process::id())).is_ok();
         if !created {
             eprintln!("warning: could not create pause file {}", path.display());
         }
-        Self { path: path.to_path_buf(), created }
+        Self {
+            path: path.to_path_buf(),
+            created,
+        }
     }
 }
 

@@ -809,7 +809,7 @@ mod tests {
     use triblespace::core::repo::pile::{Pile, PileReader};
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
     use triblespace::macros::{find, pattern};
-    use triblespace::prelude::blobencodings::{UTF8String, RawBytes};
+    use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;

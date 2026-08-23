@@ -5,8 +5,8 @@
 //! the lanes presented first by clients.
 
 use triblespace::core::metadata;
-use triblespace::macros::{find, id_hex, pattern};
 use triblespace::core::query::intersectionconstraint::and;
+use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
 /// Stable scope of the authored Compass collection.
@@ -94,7 +94,9 @@ pub fn interval_key(interval: IntervalValue) -> i128 {
 /// Both attributes are the register, and neither is a filter. Which measure
 /// of domination this is, is [`StatedOrder::recipe_id`] — not something a
 /// call site restates.
-pub fn status_register(space: &TribleSet) -> StatedOrder<'_, TribleSet, inlineencodings::NsTAIInterval> {
+pub fn status_register(
+    space: &TribleSet,
+) -> StatedOrder<'_, TribleSet, inlineencodings::NsTAIInterval> {
     StatedOrder::new(space, board::status_of.id(), metadata::created_at.id()).tiebreak_by_id()
 }
 

@@ -38,9 +38,7 @@ use ed25519_dalek::SigningKey;
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::PileReader;
 
-use faculties_secrets::{
-    identity_by_public_key, resolve_identity, IdentitySecret, SecretsCatalog,
-};
+use faculties_secrets::{identity_by_public_key, resolve_identity, IdentitySecret, SecretsCatalog};
 
 use crate::storage::load_signer;
 
@@ -102,8 +100,8 @@ pub fn identity_secret(
     if row.is_node_identity() {
         Ok(IdentitySecret::Node(signer.clone()))
     } else {
-        Ok(IdentitySecret::Password(
-            faculties_secrets::password::read(purpose)?,
-        ))
+        Ok(IdentitySecret::Password(faculties_secrets::password::read(
+            purpose,
+        )?))
     }
 }

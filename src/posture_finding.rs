@@ -187,7 +187,6 @@ fn finding_fragment(modality: Id, location: &Location) -> (Fragment, Id) {
     (fragment, id)
 }
 
-
 // ── the git side of locating source material ────────────────────────────────
 //
 // Shared with the findings migration on purpose: a bridged legacy occurrence
@@ -271,7 +270,17 @@ pub fn blame_origin(
     let range = format!("{line},{line}");
     let porcelain = git_bytes(
         repo_root,
-        &["blame", "--porcelain", "-M", "-C", "-L", &range, commit, "--", path],
+        &[
+            "blame",
+            "--porcelain",
+            "-M",
+            "-C",
+            "-L",
+            &range,
+            commit,
+            "--",
+            path,
+        ],
     )
     .ok()?;
     let porcelain = String::from_utf8_lossy(&porcelain);
@@ -297,15 +306,24 @@ pub struct GitObjects {
 impl GitObjects {
     /// Object id of `path` at `treeish`, or `None` when that tree has no such
     /// path (the commit deleted it, or it was never there).
-    pub fn blob_at(&mut self, repo_root: &Path, treeish: &str, path: &str) -> Result<Option<String>> {
+    pub fn blob_at(
+        &mut self,
+        repo_root: &Path,
+        treeish: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
         let key = (treeish.to_owned(), path.to_owned());
         if let Some(found) = self.paths.get(&key) {
             return Ok(found.clone());
         }
         let object = format!("{treeish}:{path}");
-        let found = git_probe(repo_root, &["rev-parse", "--verify", "--quiet", &object], &[1])?
-            .map(|id| id.trim().to_owned())
-            .filter(|id| !id.is_empty());
+        let found = git_probe(
+            repo_root,
+            &["rev-parse", "--verify", "--quiet", &object],
+            &[1],
+        )?
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty());
         self.paths.insert(key, found.clone());
         Ok(found)
     }
@@ -349,7 +367,8 @@ impl GitObjects {
             let Some((start, end)) = line_range(&bytes, at_line) else {
                 continue;
             };
-            let Some(offset) = find_ascii_ci(&bytes[start as usize..end as usize], needle.as_bytes())
+            let Some(offset) =
+                find_ascii_ci(&bytes[start as usize..end as usize], needle.as_bytes())
             else {
                 continue;
             };
@@ -370,11 +389,13 @@ impl GitObjects {
     }
 }
 
-
-
 /// Run git where a nonzero status can be an ordinary answer ("no such
 /// object", "no origin remote") rather than a failure.
-pub fn git_probe(repo_path: &Path, args: &[&str], absent_statuses: &[i32]) -> Result<Option<String>> {
+pub fn git_probe(
+    repo_path: &Path,
+    args: &[&str],
+    absent_statuses: &[i32],
+) -> Result<Option<String>> {
     let output = std::process::Command::new("git")
         .env("LC_ALL", "C")
         .arg("-C")
@@ -407,14 +428,19 @@ pub fn git_probe(repo_path: &Path, args: &[&str], absent_statuses: &[i32]) -> Re
     )
 }
 
-
 /// Where a protected term sits inside a commit message.
 ///
 /// A commit message has no blob, so the carrier is the commit itself — the one
 /// coordinate commit surgery still moves, and the honest place to say so. The
 /// scanner and the findings migration both call this so a bridged id is the
 /// same id a re-scan derives.
-pub fn commit_message_location(sha: &str, offset: usize, line: &str, line_index: usize, needle: &str) -> Location {
+pub fn commit_message_location(
+    sha: &str,
+    offset: usize,
+    line: &str,
+    line_index: usize,
+    needle: &str,
+) -> Location {
     match find_ascii_ci(line.as_bytes(), needle.as_bytes()) {
         Some(at) => {
             let start = (offset + at) as u64;
