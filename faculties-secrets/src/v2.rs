@@ -25,15 +25,12 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
-// These v1 names already mean exactly “encrypted secret body”, “wrap points
-// to secret”, “sealed DEK”, and the corresponding record kinds. Reusing them
-// is semantic continuity; only the direct-key recipient attribute is new.
-use crate::schema::{secret_body, wrap_dek, wrap_secret, KIND_SECRET, KIND_WRAP};
-
 pub mod schema;
 pub mod storage;
 
-use self::schema::{wrap_recipient_key, KIND_VAULT};
+use self::schema::{
+    secret_body, wrap_dek, wrap_recipient_key, wrap_secret, KIND_SECRET, KIND_VAULT, KIND_WRAP,
+};
 
 /// Consumer-owned action meaning permission to decrypt one exact vault.
 ///
