@@ -59,6 +59,8 @@ enum Command {
     },
     /// List every standing intention and its current fork-visible state.
     List,
+    /// Show one immutable definition, including its nudge and predecessors.
+    Show { habit: String },
     /// Print only intentions which are due now.
     Due,
     /// Record completion. The cooldown starts at this occurrence.
@@ -132,6 +134,30 @@ fn select_live_habit<'a>(catalog: &'a Catalog, selector: &str) -> Result<&'a Hab
         bail!("Habit {id:x} is superseded history and cannot be mutated");
     }
     Ok(habit)
+}
+
+/// Resolve any definition, including superseded history, for inspection.
+fn select_habit<'a>(catalog: &'a Catalog, selector: &str) -> Result<&'a Habit> {
+    let selector = selector.trim();
+    let labelled: Vec<_> = catalog
+        .habits()
+        .filter(|habit| habit.label.eq_ignore_ascii_case(selector))
+        .collect();
+    match labelled.as_slice() {
+        [habit] => return Ok(*habit),
+        [] => {}
+        many => bail!(
+            "label {selector:?} names {} Habit revisions; address one by id: {}",
+            many.len(),
+            id_list(many)
+        ),
+    }
+
+    let id = faculties::resolve_id_prefix(selector, catalog.habits().map(|habit| habit.id))
+        .map_err(|error| anyhow!("no Habit labelled {selector:?}, and {error}"))?;
+    catalog
+        .habit(id)
+        .ok_or_else(|| anyhow!("no Habit definition {id:x}"))
 }
 
 /// Resolve one revision predecessor by intrinsic id or id prefix.
@@ -319,6 +345,45 @@ fn cmd_list(pile: &Path, key: Option<&Path>, only_due: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_show(pile: &Path, key: Option<&Path>, selector: &str) -> Result<()> {
+    let catalog = habits::read_catalog(pile, key)?;
+    let habit = select_habit(&catalog, selector)?;
+    println!("label:       {}", habit.label);
+    println!("id:          {:x}", habit.id);
+    println!(
+        "definition:  {}",
+        if catalog.is_superseded(habit.id) {
+            "superseded"
+        } else {
+            "live"
+        }
+    );
+    println!("condition:   {}", habit.condition);
+    println!("nudge:\n{}", habit.nudge);
+    match &habit.script {
+        Some(script) => println!(
+            "script:      {} ({} bytes, carried in the pile)",
+            script.digest(),
+            script.bytes.len()
+        ),
+        None => println!("script:      none"),
+    }
+    if habit.supersedes.is_empty() {
+        println!("supersedes:  none");
+    } else {
+        println!(
+            "supersedes:  {}",
+            habit
+                .supersedes
+                .iter()
+                .map(|id| format!("{id:x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn cmd_done(pile: &Path, key: Option<&Path>, label: &str) -> Result<()> {
     let catalog = habits::read_catalog(pile, key)?;
     let habit = select_live_habit(&catalog, label)?;
@@ -368,6 +433,7 @@ fn main() -> Result<()> {
             supersedes,
         ),
         Some(Command::List) => cmd_list(&cli.pile, cli.key.as_deref(), false),
+        Some(Command::Show { habit }) => cmd_show(&cli.pile, cli.key.as_deref(), &habit),
         Some(Command::Due) => cmd_list(&cli.pile, cli.key.as_deref(), true),
         Some(Command::Done { label }) => cmd_done(&cli.pile, cli.key.as_deref(), &label),
         Some(Command::Pause { label }) => {
@@ -438,6 +504,14 @@ mod tests {
             error.to_string().contains("superseded history"),
             "{error:#}"
         );
+        assert_eq!(
+            select_habit(&catalog, &format!("{original_id:x}"))
+                .unwrap()
+                .id,
+            original_id
+        );
+        let error = select_habit(&catalog, "sweep").unwrap_err();
+        assert!(error.to_string().contains("2 Habit revisions"), "{error:#}");
     }
 
     #[test]
