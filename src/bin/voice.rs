@@ -768,17 +768,13 @@ fn speak_and_play(
         ref_text.trim().chars().count(),
     );
     let variant = mary::speak::Qwen3TtsVariant::from_env();
-    // Which team's model graph? The pile says. This caller holds only a path,
-    // so taking the team as a parameter would move the guess up one level
-    // rather than remove it.
-    let team = mary::model_collection::model_graph_team_at(&pile).with_context(|| {
-        format!(
-            "read the sole model-graph team from {}",
-            pile.display()
-        )
-    })?;
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile, team)
-        .with_context(|| format!("freeze native Qwen3-TTS snapshot {}", pile.display()))?;
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
+        .with_context(|| {
+            format!(
+                "discover and freeze the sole native Qwen3-TTS snapshot {}",
+                pile.display()
+            )
+        })?;
     let weights =
         mary::speak::Qwen3TtsWeights::from_snapshot(snapshot, variant).with_context(|| {
             format!(

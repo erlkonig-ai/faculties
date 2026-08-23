@@ -472,11 +472,8 @@ fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
         Some(p) => PathBuf::from(p),
         None => faculties::model_dir().join("clip.pile"),
     };
-    // Which team's model graph? The pile says — this caller holds only a path.
-    let team = mary::model_collection::model_graph_team_at(&pile)
-        .context("read the sole model-graph team from the Mary model pile")?;
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile, team)
-        .context("load native Mary CLIP model collection")?;
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
+        .context("discover and freeze the sole native Mary CLIP model collection")?;
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.reader(),
@@ -569,17 +566,10 @@ fn load_mm7b() -> Result<Mm7bEmbedder> {
         }
     };
     eprintln!("files: loading nomic-embed-multimodal-7b (once, ~20s)…");
-    // Which team's model graph? The pile says — this caller holds only a path.
-    let team = mary::model_collection::model_graph_team_at(&pile)
-        .context("read the sole model-graph team from the Mary model pile")?;
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile, team)
-        .context("load native Mary MM7B model collection")?;
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
+        .context("discover and freeze the sole native Mary MM7B model collection")?;
     mary::persist::load_nomic_mm7b_aliased_from_snapshot(
         snapshot,
-        mary::selection::ModelSelector::Source {
-            source: MODEL,
-            quantization: mary::persist::QUANTIZATION_NATIVE,
-        },
         &tok,
         mary::nn::backend::WgpuDevice::default(),
     )
@@ -2327,7 +2317,7 @@ mod tests {
 
         let latest =
             mary::model_collection::load_model_collection_local_latest(&test_pile.path, team).unwrap();
-        let model_error = mary::selection::load_keymap_from_graph(
+        let latest_selected = mary::selection::load_keymap_from_graph(
             latest.facts(),
             latest.reader(),
             mary::selection::ModelSelector::Source {
@@ -2335,11 +2325,9 @@ mod tests {
                 quantization: mary::persist::QUANTIZATION_NATIVE,
             },
         )
-        .unwrap_err();
-        assert!(
-            model_error.to_string().contains("ambiguous"),
-            "{model_error}"
-        );
+        .unwrap();
+        assert_eq!(latest_selected["target.weight"], (vec![1.0], vec![1]));
+        assert_eq!(latest_selected["later.weight"], (vec![3.0], vec![1]));
         let tokenizer_error = mary::selection::load_tokenizer_from_graph(
             latest.facts(),
             latest.reader(),

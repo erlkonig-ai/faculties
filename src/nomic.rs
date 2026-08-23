@@ -44,21 +44,16 @@ pub fn vision_pile() -> PathBuf {
 }
 
 fn load_model_snapshot(path: &Path, model: &str) -> Result<CollectionSnapshot<PileReader>> {
-    // Which team's model graph? The pile says. Discovering it beats taking it
-    // as a parameter: every caller here holds only a path, so a parameter would
-    // move the guess up one level rather than remove it.
-    let team = mary::model_collection::model_graph_team_at(path).with_context(|| {
-        format!(
-            "read the sole model-graph team for {model} from {}",
-            path.display()
-        )
-    })?;
-    mary::model_collection::load_model_collection_local_latest(path, team).with_context(|| {
-        format!(
-            "load locally admitted native Mary collection for {model} from {}",
-            path.display()
-        )
-    })
+    // Discover the sole team and freeze its exact ticket from one observed
+    // prefix. A second scan could otherwise hide a concurrently appended team.
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(path)
+        .with_context(|| {
+            format!(
+                "discover and freeze the sole native Mary collection for {model} in {}",
+                path.display()
+            )
+        })?;
+    Ok(snapshot)
 }
 
 /// Load nomic-embed-text-v1.5 entirely from one canonical collection snapshot.
@@ -226,7 +221,7 @@ mod tests {
         // cannot change the facts used for either half of this text load.
         publish(
             text_file.path(),
-            [weight_fragment(NOMIC_TEXT_MODEL, "conflicting.weight", 9.0)],
+            [weight_fragment(NOMIC_TEXT_MODEL, "text.weight", 9.0)],
         );
         let text_keymap = mary::selection::load_keymap_from_graph(
             text.facts(),
@@ -248,7 +243,7 @@ mod tests {
 
         let widened = load_model_snapshot(text_file.path(), NOMIC_TEXT_MODEL)
             .expect("load later widened text snapshot");
-        let ambiguity = mary::selection::load_keymap_from_graph(
+        let collision = mary::selection::load_keymap_from_graph(
             widened.facts(),
             widened.reader(),
             ModelSelector::Source {
@@ -256,10 +251,10 @@ mod tests {
                 quantization: mary::persist::QUANTIZATION_NATIVE,
             },
         )
-        .expect_err("later conflicting same-coordinate commit must fail closed");
+        .expect_err("later shard with a duplicate tensor must fail closed");
         assert!(
-            ambiguity.to_string().contains("ambiguous model root"),
-            "unexpected ambiguity diagnostic: {ambiguity}"
+            collision.to_string().contains("appears in both root"),
+            "unexpected collision diagnostic: {collision}"
         );
 
         let vision_file = NamedTempFile::new().expect("create vision pile");
