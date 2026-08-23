@@ -208,6 +208,39 @@ class WorktreeAuditTest(unittest.TestCase):
         self.assertEqual(record["state"], "INDETERMINATE")
         self.assertIn("base unresolved", record["diagnostic"])
 
+    def test_malformed_arguments_are_indeterminate_not_silently_not_due(self) -> None:
+        result = self.invoke("due", "--definitely-not-an-option")
+        self.assertEqual(result.returncode, 126)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("invalid arguments", result.stderr)
+
+    def test_ambient_git_repository_selection_is_ignored(self) -> None:
+        other = self.root / "ambient"
+        self.git("init", "-q", "-b", "main", str(other), cwd=self.root)
+        self.git("config", "user.email", "audit-test@example.invalid", cwd=other)
+        self.git("config", "user.name", "Audit Test", cwd=other)
+        (other / "tracked").write_text("ambient clean\n")
+        self.git("add", "tracked", cwd=other)
+        self.git("commit", "-qm", "ambient", cwd=other)
+        (self.repo / "dirty-target").write_text("must be observed\n")
+
+        report, records = self.json_records(
+            env={
+                "GIT_DIR": str(other / ".git"),
+                "GIT_WORK_TREE": str(other),
+                "GIT_INDEX_FILE": str(other / ".git" / "index"),
+            }
+        )
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(records[0]["repository"], str(self.repo.resolve()))
+        self.assertEqual(records[0]["state"], "ATTENTION")
+        target = next(
+            item
+            for item in records[0]["custody"]
+            if item["path"] == str(self.repo.resolve())
+        )
+        self.assertTrue(target["dirty"]["dirty"])
+
     def test_ref_race_is_reported_and_exits_126(self) -> None:
         shim = self.root / "shim"
         shim.mkdir()
@@ -234,6 +267,30 @@ class WorktreeAuditTest(unittest.TestCase):
         report, records = self.json_records(env=env)
         self.assertEqual(report.returncode, 126, report.stderr)
         self.assertEqual(records[0]["state"], "RACED")
+
+    def test_worktree_dirtiness_race_is_reported_and_exits_126(self) -> None:
+        shim = self.root / "status-shim"
+        shim.mkdir()
+        counter = self.root / "status-count"
+        wrapper = shim / "git"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"real={shlex.quote(REAL_GIT or 'git')}\n"
+            f"counter={shlex.quote(str(counter))}\n"
+            "case \" $* \" in\n"
+            "  *\\ status\\ *)\n"
+            "    n=0; [ ! -f \"$counter\" ] || n=$(cat \"$counter\")\n"
+            "    n=$((n + 1)); printf '%s' \"$n\" > \"$counter\"\n"
+            "    if [ \"$n\" -eq 2 ]; then printf '? raced\\0'; exit 0; fi;;\n"
+            "esac\n"
+            "exec \"$real\" \"$@\"\n"
+        )
+        wrapper.chmod(0o755)
+        env = {"PATH": os.pathsep.join([str(shim), os.environ.get("PATH", "")])}
+        report, records = self.json_records(env=env)
+        self.assertEqual(report.returncode, 126, report.stderr)
+        self.assertEqual(records[0]["state"], "RACED")
+        self.assertIn("dirtiness changed", records[0]["diagnostic"])
 
     def test_every_git_command_has_optional_locks_disabled_and_is_read_only(
         self,

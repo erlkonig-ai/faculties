@@ -53,7 +53,16 @@ def quote(value: str) -> str:
 class Git:
     def __init__(self, repository: Path) -> None:
         self.repository = repository
-        self.environment = os.environ.copy()
+        # `git -C` does not override repository-selection variables inherited
+        # from the caller.  A stray GIT_DIR/GIT_WORK_TREE (or alternate object
+        # database/index) could therefore make an audit named for repository A
+        # inspect repository B.  Start from the ordinary process environment,
+        # but make every Git-specific input an explicit choice below.
+        self.environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
         self.environment["GIT_OPTIONAL_LOCKS"] = "0"
         # A partial clone may otherwise fetch an absent object as a side effect
         # of an apparently read-only ancestry/tree query.
@@ -438,6 +447,11 @@ def audit_repository(repository: Path, explicit_base: str | None) -> dict[str, A
     worktrees_raw_after = git.worktrees_raw()
     if refs_after != refs_before or worktrees_raw_after != worktrees_raw_before:
         raise AuditRace("refs or registered worktree HEADs changed during the audit")
+    worktrees_after = parse_worktrees(worktrees_raw_after)
+    dirty_after = [dirty_state(git, worktree) for worktree in worktrees_after]
+    dirty_before = [worktree["dirty"] for worktree in custody]
+    if dirty_after != dirty_before:
+        raise AuditRace("worktree or index dirtiness changed during the audit")
     if explicit_base is not None:
         _, final_sha, final_ref = resolve_explicit_base(git, explicit_base)
         if final_sha != base["sha"] or final_ref != base["resolved_ref"]:
@@ -589,7 +603,11 @@ def emit_human(records: list[dict[str, Any]]) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    class AuditArgumentParser(argparse.ArgumentParser):
+        def error(self, message: str) -> None:
+            raise AuditFailure(f"invalid arguments: {message}")
+
+    parser = AuditArgumentParser(
         description="Produce read-only branch/worktree custody and lineage evidence"
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -612,7 +630,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    try:
+        args = build_parser().parse_args(argv)
+    except AuditFailure as error:
+        print(f"worktree-audit: {error}", file=sys.stderr)
+        return INDETERMINATE
     records: list[dict[str, Any]] = []
     try:
         repositories = discover_repositories(Path(args.root), args.repositories)
