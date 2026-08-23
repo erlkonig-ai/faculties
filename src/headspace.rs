@@ -1093,7 +1093,6 @@ mod tests {
     use std::path::Path;
 
     use ed25519_dalek::SigningKey;
-    use triblespace::core::collection::Collection;
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::BlobStore;
 

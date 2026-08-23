@@ -2097,7 +2097,6 @@ mod tests {
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let records = discover_collection_records(&mut pile).unwrap();
-        let source = test_source(&pile_path, &key);
         let target = test_target(&pile_path, &key);
         let inputs: BTreeSet<_> = records
             .derives()

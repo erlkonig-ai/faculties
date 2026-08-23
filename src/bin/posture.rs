@@ -7409,7 +7409,7 @@ mod tests {
     fn only_a_result_tag_clears_a_finding_and_legacy_prose_still_does() {
         let store = TestStore::new();
 
-        let mut cleared = |title: &'static str, outcome: &'static str, result: Option<Id>, at: f64| {
+        let cleared = |title: &'static str, outcome: &'static str, result: Option<Id>, at: f64| {
             let finding = genid().id;
             let decision = genid().id;
             store.publish_raw(

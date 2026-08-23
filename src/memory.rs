@@ -726,7 +726,6 @@ mod tests {
 
     use crate::storage::{initialize_signer, open_pile_strict};
     use crate::schemas::memory::DEFAULT_SCOPE_ID;
-    use triblespace::core::collection::Collection;
 
     fn point(seconds: f64) -> IntervalValue {
         let at = hifitime::Epoch::from_tai_seconds(seconds);

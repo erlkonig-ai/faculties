@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use anybytes::View;
 use anyhow::{anyhow, Context, Result};
 use triblespace::core::blob::encodings::utf8string::UTF8String;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
@@ -47,7 +47,7 @@ use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::entity;
-use triblespace::prelude::{blobencodings, exists, find, inlineencodings, pattern};
+use triblespace::prelude::{exists, find, pattern};
 
 use faculties::legacy_hint::open_scope;
 use faculties::posture_finding::{
@@ -156,7 +156,7 @@ fn build(facts: &TribleSet, reader: &PileReader) -> Result<FindingBridgePlan> {
         (finding: Id, occurrence: Id, locator: TextHandle, value: TextHandle),
         pattern!(facts, [{
             ?finding @
-            metadata::tag: (&KIND_FINDING),
+            metadata::tag: &KIND_FINDING,
             posture::occurrence: ?occurrence,
             posture::locator: ?locator,
             posture::value: ?value
@@ -168,8 +168,8 @@ fn build(facts: &TribleSet, reader: &PileReader) -> Result<FindingBridgePlan> {
         examined += 1;
         if exists!(pattern!(facts, [{
             _?bridge @
-            metadata::tag: (&KIND_LEGACY_BRIDGE),
-            posture::occurrence: (occurrence)
+            metadata::tag: &KIND_LEGACY_BRIDGE,
+            posture::occurrence: occurrence
         }])) {
             already_bridged += 1;
             continue;
@@ -178,7 +178,7 @@ fn build(facts: &TribleSet, reader: &PileReader) -> Result<FindingBridgePlan> {
         let value = read_text(reader, value, "legacy finding value")?;
         let modality = find!(
             tag: Id,
-            pattern!(facts, [{ (finding) @ metadata::tag: ?tag }])
+            pattern!(facts, [{ finding @ metadata::tag: ?tag }])
         )
         .find(|tag| modality::is_known(*tag))
         .ok_or_else(|| anyhow!("legacy finding {finding:X} carries no known modality"))?;
@@ -222,14 +222,14 @@ fn build(facts: &TribleSet, reader: &PileReader) -> Result<FindingBridgePlan> {
 fn repository_of(facts: &TribleSet, reader: &PileReader, finding: Id) -> Result<Option<PathBuf>> {
     let Some(document) = find!(
         document: Id,
-        pattern!(facts, [{ (finding) @ posture::document: ?document }])
+        pattern!(facts, [{ finding @ posture::document: ?document }])
     )
     .next() else {
         return Ok(None);
     };
     let Some(path) = find!(
         path: TextHandle,
-        pattern!(facts, [{ (document) @ posture::path: ?path }])
+        pattern!(facts, [{ document @ posture::path: ?path }])
     )
     .next() else {
         return Ok(None);

@@ -32,7 +32,6 @@ use faculties::memory as memory_model;
 use faculties::memory_cover;
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki as wiki_model;
-use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::macros::{find, pattern};

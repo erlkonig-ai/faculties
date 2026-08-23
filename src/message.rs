@@ -859,7 +859,6 @@ mod tests {
         DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID, KIND_GROUP, KIND_PERSON_ID,
     };
     use hifitime::Epoch;
-    use triblespace::core::collection::Collection;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 

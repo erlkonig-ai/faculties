@@ -1242,7 +1242,6 @@ mod tests {
     use super::*;
 
     use std::fs::File;
-    use triblespace::core::collection::simplearchive_union;
     use triblespace::core::repo::BlobStoreGet;
 
     use faculties::storage::{discover_target, initialize_signer};

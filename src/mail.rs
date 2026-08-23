@@ -3208,7 +3208,6 @@ mod tests {
         relations as relations_schema,
     };
     use crate::secrets::schema as secrets_schema;
-    use triblespace::core::collection::Collection;
     use triblespace::core::repo::pile::{Pile, PileReader};
 
     fn id(byte: u8) -> Id {

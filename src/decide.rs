@@ -832,7 +832,6 @@ mod tests {
     };
     use crate::schemas::decide::DEFAULT_SCOPE_ID;
     use hifitime::Epoch;
-    use triblespace::core::collection::Collection;
 
     fn at(second: u8) -> IntervalValue {
         let epoch = Epoch::from_gregorian_utc(2026, 8, 8, 0, 0, second, 0);

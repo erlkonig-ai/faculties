@@ -20,7 +20,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki as wiki_model;
-use triblespace::core::collection::Collection;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::prelude::*;
 
