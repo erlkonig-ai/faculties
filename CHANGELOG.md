@@ -73,10 +73,11 @@ All notable changes to this project will be documented in this file.
   record, password lockbox, scope graph, revocation ceremony, or latest-version
   selector. `secrets vault create|list|members|grant` manages explicit epochs,
   and `secrets secret add|get|share|list` operates on exact vault or version ids.
-  `migrations secrets-v2` projects the frozen v1 identity/scope collection into
-  one vault per confidentiality epoch, preserves encrypted versions and wraps,
-  grants the exact current readers direct `READ`, and verifies the resulting
-  local aggregate without printing plaintext.
+  Aggregate `migrations activate-cutover` projects the frozen historical
+  identity/scope branch directly into one vault per confidentiality epoch,
+  preserves encrypted versions and wraps, grants the exact current readers
+  direct `READ`, and verifies the resulting local aggregate without printing
+  plaintext or publishing an intermediary fixed Secrets collection.
 
 - **The Teams credentials the cutover retired are recoverable.** The collection
   cutover treats the legacy Teams OAuth rows as a bounded retired partition:
@@ -358,15 +359,14 @@ All notable changes to this project will be documented in this file.
   utterances, per-device route commits coalesce into complete generations,
   authored-empty Voice commits remain fact-empty with exact source-coordinate
   provenance, and unrelated Body deltas do not manufacture Voice authority.
-- **The fixed Secrets v1 root is retained as frozen migration source.** Its
-  strict identity/scope catalog, attachment validation, and envelope operations
-  remain in `faculties-secrets` so the bounded stopped-world migration can
-  preserve canonical facts, authored partitions, semantic metadata, attachment
-  closure, and authored-empty commits exactly. Current runtime reads and writes
-  v2 vault-epoch collections instead; the fixed root is historical evidence,
-  not a live identity/scope CLI surface. The migration also validates and
-  retires the exact historical Mail account/pointer shape found on the old
-  Secrets branch while retaining that branch as inert source evidence.
+- **Historical Secrets is migration-local, not a second runtime.** The frozen
+  wire schema, strict identity/scope/grant parser, attachment validation, DEK
+  recovery and KEM-only resealing now live solely in `faculties-migrations`.
+  `faculties-secrets` exposes only direct-key vaults; there is no compatibility
+  module, fixed Secrets collection, identity adoption, lockbox, or scope graph
+  in the live API. Direct activation still preserves the copied legacy prefix
+  as source evidence, and validates and retires the exact historical Mail
+  account/pointer shape found on that branch.
 - **Decisions are collection-native and preserve concurrent resolution.** A
   stable decision anchor has one immutable intrinsic genesis, while factors are
   additive occurrence records and resolutions form intrinsic predecessor DAGs.
@@ -376,11 +376,11 @@ All notable changes to this project will be documented in this file.
   and agreement quotients heads only by outcome plus forcedness while retaining
   distinct evidence and history. Publication validates the exact ontology,
   attachments, closed acyclic history, and all-head reconciliation.
-- **Frozen v1 recovery loads its root password without exporting it to every
+- **Frozen legacy recovery loads its root password without exporting it to every
   child process.** `FACULTIES_SECRETS_PW` remains the first source, then
   `FACULTIES_SECRETS_PW_FILE` or the XDG configuration path is read on demand.
   Group- or world-readable files are refused and editor line endings are
-  stripped. Only migration and recovery paths consume this capability; the v2
+  stripped. Only migration and recovery paths consume this capability; the
   Secrets CLI opens exact vault epochs with the durable signing key.
 - **Posture now runs on two fixed native collections.** Policy and scan
   fragments are committed through descriptor-handle V4 `Collection` records
