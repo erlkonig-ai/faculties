@@ -24,7 +24,7 @@ use faculties::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use faculties::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::triage::cog;
-use faculties::secrets::schema as secrets_schema;
+use faculties::secrets::v2::storage::{self as vaults, VaultDiscovery};
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
@@ -178,10 +178,19 @@ impl TriageSnapshot {
     }
 
     fn headspace(&self) -> Result<(CollectionView, TriageHeadspace)> {
-        let secrets = self.view(secrets_schema::DEFAULT_SCOPE_ID, "Secrets")?;
+        let secrets = self.secrets()?;
         let view = self.view(HEADSPACE_SCOPE_ID, "Headspace")?;
-        let projected = triage_model::project_headspace(view.source(), secrets.source())?;
+        let projected = triage_model::project_headspace(view.source(), secrets.snapshot())?;
         Ok((view, projected))
+    }
+
+    fn secrets(&self) -> Result<VaultDiscovery> {
+        let mut pile = self.pile.borrow_mut();
+        let pile = pile
+            .as_mut()
+            .ok_or_else(|| anyhow!("Triage snapshot is already closed"))?;
+        vaults::discover_local_vaults(pile, &self.signer)
+            .context("discover readable Secrets vaults")
     }
 
     fn memory(&self) -> Result<(CollectionView, MemoryCatalog)> {
@@ -372,7 +381,7 @@ fn cmd_scan(
 ) -> Result<()> {
     let cognition = snapshot.cognition()?;
     let headspace_view = snapshot.view(HEADSPACE_SCOPE_ID, "Headspace")?;
-    let secrets = snapshot.view(secrets_schema::DEFAULT_SCOPE_ID, "Secrets")?;
+    let secrets = snapshot.secrets()?;
     let relations = snapshot.relations()?;
     let messages = snapshot.messages(&relations)?;
     let now = now_key();
@@ -381,7 +390,7 @@ fn cmd_scan(
         ScanSources {
             cognition: cognition.source(),
             headspace: headspace_view.source(),
-            secrets: secrets.source(),
+            secrets: secrets.snapshot(),
             relations: relations.source(),
             messages: messages.source(),
         },

@@ -29,7 +29,7 @@ use crate::triage::{
     self as triage_model, PatternSummary, QueueCounts, ScanOptions, ScanReport, ScanSources,
     SourceView, UnreadMessages, UnreadUnavailable,
 };
-use crate::widgets::storage::{DatasetRevision, DatasetView};
+use crate::widgets::storage::{DatasetRevision, DatasetView, SecretsView};
 use triblespace::core::id::Id;
 
 /// How many timeline events to keep in the live snapshot. Older
@@ -176,7 +176,7 @@ impl TriageLive {
     fn refresh(
         cognition: DatasetView<'_>,
         headspace: DatasetView<'_>,
-        secrets: DatasetView<'_>,
+        secrets: SecretsView<'_>,
         relations: DatasetView<'_>,
         messages: DatasetView<'_>,
     ) -> Self {
@@ -191,7 +191,7 @@ impl TriageLive {
             ScanSources {
                 cognition: source_view(cognition),
                 headspace: source_view(headspace),
-                secrets: source_view(secrets),
+                secrets: secrets.snapshot,
                 relations: source_view(relations),
                 messages: source_view(messages),
             },
@@ -432,7 +432,7 @@ impl TriageViewer {
         ctx: &mut CardCtx<'_>,
         cognition: DatasetView<'_>,
         headspace: DatasetView<'_>,
-        secrets: DatasetView<'_>,
+        secrets: SecretsView<'_>,
         relations: DatasetView<'_>,
         messages: DatasetView<'_>,
     ) {

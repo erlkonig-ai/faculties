@@ -29,7 +29,7 @@ use crate::schemas::triage::{
     exec, model_chat, reason, KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID,
     KIND_MODEL_IN_PROGRESS_ID, KIND_MODEL_REQUEST_ID, KIND_MODEL_RESULT_ID, KIND_REASON_EVENT_ID,
 };
-use crate::secrets::{self as secrets_model};
+use crate::secrets::v2::SecretsSnapshot;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type Interval = Inline<inlineencodings::NsTAIInterval>;
@@ -41,11 +41,11 @@ pub struct SourceView<'a> {
     pub reader: &'a PileReader,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ScanSources<'a> {
     pub cognition: SourceView<'a>,
     pub headspace: SourceView<'a>,
-    pub secrets: SourceView<'a>,
+    pub secrets: &'a SecretsSnapshot<PileReader>,
     pub relations: SourceView<'a>,
     pub messages: SourceView<'a>,
 }
@@ -1062,13 +1062,11 @@ pub fn project_triage_headspace(catalog: &Catalog) -> TriageHeadspace {
 
 pub fn project_headspace(
     headspace_view: SourceView<'_>,
-    secrets_view: SourceView<'_>,
+    secrets: &SecretsSnapshot<PileReader>,
 ) -> Result<TriageHeadspace> {
-    let secrets = secrets_model::validate_catalog(secrets_view.reader, secrets_view.facts)
-        .context("validate Secrets collection")?;
     let catalog = headspace::project_result(headspace_view.reader, headspace_view.facts)
         .context("validate Headspace collection")?;
-    headspace::validate_secret_references(&catalog, &secrets)
+    headspace::validate_secret_references_v2(&catalog, secrets)
         .context("validate exact Headspace Secrets references")?;
     Ok(project_triage_headspace(&catalog))
 }

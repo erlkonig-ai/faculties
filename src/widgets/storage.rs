@@ -7,7 +7,9 @@
 //! signer. Repository branches, mutable heads, and compatibility fallbacks do
 //! not participate in this boundary. The interactive viewer loads the full
 //! catalog; focused capture binaries request only their source dependency
-//! closure.
+//! closure. Most sources are fixed descriptor-handle collections. Secrets is
+//! deliberately different: it is the aggregate of exact vault epochs for
+//! which the pile signer currently has `READ` authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -37,7 +39,7 @@ use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
-use crate::secrets::schema::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
+use crate::secrets::v2::{storage as vaults, SecretsSnapshot};
 use crate::storage::{load_signer, open_pile_strict};
 
 /// Stable logical input requested by a widget.
@@ -100,6 +102,7 @@ impl SourceKey {
             Self::Headspace => &[Self::Secrets],
             Self::Mail => &[Self::Files, Self::Decide, Self::Relations, Self::Secrets],
             Self::Messages | Self::Planner | Self::Status => &[Self::Relations],
+            Self::Teams => &[Self::Secrets],
             Self::Triage => &[
                 Self::Headspace,
                 Self::Secrets,
@@ -149,6 +152,32 @@ impl DatasetRevision {
         hasher.update(&(facts.len() as u128).to_le_bytes());
         Self(*hasher.finalize().as_bytes())
     }
+
+    fn from_secrets(discovery: &vaults::VaultDiscovery) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"faculties.viewer.secrets-revision.v2");
+        for (vault, location) in discovery.locations() {
+            let snapshot = discovery
+                .snapshot()
+                .vault(*vault)
+                .expect("every ready vault location has one snapshot");
+            hasher.update(&vault.raw());
+            hasher.update(&location.team().to_bytes());
+            hasher.update(&location.collection().raw);
+            match snapshot.facts().fingerprint().as_u128() {
+                Some(fingerprint) => {
+                    hasher.update(&[1]);
+                    hasher.update(&fingerprint.to_le_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                    hasher.update(&[0; 16]);
+                }
+            }
+            hasher.update(&(snapshot.facts().len() as u128).to_le_bytes());
+        }
+        Self(*hasher.finalize().as_bytes())
+    }
 }
 
 /// Borrowed immutable input for one widget dataset.
@@ -160,9 +189,10 @@ pub struct DatasetView<'a> {
 }
 
 /// Keyed borrowed inputs for one viewer render.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct WidgetContext<'a> {
     datasets: Option<&'a BTreeMap<SourceKey, LoadedDataset>>,
+    secrets: Option<&'a LoadedSecrets>,
 }
 
 impl<'a> WidgetContext<'a> {
@@ -171,6 +201,28 @@ impl<'a> WidgetContext<'a> {
     pub fn dataset(&self, key: SourceKey) -> Option<DatasetView<'a>> {
         self.datasets?.get(&key).map(LoadedDataset::view)
     }
+
+    /// Return the aggregate of exact readable Secrets vault epochs.
+    pub fn secrets(&self) -> Option<SecretsView<'a>> {
+        self.secrets.map(LoadedSecrets::view)
+    }
+
+    /// Whether this semantic source is present in the loaded closure.
+    pub fn contains(&self, key: SourceKey) -> bool {
+        match key {
+            SourceKey::Secrets => self.secrets.is_some(),
+            _ => self
+                .datasets
+                .is_some_and(|datasets| datasets.contains_key(&key)),
+        }
+    }
+}
+
+/// Borrowed aggregate of ready exact vault epochs plus its viewer cache token.
+#[derive(Clone, Copy)]
+pub struct SecretsView<'a> {
+    pub snapshot: &'a SecretsSnapshot<PileReader>,
+    pub revision: DatasetRevision,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +246,33 @@ impl LoadedDataset {
         DatasetView {
             facts: &self.facts,
             reader: &self.reader,
+            revision: self.revision,
+        }
+    }
+}
+
+struct LoadedSecrets {
+    discovery: vaults::VaultDiscovery,
+    revision: DatasetRevision,
+}
+
+struct LoadedCatalog {
+    datasets: BTreeMap<SourceKey, LoadedDataset>,
+    secrets: Option<LoadedSecrets>,
+}
+
+impl LoadedSecrets {
+    fn new(discovery: vaults::VaultDiscovery) -> Self {
+        let revision = DatasetRevision::from_secrets(&discovery);
+        Self {
+            discovery,
+            revision,
+        }
+    }
+
+    fn view(&self) -> SecretsView<'_> {
+        SecretsView {
+            snapshot: self.discovery.snapshot(),
             revision: self.revision,
         }
     }
@@ -276,11 +355,6 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         label: "Relations",
     },
     CollectionSource {
-        key: SourceKey::Secrets,
-        scope: SECRETS_SCOPE_ID,
-        label: "Secrets",
-    },
-    CollectionSource {
         key: SourceKey::Status,
         scope: STATUS_SCOPE_ID,
         label: "Status",
@@ -322,6 +396,7 @@ struct FileStamp {
 /// Shared read-only pile state and top-bar path selector.
 pub struct StorageState {
     datasets: Option<BTreeMap<SourceKey, LoadedDataset>>,
+    secrets: Option<LoadedSecrets>,
     sources: BTreeSet<SourceKey>,
     pile_path: PathBuf,
     pile_path_text: String,
@@ -357,6 +432,7 @@ impl StorageState {
         let pile_path_text = pile_path.to_string_lossy().into_owned();
         Self {
             datasets: None,
+            secrets: None,
             sources: source_closure(sources),
             pile_path,
             pile_path_text,
@@ -374,6 +450,7 @@ impl StorageState {
         self.ensure_loaded();
         WidgetContext {
             datasets: self.datasets.as_ref(),
+            secrets: self.secrets.as_ref(),
         }
     }
 
@@ -387,6 +464,7 @@ impl StorageState {
         self.error = None;
         if changed {
             self.datasets = None;
+            self.secrets = None;
             self.stamp = None;
         }
         self.reload_current_path();
@@ -411,8 +489,9 @@ impl StorageState {
 
     fn reload_current_path(&mut self) {
         match load_consistent_catalog(&self.pile_path, &self.sources) {
-            Ok((datasets, stamp)) => {
-                self.datasets = Some(datasets);
+            Ok((catalog, stamp)) => {
+                self.datasets = Some(catalog.datasets);
+                self.secrets = catalog.secrets;
                 self.stamp = Some(stamp);
                 self.error = None;
             }
@@ -520,7 +599,7 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
 fn load_consistent_catalog(
     path: &Path,
     sources: &BTreeSet<SourceKey>,
-) -> Result<(BTreeMap<SourceKey, LoadedDataset>, FileStamp), String> {
+) -> Result<(LoadedCatalog, FileStamp), String> {
     for _ in 0..2 {
         let before = file_stamp(path)?;
         let datasets = load_catalog(path, sources)?;
@@ -535,10 +614,7 @@ fn load_consistent_catalog(
     ))
 }
 
-fn load_catalog(
-    path: &Path,
-    sources: &BTreeSet<SourceKey>,
-) -> Result<BTreeMap<SourceKey, LoadedDataset>, String> {
+fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCatalog, String> {
     let signer = load_signer(path, None)
         .map_err(|error| format!("load durable collection signer: {error:#}"))?;
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
@@ -565,12 +641,26 @@ fn load_catalog(
             by_scope.insert(scope, (collection_id, facts));
         }
 
+        let secrets = sources
+            .contains(&SourceKey::Secrets)
+            .then(|| {
+                vaults::discover_local_vaults(&mut pile, &signer)
+                    .map(LoadedSecrets::new)
+                    .map_err(|error| format!("discover readable Secrets vaults: {error:#}"))
+            })
+            .transpose()?;
+
         let reader = pile
             .reader()
             .map_err(|error| format!("open immutable viewer blob snapshot: {error}"))?;
-        validate_catalog(&reader, &by_scope, sources)?;
+        validate_catalog(
+            &reader,
+            &by_scope,
+            sources,
+            secrets.as_ref().map(|loaded| loaded.discovery.snapshot()),
+        )?;
 
-        Ok(COLLECTION_SOURCE_CATALOG
+        let datasets = COLLECTION_SOURCE_CATALOG
             .iter()
             .filter(|source| sources.contains(&source.key))
             .map(|source| {
@@ -582,7 +672,8 @@ fn load_catalog(
                     LoadedDataset::new(*collection, facts.clone(), reader.clone()),
                 )
             })
-            .collect())
+            .collect();
+        Ok(LoadedCatalog { datasets, secrets })
     })();
 
     let closed = pile.close().map_err(|error| format!("close pile: {error}"));
@@ -598,6 +689,7 @@ fn validate_catalog(
     reader: &PileReader,
     by_scope: &BTreeMap<Id, (CollectionHandle, TribleSet)>,
     sources: &BTreeSet<SourceKey>,
+    secrets: Option<&SecretsSnapshot<PileReader>>,
 ) -> Result<(), String> {
     let facts = |source: SourceKey| {
         let scope = COLLECTION_SOURCE_CATALOG
@@ -647,22 +739,12 @@ fn validate_catalog(
         crate::files::validate_catalog(reader, facts(SourceKey::Files))
             .map_err(|error| format!("validate Files collection: {error:#}"))?;
     }
-    let secrets = if sources.contains(&SourceKey::Secrets) {
-        Some(
-            crate::secrets::validate_catalog(reader, facts(SourceKey::Secrets))
-                .map_err(|error| format!("validate Secrets collection: {error:#}"))?,
-        )
-    } else {
-        None
-    };
     if sources.contains(&SourceKey::Headspace) {
         let headspace = crate::headspace::project_result(reader, facts(SourceKey::Headspace))
             .map_err(|error| format!("validate Headspace collection: {error:#}"))?;
-        crate::headspace::validate_secret_references(
+        crate::headspace::validate_secret_references_v2(
             &headspace,
-            secrets
-                .as_ref()
-                .expect("Headspace source closure includes Secrets"),
+            secrets.expect("Headspace source closure includes Secrets"),
         )
         .map_err(|error| format!("validate Headspace secret references: {error:#}"))?;
     }
@@ -693,6 +775,11 @@ fn validate_catalog(
     if sources.contains(&SourceKey::Teams) {
         crate::teams::validate_catalog(reader, facts(SourceKey::Teams))
             .map_err(|error| format!("validate Teams collection: {error:#}"))?;
+        crate::teams::validate_auth_secret_references(
+            facts(SourceKey::Teams),
+            secrets.expect("Teams source closure includes Secrets"),
+        )
+        .map_err(|error| format!("validate Teams secret references: {error:#}"))?;
     }
     if sources.contains(&SourceKey::Wiki) {
         crate::wiki::validate_catalog(reader, facts(SourceKey::Wiki))
@@ -715,9 +802,7 @@ fn validate_catalog(
             facts(SourceKey::Files),
             facts(SourceKey::Decide),
             facts(SourceKey::Relations),
-            secrets
-                .as_ref()
-                .expect("Mail source closure includes Secrets"),
+            secrets.expect("Mail source closure includes Secrets"),
         )
         .map_err(|error| format!("validate Mail collection: {error:#}"))?;
     }
@@ -812,7 +897,7 @@ mod tests {
     fn visible_keys(context: WidgetContext<'_>) -> BTreeSet<SourceKey> {
         SourceKey::ALL
             .into_iter()
-            .filter(|key| context.dataset(*key).is_some())
+            .filter(|key| context.contains(*key))
             .collect()
     }
 
@@ -922,6 +1007,10 @@ mod tests {
             source_closure([SourceKey::Headspace]),
             BTreeSet::from([SourceKey::Headspace, SourceKey::Secrets])
         );
+        assert_eq!(
+            source_closure([SourceKey::Teams]),
+            BTreeSet::from([SourceKey::Secrets, SourceKey::Teams])
+        );
         for source in [SourceKey::Messages, SourceKey::Planner, SourceKey::Status] {
             assert_eq!(
                 source_closure([source]),
@@ -989,12 +1078,14 @@ mod tests {
     }
 
     #[test]
-    fn fixed_catalog_covers_every_source_key_once() {
+    fn fixed_catalog_covers_every_fixed_source_key_once() {
         let catalog: BTreeSet<_> = COLLECTION_SOURCE_CATALOG
             .iter()
             .map(|source| source.key)
             .collect();
-        assert_eq!(catalog, SourceKey::ALL.into_iter().collect());
+        let mut expected: BTreeSet<_> = SourceKey::ALL.into_iter().collect();
+        expected.remove(&SourceKey::Secrets);
+        assert_eq!(catalog, expected);
         assert_eq!(catalog.len(), COLLECTION_SOURCE_CATALOG.len());
         assert_eq!(
             COLLECTION_SOURCE_CATALOG
@@ -1003,6 +1094,20 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn secrets_is_a_dynamic_aggregate_not_a_fixed_dataset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("secrets.pile");
+        create_pile(&path);
+        let mut storage = StorageState::for_sources(&path, [SourceKey::Secrets]);
+
+        let context = storage.context();
+        assert!(context.contains(SourceKey::Secrets));
+        assert!(context.secrets().is_some());
+        assert!(context.dataset(SourceKey::Secrets).is_none());
+        assert!(storage.error().is_none());
     }
 
     #[test]

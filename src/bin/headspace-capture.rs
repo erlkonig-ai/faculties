@@ -43,7 +43,7 @@ fn main(nb: &mut NotebookCtx) {
             let Some(headspace) = sources.dataset(SourceKey::Headspace) else {
                 return;
             };
-            let Some(secrets) = sources.dataset(SourceKey::Secrets) else {
+            let Some(secrets) = sources.secrets() else {
                 return;
             };
             panel.render(ctx, headspace, secrets);

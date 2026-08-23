@@ -21,10 +21,9 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use crate::headspace::{self, ProfileValue, Resolution};
-use crate::secrets as secrets_model;
 use triblespace::core::id::Id;
 
-use super::storage::{DatasetRevision, DatasetView};
+use super::storage::{DatasetRevision, DatasetView, SecretsView};
 
 // ── Palette ──────────────────────────────────────────────────────────
 
@@ -130,13 +129,11 @@ struct HeadspaceLive {
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl HeadspaceLive {
-    fn refresh(headspace_view: DatasetView<'_>, secrets_view: DatasetView<'_>) -> Self {
+    fn refresh(headspace_view: DatasetView<'_>, secrets_view: SecretsView<'_>) -> Self {
         let result = (|| {
-            let secrets = secrets_model::validate_catalog(secrets_view.reader, secrets_view.facts)
-                .map_err(|error| format!("Secrets collection: {error:#}"))?;
             let catalog = headspace::project_result(headspace_view.reader, headspace_view.facts)
                 .map_err(|error| format!("Headspace collection: {error:#}"))?;
-            headspace::validate_secret_references(&catalog, &secrets)
+            headspace::validate_secret_references_v2(&catalog, secrets_view.snapshot)
                 .map_err(|error| format!("Headspace secret references: {error:#}"))?;
             Ok::<_, String>((load_active_config(&catalog), load_profiles(&catalog)))
         })();
@@ -263,7 +260,7 @@ impl HeadspaceViewer {
         &mut self,
         ctx: &mut CardCtx<'_>,
         headspace_view: DatasetView<'_>,
-        secrets_view: DatasetView<'_>,
+        secrets_view: SecretsView<'_>,
     ) {
         let need_refresh = match self.live.as_ref() {
             None => true,
