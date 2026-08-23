@@ -162,8 +162,13 @@ enum Command {
     SecretsV2 {
         /// Complete every crypto and catalog preflight without appending the
         /// authority grants or vault commits.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "verify")]
         dry_run: bool,
+        /// Strictly compare the retained v1 collection with the v2 vaults,
+        /// exact READ authority, and local exact opens. Writes and plaintext
+        /// output are forbidden in this mode.
+        #[arg(long, conflicts_with = "dry_run")]
+        verify: bool,
     },
 
     /// Recover the Teams OAuth credentials the collection cutover retired.
@@ -447,7 +452,49 @@ fn node_identity(pile: &Path, key: Option<&Path>, nickname: &str, dry_run: bool)
     Ok(())
 }
 
-fn secrets_v2(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
+fn secrets_v2_verify(pile: &Path, key: Option<&Path>) -> Result<()> {
+    let report =
+        secrets_v2_cutover::verify(pile, key).context("verify exact Secrets v2 projection")?;
+    println!("Secrets v2 exact projection verification");
+    println!("pile                    : {}", pile.display());
+    println!("legacy source facts     : {}", report.source_facts);
+    println!("vault epochs            : {}", report.vaults.len());
+    println!("ready local epochs      : {}", report.ready_local_vaults);
+    println!("secret versions         : {}", report.secret_versions());
+    println!("preserved wraps         : {}", report.preserved_wraps());
+    println!("DEK-only repair wraps   : {}", report.repaired_wraps());
+    println!("legacy local wraps      : {}", report.legacy_local_wraps());
+    println!(
+        "repaired local wraps    : {}",
+        report.repaired_local_wraps()
+    );
+    println!(
+        "local exact opens       : {}",
+        report.locally_opened_versions()
+    );
+    println!("discovery diagnostics   : {}", report.discovery_issues);
+    for vault in &report.vaults {
+        println!(
+            "  {:X} {:?}: readers={} versions={} old-wraps={} repairs={} local-old={} local-repairs={} opened={}",
+            vault.vault,
+            vault.name,
+            vault.current_readers,
+            vault.secret_versions,
+            vault.preserved_wraps,
+            vault.repaired_wraps,
+            vault.legacy_local_wraps,
+            vault.repaired_local_wraps,
+            vault.locally_opened_versions,
+        );
+    }
+    println!("verification            : complete; no plaintext or pile bytes were written");
+    Ok(())
+}
+
+fn secrets_v2(pile: &Path, key: Option<&Path>, dry_run: bool, verify: bool) -> Result<()> {
+    if verify {
+        return secrets_v2_verify(pile, key);
+    }
     let first = secrets_v2_cutover::plan(pile, key, None);
     let password;
     let plan = match first {
@@ -824,7 +871,9 @@ fn main() -> Result<()> {
         Some(Command::NodeIdentity { nickname, dry_run }) => {
             node_identity(&cli.pile, cli.key.as_deref(), &nickname, dry_run)
         }
-        Some(Command::SecretsV2 { dry_run }) => secrets_v2(&cli.pile, cli.key.as_deref(), dry_run),
+        Some(Command::SecretsV2 { dry_run, verify }) => {
+            secrets_v2(&cli.pile, cli.key.as_deref(), dry_run, verify)
+        }
         Some(Command::StatusRegister { dry_run }) => {
             status_register(&cli.pile, cli.key.as_deref(), dry_run)
         }

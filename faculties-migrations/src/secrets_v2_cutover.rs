@@ -19,6 +19,7 @@ use triblespace::core::collection::reach;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
+use zeroize::Zeroizing;
 
 use crate::legacy_secrets_v1 as legacy;
 use faculties::storage::{load_signer, open_pile_strict};
@@ -93,6 +94,67 @@ pub struct SecretsV2PublicationReport {
     pub write_grants: usize,
     pub vault_commits: usize,
     pub read_grants: usize,
+}
+
+/// Read-only evidence that one retired v1 scope is exactly represented by one
+/// v2 vault epoch. The report names the non-secret scope but excludes secret
+/// names, values, keys, and sealed bytes so it is safe to retain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultVerificationReport {
+    pub vault: Id,
+    pub name: String,
+    pub current_readers: usize,
+    pub secret_versions: usize,
+    pub preserved_wraps: usize,
+    pub repaired_wraps: usize,
+    pub legacy_local_wraps: usize,
+    pub repaired_local_wraps: usize,
+    pub locally_opened_versions: usize,
+}
+
+/// Strict post-cutover verification over the retained v1 collection, direct
+/// vault collections, exact READ projection, and the local aggregate view.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SecretsV2VerificationReport {
+    pub source_facts: usize,
+    pub ready_local_vaults: usize,
+    pub discovery_issues: usize,
+    pub vaults: Vec<VaultVerificationReport>,
+}
+
+impl SecretsV2VerificationReport {
+    pub fn secret_versions(&self) -> usize {
+        self.vaults.iter().map(|vault| vault.secret_versions).sum()
+    }
+
+    pub fn preserved_wraps(&self) -> usize {
+        self.vaults.iter().map(|vault| vault.preserved_wraps).sum()
+    }
+
+    pub fn repaired_wraps(&self) -> usize {
+        self.vaults.iter().map(|vault| vault.repaired_wraps).sum()
+    }
+
+    pub fn legacy_local_wraps(&self) -> usize {
+        self.vaults
+            .iter()
+            .map(|vault| vault.legacy_local_wraps)
+            .sum()
+    }
+
+    pub fn repaired_local_wraps(&self) -> usize {
+        self.vaults
+            .iter()
+            .map(|vault| vault.repaired_local_wraps)
+            .sum()
+    }
+
+    pub fn locally_opened_versions(&self) -> usize {
+        self.vaults
+            .iter()
+            .map(|vault| vault.locally_opened_versions)
+            .sum()
+    }
 }
 
 fn legacy_collection<S>(storage: S, team: VerifyingKey, signer: SigningKey) -> Collection<S> {
@@ -614,6 +676,258 @@ pub fn publish(
     finish_pile(store, result)
 }
 
+fn verify_in_open_pile(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<SecretsV2VerificationReport> {
+    let team = signer.verifying_key();
+    let local = team.to_bytes();
+    let source = materialize_legacy(pile, team, signer)?;
+    if source.is_empty() {
+        bail!("the retained v1 Secrets collection is empty");
+    }
+
+    let reader = pile
+        .reader()
+        .context("open retained v1 Secrets verification reader")?;
+    let legacy = legacy::validate_catalog(&reader, &source)
+        .context("validate retained v1 Secrets collection")?;
+    let identity_keys = legacy::identity_public_keys(&reader, &legacy)?;
+    let names = legacy
+        .scopes
+        .values()
+        .map(|scope| {
+            legacy::read_text(&reader, scope.name)
+                .map(|name| (scope.id, name))
+                .with_context(|| format!("read retained v1 scope {} name", scope.id))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    drop(reader);
+
+    let mut vault_facts = BTreeMap::new();
+    for scope in legacy.scopes.keys().copied() {
+        vault_facts.insert(scope, materialize_vault(pile, scope, team, signer)?);
+    }
+    let authority = resolve_authority(pile, team)
+        .map_err(|error| anyhow!("resolve v2 vault READ authority: {error}"))?;
+    let reader = pile
+        .reader()
+        .context("open exact Secrets v2 verification reader")?;
+    let mut expected_local_vaults = BTreeSet::new();
+    let mut local_secrets = BTreeMap::<Id, Vec<Id>>::new();
+    let mut reports = Vec::with_capacity(legacy.scopes.len());
+
+    for scope in legacy.scopes.values() {
+        let facts = vault_facts
+            .get(&scope.id)
+            .expect("one materialized v2 target per retained v1 scope");
+        let catalog = v2::validate_catalog(&reader, scope.id, facts)
+            .with_context(|| format!("validate exact v2 vault epoch {}", scope.id))?;
+        let created_at = if scope.created_at.len() == 1 {
+            *scope
+                .created_at
+                .first()
+                .expect("one retained v1 scope creation time checked")
+        } else {
+            bail!(
+                "retained v1 scope {} has {} creation observations; expected exactly one",
+                scope.id,
+                scope.created_at.len()
+            );
+        };
+        if catalog.header.id != scope.id
+            || catalog.header.created_at != created_at
+            || catalog.header.name != scope.name
+        {
+            bail!(
+                "v2 vault {} does not preserve its exact v1 scope header",
+                scope.id
+            );
+        }
+
+        let legacy_secrets = legacy
+            .secrets
+            .values()
+            .filter(|secret| secret.scope == scope.id)
+            .collect::<Vec<_>>();
+        let expected_secret_ids = legacy_secrets
+            .iter()
+            .map(|secret| secret.id)
+            .collect::<BTreeSet<_>>();
+        let actual_secret_ids = catalog.secrets.keys().copied().collect::<BTreeSet<_>>();
+        if actual_secret_ids != expected_secret_ids {
+            bail!(
+                "v2 vault {} does not contain exactly the retained v1 secret ids",
+                scope.id
+            );
+        }
+        for secret in &legacy_secrets {
+            let actual = &catalog.secrets[&secret.id];
+            if actual.id != secret.id
+                || actual.created_at != secret.created_at
+                || actual.name != secret.display_name
+                || actual.body != secret.body
+            {
+                bail!("v2 secret {} does not preserve its exact v1 row", secret.id);
+            }
+        }
+
+        let legacy_wraps = legacy
+            .wraps
+            .values()
+            .filter(|wrap| expected_secret_ids.contains(&wrap.secret))
+            .collect::<Vec<_>>();
+        let legacy_wrap_ids = legacy_wraps
+            .iter()
+            .map(|wrap| wrap.id)
+            .collect::<BTreeSet<_>>();
+        for wrap in &legacy_wraps {
+            let actual = catalog.wraps.get(&wrap.id).ok_or_else(|| {
+                anyhow!(
+                    "v2 vault {} is missing retained historical wrap {}",
+                    scope.id,
+                    wrap.id
+                )
+            })?;
+            if actual.id != wrap.id
+                || actual.secret != wrap.secret
+                || actual.recipient != identity_keys[&wrap.recipient]
+                || actual.sealed_dek != wrap.sealed_dek
+            {
+                bail!("v2 wrap {} does not preserve its exact v1 row", wrap.id);
+            }
+        }
+
+        let recipient_ids = legacy.recipients_of(scope.id);
+        let recipients = recipient_ids
+            .iter()
+            .map(|identity| {
+                identity_keys.get(identity).copied().ok_or_else(|| {
+                    anyhow!(
+                        "retained v1 recipient identity {} has no exact public key",
+                        identity
+                    )
+                })
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let target = v2::vault_handle(scope.id, team);
+        let actual_readers = v2::read_authority_recipient_keys(&authority, target);
+        if actual_readers != recipients {
+            bail!(
+                "v2 vault {} READ authority is not the exact current v1 recipient set",
+                scope.id
+            );
+        }
+
+        let mut missing_pairs = BTreeSet::<(Id, RecipientPublicKey)>::new();
+        for secret in &expected_secret_ids {
+            for recipient in &recipients {
+                let already_wrapped = legacy_wraps.iter().any(|wrap| {
+                    wrap.secret == *secret && identity_keys[&wrap.recipient] == *recipient
+                });
+                if !already_wrapped {
+                    missing_pairs.insert((*secret, *recipient));
+                }
+            }
+        }
+
+        let mut repaired_wraps = 0;
+        let mut repaired_local_wraps = 0;
+        for wrap in catalog.wraps.values() {
+            if legacy_wrap_ids.contains(&wrap.id) {
+                continue;
+            }
+            if !missing_pairs.remove(&(wrap.secret, wrap.recipient)) {
+                bail!(
+                    "v2 vault {} contains an unexpected additional wrap {}",
+                    scope.id,
+                    wrap.id
+                );
+            }
+            repaired_wraps += 1;
+            if wrap.recipient == local {
+                repaired_local_wraps += 1;
+            }
+        }
+        if !missing_pairs.is_empty() {
+            bail!(
+                "v2 vault {} is missing {} required DEK-only repair wrap(s)",
+                scope.id,
+                missing_pairs.len()
+            );
+        }
+        if catalog.wraps.len() != legacy_wraps.len() + repaired_wraps {
+            bail!("v2 vault {} contains unaccounted wrap rows", scope.id);
+        }
+
+        let legacy_local_wraps = legacy_wraps
+            .iter()
+            .filter(|wrap| identity_keys[&wrap.recipient] == local)
+            .count();
+        if recipients.contains(&local) {
+            expected_local_vaults.insert(scope.id);
+            local_secrets.insert(scope.id, expected_secret_ids.iter().copied().collect());
+        }
+        reports.push(VaultVerificationReport {
+            vault: scope.id,
+            name: names[&scope.id].clone(),
+            current_readers: recipients.len(),
+            secret_versions: legacy_secrets.len(),
+            preserved_wraps: legacy_wraps.len(),
+            repaired_wraps,
+            legacy_local_wraps,
+            repaired_local_wraps,
+            locally_opened_versions: 0,
+        });
+    }
+    drop(reader);
+
+    let discovery = v2::storage::discover_local_vaults(pile, signer)
+        .context("discover local Secrets v2 aggregate")?;
+    let actual_local_vaults = discovery
+        .snapshot()
+        .vaults()
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual_local_vaults != expected_local_vaults {
+        bail!("local Secrets v2 aggregate does not contain the exact readable v1 epoch set");
+    }
+    for report in &mut reports {
+        let Some(secrets) = local_secrets.get(&report.vault) else {
+            continue;
+        };
+        for secret in secrets {
+            let plaintext = Zeroizing::new(
+                discovery
+                    .snapshot()
+                    .open(*secret, signer)
+                    .with_context(|| format!("open exact migrated secret {secret}"))?,
+            );
+            report.locally_opened_versions += 1;
+            drop(plaintext);
+        }
+    }
+
+    Ok(SecretsV2VerificationReport {
+        source_facts: source.len(),
+        ready_local_vaults: actual_local_vaults.len(),
+        discovery_issues: discovery.issues().len(),
+        vaults: reports,
+    })
+}
+
+/// Verify the exact additive projection without writing pile bytes or
+/// returning plaintext. This is intentionally a post-cutover operation: a
+/// missing epoch, row, current READ grant, repair wrap, or local open fails the
+/// whole verification.
+pub fn verify(pile: &Path, key: Option<&Path>) -> Result<SecretsV2VerificationReport> {
+    let signer = load_signer(pile, key).context("load durable signer for Secrets v2 verify")?;
+    let mut store = open_pile_strict(pile)?;
+    let result = verify_in_open_pile(&mut store, &signer);
+    finish_pile(store, result)
+}
+
 fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
     let close = pile.close();
     match (result, close) {
@@ -829,6 +1143,19 @@ mod tests {
         assert_eq!(published.read_grants, 2);
         let (source_after, _) = snapshot_legacy(&fixture.pile, &fixture.key);
         assert_eq!(source_after, fixture.source);
+
+        let verification = verify(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(verification.source_facts, fixture.source.len());
+        assert_eq!(verification.ready_local_vaults, 1);
+        assert_eq!(verification.discovery_issues, 0);
+        assert_eq!(verification.secret_versions(), 1);
+        assert_eq!(verification.preserved_wraps(), 2);
+        assert_eq!(verification.repaired_wraps(), 1);
+        assert_eq!(verification.legacy_local_wraps(), 0);
+        assert_eq!(verification.repaired_local_wraps(), 1);
+        assert_eq!(verification.locally_opened_versions(), 1);
+        assert_eq!(verification.vaults[0].vault, fixture.scope);
+        assert_eq!(verification.vaults[0].name, "epoch");
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
