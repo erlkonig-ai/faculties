@@ -35,6 +35,7 @@ triblespace = { version = "0.47", path = "../../triblespace-rs" }
 # path, so a crate declaring a retired attribute needs the core crate by name.
 triblespace-core = { path = "../../triblespace-rs/triblespace-core" }
 triblespace-search = { version = "0.47.0", path = "../../triblespace-rs/triblespace-search" }
+zeroize = "1.9"
 
 # The schemas, catalog validators, and canonical models the transforms read.
 # `default-features = false` keeps the migration path off the mary/GORBIE stack:

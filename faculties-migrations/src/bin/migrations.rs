@@ -20,6 +20,8 @@
 //!   had, on the events written before that identity existed.
 //! - `node-identity` names this pile's own signing key as a Secrets identity,
 //!   so a node has one key rather than two.
+//! - `secrets-v2` additively projects that retired identity/scope language into
+//!   direct-key vault collections without changing encrypted secret bodies.
 //! - `mail-credentials` recovers the mail account the Secrets cutover sealed
 //!   and retired, so `mail` can be configured again without re-deriving a
 //!   password nobody wrote down.
@@ -36,9 +38,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
     activation_cutover, collection_cutover, collection_naming, disposable_cutover,
-    mail_credentials, node_identity, posture_findings, status_register, teams_credentials,
-    write_authority,
+    legacy_secrets_v1, mail_credentials, node_identity, posture_findings, secrets_v2_cutover,
+    status_register, teams_credentials, write_authority,
 };
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -145,6 +148,20 @@ enum Command {
         #[arg(long)]
         nickname: String,
         /// Report what would be written, without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Additively project the frozen identity/scope Secrets collection into
+    /// one direct-key private vault per confidentiality epoch.
+    ///
+    /// Exact secret ids, names, timestamps, encrypted bodies, historical wrap
+    /// ids, and sealed DEKs are preserved. Current effective v1 recipients
+    /// receive root READ authority; a missing current-reader wrap is repaired
+    /// by re-sealing only its DEK. The old collection remains untouched.
+    SecretsV2 {
+        /// Complete every crypto and catalog preflight without appending the
+        /// authority grants or vault commits.
         #[arg(long)]
         dry_run: bool,
     },
@@ -427,6 +444,62 @@ fn node_identity(pile: &Path, key: Option<&Path>, nickname: &str, dry_run: bool)
     if dry_run {
         println!("\n(dry run: nothing written)");
     }
+    Ok(())
+}
+
+fn secrets_v2(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
+    let first = secrets_v2_cutover::plan(pile, key, None);
+    let password;
+    let plan = match first {
+        Ok(plan) => plan,
+        Err(error)
+            if error
+                .downcast_ref::<legacy_secrets_v1::PasswordRequired>()
+                .is_some() =>
+        {
+            password = Zeroizing::new(faculties::secrets::password::read(
+                "re-seal a legacy Secrets DEK during v2 cutover",
+            )?);
+            secrets_v2_cutover::plan(pile, key, Some(password.as_slice()))
+                .context("plan Secrets v2 cutover with the configured legacy password")?
+        }
+        Err(error) => return Err(error).context("plan Secrets v2 cutover"),
+    };
+
+    let report = plan.report();
+    println!("Secrets v2 vault cutover");
+    println!("pile                    : {}", pile.display());
+    println!("legacy source facts     : {}", report.source_facts);
+    println!("vault epochs            : {}", report.vaults.len());
+    println!("secret versions         : {}", report.secret_versions());
+    println!("preserved wraps         : {}", report.preserved_wraps());
+    println!("synthesized DEK wraps   : {}", report.synthesized_wraps());
+    println!("vault commits pending   : {}", report.pending_vaults());
+    for vault in &report.vaults {
+        println!(
+            "  {:X}: readers={} versions={} old-wraps={} new-wraps={} data={}",
+            vault.vault,
+            vault.current_readers,
+            vault.secret_versions,
+            vault.preserved_wraps,
+            vault.synthesized_wraps,
+            if vault.data_pending {
+                "pending"
+            } else {
+                "settled"
+            },
+        );
+    }
+    if dry_run {
+        println!("dry-run                 : complete; no pile bytes were written");
+        return Ok(());
+    }
+
+    let published = secrets_v2_cutover::publish(pile, key, &plan)
+        .context("publish preflighted Secrets v2 cutover")?;
+    println!("WRITE grants appended   : {}", published.write_grants);
+    println!("vault commits appended  : {}", published.vault_commits);
+    println!("READ grants appended    : {}", published.read_grants);
     Ok(())
 }
 
@@ -751,6 +824,7 @@ fn main() -> Result<()> {
         Some(Command::NodeIdentity { nickname, dry_run }) => {
             node_identity(&cli.pile, cli.key.as_deref(), &nickname, dry_run)
         }
+        Some(Command::SecretsV2 { dry_run }) => secrets_v2(&cli.pile, cli.key.as_deref(), dry_run),
         Some(Command::StatusRegister { dry_run }) => {
             status_register(&cli.pile, cli.key.as_deref(), dry_run)
         }

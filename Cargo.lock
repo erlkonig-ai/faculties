@@ -3941,6 +3941,7 @@ dependencies = [
  "triblespace",
  "triblespace-core",
  "triblespace-search",
+ "zeroize",
 ]
 
 [[package]]
