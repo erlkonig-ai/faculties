@@ -11,8 +11,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use faculties::secrets::v2::{self, RecipientPublicKey, VaultCatalog};
-use triblespace::core::authority::{resolve_authority, ACTION_WRITE};
-use triblespace::core::collection::discover_collection_records;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
@@ -219,33 +217,17 @@ where
     let team = signer.verifying_key();
     let catalog = legacy::validate_catalog(reader, &source)
         .context("validate projected pre-collection Secrets catalog")?;
+    crate::collection_cutover::reject_dormant_local_commits(
+        &mut *pile,
+        signer,
+        catalog
+            .scopes
+            .keys()
+            .copied()
+            .map(|vault| v2::vault_handle(vault, team)),
+    )
+    .context("preflight dormant COMMITs on direct vault WRITE targets")?;
     let identity_keys = legacy::identity_public_keys(reader, &catalog)?;
-
-    // A candidate adds local WRITE before publishing vault data. Reject any
-    // target commit that is dormant only because its signer currently lacks
-    // WRITE: the new grant could otherwise awaken facts that this preflight
-    // incorrectly treated as an empty baseline.
-    let records =
-        discover_collection_records(&mut *pile).context("discover frozen vault target records")?;
-    let authority = resolve_authority(&mut *pile, team)
-        .map_err(|error| anyhow!("resolve frozen vault target authority: {error}"))?;
-    for vault in catalog.scopes.keys().copied() {
-        let handle = v2::vault_handle(vault, team);
-        for commit in records
-            .commits()
-            .iter()
-            .filter(|commit| commit.collection() == handle)
-        {
-            if commit.public_key().raw == team.to_bytes()
-                && !authority.allows(&commit.public_key(), ACTION_WRITE, handle)
-            {
-                bail!(
-                    "vault {vault:X} has a dormant pre-existing COMMIT {:X} that a new WRITE grant could activate",
-                    commit.id()
-                );
-            }
-        }
-    }
 
     let mut existing_by_vault = BTreeMap::new();
     for vault in catalog.scopes.keys().copied() {

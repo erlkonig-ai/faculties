@@ -586,6 +586,13 @@ pub fn plan(
     signer: &SigningKey,
     password: Option<&[u8]>,
 ) -> Result<ActivationPlan> {
+    let mut frozen_collections = source.collection_store();
+    crate::collection_cutover::reject_dormant_local_commits(
+        &mut frozen_collections,
+        signer,
+        crate::collection_cutover::fixed_write_targets(signer),
+    )
+    .context("preflight dormant COMMITs on fixed activation WRITE targets")?;
     let mut collections = ActivationBuilder::default();
 
     let archive = archive_cutover::plan(source).context("plan Archive activation")?;
@@ -803,7 +810,6 @@ pub fn plan(
 
     let secret_plan = secrets_cutover::plan(source)
         .context("project pre-collection Secrets activation source")?;
-    let mut frozen_collections = source.collection_store();
     let direct = secrets_v2_cutover::plan_from_legacy_in_store(
         &mut frozen_collections,
         signer,
@@ -1349,6 +1355,46 @@ mod tests {
 
         let error = validate_candidate_views(&reader, &CandidateViews::default()).unwrap_err();
         assert!(format!("{error:#}").contains("no planned Archive collection"));
+    }
+
+    #[test]
+    fn aggregate_plan_rejects_fixed_root_dormant_commit_before_source_planning() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.pile");
+        let key = directory.path().join("source.key");
+        File::create(&path).unwrap();
+        let signer = faculties::storage::initialize_signer(&path, Some(&key)).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        publish_grant(
+            &mut pile,
+            signer.verifying_key(),
+            &signer,
+            AuthorityGrant::root(
+                signer.verifying_key(),
+                Inline::<Handle<SimpleArchive>>::new([0xE6; 32]),
+                ACTION_WRITE,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .unwrap();
+        triblespace::core::collection::simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &faculties::collection_names::root_descriptor(
+                schemas::wiki::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            ),
+            Fragment::empty(),
+            &signer,
+        )
+        .unwrap();
+        pile.close().unwrap();
+
+        let source = crate::collection_cutover::freeze_source(&path).unwrap();
+        let error = plan(&source, &signer, None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("preflight dormant COMMITs on fixed activation WRITE targets"));
+        assert!(message.contains("would awaken dormant local COMMIT"));
+        assert!(!message.contains("plan Archive activation"));
     }
 
     #[test]

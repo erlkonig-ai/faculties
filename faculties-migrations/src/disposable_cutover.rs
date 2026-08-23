@@ -287,43 +287,9 @@ fn future_write_targets(
     signer: &SigningKey,
     publications: &[Publication<'_>],
 ) -> BTreeSet<CollectionHandle> {
-    let team = signer.verifying_key();
-    faculties::collection_names::table()
-        .into_iter()
-        .map(|(scope, _, _)| {
-            faculties::collection_names::root_descriptor(scope, team)
-                .facts()
-                .clone()
-                .to_blob()
-                .get_handle()
-        })
-        .chain(publications.iter().map(|publication| publication.handle))
-        .collect()
-}
-
-fn reject_dormant_commits_awakened_by_planned_write(
-    pile: &mut Pile,
-    signer: &SigningKey,
-    records: &DiscoveredCollectionRecords,
-    publications: &[Publication<'_>],
-) -> Result<()> {
-    let team = signer.verifying_key();
-    let authority = resolve_authority(&mut *pile, team)
-        .map_err(|error| anyhow!("resolve pre-activation authority: {error}"))?;
-    let targets = future_write_targets(signer, publications);
-    for commit in records.commits() {
-        if targets.contains(&commit.collection())
-            && commit.public_key().raw == team.to_bytes()
-            && !authority.allows(&commit.public_key(), ACTION_WRITE, commit.collection())
-        {
-            bail!(
-                "planned WRITE authority would awaken dormant local COMMIT {:X} on collection {}",
-                commit.id(),
-                hex::encode_upper(commit.collection().raw)
-            );
-        }
-    }
-    Ok(())
+    let mut targets = crate::collection_cutover::fixed_write_targets(signer);
+    targets.extend(publications.iter().map(|publication| publication.handle));
+    targets
 }
 
 fn publication_handle(
@@ -354,13 +320,13 @@ fn build_world(
 ) -> Result<CandidateWorld> {
     let mut pile = open_pile_strict(candidate)?;
     let result = (|| {
-        let baseline_records = discover_collection_records(&mut pile)?;
-        reject_dormant_commits_awakened_by_planned_write(
+        crate::collection_cutover::reject_dormant_local_commits(
             &mut pile,
             signer,
-            &baseline_records,
-            publications,
-        )?;
+            future_write_targets(signer, publications),
+        )
+        .context("recheck dormant COMMITs before candidate WRITE grants")?;
+        let baseline_records = discover_collection_records(&mut pile)?;
         let mut authority = ensure_team_of_one_write_authority(&mut pile, signer)
             .context("initialize candidate WRITE authority")?
             .rows()
@@ -1325,7 +1291,7 @@ mod tests {
             Ok(_) => panic!("dormant local vault COMMIT was accepted"),
             Err(error) => error,
         };
-        assert!(format!("{error:#}").contains("dormant pre-existing COMMIT"));
+        assert!(format!("{error:#}").contains("would awaken dormant local COMMIT"));
 
         let foreign_fixture = Fixture::new();
         let foreign = SigningKey::from_bytes(&[0x77; 32]);

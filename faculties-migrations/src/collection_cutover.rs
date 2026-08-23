@@ -28,21 +28,25 @@ use std::os::unix::fs::MetadataExt;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
+use ed25519_dalek::SigningKey;
 
 use faculties::storage::open_pile_strict;
 use triblespace::core::attribute::Attribute;
+use triblespace::core::authority::{resolve_authority, ACTION_WRITE};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob, MemoryBlobStore};
-use triblespace::core::collection::{CollectionRecord, CollectionStore};
+use triblespace::core::collection::{
+    discover_collection_records, CollectionHandle, CollectionRecord, CollectionStore,
+};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{
-    self, BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinSnapshotSource,
+    self, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, CommitHandle, PinSnapshotSource,
 };
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{entity, find, pattern};
@@ -304,6 +308,57 @@ impl CollectionStore for FrozenCollectionStore {
     fn insert(&mut self, _record: CollectionRecord) -> std::result::Result<(), Self::InsertError> {
         Err(FrozenStoreWriteError)
     }
+}
+
+/// Exact fixed faculty handles that team-of-one activation will WRITE-grant.
+pub(crate) fn fixed_write_targets(signer: &SigningKey) -> BTreeSet<CollectionHandle> {
+    let team = signer.verifying_key();
+    faculties::collection_names::table()
+        .into_iter()
+        .map(|(scope, _, _)| {
+            faculties::collection_names::root_descriptor(scope, team)
+                .facts()
+                .clone()
+                .to_blob()
+                .get_handle()
+        })
+        .collect()
+}
+
+/// Reject local COMMITs that a deterministic future WRITE grant would awaken.
+///
+/// Foreign signers remain inert: a root grant to the durable local signer does
+/// not authorize them. Callers run this over the exact target set both during
+/// read-only planning and again on the disposable candidate before grants are
+/// appended, making the second invocation the stopped-world TOCTOU guard.
+pub(crate) fn reject_dormant_local_commits<S>(
+    store: &mut S,
+    signer: &SigningKey,
+    targets: impl IntoIterator<Item = CollectionHandle>,
+) -> Result<()>
+where
+    S: BlobStore + CollectionStore,
+    S::Reader: BlobStoreMeta,
+{
+    let records = discover_collection_records(&mut *store)
+        .context("discover records before planned WRITE authority")?;
+    let team = signer.verifying_key();
+    let authority = resolve_authority(&mut *store, team)
+        .map_err(|error| anyhow!("resolve authority before planned WRITE grants: {error}"))?;
+    let targets = targets.into_iter().collect::<BTreeSet<_>>();
+    for commit in records.commits() {
+        if targets.contains(&commit.collection())
+            && commit.public_key().raw == team.to_bytes()
+            && !authority.allows(&commit.public_key(), ACTION_WRITE, commit.collection())
+        {
+            bail!(
+                "planned WRITE authority would awaken dormant local COMMIT {:X} on collection {}",
+                commit.id(),
+                hex::encode_upper(commit.collection().raw)
+            );
+        }
+    }
+    Ok(())
 }
 
 impl FrozenSource {
