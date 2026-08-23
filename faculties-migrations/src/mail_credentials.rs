@@ -4,9 +4,9 @@
 //! `secrets` branch: a cleartext address plus a password-locked `box` holding
 //! the mailbox password and the hosts and ports to reach it. `secrets_cutover`
 //! validates that record exactly and then retires it — it is bounded evidence,
-//! not Secrets authority, so neither its facts nor its envelope enter the
-//! native Secrets collection. The cutover note says live configuration would
-//! restart from a Mail account record naming an encrypted Secrets version.
+//! not Secrets authority, so neither its facts nor its envelope enter a current
+//! Secrets vault. The cutover note says live configuration would restart from
+//! a Mail account record naming an encrypted Secrets version.
 //!
 //! Nothing built that restart, and it is the same gap Teams had. On a migrated
 //! pile `mail account list` is empty and `mail fetch` does nothing, while the
@@ -23,8 +23,8 @@
 //!
 //! The one difference from the Teams recovery is that the legacy rows here are
 //! *not* plaintext: the envelope is argon2id + secretbox keyed on the same root
-//! password the Secrets store uses, so exporting needs that password. Reporting
-//! does not.
+//! password the retired Secrets store used, so exporting needs that password.
+//! Reporting does not.
 //!
 //! It opens the pile read-only, appends nothing, and prints no secret.
 
@@ -98,7 +98,7 @@ fn unlock(password: &[u8], envelope: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| {
             anyhow!(
                 "wrong root password: the retired Mail envelope did not open. It is locked with \
-                 the same FACULTIES_SECRETS_PW the Secrets store uses."
+                 the FACULTIES_SECRETS_PW used by the retired Secrets store."
             )
         })
 }
@@ -312,8 +312,8 @@ pub struct RecoveredAccount {
 
 /// Unlock one retired account's envelope.
 ///
-/// `password` is the Secrets root password — the legacy envelope predates the
-/// identity/scope/grant ceremony and is keyed on it directly.
+/// `password` is the retired Secrets root password — the legacy envelope
+/// predates the identity/scope/grant ceremony and is keyed on it directly.
 pub fn open(account: &LegacyAccount, password: &[u8]) -> Result<RecoveredAccount> {
     let envelope = account.envelope.as_deref().ok_or_else(|| {
         anyhow!(

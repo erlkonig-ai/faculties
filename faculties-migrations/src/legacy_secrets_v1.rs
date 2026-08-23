@@ -1137,8 +1137,19 @@ mod tests {
             (KIND_SECRET, "72B64C9F3644B8016B64820D7F3F23C1"),
             (KIND_WRAP, "EB8549BAF679C5D11ECEDB416AAD76E3"),
             (identity_sign_pk.id(), "FD0897D627CF18F4E49A93968A8D6301"),
+            (identity_lockbox.id(), "1E4279231655D8C67835865C3AFB629F"),
+            (grant_object.id(), "B3F0E5A5FFACC159B651BFDA19EAE18C"),
+            (grant_relation.id(), "22F807F93FADFE092C8CE0698044680B"),
+            (grant_subject.id(), "B44AF03BA7AF04ED81096D7900D70A12"),
+            (grant_issuer.id(), "B177568BEE389D76D9D71110E9067EF1"),
+            (grant_retracted_at.id(), "73CE206E6B9B81CB2BD2388ECC5D3AA8"),
+            (secret_scope.id(), "A66C795299212D16BA6BA25BD1D9F983"),
+            (secret_name.id(), "8FD8C43D3490ACD6AFAD6D691B748CA3"),
             (secret_body.id(), "7FC38805FDC9FA4D8449497B298B51BB"),
+            (wrap_secret.id(), "D17EC6F6A9F9D6B7A3B9A329A9CFC4CC"),
             (wrap_recipient.id(), "CAD2A79E7F5B1A870F5814BDEE5C90F8"),
+            (wrap_dek.id(), "B30CE37D4DC3CAACC34D946B3D71E37C"),
+            (scope_creator.id(), "CE866212934742FF5B27DEF25E366E07"),
         ] {
             assert_eq!(format!("{actual:X}"), expected);
         }

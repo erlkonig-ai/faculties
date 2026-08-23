@@ -6,7 +6,7 @@
 //! ids, semantic commit metadata, and resident attachment closure are copied
 //! exactly. Current imported-observation and read shadows are added beside
 //! that inert evidence; no historical Mail-owned credential envelope is
-//! migrated into the shared Secrets collection.
+//! migrated into a current Secrets vault.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

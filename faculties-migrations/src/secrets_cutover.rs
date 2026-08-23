@@ -382,8 +382,8 @@ mod tests {
         };
 
         // The old Mail writer placed account state on this branch. It remains
-        // an authored source delta, but becomes an empty native Secrets commit
-        // after its complete bounded record is retired.
+        // an authored source delta, but enters no vault commit after its
+        // complete bounded record is retired.
         let canonical_identity_facts = identity_fragment.facts().clone();
         let retired_account = Id::new([0x61; 16]).unwrap();
         let retired_active = Id::new([0x62; 16]).unwrap();

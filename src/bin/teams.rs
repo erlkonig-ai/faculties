@@ -124,7 +124,7 @@ enum CommandMode {
             long = "client-secret",
             value_name = "@PATH|@-",
             conflicts_with = "client_secret_version",
-            help = "Read the Azure app client secret from @path or @- and encrypt it into shared Secrets. TEAMS_CLIENT_SECRET is the environment alternative."
+            help = "Read the Azure app client secret from @path or @- and encrypt it into the selected Secrets vault epoch. TEAMS_CLIENT_SECRET is the environment alternative."
         )]
         client_secret_source: Option<String>,
         /// Exact existing Secrets version for the app client secret.

@@ -200,6 +200,24 @@ fn next_unused_id(used: &mut BTreeSet<Id>) -> Id {
     }
 }
 
+/// A historical scope admitted creation time as a set of observations, while
+/// a vault header has one immutable scalar. Refuse a non-singleton set rather
+/// than silently choosing a winner; the copied legacy branch retains every
+/// original observation until an explicit projection policy is chosen.
+fn vault_created_at(scope: &legacy::ScopeRow) -> Result<legacy::IntervalValue> {
+    if scope.created_at.len() != 1 {
+        bail!(
+            "legacy scope {} has {} creation observations; a vault requires exactly one",
+            scope.id,
+            scope.created_at.len()
+        );
+    }
+    Ok(*scope
+        .created_at
+        .first()
+        .expect("one legacy scope creation observation checked above"))
+}
+
 /// Translate an exact pre-collection legacy Secrets projection directly into
 /// zero or more vault plans. The projection is an in-memory source boundary,
 /// never a fixed native `secrets` collection or an authority target.
@@ -242,17 +260,7 @@ where
     let mut vaults = Vec::with_capacity(catalog.scopes.len());
 
     for scope in catalog.scopes.values() {
-        if scope.created_at.len() != 1 {
-            bail!(
-                "legacy scope {} has {} creation observations; a vault requires exactly one",
-                scope.id,
-                scope.created_at.len()
-            );
-        }
-        let created_at = *scope
-            .created_at
-            .first()
-            .expect("one legacy scope creation observation checked above");
+        let created_at = vault_created_at(scope)?;
         let vault_name = legacy::read_text(reader, scope.name)
             .with_context(|| format!("read legacy scope {} name", scope.id))?;
         let recipient_ids = catalog.recipients_of(scope.id);
@@ -421,4 +429,30 @@ where
         vaults,
         report,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn at(byte: u8) -> legacy::IntervalValue {
+        Inline::new([byte; 32])
+    }
+
+    #[test]
+    fn repeated_legacy_creation_observations_are_not_arbitrated() {
+        let scope = legacy::ScopeRow {
+            id: id(1),
+            creator: id(2),
+            created_at: BTreeSet::from([at(3), at(4)]),
+            name: Inline::new([5; 32]),
+        };
+
+        let error = vault_created_at(&scope).unwrap_err().to_string();
+        assert!(error.contains("2 creation observations"), "{error}");
+    }
 }

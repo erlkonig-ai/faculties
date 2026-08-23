@@ -56,7 +56,7 @@ pub struct CoverageHead {
 }
 
 /// Complete public state of one immutable Teams authentication profile.
-/// Secret-bearing values live in the shared Secrets collection; these fields
+/// Secret-bearing values live in explicit Secrets vault epochs; these fields
 /// are exact immutable version references, never names resolved by time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthProfileRecord {

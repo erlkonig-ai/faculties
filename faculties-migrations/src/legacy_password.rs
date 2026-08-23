@@ -1,8 +1,10 @@
-//! Loading the root password that unlocks the secrets store.
+//! Loading the retired root password used by legacy Secrets recovery.
 //!
-//! The password cannot live in the store it unlocks. An environment variable
-//! remains supported for ephemeral use, while a mode-checked file avoids
-//! exporting the root secret to every child process.
+//! Current vaults use direct durable-key custody and have no root password.
+//! This loader remains only so one-time activation can open an old identity
+//! lockbox or retired Mail envelope. An environment variable remains supported
+//! for ephemeral use, while a mode-checked file avoids exporting the retired
+//! secret to every child process.
 
 use std::path::{Path, PathBuf};
 

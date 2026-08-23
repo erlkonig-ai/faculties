@@ -6,9 +6,10 @@
 //! renders the live state as a single "you are here" card plus a compact
 //! roster of other profiles.
 //!
-//! It consumes the exact native Headspace and Secrets collection snapshots.
-//! The shared projector preserves missing, agreed, and forked DAG heads; this
-//! widget never chooses a timestamp winner and never decrypts a credential.
+//! It consumes the exact native Headspace snapshot and the aggregate of locally
+//! readable Secrets vault snapshots. The shared projector preserves missing,
+//! agreed, and forked DAG heads; this widget never chooses a timestamp winner
+//! and never decrypts a credential.
 //!
 //! ```ignore
 //! let mut panel = HeadspaceViewer::default();
