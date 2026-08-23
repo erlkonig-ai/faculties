@@ -121,8 +121,13 @@ fn main() -> anyhow::Result<()> {
         pile.display()
     );
     eprintln!("imagine: weights pile → {}", pile.display());
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
-        .with_context(|| format!("freezing native FLUX collection {}", pile.display()))?;
+    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
+        .with_context(|| {
+            format!(
+                "discovering and freezing the sole FLUX model collection in {}",
+                pile.display()
+            )
+        })?;
     let weights = FluxWeights::from_snapshot(snapshot, variant).with_context(|| {
         format!(
             "selecting the {label} text encoder, transformer, and VAE from {}",
