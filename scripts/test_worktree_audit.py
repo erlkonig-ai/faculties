@@ -159,6 +159,19 @@ class WorktreeAuditTest(unittest.TestCase):
         self.assertEqual(base["sha"], head)
         self.assertEqual(base["freshness"], "not_checked")
 
+    def test_non_origin_remote_head_is_a_portable_fork_base(self) -> None:
+        head = self.git("rev-parse", "HEAD")
+        self.git("branch", "-m", "main", "topic")
+        self.git("update-ref", "refs/remotes/fork/main", head)
+        self.git("symbolic-ref", "refs/remotes/fork/HEAD", "refs/remotes/fork/main")
+
+        report, records = self.json_records()
+        self.assertEqual(report.returncode, 0, report.stderr)
+        base = records[0]["base"]
+        self.assertEqual(base["ref"], "refs/remotes/fork/HEAD")
+        self.assertEqual(base["resolved_ref"], "refs/remotes/fork/main")
+        self.assertEqual(base["sha"], head)
+
     def test_complete_base_precedence_and_explicit_override(self) -> None:
         head = self.git("rev-parse", "HEAD")
         self.git("branch", "master", head)

@@ -204,13 +204,39 @@ def select_base(
             "freshness": "not_checked",
         }
 
-    for ref in (
+    remote_heads = sorted(
+        ref
+        for ref, entry in refs.items()
+        if ref.startswith("refs/remotes/")
+        and ref.endswith("/HEAD")
+        and entry["symref"] is not None
+        and ref != "refs/remotes/origin/HEAD"
+    )
+    remote_mains = sorted(
+        ref
+        for ref in refs
+        if ref.startswith("refs/remotes/")
+        and ref.endswith("/main")
+        and ref != "refs/remotes/origin/main"
+    )
+    remote_masters = sorted(
+        ref
+        for ref in refs
+        if ref.startswith("refs/remotes/")
+        and ref.endswith("/master")
+        and ref != "refs/remotes/origin/master"
+    )
+    precedence = [
         "refs/remotes/origin/HEAD",
+        *remote_heads,
         "refs/remotes/origin/main",
         "refs/heads/main",
+        *remote_mains,
         "refs/remotes/origin/master",
         "refs/heads/master",
-    ):
+        *remote_masters,
+    ]
+    for ref in precedence:
         if ref in refs:
             return {
                 "ref": ref,
@@ -220,8 +246,7 @@ def select_base(
                 "freshness": "not_checked",
             }
     raise AuditFailure(
-        "base unresolved (tried origin/HEAD, origin/main, local main, "
-        "origin/master, and local master)"
+        "base unresolved (tried every remote HEAD plus conventional main/master refs)"
     )
 
 
@@ -229,9 +254,12 @@ def primary_local_ref(base: dict[str, Any]) -> str | None:
     ref = base.get("resolved_ref") or base["ref"]
     if ref.startswith("refs/heads/"):
         return ref
-    prefix = "refs/remotes/origin/"
+    prefix = "refs/remotes/"
     if ref.startswith(prefix):
-        return "refs/heads/" + ref[len(prefix) :]
+        remote_and_branch = ref[len(prefix) :]
+        _, separator, branch = remote_and_branch.partition("/")
+        if separator:
+            return "refs/heads/" + branch
     return None
 
 
