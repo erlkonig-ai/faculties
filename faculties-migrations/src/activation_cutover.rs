@@ -307,7 +307,7 @@ pub fn validate_candidate_views(
     let message_facts = required_view(views, "Message", schemas::message::DEFAULT_SCOPE_ID)?;
     message::validate_catalog(reader, message_facts, relation_facts)
         .context("validate Message -> Relations candidate references")?;
-    mail::validate_catalog(
+    mail::validate_catalog_legacy_secrets_v1(
         reader,
         mail_facts,
         files,
@@ -652,7 +652,7 @@ pub fn plan(source: &FrozenSource) -> Result<ActivationPlan> {
     let secrets_facts = secret_plan.materialized_facts();
     let secrets_catalog = secrets::validate_catalog(source.reader(), &secrets_facts)
         .context("validate planned Secrets catalog for Mail preflight")?;
-    let validated_mail = mail::validate_catalog_union_with_blobs(
+    let validated_mail = mail::validate_catalog_union_with_blobs_legacy_secrets_v1(
         source.reader(),
         &TribleSet::new(),
         &staged_mail,

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
+use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use lettre::message::{header, Mailbox, MultiPart, SinglePart};
 use lettre::Message;
@@ -31,7 +32,7 @@ use crate::schemas::mail::{
     LEGACY_KIND_MESSAGE, LEGACY_KIND_SPAM, RECIPE_RFC5322_V1,
 };
 use crate::schemas::message::local as legacy_read;
-use crate::secrets::{self, SecretsCatalog};
+use crate::secrets::v2::SecretsSnapshot;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -1681,16 +1682,16 @@ pub fn authorized_send(
 }
 
 /// Materialize one current account and open its exact referenced Secrets
-/// version as one exact Secrets identity. The identity is deliberately not a
-/// Relations person id; callers resolve those namespaces independently.
-pub fn open_account(
+/// version with the pile's durable signing key.
+///
+/// The account schema stores one immutable secret id, so this path performs no
+/// name or “latest version” arbitration and has no password-identity fallback.
+pub fn open_account<R: BlobStoreGet>(
     mail_reader: &PileReader,
     mail_facts: &TribleSet,
-    secrets_reader: &PileReader,
-    secrets_catalog: &SecretsCatalog,
+    secrets: &SecretsSnapshot<R>,
     anchor: Id,
-    identity: Id,
-    identity_secret: &secrets::IdentitySecret,
+    signing_key: &SigningKey,
 ) -> Result<OpenAccount> {
     let config_id = match account_head(mail_facts, anchor)? {
         Head::Unique(id) => id,
@@ -1700,13 +1701,7 @@ pub fn open_account(
         }
     };
     let config = account_config(mail_facts, config_id)?;
-    let password = secrets::open_version(
-        secrets_reader,
-        secrets_catalog,
-        config.credential,
-        identity,
-        identity_secret,
-    )?;
+    let password = secrets.open(config.credential, signing_key)?;
     Ok(OpenAccount {
         anchor,
         config: config_id,
@@ -1904,13 +1899,13 @@ fn validate_attempt_rendering(
 }
 
 /// Exact structural and cross-collection validation for one Mail materialization.
-pub fn validate_catalog(
+pub fn validate_catalog<R>(
     reader: &PileReader,
     facts: &TribleSet,
     files_facts: &TribleSet,
     decide_facts: &TribleSet,
     relations_facts: &TribleSet,
-    secrets_catalog: &SecretsCatalog,
+    secrets: &SecretsSnapshot<R>,
 ) -> Result<()> {
     validate_catalog_inner(
         reader,
@@ -1919,9 +1914,67 @@ pub fn validate_catalog(
         files_facts,
         decide_facts,
         relations_facts,
-        Some(secrets_catalog),
         true,
-    )
+    )?;
+    validate_secret_references(facts, secrets)
+}
+
+/// Validate only Mail's exact immutable references into Secrets v2.
+pub fn validate_secret_references<R>(
+    facts: &TribleSet,
+    secrets: &SecretsSnapshot<R>,
+) -> Result<()> {
+    for (id, record) in config_owner_map(facts)? {
+        if !secrets.contains(record.credential) {
+            bail!(
+                "account config {id:x} names unknown Secrets version {:x}",
+                record.credential
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Frozen-v1 migration seam for exact Mail credential references.
+///
+/// Runtime consumers must use [`validate_catalog`] and a v2
+/// [`SecretsSnapshot`]. This deliberately named exception exists only so the
+/// stopped-world activation planner can validate its legacy, pre-v2 candidate.
+pub fn validate_legacy_secret_references_v1(
+    facts: &TribleSet,
+    secrets: &crate::secrets::SecretsCatalog,
+) -> Result<()> {
+    for (id, record) in config_owner_map(facts)? {
+        if !secrets.secrets.contains_key(&record.credential) {
+            bail!(
+                "account config {id:x} names unknown legacy Secrets v1 version {:x}",
+                record.credential
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Full stopped-world validation against the frozen Secrets v1 collection.
+#[doc(hidden)]
+pub fn validate_catalog_legacy_secrets_v1(
+    reader: &PileReader,
+    facts: &TribleSet,
+    files_facts: &TribleSet,
+    decide_facts: &TribleSet,
+    relations_facts: &TribleSet,
+    secrets: &crate::secrets::SecretsCatalog,
+) -> Result<()> {
+    validate_catalog_inner(
+        reader,
+        None::<&PileReader>,
+        facts,
+        files_facts,
+        decide_facts,
+        relations_facts,
+        true,
+    )?;
+    validate_legacy_secret_references_v1(facts, secrets)
 }
 
 /// Exact local Mail reconstruction without resolving cross-collection edges.
@@ -1936,7 +1989,6 @@ pub fn validate_local_catalog(reader: &PileReader, facts: &TribleSet) -> Result<
         &TribleSet::new(),
         &TribleSet::new(),
         &TribleSet::new(),
-        None,
         false,
     )
 }
@@ -1962,7 +2014,6 @@ pub fn validate_local_catalog_union(
         &TribleSet::new(),
         &TribleSet::new(),
         &TribleSet::new(),
-        None,
         false,
     )?;
     Ok(expected)
@@ -1970,14 +2021,14 @@ pub fn validate_local_catalog_union(
 
 /// Preflight the exact set union a Mail publication would create, including
 /// the new fragment's in-memory blobs, without writing pile bytes.
-pub fn validate_catalog_union(
+pub fn validate_catalog_union<R>(
     reader: &PileReader,
     current: &TribleSet,
     fragment: &Fragment,
     files_facts: &TribleSet,
     decide_facts: &TribleSet,
     relations_facts: &TribleSet,
-    secrets_catalog: &SecretsCatalog,
+    secrets: &SecretsSnapshot<R>,
 ) -> Result<TribleSet> {
     validate_catalog_union_with_blobs(
         reader,
@@ -1987,7 +2038,7 @@ pub fn validate_catalog_union(
         files_facts,
         decide_facts,
         relations_facts,
-        secrets_catalog,
+        secrets,
     )
 }
 
@@ -1996,7 +2047,7 @@ pub fn validate_catalog_union(
 /// `blob_overlay` is an ownership carrier for any Mail, Files, or Decide blobs
 /// that have not reached the pile yet.
 #[allow(clippy::too_many_arguments)]
-pub fn validate_catalog_union_with_blobs(
+pub fn validate_catalog_union_with_blobs<R>(
     reader: &PileReader,
     current: &TribleSet,
     mail_fragment: &Fragment,
@@ -2004,7 +2055,7 @@ pub fn validate_catalog_union_with_blobs(
     files_facts: &TribleSet,
     decide_facts: &TribleSet,
     relations_facts: &TribleSet,
-    secrets_catalog: &SecretsCatalog,
+    secrets: &SecretsSnapshot<R>,
 ) -> Result<TribleSet> {
     let mut expected = current.clone();
     expected += mail_fragment.facts().clone();
@@ -2020,9 +2071,42 @@ pub fn validate_catalog_union_with_blobs(
         files_facts,
         decide_facts,
         relations_facts,
-        Some(secrets_catalog),
         true,
     )?;
+    validate_secret_references(&expected, secrets)?;
+    Ok(expected)
+}
+
+/// Stopped-world union preflight against a frozen Secrets v1 candidate.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn validate_catalog_union_with_blobs_legacy_secrets_v1(
+    reader: &PileReader,
+    current: &TribleSet,
+    mail_fragment: &Fragment,
+    blob_overlay: &Fragment,
+    files_facts: &TribleSet,
+    decide_facts: &TribleSet,
+    relations_facts: &TribleSet,
+    secrets: &crate::secrets::SecretsCatalog,
+) -> Result<TribleSet> {
+    let mut expected = current.clone();
+    expected += mail_fragment.facts().clone();
+    let mut staged = blob_overlay.clone();
+    let overlay = staged
+        .blobs_mut()
+        .reader()
+        .expect("memory blob reader creation is infallible");
+    validate_catalog_inner(
+        reader,
+        Some(&overlay),
+        &expected,
+        files_facts,
+        decide_facts,
+        relations_facts,
+        true,
+    )?;
+    validate_legacy_secret_references_v1(&expected, secrets)?;
     Ok(expected)
 }
 
@@ -2034,7 +2118,6 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
     files_facts: &TribleSet,
     decide_facts: &TribleSet,
     relations_facts: &TribleSet,
-    secrets_catalog: Option<&SecretsCatalog>,
     validate_cross_collection: bool,
 ) -> Result<()> {
     let accounts = account_anchors(facts);
@@ -2057,17 +2140,6 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
             bail!(
                 "account config {id:x} names unknown account {:x}",
                 record.account
-            );
-        }
-        if validate_cross_collection
-            && !secrets_catalog
-                .expect("cross-collection validation requires a Secrets catalog")
-                .secrets
-                .contains_key(&record.credential)
-        {
-            bail!(
-                "account config {id:x} names unknown Secrets version {:x}",
-                record.credential
             );
         }
         for handle in [
@@ -3101,14 +3173,14 @@ fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
 /// execution is therefore an affine authority which deployments must
 /// serialize per account rather than running concurrently on replicas.
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_send(
+pub fn prepare_send<R>(
     mail_reader: &PileReader,
     decide_reader: &PileReader,
     mail_facts: &TribleSet,
     files_facts: &TribleSet,
     decide_facts: &TribleSet,
     relations_facts: &TribleSet,
-    secrets_catalog: &SecretsCatalog,
+    secrets: &SecretsSnapshot<R>,
     input: SendAttemptInput,
 ) -> Result<PreparedSend> {
     let draft = draft_from_facts(mail_facts, input.draft)
@@ -3146,7 +3218,7 @@ pub fn prepare_send(
         &files_union,
         decide_facts,
         relations_facts,
-        secrets_catalog,
+        secrets,
     )?;
     Ok(PreparedSend {
         attempt,
@@ -3204,7 +3276,7 @@ mod tests {
         decide as decide_schema, files as files_schema, mail as mail_schema,
         relations as relations_schema,
     };
-    use crate::secrets::schema as secrets_schema;
+    use crate::secrets::v2::storage as vaults;
     use crate::storage::{load_signer, open_pile_strict, publish_fragment};
     use crate::test_support::initialize_team_of_one_write_fixture;
     use triblespace::core::repo::pile::{Pile, PileReader};
@@ -3232,8 +3304,7 @@ mod tests {
         _directory: tempfile::TempDir,
         pile: PathBuf,
         key: PathBuf,
-        secret_identity: Id,
-        secret_scope: Id,
+        secret_vault: Id,
     }
 
     struct CollectionView {
@@ -3246,8 +3317,7 @@ mod tests {
         files: CollectionView,
         decide: CollectionView,
         relations: CollectionView,
-        secrets: CollectionView,
-        secrets_catalog: SecretsCatalog,
+        secrets: SecretsSnapshot<PileReader>,
     }
 
     impl Fixture {
@@ -3257,26 +3327,16 @@ mod tests {
             let key = directory.path().join("mail.key");
             File::create(&pile).unwrap();
             initialize_team_of_one_write_fixture(&pile, Some(&key));
-            let prepared =
-                secrets::prepare_identity("operator", b"identity password", at(1)).unwrap();
-            let secret_identity = prepared.id;
-            let scope = secrets::scope_fragment(secret_identity, "mail-test", at(2)).unwrap();
-            let secret_scope = scope.root().unwrap();
-            let mut secrets_fragment = prepared.fragment;
-            secrets_fragment += scope;
-            publish_fragment(
-                &pile,
-                Some(&key),
-                secrets_schema::DEFAULT_SCOPE_ID,
-                secrets_fragment,
-            )
-            .unwrap();
+            let secret_vault = id(120);
+            let signer = load_signer(&pile, Some(&key)).unwrap();
+            let mut store = open_pile_strict(&pile).unwrap();
+            vaults::create_vault(&mut store, &signer, secret_vault, "mail-test", at(2)).unwrap();
+            store.close().unwrap();
             Self {
                 _directory: directory,
                 pile,
                 key,
-                secret_identity,
-                secret_scope,
+                secret_vault,
             }
         }
 
@@ -3287,26 +3347,51 @@ mod tests {
         fn views(&self) -> Views {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
+            let secrets = vaults::discover_local_vaults(&mut pile, &signer)
+                .unwrap()
+                .into_parts()
+                .0;
             let mut materialize = |scope| CollectionView {
                 facts: crate::collection_names::open(&mut pile, scope, signer.clone())
                     .materialize()
                     .unwrap(),
                 reader: pile.reader().unwrap(),
             };
-            let secrets = materialize(secrets_schema::DEFAULT_SCOPE_ID);
-            let secrets_catalog =
-                secrets::validate_catalog(&secrets.reader, &secrets.facts).unwrap();
             let views = Views {
                 mail: materialize(mail_schema::DEFAULT_SCOPE_ID),
                 files: materialize(files_schema::DEFAULT_SCOPE_ID),
                 decide: materialize(decide_schema::DEFAULT_SCOPE_ID),
                 relations: materialize(relations_schema::DEFAULT_SCOPE_ID),
                 secrets,
-                secrets_catalog,
             };
             drop(materialize);
             pile.close().unwrap();
             views
+        }
+
+        fn signer(&self) -> SigningKey {
+            load_signer(&self.pile, Some(&self.key)).unwrap()
+        }
+
+        fn add_secret(&self, name: &str, plaintext: &[u8], created_at: IntervalValue) -> Id {
+            let signer = self.signer();
+            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let discovery = vaults::discover_local_vaults(&mut pile, &signer).unwrap();
+            let location = *discovery.location(self.secret_vault).unwrap();
+            let secret = vaults::add_secret(
+                &mut pile,
+                &signer,
+                &location,
+                discovery.snapshot(),
+                name,
+                plaintext,
+                created_at,
+            )
+            .unwrap()
+            .0;
+            drop(discovery);
+            pile.close().unwrap();
+            secret
         }
     }
 
@@ -3325,24 +3410,7 @@ mod tests {
     }
 
     fn add_account(fixture: &Fixture, account_id: Id) -> (Id, Id) {
-        let views = fixture.views();
-        let sealed = secrets::seal_version(
-            &views.secrets.reader,
-            &views.secrets_catalog,
-            fixture.secret_scope,
-            "mail/test",
-            b"smtp-secret",
-            at(3),
-        )
-        .unwrap();
-        secrets::validate_candidate(
-            &views.secrets.reader,
-            &views.secrets.facts,
-            &sealed.fragment,
-        )
-        .unwrap();
-        let credential_id = sealed.secret;
-        fixture.publish(secrets_schema::DEFAULT_SCOPE_ID, sealed.fragment);
+        let credential_id = fixture.add_secret("mail/test", b"smtp-secret", at(3));
         let views = fixture.views();
         let mut fragment = Fragment::empty();
         let (config, config_id) = account_config_fragment(
@@ -3367,7 +3435,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, fragment);
@@ -3514,7 +3582,7 @@ mod tests {
             &files_union,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap_err();
         let error = format!("{error:#}");
@@ -3543,7 +3611,7 @@ mod tests {
             &first_files,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         fixture.publish(files_schema::DEFAULT_SCOPE_ID, first.files.clone());
@@ -3557,7 +3625,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .expect("an exact account/UIDL/raw replay is idempotent");
 
@@ -3575,7 +3643,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("UIDL \"stable-uidl\" names different raw messages"));
@@ -3688,7 +3756,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("unknown Secrets version"));
@@ -3697,18 +3765,7 @@ mod tests {
     #[test]
     fn opening_an_account_requires_utf8_mailbox_secret_bytes() {
         let fixture = Fixture::new();
-        let views = fixture.views();
-        let sealed = secrets::seal_version(
-            &views.secrets.reader,
-            &views.secrets_catalog,
-            fixture.secret_scope,
-            "mail/non-utf8",
-            &[0xff, 0xfe],
-            at(4),
-        )
-        .unwrap();
-        let secret = sealed.secret;
-        fixture.publish(secrets_schema::DEFAULT_SCOPE_ID, sealed.fragment);
+        let secret = fixture.add_secret("mail/non-utf8", &[0xff, 0xfe], at(4));
         let views = fixture.views();
         let account = id(85);
         let (config, _) = account_config_fragment(
@@ -3732,7 +3789,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, config);
@@ -3740,14 +3797,41 @@ mod tests {
         let error = open_account(
             &views.mail.reader,
             &views.mail.facts,
-            &views.secrets.reader,
-            &views.secrets_catalog,
+            &views.secrets,
             account,
-            fixture.secret_identity,
-            &secrets::IdentitySecret::Password(b"identity password".to_vec()),
+            &fixture.signer(),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("not UTF-8"));
+    }
+
+    #[test]
+    fn opening_an_account_uses_the_durable_signer_without_password_identity() {
+        let fixture = Fixture::new();
+        let account = id(86);
+        add_account(&fixture, account);
+        let views = fixture.views();
+
+        let opened = open_account(
+            &views.mail.reader,
+            &views.mail.facts,
+            &views.secrets,
+            account,
+            &fixture.signer(),
+        )
+        .unwrap();
+        assert_eq!(opened.password, "smtp-secret");
+
+        let outsider = SigningKey::from_bytes(&[99; 32]);
+        let error = open_account(
+            &views.mail.reader,
+            &views.mail.facts,
+            &views.secrets,
+            account,
+            &outsider,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("no wrap for this signing key"));
     }
 
     #[test]
@@ -3795,7 +3879,7 @@ mod tests {
             &views.files.facts,
             &decide_union,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("non-resident thread wire"));
@@ -3840,7 +3924,7 @@ mod tests {
             &digest_files,
             &decide_union,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("digest-only thread wire"));
@@ -3857,7 +3941,7 @@ mod tests {
             &wrong_files,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("unknown config"));
@@ -3876,7 +3960,7 @@ mod tests {
             &files_union,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         fixture.publish(files_schema::DEFAULT_SCOPE_ID, incoming.files.clone());
@@ -3889,7 +3973,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         let inbox = inbox_projection(&views.mail.facts, &views.relations.facts, persona).unwrap();
@@ -3912,7 +3996,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, read_fragment);
@@ -3928,7 +4012,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, replay.mail);
@@ -3971,7 +4055,7 @@ mod tests {
             &views.files.facts,
             &decide_union,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, draft.decide);
@@ -3989,11 +4073,9 @@ mod tests {
         let account = open_account(
             &views.mail.reader,
             &views.mail.facts,
-            &views.secrets.reader,
-            &views.secrets_catalog,
+            &views.secrets,
             account_id,
-            fixture.secret_identity,
-            &secrets::IdentitySecret::Password(b"identity password".to_vec()),
+            &fixture.signer(),
         )
         .unwrap();
         assert_eq!(account.password, "smtp-secret");
@@ -4053,7 +4135,7 @@ mod tests {
                 &views.files.facts,
                 &views.decide.facts,
                 &views.relations.facts,
-                &views.secrets_catalog,
+                &views.secrets,
             )
             .unwrap_err();
             assert!(format!("{error:#}").contains(needle));
@@ -4077,7 +4159,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
             SendAttemptInput {
                 raw: corrupt,
                 ..base_attempt.clone()
@@ -4093,7 +4175,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
             base_attempt,
         )
         .unwrap();
@@ -4120,7 +4202,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap_err();
         let error = format!("{error:#}");
@@ -4138,7 +4220,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap_err();
         let error = format!("{error:#}");
@@ -4161,7 +4243,7 @@ mod tests {
                     &views.files.facts,
                     &views.decide.facts,
                     &views.relations.facts,
-                    &views.secrets_catalog,
+                    &views.secrets,
                 )?;
                 fixture.publish(mail_schema::DEFAULT_SCOPE_ID, fragment.clone());
                 Ok(())
@@ -4179,7 +4261,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         assert_eq!(
@@ -4223,7 +4305,7 @@ mod tests {
             &views.files.facts,
             &decide_union,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, draft.decide);
@@ -4237,11 +4319,9 @@ mod tests {
         let account = open_account(
             &views.mail.reader,
             &views.mail.facts,
-            &views.secrets.reader,
-            &views.secrets_catalog,
+            &views.secrets,
             account_id,
-            fixture.secret_identity,
-            &secrets::IdentitySecret::Password(b"identity password".to_vec()),
+            &fixture.signer(),
         )
         .unwrap();
         let materialized = materialize_draft(
@@ -4262,7 +4342,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
             SendAttemptInput {
                 draft: draft.draft,
                 config: account.config,
@@ -4300,7 +4380,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
 
@@ -4331,7 +4411,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             &views.relations.facts,
-            &views.secrets_catalog,
+            &views.secrets,
         )
         .unwrap();
     }
