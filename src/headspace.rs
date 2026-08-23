@@ -34,7 +34,7 @@ use crate::schemas::headspace::{
     DEFAULT_SYSTEM_PROMPT, KIND_CONFIG_ID, KIND_LIVE_RECORD, KIND_MODEL_PROFILE_ID,
     KIND_PROFILE_ANCHOR_ID,
 };
-use crate::secrets::{v2::SecretsSnapshot, SecretsCatalog as LegacySecretsCatalog};
+use crate::secrets::v2::SecretsSnapshot;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type CountValue = Inline<inlineencodings::U256BE>;
@@ -951,13 +951,6 @@ pub fn validate_secret_references_v2<R>(
     secrets: &SecretsSnapshot<R>,
 ) -> Result<()> {
     validate_secret_references_by(catalog, |secret| secrets.contains(secret))
-}
-
-/// Historical fixed-scope validator retained only while cutover-only callers
-/// are being moved to discovered v2 vault epochs.
-#[doc(hidden)]
-pub fn validate_secret_references(catalog: &Catalog, secrets: &LegacySecretsCatalog) -> Result<()> {
-    validate_secret_references_by(catalog, |secret| secrets.secrets.contains_key(&secret))
 }
 
 /// Resolve the one active config and its one settled profile.

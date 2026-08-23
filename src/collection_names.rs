@@ -51,7 +51,6 @@ use crate::schemas::{
 ///
 /// The ones worth naming individually:
 ///
-/// - `secrets` is not a migration candidate. It stays put permanently.
 /// - `memory` and `memory-comb` are the journal, first-person and personal.
 /// - `compass` and `wiki` are the two JP has floated sharing. Neither becomes
 ///   public here: his own design for compass is a collection that shares its
@@ -93,11 +92,6 @@ pub fn table() -> Vec<(Id, &'static str, Fragment)> {
             reach::private(),
         ),
         (relations::DEFAULT_SCOPE_ID, "relations", reach::private()),
-        (
-            crate::secrets::schema::DEFAULT_SCOPE_ID,
-            "secrets",
-            reach::private(),
-        ),
         (status::DEFAULT_SCOPE_ID, "status", reach::private()),
         (teams::DEFAULT_SCOPE_ID, "teams", reach::private()),
         (voice::COLLECTION_SCOPE_ID, "voice", reach::private()),

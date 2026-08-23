@@ -18,10 +18,6 @@
 //!   WRITE access to the closed faculty-root manifest in this build.
 //! - `status-register` gives Compass's status register the identity it never
 //!   had, on the events written before that identity existed.
-//! - `node-identity` names this pile's own signing key as a Secrets identity,
-//!   so a node has one key rather than two.
-//! - `secrets-v2` additively projects that retired identity/scope language into
-//!   direct-key vault collections without changing encrypted secret bodies.
 //! - `mail-credentials` recovers the mail account the Secrets cutover sealed
 //!   and retired, so `mail` can be configured again without re-deriving a
 //!   password nobody wrote down.
@@ -38,8 +34,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
     activation_cutover, collection_cutover, collection_naming, disposable_cutover,
-    legacy_secrets_v1, mail_credentials, node_identity, posture_findings, secrets_v2_cutover,
-    status_register, teams_credentials, write_authority,
+    legacy_secrets_v1, mail_credentials, posture_findings, status_register, teams_credentials,
+    write_authority,
 };
 use zeroize::Zeroizing;
 
@@ -132,43 +128,6 @@ enum Command {
         /// Report what would be written, without writing.
         #[arg(long)]
         dry_run: bool,
-    },
-
-    /// Name this pile's durable signing key as a Secrets identity, so the key
-    /// that signs its commits is also the key its secrets are sealed to.
-    ///
-    /// Additive and narrow: it appends one identity record built from public
-    /// material. Existing password-locked identities are untouched and keep
-    /// working. It grants nothing — naming a key is not entitling it — so the
-    /// report names the `secrets grant` and `secrets secret share` commands
-    /// that finish the job under an admin's authority.
-    NodeIdentity {
-        /// Nickname for the node's identity. Names the machine, not a window:
-        /// every persona on this pile shares one signing key.
-        #[arg(long)]
-        nickname: String,
-        /// Report what would be written, without writing.
-        #[arg(long)]
-        dry_run: bool,
-    },
-
-    /// Additively project the frozen identity/scope Secrets collection into
-    /// one direct-key private vault per confidentiality epoch.
-    ///
-    /// Exact secret ids, names, timestamps, encrypted bodies, historical wrap
-    /// ids, and sealed DEKs are preserved. Current effective v1 recipients
-    /// receive root READ authority; a missing current-reader wrap is repaired
-    /// by re-sealing only its DEK. The old collection remains untouched.
-    SecretsV2 {
-        /// Complete every crypto and catalog preflight without appending the
-        /// authority grants or vault commits.
-        #[arg(long, conflicts_with = "verify")]
-        dry_run: bool,
-        /// Strictly compare the retained v1 collection with the v2 vaults,
-        /// exact READ authority, and local exact opens. Writes and plaintext
-        /// output are forbidden in this mode.
-        #[arg(long, conflicts_with = "dry_run")]
-        verify: bool,
     },
 
     /// Recover the Teams OAuth credentials the collection cutover retired.
@@ -371,181 +330,6 @@ fn mail_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
         recovered.smtp_endpoint,
     );
     println!("\nThe exported file is a live secret in the clear. Publish it and delete it.");
-    Ok(())
-}
-
-fn node_identity(pile: &Path, key: Option<&Path>, nickname: &str, dry_run: bool) -> Result<()> {
-    let report = if dry_run {
-        node_identity::plan(pile, key)?
-    } else {
-        node_identity::publish(pile, key, nickname)?
-    };
-    println!("Node identity");
-    println!("pile                     : {}", pile.display());
-    println!(
-        "this node's key          : {}",
-        hex::encode(report.local_public_key)
-    );
-    println!("nodes attested by pile   : {}", report.nodes.len());
-    println!("  of those, unnamed      : {}", report.unnamed_nodes());
-    println!("identities on a node key : {}", report.node_identities);
-    println!("identities on a lockbox  : {}", report.lockbox_identities);
-    match &report.bound {
-        Some((id, name)) if report.bound_now => {
-            println!("\nbound this run: identity {id:x} ({name})");
-        }
-        Some((id, name)) => {
-            println!("\nalready bound: identity {id:x} ({name}) — nothing written");
-        }
-        None => {
-            println!("\nnot bound: this node's key names no Secrets identity");
-            if dry_run {
-                println!("  re-run without --dry-run to append it");
-            }
-        }
-    }
-
-    if !report.nodes.is_empty() {
-        println!("\nnodes:");
-        for node in &report.nodes {
-            let named = match (&node.identity, &node.name) {
-                (Some(id), Some(name)) => format!("{name} {id:x}"),
-                _ => "(unnamed)".to_owned(),
-            };
-            println!(
-                "  {}  {:>6} commit(s)  {named}{}",
-                hex::encode(node.public_key),
-                node.commits,
-                if node.is_local { "  [this node]" } else { "" }
-            );
-        }
-    }
-
-    // Deliberately a worklist, not an action. Both remaining steps are
-    // authorized acts: one needs an effective admin, the other needs a DEK
-    // only a current wrap holder can recover.
-    if let Some((_, name)) = &report.bound {
-        if report.gaps.is_empty() {
-            println!("\n✓ {name} is a recipient of every scope and holds a wrap of every current version");
-        } else {
-            println!("\nremaining, for an admin to run:");
-            for gap in &report.gaps {
-                if !gap.member {
-                    println!(
-                        "  secrets grant --object {} --subject {name} --as <admin>",
-                        gap.scope_name
-                    );
-                }
-                for credential in &gap.unwrapped {
-                    println!(
-                        "  secrets secret share --scope {} --name {credential} --as <holder>",
-                        gap.scope_name
-                    );
-                }
-            }
-        }
-    }
-    if dry_run {
-        println!("\n(dry run: nothing written)");
-    }
-    Ok(())
-}
-
-fn secrets_v2_verify(pile: &Path, key: Option<&Path>) -> Result<()> {
-    let report =
-        secrets_v2_cutover::verify(pile, key).context("verify exact Secrets v2 projection")?;
-    println!("Secrets v2 exact projection verification");
-    println!("pile                    : {}", pile.display());
-    println!("legacy source facts     : {}", report.source_facts);
-    println!("vault epochs            : {}", report.vaults.len());
-    println!("ready local epochs      : {}", report.ready_local_vaults);
-    println!("secret versions         : {}", report.secret_versions());
-    println!("preserved wraps         : {}", report.preserved_wraps());
-    println!("DEK-only repair wraps   : {}", report.repaired_wraps());
-    println!("legacy local wraps      : {}", report.legacy_local_wraps());
-    println!(
-        "repaired local wraps    : {}",
-        report.repaired_local_wraps()
-    );
-    println!(
-        "local exact opens       : {}",
-        report.locally_opened_versions()
-    );
-    println!("discovery diagnostics   : {}", report.discovery_issues);
-    for vault in &report.vaults {
-        println!(
-            "  {:X} {:?}: readers={} versions={} old-wraps={} repairs={} local-old={} local-repairs={} opened={}",
-            vault.vault,
-            vault.name,
-            vault.current_readers,
-            vault.secret_versions,
-            vault.preserved_wraps,
-            vault.repaired_wraps,
-            vault.legacy_local_wraps,
-            vault.repaired_local_wraps,
-            vault.locally_opened_versions,
-        );
-    }
-    println!("verification            : complete; no plaintext or pile bytes were written");
-    Ok(())
-}
-
-fn secrets_v2(pile: &Path, key: Option<&Path>, dry_run: bool, verify: bool) -> Result<()> {
-    if verify {
-        return secrets_v2_verify(pile, key);
-    }
-    let first = secrets_v2_cutover::plan(pile, key, None);
-    let password;
-    let plan = match first {
-        Ok(plan) => plan,
-        Err(error)
-            if error
-                .downcast_ref::<legacy_secrets_v1::PasswordRequired>()
-                .is_some() =>
-        {
-            password = Zeroizing::new(faculties::secrets::password::read(
-                "re-seal a legacy Secrets DEK during v2 cutover",
-            )?);
-            secrets_v2_cutover::plan(pile, key, Some(password.as_slice()))
-                .context("plan Secrets v2 cutover with the configured legacy password")?
-        }
-        Err(error) => return Err(error).context("plan Secrets v2 cutover"),
-    };
-
-    let report = plan.report();
-    println!("Secrets v2 vault cutover");
-    println!("pile                    : {}", pile.display());
-    println!("legacy source facts     : {}", report.source_facts);
-    println!("vault epochs            : {}", report.vaults.len());
-    println!("secret versions         : {}", report.secret_versions());
-    println!("preserved wraps         : {}", report.preserved_wraps());
-    println!("synthesized DEK wraps   : {}", report.synthesized_wraps());
-    println!("vault commits pending   : {}", report.pending_vaults());
-    for vault in &report.vaults {
-        println!(
-            "  {:X}: readers={} versions={} old-wraps={} new-wraps={} data={}",
-            vault.vault,
-            vault.current_readers,
-            vault.secret_versions,
-            vault.preserved_wraps,
-            vault.synthesized_wraps,
-            if vault.data_pending {
-                "pending"
-            } else {
-                "settled"
-            },
-        );
-    }
-    if dry_run {
-        println!("dry-run                 : complete; no pile bytes were written");
-        return Ok(());
-    }
-
-    let published = secrets_v2_cutover::publish(pile, key, &plan)
-        .context("publish preflighted Secrets v2 cutover")?;
-    println!("WRITE grants appended   : {}", published.write_grants);
-    println!("vault commits appended  : {}", published.vault_commits);
-    println!("READ grants appended    : {}", published.read_grants);
     Ok(())
 }
 
@@ -767,10 +551,35 @@ fn list_faculties() {
     }
 }
 
-fn plan_cutover(pile: &Path) -> Result<()> {
+fn activation_plan(
+    source: &collection_cutover::FrozenSource,
+    signer: &ed25519_dalek::SigningKey,
+) -> Result<activation_cutover::ActivationPlan> {
+    let first = activation_cutover::plan(source, signer, None);
+    let password;
+    match first {
+        Ok(plan) => Ok(plan),
+        Err(error)
+            if error
+                .downcast_ref::<legacy_secrets_v1::PasswordRequired>()
+                .is_some() =>
+        {
+            password = Zeroizing::new(faculties::secrets::password::read(
+                "re-seal a legacy Secrets DEK during direct activation",
+            )?);
+            activation_cutover::plan(source, signer, Some(password.as_slice()))
+                .context("plan direct Secrets activation with the configured legacy password")
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
+    let signer = faculties::storage::load_signer(pile, key)
+        .context("load durable signer for activation planning")?;
     let source = collection_cutover::freeze_source(pile)
         .with_context(|| format!("freeze cutover source {}", pile.display()))?;
-    let plan = activation_cutover::plan(&source).context("plan aggregate collection cutover")?;
+    let plan = activation_plan(&source, &signer).context("plan aggregate collection cutover")?;
 
     let semantic = source.fingerprint();
     let physical = source.physical_fingerprint();
@@ -784,17 +593,33 @@ fn plan_cutover(pile: &Path) -> Result<()> {
 
     println!("Collections:");
     for collection in plan.collections() {
-        let retirement = match collection.retired_source_facts() {
+        let view = match collection.view() {
+            activation_cutover::CandidateViewKey::Faculty(scope) => {
+                format!("faculty {scope:X}")
+            }
+            activation_cutover::CandidateViewKey::Vault(vault) => format!("vault {vault:X}"),
+        };
+        println!(
+            "- {} | {} | {} commit fragment(s) | {} fact(s) | {:?}",
+            collection.name().as_str(),
+            view,
+            collection.fragments().len(),
+            collection.expected_facts().len(),
+            collection.policy(),
+        );
+    }
+
+    println!();
+    println!("Source transforms:");
+    for consumption in plan.consumptions() {
+        let retirement = match consumption.retired_source_facts() {
             0 => String::new(),
             count => format!(" | {count} retired source fact(s)"),
         };
         println!(
-            "- {} | scope {:X} | {} source pin(s) | {} commit fragment(s) | {} fact(s){}",
-            collection.name(),
-            collection.scope(),
-            collection.source_pins().len(),
-            collection.fragments().len(),
-            collection.expected_facts().len(),
+            "- {} | {} source pin(s){}",
+            consumption.name(),
+            consumption.source_pins().len(),
             retirement,
         );
     }
@@ -813,17 +638,15 @@ fn plan_cutover(pile: &Path) -> Result<()> {
 }
 
 fn activate_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
+    let signer = faculties::storage::load_signer(pile, key)
+        .context("load durable signer for disposable activation")?;
     let source = collection_cutover::freeze_source(pile)
         .with_context(|| format!("freeze cutover source {}", pile.display()))?;
-    let plan = activation_cutover::plan(&source).context("plan aggregate collection cutover")?;
-    let retired_source_facts = plan
-        .collections()
-        .iter()
-        .map(|collection| collection.retired_source_facts())
-        .sum::<usize>();
+    let plan = activation_plan(&source, &signer).context("plan aggregate collection cutover")?;
+    let retired_source_facts = plan.retired_source_facts();
     let outcome = disposable_cutover::activate(
         pile,
-        key,
+        &signer,
         &source,
         &plan,
         activation_cutover::validate_candidate_views,
@@ -853,7 +676,7 @@ fn activate_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::PlanCutover) => plan_cutover(&cli.pile),
+        Some(Command::PlanCutover) => plan_cutover(&cli.pile, cli.key.as_deref()),
         Some(Command::ActivateCutover) => activate_cutover(&cli.pile, cli.key.as_deref()),
         Some(Command::MigrateLegacy { faculty }) => {
             per_faculty::migrate(faculty, &cli.pile, cli.key.as_deref())
@@ -866,12 +689,6 @@ fn main() -> Result<()> {
         }
         Some(Command::FacultyWriteAuthority { dry_run }) => {
             faculty_write_authority(&cli.pile, cli.key.as_deref(), dry_run)
-        }
-        Some(Command::NodeIdentity { nickname, dry_run }) => {
-            node_identity(&cli.pile, cli.key.as_deref(), &nickname, dry_run)
-        }
-        Some(Command::SecretsV2 { dry_run, verify }) => {
-            secrets_v2(&cli.pile, cli.key.as_deref(), dry_run, verify)
         }
         Some(Command::StatusRegister { dry_run }) => {
             status_register(&cli.pile, cli.key.as_deref(), dry_run)

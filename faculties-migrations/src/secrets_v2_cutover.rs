@@ -1,28 +1,23 @@
-//! Additive stopped-world cutover from the frozen v1 Secrets collection to
+//! Stopped-world projection from the frozen pre-collection Secrets branch to
 //! one direct-key v2 vault collection per confidentiality epoch.
 //!
-//! The old collection is retained byte-for-byte.  Planning first validates
-//! every source and target catalog, copies the exact encrypted payloads into a
-//! self-contained candidate, and proves cross-vault identity uniqueness.  No
-//! destination byte is appended until that complete preflight succeeds.
+//! The copied pile prefix retains the old branch byte-for-byte. Planning
+//! validates every source and target catalog, stages the exact encrypted
+//! payloads needed by direct vault commits, and proves cross-vault identity
+//! uniqueness. There is no intermediary fixed `secrets` collection.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use faculties::secrets::v2::{self, RecipientPublicKey, VaultCatalog, ACTION_READ};
-use triblespace::core::authority::{
-    publish_grant, resolve_authority, AuthorityGrant, AuthorityMode, ACTION_WRITE,
-};
-use triblespace::core::collection::reach;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use faculties::secrets::v2::{self, RecipientPublicKey, VaultCatalog};
+use triblespace::core::authority::{resolve_authority, ACTION_WRITE};
+use triblespace::core::collection::discover_collection_records;
+use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
-use zeroize::Zeroizing;
 
 use crate::legacy_secrets_v1 as legacy;
-use faculties::storage::{load_signer, open_pile_strict};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultMigrationReport {
@@ -65,12 +60,11 @@ impl SecretsV2MigrationReport {
 }
 
 #[derive(Clone)]
-struct VaultPlan {
-    vault: Id,
-    recipients: BTreeSet<RecipientPublicKey>,
-    existing: TribleSet,
-    required: Fragment,
-    report: VaultMigrationReport,
+pub(crate) struct VaultPlan {
+    pub(crate) vault: Id,
+    pub(crate) recipients: BTreeSet<RecipientPublicKey>,
+    pub(crate) required: Fragment,
+    pub(crate) report: VaultMigrationReport,
 }
 
 /// Complete read-only preflight.  The plan owns every attachment needed by a
@@ -78,7 +72,6 @@ struct VaultPlan {
 #[derive(Clone)]
 pub struct SecretsV2MigrationPlan {
     team: RecipientPublicKey,
-    source: TribleSet,
     vaults: Vec<VaultPlan>,
     report: SecretsV2MigrationReport,
 }
@@ -87,103 +80,26 @@ impl SecretsV2MigrationPlan {
     pub fn report(&self) -> &SecretsV2MigrationReport {
         &self.report
     }
-}
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SecretsV2PublicationReport {
-    pub write_grants: usize,
-    pub vault_commits: usize,
-    pub read_grants: usize,
-}
-
-/// Read-only evidence that one retired v1 scope is exactly represented by one
-/// v2 vault epoch. The report names the non-secret scope but excludes secret
-/// names, values, keys, and sealed bytes so it is safe to retain.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VaultVerificationReport {
-    pub vault: Id,
-    pub name: String,
-    pub current_readers: usize,
-    pub secret_versions: usize,
-    pub preserved_wraps: usize,
-    pub repaired_wraps: usize,
-    pub legacy_local_wraps: usize,
-    pub repaired_local_wraps: usize,
-    pub locally_opened_versions: usize,
-}
-
-/// Strict post-cutover verification over the retained v1 collection, direct
-/// vault collections, exact READ projection, and the local aggregate view.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SecretsV2VerificationReport {
-    pub source_facts: usize,
-    pub ready_local_vaults: usize,
-    pub discovery_issues: usize,
-    pub vaults: Vec<VaultVerificationReport>,
-}
-
-impl SecretsV2VerificationReport {
-    pub fn secret_versions(&self) -> usize {
-        self.vaults.iter().map(|vault| vault.secret_versions).sum()
+    pub(crate) fn team(&self) -> RecipientPublicKey {
+        self.team
     }
 
-    pub fn preserved_wraps(&self) -> usize {
-        self.vaults.iter().map(|vault| vault.preserved_wraps).sum()
-    }
-
-    pub fn repaired_wraps(&self) -> usize {
-        self.vaults.iter().map(|vault| vault.repaired_wraps).sum()
-    }
-
-    pub fn legacy_local_wraps(&self) -> usize {
-        self.vaults
-            .iter()
-            .map(|vault| vault.legacy_local_wraps)
-            .sum()
-    }
-
-    pub fn repaired_local_wraps(&self) -> usize {
-        self.vaults
-            .iter()
-            .map(|vault| vault.repaired_local_wraps)
-            .sum()
-    }
-
-    pub fn locally_opened_versions(&self) -> usize {
-        self.vaults
-            .iter()
-            .map(|vault| vault.locally_opened_versions)
-            .sum()
+    pub(crate) fn vaults(&self) -> &[VaultPlan] {
+        &self.vaults
     }
 }
 
-fn legacy_collection<S>(storage: S, team: VerifyingKey, signer: SigningKey) -> Collection<S> {
-    Collection::new(
-        storage,
-        &CollectionName::new(legacy::COLLECTION_NAME)
-            .expect("the frozen legacy collection name is valid"),
-        team,
-        signer,
-        reach::private(),
-    )
-}
-
-fn materialize_legacy(
-    pile: &mut Pile,
-    team: VerifyingKey,
-    signer: &SigningKey,
-) -> Result<TribleSet> {
-    legacy_collection(pile, team, signer.clone())
-        .materialize()
-        .context("materialize frozen v1 Secrets collection")
-}
-
-fn materialize_vault(
-    pile: &mut Pile,
+fn materialize_vault<S>(
+    pile: &mut S,
     vault: Id,
     team: VerifyingKey,
     signer: &SigningKey,
-) -> Result<TribleSet> {
+) -> Result<TribleSet>
+where
+    S: BlobStore + triblespace::core::collection::CollectionStore,
+    S::Reader: BlobStoreMeta,
+{
     v2::vault_collection(pile, vault, team, signer.clone())
         .materialize()
         .with_context(|| format!("materialize v2 vault {vault:X}"))
@@ -286,33 +202,56 @@ fn next_unused_id(used: &mut BTreeSet<Id>) -> Id {
     }
 }
 
-fn plan_in_open_pile(
-    pile: &mut Pile,
+/// Translate an exact pre-collection legacy Secrets projection directly into
+/// zero or more vault plans. The projection is an in-memory source boundary,
+/// never a fixed native `secrets` collection or an authority target.
+pub(crate) fn plan_from_legacy_in_store<S>(
+    pile: &mut S,
     signer: &SigningKey,
+    reader: &PileReader,
+    source: TribleSet,
     password: Option<&[u8]>,
-) -> Result<SecretsV2MigrationPlan> {
+) -> Result<SecretsV2MigrationPlan>
+where
+    S: BlobStore + triblespace::core::collection::CollectionStore,
+    S::Reader: BlobStoreMeta,
+{
     let team = signer.verifying_key();
-    let source = materialize_legacy(pile, team, signer)?;
-    if source.is_empty() {
-        bail!("the frozen v1 Secrets collection is empty; refuse to create parallel empty vaults");
-    }
+    let catalog = legacy::validate_catalog(reader, &source)
+        .context("validate projected pre-collection Secrets catalog")?;
+    let identity_keys = legacy::identity_public_keys(reader, &catalog)?;
 
-    let reader = pile
-        .reader()
-        .context("open v1 Secrets preflight attachment reader")?;
-    let catalog =
-        legacy::validate_catalog(&reader, &source).context("validate frozen v1 Secrets catalog")?;
-    let identity_keys = legacy::identity_public_keys(&reader, &catalog)?;
-    drop(reader);
+    // A candidate adds local WRITE before publishing vault data. Reject any
+    // target commit that is dormant only because its signer currently lacks
+    // WRITE: the new grant could otherwise awaken facts that this preflight
+    // incorrectly treated as an empty baseline.
+    let records =
+        discover_collection_records(&mut *pile).context("discover frozen vault target records")?;
+    let authority = resolve_authority(&mut *pile, team)
+        .map_err(|error| anyhow!("resolve frozen vault target authority: {error}"))?;
+    for vault in catalog.scopes.keys().copied() {
+        let handle = v2::vault_handle(vault, team);
+        for commit in records
+            .commits()
+            .iter()
+            .filter(|commit| commit.collection() == handle)
+        {
+            if commit.public_key().raw == team.to_bytes()
+                && !authority.allows(&commit.public_key(), ACTION_WRITE, handle)
+            {
+                bail!(
+                    "vault {vault:X} has a dormant pre-existing COMMIT {:X} that a new WRITE grant could activate",
+                    commit.id()
+                );
+            }
+        }
+    }
 
     let mut existing_by_vault = BTreeMap::new();
     for vault in catalog.scopes.keys().copied() {
         existing_by_vault.insert(vault, materialize_vault(pile, vault, team, signer)?);
     }
 
-    let reader = pile
-        .reader()
-        .context("open complete Secrets v2 planning attachment reader")?;
     let mut used_ids = source.iter().map(|fact| *fact.e()).collect::<BTreeSet<_>>();
     for facts in existing_by_vault.values() {
         used_ids.extend(facts.iter().map(|fact| *fact.e()));
@@ -332,7 +271,7 @@ fn plan_in_open_pile(
             .created_at
             .first()
             .expect("one legacy scope creation observation checked above");
-        let vault_name = legacy::read_text(&reader, scope.name)
+        let vault_name = legacy::read_text(reader, scope.name)
             .with_context(|| format!("read legacy scope {} name", scope.id))?;
         let recipient_ids = catalog.recipients_of(scope.id);
         if recipient_ids.is_empty() {
@@ -362,7 +301,7 @@ fn plan_in_open_pile(
             .filter(|secret| secret.scope == scope.id)
             .collect::<Vec<_>>();
         for secret in &scoped_secrets {
-            let body = legacy::read_bytes(&reader, secret.body)
+            let body = legacy::read_bytes(reader, secret.body)
                 .with_context(|| format!("read legacy secret {} encrypted body", secret.id))?;
             required += v2::encrypted_secret_fragment(
                 secret.id,
@@ -398,7 +337,7 @@ fn plan_in_open_pile(
                 .get(&wrap.recipient)
                 .copied()
                 .ok_or_else(|| anyhow!("legacy wrap {} recipient has no exact key", wrap.id))?;
-            let sealed = legacy::read_bytes(&reader, wrap.sealed_dek)
+            let sealed = legacy::read_bytes(reader, wrap.sealed_dek)
                 .with_context(|| format!("read legacy wrap {} sealed DEK", wrap.id))?;
             required +=
                 v2::recipient_wrap_fragment(wrap.id, wrap.secret, recipient, sealed.clone())?;
@@ -412,7 +351,7 @@ fn plan_in_open_pile(
             None
         } else {
             Some(
-                v2::validate_catalog(&reader, scope.id, &existing)
+                v2::validate_catalog(reader, scope.id, &existing)
                     .with_context(|| format!("validate existing v2 vault {}", scope.id))?,
             )
         };
@@ -442,7 +381,7 @@ fn plan_in_open_pile(
                 continue;
             }
             let dek =
-                legacy::recover_dek_for_migration(&reader, &catalog, secret.id, signer, password)?;
+                legacy::recover_dek_for_migration(reader, &catalog, secret.id, signer, password)?;
             for recipient in missing {
                 let sealed = legacy::seal_dek_for_recipient(&dek, recipient)?;
                 required += v2::recipient_wrap_fragment(
@@ -456,14 +395,13 @@ fn plan_in_open_pile(
             }
         }
 
-        let final_catalog = validate_candidate(&reader, scope.id, &existing, &required)?;
-        for secret in &scoped_secrets {
-            let actual = final_catalog
-                .wrap_holders(secret.id)
-                .intersection(&recipients)
-                .count();
-            if actual != recipients.len() {
-                bail!("v2 vault candidate leaves a current reader without a secret wrap");
+        let final_catalog = validate_candidate(reader, scope.id, &existing, &required)?;
+        for secret in final_catalog.secrets.keys().copied() {
+            let holders = final_catalog.wrap_holders(secret);
+            if !recipients.is_subset(&holders) {
+                bail!(
+                    "v2 vault candidate leaves a current reader without a wrap for secret {secret:X}"
+                );
             }
         }
         for secret in final_catalog.secrets.keys().copied() {
@@ -487,7 +425,6 @@ fn plan_in_open_pile(
         vaults.push(VaultPlan {
             vault: scope.id,
             recipients,
-            existing,
             required,
             report,
         });
@@ -499,788 +436,7 @@ fn plan_in_open_pile(
     };
     Ok(SecretsV2MigrationPlan {
         team: team.to_bytes(),
-        source,
         vaults,
         report,
     })
-}
-
-/// Build a complete read-only migration plan.  `password` is needed only if a
-/// current reader lacks a wrap and no locally held node key can recover the
-/// exact legacy DEK.  Completed replay therefore needs no retired password.
-pub fn plan(
-    pile: &Path,
-    key: Option<&Path>,
-    password: Option<&[u8]>,
-) -> Result<SecretsV2MigrationPlan> {
-    let signer = load_signer(pile, key).context("load durable signer for Secrets v2 planning")?;
-    let mut store = open_pile_strict(pile)?;
-    let result = plan_in_open_pile(&mut store, &signer, password);
-    finish_pile(store, result)
-}
-
-fn preflight_plan(
-    pile: &mut Pile,
-    signer: &SigningKey,
-    plan: &SecretsV2MigrationPlan,
-) -> Result<()> {
-    if signer.verifying_key().to_bytes() != plan.team {
-        bail!("Secrets v2 plan belongs to a different durable team root");
-    }
-    let team = signer.verifying_key();
-    let source = materialize_legacy(pile, team, signer)?;
-    if source != plan.source {
-        bail!("v1 Secrets source changed after complete migration preflight");
-    }
-    let mut current = Vec::with_capacity(plan.vaults.len());
-    for vault in &plan.vaults {
-        let facts = materialize_vault(pile, vault.vault, team, signer)?;
-        if facts != vault.existing {
-            bail!(
-                "v2 vault {} changed after complete migration preflight",
-                vault.vault
-            );
-        }
-        current.push(facts);
-    }
-    let reader = pile
-        .reader()
-        .context("open Secrets v2 publication preflight reader")?;
-    let mut claimed = BTreeMap::<Id, Id>::new();
-    for (vault, existing) in plan.vaults.iter().zip(current) {
-        let catalog = validate_candidate(&reader, vault.vault, &existing, &vault.required)?;
-        for secret in catalog.secrets.keys().copied() {
-            if let Some(previous) = claimed.insert(secret, vault.vault) {
-                bail!(
-                    "secret {secret:X} appears in both v2 vault {previous:X} and {:X}",
-                    vault.vault
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn exact_grant_present(pile: &mut Pile, team: VerifyingKey, grant: AuthorityGrant) -> Result<bool> {
-    let resolution = resolve_authority(pile, team)
-        .map_err(|error| anyhow!("resolve v2 vault authority: {error}"))?;
-    let present = resolution
-        .grants()
-        .any(|accepted| accepted.grant() == grant);
-    Ok(present)
-}
-
-fn ensure_grant(
-    pile: &mut Pile,
-    team: VerifyingKey,
-    signer: &SigningKey,
-    grant: AuthorityGrant,
-) -> Result<bool> {
-    if exact_grant_present(pile, team, grant)? {
-        return Ok(false);
-    }
-    publish_grant(pile, team, signer, grant)
-        .map_err(|error| anyhow!("publish v2 vault authority grant: {error}"))?;
-    if !exact_grant_present(pile, team, grant)? {
-        bail!("published v2 vault grant did not enter the accepted authority fixed point");
-    }
-    Ok(true)
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StopAfter {
-    Write,
-    Data,
-}
-
-fn publish_in_open_pile(
-    pile: &mut Pile,
-    signer: &SigningKey,
-    plan: &SecretsV2MigrationPlan,
-    #[cfg(test)] stop_after: Option<StopAfter>,
-) -> Result<SecretsV2PublicationReport> {
-    preflight_plan(pile, signer, plan)?;
-    let team = signer.verifying_key();
-    let mut report = SecretsV2PublicationReport::default();
-
-    for vault in &plan.vaults {
-        let expected = v2::vault_handle(vault.vault, team);
-        let write = AuthorityGrant::root(team, expected, ACTION_WRITE, AuthorityMode::Invoke);
-        if ensure_grant(pile, team, signer, write)? {
-            report.write_grants += 1;
-        }
-        #[cfg(test)]
-        if stop_after == Some(StopAfter::Write) {
-            bail!("injected crash after v2 vault WRITE grant");
-        }
-
-        if vault.report.data_pending {
-            v2::vault_collection(&mut *pile, vault.vault, team, signer.clone())
-                .commit(vault.required.clone())
-                .with_context(|| format!("commit complete v2 vault {}", vault.vault))?;
-            report.vault_commits += 1;
-        }
-        #[cfg(test)]
-        if stop_after == Some(StopAfter::Data) {
-            bail!("injected crash after complete v2 vault data commit");
-        }
-
-        for recipient in &vault.recipients {
-            let recipient = VerifyingKey::from_bytes(recipient)
-                .context("validate planned v2 READ recipient")?;
-            let read =
-                AuthorityGrant::root(recipient, expected, ACTION_READ, AuthorityMode::Invoke);
-            if ensure_grant(pile, team, signer, read)? {
-                report.read_grants += 1;
-            }
-        }
-    }
-
-    for vault in &plan.vaults {
-        let facts = materialize_vault(pile, vault.vault, team, signer)?;
-        let reader = pile
-            .reader()
-            .context("open published v2 vault validation reader")?;
-        v2::validate_catalog(&reader, vault.vault, &facts)
-            .with_context(|| format!("validate published v2 vault {}", vault.vault))?;
-        let authority = resolve_authority(pile, team)
-            .map_err(|error| anyhow!("resolve final v2 READ authority: {error}"))?;
-        let actual =
-            v2::read_authority_recipient_keys(&authority, v2::vault_handle(vault.vault, team));
-        if !vault.recipients.is_subset(&actual) {
-            bail!("published v2 vault is missing one or more planned READ grants");
-        }
-    }
-    Ok(report)
-}
-
-/// Publish root WRITE -> one complete vault commit -> root READ for every
-/// vault. `Collection::commit` carries the descriptor alongside the first
-/// complete data commit. An interrupted prefix is safe and a fresh plan adopts
-/// a committed synthetic wrap instead of generating another.
-pub fn publish(
-    pile: &Path,
-    key: Option<&Path>,
-    plan: &SecretsV2MigrationPlan,
-) -> Result<SecretsV2PublicationReport> {
-    let signer = load_signer(pile, key).context("load durable signer for Secrets v2 publish")?;
-    let mut store = open_pile_strict(pile)?;
-    let result = publish_in_open_pile(
-        &mut store,
-        &signer,
-        plan,
-        #[cfg(test)]
-        None,
-    );
-    finish_pile(store, result)
-}
-
-fn verify_in_open_pile(
-    pile: &mut Pile,
-    signer: &SigningKey,
-) -> Result<SecretsV2VerificationReport> {
-    let team = signer.verifying_key();
-    let local = team.to_bytes();
-    let source = materialize_legacy(pile, team, signer)?;
-    if source.is_empty() {
-        bail!("the retained v1 Secrets collection is empty");
-    }
-
-    let reader = pile
-        .reader()
-        .context("open retained v1 Secrets verification reader")?;
-    let legacy = legacy::validate_catalog(&reader, &source)
-        .context("validate retained v1 Secrets collection")?;
-    let identity_keys = legacy::identity_public_keys(&reader, &legacy)?;
-    let names = legacy
-        .scopes
-        .values()
-        .map(|scope| {
-            legacy::read_text(&reader, scope.name)
-                .map(|name| (scope.id, name))
-                .with_context(|| format!("read retained v1 scope {} name", scope.id))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    drop(reader);
-
-    let mut vault_facts = BTreeMap::new();
-    for scope in legacy.scopes.keys().copied() {
-        vault_facts.insert(scope, materialize_vault(pile, scope, team, signer)?);
-    }
-    let authority = resolve_authority(pile, team)
-        .map_err(|error| anyhow!("resolve v2 vault READ authority: {error}"))?;
-    let reader = pile
-        .reader()
-        .context("open exact Secrets v2 verification reader")?;
-    let mut expected_local_vaults = BTreeSet::new();
-    let mut local_secrets = BTreeMap::<Id, Vec<Id>>::new();
-    let mut reports = Vec::with_capacity(legacy.scopes.len());
-
-    for scope in legacy.scopes.values() {
-        let facts = vault_facts
-            .get(&scope.id)
-            .expect("one materialized v2 target per retained v1 scope");
-        let catalog = v2::validate_catalog(&reader, scope.id, facts)
-            .with_context(|| format!("validate exact v2 vault epoch {}", scope.id))?;
-        let created_at = if scope.created_at.len() == 1 {
-            *scope
-                .created_at
-                .first()
-                .expect("one retained v1 scope creation time checked")
-        } else {
-            bail!(
-                "retained v1 scope {} has {} creation observations; expected exactly one",
-                scope.id,
-                scope.created_at.len()
-            );
-        };
-        if catalog.header.id != scope.id
-            || catalog.header.created_at != created_at
-            || catalog.header.name != scope.name
-        {
-            bail!(
-                "v2 vault {} does not preserve its exact v1 scope header",
-                scope.id
-            );
-        }
-
-        let legacy_secrets = legacy
-            .secrets
-            .values()
-            .filter(|secret| secret.scope == scope.id)
-            .collect::<Vec<_>>();
-        let expected_secret_ids = legacy_secrets
-            .iter()
-            .map(|secret| secret.id)
-            .collect::<BTreeSet<_>>();
-        let actual_secret_ids = catalog.secrets.keys().copied().collect::<BTreeSet<_>>();
-        if actual_secret_ids != expected_secret_ids {
-            bail!(
-                "v2 vault {} does not contain exactly the retained v1 secret ids",
-                scope.id
-            );
-        }
-        for secret in &legacy_secrets {
-            let actual = &catalog.secrets[&secret.id];
-            if actual.id != secret.id
-                || actual.created_at != secret.created_at
-                || actual.name != secret.display_name
-                || actual.body != secret.body
-            {
-                bail!("v2 secret {} does not preserve its exact v1 row", secret.id);
-            }
-        }
-
-        let legacy_wraps = legacy
-            .wraps
-            .values()
-            .filter(|wrap| expected_secret_ids.contains(&wrap.secret))
-            .collect::<Vec<_>>();
-        let legacy_wrap_ids = legacy_wraps
-            .iter()
-            .map(|wrap| wrap.id)
-            .collect::<BTreeSet<_>>();
-        for wrap in &legacy_wraps {
-            let actual = catalog.wraps.get(&wrap.id).ok_or_else(|| {
-                anyhow!(
-                    "v2 vault {} is missing retained historical wrap {}",
-                    scope.id,
-                    wrap.id
-                )
-            })?;
-            if actual.id != wrap.id
-                || actual.secret != wrap.secret
-                || actual.recipient != identity_keys[&wrap.recipient]
-                || actual.sealed_dek != wrap.sealed_dek
-            {
-                bail!("v2 wrap {} does not preserve its exact v1 row", wrap.id);
-            }
-        }
-
-        let recipient_ids = legacy.recipients_of(scope.id);
-        let recipients = recipient_ids
-            .iter()
-            .map(|identity| {
-                identity_keys.get(identity).copied().ok_or_else(|| {
-                    anyhow!(
-                        "retained v1 recipient identity {} has no exact public key",
-                        identity
-                    )
-                })
-            })
-            .collect::<Result<BTreeSet<_>>>()?;
-        let target = v2::vault_handle(scope.id, team);
-        let actual_readers = v2::read_authority_recipient_keys(&authority, target);
-        if actual_readers != recipients {
-            bail!(
-                "v2 vault {} READ authority is not the exact current v1 recipient set",
-                scope.id
-            );
-        }
-
-        let mut missing_pairs = BTreeSet::<(Id, RecipientPublicKey)>::new();
-        for secret in &expected_secret_ids {
-            for recipient in &recipients {
-                let already_wrapped = legacy_wraps.iter().any(|wrap| {
-                    wrap.secret == *secret && identity_keys[&wrap.recipient] == *recipient
-                });
-                if !already_wrapped {
-                    missing_pairs.insert((*secret, *recipient));
-                }
-            }
-        }
-
-        let mut repaired_wraps = 0;
-        let mut repaired_local_wraps = 0;
-        for wrap in catalog.wraps.values() {
-            if legacy_wrap_ids.contains(&wrap.id) {
-                continue;
-            }
-            if !missing_pairs.remove(&(wrap.secret, wrap.recipient)) {
-                bail!(
-                    "v2 vault {} contains an unexpected additional wrap {}",
-                    scope.id,
-                    wrap.id
-                );
-            }
-            repaired_wraps += 1;
-            if wrap.recipient == local {
-                repaired_local_wraps += 1;
-            }
-        }
-        if !missing_pairs.is_empty() {
-            bail!(
-                "v2 vault {} is missing {} required DEK-only repair wrap(s)",
-                scope.id,
-                missing_pairs.len()
-            );
-        }
-        if catalog.wraps.len() != legacy_wraps.len() + repaired_wraps {
-            bail!("v2 vault {} contains unaccounted wrap rows", scope.id);
-        }
-
-        let legacy_local_wraps = legacy_wraps
-            .iter()
-            .filter(|wrap| identity_keys[&wrap.recipient] == local)
-            .count();
-        if recipients.contains(&local) {
-            expected_local_vaults.insert(scope.id);
-            local_secrets.insert(scope.id, expected_secret_ids.iter().copied().collect());
-        }
-        reports.push(VaultVerificationReport {
-            vault: scope.id,
-            name: names[&scope.id].clone(),
-            current_readers: recipients.len(),
-            secret_versions: legacy_secrets.len(),
-            preserved_wraps: legacy_wraps.len(),
-            repaired_wraps,
-            legacy_local_wraps,
-            repaired_local_wraps,
-            locally_opened_versions: 0,
-        });
-    }
-    drop(reader);
-
-    let discovery = v2::storage::discover_local_vaults(pile, signer)
-        .context("discover local Secrets v2 aggregate")?;
-    let actual_local_vaults = discovery
-        .snapshot()
-        .vaults()
-        .keys()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if actual_local_vaults != expected_local_vaults {
-        bail!("local Secrets v2 aggregate does not contain the exact readable v1 epoch set");
-    }
-    for report in &mut reports {
-        let Some(secrets) = local_secrets.get(&report.vault) else {
-            continue;
-        };
-        for secret in secrets {
-            let plaintext = Zeroizing::new(
-                discovery
-                    .snapshot()
-                    .open(*secret, signer)
-                    .with_context(|| format!("open exact migrated secret {secret}"))?,
-            );
-            report.locally_opened_versions += 1;
-            drop(plaintext);
-        }
-    }
-
-    Ok(SecretsV2VerificationReport {
-        source_facts: source.len(),
-        ready_local_vaults: actual_local_vaults.len(),
-        discovery_issues: discovery.issues().len(),
-        vaults: reports,
-    })
-}
-
-/// Verify the exact additive projection without writing pile bytes or
-/// returning plaintext. This is intentionally a post-cutover operation: a
-/// missing epoch, row, current READ grant, repair wrap, or local open fails the
-/// whole verification.
-pub fn verify(pile: &Path, key: Option<&Path>) -> Result<SecretsV2VerificationReport> {
-    let signer = load_signer(pile, key).context("load durable signer for Secrets v2 verify")?;
-    let mut store = open_pile_strict(pile)?;
-    let result = verify_in_open_pile(&mut store, &signer);
-    finish_pile(store, result)
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close();
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(anyhow!("close Secrets v2 pile: {error}")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => Err(error.context(format!(
-            "closing Secrets v2 pile also failed: {close_error}"
-        ))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs::{self, File};
-
-    use hifitime::Epoch;
-    use tempfile::TempDir;
-
-    use super::*;
-    use faculties::secrets as old;
-    use faculties::storage::{
-        ensure_team_of_one_write_authority, initialize_signer, load_signer, open_pile_strict,
-    };
-
-    fn at(second: i64) -> legacy::IntervalValue {
-        let epoch = Epoch::from_unix_seconds(second as f64);
-        (epoch, epoch).try_to_inline().unwrap()
-    }
-
-    struct Fixture {
-        _directory: TempDir,
-        pile: std::path::PathBuf,
-        key: std::path::PathBuf,
-        password: Vec<u8>,
-        scope: Id,
-        secret: Id,
-        historical_key: RecipientPublicKey,
-        source: TribleSet,
-        source_catalog: legacy::Catalog,
-    }
-
-    fn commit_legacy(pile_path: &Path, key_path: &Path, fragment: Fragment) {
-        let signer = load_signer(pile_path, Some(key_path)).unwrap();
-        let pile = open_pile_strict(pile_path).unwrap();
-        let mut collection =
-            faculties::collection_names::open(pile, old::schema::DEFAULT_SCOPE_ID, signer);
-        collection.commit(fragment).unwrap();
-        collection.into_storage().close().unwrap();
-    }
-
-    fn snapshot_legacy(pile_path: &Path, key_path: &Path) -> (TribleSet, legacy::Catalog) {
-        let signer = load_signer(pile_path, Some(key_path)).unwrap();
-        let pile = open_pile_strict(pile_path).unwrap();
-        let mut collection =
-            faculties::collection_names::open(pile, old::schema::DEFAULT_SCOPE_ID, signer);
-        let facts = collection.materialize().unwrap();
-        let reader = collection.storage_mut().reader().unwrap();
-        let catalog = legacy::validate_catalog(&reader, &facts).unwrap();
-        drop(reader);
-        collection.into_storage().close().unwrap();
-        (facts, catalog)
-    }
-
-    fn fixture() -> Fixture {
-        fixture_with_body_authentication(true)
-    }
-
-    fn fixture_with_body_authentication(authenticated_body: bool) -> Fixture {
-        let directory = tempfile::tempdir().unwrap();
-        let pile = directory.path().join("faculties.pile");
-        let key = directory.path().join("faculties.key");
-        let password = b"migration fixture password".to_vec();
-        let signer = initialize_signer(&pile, Some(&key)).unwrap();
-
-        File::create(&pile).unwrap();
-        let mut store = Pile::open(&pile).unwrap();
-        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
-
-        let creator = old::prepare_identity("creator", &password, at(1)).unwrap();
-        let creator_id = creator.id;
-        let historical_signer = SigningKey::from_bytes(&[0x41; 32]);
-        let historical_key = historical_signer.verifying_key().to_bytes();
-        let historical = old::prepare_node_identity("historical", &historical_key, at(2)).unwrap();
-        let historical_id = historical.id;
-        let scope_fragment = old::scope_fragment(creator_id, "epoch", at(3)).unwrap();
-        let scope = scope_fragment.root().unwrap();
-        let historical_grant = genid().id;
-        let mut foundation = creator.fragment;
-        foundation += historical.fragment;
-        foundation += scope_fragment;
-        foundation += old::grant_fragment(
-            historical_grant,
-            scope,
-            "member",
-            historical_id,
-            creator_id,
-            at(4),
-        )
-        .unwrap();
-        commit_legacy(&pile, &key, foundation);
-
-        let signer_for_view = load_signer(&pile, Some(&key)).unwrap();
-        let pile_store = open_pile_strict(&pile).unwrap();
-        let mut collection = faculties::collection_names::open(
-            pile_store,
-            old::schema::DEFAULT_SCOPE_ID,
-            signer_for_view,
-        );
-        let facts = collection.materialize().unwrap();
-        let reader = collection.storage_mut().reader().unwrap();
-        let catalog = old::validate_catalog(&reader, &facts).unwrap();
-        let sealed = old::seal_version(
-            &reader,
-            &catalog,
-            scope,
-            "service",
-            b"body remains encrypted during cutover",
-            at(5),
-        )
-        .unwrap();
-        let secret = sealed.secret;
-        drop(reader);
-        let sealed_fragment = if authenticated_body {
-            sealed.fragment
-        } else {
-            let (_, facts, metafacts, blobs) = sealed.fragment.into_parts();
-            let old_body_facts = facts
-                .iter()
-                .filter(|fact| fact.a() == &old::schema::secret_body.id())
-                .copied()
-                .collect::<TribleSet>();
-            let facts = facts.difference(&old_body_facts);
-            let mut fragment = Fragment::from_parts(facts, metafacts, blobs);
-            // nonce(24) || a syntactically valid 16-byte secretbox MAC.  It
-            // cannot authenticate under the original DEK, so any migration
-            // code that crosses the DEM boundary will fail this fixture.
-            let body = fragment.put::<blobencodings::RawBytes, _>(vec![0; 24 + 16]);
-            fragment += entity! { ExclusiveId::force_ref(&secret) @
-                old::schema::secret_body: body
-            };
-            fragment
-        };
-        collection.commit(sealed_fragment).unwrap();
-        collection.into_storage().close().unwrap();
-
-        let node =
-            old::prepare_node_identity("durable-node", signer.verifying_key().as_bytes(), at(6))
-                .unwrap();
-        let node_id = node.id;
-        let mut authority_change = node.fragment;
-        authority_change +=
-            old::grant_fragment(genid().id, scope, "member", node_id, creator_id, at(7)).unwrap();
-        authority_change += old::retraction_fragment([historical_grant], at(8)).unwrap();
-        commit_legacy(&pile, &key, authority_change);
-
-        let (source, source_catalog) = snapshot_legacy(&pile, &key);
-        Fixture {
-            _directory: directory,
-            pile,
-            key,
-            password,
-            scope,
-            secret,
-            historical_key,
-            source,
-            source_catalog,
-        }
-    }
-
-    #[test]
-    fn exact_additive_cutover_preserves_history_repairs_one_dek_and_replays_to_noop() {
-        let fixture = fixture();
-        let missing = match plan(&fixture.pile, Some(&fixture.key), None) {
-            Ok(_) => panic!("cutover unexpectedly planned without the legacy password"),
-            Err(error) => error,
-        };
-        assert!(
-            missing.downcast_ref::<legacy::PasswordRequired>().is_some(),
-            "{missing:#}"
-        );
-
-        let migration_plan =
-            plan(&fixture.pile, Some(&fixture.key), Some(&fixture.password)).unwrap();
-        assert_eq!(migration_plan.report().vaults.len(), 1);
-        assert_eq!(migration_plan.report().secret_versions(), 1);
-        assert_eq!(migration_plan.report().preserved_wraps(), 2);
-        assert_eq!(migration_plan.report().synthesized_wraps(), 1);
-        assert_eq!(migration_plan.report().pending_vaults(), 1);
-
-        let vault_plan = &migration_plan.vaults[0];
-        let projected = v2::load_catalog(fixture.scope, vault_plan.required.facts()).unwrap();
-        let old_secret = &fixture.source_catalog.secrets[&fixture.secret];
-        assert_eq!(projected.secrets[&fixture.secret].body, old_secret.body);
-        assert_eq!(
-            projected.secrets[&fixture.secret].name,
-            old_secret.display_name
-        );
-        for old_wrap in fixture
-            .source_catalog
-            .wraps
-            .values()
-            .filter(|wrap| wrap.secret == fixture.secret)
-        {
-            let projected_wrap = projected.wraps.get(&old_wrap.id).unwrap();
-            assert_eq!(projected_wrap.sealed_dek, old_wrap.sealed_dek);
-        }
-
-        let published = publish(&fixture.pile, Some(&fixture.key), &migration_plan).unwrap();
-        assert_eq!(published.vault_commits, 1);
-        assert_eq!(published.write_grants, 1);
-        assert_eq!(published.read_grants, 2);
-        let (source_after, _) = snapshot_legacy(&fixture.pile, &fixture.key);
-        assert_eq!(source_after, fixture.source);
-
-        let verification = verify(&fixture.pile, Some(&fixture.key)).unwrap();
-        assert_eq!(verification.source_facts, fixture.source.len());
-        assert_eq!(verification.ready_local_vaults, 1);
-        assert_eq!(verification.discovery_issues, 0);
-        assert_eq!(verification.secret_versions(), 1);
-        assert_eq!(verification.preserved_wraps(), 2);
-        assert_eq!(verification.repaired_wraps(), 1);
-        assert_eq!(verification.legacy_local_wraps(), 0);
-        assert_eq!(verification.repaired_local_wraps(), 1);
-        assert_eq!(verification.locally_opened_versions(), 1);
-        assert_eq!(verification.vaults[0].vault, fixture.scope);
-        assert_eq!(verification.vaults[0].name, "epoch");
-
-        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
-        let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let facts =
-            materialize_vault(&mut pile, fixture.scope, signer.verifying_key(), &signer).unwrap();
-        let reader = pile.reader().unwrap();
-        let catalog = v2::validate_catalog(&reader, fixture.scope, &facts).unwrap();
-        assert_eq!(
-            v2::open_version(&reader, &catalog, fixture.secret, &signer).unwrap(),
-            b"body remains encrypted during cutover"
-        );
-        assert!(catalog
-            .wraps
-            .values()
-            .any(|wrap| wrap.recipient == fixture.historical_key));
-        let authority = resolve_authority(&mut pile, signer.verifying_key()).unwrap();
-        let readers = v2::read_authority_recipient_keys(
-            &authority,
-            v2::vault_handle(fixture.scope, signer.verifying_key()),
-        );
-        assert!(!readers.contains(&fixture.historical_key));
-        drop(reader);
-        pile.close().unwrap();
-
-        let replay = plan(&fixture.pile, Some(&fixture.key), None).unwrap();
-        assert_eq!(replay.report().synthesized_wraps(), 0);
-        assert_eq!(replay.report().pending_vaults(), 0);
-        let before = fs::metadata(&fixture.pile).unwrap().len();
-        assert_eq!(
-            publish(&fixture.pile, Some(&fixture.key), &replay).unwrap(),
-            SecretsV2PublicationReport::default()
-        );
-        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
-    }
-
-    #[test]
-    fn every_publication_crash_prefix_resumes_without_reencrypting_a_body() {
-        for stop in [StopAfter::Write, StopAfter::Data] {
-            let fixture = fixture();
-            let initial = plan(&fixture.pile, Some(&fixture.key), Some(&fixture.password)).unwrap();
-            let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
-            let mut store = open_pile_strict(&fixture.pile).unwrap();
-            let interrupted = publish_in_open_pile(&mut store, &signer, &initial, Some(stop));
-            assert!(interrupted.is_err());
-            store.close().unwrap();
-
-            let resumed = if stop == StopAfter::Data {
-                let plan = plan(&fixture.pile, Some(&fixture.key), None).unwrap();
-                assert_eq!(plan.report().synthesized_wraps(), 0);
-                plan
-            } else {
-                plan(&fixture.pile, Some(&fixture.key), Some(&fixture.password)).unwrap()
-            };
-            publish(&fixture.pile, Some(&fixture.key), &resumed).unwrap();
-            let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
-            let mut pile = open_pile_strict(&fixture.pile).unwrap();
-            let facts =
-                materialize_vault(&mut pile, fixture.scope, signer.verifying_key(), &signer)
-                    .unwrap();
-            let reader = pile.reader().unwrap();
-            let catalog = v2::validate_catalog(&reader, fixture.scope, &facts).unwrap();
-            assert_eq!(
-                v2::open_version(&reader, &catalog, fixture.secret, &signer).unwrap(),
-                b"body remains encrypted during cutover"
-            );
-            drop(reader);
-            pile.close().unwrap();
-        }
-    }
-
-    #[test]
-    fn cutover_never_authenticates_or_decrypts_the_encrypted_body() {
-        let fixture = fixture_with_body_authentication(false);
-        let migration_plan =
-            plan(&fixture.pile, Some(&fixture.key), Some(&fixture.password)).unwrap();
-        publish(&fixture.pile, Some(&fixture.key), &migration_plan).unwrap();
-
-        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
-        let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let facts =
-            materialize_vault(&mut pile, fixture.scope, signer.verifying_key(), &signer).unwrap();
-        let reader = pile.reader().unwrap();
-        let catalog = v2::validate_catalog(&reader, fixture.scope, &facts).unwrap();
-        let error = v2::open_version(&reader, &catalog, fixture.secret, &signer).unwrap_err();
-        assert!(format!("{error:#}").contains("decrypt secret body failed"));
-        drop(reader);
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn multiple_legacy_scope_creation_observations_fail_closed() {
-        let fixture = fixture();
-        let duplicate = entity! { ExclusiveId::force_ref(&fixture.scope) @
-            triblespace::core::metadata::created_at: at(99)
-        };
-        commit_legacy(&fixture.pile, &fixture.key, duplicate);
-        let error = match plan(&fixture.pile, Some(&fixture.key), Some(&fixture.password)) {
-            Ok(_) => panic!("cutover accepted competing scope creation observations"),
-            Err(error) => error,
-        };
-        assert!(
-            format!("{error:#}").contains("requires exactly one"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn stale_full_preflight_fails_before_any_destination_byte_is_appended() {
-        let fixture = fixture();
-        let migration_plan =
-            plan(&fixture.pile, Some(&fixture.key), Some(&fixture.password)).unwrap();
-        let late_source_fact = entity! { ExclusiveId::force_ref(&fixture.scope) @
-            triblespace::core::metadata::created_at: at(99)
-        };
-        commit_legacy(&fixture.pile, &fixture.key, late_source_fact);
-        let before = fs::metadata(&fixture.pile).unwrap().len();
-        let error = publish(&fixture.pile, Some(&fixture.key), &migration_plan).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("source changed after complete migration preflight"),
-            "{error:#}"
-        );
-        assert_eq!(
-            fs::metadata(&fixture.pile).unwrap().len(),
-            before,
-            "a stale full preflight appended destination bytes before failing"
-        );
-    }
 }

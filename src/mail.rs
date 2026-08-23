@@ -1935,48 +1935,6 @@ pub fn validate_secret_references<R>(
     Ok(())
 }
 
-/// Frozen-v1 migration seam for exact Mail credential references.
-///
-/// Runtime consumers must use [`validate_catalog`] and a v2
-/// [`SecretsSnapshot`]. This deliberately named exception exists only so the
-/// stopped-world activation planner can validate its legacy, pre-v2 candidate.
-pub fn validate_legacy_secret_references_v1(
-    facts: &TribleSet,
-    secrets: &crate::secrets::SecretsCatalog,
-) -> Result<()> {
-    for (id, record) in config_owner_map(facts)? {
-        if !secrets.secrets.contains_key(&record.credential) {
-            bail!(
-                "account config {id:x} names unknown legacy Secrets v1 version {:x}",
-                record.credential
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Full stopped-world validation against the frozen Secrets v1 collection.
-#[doc(hidden)]
-pub fn validate_catalog_legacy_secrets_v1(
-    reader: &PileReader,
-    facts: &TribleSet,
-    files_facts: &TribleSet,
-    decide_facts: &TribleSet,
-    relations_facts: &TribleSet,
-    secrets: &crate::secrets::SecretsCatalog,
-) -> Result<()> {
-    validate_catalog_inner(
-        reader,
-        None::<&PileReader>,
-        facts,
-        files_facts,
-        decide_facts,
-        relations_facts,
-        true,
-    )?;
-    validate_legacy_secret_references_v1(facts, secrets)
-}
-
 /// Exact local Mail reconstruction without resolving cross-collection edges.
 /// The stopped-world cutover uses this while each target collection is being
 /// materialized independently; [`validate_catalog`] remains the required
@@ -2074,39 +2032,6 @@ pub fn validate_catalog_union_with_blobs<R>(
         true,
     )?;
     validate_secret_references(&expected, secrets)?;
-    Ok(expected)
-}
-
-/// Stopped-world union preflight against a frozen Secrets v1 candidate.
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
-pub fn validate_catalog_union_with_blobs_legacy_secrets_v1(
-    reader: &PileReader,
-    current: &TribleSet,
-    mail_fragment: &Fragment,
-    blob_overlay: &Fragment,
-    files_facts: &TribleSet,
-    decide_facts: &TribleSet,
-    relations_facts: &TribleSet,
-    secrets: &crate::secrets::SecretsCatalog,
-) -> Result<TribleSet> {
-    let mut expected = current.clone();
-    expected += mail_fragment.facts().clone();
-    let mut staged = blob_overlay.clone();
-    let overlay = staged
-        .blobs_mut()
-        .reader()
-        .expect("memory blob reader creation is infallible");
-    validate_catalog_inner(
-        reader,
-        Some(&overlay),
-        &expected,
-        files_facts,
-        decide_facts,
-        relations_facts,
-        true,
-    )?;
-    validate_legacy_secret_references_v1(&expected, secrets)?;
     Ok(expected)
 }
 

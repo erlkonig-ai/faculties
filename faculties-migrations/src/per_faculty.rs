@@ -113,7 +113,6 @@ faculties! {
     Planner,   "planner",   planner_cutover,   schemas::planner::DEFAULT_SCOPE_ID,       materialized_facts;
     Posture,   "posture",   posture_cutover,   schemas::posture::DEFAULT_POLICY_SCOPE_ID, materialized_facts;
     Relations, "relations", relations_cutover, schemas::relations::DEFAULT_SCOPE_ID,     materialized_facts;
-    Secrets,   "secrets",   secrets_cutover,   faculties::secrets::schema::DEFAULT_SCOPE_ID, materialized_facts;
     Status,    "status",    status_cutover,    schemas::status::DEFAULT_SCOPE_ID,        materialized_facts;
     Teams,     "teams",     teams_cutover,     schemas::teams::DEFAULT_SCOPE_ID,         materialized_facts;
     Voice,     "voice",     voice_cutover,     schemas::voice::COLLECTION_SCOPE_ID,      materialized_facts;

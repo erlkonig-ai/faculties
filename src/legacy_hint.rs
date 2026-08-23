@@ -125,10 +125,6 @@ pub const LEGACY_SOURCES: &[(Id, &str)] = &[
         schemas::relations::LEGACY_BRANCH_NAME,
     ),
     (
-        crate::secrets::schema::DEFAULT_SCOPE_ID,
-        crate::secrets::schema::LEGACY_BRANCH_NAME,
-    ),
-    (
         schemas::status::DEFAULT_SCOPE_ID,
         schemas::status::STATUS_BRANCH_NAME,
     ),

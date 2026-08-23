@@ -148,7 +148,6 @@ pub fn table() -> Vec<(Id, &'static str)> {
         (posture::DEFAULT_POLICY_SCOPE_ID, "posture-policy"),
         (posture::DEFAULT_SCAN_SCOPE_ID, "posture-scan"),
         (relations::DEFAULT_SCOPE_ID, "relations"),
-        (faculties::secrets::schema::DEFAULT_SCOPE_ID, "secrets"),
         (status::DEFAULT_SCOPE_ID, "status"),
         (teams::DEFAULT_SCOPE_ID, "teams"),
         (voice::COLLECTION_SCOPE_ID, "voice"),

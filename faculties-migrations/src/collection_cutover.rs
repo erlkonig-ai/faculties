@@ -17,6 +17,8 @@
 //! it whether or not a migration ever runs.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::convert::Infallible;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::Seek;
 use std::path::Path;
@@ -32,13 +34,16 @@ use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::UnknownBlob;
-use triblespace::core::blob::{Blob, IntoBlob, MemoryBlobStore};
+use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob, MemoryBlobStore};
+use triblespace::core::collection::{CollectionRecord, CollectionStore};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{self, BlobStore, BlobStoreGet, CommitHandle, PinSnapshotSource};
+use triblespace::core::repo::{
+    self, BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinSnapshotSource,
+};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{entity, find, pattern};
 
@@ -233,12 +238,72 @@ pub struct ProjectedLegacyCommit {
 }
 
 /// Read-only stopped-world input for deterministic migration transforms.
-#[derive(Debug)]
 pub struct FrozenSource {
     fingerprint: SourceFingerprint,
     physical_fingerprint: PhysicalSourceFingerprint,
     legacy_pins: Vec<LegacyPinCoordinate>,
     reader: PileReader,
+    collections: FrozenCollectionStore,
+}
+
+/// Read-only native collection records captured beside the frozen blob reader.
+#[derive(Clone)]
+pub(crate) struct FrozenCollectionStore {
+    reader: PileReader,
+    records: Vec<CollectionRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FrozenStoreWriteError;
+
+impl fmt::Display for FrozenStoreWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the frozen source collection store is read-only")
+    }
+}
+
+impl std::error::Error for FrozenStoreWriteError {}
+
+impl BlobStorePut for FrozenCollectionStore {
+    type PutError = FrozenStoreWriteError;
+
+    fn put<S, T>(&mut self, _item: T) -> std::result::Result<Inline<Handle<S>>, Self::PutError>
+    where
+        S: BlobEncoding + 'static,
+        T: IntoBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        Err(FrozenStoreWriteError)
+    }
+}
+
+impl BlobStore for FrozenCollectionStore {
+    type Reader = PileReader;
+    type ReaderError = Infallible;
+
+    fn reader(&mut self) -> std::result::Result<Self::Reader, Self::ReaderError> {
+        Ok(self.reader.clone())
+    }
+}
+
+impl CollectionStore for FrozenCollectionStore {
+    type RecordsError = Infallible;
+    type InsertError = FrozenStoreWriteError;
+    type RecordIter<'a> = std::vec::IntoIter<std::result::Result<CollectionRecord, Infallible>>;
+
+    fn records<'a>(&'a mut self) -> std::result::Result<Self::RecordIter<'a>, Self::RecordsError> {
+        Ok(self
+            .records
+            .iter()
+            .copied()
+            .map(Ok)
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
+
+    fn insert(&mut self, _record: CollectionRecord) -> std::result::Result<(), Self::InsertError> {
+        Err(FrozenStoreWriteError)
+    }
 }
 
 impl FrozenSource {
@@ -268,6 +333,11 @@ impl FrozenSource {
     /// Immutable blob reader captured with the legacy coordinates.
     pub fn reader(&self) -> &PileReader {
         &self.reader
+    }
+
+    /// Native records and blobs from the exact same frozen pile prefix.
+    pub(crate) fn collection_store(&self) -> FrozenCollectionStore {
+        self.collections.clone()
     }
 
     /// Resolve and verify one exact-name legacy branch from this snapshot.
@@ -748,15 +818,20 @@ pub fn freeze_source(path: &Path) -> Result<FrozenSource> {
     let result = (|| {
         let legacy_pins = legacy_pin_coordinates(&mut pile)?;
         let reader = pile.reader().context("snapshot frozen source pile")?;
+        let records = pile
+            .records()
+            .context("snapshot frozen native collection records")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("decode frozen native collection record")?;
         for pin in &legacy_pins {
             let _: TribleSet = reader
                 .get(pin.value)
                 .with_context(|| format!("read frozen legacy pin {:X}", pin.id))?;
         }
-        Ok((legacy_pins, reader))
+        Ok((legacy_pins, reader, records))
     })();
     let close = pile.close();
-    let (legacy_pins, reader) = match (result, close) {
+    let (legacy_pins, reader, records) = match (result, close) {
         (Ok(value), Ok(())) => value,
         (Err(error), Ok(())) => return Err(error),
         (Ok(_), Err(error)) => return Err(anyhow!("close frozen source pile: {error}")),
@@ -774,6 +849,10 @@ pub fn freeze_source(path: &Path) -> Result<FrozenSource> {
         fingerprint,
         physical_fingerprint,
         legacy_pins,
+        collections: FrozenCollectionStore {
+            reader: reader.clone(),
+            records,
+        },
         reader,
     })
 }
@@ -878,6 +957,7 @@ pub(crate) mod test_support {
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::encodings::utf8string::UTF8String;
     use triblespace::core::blob::{Blob, IntoBlob};
+    use triblespace::core::collection::CollectionStore;
     use triblespace::core::id::Id;
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::{Inline, TryToInline};
@@ -889,8 +969,8 @@ pub(crate) mod test_support {
     use faculties::storage::open_pile_strict;
 
     use super::{
-        fingerprint_legacy_pins, legacy_commit_subject, FrozenLegacyBranch, FrozenLegacyDelta,
-        FrozenLegacyDeltaData, FrozenSource, PhysicalSourceFingerprint,
+        fingerprint_legacy_pins, legacy_commit_subject, FrozenCollectionStore, FrozenLegacyBranch,
+        FrozenLegacyDelta, FrozenLegacyDeltaData, FrozenSource, PhysicalSourceFingerprint,
     };
 
     /// Parent selection for one immutable historical delta.
@@ -1011,6 +1091,10 @@ pub(crate) mod test_support {
             let reader = pile
                 .reader()
                 .context("snapshot immutable legacy fixture blobs")?;
+            let records = pile
+                .records()
+                .context("snapshot immutable fixture collection records")?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             pile.close()
                 .context("close immutable legacy fixture pile")?;
             let physical_fingerprint = PhysicalSourceFingerprint::capture(path)?;
@@ -1021,6 +1105,10 @@ pub(crate) mod test_support {
                     fingerprint,
                     physical_fingerprint,
                     legacy_pins: pins,
+                    collections: FrozenCollectionStore {
+                        reader: reader.clone(),
+                        records,
+                    },
                     reader,
                 },
                 branches,
@@ -1449,6 +1537,10 @@ mod tests {
             fingerprint: source.fingerprint,
             physical_fingerprint: source.physical_fingerprint,
             legacy_pins: source.legacy_pins.clone(),
+            collections: FrozenCollectionStore {
+                reader: detached_reader.clone(),
+                records: Vec::new(),
+            },
             reader: detached_reader,
         };
 

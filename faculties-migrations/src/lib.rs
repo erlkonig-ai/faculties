@@ -45,7 +45,6 @@ pub mod mail_credentials;
 pub mod mail_cutover;
 pub mod memory_cutover;
 pub mod message_cutover;
-pub mod node_identity;
 pub mod orient_cutover;
 pub mod planner_cutover;
 pub mod posture_cutover;

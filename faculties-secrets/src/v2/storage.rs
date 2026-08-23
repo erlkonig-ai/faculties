@@ -13,9 +13,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, TryFromBlob};
-use triblespace::core::collection::{
-    descriptor, discover_collection_records, CollectionCommit, CollectionHandle,
-};
+use triblespace::core::collection::{descriptor, discover_collection_records, CollectionHandle};
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
@@ -103,6 +101,27 @@ pub struct VaultDiscovery {
     issues: Vec<VaultDiscoveryIssue>,
 }
 
+/// Strict global census of every canonical vault descriptor already resident
+/// in one pile, independent of which recipients the local key may read.
+pub struct GlobalVaultDiscovery {
+    snapshot: SecretsSnapshot<PileReader>,
+    locations: BTreeMap<Id, VaultLocation>,
+}
+
+impl GlobalVaultDiscovery {
+    pub fn snapshot(&self) -> &SecretsSnapshot<PileReader> {
+        &self.snapshot
+    }
+
+    pub fn locations(&self) -> &BTreeMap<Id, VaultLocation> {
+        &self.locations
+    }
+
+    pub fn into_parts(self) -> (SecretsSnapshot<PileReader>, BTreeMap<Id, VaultLocation>) {
+        (self.snapshot, self.locations)
+    }
+}
+
 impl VaultDiscovery {
     pub fn snapshot(&self) -> &SecretsSnapshot<PileReader> {
         &self.snapshot
@@ -177,7 +196,7 @@ fn discover_team_roots(store: &mut Pile) -> Result<BTreeSet<[u8; 32]>> {
     let collections = records
         .commits()
         .iter()
-        .map(CollectionCommit::collection)
+        .map(|commit| commit.collection())
         .collect::<BTreeSet<_>>();
     let reader = store.reader().context("open collection descriptor view")?;
     let mut teams = BTreeSet::new();
@@ -202,6 +221,119 @@ fn discover_team_roots(store: &mut Pile) -> Result<BTreeSet<[u8; 32]>> {
         }
     }
     Ok(teams)
+}
+
+/// Materialize every canonical v2 vault in the pile through its team's exact
+/// `WRITE` authority. Duplicate vault ids across teams, malformed vault-like
+/// descriptors, and invalid vault catalogs are fatal: this is the global
+/// activation invariant, not the fault-isolating local runtime view.
+pub fn discover_all_vaults_strict<S>(
+    store: &mut S,
+    signing_key: &SigningKey,
+) -> Result<GlobalVaultDiscovery>
+where
+    S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
+    S::Reader: triblespace::core::repo::BlobStoreMeta,
+{
+    let records = discover_collection_records(&mut *store)
+        .context("discover global vault collection records")?;
+    let collections = records
+        .commits()
+        .iter()
+        .map(|commit| commit.collection())
+        .collect::<BTreeSet<_>>();
+    let reader = store
+        .reader()
+        .context("open global vault descriptor view")?;
+    let mut descriptors = BTreeMap::<[u8; 32], Vec<(CollectionHandle, TribleSet)>>::new();
+    for collection in collections {
+        // An unreadable or non-descriptor blob cannot name an owning team, so
+        // an inert foreign COMMIT that points at it has no semantic force.
+        // Once a readable descriptor names a valid team, authority resolution
+        // below decides whether its name and canonical vault shape matter.
+        let Ok(facts) = descriptor_facts(&reader, collection) else {
+            continue;
+        };
+        let Some(Ok(team)) = descriptor::team(&facts) else {
+            continue;
+        };
+        descriptors
+            .entry(team.to_bytes())
+            .or_default()
+            .push((collection, facts));
+    }
+    drop(reader);
+
+    let mut locations = BTreeMap::new();
+    for (team_bytes, descriptors) in descriptors {
+        let team = VerifyingKey::from_bytes(&team_bytes)
+            .expect("descriptor team bytes came from a validated verifying key");
+        let resolution = authority::resolve_authority(&mut *store, team).map_err(|error| {
+            anyhow!(
+                "resolve global vault candidate team {} authority: {error}",
+                bytes_hex(&team_bytes)
+            )
+        })?;
+        let authorized = records
+            .commits()
+            .iter()
+            .filter(|commit| {
+                resolution.allows(&commit.public_key(), ACTION_WRITE, commit.collection())
+            })
+            .map(|commit| commit.collection())
+            .collect::<BTreeSet<_>>();
+        for (collection, facts) in descriptors {
+            if !authorized.contains(&collection) {
+                continue;
+            }
+
+            let Some(name) = descriptor::name(&facts) else {
+                continue;
+            };
+            let name = name.context("decode global collection name")?;
+            if !name.as_str().starts_with(super::VAULT_NAME_PREFIX) {
+                continue;
+            }
+            let vault = parse_vault_name(&name)
+                .with_context(|| format!("decode global vault collection {}", name.as_str()))?;
+            if collection != vault_handle(vault, team)
+                || facts != *vault_descriptor(vault, team).facts()
+            {
+                bail!("global vault {vault:X} does not use its exact canonical descriptor");
+            }
+            let location = VaultLocation {
+                vault,
+                team,
+                collection,
+            };
+            if let Some(previous) = locations.insert(vault, location) {
+                bail!(
+                    "vault {vault:X} is anchored by both team {} and team {}",
+                    bytes_hex(&previous.team.to_bytes()),
+                    bytes_hex(&team.to_bytes())
+                );
+            }
+        }
+    }
+
+    let mut facts = BTreeMap::new();
+    for (vault, location) in &locations {
+        facts.insert(
+            *vault,
+            vault_collection(&mut *store, *vault, location.team, signing_key.clone())
+                .materialize()
+                .with_context(|| format!("materialize global vault {vault:X}"))?,
+        );
+    }
+    let reader = store
+        .reader()
+        .context("open global vault attachment snapshot")?;
+    let snapshot = SecretsSnapshot::new(reader, facts)
+        .context("validate global vault catalog and secret-id uniqueness")?;
+    Ok(GlobalVaultDiscovery {
+        snapshot,
+        locations,
+    })
 }
 
 fn issue(

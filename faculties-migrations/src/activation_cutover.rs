@@ -8,27 +8,104 @@
 //! checkpoint, resume protocol, target head, signer, or target write here.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use anyhow::{anyhow, bail, Context, Result};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::authority::resolve_authority;
+use triblespace::core::blob::{BlobEncoding, TryFromBlob};
+use triblespace::core::collection::reach;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::InlineEncoding;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::CommitHandle;
-use triblespace::prelude::Inline;
-use triblespace::prelude::{Fragment, Id, TribleSet};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::prelude::{CollectionName, Fragment, Id, Inline, TribleSet};
 
 use crate::collection_cutover::{FrozenSource, LegacyPinCoordinate};
 use crate::{
     archive_cutover, atlas_cutover, body_cutover, cognition_cutover, comb_cutover, compass_cutover,
     decide_cutover, discord_cutover, files_cutover, habit_cutover, headspace_cutover, mail_cutover,
     memory_cutover, message_cutover, orient_cutover, planner_cutover, posture_cutover,
-    relations_cutover, secrets_cutover, status_cutover, teams_cutover, voice_cutover, web_cutover,
-    wiki_cutover,
+    relations_cutover, secrets_cutover, secrets_v2_cutover, status_cutover, teams_cutover,
+    voice_cutover, web_cutover, wiki_cutover,
 };
 use faculties::schemas;
-use faculties::secrets;
+use faculties::secrets::v2;
 use faculties::{
     atlas, blockdag, body, cognition, comb, compass, decide, discord, files, habits, headspace,
     mail, memory, message, planner, relations, status, teams, voice, wiki,
 };
+
+#[derive(Clone, Copy)]
+struct PlannedActivationReader<'a, Overlay> {
+    overlay: &'a Overlay,
+    source: &'a PileReader,
+}
+
+#[derive(Debug)]
+struct PlannedActivationReadError(String);
+
+impl fmt::Display for PlannedActivationReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlannedActivationReadError {}
+
+impl<Overlay> BlobStoreGet for PlannedActivationReader<'_, Overlay>
+where
+    Overlay: BlobStoreGet + BlobStoreMeta,
+{
+    type GetError<E: std::error::Error + Send + Sync + 'static> = PlannedActivationReadError;
+
+    fn get<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> std::result::Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
+    where
+        S: BlobEncoding + 'static,
+        T: TryFromBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        let staged = self
+            .overlay
+            .metadata(handle)
+            .map_err(|error| {
+                PlannedActivationReadError(format!("inspect planned blob: {error:?}"))
+            })?
+            .is_some();
+        if staged {
+            self.overlay.get(handle).map_err(|error| {
+                PlannedActivationReadError(format!("read planned blob: {error:?}"))
+            })
+        } else {
+            self.source.get(handle).map_err(|error| {
+                PlannedActivationReadError(format!("read frozen source blob: {error:?}"))
+            })
+        }
+    }
+}
+
+/// Semantic role of one target collection inside the complete candidate.
+///
+/// The collection handle, not this key, is the publication identity. This key
+/// exists only to route the exact materialized facts to their validator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum CandidateViewKey {
+    Faculty(Id),
+    Vault(Id),
+}
+
+/// Authority policy implied by one semantic target kind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TargetPolicy {
+    Faculty,
+    Vault {
+        readers: BTreeSet<v2::RecipientPublicKey>,
+    },
+}
 
 /// One validated native collection projection with its concrete source inputs.
 ///
@@ -39,28 +116,25 @@ use faculties::{
 /// the typed plan is erased.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedCollection {
-    name: &'static str,
-    scope: Id,
-    source_pins: Vec<LegacyPinCoordinate>,
+    name: CollectionName,
+    reach: Fragment,
+    view: CandidateViewKey,
+    policy: TargetPolicy,
     fragments: Vec<Fragment>,
     expected_facts: TribleSet,
-    /// Exact source facts deliberately excluded by the typed migration.
-    /// This is diagnostic evidence only; the typed plan owns the conservation
-    /// proof before erasure into this aggregate plan.
-    retired_source_facts: usize,
 }
 
 impl PlannedCollection {
-    pub const fn name(&self) -> &'static str {
-        self.name
+    pub fn name(&self) -> &CollectionName {
+        &self.name
     }
 
-    pub const fn scope(&self) -> Id {
-        self.scope
+    pub const fn view(&self) -> CandidateViewKey {
+        self.view
     }
 
-    pub fn source_pins(&self) -> &[LegacyPinCoordinate] {
-        &self.source_pins
+    pub fn reach(&self) -> &Fragment {
+        &self.reach
     }
 
     pub fn fragments(&self) -> &[Fragment] {
@@ -71,8 +145,8 @@ impl PlannedCollection {
         &self.expected_facts
     }
 
-    pub const fn retired_source_facts(&self) -> usize {
-        self.retired_source_facts
+    pub fn policy(&self) -> &TargetPolicy {
+        &self.policy
     }
 
     fn new(
@@ -81,7 +155,7 @@ impl PlannedCollection {
         source_pins: impl IntoIterator<Item = LegacyPinCoordinate>,
         fragments: impl IntoIterator<Item = Fragment>,
         expected_facts: TribleSet,
-    ) -> Result<Self> {
+    ) -> Result<PlannedOutput> {
         let source_pins = source_pins.into_iter().collect::<Vec<_>>();
         let fragments = fragments.into_iter().collect::<Vec<_>>();
         let staged_facts = materialized_facts(&fragments);
@@ -92,19 +166,80 @@ impl PlannedCollection {
                 expected_facts.len()
             );
         }
-        Ok(Self {
-            name,
-            scope,
-            source_pins,
-            fragments,
-            expected_facts,
-            retired_source_facts: 0,
+        Ok(PlannedOutput {
+            collection: Self {
+                name: faculties::collection_names::require_name(scope),
+                reach: faculties::collection_names::require_reach(scope),
+                view: CandidateViewKey::Faculty(scope),
+                policy: TargetPolicy::Faculty,
+                fragments,
+                expected_facts,
+            },
+            consumption: SourceConsumption {
+                name: name.to_owned(),
+                source_pins,
+                retired_source_facts: 0,
+            },
         })
     }
 
+    fn vault(
+        vault: Id,
+        fragments: impl IntoIterator<Item = Fragment>,
+        expected_facts: TribleSet,
+        readers: BTreeSet<v2::RecipientPublicKey>,
+    ) -> Result<Self> {
+        let name = v2::vault_name(vault);
+        let fragments = fragments.into_iter().collect::<Vec<_>>();
+        let staged_facts = materialized_facts(&fragments);
+        if staged_facts != expected_facts {
+            bail!(
+                "erased vault {vault:X} plan stages {} facts but expects {}",
+                staged_facts.len(),
+                expected_facts.len()
+            );
+        }
+        Ok(Self {
+            name,
+            reach: reach::private(),
+            view: CandidateViewKey::Vault(vault),
+            policy: TargetPolicy::Vault { readers },
+            fragments,
+            expected_facts,
+        })
+    }
+}
+
+struct PlannedOutput {
+    collection: PlannedCollection,
+    consumption: SourceConsumption,
+}
+
+impl PlannedOutput {
     fn with_retired_source_facts(mut self, retired_source_facts: usize) -> Self {
-        self.retired_source_facts = retired_source_facts;
+        self.consumption.retired_source_facts = retired_source_facts;
         self
+    }
+}
+
+#[derive(Default)]
+struct ActivationBuilder {
+    collections: Vec<PlannedCollection>,
+    consumptions: Vec<SourceConsumption>,
+}
+
+impl ActivationBuilder {
+    fn push(&mut self, output: PlannedOutput) {
+        self.collections.push(output.collection);
+        self.consumptions.push(output.consumption);
+    }
+
+    fn push_target(&mut self, collection: PlannedCollection) {
+        self.collections.push(collection);
+    }
+
+    fn into_parts(self) -> (Vec<PlannedCollection>, Vec<SourceConsumption>) {
+        (self.collections, self.consumptions)
     }
 }
 
@@ -119,6 +254,30 @@ pub struct SourceDisposition {
     branch_name: &'static str,
     source_pin: LegacyPinCoordinate,
     reason: &'static str,
+}
+
+/// One typed source transform, independent of how many target collections it
+/// emits. This is the coverage unit: a consumed-empty source and a source that
+/// fans out to many vaults are both represented exactly once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceConsumption {
+    name: String,
+    source_pins: Vec<LegacyPinCoordinate>,
+    retired_source_facts: usize,
+}
+
+impl SourceConsumption {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn source_pins(&self) -> &[LegacyPinCoordinate] {
+        &self.source_pins
+    }
+
+    pub const fn retired_source_facts(&self) -> usize {
+        self.retired_source_facts
+    }
 }
 
 impl SourceDisposition {
@@ -138,11 +297,64 @@ impl SourceDisposition {
 /// Complete pure plan for one atomic activation candidate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivationPlan {
+    team: [u8; 32],
     collections: Vec<PlannedCollection>,
+    consumptions: Vec<SourceConsumption>,
     dispositions: Vec<SourceDisposition>,
 }
 
+/// Complete semantic views from one closed candidate snapshot.
+///
+/// `vaults` is the global structural census of every vault targeted by this
+/// activation. `local_vaults` is the strict subset for which the durable local
+/// signer has accepted exact-resource `READ` authority. Runtime references are
+/// validated only against that local subset.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CandidateViews {
+    faculties: BTreeMap<Id, TribleSet>,
+    vaults: BTreeMap<Id, TribleSet>,
+    local_vaults: BTreeMap<Id, TribleSet>,
+}
+
+impl CandidateViews {
+    pub fn new(
+        faculties: BTreeMap<Id, TribleSet>,
+        vaults: BTreeMap<Id, TribleSet>,
+        local_vaults: BTreeMap<Id, TribleSet>,
+    ) -> Result<Self> {
+        for (vault, local) in &local_vaults {
+            let Some(global) = vaults.get(vault) else {
+                bail!("local READ vault {vault:X} is absent from the global vault snapshot");
+            };
+            if local != global {
+                bail!("local READ vault {vault:X} differs from its global vault facts");
+            }
+        }
+        Ok(Self {
+            faculties,
+            vaults,
+            local_vaults,
+        })
+    }
+
+    pub fn faculties(&self) -> &BTreeMap<Id, TribleSet> {
+        &self.faculties
+    }
+
+    pub fn vaults(&self) -> &BTreeMap<Id, TribleSet> {
+        &self.vaults
+    }
+
+    pub fn local_vaults(&self) -> &BTreeMap<Id, TribleSet> {
+        &self.local_vaults
+    }
+}
+
 impl ActivationPlan {
+    pub const fn team(&self) -> [u8; 32] {
+        self.team
+    }
+
     pub fn collections(&self) -> &[PlannedCollection] {
         &self.collections
     }
@@ -151,9 +363,25 @@ impl ActivationPlan {
         &self.dispositions
     }
 
+    pub fn consumptions(&self) -> &[SourceConsumption] {
+        &self.consumptions
+    }
+
+    pub fn retired_source_facts(&self) -> usize {
+        self.consumptions
+            .iter()
+            .map(SourceConsumption::retired_source_facts)
+            .sum()
+    }
+
     /// Recheck exact source coverage against the same immutable snapshot.
     pub fn verify_source_coverage(&self, source: &FrozenSource) -> Result<()> {
-        validate_source_coverage(source.legacy_pins(), &self.collections, &self.dispositions)
+        validate_source_coverage(
+            source.legacy_pins(),
+            &self.collections,
+            &self.consumptions,
+            &self.dispositions,
+        )
     }
 }
 
@@ -164,10 +392,8 @@ impl ActivationPlan {
 /// a coherent native snapshot. Local predicates run first; faculty
 /// cross-collection invariants run over the same immutable pile reader and
 /// the catalogs parsed from those exact candidate views afterwards.
-pub fn validate_candidate_views(
-    reader: &PileReader,
-    views: &BTreeMap<Id, TribleSet>,
-) -> Result<()> {
+pub fn validate_candidate_views(reader: &PileReader, views: &CandidateViews) -> Result<()> {
+    let faculty_views = views.faculties();
     let known_scopes = BTreeSet::from([
         schemas::blockdag::DEFAULT_SCOPE_ID,
         schemas::atlas::DEFAULT_SCOPE_ID,
@@ -186,20 +412,23 @@ pub fn validate_candidate_views(
         schemas::planner::DEFAULT_SCOPE_ID,
         schemas::posture::DEFAULT_POLICY_SCOPE_ID,
         schemas::relations::DEFAULT_SCOPE_ID,
-        secrets::schema::DEFAULT_SCOPE_ID,
         schemas::status::DEFAULT_SCOPE_ID,
         schemas::teams::DEFAULT_SCOPE_ID,
         schemas::voice::COLLECTION_SCOPE_ID,
         schemas::web::DEFAULT_SCOPE_ID,
         schemas::wiki::DEFAULT_SCOPE_ID,
     ]);
-    for scope in views.keys() {
+    for scope in faculty_views.keys() {
         if !known_scopes.contains(scope) {
             bail!("candidate contains an unrecognized planned collection scope {scope:X}");
         }
     }
 
-    let archive = required_view(views, "Archive", schemas::blockdag::DEFAULT_SCOPE_ID)?;
+    let archive = required_view(
+        faculty_views,
+        "Archive",
+        schemas::blockdag::DEFAULT_SCOPE_ID,
+    )?;
     match blockdag::validate_catalog(reader, archive).context("validate Archive candidate")? {
         blockdag::CatalogValidation::Accepted => {}
         blockdag::CatalogValidation::Pending { missing } => {
@@ -215,135 +444,124 @@ pub fn validate_candidate_views(
 
     atlas::validate_catalog(
         reader,
-        required_view(views, "Atlas", schemas::atlas::DEFAULT_SCOPE_ID)?,
+        required_view(faculty_views, "Atlas", schemas::atlas::DEFAULT_SCOPE_ID)?,
     )
     .context("validate Atlas candidate")?;
     body::validate_catalog(
         reader,
-        required_view(views, "Body", schemas::body::DEFAULT_SCOPE_ID)?,
+        required_view(faculty_views, "Body", schemas::body::DEFAULT_SCOPE_ID)?,
     )
     .context("validate Body candidate")?;
     cognition::validate_catalog(
         reader,
-        required_view(views, "Cognition", schemas::cognition::DEFAULT_SCOPE_ID)?,
+        required_view(
+            faculty_views,
+            "Cognition",
+            schemas::cognition::DEFAULT_SCOPE_ID,
+        )?,
     )
     .context("validate Cognition candidate")?;
-    if let Some(facts) = views.get(&schemas::memory::DEFAULT_COMB_SCOPE_ID) {
+    if let Some(facts) = faculty_views.get(&schemas::memory::DEFAULT_COMB_SCOPE_ID) {
         comb::load_catalog(facts).context("validate optional Comb candidate")?;
     }
     compass::validate_known_payloads(
         reader,
-        required_view(views, "Compass", schemas::compass::DEFAULT_SCOPE_ID)?,
+        required_view(faculty_views, "Compass", schemas::compass::DEFAULT_SCOPE_ID)?,
     )
     .context("validate Compass candidate")?;
     decide::validate_catalog(
         reader,
-        required_view(views, "Decide", schemas::decide::DEFAULT_SCOPE_ID)?,
+        required_view(faculty_views, "Decide", schemas::decide::DEFAULT_SCOPE_ID)?,
     )
     .context("validate Decide candidate")?;
-    if let Some(facts) = views.get(&schemas::discord::DEFAULT_SCOPE_ID) {
+    if let Some(facts) = faculty_views.get(&schemas::discord::DEFAULT_SCOPE_ID) {
         discord::validate_catalog(reader, facts).context("validate optional Discord candidate")?;
     }
-    let files = required_view(views, "Files", schemas::files::DEFAULT_SCOPE_ID)?;
+    let files = required_view(faculty_views, "Files", schemas::files::DEFAULT_SCOPE_ID)?;
     files::validate_catalog(reader, files).context("validate Files candidate")?;
-    if let Some(facts) = views.get(&schemas::habit::DEFAULT_SCOPE_ID) {
+    if let Some(facts) = faculty_views.get(&schemas::habit::DEFAULT_SCOPE_ID) {
         habits::validate_catalog(reader, facts).context("validate optional Habit candidate")?;
     }
     let headspace_catalog = headspace::project_result(
         reader,
-        required_view(views, "Headspace", schemas::headspace::DEFAULT_SCOPE_ID)?,
+        required_view(
+            faculty_views,
+            "Headspace",
+            schemas::headspace::DEFAULT_SCOPE_ID,
+        )?,
     )
     .context("validate Headspace candidate")?;
-    let mail_facts = required_view(views, "Mail", schemas::mail::DEFAULT_SCOPE_ID)?;
+    let mail_facts = required_view(faculty_views, "Mail", schemas::mail::DEFAULT_SCOPE_ID)?;
     mail::validate_local_catalog(reader, mail_facts).context("validate local Mail candidate")?;
     memory::validate_catalog(
         reader,
-        required_view(views, "Memory", schemas::memory::DEFAULT_SCOPE_ID)?,
+        required_view(faculty_views, "Memory", schemas::memory::DEFAULT_SCOPE_ID)?,
     )
     .context("validate Memory candidate")?;
     planner::validate_catalog(
         reader,
-        required_view(views, "Planner", schemas::planner::DEFAULT_SCOPE_ID)?,
+        required_view(faculty_views, "Planner", schemas::planner::DEFAULT_SCOPE_ID)?,
     )
     .context("validate Planner candidate")?;
     faculties::posture_policy::validate_policy_catalog(
         reader,
-        required_view(views, "Posture", schemas::posture::DEFAULT_POLICY_SCOPE_ID)?,
+        required_view(
+            faculty_views,
+            "Posture",
+            schemas::posture::DEFAULT_POLICY_SCOPE_ID,
+        )?,
     )
     .context("validate Posture candidate")?;
-    let relation_facts = required_view(views, "Relations", schemas::relations::DEFAULT_SCOPE_ID)?;
+    let relation_facts = required_view(
+        faculty_views,
+        "Relations",
+        schemas::relations::DEFAULT_SCOPE_ID,
+    )?;
     relations::validate_catalog(reader, relation_facts).context("validate Relations candidate")?;
-    let secrets_catalog = secrets::validate_catalog(
-        reader,
-        required_view(views, "Secrets", secrets::schema::DEFAULT_SCOPE_ID)?,
-    )
-    .context("validate Secrets candidate")?;
-    headspace::validate_secret_references(&headspace_catalog, &secrets_catalog)
-        .context("validate Headspace candidate exact Secrets references")?;
+    let _all_secrets = v2::SecretsSnapshot::new(reader.clone(), views.vaults.clone())
+        .context("validate global Secrets v2 vault candidate")?;
+    let local_secrets = v2::SecretsSnapshot::new(reader.clone(), views.local_vaults.clone())
+        .context("validate local READ-authorized Secrets v2 vault candidate")?;
+    headspace::validate_secret_references_v2(&headspace_catalog, &local_secrets)
+        .context("validate Headspace candidate exact local Secrets references")?;
     status::validate_catalog(
         reader,
-        required_view(views, "Status", schemas::status::DEFAULT_SCOPE_ID)?,
+        required_view(faculty_views, "Status", schemas::status::DEFAULT_SCOPE_ID)?,
     )
     .context("validate Status candidate")?;
-    let teams_facts = required_view(views, "Teams", schemas::teams::DEFAULT_SCOPE_ID)?;
+    let teams_facts = required_view(faculty_views, "Teams", schemas::teams::DEFAULT_SCOPE_ID)?;
     teams::validate_catalog(reader, teams_facts).context("validate Teams candidate")?;
-    validate_frozen_v1_teams_secret_references(teams_facts, &secrets_catalog)
-        .context("validate Teams candidate exact Secrets references")?;
+    teams::validate_auth_secret_references(teams_facts, &local_secrets)
+        .context("validate Teams candidate exact local Secrets references")?;
     voice::validate_catalog(
         reader,
-        required_view(views, "Voice", schemas::voice::COLLECTION_SCOPE_ID)?,
+        required_view(faculty_views, "Voice", schemas::voice::COLLECTION_SCOPE_ID)?,
     )
     .context("validate Voice candidate")?;
-    if let Some(facts) = views.get(&schemas::web::DEFAULT_SCOPE_ID) {
+    if let Some(facts) = faculty_views.get(&schemas::web::DEFAULT_SCOPE_ID) {
         web_cutover::validate_known_payloads(reader, facts)
             .context("validate optional Web candidate")?;
     }
     wiki::validate_catalog(
         reader,
-        required_view(views, "Wiki", schemas::wiki::DEFAULT_SCOPE_ID)?,
+        required_view(faculty_views, "Wiki", schemas::wiki::DEFAULT_SCOPE_ID)?,
     )
     .context("validate Wiki candidate")?;
 
-    let message_facts = required_view(views, "Message", schemas::message::DEFAULT_SCOPE_ID)?;
+    let message_facts =
+        required_view(faculty_views, "Message", schemas::message::DEFAULT_SCOPE_ID)?;
     message::validate_catalog(reader, message_facts, relation_facts)
         .context("validate Message -> Relations candidate references")?;
-    mail::validate_catalog_legacy_secrets_v1(
+    mail::validate_catalog(
         reader,
         mail_facts,
         files,
-        required_view(views, "Decide", schemas::decide::DEFAULT_SCOPE_ID)?,
+        required_view(faculty_views, "Decide", schemas::decide::DEFAULT_SCOPE_ID)?,
         relation_facts,
-        &secrets_catalog,
+        &local_secrets,
     )
     .context("validate Mail candidate cross-collection references")?;
 
-    Ok(())
-}
-
-/// Preserve the stopped-world activation invariant against its exact frozen
-/// v1 Secrets candidate. Live Teams deliberately accepts only a discovered v2
-/// vault snapshot; the retired fixed collection remains local to migration.
-fn validate_frozen_v1_teams_secret_references(
-    teams_facts: &TribleSet,
-    secrets_catalog: &secrets::SecretsCatalog,
-) -> Result<()> {
-    for source in teams::auth_profile_sources(teams_facts) {
-        for profile in teams::auth_profile_ids(teams_facts, source) {
-            let record = teams::auth_profile(teams_facts, profile)?;
-            for (label, secret) in [
-                ("client secret", record.client_secret_version),
-                ("delegated token bundle", record.delegated_token_version),
-            ] {
-                if let Some(secret) = secret {
-                    if !secrets_catalog.secrets.contains_key(&secret) {
-                        bail!(
-                            "Teams auth profile {profile:x} names unknown {label} Secrets version {secret:x}"
-                        );
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }
 
@@ -363,8 +581,12 @@ fn required_view<'a>(
 /// branch produces no collection. Every other typed source and every explicit
 /// disposition must be present and valid. The resulting coverage proof is
 /// completed before this function returns.
-pub fn plan(source: &FrozenSource) -> Result<ActivationPlan> {
-    let mut collections = Vec::new();
+pub fn plan(
+    source: &FrozenSource,
+    signer: &SigningKey,
+    password: Option<&[u8]>,
+) -> Result<ActivationPlan> {
+    let mut collections = ActivationBuilder::default();
 
     let archive = archive_cutover::plan(source).context("plan Archive activation")?;
     collections.push(PlannedCollection::new(
@@ -579,20 +801,39 @@ pub fn plan(source: &FrozenSource) -> Result<ActivationPlan> {
         relations.materialized_facts(),
     )?);
 
-    let secret_plan = secrets_cutover::plan(source).context("plan Secrets activation")?;
-    collections.push(
-        PlannedCollection::new(
-            "secrets",
-            secrets::schema::DEFAULT_SCOPE_ID,
-            [secret_plan.source_pin()],
-            secret_plan
-                .commits()
-                .iter()
-                .map(|commit| commit.fragment.clone()),
-            secret_plan.materialized_facts(),
-        )?
-        .with_retired_source_facts(secret_plan.report().retired_facts),
-    );
+    let secret_plan = secrets_cutover::plan(source)
+        .context("project pre-collection Secrets activation source")?;
+    let mut frozen_collections = source.collection_store();
+    let direct = secrets_v2_cutover::plan_from_legacy_in_store(
+        &mut frozen_collections,
+        signer,
+        source.reader(),
+        secret_plan.retained_facts().clone(),
+        password,
+    )
+    .context("plan direct Secrets vault activation")?;
+    if direct.team() != signer.verifying_key().to_bytes() {
+        bail!("direct Secrets plan belongs to a different durable team root");
+    }
+    for vault in direct.vaults() {
+        for recipient in &vault.recipients {
+            VerifyingKey::from_bytes(recipient)
+                .context("validate planned direct Secrets READ recipient")?;
+        }
+        let fragments = vault
+            .report
+            .data_pending
+            .then(|| vault.required.clone())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let expected_facts = materialized_facts(&fragments);
+        collections.push_target(PlannedCollection::vault(
+            vault.vault,
+            fragments,
+            expected_facts,
+            vault.recipients.clone(),
+        )?);
+    }
 
     let status = status_cutover::plan(source).context("plan Status activation")?;
     collections.push(PlannedCollection::new(
@@ -649,14 +890,113 @@ pub fn plan(source: &FrozenSource) -> Result<ActivationPlan> {
         wiki.materialized_facts(),
     )?);
 
-    // The individual Mail planner can prove only its local algebra. Before
-    // any candidate bytes exist, prove its references against the planned
-    // Files, Decide, Relations, and Secrets projections that will accompany
-    // it. Mail/Files/Decide may own newly staged payloads, so expose their
-    // combined in-memory blob closure to the same validator used at publish.
-    // Existing WRITE-authorized native facts are intentionally outside this
-    // pure legacy-source plan; disposable activation repeats the predicate
-    // over the authoritative baseline union planned facts before replacement.
+    // Prove the full cross-faculty world before a disposable COMMIT exists.
+    // Global vault validation sees every frozen authorized vault plus every
+    // staged direct projection; runtime references see only the hypothetical
+    // final subset for which the durable signer has exact READ.
+    let global = v2::storage::discover_all_vaults_strict(&mut frozen_collections, signer)
+        .context("discover frozen global Secrets vault baseline")?;
+    let mut vault_facts = global
+        .snapshot()
+        .vaults()
+        .iter()
+        .map(|(vault, snapshot)| (*vault, snapshot.facts().clone()))
+        .collect::<BTreeMap<_, _>>();
+    let locations = global.locations().clone();
+    drop(global);
+
+    let planned_readers = direct
+        .vaults()
+        .iter()
+        .map(|vault| (vault.vault, vault.recipients.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let local_team_authority =
+        resolve_authority(&mut frozen_collections, signer.verifying_key())
+            .map_err(|error| anyhow!("resolve frozen local-team Secrets authority: {error}"))?;
+    let mut staged_vaults = Fragment::empty();
+    for vault in direct.vaults() {
+        let handle = v2::vault_handle(vault.vault, signer.verifying_key());
+        let current = v2::read_authority_recipient_keys(&local_team_authority, handle);
+        if !current.is_subset(&vault.recipients) {
+            bail!(
+                "frozen vault {:X} already has a READ recipient outside the projected legacy effective-recipient set",
+                vault.vault
+            );
+        }
+        if let Some(location) = locations.get(&vault.vault) {
+            if location.team() != signer.verifying_key() {
+                bail!(
+                    "planned vault {:X} is already anchored by another team",
+                    vault.vault
+                );
+            }
+        }
+        let facts = vault_facts.entry(vault.vault).or_default();
+        *facts += vault.required.facts().clone();
+        staged_vaults += vault.required.clone();
+    }
+
+    let mut local_vault_facts = BTreeMap::new();
+    let mut final_readers = BTreeMap::new();
+    for (vault, facts) in &vault_facts {
+        let readers = if let Some(readers) = planned_readers.get(vault) {
+            readers.clone()
+        } else if let Some(location) = locations.get(vault) {
+            let authority = resolve_authority(&mut frozen_collections, location.team())
+                .map_err(|error| anyhow!("resolve frozen vault {vault:X} authority: {error}"))?;
+            v2::read_authority_recipient_keys(&authority, location.collection())
+        } else {
+            BTreeSet::new()
+        };
+        final_readers.insert(*vault, readers.clone());
+        if readers.contains(&signer.verifying_key().to_bytes()) {
+            local_vault_facts.insert(*vault, facts.clone());
+        }
+    }
+
+    let staged_reader = staged_vaults
+        .blobs_mut()
+        .reader()
+        .context("snapshot staged direct Secrets attachments")?;
+    let global_secrets = v2::SecretsSnapshot::new(
+        PlannedActivationReader {
+            overlay: &staged_reader,
+            source: source.reader(),
+        },
+        vault_facts,
+    )
+    .context("validate planned global Secrets vault snapshot")?;
+    for (vault, snapshot) in global_secrets.vaults() {
+        let readers = &final_readers[vault];
+        for secret in snapshot.catalog().secrets.keys().copied() {
+            if !readers.is_subset(&snapshot.catalog().wrap_holders(secret)) {
+                bail!(
+                    "planned vault {vault:X} leaves an accepted READ recipient without a wrap for secret {secret:X}"
+                );
+            }
+        }
+    }
+    let local_secrets = v2::SecretsSnapshot::new(
+        PlannedActivationReader {
+            overlay: &staged_reader,
+            source: source.reader(),
+        },
+        local_vault_facts,
+    )
+    .context("validate planned local READ-authorized Secrets vault snapshot")?;
+    drop(global_secrets);
+
+    let headspace_catalog =
+        headspace::project_result(source.reader(), &headspace.materialized_facts())
+            .context("validate planned Headspace catalog")?;
+    headspace::validate_secret_references_v2(&headspace_catalog, &local_secrets)
+        .context("validate planned Headspace local Secrets references")?;
+    let teams_facts = teams.materialized_facts();
+    teams::validate_catalog(source.reader(), &teams_facts)
+        .context("validate planned Teams catalog")?;
+    teams::validate_auth_secret_references(&teams_facts, &local_secrets)
+        .context("validate planned Teams local Secrets references")?;
+
     let staged_mail = mail
         .commits()
         .iter()
@@ -673,35 +1013,32 @@ pub fn plan(source: &FrozenSource) -> Result<ActivationPlan> {
     {
         blob_overlay.blobs_mut().union(fragment.blobs().clone());
     }
-    let files_facts = files.materialized_facts();
-    let decide_facts = decide.materialized_facts();
-    let relations_facts = relations.materialized_facts();
-    let secrets_facts = secret_plan.materialized_facts();
-    let secrets_catalog = secrets::validate_catalog(source.reader(), &secrets_facts)
-        .context("validate planned Secrets catalog for Mail preflight")?;
-    let validated_mail = mail::validate_catalog_union_with_blobs_legacy_secrets_v1(
+    let validated_mail = mail::validate_catalog_union_with_blobs(
         source.reader(),
         &TribleSet::new(),
         &staged_mail,
         &blob_overlay,
-        &files_facts,
-        &decide_facts,
-        &relations_facts,
-        &secrets_catalog,
+        &files.materialized_facts(),
+        &decide.materialized_facts(),
+        &relations.materialized_facts(),
+        &local_secrets,
     )
-    .context("validate planned Mail cross-collection references")?;
-    let planned_mail = mail.materialized_facts();
-    if validated_mail != planned_mail {
-        bail!(
-            "Mail cross-collection preflight reconstructed {} facts but its typed plan carries {}",
-            validated_mail.len(),
-            planned_mail.len()
-        );
+    .context("validate planned Mail cross-collection and local Secrets references")?;
+    if validated_mail != mail.materialized_facts() {
+        bail!("planned Mail cross-collection preflight reconstructed different facts");
     }
 
     let dispositions = plan_source_dispositions(source)?;
+    let (collections, mut consumptions) = collections.into_parts();
+    consumptions.push(SourceConsumption {
+        name: "secrets-vaults".to_owned(),
+        source_pins: vec![secret_plan.source_pin()],
+        retired_source_facts: secret_plan.report().retired_facts,
+    });
     let activation = ActivationPlan {
+        team: signer.verifying_key().to_bytes(),
         collections,
+        consumptions,
         dispositions,
     };
     activation.verify_source_coverage(source)?;
@@ -835,6 +1172,7 @@ fn commit_handle(value: &str) -> CommitHandle {
 fn validate_source_coverage(
     source_pins: &[LegacyPinCoordinate],
     collections: &[PlannedCollection],
+    consumptions: &[SourceConsumption],
     dispositions: &[SourceDisposition],
 ) -> Result<()> {
     let mut source = BTreeSet::new();
@@ -844,45 +1182,51 @@ fn validate_source_coverage(
         }
     }
 
-    let mut collection_names = BTreeSet::new();
-    let mut collection_scopes = BTreeSet::new();
-    let mut consumed = BTreeMap::<LegacyPinCoordinate, BTreeSet<&str>>::new();
+    let mut collection_views = BTreeSet::new();
     for collection in collections {
-        if !collection_names.insert(collection.name) {
+        if !collection_views.insert(collection.view) {
             bail!(
-                "activation plan repeats collection name {}",
-                collection.name
+                "activation plan repeats semantic collection view {:?}",
+                collection.view
             );
         }
-        if !collection_scopes.insert(collection.scope) {
+    }
+
+    let mut consumption_names = BTreeSet::new();
+    let mut consumed = BTreeMap::<LegacyPinCoordinate, BTreeSet<&str>>::new();
+    for consumption in consumptions {
+        if !consumption_names.insert(consumption.name.as_str()) {
             bail!(
-                "activation plan repeats target collection scope {:X}",
-                collection.scope
+                "activation plan repeats source transform {}",
+                consumption.name
             );
         }
-        if collection.source_pins.is_empty() {
+        if consumption.source_pins.is_empty() {
             bail!(
-                "planned collection {} has no legacy source pin",
-                collection.name
+                "source transform {} has no legacy source pin",
+                consumption.name
             );
         }
         let mut own_pins = BTreeSet::new();
-        for pin in &collection.source_pins {
+        for pin in &consumption.source_pins {
             if !own_pins.insert(*pin) {
                 bail!(
-                    "planned collection {} repeats legacy pin {:X}",
-                    collection.name,
+                    "source transform {} repeats legacy pin {:X}",
+                    consumption.name,
                     pin.id
                 );
             }
             if !source.contains(pin) {
                 bail!(
-                    "planned collection {} consumes unknown legacy pin {:X}",
-                    collection.name,
+                    "source transform {} consumes unknown legacy pin {:X}",
+                    consumption.name,
                     pin.id
                 );
             }
-            consumed.entry(*pin).or_default().insert(collection.name);
+            consumed
+                .entry(*pin)
+                .or_default()
+                .insert(consumption.name.as_str());
         }
     }
 
@@ -927,13 +1271,18 @@ mod tests {
     use std::fs::File;
 
     use ed25519_dalek::SigningKey;
+    use hifitime::Epoch;
+    use triblespace::core::authority::{
+        publish_grant, AuthorityGrant, AuthorityMode, ACTION_WRITE,
+    };
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::BlobStore;
+    use triblespace::prelude::TryToInline;
 
-    use crate::collection_cutover::test_support::{TestBranchSpec, TestSourceSpec};
+    use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
 
     fn pin(byte: u8) -> LegacyPinCoordinate {
         LegacyPinCoordinate {
@@ -942,8 +1291,8 @@ mod tests {
         }
     }
 
-    fn empty_mandatory_candidate_views() -> BTreeMap<Id, TribleSet> {
-        [
+    fn empty_mandatory_candidate_views() -> CandidateViews {
+        let faculties = [
             schemas::blockdag::DEFAULT_SCOPE_ID,
             schemas::atlas::DEFAULT_SCOPE_ID,
             schemas::body::DEFAULT_SCOPE_ID,
@@ -958,7 +1307,6 @@ mod tests {
             schemas::planner::DEFAULT_SCOPE_ID,
             schemas::posture::DEFAULT_POLICY_SCOPE_ID,
             schemas::relations::DEFAULT_SCOPE_ID,
-            secrets::schema::DEFAULT_SCOPE_ID,
             schemas::status::DEFAULT_SCOPE_ID,
             schemas::teams::DEFAULT_SCOPE_ID,
             schemas::voice::COLLECTION_SCOPE_ID,
@@ -966,38 +1314,8 @@ mod tests {
         ]
         .into_iter()
         .map(|scope| (scope, TribleSet::new()))
-        .collect()
-    }
-
-    #[test]
-    fn frozen_activation_keeps_its_exact_v1_teams_reference_invariant_local() {
-        let source_identity = teams::source_fragment("tenant.example");
-        let source = source_identity.root().unwrap();
-        let missing = Id::new([0xE6; 16]).unwrap();
-        let (profile, _) = teams::auth_profile_fragment(
-            source,
-            "client",
-            "user",
-            "offline_access",
-            None,
-            Some(missing),
-            [],
-        )
-        .unwrap();
-        let mut teams_facts = source_identity;
-        teams_facts += profile;
-
-        let error = validate_frozen_v1_teams_secret_references(
-            teams_facts.facts(),
-            &secrets::SecretsCatalog::default(),
-        )
-        .unwrap_err();
-        let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains("unknown delegated token bundle"),
-            "{rendered}"
-        );
-        assert!(rendered.contains(&format!("{missing:x}")), "{rendered}");
+        .collect();
+        CandidateViews::new(faculties, BTreeMap::new(), BTreeMap::new()).unwrap()
     }
 
     #[test]
@@ -1010,7 +1328,12 @@ mod tests {
         pile.close().unwrap();
 
         let unknown = Id::new([0xE7; 16]).unwrap();
-        let views = BTreeMap::from([(unknown, TribleSet::new())]);
+        let views = CandidateViews::new(
+            BTreeMap::from([(unknown, TribleSet::new())]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
         let error = validate_candidate_views(&reader, &views).unwrap_err();
         assert!(format!("{error:#}").contains("unrecognized planned collection scope"));
     }
@@ -1024,12 +1347,12 @@ mod tests {
         let reader = pile.reader().unwrap();
         pile.close().unwrap();
 
-        let error = validate_candidate_views(&reader, &BTreeMap::new()).unwrap_err();
+        let error = validate_candidate_views(&reader, &CandidateViews::default()).unwrap_err();
         assert!(format!("{error:#}").contains("no planned Archive collection"));
     }
 
     #[test]
-    fn candidate_validation_rejects_missing_exact_headspace_secret_version() {
+    fn candidate_validation_rejects_globally_present_but_nonlocal_secret_references() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("candidate.pile");
         File::create(&path).unwrap();
@@ -1037,43 +1360,168 @@ mod tests {
         let signer = SigningKey::from_bytes(&[0xE8; 32]);
         faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
 
-        let anchor = Id::new([0xE9; 16]).unwrap();
-        let missing_secret = Id::new([0xEA; 16]).unwrap();
-        let mut profile = headspace::default_profile(anchor, "missing-secret");
-        profile.model_secret_version = Some(missing_secret);
-        let (fragment, _, _) =
-            headspace::add_profile_fragment(&profile, &headspace::default_config(anchor), &[])
-                .unwrap();
-        let headspace_facts = fragment.facts().clone();
-        faculties::collection_names::open(&mut pile, schemas::headspace::DEFAULT_SCOPE_ID, signer)
-            .commit(fragment)
+        let team = signer.verifying_key();
+        let vault = Id::new([0xE9; 16]).unwrap();
+        let outsider = SigningKey::from_bytes(&[0xEA; 32]);
+        let epoch = Epoch::from_unix_seconds(1.0);
+        let created_at = (epoch, epoch).try_to_inline().unwrap();
+        let sealed = v2::seal_version(
+            "globally-visible",
+            b"not locally readable",
+            &BTreeSet::from([outsider.verifying_key().to_bytes()]),
+            created_at,
+        )
+        .unwrap();
+        let secret = sealed.secret;
+        let mut vault_fragment =
+            v2::vault_header_fragment(vault, "global-only", created_at).unwrap();
+        vault_fragment += sealed.fragment;
+        let vault_facts = vault_fragment.facts().clone();
+        let vault_handle = v2::vault_handle(vault, team);
+        publish_grant(
+            &mut pile,
+            team,
+            &signer,
+            AuthorityGrant::root(team, vault_handle, ACTION_WRITE, AuthorityMode::Invoke),
+        )
+        .unwrap();
+        v2::vault_collection(&mut pile, vault, team, signer.clone())
+            .commit(vault_fragment)
             .unwrap();
+        publish_grant(
+            &mut pile,
+            team,
+            &signer,
+            AuthorityGrant::root(
+                outsider.verifying_key(),
+                vault_handle,
+                v2::ACTION_READ,
+                AuthorityMode::Invoke,
+            ),
+        )
+        .unwrap();
+        let authority = resolve_authority(&mut pile, team).unwrap();
+        let local_readers = v2::read_authority_recipient_keys(&authority, vault_handle);
+        assert!(!local_readers.contains(&team.to_bytes()));
+
+        let headspace_anchor = Id::new([0xEB; 16]).unwrap();
+        let mut profile = headspace::default_profile(headspace_anchor, "global-only-secret");
+        profile.model_secret_version = Some(secret);
+        let (headspace_fragment, _, _) = headspace::add_profile_fragment(
+            &profile,
+            &headspace::default_config(headspace_anchor),
+            &[],
+        )
+        .unwrap();
+        let headspace_facts = headspace_fragment.facts().clone();
+        faculties::collection_names::open(
+            &mut pile,
+            schemas::headspace::DEFAULT_SCOPE_ID,
+            signer.clone(),
+        )
+        .commit(headspace_fragment)
+        .unwrap();
+
+        let mut teams_fragment = teams::source_fragment("tenant.example");
+        let teams_source = teams_fragment.root().unwrap();
+        let (auth_profile, _) = teams::auth_profile_fragment(
+            teams_source,
+            "client",
+            "user",
+            "offline_access",
+            None,
+            Some(secret),
+            [],
+        )
+        .unwrap();
+        teams_fragment += auth_profile;
+        let teams_facts = teams_fragment.facts().clone();
+        faculties::collection_names::open(
+            &mut pile,
+            schemas::teams::DEFAULT_SCOPE_ID,
+            signer.clone(),
+        )
+        .commit(teams_fragment)
+        .unwrap();
+
+        let (mail_fragment, _) = mail::account_config_fragment(
+            Id::new([0xEC; 16]).unwrap(),
+            mail::AccountConfigInput {
+                address: "operator@example.test".to_owned(),
+                display_name: "Operator".to_owned(),
+                pop_endpoint: "pop.example.test:995".to_owned(),
+                smtp_endpoint: "smtp.example.test:465".to_owned(),
+                username: "operator@example.test".to_owned(),
+                credential: secret,
+                enabled: true,
+                predecessors: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mail_facts = mail_fragment.facts().clone();
+        faculties::collection_names::open(
+            &mut pile,
+            schemas::mail::DEFAULT_SCOPE_ID,
+            signer.clone(),
+        )
+        .commit(mail_fragment)
+        .unwrap();
+
         let reader = pile.reader().unwrap();
         pile.close().unwrap();
 
-        let mut views = empty_mandatory_candidate_views();
-        views.insert(schemas::headspace::DEFAULT_SCOPE_ID, headspace_facts);
-        let error = validate_candidate_views(&reader, &views).unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("validate Headspace candidate exact Secrets references"));
-        assert!(message.contains("missing exact model Secrets version"));
+        let global_vaults = BTreeMap::from([(vault, vault_facts)]);
+        for (scope, facts, context, detail) in [
+            (
+                schemas::headspace::DEFAULT_SCOPE_ID,
+                headspace_facts,
+                "validate Headspace candidate exact local Secrets references",
+                "missing exact model Secrets version",
+            ),
+            (
+                schemas::teams::DEFAULT_SCOPE_ID,
+                teams_facts,
+                "validate Teams candidate exact local Secrets references",
+                "unknown delegated token bundle Secrets version",
+            ),
+            (
+                schemas::mail::DEFAULT_SCOPE_ID,
+                mail_facts,
+                "validate Mail candidate cross-collection references",
+                "names unknown Secrets version",
+            ),
+        ] {
+            let mut faculties = empty_mandatory_candidate_views().faculties;
+            faculties.insert(scope, facts);
+            let views =
+                CandidateViews::new(faculties, global_vaults.clone(), BTreeMap::new()).unwrap();
+            let error = validate_candidate_views(&reader, &views).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(context), "{message}");
+            assert!(message.contains(detail), "{message}");
+        }
     }
 
-    fn collection(
-        name: &'static str,
-        scope_byte: u8,
+    fn collection(name: &str, scope_byte: u8) -> PlannedCollection {
+        PlannedCollection {
+            name: CollectionName::new(name).unwrap(),
+            reach: reach::private(),
+            view: CandidateViewKey::Faculty(Id::new([scope_byte; 16]).unwrap()),
+            policy: TargetPolicy::Faculty,
+            fragments: Vec::new(),
+            expected_facts: TribleSet::new(),
+        }
+    }
+
+    fn consumption(
+        name: &str,
         source_pins: impl IntoIterator<Item = LegacyPinCoordinate>,
-        fragments: Vec<Fragment>,
-    ) -> PlannedCollection {
-        let expected = materialized_facts(&fragments);
-        PlannedCollection::new(
-            name,
-            Id::new([scope_byte; 16]).unwrap(),
-            source_pins,
-            fragments,
-            expected,
-        )
-        .unwrap()
+    ) -> SourceConsumption {
+        SourceConsumption {
+            name: name.to_owned(),
+            source_pins: source_pins.into_iter().collect(),
+            retired_source_facts: 0,
+        }
     }
 
     fn disposition(
@@ -1088,89 +1536,108 @@ mod tests {
     }
 
     #[test]
-    fn one_pin_may_feed_two_planned_collections() {
+    fn one_source_transform_may_emit_many_collections() {
         let shared = pin(1);
-        let plans = [
-            collection("message", 11, [shared], vec![]),
-            collection("relations", 12, [shared], vec![]),
-        ];
-        validate_source_coverage(&[shared], &plans, &[]).unwrap();
+        let targets = [collection("left", 11), collection("right", 12)];
+        let sources = [consumption("fan-out", [shared])];
+        validate_source_coverage(&[shared], &targets, &sources, &[]).unwrap();
     }
 
     #[test]
-    fn one_planned_collection_may_consume_many_pins() {
-        let left = pin(1);
-        let right = pin(2);
-        let plans = [collection("message", 11, [left, right], vec![])];
-        validate_source_coverage(&[left, right], &plans, &[]).unwrap();
-    }
-
-    #[test]
-    fn one_collection_may_not_repeat_a_source_pin() {
+    fn consumed_empty_source_needs_no_target_collection() {
         let source = pin(1);
-        let plans = [collection("duplicate", 11, [source, source], vec![])];
-        let error = validate_source_coverage(&[source], &plans, &[]).unwrap_err();
+        let sources = [consumption("zero-output", [source])];
+        validate_source_coverage(&[source], &[], &sources, &[]).unwrap();
+    }
+
+    #[test]
+    fn authored_empty_legacy_secrets_is_consumed_without_a_vault_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.pile");
+        File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[0xA4; 32]);
+        let mut pile = Pile::open(&path).unwrap();
+        faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+        pile.close().unwrap();
+
+        let source = TestSourceSpec::new(vec![TestBranchSpec::new(
+            faculties::secrets::schema::LEGACY_BRANCH_NAME,
+            Id::new([0xA4; 16]).unwrap(),
+            SigningKey::from_bytes(&[0xA5; 32]),
+            vec![TestDeltaSpec::authored(
+                Fragment::empty(),
+                "legacy authored empty Secrets",
+            )],
+        )])
+        .freeze(&path)
+        .unwrap()
+        .source;
+        let legacy = secrets_cutover::plan(&source).unwrap();
+        assert!(legacy.retained_facts().is_empty());
+        assert_eq!(legacy.report().source_facts, 0);
+
+        let mut frozen_collections = source.collection_store();
+        let direct = secrets_v2_cutover::plan_from_legacy_in_store(
+            &mut frozen_collections,
+            &signer,
+            source.reader(),
+            legacy.retained_facts().clone(),
+            None,
+        )
+        .unwrap();
+        assert!(direct.vaults().is_empty());
+
+        let activation = ActivationPlan {
+            team: signer.verifying_key().to_bytes(),
+            collections: Vec::new(),
+            consumptions: vec![SourceConsumption {
+                name: "secrets-vaults".to_owned(),
+                source_pins: vec![legacy.source_pin()],
+                retired_source_facts: legacy.report().retired_facts,
+            }],
+            dispositions: Vec::new(),
+        };
+        activation.verify_source_coverage(&source).unwrap();
+    }
+
+    #[test]
+    fn one_source_transform_may_not_repeat_a_pin() {
+        let source = pin(1);
+        let sources = [consumption("duplicate", [source, source])];
+        let error = validate_source_coverage(&[source], &[], &sources, &[]).unwrap_err();
         assert!(format!("{error:#}").contains("repeats legacy pin"));
     }
 
     #[test]
-    fn collection_names_and_scopes_are_unique() {
-        let left = pin(1);
-        let right = pin(2);
-        let duplicate_name = [
-            collection("same", 11, [left], vec![]),
-            collection("same", 12, [right], vec![]),
-        ];
-        let error = validate_source_coverage(&[left, right], &duplicate_name, &[]).unwrap_err();
-        assert!(format!("{error:#}").contains("repeats collection name"));
-
-        let duplicate_scope = [
-            collection("left", 11, [left], vec![]),
-            collection("right", 11, [right], vec![]),
-        ];
-        let error = validate_source_coverage(&[left, right], &duplicate_scope, &[]).unwrap_err();
-        assert!(format!("{error:#}").contains("repeats target collection scope"));
-    }
-
-    #[test]
-    fn an_empty_plan_still_consumes_its_source_pin() {
+    fn duplicate_semantic_target_view_is_rejected() {
         let source = pin(1);
-        let plans = [collection("empty", 11, [source], vec![])];
-        assert!(plans[0].fragments().is_empty());
-        assert!(plans[0].expected_facts().is_empty());
-        validate_source_coverage(&[source], &plans, &[]).unwrap();
-    }
-
-    #[test]
-    fn unknown_planned_pin_is_rejected() {
-        let source = pin(1);
-        let unknown = pin(2);
-        let plans = [collection("unknown", 11, [unknown], vec![])];
-        let error = validate_source_coverage(&[source], &plans, &[]).unwrap_err();
-        assert!(format!("{error:#}").contains("consumes unknown legacy pin"));
+        let targets = [collection("left", 11), collection("right", 11)];
+        let sources = [consumption("source", [source])];
+        let error = validate_source_coverage(&[source], &targets, &sources, &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("repeats semantic collection view"));
     }
 
     #[test]
     fn duplicate_disposition_is_rejected() {
         let source = pin(1);
         let dispositions = [disposition("first", source), disposition("second", source)];
-        let error = validate_source_coverage(&[source], &[], &dispositions).unwrap_err();
+        let error = validate_source_coverage(&[source], &[], &[], &dispositions).unwrap_err();
         assert!(format!("{error:#}").contains("duplicate source dispositions"));
     }
 
     #[test]
     fn consumed_and_disposed_overlap_is_rejected() {
         let source = pin(1);
-        let plans = [collection("collection", 11, [source], vec![])];
+        let sources = [consumption("collection", [source])];
         let dispositions = [disposition("disposed", source)];
-        let error = validate_source_coverage(&[source], &plans, &dispositions).unwrap_err();
+        let error = validate_source_coverage(&[source], &[], &sources, &dispositions).unwrap_err();
         assert!(format!("{error:#}").contains("both consumed"));
     }
 
     #[test]
     fn uncovered_source_pin_is_rejected() {
         let source = pin(1);
-        let error = validate_source_coverage(&[source], &[], &[]).unwrap_err();
+        let error = validate_source_coverage(&[source], &[], &[], &[]).unwrap_err();
         assert!(format!("{error:#}").contains("neither consumed nor disposed"));
     }
 
@@ -1178,7 +1645,7 @@ mod tests {
     fn unknown_disposition_pin_is_rejected() {
         let source = pin(1);
         let dispositions = [disposition("unknown", pin(2))];
-        let error = validate_source_coverage(&[source], &[], &dispositions).unwrap_err();
+        let error = validate_source_coverage(&[source], &[], &[], &dispositions).unwrap_err();
         assert!(format!("{error:#}").contains("names unknown legacy pin"));
     }
 
