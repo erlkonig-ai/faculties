@@ -33,8 +33,11 @@ use triblespace::core::collection::{
     DiscoveredCollectionRecords,
 };
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
+use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::prelude::{Collection, CollectionName};
 
@@ -126,6 +129,369 @@ impl<'a> Publication<'a> {
             facts: plan.expected_facts(),
         }
     }
+}
+
+/// Read-only state of one deterministic cutover publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePublicationStatus {
+    /// None of the planned target COMMITs is present.
+    Missing,
+    /// Some exact evidence is present, but publication or authority is incomplete.
+    Partial,
+    /// Every planned record and dependency is present under the exact authority policy.
+    Complete,
+}
+
+impl NativePublicationStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Partial => "partial",
+            Self::Complete => "already complete",
+        }
+    }
+}
+
+/// Exact subset check for one target collection in an activation plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionPublicationPresence {
+    status: NativePublicationStatus,
+    planned_commits: usize,
+    present_commits: usize,
+    required_dependencies: usize,
+    resident_dependencies: usize,
+    required_authority_grants: usize,
+    accepted_authority_grants: usize,
+    required_authority_dependencies: usize,
+    resident_authority_dependencies: usize,
+    authority_policy_matches: bool,
+}
+
+impl CollectionPublicationPresence {
+    pub const fn status(&self) -> NativePublicationStatus {
+        self.status
+    }
+
+    pub const fn planned_commits(&self) -> usize {
+        self.planned_commits
+    }
+
+    pub const fn present_commits(&self) -> usize {
+        self.present_commits
+    }
+
+    pub const fn required_dependencies(&self) -> usize {
+        self.required_dependencies
+    }
+
+    pub const fn resident_dependencies(&self) -> usize {
+        self.resident_dependencies
+    }
+
+    pub const fn required_authority_grants(&self) -> usize {
+        self.required_authority_grants
+    }
+
+    pub const fn accepted_authority_grants(&self) -> usize {
+        self.accepted_authority_grants
+    }
+
+    pub const fn required_authority_dependencies(&self) -> usize {
+        self.required_authority_dependencies
+    }
+
+    pub const fn resident_authority_dependencies(&self) -> usize {
+        self.resident_authority_dependencies
+    }
+
+    pub const fn authority_policy_matches(&self) -> bool {
+        self.authority_policy_matches
+    }
+}
+
+/// Exact native-publication presence for one frozen activation plan.
+///
+/// `Complete` means deterministic replay has no planned collection bytes to
+/// add. It deliberately does not re-run the aggregate faculty semantic
+/// validator; `activate-cutover` remains the authoritative validation command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CutoverPublicationPresence {
+    status: NativePublicationStatus,
+    fixed_authority_grants: usize,
+    accepted_fixed_authority_grants: usize,
+    fixed_authority_dependencies: usize,
+    resident_fixed_authority_dependencies: usize,
+    collections: Vec<CollectionPublicationPresence>,
+}
+
+impl CutoverPublicationPresence {
+    pub const fn status(&self) -> NativePublicationStatus {
+        self.status
+    }
+
+    pub const fn fixed_authority_grants(&self) -> usize {
+        self.fixed_authority_grants
+    }
+
+    pub const fn accepted_fixed_authority_grants(&self) -> usize {
+        self.accepted_fixed_authority_grants
+    }
+
+    pub const fn fixed_authority_dependencies(&self) -> usize {
+        self.fixed_authority_dependencies
+    }
+
+    pub const fn resident_fixed_authority_dependencies(&self) -> usize {
+        self.resident_fixed_authority_dependencies
+    }
+
+    pub fn collections(&self) -> &[CollectionPublicationPresence] {
+        &self.collections
+    }
+}
+
+#[derive(Default)]
+struct ExpectedPublication {
+    commits: BTreeMap<Id, CollectionCommit>,
+    dependencies: BTreeSet<[u8; 32]>,
+}
+
+#[derive(Default)]
+struct ExpectedAuthority {
+    grants: BTreeMap<Id, (CollectionCommit, AuthorityGrant)>,
+    dependencies: BTreeSet<[u8; 32]>,
+}
+
+fn scratch_dependencies(scratch: &mut MemoryRepo) -> BTreeSet<[u8; 32]> {
+    scratch
+        .reader()
+        .expect("memory repository reader is infallible")
+        .iter()
+        .map(|(handle, _)| handle.raw)
+        .collect()
+}
+
+fn expected_publication(
+    publication: &Publication<'_>,
+    signer: &SigningKey,
+) -> Result<ExpectedPublication> {
+    let descriptor = simplearchive_union::descriptor(
+        publication.name,
+        signer.verifying_key(),
+        publication.reach.clone(),
+    );
+    let mut commits = BTreeMap::new();
+    let mut dependencies = BTreeSet::new();
+    for fragment in publication.fragments {
+        // Bound scratch memory to one fragment. Large migrations can carry
+        // thousands of independent authored leaves, and only their identities
+        // and dependency handles are needed after preparation.
+        let mut scratch = MemoryRepo::default();
+        let commit = simplearchive_union::publish_fragment_commit(
+            &mut scratch,
+            &descriptor,
+            fragment.clone(),
+            signer,
+        )
+        .map_err(|error| anyhow!("prepare {} COMMIT: {error}", publication.name.as_str()))?;
+        commits.insert(commit.id(), commit);
+        dependencies.extend(scratch_dependencies(&mut scratch));
+    }
+    Ok(ExpectedPublication {
+        commits,
+        dependencies,
+    })
+}
+
+fn expected_authority(
+    publication: &Publication<'_>,
+    signer: &SigningKey,
+) -> Result<ExpectedAuthority> {
+    let mut scratch = MemoryRepo::default();
+    let mut grants = BTreeMap::new();
+    for grant in planned_grants(publication, signer)? {
+        let commit = publish_grant(&mut scratch, signer.verifying_key(), signer, grant)
+            .map_err(|error| anyhow!("prepare {} authority: {error}", publication.name.as_str()))?;
+        grants.insert(commit.id(), (commit, grant));
+    }
+    let dependencies = scratch_dependencies(&mut scratch);
+    Ok(ExpectedAuthority {
+        grants,
+        dependencies,
+    })
+}
+
+fn commit_dependencies(commit: CollectionCommit) -> [[u8; 32]; 3] {
+    [
+        commit.collection().raw,
+        commit.data().raw,
+        commit.metadata().raw,
+    ]
+}
+
+fn resident_dependencies(reader: &PileReader, dependencies: &BTreeSet<[u8; 32]>) -> Result<usize> {
+    dependencies.iter().try_fold(0, |present, raw| {
+        let handle = Inline::<Handle<UnknownBlob>>::new(*raw);
+        let resident = reader
+            .metadata(handle)
+            .context("inspect planned cutover dependency")?
+            .is_some();
+        Ok(present + usize::from(resident))
+    })
+}
+
+/// Inspect exact deterministic cutover publication against its frozen source.
+///
+/// This performs no writes, creates no candidate, and ignores unrelated later
+/// collection history. A complete result proves only that the planned records,
+/// dependencies, and authority policy are already represented in this frozen
+/// prefix; aggregate semantic validation still belongs to [`activate`].
+pub fn inspect_publication(
+    source: &FrozenSource,
+    signer: &SigningKey,
+    plan: &ActivationPlan,
+) -> Result<CutoverPublicationPresence> {
+    if plan.team() != signer.verifying_key().to_bytes() {
+        bail!("activation plan belongs to a different durable team root");
+    }
+    plan.verify_source_coverage(source)?;
+    let publications = plan
+        .collections()
+        .iter()
+        .map(|plan| Publication::new(plan, signer.verifying_key()))
+        .collect::<Vec<_>>();
+    validate_plan(signer, &publications)?;
+    inspect_publications(source, signer, &publications)
+}
+
+fn inspect_publications(
+    source: &FrozenSource,
+    signer: &SigningKey,
+    publications: &[Publication<'_>],
+) -> Result<CutoverPublicationPresence> {
+    let mut store = source.collection_store();
+    let records = discover_collection_records(&mut store)
+        .context("discover frozen native collection records")?;
+    let observed_commits = commit_map(records.commits());
+    let authority = resolve_authority(&mut store, signer.verifying_key())
+        .map_err(|error| anyhow!("resolve frozen native authority: {error}"))?;
+    let fixed = faculties::storage::plan_team_of_one_write_authority(&mut store, signer)
+        .context("inspect fixed faculty WRITE authority")?;
+
+    let mut fixed_dependencies = BTreeSet::new();
+    let mut fixed_by_resource = BTreeMap::new();
+    for row in fixed.rows() {
+        fixed_dependencies.extend(commit_dependencies(row.commit()));
+        fixed_by_resource.insert(row.resource(), (row.commit(), row.accepted()));
+    }
+    let resident_fixed_dependencies = resident_dependencies(source.reader(), &fixed_dependencies)?;
+
+    let mut collections = Vec::with_capacity(publications.len());
+    for publication in publications {
+        let expected = expected_publication(publication, signer)?;
+        let present_commits = expected
+            .commits
+            .iter()
+            .filter(|(id, commit)| observed_commits.get(*id) == Some(*commit))
+            .count();
+        let resident = resident_dependencies(source.reader(), &expected.dependencies)?;
+
+        let (required_grants, accepted_grants, authority_dependencies, policy_matches) =
+            match publication.policy {
+                TargetPolicy::Faculty => {
+                    let Some((commit, accepted)) = fixed_by_resource.get(&publication.handle)
+                    else {
+                        bail!(
+                            "planned faculty collection {} is absent from the fixed WRITE manifest",
+                            publication.name.as_str()
+                        );
+                    };
+                    let dependencies = commit_dependencies(*commit).into_iter().collect();
+                    (1, usize::from(*accepted), dependencies, true)
+                }
+                TargetPolicy::Vault { readers } => {
+                    let expected_authority = expected_authority(publication, signer)?;
+                    let accepted = expected_authority
+                        .grants
+                        .values()
+                        .filter(|(commit, grant)| {
+                            authority.grant(commit.id()).is_some_and(|actual| {
+                                actual.commit() == *commit && actual.grant() == *grant
+                            })
+                        })
+                        .count();
+                    let actual_readers = faculties::secrets::read_authority_recipient_keys(
+                        &authority,
+                        publication.handle,
+                    );
+                    (
+                        expected_authority.grants.len(),
+                        accepted,
+                        expected_authority.dependencies,
+                        actual_readers == *readers,
+                    )
+                }
+            };
+        let resident_authority = resident_dependencies(source.reader(), &authority_dependencies)?;
+
+        let complete = present_commits == expected.commits.len()
+            && resident == expected.dependencies.len()
+            && accepted_grants == required_grants
+            && resident_authority == authority_dependencies.len()
+            && policy_matches;
+        let status = if complete {
+            NativePublicationStatus::Complete
+        } else if expected.commits.is_empty() || present_commits > 0 {
+            NativePublicationStatus::Partial
+        } else {
+            NativePublicationStatus::Missing
+        };
+        collections.push(CollectionPublicationPresence {
+            status,
+            planned_commits: expected.commits.len(),
+            present_commits,
+            required_dependencies: expected.dependencies.len(),
+            resident_dependencies: resident,
+            required_authority_grants: required_grants,
+            accepted_authority_grants: accepted_grants,
+            required_authority_dependencies: authority_dependencies.len(),
+            resident_authority_dependencies: resident_authority,
+            authority_policy_matches: policy_matches,
+        });
+    }
+
+    let fixed_complete = fixed.accepted() == fixed.rows().len()
+        && resident_fixed_dependencies == fixed_dependencies.len();
+    let all_complete = fixed_complete
+        && collections
+            .iter()
+            .all(|collection| collection.status == NativePublicationStatus::Complete);
+    let planned_commits = collections
+        .iter()
+        .map(CollectionPublicationPresence::planned_commits)
+        .sum::<usize>();
+    let present_commits = collections
+        .iter()
+        .map(CollectionPublicationPresence::present_commits)
+        .sum::<usize>();
+    let status = if all_complete {
+        NativePublicationStatus::Complete
+    } else if (planned_commits > 0 && present_commits == 0)
+        || (planned_commits == 0 && fixed.accepted() == 0)
+    {
+        NativePublicationStatus::Missing
+    } else {
+        NativePublicationStatus::Partial
+    };
+
+    Ok(CutoverPublicationPresence {
+        status,
+        fixed_authority_grants: fixed.rows().len(),
+        accepted_fixed_authority_grants: fixed.accepted(),
+        fixed_authority_dependencies: fixed_dependencies.len(),
+        resident_fixed_authority_dependencies: resident_fixed_dependencies,
+        collections,
+    })
 }
 
 #[derive(Clone)]
@@ -853,6 +1219,13 @@ mod tests {
     }
 
     fn publications<'a>(fragment: &'a Fragment, signer: &SigningKey) -> Vec<Publication<'a>> {
+        publications_many(std::slice::from_ref(fragment), signer)
+    }
+
+    fn publications_many<'a>(
+        fragments: &'a [Fragment],
+        signer: &SigningKey,
+    ) -> Vec<Publication<'a>> {
         let name = Box::leak(Box::new(faculties::collection_names::require_name(SCOPE)));
         let reach = Box::leak(Box::new(faculties::collection_names::require_reach(SCOPE)));
         let handle = simplearchive_union::descriptor(name, signer.verifying_key(), reach.clone())
@@ -860,14 +1233,21 @@ mod tests {
             .clone()
             .to_blob()
             .get_handle();
+        let facts = Box::leak(Box::new(fragments.iter().fold(
+            TribleSet::new(),
+            |mut all, fragment| {
+                all += fragment.facts().clone();
+                all
+            },
+        )));
         vec![Publication {
             handle,
             name,
             reach,
             view: CandidateViewKey::Faculty(SCOPE),
             policy: &TargetPolicy::Faculty,
-            fragments: std::slice::from_ref(fragment),
-            facts: fragment.facts(),
+            fragments,
+            facts,
         }]
     }
 
@@ -1406,6 +1786,10 @@ mod tests {
             BTreeSet::from([fixture.signer.verifying_key().to_bytes()]),
             Vec::new(),
         );
+        let presence =
+            inspect_publications(&frozen, &fixture.signer, &[publication.publication()]).unwrap();
+        assert_eq!(presence.status(), NativePublicationStatus::Partial);
+        assert!(!presence.collections()[0].authority_policy_matches());
         let error = activate_publications(
             &fixture.live,
             &fixture.target(),
@@ -1533,6 +1917,120 @@ mod tests {
         assert!(!fixture.candidate.exists());
         #[cfg(unix)]
         assert_eq!(fs::metadata(&fixture.live).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn publication_presence_distinguishes_missing_partial_and_complete_with_later_history() {
+        let fixture = Fixture::new();
+        let first = text_fragment(0x81, "first planned publication");
+        let second = text_fragment(0x82, "second planned publication");
+        let planned = [first.clone(), second.clone()];
+        let publications = publications_many(&planned, &fixture.signer);
+
+        let frozen = freeze_source(&fixture.live).unwrap();
+        let missing = inspect_publications(&frozen, &fixture.signer, &publications).unwrap();
+        assert_eq!(missing.status(), NativePublicationStatus::Missing);
+        assert_eq!(
+            missing.collections()[0].status(),
+            NativePublicationStatus::Missing
+        );
+        assert_eq!(missing.collections()[0].present_commits(), 0);
+        assert_eq!(missing.collections()[0].planned_commits(), 2);
+
+        fixture.publish(first);
+        fixture.publish(text_fragment(0x83, "unrelated later history"));
+        let frozen = freeze_source(&fixture.live).unwrap();
+        let partial = inspect_publications(&frozen, &fixture.signer, &publications).unwrap();
+        assert_eq!(partial.status(), NativePublicationStatus::Partial);
+        assert_eq!(
+            partial.collections()[0].status(),
+            NativePublicationStatus::Partial
+        );
+        assert_eq!(partial.collections()[0].present_commits(), 1);
+
+        fixture.publish(second);
+        let frozen = freeze_source(&fixture.live).unwrap();
+        let complete = inspect_publications(&frozen, &fixture.signer, &publications).unwrap();
+        assert_eq!(complete.status(), NativePublicationStatus::Complete);
+        assert_eq!(
+            complete.collections()[0].status(),
+            NativePublicationStatus::Complete
+        );
+        assert_eq!(complete.collections()[0].present_commits(), 2);
+
+        let before = fs::read(&fixture.live).unwrap();
+        let outcome = activate_publications(
+            &fixture.live,
+            &fixture.target(),
+            &fixture.candidate,
+            &frozen,
+            &fixture.signer,
+            &publications,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(outcome, ActivationOutcome::AlreadyActive);
+        assert_eq!(fs::read(&fixture.live).unwrap(), before);
+    }
+
+    #[test]
+    fn publication_presence_distinguishes_no_output_from_an_authored_empty_commit() {
+        let fixture = Fixture::new();
+        let no_fragments: [Fragment; 0] = [];
+        let no_publication = publications_many(&no_fragments, &fixture.signer);
+        let frozen = freeze_source(&fixture.live).unwrap();
+        assert!(frozen
+            .reader()
+            .metadata(no_publication[0].handle)
+            .unwrap()
+            .is_none());
+        let empty_target = inspect_publications(&frozen, &fixture.signer, &no_publication).unwrap();
+        assert_eq!(empty_target.status(), NativePublicationStatus::Complete);
+        assert_eq!(
+            empty_target.collections()[0].status(),
+            NativePublicationStatus::Complete
+        );
+        assert_eq!(empty_target.collections()[0].planned_commits(), 0);
+        assert_eq!(empty_target.collections()[0].required_dependencies(), 0);
+
+        let authored_empty = Fragment::empty();
+        let authored = publications(&authored_empty, &fixture.signer);
+        let missing = inspect_publications(&frozen, &fixture.signer, &authored).unwrap();
+        assert_eq!(missing.status(), NativePublicationStatus::Missing);
+        assert_eq!(missing.collections()[0].planned_commits(), 1);
+
+        fixture.publish(authored_empty.clone());
+        let frozen = freeze_source(&fixture.live).unwrap();
+        let present = inspect_publications(&frozen, &fixture.signer, &authored).unwrap();
+        assert_eq!(present.status(), NativePublicationStatus::Complete);
+        assert_eq!(present.collections()[0].present_commits(), 1);
+    }
+
+    #[test]
+    fn publication_presence_requires_the_planned_commit_blob_closure() {
+        use triblespace::core::collection::{CollectionRecord, CollectionStore};
+
+        let fixture = Fixture::new();
+        let fragment = text_fragment(0x84, "record without its closure");
+        let publications = publications(&fragment, &fixture.signer);
+        let expected = expected_publication(&publications[0], &fixture.signer).unwrap();
+        let commit = *expected
+            .commits
+            .values()
+            .next()
+            .expect("one planned fragment produces one COMMIT");
+        let mut pile = open_pile_strict(&fixture.live).unwrap();
+        pile.insert(CollectionRecord::Commit(commit)).unwrap();
+        pile.close().unwrap();
+
+        let frozen = freeze_source(&fixture.live).unwrap();
+        let presence = inspect_publications(&frozen, &fixture.signer, &publications).unwrap();
+        assert_eq!(presence.status(), NativePublicationStatus::Partial);
+        assert_eq!(presence.collections()[0].present_commits(), 1);
+        assert!(
+            presence.collections()[0].resident_dependencies()
+                < presence.collections()[0].required_dependencies()
+        );
     }
 
     #[test]

@@ -575,6 +575,8 @@ fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
     let source = collection_cutover::freeze_source(pile)
         .with_context(|| format!("freeze cutover source {}", pile.display()))?;
     let plan = activation_plan(&source, &signer).context("plan aggregate collection cutover")?;
+    let presence = disposable_cutover::inspect_publication(&source, &signer, &plan)
+        .context("inspect native cutover publication")?;
 
     let semantic = source.fingerprint();
     let physical = source.physical_fingerprint();
@@ -584,10 +586,18 @@ fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
     println!("source hash  : blake3:{}", hex::encode(physical.digest));
     println!("legacy pins  : {}", semantic.pin_count);
     println!("pin digest   : blake3:{}", hex::encode(semantic.digest));
+    println!("publication  : {}", presence.status().label());
+    println!(
+        "fixed WRITE  : {}/{} exact grant(s), {}/{} dependency blob(s)",
+        presence.accepted_fixed_authority_grants(),
+        presence.fixed_authority_grants(),
+        presence.resident_fixed_authority_dependencies(),
+        presence.fixed_authority_dependencies(),
+    );
     println!();
 
     println!("Collections:");
-    for collection in plan.collections() {
+    for (collection, publication) in plan.collections().iter().zip(presence.collections()) {
         let view = match collection.view() {
             activation_cutover::CandidateViewKey::Faculty(scope) => {
                 format!("faculty {scope:X}")
@@ -595,13 +605,39 @@ fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
             activation_cutover::CandidateViewKey::Vault(vault) => format!("vault {vault:X}"),
         };
         println!(
-            "- {} | {} | {} commit fragment(s) | {} fact(s) | {:?}",
+            "- {} | {} | {} | {}/{} exact COMMIT(s) | {}/{} dependency blob(s) | {}/{} authority grant(s), {}/{} blob(s){} | {} fact(s) | {:?}",
             collection.name().as_str(),
             view,
-            collection.fragments().len(),
+            publication.status().label(),
+            publication.present_commits(),
+            publication.planned_commits(),
+            publication.resident_dependencies(),
+            publication.required_dependencies(),
+            publication.accepted_authority_grants(),
+            publication.required_authority_grants(),
+            publication.resident_authority_dependencies(),
+            publication.required_authority_dependencies(),
+            if publication.authority_policy_matches() {
+                ""
+            } else {
+                ", READ POLICY MISMATCH"
+            },
             collection.expected_facts().len(),
             collection.policy(),
         );
+    }
+
+    println!();
+    match presence.status() {
+        disposable_cutover::NativePublicationStatus::Complete => println!(
+            "All exact planned native publications are already complete. `activate-cutover` would add no planned collection bytes; it remains the authoritative aggregate semantic validation."
+        ),
+        disposable_cutover::NativePublicationStatus::Partial => println!(
+            "Native publication is partial. `activate-cutover` is the authoritative check for whether the deterministic remainder can be completed and validated."
+        ),
+        disposable_cutover::NativePublicationStatus::Missing => println!(
+            "Native publication is missing. `activate-cutover` would publish and validate the deterministic plan."
+        ),
     }
 
     println!();

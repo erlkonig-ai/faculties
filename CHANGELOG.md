@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **`migrations plan-cutover` now recognizes an already-published native
+  cutover.** Planning still derives the legacy projection from one frozen pile
+  prefix, then deterministically replays each planned commit and authority
+  grant in bounded scratch storage and compares their exact records and blob
+  closure with that same snapshot. The report distinguishes missing, partial,
+  and already-complete publication per collection, ignores unrelated later
+  commits, treats an authored empty fragment as a real commit, and flags vault
+  reader-policy drift. This keeps the read-only planner useful after a cutover
+  without mistaking a completed live pile for work that should be activated a
+  second time; `activate-cutover` remains the authoritative aggregate semantic
+  validator. The fixed WRITE bootstrap now also replays an already-accepted
+  grant when its descriptor or metadata blob is absent, so “ensure” repairs
+  the same complete dependency closure that planning verifies.
+
 - **`converse` — a half-duplex talk-loop bridge.** Three seams that already
   existed are now joined into one spoken loop: a listener appends utterances
   to a jsonl log, `converse run` tails it, takes one brain turn per utterance,

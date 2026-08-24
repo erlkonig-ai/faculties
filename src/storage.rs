@@ -38,9 +38,10 @@ use triblespace::core::collection::{
     CollectionRecordDiagnostic, CollectionStore,
 };
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
-use triblespace::core::repo::pile::{Pile, ReadError};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::pile::{Pile, PileReader, ReadError};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 
@@ -353,7 +354,10 @@ struct FacultyRootObservation {
 /// `collection_names::table`; this pass exists only to count already-used
 /// targets, report ignored roots, and reject the common wrong-`--key` failure
 /// before it grants an otherwise empty parallel team.
-fn observe_faculty_roots(pile: &mut Pile, team: VerifyingKey) -> Result<FacultyRootObservation> {
+fn observe_faculty_roots<S>(pile: &mut S, team: VerifyingKey) -> Result<FacultyRootObservation>
+where
+    S: BlobStore + CollectionStore,
+{
     let records =
         discover_collection_records(pile).context("discover roots before WRITE bootstrap")?;
     let mut observed = FacultyRootObservation::default();
@@ -459,10 +463,13 @@ fn expected_team_of_one_write_grants(
 /// The pile is read only. Existing collection records influence reporting and
 /// the wrong-key guard, never the grant set. In particular, pre-naming,
 /// unknown, and foreign-team descriptors remain outside authority.
-pub fn plan_team_of_one_write_authority(
-    pile: &mut Pile,
+pub fn plan_team_of_one_write_authority<S>(
+    pile: &mut S,
     signer: &SigningKey,
-) -> Result<TeamOfOneWriteAuthorityReport> {
+) -> Result<TeamOfOneWriteAuthorityReport>
+where
+    S: BlobStore + CollectionStore,
+{
     let team = signer.verifying_key();
     let observed = observe_faculty_roots(pile, team)?;
     let resolution = resolve_authority(pile, team)
@@ -517,9 +524,18 @@ pub fn ensure_team_of_one_write_authority(
         .filter(|row| !row.accepted)
         .map(|row| row.commit.id())
         .collect::<BTreeSet<_>>();
+    let reader = pile
+        .reader()
+        .context("inspect fixed WRITE grant dependency closure")?;
+    let incomplete = expected
+        .iter()
+        .filter_map(|(_, _, _, _, commit)| {
+            (!commit_dependencies_resident(&reader, *commit)).then_some(commit.id())
+        })
+        .collect::<BTreeSet<_>>();
     let mut published = Vec::new();
     for (_, name, _, grant, expected_commit) in expected {
-        if !missing.contains(&expected_commit.id()) {
+        if !missing.contains(&expected_commit.id()) && !incomplete.contains(&expected_commit.id()) {
             continue;
         }
         let commit = publish_grant(pile, team, signer, grant)
@@ -527,7 +543,9 @@ pub fn ensure_team_of_one_write_authority(
         if commit != expected_commit {
             anyhow::bail!("{name} WRITE grant changed identity between planning and publication");
         }
-        published.push(commit.id());
+        if missing.contains(&commit.id()) {
+            published.push(commit.id());
+        }
     }
 
     let mut after = plan_team_of_one_write_authority(pile, signer)?;
@@ -538,8 +556,37 @@ pub fn ensure_team_of_one_write_authority(
             after.rows.len()
         );
     }
+    let reader = pile
+        .reader()
+        .context("verify fixed WRITE grant dependency closure")?;
+    let incomplete = after
+        .rows
+        .iter()
+        .filter(|row| !commit_dependencies_resident(&reader, row.commit))
+        .count();
+    if incomplete != 0 {
+        anyhow::bail!(
+            "WRITE authority publication left {incomplete} of {} configured grant dependency closures incomplete",
+            after.rows.len()
+        );
+    }
     after.published = published;
     Ok(after)
+}
+
+fn commit_dependencies_resident(reader: &PileReader, commit: CollectionCommit) -> bool {
+    reader
+        .metadata(commit.collection())
+        .expect("pile metadata lookup is infallible")
+        .is_some()
+        && reader
+            .metadata(Handle::<SimpleArchive>::from_hash(commit.data()))
+            .expect("pile metadata lookup is infallible")
+            .is_some()
+        && reader
+            .metadata(commit.metadata())
+            .expect("pile metadata lookup is infallible")
+            .is_some()
 }
 
 /// Publish one complete fragment into one scoped native collection.
@@ -654,7 +701,7 @@ mod tests {
     use triblespace::core::inline::Inline;
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet};
+    use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
     use triblespace::core::trible::TribleSet;
     use triblespace::macros::entity;
 
@@ -927,6 +974,44 @@ mod tests {
         assert!(replay.published().is_empty());
         assert_eq!(replay.rows(), first.rows());
         assert_eq!(fs::read(&files.pile).unwrap(), after_first);
+    }
+
+    #[test]
+    fn write_authority_repairs_an_accepted_grants_missing_blob_closure() {
+        let files = TestFiles::new();
+        let signer = initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let (_, _, _, grant, commit) = expected_team_of_one_write_grants(&signer)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the fixed WRITE manifest is nonempty");
+        let data: Blob<SimpleArchive> = grant.fragment().into_facts().to_blob();
+        assert_eq!(
+            Handle::<SimpleArchive>::to_hash(data.get_handle()),
+            commit.data()
+        );
+
+        let mut pile = open_pile_strict(&files.pile).unwrap();
+        pile.put::<SimpleArchive, _>(data).unwrap();
+        pile.insert(CollectionRecord::Commit(commit)).unwrap();
+
+        let before = plan_team_of_one_write_authority(&mut pile, &signer).unwrap();
+        assert!(before
+            .rows()
+            .iter()
+            .find(|row| row.commit() == commit)
+            .expect("the sparse grant belongs to the fixed manifest")
+            .accepted());
+        let reader = pile.reader().unwrap();
+        assert!(reader.metadata(commit.collection()).unwrap().is_none());
+        assert!(reader.metadata(commit.metadata()).unwrap().is_none());
+
+        let repaired = ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+        assert!(!repaired.published().contains(&commit.id()));
+        let reader = pile.reader().unwrap();
+        assert!(reader.metadata(commit.collection()).unwrap().is_some());
+        assert!(reader.metadata(commit.metadata()).unwrap().is_some());
+        pile.close().unwrap();
     }
 
     #[test]
