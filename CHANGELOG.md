@@ -15,23 +15,22 @@ All notable changes to this project will be documented in this file.
 
 - **`migrations plan-cutover` now recognizes an already-published native
   cutover.** Planning still derives the legacy projection from one frozen pile
-  prefix, then deterministically replays each planned commit and authority
-  grant in bounded scratch storage and compares their exact records and blob
-  closure with that same snapshot. The report distinguishes missing, partial,
-  and already-complete publication per collection, ignores unrelated later
-  commits, treats an authored empty fragment as a real commit, and flags vault
-  reader-policy drift. This keeps the read-only planner useful after a cutover
-  without mistaking a completed live pile for work that should be activated a
-  second time; `activate-cutover` remains the authoritative aggregate semantic
-  validator. The fixed WRITE bootstrap now also replays an already-accepted
-  grant when its descriptor or metadata blob is absent, so “ensure” repairs
-  the same complete dependency closure that planning verifies. Aggregate
-  planning now also rejects a durable key that would open a parallel empty
-  team epoch before running any faculty transform. If one valid historical
-  Secrets scope carries repeated creation observations, direct vault
-  activation now projects their earliest point as the immutable vault genesis;
-  intrinsic scope identity was `(creator, name)`, and the preserved legacy
-  prefix retains the complete observation set.
+  prefix, then deterministically replays each planned collection commit and
+  Secrets access-envelope publication in bounded scratch storage and compares
+  their exact records and blob closure with that same snapshot. The report
+  distinguishes missing, partial, and already-complete publication per
+  collection, ignores unrelated later commits, treats an authored empty
+  fragment as a real commit, and flags vault custody or access drift. This
+  keeps the read-only planner useful after a cutover without mistaking a
+  completed live pile for work that should be activated a second time;
+  `activate-cutover` remains the aggregate semantic validator. If one valid
+  historical Secrets scope carries repeated creation observations, direct
+  vault activation projects their earliest point as the immutable vault
+  genesis; intrinsic scope identity was `(creator, name)`, and the preserved
+  legacy prefix retains the complete observation set. Direct-recipient vaults
+  created after that catalog generation are inventoried from the durable
+  root's exact historical READ grants and materialized only from strictly
+  verified root-authored commits; dormant foreign commits remain inert.
 
 - **`converse` — a half-duplex talk-loop bridge.** Three seams that already
   existed are now joined into one spoken loop: a listener appends utterances
@@ -94,27 +93,28 @@ All notable changes to this project will be documented in this file.
   checkpoint still parses, and its empty Teams set means the first check after
   the upgrade reports the standing conversation once.
 
-- **Secrets now uses exact vault epochs with direct public-key custody.** One
-  vault epoch is one private collection. Accepted exact `READ` authority for
-  that collection determines its recipient keys, while every encrypted secret
-  version has one immutable exact id. The durable pile signing key is the local
-  decryption key; the live model has no separate Secrets identity, node-adoption
-  record, password lockbox, scope graph, revocation ceremony, or latest-version
-  selector. `secrets vault create|list|members|grant` manages explicit epochs,
-  and `secrets secret add|get|share|list` operates on exact vault or version ids.
-  Aggregate `migrations activate-cutover` projects the frozen historical
-  identity/scope branch directly into one vault per confidentiality epoch,
-  preserves encrypted versions and wraps, grants the exact current readers
-  direct `READ`, and verifies the resulting local aggregate without printing
-  plaintext or publishing an intermediary fixed Secrets collection.
+- **Secrets vaults now separate authority, custody, and private discovery.** One
+  vault epoch is one capability-anchored private collection with a random
+  custody key. Every immutable secret version has exactly one DEK wrap to that
+  custody key, independent of the number of readers. Exact `READ` and unbounded
+  `WRITE` capability proofs travel in a recipient-sealed access envelope along
+  with the custody seed; a recipient's private open-admission inbox is only an
+  untrusted delivery index, and every candidate is independently authenticated
+  and validated before it can admit commits or decrypt data. Grants are thus
+  constant in vault size and do not enumerate membership. The live CLI manages
+  explicit epochs with `secrets vault create|list|grant` and exact immutable
+  versions with `secrets secret add|get|list`; the enumerable `members` and
+  per-secret `share` surfaces are gone. Aggregate `migrations activate-cutover`
+  preserves historical secret ids, encrypted bodies, and source evidence while
+  re-sealing only each DEK into a capability-anchored custody successor.
 
 - **The Teams credentials the cutover retired are recoverable.** The collection
   cutover treats the legacy Teams OAuth rows as a bounded retired partition:
-  verified as source evidence, never republished, because native authority
-  never holds a secret in the clear. Live authentication was meant to restart
-  at a source-scoped auth profile naming exact encrypted Secrets versions —
-  and nothing built that restart, so on a migrated pile the Teams collection
-  has no auth profile, and every `teams` command fails with `Teams auth-profile
+  verified as source evidence, never republished, because the native Teams
+  collection never holds a secret in the clear. Live authentication was meant
+  to restart at a source-scoped auth profile naming exact encrypted Secrets
+  versions — and nothing built that restart, so on a migrated pile the Teams
+  collection has no auth profile, and every `teams` command fails with `Teams auth-profile
   source ... is missing` while the credentials sit unreferenced on the legacy
   branch. `migrations
   teams-credentials` is the bridge. It reads the frozen legacy branch and
@@ -127,8 +127,8 @@ All notable changes to this project will be documented in this file.
   own that write: `teams login --vault <id> --client-secret @file` and `secrets
   secret add --vault <id> --name <name> --value @file`. It never writes to the
   pile and never prints a secret — selecting an exact vault epoch and its
-  direct-key recipients belongs to the durable signer, not to a source-reading
-  migration.
+  capability/custody context belongs to the durable signer, not to a
+  source-reading migration.
 
 - **Compass's status register has an identity.** A goal's current status was
   the greatest `(created_at, event id)` among the status events hanging off
@@ -390,11 +390,11 @@ All notable changes to this project will be documented in this file.
   provenance, and unrelated Body deltas do not manufacture Voice authority.
 - **Historical Secrets is migration-local, not a second runtime.** The frozen
   wire schema, strict identity/scope/grant parser, attachment validation, DEK
-  recovery and KEM-only resealing now live solely in `faculties-migrations`.
-  `faculties-secrets` exposes only direct-key vaults; there is no compatibility
-  module, fixed Secrets collection, identity adoption, lockbox, or scope graph
-  in the live API. Direct activation still preserves the copied legacy prefix
-  as source evidence, and validates and retires the exact historical Mail
+  recovery, and KEM-only resealing live solely in `faculties-migrations`.
+  `faculties-secrets` exposes only capability-gated custody vaults; there is no
+  compatibility module, fixed Secrets collection, identity adoption, lockbox,
+  or scope graph in the live API. Activation preserves the copied legacy prefix
+  as source evidence and validates and retires the exact historical Mail
   account/pointer shape found on that branch.
 - **Decisions are collection-native and preserve concurrent resolution.** A
   stable decision anchor has one immutable intrinsic genesis, while factors are

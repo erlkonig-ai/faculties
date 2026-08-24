@@ -39,11 +39,11 @@ use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
     LegacyPinCoordinate, ProjectedLegacyCommit,
 };
-use crate::write_authority::publish_fragments;
 use faculties::planner::{self, EventDraft, IntervalValue, STATUS_CANCELLED};
 use faculties::schemas::planner::{
     event, note, DEFAULT_SCOPE_ID, KIND_EVENT_ID, KIND_NOTE_ID, LEGACY_BRANCH_NAME,
 };
+use faculties::storage::publish_fragments;
 
 /// One native collection commit corresponding to one exact authored legacy
 /// commit.

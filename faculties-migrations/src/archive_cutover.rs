@@ -24,9 +24,9 @@ use triblespace::prelude::*;
 use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
 };
-use crate::write_authority::publish_fragments;
 use faculties::blockdag::{self, CatalogValidation};
 use faculties::schemas::{blockdag as schema, files as files_schema};
+use faculties::storage::publish_fragments;
 
 /// Historical branch name used only as a read-only migration coordinate.
 pub use faculties::schemas::blockdag::LEGACY_BRANCH_NAME;

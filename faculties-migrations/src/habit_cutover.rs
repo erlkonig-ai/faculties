@@ -40,12 +40,12 @@ use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenLegacyBranch, FrozenSource, LegacyCommitCoordinate,
     LegacyPinCoordinate,
 };
-use crate::write_authority::publish_fragments;
 use faculties::habits::{self, DeclaredState, IntervalValue, TextHandle};
 use faculties::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
     MAX_LABEL_BYTES, STATE_ACTIVE, STATE_PAUSED,
 };
+use faculties::storage::publish_fragments;
 
 pub use faculties::schemas::habit::LEGACY_BRANCH_NAME;
 

@@ -377,7 +377,7 @@ pub fn ensure_succinct_index(
     let mut collection =
         ArchiveSnapshot::open_collection(pile_path, key_path, schema::DEFAULT_SCOPE_ID)?;
     let result = (|| {
-        let team = collection_team(&collection)?;
+        let namespace = collection_namespace(&collection)?;
         let archive = ArchiveSnapshot::from_collection(&mut collection, schema::DEFAULT_SCOPE_ID)?;
         // Two reaches: the archive root's, taken from the one registry that
         // decides it, and this derived index's own. A derivation does not
@@ -386,8 +386,10 @@ pub fn ensure_succinct_index(
         // it privately.
         let algebra = SuccinctArchiveCollection::new(
             crate::collection_names::require_name(schema::DEFAULT_SCOPE_ID),
-            team,
+            namespace,
+            None,
             crate::collection_names::require_reach(schema::DEFAULT_SCOPE_ID),
+            None,
             reach::private(),
         );
         let source = algebra.source_descriptor();
@@ -437,9 +439,9 @@ pub fn ensure_bm25_index(
     let mut collection =
         ArchiveSnapshot::open_collection(pile_path, key_path, schema::DEFAULT_SCOPE_ID)?;
     let result = (|| {
-        let team = collection_team(&collection)?;
+        let namespace = collection_namespace(&collection)?;
         let archive = ArchiveSnapshot::from_collection(&mut collection, schema::DEFAULT_SCOPE_ID)?;
-        Ok(ensure_bm25_for_snapshot(collection.storage_mut(), &archive, team)?.report)
+        Ok(ensure_bm25_for_snapshot(collection.storage_mut(), &archive, namespace)?.report)
     })();
     close_collection(
         collection,
@@ -448,28 +450,28 @@ pub fn ensure_bm25_index(
     )
 }
 
-/// The team an already-open collection belongs to.
+/// The namespace an already-open collection belongs to.
 ///
 /// Read back off the descriptor the collection was constructed with rather than
-/// threaded in again beside it: the team is a property of the collection you
-/// have already opened, and a second copy travelling alongside is a second
-/// thing that can disagree with it.
-fn collection_team(collection: &Collection<Pile>) -> Result<ed25519_dalek::VerifyingKey> {
-    descriptor_facts::team(collection.descriptor().facts())
-        .context("an Archive root descriptor names the team it belongs to")?
-        .context("decode the team on the Archive root descriptor")
+/// threaded in again beside it: the namespace is a property of the collection
+/// already opened, and a second copy travelling alongside is a second thing
+/// that can disagree with it.
+fn collection_namespace(collection: &Collection<Pile>) -> Result<ed25519_dalek::VerifyingKey> {
+    descriptor_facts::namespace(collection.descriptor().facts())
+        .context("an Archive root descriptor names its namespace")?
+        .context("decode the namespace on the Archive root descriptor")
 }
 
 fn ensure_bm25_for_snapshot(
     pile: &mut Pile,
     archive: &ArchiveSnapshot,
-    team: ed25519_dalek::VerifyingKey,
+    namespace: ed25519_dalek::VerifyingKey,
 ) -> Result<EnsuredBm25> {
-    let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, team);
-    let target = archive_bm25::descriptor(team);
+    let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, namespace);
+    let target = archive_bm25::descriptor(namespace);
     let exact = ExactDerivedCollection::new(source.clone(), target.clone());
     let algebra = ArchiveBm25Algebra {
-        team,
+        namespace,
         reader: pile
             .reader()
             .context("open Archive BM25 attachment reader")?,
@@ -497,9 +499,9 @@ fn ensure_bm25_for_snapshot(
 /// reader rather than a different physical cover.
 struct ArchiveBm25Algebra {
     reader: PileReader,
-    /// The team whose collections this algebra will accept, so validation
-    /// compares against the descriptors this pile actually roots.
-    team: ed25519_dalek::VerifyingKey,
+    /// Namespace whose collections this algebra accepts, so validation
+    /// compares against the exact descriptors this pile addresses.
+    namespace: ed25519_dalek::VerifyingKey,
 }
 
 fn fatal_bm25(error: impl std::fmt::Display) -> ExactAlgebraError {
@@ -513,7 +515,8 @@ impl ExactDerivedAlgebra<SimpleArchive, PortableBM25Blob> for ArchiveBm25Algebra
         source: &Blob<SimpleArchive>,
     ) -> std::result::Result<(), ExactAlgebraError> {
         if descriptor.facts()
-            != crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, self.team).facts()
+            != crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, self.namespace)
+                .facts()
         {
             return Err(ExactAlgebraError::Fatal(
                 "source descriptor does not match the Archive collection".to_owned(),
@@ -527,7 +530,7 @@ impl ExactDerivedAlgebra<SimpleArchive, PortableBM25Blob> for ArchiveBm25Algebra
         descriptor: &Fragment,
         target: &Blob<PortableBM25Blob>,
     ) -> std::result::Result<(), ExactAlgebraError> {
-        if descriptor.facts() != archive_bm25::descriptor(self.team).facts() {
+        if descriptor.facts() != archive_bm25::descriptor(self.namespace).facts() {
             return Err(ExactAlgebraError::Fatal(
                 "target descriptor does not match the Archive BM25 recipe".to_owned(),
             ));
@@ -571,7 +574,7 @@ fn distinct_ticket_data(commits: &[CollectionCommit]) -> BTreeSet<CollectionData
 }
 
 /// One frozen Archive view and one resident portable BM25 index attached from
-/// the exact cover of the same authorized source commits.
+/// the exact cover of the same admitted source commits.
 pub struct ArchiveSearchSnapshot {
     archive: ArchiveSnapshot,
     index: ArchiveBm25,
@@ -585,10 +588,10 @@ impl ArchiveSearchSnapshot {
         let mut collection =
             ArchiveSnapshot::open_collection(pile_path, key_path, schema::DEFAULT_SCOPE_ID)?;
         let result = (|| {
-            let team = collection_team(&collection)?;
+            let namespace = collection_namespace(&collection)?;
             let archive =
                 ArchiveSnapshot::from_collection(&mut collection, schema::DEFAULT_SCOPE_ID)?;
-            let ensured = ensure_bm25_for_snapshot(collection.storage_mut(), &archive, team)?;
+            let ensured = ensure_bm25_for_snapshot(collection.storage_mut(), &archive, namespace)?;
             let mut segments = Vec::with_capacity(ensured.cover.len());
             for (data, blob) in ensured.cover.into_members() {
                 segments.push(ArchiveBm25::try_from_blob(blob).with_context(|| {
@@ -644,7 +647,7 @@ impl ArchiveSearchSnapshot {
     }
 }
 
-/// One immutable materialized Archive view from the local durable authority.
+/// One immutable materialized Archive view from the local durable collection.
 pub struct ArchiveSnapshot {
     scope: Id,
     facts: TribleSet,
@@ -1370,19 +1373,25 @@ fn optional_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>>
 mod tests {
     use triblespace::core::collection::records::CollectionHandle;
 
-    /// This pile is a team of one, so its durable identity is its team root.
-    fn test_team(pile: &std::path::Path, key: &std::path::Path) -> ed25519_dalek::VerifyingKey {
+    /// Historical namespace of the open-admission Archive fixture.
+    fn test_namespace(
+        pile: &std::path::Path,
+        key: &std::path::Path,
+    ) -> ed25519_dalek::VerifyingKey {
         load_signer(pile, Some(key)).unwrap().verifying_key()
     }
 
     /// The Archive root these fixtures commit into.
     fn test_source(pile: &std::path::Path, key: &std::path::Path) -> Fragment {
-        crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, test_team(pile, key))
+        crate::collection_names::root_descriptor(
+            schema::DEFAULT_SCOPE_ID,
+            test_namespace(pile, key),
+        )
     }
 
     /// The derived BM25 collection over that root.
     fn test_target(pile: &std::path::Path, key: &std::path::Path) -> Fragment {
-        archive_bm25::descriptor(test_team(pile, key))
+        archive_bm25::descriptor(test_namespace(pile, key))
     }
 
     /// Content identity of a descriptor these tests built but have not stored.
@@ -1391,23 +1400,13 @@ mod tests {
             .get_handle()
     }
 
-    /// Initialize the team-of-one fixture and explicitly authorize its Archive root.
+    /// Initialize the durable signer used by the open-admission Archive fixture.
     fn initialize_archive_fixture(pile: &std::path::Path, key: &std::path::Path) -> SigningKey {
-        let signer = initialize_signer(pile, Some(key)).unwrap();
-        let team = signer.verifying_key();
-        let resource = collection_of(&crate::collection_names::root_descriptor(
-            schema::DEFAULT_SCOPE_ID,
-            team,
-        ));
-        let mut store = open_pile_strict(pile).unwrap();
-        grant_collection_write_authority(&mut store, resource, &signer);
-        store.close().unwrap();
-        signer
+        initialize_signer(pile, Some(key)).unwrap()
     }
 
     use super::*;
     use crate::storage::initialize_signer;
-    use crate::test_support::grant_collection_write_authority;
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use tempfile::TempDir;
@@ -1847,12 +1846,13 @@ mod tests {
         let output: Blob<SuccinctArchiveBlob> = reader
             .get(Handle::<SuccinctArchiveBlob>::from_hash(output))
             .unwrap();
-        let team = load_signer(&pile_path, Some(&key)).unwrap().verifying_key();
-        let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, team);
+        let namespace = load_signer(&pile_path, Some(&key)).unwrap().verifying_key();
+        let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, namespace);
         succinctarchive_union::validate_derive(
             &source,
             &succinctarchive_union::descriptor(
-                archive_bm25::source_collection(team),
+                archive_bm25::source_collection(namespace),
+                None,
                 reach::private(),
             ),
             &derive,
@@ -1911,7 +1911,7 @@ mod tests {
             .collect();
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
-            team: test_team(&pile_path, &key),
+            namespace: test_namespace(&pile_path, &key),
         };
         let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let cover = exact.attach_exact(&mut pile, &commits, &algebra).unwrap();
@@ -2059,7 +2059,7 @@ mod tests {
         let derive = CollectionDerive::new(collection_of(&target), input_data, output_data);
         let algebra = ArchiveBm25Algebra {
             reader,
-            team: test_team(&pile_path, &key),
+            namespace: test_namespace(&pile_path, &key),
         };
         assert_eq!(algebra.derive(&union).unwrap().bytes, output.bytes);
         algebra.validate_target(&target, &output).unwrap();
@@ -2089,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn bm25_frozen_ticket_excludes_a_later_authorized_commit() {
+    fn bm25_frozen_ticket_excludes_a_later_admitted_commit() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -2103,7 +2103,7 @@ mod tests {
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let ensured =
-            ensure_bm25_for_snapshot(&mut pile, &frozen, test_team(&pile_path, &key)).unwrap();
+            ensure_bm25_for_snapshot(&mut pile, &frozen, test_namespace(&pile_path, &key)).unwrap();
         assert_eq!(ensured.report.source_commits, 1);
         drop(ensured);
         pile.close().unwrap();
@@ -2143,7 +2143,7 @@ mod tests {
         let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
-            team: test_team(&pile_path, &key),
+            namespace: test_namespace(&pile_path, &key),
         };
 
         let first = exact
@@ -2213,7 +2213,7 @@ mod tests {
         CollectionStore::insert(&mut pile, CollectionRecord::Commit(second)).unwrap();
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
-            team: test_team(&pile_path, &key),
+            namespace: test_namespace(&pile_path, &key),
         };
         let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let ready = exact
@@ -2263,7 +2263,7 @@ mod tests {
 
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
-            team: test_team(&pile_path, &key),
+            namespace: test_namespace(&pile_path, &key),
         };
         let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let ready = exact.ensure_exact(&mut pile, &[commit], &algebra).unwrap();
@@ -2334,7 +2334,7 @@ mod tests {
         let before = std::fs::metadata(&pile_path).unwrap().len();
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
-            team: test_team(&pile_path, &key),
+            namespace: test_namespace(&pile_path, &key),
         };
         let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let ready = exact.ensure_exact(&mut pile, &[commit], &algebra).unwrap();
@@ -2374,7 +2374,7 @@ mod tests {
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let algebra = ArchiveBm25Algebra {
             reader: pile.reader().unwrap(),
-            team: test_team(&pile_path, &key),
+            namespace: test_namespace(&pile_path, &key),
         };
         let exact = ExactDerivedCollection::new(source.clone(), target.clone());
         let error = match exact.ensure_exact(&mut pile, &[absent], &algebra) {

@@ -199,9 +199,7 @@ mod tests {
     use anybytes::View;
     use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
     use faculties::schemas::reason::{reason_schema, KIND_REASON_ID};
-    use faculties::storage::{
-        ensure_team_of_one_write_authority, initialize_signer, load_signer, open_pile_strict,
-    };
+    use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     use std::fs::File;
     use triblespace::core::repo::BlobStore;
 
@@ -227,10 +225,7 @@ mod tests {
         let key_path = directory.path().join("reason.key");
         File::create(&pile_path).unwrap();
 
-        let signer = initialize_signer(&pile_path, Some(&key_path)).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-        pile.close().unwrap();
+        initialize_signer(&pile_path, Some(&key_path)).unwrap();
         let storage = ReasonStorage {
             pile: &pile_path,
             key: Some(&key_path),

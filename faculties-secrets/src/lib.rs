@@ -1,12 +1,10 @@
-//! Vault-epoch Secrets: direct key custody over exact private collections.
+//! Vault-epoch Secrets: capability-gated custody over exact private collections.
 //!
-//! One vault epoch is one private `SimpleArchive`-union collection. The
-//! team's positive authority ledger is the only access-control language:
-//! accepted `READ` invocation grants for that exact collection are projected
-//! directly to Ed25519 recipient keys. The vault itself contains only its
-//! immutable header, immutable encrypted secret versions, and direct-key DEK
-//! wraps. It carries no identity, scope, grant, retraction, or administrator
-//! graph of its own.
+//! One vault epoch is one private `SimpleArchive`-union collection with one
+//! random custody keypair. Every new secret has one DEK wrap to that custody
+//! key. Exact blob-native `READ(vault)` proofs authorize subject-specific
+//! delivery of the custody seed; they are never enumerated into ambient
+//! membership. Collection `WRITE` remains a separate exact capability.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,18 +16,27 @@ use dryoc::dryocbox::{DryocBox, KeyPair as BoxKeyPair, PublicKey as BoxPublicKey
 use dryoc::dryocsecretbox::{DryocSecretBox, Key, Nonce};
 use dryoc::types::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::authority::AuthorityResolution;
-use triblespace::core::collection::{reach, simplearchive_union, CollectionHandle};
+use hifitime::Epoch;
+use triblespace::core::capability::{
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
+    CapabilityResource,
+};
+use triblespace::core::collection::{
+    reach, simplearchive_union, CapabilityPresentation, CollectionAdmission, CollectionHandle,
+    ACTION_WRITE,
+};
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
+pub mod access;
 pub mod schema;
 pub mod storage;
 
 use self::schema::{
-    secret_body, wrap_dek, wrap_recipient_key, wrap_secret, KIND_SECRET, KIND_VAULT, KIND_WRAP,
+    custody_public_key, secret_body, wrap_dek, wrap_recipient_key, wrap_secret, KIND_SECRET,
+    KIND_VAULT, KIND_VAULT_CUSTODY, KIND_WRAP,
 };
 
 /// Consumer-owned action meaning permission to decrypt one exact vault.
@@ -38,6 +45,12 @@ use self::schema::{
 /// 2026-08-23. Actions are uninterpreted atoms; this one neither implies nor
 /// is implied by collection `WRITE`.
 pub const ACTION_READ: Id = triblespace::macros::id_hex!("A6378B816786E9F08A579B8E5F8F4FF4");
+
+/// Version marker at the start of every sealed custody-seed plaintext.
+///
+/// Minted with `trible genid` on 2026-08-24.
+pub const ACCESS_ENVELOPE_FORMAT_V1: Id =
+    triblespace::macros::id_hex!("B4A31C5D175AD83A341C3BABBB1138A7");
 
 pub const VAULT_NAME_PREFIX: &str = "vault-";
 pub const VAULT_NAME_DIGITS: usize = 25;
@@ -95,13 +108,22 @@ pub fn parse_vault_name(name: &CollectionName) -> Result<Id> {
 }
 
 /// Canonical private `SimpleArchive`-union descriptor of one vault epoch.
-pub fn vault_descriptor(vault: Id, team: VerifyingKey) -> Fragment {
-    simplearchive_union::descriptor(&vault_name(vault), team, reach::private())
+pub fn vault_descriptor(vault: Id, namespace: VerifyingKey, authority: VerifyingKey) -> Fragment {
+    simplearchive_union::descriptor(
+        &vault_name(vault),
+        namespace,
+        Some(authority),
+        reach::private(),
+    )
 }
 
 /// Exact collection resource governed by `WRITE` and `READ` authority.
-pub fn vault_handle(vault: Id, team: VerifyingKey) -> CollectionHandle {
-    vault_descriptor(vault, team)
+pub fn vault_handle(
+    vault: Id,
+    namespace: VerifyingKey,
+    authority: VerifyingKey,
+) -> CollectionHandle {
+    vault_descriptor(vault, namespace, authority)
         .into_facts()
         .to_blob()
         .get_handle()
@@ -111,34 +133,18 @@ pub fn vault_handle(vault: Id, team: VerifyingKey) -> CollectionHandle {
 pub fn vault_collection<S>(
     storage: S,
     vault: Id,
-    team: VerifyingKey,
+    namespace: VerifyingKey,
     signing_key: SigningKey,
+    admission: CollectionAdmission,
 ) -> Collection<S> {
     Collection::new(
         storage,
         &vault_name(vault),
-        team,
+        namespace,
         signing_key,
         reach::private(),
+        admission,
     )
-}
-
-/// Direct keys entitled to receive wraps for one exact vault resource.
-///
-/// Delegation alone is not decryption. Only accepted grants carrying Invoke
-/// for this consumer-owned action and this exact collection are projected.
-pub fn read_authority_recipient_keys(
-    authority: &AuthorityResolution,
-    vault: CollectionHandle,
-) -> BTreeSet<RecipientPublicKey> {
-    authority
-        .grants()
-        .filter_map(|accepted| {
-            let grant = accepted.grant();
-            (grant.action() == ACTION_READ && grant.resource() == vault && grant.invoke())
-                .then_some(grant.subject().raw)
-        })
-        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,6 +152,12 @@ pub struct VaultHeader {
     pub id: Id,
     pub created_at: IntervalValue,
     pub name: TextHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustodyRow {
+    pub id: Id,
+    pub public_key: RecipientPublicKey,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +183,9 @@ pub struct WrapRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultCatalog {
     pub header: VaultHeader,
+    /// Absent only on preserved direct-recipient vaults awaiting the additive
+    /// custody migration.
+    pub custody: Option<CustodyRow>,
     pub secrets: BTreeMap<Id, SecretRow>,
     pub wraps: BTreeMap<Id, WrapRow>,
 }
@@ -198,11 +213,153 @@ impl VaultCatalog {
 /// validate the prospective monotone union before publishing it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultSnapshot {
+    vault: Id,
+    collection: Option<CollectionHandle>,
     facts: TribleSet,
     catalog: VaultCatalog,
 }
 
+/// Exact local evidence needed to use one vault epoch.
+///
+/// This is not a member record. It is the result of opening one or more
+/// subject-specific envelopes and verifying their exact proofs. READ is
+/// checked again whenever plaintext is requested, so an expired lease cannot
+/// survive merely because a process kept this snapshot alive.
+#[derive(Clone)]
+pub struct VaultAccess {
+    vault: Id,
+    trust_root: VerifyingKey,
+    collection: CollectionHandle,
+    subject: VerifyingKey,
+    custody: SigningKey,
+    read_proofs: Vec<CapabilityProof>,
+    write_presentations: Vec<CapabilityPresentation>,
+}
+
+impl VaultAccess {
+    pub(crate) fn new(
+        vault: Id,
+        namespace: VerifyingKey,
+        trust_root: VerifyingKey,
+        subject: VerifyingKey,
+        custody: SigningKey,
+        read_proofs: Vec<CapabilityProof>,
+        write_presentations: Vec<CapabilityPresentation>,
+    ) -> Result<Self> {
+        if read_proofs.is_empty() {
+            bail!("vault access requires at least one exact READ proof");
+        }
+        if write_presentations.is_empty() {
+            bail!("vault access requires at least one exact WRITE presentation");
+        }
+        let collection = vault_handle(vault, namespace, trust_root);
+        let access = Self {
+            vault,
+            trust_root,
+            collection,
+            subject,
+            custody,
+            read_proofs,
+            write_presentations,
+        };
+        let instant = triblespace::core::clock::epoch_now();
+        access.verify_read_at(instant)?;
+        access.verify_write_at(instant)?;
+        Ok(access)
+    }
+
+    pub const fn vault(&self) -> Id {
+        self.vault
+    }
+
+    pub fn trust_root(&self) -> VerifyingKey {
+        self.trust_root
+    }
+
+    pub const fn collection(&self) -> CollectionHandle {
+        self.collection
+    }
+
+    pub fn subject(&self) -> VerifyingKey {
+        self.subject
+    }
+
+    pub fn custody(&self) -> &SigningKey {
+        &self.custody
+    }
+
+    pub fn read_proofs(&self) -> &[CapabilityProof] {
+        &self.read_proofs
+    }
+
+    pub fn write_presentations(&self) -> &[CapabilityPresentation] {
+        &self.write_presentations
+    }
+
+    pub fn admission(&self) -> CollectionAdmission {
+        CollectionAdmission::capability(self.trust_root, self.write_presentations.clone())
+    }
+
+    pub fn verify_read_at(&self, instant: Epoch) -> Result<()> {
+        let atom = CapabilityAtom::new(
+            CapabilityAction::new(ACTION_READ),
+            CapabilityResource::from(self.collection),
+        );
+        let claim = CapabilityClaim::new(self.subject, atom, CapabilityMode::Invoke);
+        let mut failures = Vec::new();
+        for proof in &self.read_proofs {
+            match proof.verify_claim(self.trust_root, instant, claim) {
+                Ok(_) => return Ok(()),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        bail!(
+            "no supplied READ proof currently authorizes this vault: {}",
+            failures.join("; ")
+        )
+    }
+
+    /// Reverify every supplied collection writer at an explicit instant.
+    ///
+    /// Vault WRITE evidence must be unbounded. Collection admission is checked
+    /// at materialization time, so a bounded writer would otherwise make
+    /// already-committed ciphertext disappear when its lease expired.
+    pub fn verify_write_at(&self, instant: Epoch) -> Result<()> {
+        let atom = CapabilityAtom::new(
+            CapabilityAction::new(ACTION_WRITE),
+            CapabilityResource::from(self.collection),
+        );
+        for (index, presentation) in self.write_presentations.iter().enumerate() {
+            let verified = presentation
+                .proof()
+                .verify_claim(
+                    self.trust_root,
+                    instant,
+                    CapabilityClaim::new(presentation.subject(), atom, CapabilityMode::Invoke),
+                )
+                .with_context(|| format!("verify vault WRITE presentation {index}"))?;
+            if verified.effective_validity().is_some() {
+                bail!(
+                    "vault WRITE presentation {index} is bounded; historical commits require unbounded admission"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 impl VaultSnapshot {
+    /// Vault-local graph identity carried by the canonical header.
+    pub const fn id(&self) -> Id {
+        self.vault
+    }
+
+    /// Exact collection identity, when this snapshot came through verified
+    /// access discovery rather than an offline unscoped validation input.
+    pub const fn collection(&self) -> Option<CollectionHandle> {
+        self.collection
+    }
+
     /// Complete canonical facts of this exact vault epoch.
     pub fn facts(&self) -> &TribleSet {
         &self.facts
@@ -214,17 +371,19 @@ impl VaultSnapshot {
     }
 }
 
-/// Storage-agnostic aggregate over an exact set of validated vault epochs.
+/// Storage-agnostic aggregate over validated vault epochs.
 ///
-/// Secret identities are global within one snapshot: the constructor rejects
-/// a secret id observed in more than one vault. Lookup and opening therefore
-/// select only by exact secret id; this type performs no name, timestamp, or
-/// “latest” arbitration. Vault catalogs retain every historical wrap admitted
-/// by their facts without comparing them to current `READ` authority.
+/// Access-discovered vaults retain their exact collection identity. Bare vault
+/// and secret ids are conveniences only when unique in this snapshot; exact
+/// collection lookup remains available when independently valid authorities
+/// happen to reuse the same graph-local ids. Offline [`Self::new`] inputs have
+/// no collection provenance and therefore retain the stricter historical
+/// uniqueness checks. This type performs no name, timestamp, or “latest”
+/// arbitration.
 pub struct SecretsSnapshot<R> {
     reader: R,
-    vaults: BTreeMap<Id, VaultSnapshot>,
-    secret_vaults: BTreeMap<Id, Id>,
+    vaults: Vec<VaultSnapshot>,
+    access: BTreeMap<CollectionHandle, VaultAccess>,
 }
 
 impl<R> SecretsSnapshot<R> {
@@ -233,26 +392,67 @@ impl<R> SecretsSnapshot<R> {
         &self.reader
     }
 
-    /// Validated vaults keyed by their exact epoch ids.
-    pub fn vaults(&self) -> &BTreeMap<Id, VaultSnapshot> {
+    /// Every validated vault, ordered by construction input.
+    pub fn vaults(&self) -> &[VaultSnapshot] {
         &self.vaults
     }
 
-    /// Facts and catalog for one exact vault epoch.
+    /// Facts and catalog for a unique graph-local vault id.
+    ///
+    /// Returns `None` both when absent and when multiple exact collections use
+    /// the id. Use [`Self::vault_exact`] when collection identity is known.
     pub fn vault(&self, vault: Id) -> Option<&VaultSnapshot> {
-        self.vaults.get(&vault)
+        let mut matching = self
+            .vaults
+            .iter()
+            .filter(|snapshot| snapshot.vault == vault);
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
+    }
+
+    /// Facts and catalog for one exact access-discovered collection.
+    pub fn vault_exact(&self, collection: CollectionHandle) -> Option<&VaultSnapshot> {
+        self.vaults
+            .iter()
+            .find(|snapshot| snapshot.collection == Some(collection))
     }
 
     /// Whether one exact immutable secret id occurs in this snapshot.
     pub fn contains(&self, secret: Id) -> bool {
-        self.secret_vaults.contains_key(&secret)
+        self.vaults
+            .iter()
+            .any(|vault| vault.catalog.secrets.contains_key(&secret))
     }
 
-    /// Locate one exact immutable secret as `(vault_id, row)`.
+    /// Locate a globally unique immutable secret as `(vault_id, row)`.
+    ///
+    /// Returns `None` when more than one exact collection contains the id.
     pub fn lookup(&self, secret: Id) -> Option<(Id, &SecretRow)> {
-        let vault = *self.secret_vaults.get(&secret)?;
-        let row = self.vaults.get(&vault)?.catalog.secrets.get(&secret)?;
-        Some((vault, row))
+        let mut matching = self.vaults.iter().filter_map(|vault| {
+            vault
+                .catalog
+                .secrets
+                .get(&secret)
+                .map(|row| (vault.vault, row))
+        });
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
+    }
+
+    /// Locate one immutable secret inside an exact collection.
+    pub fn lookup_exact(&self, collection: CollectionHandle, secret: Id) -> Option<&SecretRow> {
+        self.vault_exact(collection)?.catalog.secrets.get(&secret)
+    }
+
+    /// Verified local access evidence for a unique graph-local vault id.
+    pub fn access(&self, vault: Id) -> Option<&VaultAccess> {
+        let snapshot = self.vault(vault)?;
+        self.access.get(&snapshot.collection?)
+    }
+
+    /// Verified local access evidence for one exact collection.
+    pub fn access_exact(&self, collection: CollectionHandle) -> Option<&VaultAccess> {
+        self.access.get(&collection)
     }
 }
 
@@ -265,52 +465,162 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
     where
         I: IntoIterator<Item = (Id, TribleSet)>,
     {
-        let mut by_vault = BTreeMap::new();
+        let mut snapshots = Vec::new();
+        let mut vault_ids = BTreeSet::new();
         let mut secret_vaults = BTreeMap::new();
         for (vault, facts) in vaults {
-            let catalog = validate_catalog(&reader, vault, &facts)
-                .with_context(|| format!("validate vault {vault}"))?;
-            if by_vault.contains_key(&vault) {
+            if !vault_ids.insert(vault) {
                 bail!("vault {vault} was supplied more than once");
             }
+            let catalog = validate_catalog(&reader, vault, &facts)
+                .with_context(|| format!("validate vault {vault}"))?;
             for secret in catalog.secrets.keys() {
                 if let Some(previous) = secret_vaults.insert(*secret, vault) {
                     bail!("secret {secret} occurs in both vault {previous} and vault {vault}");
                 }
             }
-            by_vault.insert(vault, VaultSnapshot { facts, catalog });
+            snapshots.push(VaultSnapshot {
+                vault,
+                collection: None,
+                facts,
+                catalog,
+            });
         }
         Ok(Self {
             reader,
-            vaults: by_vault,
-            secret_vaults,
+            vaults: snapshots,
+            access: BTreeMap::new(),
+        })
+    }
+
+    /// Validate exact collection-scoped vaults without attaching local access.
+    ///
+    /// This is the stopped-world planning counterpart to runtime access
+    /// discovery. Independently valid collections may reuse graph-local vault
+    /// or secret ids; only the exact collection handle must be unique.
+    pub fn new_exact<I>(reader: R, vaults: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (CollectionHandle, Id, TribleSet)>,
+    {
+        let mut snapshots = Vec::new();
+        let mut collections = BTreeSet::new();
+        for (collection, vault, facts) in vaults {
+            if !collections.insert(collection) {
+                bail!("collection {collection:?} was supplied more than once");
+            }
+            let catalog = validate_catalog(&reader, vault, &facts)
+                .with_context(|| format!("validate vault {vault}"))?;
+            snapshots.push(VaultSnapshot {
+                vault,
+                collection: Some(collection),
+                facts,
+                catalog,
+            });
+        }
+        Ok(Self {
+            reader,
+            vaults: snapshots,
+            access: BTreeMap::new(),
+        })
+    }
+
+    /// Validate and index vault epochs together with explicit local access.
+    pub(crate) fn new_accessible<I>(reader: R, vaults: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (Id, TribleSet, VaultAccess)>,
+    {
+        let mut snapshots = Vec::new();
+        let mut by_access = BTreeMap::new();
+        for (vault, facts, access) in vaults {
+            let catalog = validate_catalog(&reader, vault, &facts)
+                .with_context(|| format!("validate vault {vault}"))?;
+            if access.vault != vault {
+                bail!(
+                    "vault {vault} access evidence is bound to vault {}",
+                    access.vault
+                );
+            }
+            let collection = access.collection;
+            let custody = catalog
+                .custody
+                .context("an accessible vault must declare one custody key")?;
+            if access.custody.verifying_key().to_bytes() != custody.public_key {
+                bail!("vault {vault} access envelope opens to a different custody key");
+            }
+            if by_access.insert(collection, access).is_some() {
+                bail!("collection {collection:?} was supplied more than once");
+            }
+            snapshots.push(VaultSnapshot {
+                vault,
+                collection: Some(collection),
+                facts,
+                catalog,
+            });
+        }
+        Ok(Self {
+            reader,
+            vaults: snapshots,
+            access: by_access,
         })
     }
 
     /// Open one exact immutable secret with its recipient signing key.
     pub fn open(&self, secret: Id, signing_key: &SigningKey) -> Result<Vec<u8>> {
-        let vault = *self
-            .secret_vaults
-            .get(&secret)
-            .ok_or_else(|| anyhow!("secret {secret} not found in any vault"))?;
-        let snapshot = self
+        let mut matching = self
             .vaults
-            .get(&vault)
-            .expect("secret index only contains retained vaults");
-        open_version(&self.reader, &snapshot.catalog, secret, signing_key)
-            .with_context(|| format!("open secret {secret} from vault {vault}"))
+            .iter()
+            .filter(|vault| vault.catalog.secrets.contains_key(&secret));
+        let snapshot = matching
+            .next()
+            .ok_or_else(|| anyhow!("secret {secret} not found in any vault"))?;
+        if matching.next().is_some() {
+            bail!("secret {secret} is ambiguous across exact vault collections");
+        }
+        let collection = snapshot
+            .collection
+            .context("the selected vault has no exact collection identity")?;
+        let access = self.access.get(&collection).ok_or_else(|| {
+            anyhow!(
+                "no verified local access envelope for vault {}",
+                snapshot.vault
+            )
+        })?;
+        if signing_key.verifying_key() != access.subject {
+            bail!("the supplied signing key is not the access-envelope subject");
+        }
+        access.verify_read_at(triblespace::core::clock::epoch_now())?;
+        open_version(&self.reader, &snapshot.catalog, secret, &access.custody)
+            .with_context(|| format!("open secret {secret} from vault {}", snapshot.vault))
+    }
+
+    /// Open one immutable secret from an exact collection.
+    pub fn open_exact(
+        &self,
+        collection: CollectionHandle,
+        secret: Id,
+        signing_key: &SigningKey,
+    ) -> Result<Vec<u8>> {
+        let snapshot = self
+            .vault_exact(collection)
+            .ok_or_else(|| anyhow!("vault collection {collection:?} is not present"))?;
+        if !snapshot.catalog.secrets.contains_key(&secret) {
+            bail!("secret {secret} is not present in vault collection {collection:?}");
+        }
+        let access = self
+            .access_exact(collection)
+            .ok_or_else(|| anyhow!("no verified local access envelope for {collection:?}"))?;
+        if signing_key.verifying_key() != access.subject {
+            bail!("the supplied signing key is not the access-envelope subject");
+        }
+        access.verify_read_at(triblespace::core::clock::epoch_now())?;
+        open_version(&self.reader, &snapshot.catalog, secret, &access.custody)
+            .with_context(|| format!("open secret {secret} from vault collection {collection:?}"))
     }
 }
 
 pub struct SealedVersion {
     pub fragment: Fragment,
     pub secret: Id,
-    pub recipient_count: usize,
-}
-
-pub struct SharedVersion {
-    pub fragment: Fragment,
-    pub new_recipient_count: usize,
 }
 
 fn point_value(field: &str, value: IntervalValue) -> Result<()> {
@@ -364,6 +674,14 @@ fn header_record(vault: Id, name: TextHandle, created_at: IntervalValue) -> Frag
     }
 }
 
+fn custody_record(custody: RecipientPublicKey) -> Fragment {
+    let custody = Inline::<inlineencodings::ED25519PublicKey>::new(custody);
+    entity! { _ @
+        metadata::tag: &KIND_VAULT_CUSTODY,
+        custody_public_key: custody,
+    }
+}
+
 fn secret_record(
     secret: Id,
     name: TextHandle,
@@ -393,14 +711,48 @@ fn wrap_record(
     }
 }
 
-/// Canonical header-only genesis payload of one vault epoch.
-pub fn vault_header_fragment(vault: Id, name: &str, created_at: IntervalValue) -> Result<Fragment> {
+fn build_vault_header_fragment(
+    vault: Id,
+    name: &str,
+    created_at: IntervalValue,
+    custody: Option<RecipientPublicKey>,
+) -> Result<Fragment> {
     validate_name("vault name", name)?;
     point_value("vault creation time", created_at)?;
+    if let Some(custody) = custody {
+        box_pk_from_ed25519(&custody).context("validate vault custody public key")?;
+    }
     let mut fragment = Fragment::empty();
     let name = fragment.put(name.to_owned());
     fragment += header_record(vault, name, created_at);
-    Ok(fragment)
+    if let Some(custody) = custody {
+        fragment += custody_record(custody);
+    }
+    // The custody singleton is part of the committed graph, not a second
+    // entry point. Preserve the vault id as this genesis fragment's one public
+    // root even though its facts contain two intrinsic entities.
+    let (_, facts, metafacts, blobs) = fragment.into_parts();
+    Ok(Fragment::rooted_from_parts(vault, facts, metafacts, blobs))
+}
+
+/// Canonical genesis payload of one custody-backed vault epoch.
+pub fn vault_header_fragment(
+    vault: Id,
+    name: &str,
+    created_at: IntervalValue,
+    custody: RecipientPublicKey,
+) -> Result<Fragment> {
+    build_vault_header_fragment(vault, name, created_at, Some(custody))
+}
+
+/// Frozen three-fact header shape used only while reading or migrating the
+/// direct-recipient vault generation.
+pub fn legacy_vault_header_fragment(
+    vault: Id,
+    name: &str,
+    created_at: IntervalValue,
+) -> Result<Fragment> {
+    build_vault_header_fragment(vault, name, created_at, None)
 }
 
 /// Canonical immutable encrypted secret record with caller-selected identity.
@@ -420,7 +772,7 @@ pub fn encrypted_secret_fragment(
     Ok(fragment)
 }
 
-/// Canonical direct-key wrap record with caller-selected identity.
+/// Canonical recipient-key wrap record with caller-selected identity.
 pub fn recipient_wrap_fragment(
     wrap: Id,
     secret: Id,
@@ -484,6 +836,24 @@ fn load_header(space: &TribleSet, id: Id) -> Result<VaultHeader> {
         bail!("vault header {id:x} is not one canonical immutable record");
     }
     Ok(row)
+}
+
+fn load_custody(space: &TribleSet, id: Id) -> Result<CustodyRow> {
+    let public_key = exactly_one(
+        id,
+        "custody_public_key",
+        find!(
+            value: Inline<inlineencodings::ED25519PublicKey>,
+            pattern!(space, [{ id @ custody_public_key: ?value }])
+        )
+        .collect(),
+    )?
+    .raw;
+    box_pk_from_ed25519(&public_key).context("validate vault custody public key")?;
+    if entity_facts(space, id) != *custody_record(public_key).facts() {
+        bail!("vault custody declaration {id:x} is not one canonical immutable record");
+    }
+    Ok(CustodyRow { id, public_key })
 }
 
 fn load_secret(space: &TribleSet, id: Id) -> Result<SecretRow> {
@@ -568,6 +938,20 @@ pub fn load_catalog(vault: Id, space: &TribleSet) -> Result<VaultCatalog> {
     }
     let header = load_header(space, header_id)?;
 
+    let custody_ids = tagged_entities(space, KIND_VAULT_CUSTODY);
+    if custody_ids.len() > 1 {
+        bail!(
+            "vault collection has {} custody declarations; expected at most one",
+            custody_ids.len()
+        );
+    }
+    let custody = custody_ids
+        .iter()
+        .next()
+        .copied()
+        .map(|id| load_custody(space, id))
+        .transpose()?;
+
     let secret_ids = tagged_entities(space, KIND_SECRET);
     let wrap_ids = tagged_entities(space, KIND_WRAP);
     let mut secrets = BTreeMap::new();
@@ -587,10 +971,23 @@ pub fn load_catalog(vault: Id, space: &TribleSet) -> Result<VaultCatalog> {
         if !wraps.values().any(|wrap| wrap.secret == secret.id) {
             bail!("secret {} has no recipient wrap", secret.id);
         }
+        if let Some(custody) = custody {
+            let custody_wraps = wraps
+                .values()
+                .filter(|wrap| wrap.secret == secret.id && wrap.recipient == custody.public_key)
+                .count();
+            if custody_wraps != 1 {
+                bail!(
+                    "secret {} has {custody_wraps} custody wraps; expected exactly one",
+                    secret.id
+                );
+            }
+        }
     }
 
     let all_ids: BTreeSet<Id> = header_ids
         .into_iter()
+        .chain(custody_ids)
         .chain(secret_ids)
         .chain(wrap_ids)
         .collect();
@@ -607,6 +1004,7 @@ pub fn load_catalog(vault: Id, space: &TribleSet) -> Result<VaultCatalog> {
 
     Ok(VaultCatalog {
         header,
+        custody,
         secrets,
         wraps,
     })
@@ -734,21 +1132,15 @@ fn decrypt_secret_body<R: BlobStoreGet>(
         .map_err(|_| anyhow!("decrypt secret body failed"))
 }
 
-/// Encrypt one immutable version and seal its DEK to an explicit key set.
+/// Encrypt one immutable version and seal its DEK exactly once to the vault
+/// epoch's custody key.
 pub fn seal_version(
     name: &str,
     plaintext: &[u8],
-    recipients: &BTreeSet<RecipientPublicKey>,
+    custody: RecipientPublicKey,
     created_at: IntervalValue,
 ) -> Result<SealedVersion> {
-    if recipients.is_empty() {
-        bail!("a secret version must have at least one recipient");
-    }
-    let recipients: Vec<_> = recipients
-        .iter()
-        .map(|recipient| Ok((*recipient, box_pk_from_ed25519(recipient)?)))
-        .collect::<Result<_>>()?;
-    let recipient_count = recipients.len();
+    let custody_box = box_pk_from_ed25519(&custody)?;
     let dek = Key::gen();
     let nonce = Nonce::gen();
     let ciphertext = DryocSecretBox::encrypt_to_vecbox(plaintext, &nonce, &dek).to_vec();
@@ -758,74 +1150,61 @@ pub fn seal_version(
 
     let secret = genid().id;
     let mut fragment = encrypted_secret_fragment(secret, name, body, created_at)?;
-    for (recipient, public) in recipients {
-        let sealed = DryocBox::seal_to_vecbox(&dek, &public)
-            .map_err(|error| anyhow!("seal to recipient: {error:?}"))?
-            .to_vec();
-        fragment += recipient_wrap_fragment(genid().id, secret, recipient, sealed)?;
-    }
-    Ok(SealedVersion {
-        fragment,
-        secret,
-        recipient_count,
-    })
+    let sealed = DryocBox::seal_to_vecbox(&dek, &custody_box)
+        .map_err(|error| anyhow!("seal to vault custody key: {error:?}"))?
+        .to_vec();
+    fragment += recipient_wrap_fragment(genid().id, secret, custody, sealed)?;
+    Ok(SealedVersion { fragment, secret })
 }
 
-/// Open one exact immutable version with the matching durable signing key.
+/// Re-seal one existing direct-vault DEK to a successor custody key without
+/// reading or rewriting the encrypted secret body.
+///
+/// This is an explicit stopped-world migration seam, not a sharing API. The
+/// source signing key must already have a valid direct wrap in `catalog`; all
+/// such wraps are checked for one consistent DEK before the caller-selected
+/// custody-wrap occurrence is constructed.
+pub fn rewrap_version_for_migration<R: BlobStoreGet>(
+    reader: &R,
+    catalog: &VaultCatalog,
+    secret: Id,
+    source: &SigningKey,
+    custody: RecipientPublicKey,
+    wrap: Id,
+) -> Result<Fragment> {
+    let dek = recover_dek(reader, catalog, secret, source)
+        .context("recover direct-vault DEK for custody migration")?;
+    let custody_box = box_pk_from_ed25519(&custody)?;
+    let sealed = DryocBox::seal_to_vecbox(&dek, &custody_box)
+        .map_err(|error| anyhow!("seal migrated DEK to vault custody key: {error:?}"))?
+        .to_vec();
+    recipient_wrap_fragment(wrap, secret, custody, sealed)
+}
+
+/// Open one exact immutable version with its vault epoch custody key.
 pub fn open_version<R: BlobStoreGet>(
     reader: &R,
     catalog: &VaultCatalog,
     secret: Id,
-    signing_key: &SigningKey,
+    custody: &SigningKey,
 ) -> Result<Vec<u8>> {
-    let dek = recover_dek(reader, catalog, secret, signing_key)?;
+    let expected = catalog
+        .custody
+        .context("vault has no custody key; migrate the direct-recipient epoch first")?
+        .public_key;
+    if custody.verifying_key().to_bytes() != expected {
+        bail!("supplied custody seed does not match the vault header");
+    }
+    let dek = recover_dek(reader, catalog, secret, custody)?;
     decrypt_secret_body(reader, catalog, secret, &dek)
-}
-
-/// Add missing wraps for an explicit recipient set using one existing reader.
-pub fn share_version<R: BlobStoreGet>(
-    reader: &R,
-    catalog: &VaultCatalog,
-    secret: Id,
-    signing_key: &SigningKey,
-    recipients: &BTreeSet<RecipientPublicKey>,
-) -> Result<SharedVersion> {
-    if !catalog.secrets.contains_key(&secret) {
-        bail!("secret {secret} not found");
-    }
-    let mut missing = Vec::new();
-    let existing = catalog.wrap_holders(secret);
-    for recipient in recipients {
-        if !existing.contains(recipient) {
-            missing.push((*recipient, box_pk_from_ed25519(recipient)?));
-        }
-    }
-    let dek = recover_dek(reader, catalog, secret, signing_key)?;
-    if missing.is_empty() {
-        return Ok(SharedVersion {
-            fragment: Fragment::empty(),
-            new_recipient_count: 0,
-        });
-    }
-    let mut fragment = Fragment::empty();
-    for (recipient, public) in &missing {
-        let sealed = DryocBox::seal_to_vecbox(&dek, public)
-            .map_err(|error| anyhow!("seal to recipient: {error:?}"))?
-            .to_vec();
-        fragment += recipient_wrap_fragment(genid().id, secret, *recipient, sealed)?;
-    }
-    Ok(SharedVersion {
-        fragment,
-        new_recipient_count: missing.len(),
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand_core::OsRng;
-    use triblespace::core::authority::{self, AuthorityGrant, AuthorityMode, ACTION_WRITE};
     use triblespace::core::blob::IntoBlob;
+    use triblespace::core::capability::{CapabilityGrant, CapabilityProofStep};
     use triblespace::core::collection::descriptor as descriptor_facts;
     use triblespace::core::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
@@ -840,8 +1219,28 @@ mod tests {
     }
 
     fn at(second: i64) -> IntervalValue {
-        let epoch = hifitime::Epoch::from_unix_seconds(second as f64);
+        let epoch = Epoch::from_unix_seconds(second as f64);
         (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    fn atom(collection: CollectionHandle, action: Id) -> CapabilityAtom {
+        CapabilityAtom::new(
+            CapabilityAction::new(action),
+            CapabilityResource::from(collection),
+        )
+    }
+
+    fn root_proof(
+        root: &SigningKey,
+        subject: VerifyingKey,
+        collection: CollectionHandle,
+        action: Id,
+        mode: CapabilityMode,
+    ) -> CapabilityProof {
+        CapabilityProof::new(vec![CapabilityProofStep::issue(
+            root,
+            CapabilityGrant::root(subject, atom(collection, action), mode, None),
+        )])
     }
 
     fn catalog_from_fragment(vault: Id, fragment: &mut Fragment) -> VaultCatalog {
@@ -851,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn base36_roundtrips_full_range_and_preserves_leading_zeros() {
+    fn base36_roundtrips_full_range_and_rejects_noncanonical_names() {
         assert_eq!(
             format!("{ACTION_READ:X}"),
             "A6378B816786E9F08A579B8E5F8F4FF4"
@@ -859,13 +1258,9 @@ mod tests {
         let one = Id::new(1u128.to_be_bytes()).unwrap();
         assert_eq!(vault_name(one).as_str(), "vault-0000000000000000000000001");
         for value in [1, 35, 36, u64::MAX as u128, u128::MAX] {
-            let id = Id::new(value.to_be_bytes()).unwrap();
-            assert_eq!(parse_vault_name(&vault_name(id)).unwrap(), id);
+            let value = Id::new(value.to_be_bytes()).unwrap();
+            assert_eq!(parse_vault_name(&vault_name(value)).unwrap(), value);
         }
-    }
-
-    #[test]
-    fn base36_rejects_malformed_noncanonical_and_out_of_range_names() {
         for malformed in [
             "other-0000000000000000000000001",
             "vault-000000000000000000000001",
@@ -875,21 +1270,30 @@ mod tests {
             let name = CollectionName::new(malformed).unwrap();
             assert!(parse_vault_name(&name).is_err(), "accepted {malformed}");
         }
-        assert!(CollectionName::new("vault-000000000000000000000000A").is_err());
     }
 
     #[test]
-    fn descriptor_roundtrip_is_exact_private_simplearchive_union() {
+    fn descriptor_is_exact_private_union_with_namespace_and_authority() {
         let vault = id(7);
-        let team = key(1).verifying_key();
-        let descriptor = vault_descriptor(vault, team);
+        let namespace = key(1).verifying_key();
+        let authority = key(2).verifying_key();
+        let descriptor = vault_descriptor(vault, namespace, authority);
+
         assert_eq!(
             descriptor_facts::name(descriptor.facts()).unwrap().unwrap(),
             vault_name(vault)
         );
         assert_eq!(
-            descriptor_facts::team(descriptor.facts()).unwrap().unwrap(),
-            team
+            descriptor_facts::namespace(descriptor.facts())
+                .unwrap()
+                .unwrap(),
+            namespace
+        );
+        assert_eq!(
+            descriptor_facts::authority(descriptor.facts())
+                .unwrap()
+                .unwrap(),
+            authority
         );
         assert_eq!(
             descriptor_facts::representation(descriptor.facts()).unwrap(),
@@ -901,242 +1305,223 @@ mod tests {
         );
         assert!(!reach::travels(descriptor.facts()));
         assert_eq!(
-            vault_handle(vault, team),
+            vault_handle(vault, namespace, authority),
             descriptor.into_facts().to_blob().get_handle()
+        );
+        assert_ne!(
+            vault_handle(vault, namespace, authority),
+            vault_handle(vault, namespace, key(3).verifying_key())
+        );
+        assert_ne!(
+            vault_handle(vault, namespace, authority),
+            vault_handle(vault, key(4).verifying_key(), authority)
         );
     }
 
     #[test]
-    fn header_only_genesis_is_one_exact_valid_vault() {
+    fn legacy_header_stays_three_facts_and_custody_genesis_is_five() {
         let vault = id(8);
-        let mut genesis = vault_header_fragment(vault, "production", at(1)).unwrap();
+        let custody = SigningKey::generate(&mut OsRng);
+
+        let mut legacy = legacy_vault_header_fragment(vault, "production", at(1)).unwrap();
+        assert_eq!(legacy.root(), Some(vault));
+        assert_eq!(legacy.facts().len(), 3);
+        let legacy_catalog = catalog_from_fragment(vault, &mut legacy);
+        assert_eq!(legacy_catalog.header.id, vault);
+        assert!(legacy_catalog.custody.is_none());
+
+        let mut genesis = vault_header_fragment(
+            vault,
+            "production",
+            at(1),
+            custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
         assert_eq!(genesis.root(), Some(vault));
-        assert_eq!(genesis.facts().len(), 3);
+        assert_eq!(genesis.facts().len(), 5);
         let catalog = catalog_from_fragment(vault, &mut genesis);
-        assert_eq!(catalog.header.id, vault);
+        assert_eq!(
+            catalog.custody.unwrap().public_key,
+            custody.verifying_key().to_bytes()
+        );
         assert!(catalog.secrets.is_empty());
         assert!(catalog.wraps.is_empty());
     }
 
     #[test]
-    fn read_projection_is_exact_delegated_invoke_only_and_deduplicated() {
-        let root = key(1);
-        let delegate = key(2);
-        let direct = key(3);
-        let child = key(4);
-        let delegate_only = key(5);
-        let wrong = key(6);
-        let team = root.verifying_key();
-        let target = vault_handle(id(7), team);
-        let other = vault_handle(id(8), team);
-        let mut repo = MemoryRepo::default();
-
-        for mode in [AuthorityMode::Invoke, AuthorityMode::InvokeAndDelegate] {
-            authority::publish_grant(
-                &mut repo,
-                team,
-                &root,
-                AuthorityGrant::root(direct.verifying_key(), target, ACTION_READ, mode),
-            )
-            .unwrap();
-        }
-        let parent = authority::publish_grant(
-            &mut repo,
-            team,
-            &root,
-            AuthorityGrant::root(
-                delegate.verifying_key(),
-                target,
-                ACTION_READ,
-                AuthorityMode::Delegate,
-            ),
-        )
-        .unwrap();
-        authority::publish_grant(
-            &mut repo,
-            team,
-            &delegate,
-            AuthorityGrant::delegated(
-                parent.id(),
-                child.verifying_key(),
-                target,
-                ACTION_READ,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-        authority::publish_grant(
-            &mut repo,
-            team,
-            &root,
-            AuthorityGrant::root(
-                delegate_only.verifying_key(),
-                target,
-                ACTION_READ,
-                AuthorityMode::Delegate,
-            ),
-        )
-        .unwrap();
-        authority::publish_grant(
-            &mut repo,
-            team,
-            &root,
-            AuthorityGrant::root(
-                wrong.verifying_key(),
-                target,
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-        authority::publish_grant(
-            &mut repo,
-            team,
-            &root,
-            AuthorityGrant::root(
-                wrong.verifying_key(),
-                other,
-                ACTION_READ,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-
-        let resolved = authority::resolve_authority(&mut repo, team).unwrap();
-        assert_eq!(
-            read_authority_recipient_keys(&resolved, target),
-            BTreeSet::from([
-                direct.verifying_key().to_bytes(),
-                child.verifying_key().to_bytes(),
-            ])
-        );
-    }
-
-    #[test]
-    fn sealing_opening_sharing_and_outsider_refusal_use_direct_keys() {
+    fn one_custody_wrap_opens_only_with_the_matching_custody_key() {
         let vault = id(9);
-        let alice = SigningKey::generate(&mut OsRng);
-        let bob = SigningKey::generate(&mut OsRng);
+        let custody = SigningKey::generate(&mut OsRng);
         let outsider = SigningKey::generate(&mut OsRng);
-        let mut recipients = BTreeSet::from([alice.verifying_key().to_bytes()]);
-        let sealed = seal_version("database", b"hunter2", &recipients, at(2)).unwrap();
+        let sealed = seal_version(
+            "database",
+            b"hunter2",
+            custody.verifying_key().to_bytes(),
+            at(2),
+        )
+        .unwrap();
         let secret = sealed.secret;
-        assert_eq!(sealed.recipient_count, 1);
-        let mut fragment = vault_header_fragment(vault, "production", at(1)).unwrap();
+        let mut fragment = vault_header_fragment(
+            vault,
+            "production",
+            at(1),
+            custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
         fragment += sealed.fragment;
+
         let catalog = catalog_from_fragment(vault, &mut fragment);
+        assert_eq!(catalog.wraps.len(), 1);
+        assert_eq!(
+            catalog
+                .wraps_for(secret, custody.verifying_key().to_bytes())
+                .len(),
+            1
+        );
         let reader = fragment.blobs_mut().reader().unwrap();
         assert_eq!(
-            open_version(&reader, &catalog, secret, &alice).unwrap(),
+            open_version(&reader, &catalog, secret, &custody).unwrap(),
             b"hunter2"
         );
         assert!(open_version(&reader, &catalog, secret, &outsider).is_err());
-
-        recipients.insert(bob.verifying_key().to_bytes());
-        let shared = share_version(&reader, &catalog, secret, &alice, &recipients).unwrap();
-        assert_eq!(shared.new_recipient_count, 1);
-        drop(reader);
-        fragment += shared.fragment;
-        let catalog = catalog_from_fragment(vault, &mut fragment);
-        let reader = fragment.blobs_mut().reader().unwrap();
-        assert_eq!(
-            open_version(&reader, &catalog, secret, &bob).unwrap(),
-            b"hunter2"
-        );
     }
 
     #[test]
-    fn aggregate_snapshot_uses_exact_ids_and_retains_historical_wraps() {
-        let vault_a = id(30);
-        let vault_b = id(31);
-        let alice = SigningKey::generate(&mut OsRng);
-        let bob = SigningKey::generate(&mut OsRng);
-        let historical = SigningKey::generate(&mut OsRng);
-
-        let sealed_a = seal_version(
+    fn migration_rewraps_only_the_dek_and_preserves_the_encrypted_body() {
+        let vault = id(60);
+        let direct_reader = SigningKey::generate(&mut OsRng);
+        let custody = SigningKey::generate(&mut OsRng);
+        let sealed = seal_version(
             "database",
-            b"alpha",
-            &BTreeSet::from([
-                alice.verifying_key().to_bytes(),
-                historical.verifying_key().to_bytes(),
-            ]),
+            b"unchanged ciphertext",
+            direct_reader.verifying_key().to_bytes(),
             at(2),
         )
         .unwrap();
-        let secret_a = sealed_a.secret;
-        let sealed_b = seal_version(
-            "database",
-            b"beta",
-            &BTreeSet::from([bob.verifying_key().to_bytes()]),
-            at(3),
+        let secret = sealed.secret;
+        let mut fragment = legacy_vault_header_fragment(vault, "legacy", at(1)).unwrap();
+        fragment += sealed.fragment;
+        let direct_catalog = catalog_from_fragment(vault, &mut fragment);
+        let original_body = direct_catalog.secrets[&secret].body;
+        let reader = fragment.blobs_mut().reader().unwrap();
+        let custody_wrap = rewrap_version_for_migration(
+            &reader,
+            &direct_catalog,
+            secret,
+            &direct_reader,
+            custody.verifying_key().to_bytes(),
+            id(61),
         )
         .unwrap();
-        let secret_b = sealed_b.secret;
+        drop(reader);
 
-        let mut fragment_a = vault_header_fragment(vault_a, "alpha", at(1)).unwrap();
-        fragment_a += sealed_a.fragment;
-        let facts_a = fragment_a.facts().clone();
-        let mut fragment_b = vault_header_fragment(vault_b, "beta", at(1)).unwrap();
-        fragment_b += sealed_b.fragment;
-        let facts_b = fragment_b.facts().clone();
-
-        let mut blobs = Fragment::empty();
-        blobs += fragment_a;
-        blobs += fragment_b;
-        let reader = blobs.blobs_mut().reader().unwrap();
-        let snapshot =
-            SecretsSnapshot::new(reader, [(vault_b, facts_b), (vault_a, facts_a.clone())]).unwrap();
-
+        fragment += custody_record(custody.verifying_key().to_bytes());
+        fragment += custody_wrap;
+        let catalog = catalog_from_fragment(vault, &mut fragment);
+        assert_eq!(catalog.secrets[&secret].body, original_body);
+        let reader = fragment.blobs_mut().reader().unwrap();
         assert_eq!(
-            snapshot.vaults().keys().copied().collect::<Vec<_>>(),
-            vec![vault_a, vault_b]
+            open_version(&reader, &catalog, secret, &custody).unwrap(),
+            b"unchanged ciphertext"
         );
-        assert_eq!(snapshot.vault(vault_a).unwrap().facts(), &facts_a);
-        assert!(snapshot.contains(secret_a));
-        assert!(snapshot.contains(secret_b));
-        assert!(!snapshot.contains(id(99)));
-        assert_eq!(snapshot.lookup(secret_a).unwrap().0, vault_a);
-        assert_eq!(snapshot.lookup(secret_b).unwrap().0, vault_b);
-        assert!(snapshot.lookup(id(99)).is_none());
-        assert_eq!(snapshot.open(secret_a, &alice).unwrap(), b"alpha");
-        assert_eq!(snapshot.open(secret_b, &bob).unwrap(), b"beta");
-        assert!(snapshot.open(secret_a, &bob).is_err());
-        assert!(snapshot.open(id(99), &alice).is_err());
-
-        // The aggregate accepts no current READ-member set and therefore
-        // retains the historical recipient's immutable wrap verbatim.
-        assert_eq!(
-            snapshot
-                .vault(vault_a)
-                .unwrap()
-                .catalog()
-                .wrap_holders(secret_a),
-            BTreeSet::from([
-                alice.verifying_key().to_bytes(),
-                historical.verifying_key().to_bytes(),
-            ])
-        );
-        assert_eq!(snapshot.open(secret_a, &historical).unwrap(), b"alpha");
     }
 
     #[test]
-    fn aggregate_snapshot_rejects_cross_vault_secret_ids_and_duplicate_vault_inputs() {
-        let vault_a = id(32);
-        let vault_b = id(33);
-        let alice = SigningKey::generate(&mut OsRng);
+    fn catalog_rejects_missing_duplicate_or_competing_custody_rows_and_wraps() {
+        let vault = id(10);
+        let custody = SigningKey::generate(&mut OsRng);
+        let other = SigningKey::generate(&mut OsRng);
+
+        let sealed_for_other = seal_version(
+            "database",
+            b"hunter2",
+            other.verifying_key().to_bytes(),
+            at(2),
+        )
+        .unwrap();
+        let mut missing = vault_header_fragment(
+            vault,
+            "production",
+            at(1),
+            custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        missing += sealed_for_other.fragment;
+        let error = load_catalog(vault, missing.facts()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("0 custody wraps"),
+            "{error:#}"
+        );
+
+        let sealed = seal_version(
+            "database",
+            b"hunter2",
+            custody.verifying_key().to_bytes(),
+            at(2),
+        )
+        .unwrap();
+        let secret = sealed.secret;
+        let mut duplicate_wrap = vault_header_fragment(
+            vault,
+            "production",
+            at(1),
+            custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        duplicate_wrap += sealed.fragment;
+        let extra = DryocBox::seal_to_vecbox(
+            &Key::gen(),
+            &box_pk_from_ed25519(&custody.verifying_key().to_bytes()).unwrap(),
+        )
+        .unwrap()
+        .to_vec();
+        duplicate_wrap +=
+            recipient_wrap_fragment(id(90), secret, custody.verifying_key().to_bytes(), extra)
+                .unwrap();
+        let error = load_catalog(vault, duplicate_wrap.facts()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("2 custody wraps"),
+            "{error:#}"
+        );
+
+        let mut competing_custody = vault_header_fragment(
+            vault,
+            "production",
+            at(1),
+            custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        competing_custody += custody_record(other.verifying_key().to_bytes());
+        let error = load_catalog(vault, competing_custody.facts()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("2 custody declarations"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_duplicate_vaults_and_secret_ids_across_vaults() {
+        let vault_a = id(30);
+        let vault_b = id(31);
+        let custody = SigningKey::generate(&mut OsRng);
         let sealed = seal_version(
             "database",
             b"shared identity",
-            &BTreeSet::from([alice.verifying_key().to_bytes()]),
+            custody.verifying_key().to_bytes(),
             at(2),
         )
         .unwrap();
         let secret = sealed.secret;
 
-        let mut fragment_a = vault_header_fragment(vault_a, "alpha", at(1)).unwrap();
+        let mut fragment_a =
+            vault_header_fragment(vault_a, "alpha", at(1), custody.verifying_key().to_bytes())
+                .unwrap();
         fragment_a += sealed.fragment.clone();
         let facts_a = fragment_a.facts().clone();
-        let mut fragment_b = vault_header_fragment(vault_b, "beta", at(1)).unwrap();
+
+        let mut fragment_b =
+            vault_header_fragment(vault_b, "beta", at(1), custody.verifying_key().to_bytes())
+                .unwrap();
         fragment_b += sealed.fragment;
         let facts_b = fragment_b.facts().clone();
 
@@ -1144,6 +1529,7 @@ mod tests {
         blobs += fragment_a;
         blobs += fragment_b;
         let reader = blobs.blobs_mut().reader().unwrap();
+
         let error = SecretsSnapshot::new(
             reader.clone(),
             [(vault_a, facts_a.clone()), (vault_b, facts_b)],
@@ -1165,82 +1551,192 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_snapshot_strictly_validates_attachments() {
-        let vault = id(34);
-        let alice = SigningKey::generate(&mut OsRng);
-        let recipient = alice.verifying_key().to_bytes();
-        let mut malformed = vault_header_fragment(vault, "production", at(1)).unwrap();
-        let name = malformed.put("broken".to_owned());
-        let body = malformed.put::<blobencodings::RawBytes, _>(vec![0; 23]);
-        let secret = id(35);
-        malformed += secret_record(secret, name, body, at(2));
-        let sealed =
-            DryocBox::seal_to_vecbox(&Key::gen(), &box_pk_from_ed25519(&recipient).unwrap())
-                .unwrap()
-                .to_vec();
-        malformed += recipient_wrap_fragment(id(36), secret, recipient, sealed).unwrap();
-
-        // Structural loading succeeds, so this specifically proves the
-        // aggregate constructor performs attachment-aware vault validation.
-        load_catalog(vault, malformed.facts()).unwrap();
-        let facts = malformed.facts().clone();
-        let reader = malformed.blobs_mut().reader().unwrap();
-        let error = SecretsSnapshot::new(reader, [(vault, facts)])
-            .err()
-            .expect("malformed body attachment must fail");
-        let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains(&format!("validate vault {vault}")),
-            "{rendered}"
+    fn vault_access_binds_exact_read_and_write_proofs() {
+        let vault = id(40);
+        let root = key(1);
+        let namespace = key(2).verifying_key();
+        let subject = key(3);
+        let outsider = key(4);
+        let custody = SigningKey::generate(&mut OsRng);
+        let collection = vault_handle(vault, namespace, root.verifying_key());
+        let read = root_proof(
+            &root,
+            subject.verifying_key(),
+            collection,
+            ACTION_READ,
+            CapabilityMode::InvokeAndDelegate,
         );
-        assert!(rendered.contains("too short"), "{rendered}");
-    }
+        let write = root_proof(
+            &root,
+            subject.verifying_key(),
+            collection,
+            ACTION_WRITE,
+            CapabilityMode::Invoke,
+        );
+        write
+            .verify_claim(
+                root.verifying_key(),
+                triblespace::core::clock::epoch_now(),
+                CapabilityClaim::new(
+                    subject.verifying_key(),
+                    atom(collection, ACTION_WRITE),
+                    CapabilityMode::Invoke,
+                ),
+            )
+            .unwrap();
 
-    #[test]
-    fn duplicate_wraps_must_open_to_one_dek() {
-        let vault = id(10);
-        let alice = SigningKey::generate(&mut OsRng);
-        let recipient = alice.verifying_key().to_bytes();
-        let sealed =
-            seal_version("database", b"hunter2", &BTreeSet::from([recipient]), at(2)).unwrap();
+        let access = VaultAccess::new(
+            vault,
+            namespace,
+            root.verifying_key(),
+            subject.verifying_key(),
+            SigningKey::from_bytes(&custody.to_bytes()),
+            vec![read.clone()],
+            vec![CapabilityPresentation::new(
+                subject.verifying_key(),
+                write.clone(),
+            )],
+        )
+        .unwrap();
+
+        let sealed = seal_version(
+            "database",
+            b"hunter2",
+            custody.verifying_key().to_bytes(),
+            at(2),
+        )
+        .unwrap();
         let secret = sealed.secret;
-        let mut fragment = vault_header_fragment(vault, "production", at(1)).unwrap();
+        let mut fragment = vault_header_fragment(
+            vault,
+            "production",
+            at(1),
+            custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
         fragment += sealed.fragment;
-        let catalog = catalog_from_fragment(vault, &mut fragment);
-        let reader = fragment.blobs_mut().reader().unwrap();
-        let dek = recover_dek(&reader, &catalog, secret, &alice).unwrap();
-        drop(reader);
+        let facts = fragment.facts().clone();
 
-        let public = box_pk_from_ed25519(&recipient).unwrap();
-        let same = DryocBox::seal_to_vecbox(&dek, &public).unwrap().to_vec();
-        fragment += recipient_wrap_fragment(id(90), secret, recipient, same).unwrap();
-        let catalog = catalog_from_fragment(vault, &mut fragment);
-        let reader = fragment.blobs_mut().reader().unwrap();
-        assert_eq!(
-            open_version(&reader, &catalog, secret, &alice).unwrap(),
-            b"hunter2"
+        let mut authorized = vault_collection(
+            MemoryRepo::default(),
+            vault,
+            namespace,
+            SigningKey::from_bytes(&subject.to_bytes()),
+            access.admission(),
         );
-        drop(reader);
+        authorized.commit(fragment.clone()).unwrap();
 
-        let competing = DryocBox::seal_to_vecbox(&Key::gen(), &public)
-            .unwrap()
-            .to_vec();
-        fragment += recipient_wrap_fragment(id(91), secret, recipient, competing).unwrap();
-        let catalog = catalog_from_fragment(vault, &mut fragment);
         let reader = fragment.blobs_mut().reader().unwrap();
-        let error = open_version(&reader, &catalog, secret, &alice).unwrap_err();
-        assert!(format!("{error:#}").contains("competing DEKs"), "{error:#}");
+        let snapshot =
+            SecretsSnapshot::new_accessible(reader.clone(), [(vault, facts.clone(), access)])
+                .unwrap();
+        assert_eq!(snapshot.open(secret, &subject).unwrap(), b"hunter2");
+        assert!(snapshot.open(secret, &outsider).is_err());
+
+        let wrong_resource = vault_handle(id(41), namespace, root.verifying_key());
+        let wrong_read = root_proof(
+            &root,
+            subject.verifying_key(),
+            wrong_resource,
+            ACTION_READ,
+            CapabilityMode::Invoke,
+        );
+        assert!(VaultAccess::new(
+            vault,
+            namespace,
+            root.verifying_key(),
+            subject.verifying_key(),
+            SigningKey::from_bytes(&custody.to_bytes()),
+            vec![wrong_read],
+            vec![CapabilityPresentation::new(
+                subject.verifying_key(),
+                write.clone(),
+            )],
+        )
+        .is_err());
+
+        let wrong_subject_read = root_proof(
+            &root,
+            outsider.verifying_key(),
+            collection,
+            ACTION_READ,
+            CapabilityMode::Invoke,
+        );
+        assert!(VaultAccess::new(
+            vault,
+            namespace,
+            root.verifying_key(),
+            subject.verifying_key(),
+            SigningKey::from_bytes(&custody.to_bytes()),
+            vec![wrong_subject_read],
+            vec![CapabilityPresentation::new(
+                subject.verifying_key(),
+                write.clone(),
+            )],
+        )
+        .is_err());
+
+        let wrong_custody = SigningKey::generate(&mut OsRng);
+        let wrong_custody_access = VaultAccess::new(
+            vault,
+            namespace,
+            root.verifying_key(),
+            subject.verifying_key(),
+            wrong_custody,
+            vec![read.clone()],
+            vec![CapabilityPresentation::new(
+                subject.verifying_key(),
+                write.clone(),
+            )],
+        )
+        .unwrap();
+        assert!(SecretsSnapshot::new_accessible(
+            reader.clone(),
+            [(vault, facts.clone(), wrong_custody_access)],
+        )
+        .is_err());
+
+        let wrong_write = root_proof(
+            &root,
+            subject.verifying_key(),
+            wrong_resource,
+            ACTION_WRITE,
+            CapabilityMode::Invoke,
+        );
+        assert!(VaultAccess::new(
+            vault,
+            namespace,
+            root.verifying_key(),
+            subject.verifying_key(),
+            custody,
+            vec![read],
+            vec![CapabilityPresentation::new(
+                subject.verifying_key(),
+                wrong_write,
+            )],
+        )
+        .is_err());
     }
 
     #[test]
-    fn strict_shape_rejects_extra_facts_multiple_headers_and_dangling_wraps() {
-        let vault = id(11);
-        let alice = SigningKey::generate(&mut OsRng);
-        let recipient = alice.verifying_key().to_bytes();
-        let sealed =
-            seal_version("database", b"hunter2", &BTreeSet::from([recipient]), at(2)).unwrap();
+    fn strict_shape_and_attachment_validation_rejects_unaccounted_or_bad_data() {
+        let vault = id(50);
+        let custody = SigningKey::generate(&mut OsRng);
+        let sealed = seal_version(
+            "database",
+            b"hunter2",
+            custody.verifying_key().to_bytes(),
+            at(2),
+        )
+        .unwrap();
         let secret = sealed.secret;
-        let mut valid = vault_header_fragment(vault, "production", at(1)).unwrap();
+        let mut valid = vault_header_fragment(
+            vault,
+            "production",
+            at(1),
+            custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
         valid += sealed.fragment;
         catalog_from_fragment(vault, &mut valid);
 
@@ -1250,55 +1746,35 @@ mod tests {
         };
         assert!(load_catalog(vault, extra.facts()).is_err());
 
-        let mut conflicting = valid.clone();
-        let current = load_catalog(vault, conflicting.facts()).unwrap();
-        let body = conflicting.put::<blobencodings::RawBytes, _>(vec![0; SECRET_BODY_MIN_BYTES]);
-        conflicting += secret_record(secret, current.secrets[&secret].name, body, at(2));
-        let error = load_catalog(vault, conflicting.facts()).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("2 values for secret_body"),
-            "{error:#}"
-        );
+        let mut malformed = vault_header_fragment(
+            vault,
+            "production",
+            at(1),
+            custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        let name = malformed.put("broken".to_owned());
+        let body = malformed.put::<blobencodings::RawBytes, _>(vec![0; 23]);
+        let malformed_secret = id(51);
+        malformed += secret_record(malformed_secret, name, body, at(2));
+        let wrapped = DryocBox::seal_to_vecbox(
+            &Key::gen(),
+            &box_pk_from_ed25519(&custody.verifying_key().to_bytes()).unwrap(),
+        )
+        .unwrap()
+        .to_vec();
+        malformed += recipient_wrap_fragment(
+            id(52),
+            malformed_secret,
+            custody.verifying_key().to_bytes(),
+            wrapped,
+        )
+        .unwrap();
 
-        let mut multiple = valid.clone();
-        multiple += vault_header_fragment(id(12), "other", at(3)).unwrap();
-        assert!(load_catalog(vault, multiple.facts()).is_err());
-
-        let sealed_dek =
-            DryocBox::seal_to_vecbox(&Key::gen(), &box_pk_from_ed25519(&recipient).unwrap())
-                .unwrap()
-                .to_vec();
-        let mut dangling = vault_header_fragment(vault, "production", at(1)).unwrap();
-        dangling += recipient_wrap_fragment(id(92), id(99), recipient, sealed_dek).unwrap();
-        assert!(load_catalog(vault, dangling.facts()).is_err());
-    }
-
-    #[test]
-    fn validation_rejects_malformed_attachments_without_read_set_comparison() {
-        let vault = id(13);
-        let alice = SigningKey::generate(&mut OsRng);
-        let recipient = alice.verifying_key().to_bytes();
-        let mut fragment = vault_header_fragment(vault, "production", at(1)).unwrap();
-        let name = fragment.put("broken".to_owned());
-        let body = fragment.put::<blobencodings::RawBytes, _>(vec![0; 23]);
-        let secret = id(20);
-        fragment += secret_record(secret, name, body, at(2));
-        let sealed =
-            DryocBox::seal_to_vecbox(&Key::gen(), &box_pk_from_ed25519(&recipient).unwrap())
-                .unwrap()
-                .to_vec();
-        fragment += recipient_wrap_fragment(id(21), secret, recipient, sealed).unwrap();
-        let facts = fragment.facts().clone();
-        let reader = fragment.blobs_mut().reader().unwrap();
+        load_catalog(vault, malformed.facts()).unwrap();
+        let facts = malformed.facts().clone();
+        let reader = malformed.blobs_mut().reader().unwrap();
         let error = validate_catalog(&reader, vault, &facts).unwrap_err();
         assert!(format!("{error:#}").contains("too short"), "{error:#}");
-
-        // Historical wraps are intentionally valid even when an unrelated
-        // authority projection would now return a different recipient set.
-        let mut proper = vault_header_fragment(vault, "production", at(1)).unwrap();
-        proper += seal_version("database", b"hunter2", &BTreeSet::from([recipient]), at(2))
-            .unwrap()
-            .fragment;
-        catalog_from_fragment(vault, &mut proper);
     }
 }

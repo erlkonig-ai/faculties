@@ -2938,22 +2938,45 @@ mod tests {
 
     #[test]
     fn auth_reference_validation_uses_exact_vault_snapshot_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("teams-secrets.pile");
+        std::fs::File::create(&path).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
         let signer = SigningKey::from_bytes(&[0x31; 32]);
-        let recipients = BTreeSet::from([signer.verifying_key().to_bytes()]);
         let vault = Id::new([0x32; 16]).unwrap();
-        let sealed =
-            crate::secrets::seal_version("same-name", b"exact", &recipients, point(2.0)).unwrap();
-        let exact = sealed.secret;
-        let later =
-            crate::secrets::seal_version("same-name", b"later", &recipients, point(3.0)).unwrap();
-        assert_ne!(exact, later.secret);
-        let mut vault_fragment =
-            crate::secrets::vault_header_fragment(vault, "teams", point(1.0)).unwrap();
-        vault_fragment += sealed.fragment;
-        vault_fragment += later.fragment;
-        let vault_facts = vault_fragment.facts().clone();
-        let reader = vault_fragment.blobs_mut().reader().unwrap();
-        let secrets = SecretsSnapshot::new(reader, [(vault, vault_facts)]).unwrap();
+        let location =
+            crate::secrets::storage::create_vault(&mut pile, &signer, vault, "teams", point(1.0))
+                .unwrap();
+
+        let discovery = crate::secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
+        let exact = crate::secrets::storage::add_secret(
+            &mut pile,
+            &signer,
+            &location,
+            discovery.snapshot(),
+            "same-name",
+            b"exact",
+            point(2.0),
+        )
+        .unwrap();
+        drop(discovery);
+
+        let discovery = crate::secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
+        let later = crate::secrets::storage::add_secret(
+            &mut pile,
+            &signer,
+            &location,
+            discovery.snapshot(),
+            "same-name",
+            b"later",
+            point(3.0),
+        )
+        .unwrap();
+        assert_ne!(exact, later);
+        drop(discovery);
+
+        let discovery = crate::secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
+        let secrets = discovery.snapshot();
         assert_eq!(secrets.open(exact, &signer).unwrap(), b"exact");
 
         let source_identity = source_fragment("tenant.example");
@@ -2970,7 +2993,7 @@ mod tests {
         .unwrap();
         let mut teams = source_identity;
         teams += profile;
-        validate_auth_secret_references(teams.facts(), &secrets).unwrap();
+        validate_auth_secret_references(teams.facts(), secrets).unwrap();
 
         let unknown = Id::new([0x33; 16]).unwrap();
         let (profile, _) = auth_profile_fragment(
@@ -2985,8 +3008,11 @@ mod tests {
         .unwrap();
         let mut dangling = source_fragment("tenant.example");
         dangling += profile;
-        let error = validate_auth_secret_references(dangling.facts(), &secrets).unwrap_err();
+        let error = validate_auth_secret_references(dangling.facts(), secrets).unwrap_err();
         assert!(format!("{error:#}").contains(&format!("{unknown:x}")));
+
+        drop(discovery);
+        pile.close().unwrap();
     }
 
     #[test]

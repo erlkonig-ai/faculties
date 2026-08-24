@@ -237,7 +237,6 @@ impl Storage<'_> {
             plaintext,
             point_now()?,
         )
-        .map(|(secret, _)| secret)
         .context("seal and publish Headspace credential version")
     }
 
@@ -960,10 +959,7 @@ mod tests {
         let pile = directory.path().join("headspace.pile");
         let key = directory.path().join("headspace.key");
         File::create(&pile).unwrap();
-        let signer = initialize_signer(&pile, Some(&key)).unwrap();
-        let mut store = open_pile_strict(&pile).unwrap();
-        faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
         (directory, pile, key)
     }
 
@@ -1047,7 +1043,7 @@ mod tests {
         )
         .unwrap();
         let discovery = vaults::discover_local_vaults(&mut store, &signer).unwrap();
-        let (version, _) = vaults::add_secret(
+        let version = vaults::add_secret(
             &mut store,
             &signer,
             &location,

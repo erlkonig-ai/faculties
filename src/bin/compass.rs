@@ -1074,9 +1074,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::storage::{
-        ensure_team_of_one_write_authority, initialize_signer, open_pile_strict,
-    };
+    use faculties::storage::initialize_signer;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
@@ -1141,10 +1139,7 @@ mod tests {
         let pile = directory.0.join("compass.pile");
         let key = directory.0.join("compass.key");
         std::fs::File::create(&pile).unwrap();
-        let signer = initialize_signer(&pile, Some(&key)).unwrap();
-        let mut store = open_pile_strict(&pile).unwrap();
-        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
         let storage = CompassStorage {
             pile: &pile,
             key: Some(&key),

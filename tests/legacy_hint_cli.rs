@@ -3,15 +3,14 @@
 //! The unit tests in `faculties::legacy_hint` prove the predicate. This proves
 //! the delivery: someone who upgrades and runs a real faculty against a
 //! pre-collection pile sees the hint, on stderr, without it breaking the
-//! command — and stops seeing it once that native history has explicit WRITE
-//! authority.
+//! command — and stops seeing it once native history exists.
 
 use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 
 use faculties::schemas::compass::{board, KIND_GOAL_ID};
-use faculties::storage::{ensure_team_of_one_write_authority, initialize_signer, open_pile_strict};
+use faculties::storage::{initialize_signer, open_pile_strict};
 use triblespace::core::collection::simplearchive_union;
 use triblespace::core::metadata;
 use triblespace::macros::entity;
@@ -91,7 +90,7 @@ fn a_legacy_only_pile_tells_the_operator_how_to_migrate() {
 }
 
 #[test]
-fn pre_authority_native_history_is_explained_then_becomes_visible() {
+fn open_admission_native_history_is_immediately_visible() {
     let directory = tempfile::TempDir::new().unwrap();
     let pile_path = legacy_only_pile(directory.path());
 
@@ -112,29 +111,14 @@ fn pre_authority_native_history_is_explained_then_becomes_visible() {
     .unwrap();
     pile.close().unwrap();
 
-    let before = compass_list(&pile_path);
-    let stderr = String::from_utf8_lossy(&before.stderr);
-    let stdout = String::from_utf8_lossy(&before.stdout);
-    assert!(before.status.success(), "{stderr}");
-    assert!(stderr.contains("faculty-write-authority"), "{stderr}");
-    assert!(
-        !stdout.contains("a native goal"),
-        "an ungranted commit must remain inert: {stdout}"
-    );
-
-    let mut pile = open_pile_strict(&pile_path).unwrap();
-    ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-    pile.close().unwrap();
-
-    let after = compass_list(&pile_path);
-    let stderr = String::from_utf8_lossy(&after.stderr);
-    let stdout = String::from_utf8_lossy(&after.stdout);
-    assert!(after.status.success(), "{stderr}");
-    assert!(!stderr.contains("faculty-write-authority"), "{stderr}");
+    let output = compass_list(&pile_path);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stderr}");
     assert!(!stderr.contains("legacy `compass`"), "{stderr}");
     assert!(
         stdout.contains("a native goal"),
-        "the same historical commit becomes visible after the additive grant: {stdout}"
+        "a strictly verified commit is visible immediately: {stdout}"
     );
 }
 

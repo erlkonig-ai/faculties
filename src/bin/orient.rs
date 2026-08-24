@@ -1981,9 +1981,6 @@ mod tests {
             let path = dir.join("test.pile");
             fs::File::create(&path).unwrap();
             let signer = SigningKey::generate(&mut rand_core::OsRng);
-            let mut pile = open_pile_strict(&path).unwrap();
-            faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-            pile.close().unwrap();
             Self { dir, path, signer }
         }
     }

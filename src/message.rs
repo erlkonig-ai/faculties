@@ -858,7 +858,7 @@ mod tests {
         DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID, KIND_GROUP, KIND_PERSON_ID,
     };
     use crate::storage::{discover_target, open_pile_strict};
-    use crate::test_support::initialize_team_of_one_write_fixture;
+    use crate::test_support::initialize_open_collection_fixture;
     use hifitime::Epoch;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
@@ -1366,7 +1366,7 @@ mod tests {
         let pile_path = directory.0.join("messages.pile");
         let key_path = directory.0.join("messages.key");
         File::create(&pile_path).unwrap();
-        let signer = initialize_team_of_one_write_fixture(&pile_path, Some(&key_path));
+        let signer = initialize_open_collection_fixture(&pile_path, Some(&key_path));
 
         let sender = test_id(0x51);
         let recipient = test_id(0x52);

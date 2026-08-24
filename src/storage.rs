@@ -1,9 +1,9 @@
-//! Durable authority and native-collection plumbing shared by every faculty.
+//! Durable signing identity and native-collection plumbing shared by every faculty.
 //!
 //! Three concerns that every faculty needs before it can read or write
 //! anything, and that none of them should re-implement:
 //!
-//! - **Authority.** [`signer_path`], [`load_signer`], and [`initialize_signer`]
+//! - **Signing identity.** [`signer_path`], [`load_signer`], and [`initialize_signer`]
 //!   resolve one durable signing key per pile. Ordinary commands load; only an
 //!   explicit initialization mints. No faculty falls back to an ephemeral
 //!   identity.
@@ -19,123 +19,23 @@
 //! `faculties-migrations` crate and depends on this module rather than the
 //! other way round.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use triblespace::core::authority::{
-    publish_grant, resolve_authority, AuthorityDiagnostic, AuthorityGrant, AuthorityMode,
-    ACTION_WRITE,
-};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::IntoBlob;
-use triblespace::core::blob::{Blob, TryFromBlob};
+#[cfg(test)]
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
     discover_collection_records, CollectionCommit, CollectionDerive, CollectionMerge,
-    CollectionRecordDiagnostic, CollectionStore, DiscoveredCollectionRecords,
+    CollectionRecordDiagnostic, CollectionStore,
 };
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::repo::memoryrepo::MemoryRepo;
-use triblespace::core::repo::pile::{Pile, PileReader, ReadError};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::signing_key_file;
-use triblespace::core::trible::{Fragment, TribleSet};
-
-/// One configured faculty root and its deterministic team-of-one WRITE grant.
-///
-/// The row comes from [`crate::collection_names::table`], never from collection
-/// discovery. `target_commits` is therefore only a diagnostic about whether
-/// that configured resource has already been used; it does not decide whether
-/// the resource receives authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TeamOfOneWriteGrantRow {
-    scope: Id,
-    name: &'static str,
-    resource: CollectionHandle,
-    commit: CollectionCommit,
-    target_commits: usize,
-    accepted: bool,
-}
-
-impl TeamOfOneWriteGrantRow {
-    pub const fn scope(&self) -> Id {
-        self.scope
-    }
-
-    pub const fn name(&self) -> &'static str {
-        self.name
-    }
-
-    pub const fn resource(&self) -> CollectionHandle {
-        self.resource
-    }
-
-    pub const fn commit(&self) -> CollectionCommit {
-        self.commit
-    }
-
-    pub const fn target_commits(&self) -> usize {
-        self.target_commits
-    }
-
-    pub const fn accepted(&self) -> bool {
-        self.accepted
-    }
-}
-
-/// Exact state of the current build's team-of-one faculty WRITE bootstrap.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TeamOfOneWriteAuthorityReport {
-    team_root: [u8; 32],
-    rows: Vec<TeamOfOneWriteGrantRow>,
-    diagnostics: Vec<AuthorityDiagnostic>,
-    published: Vec<Id>,
-    ignored_foreign_roots: usize,
-    ignored_unknown_roots: usize,
-}
-
-impl TeamOfOneWriteAuthorityReport {
-    pub const fn team_root(&self) -> [u8; 32] {
-        self.team_root
-    }
-
-    pub fn rows(&self) -> &[TeamOfOneWriteGrantRow] {
-        &self.rows
-    }
-
-    pub fn diagnostics(&self) -> &[AuthorityDiagnostic] {
-        &self.diagnostics
-    }
-
-    /// Grant records this call actually had to publish.
-    ///
-    /// Plans and exact replays return an empty slice. Consumers that need
-    /// stable output should report [`Self::rows`] instead: their commit ids do
-    /// not depend on whether this was the first run.
-    pub fn published(&self) -> &[Id] {
-        &self.published
-    }
-
-    pub const fn ignored_foreign_roots(&self) -> usize {
-        self.ignored_foreign_roots
-    }
-
-    pub const fn ignored_unknown_roots(&self) -> usize {
-        self.ignored_unknown_roots
-    }
-
-    pub fn accepted(&self) -> usize {
-        self.rows.iter().filter(|row| row.accepted).count()
-    }
-
-    pub fn missing(&self) -> usize {
-        self.rows.len() - self.accepted()
-    }
-}
+use triblespace::core::trible::Fragment;
 
 /// Canonical records currently known for one scoped target collection.
 ///
@@ -193,17 +93,21 @@ impl TargetDiscovery {
 /// Discover one target directly through the native collection-record store.
 ///
 /// The canonical descriptor and its collection handle are derived from `scope`
-/// and `team`; no definition registry, blob scan, or legacy pin lookup
+/// and `namespace`; no definition registry, blob scan, or legacy pin lookup
 /// participates in target discovery.
 ///
-/// `team` is the team's ROOT key, not the key that signs commits — they
-/// coincide only for a team of one, and it is a parameter rather than a default
-/// because a collection rooted at the wrong key is one nothing else can find.
-pub fn discover_target<S>(store: &mut S, scope: Id, team: VerifyingKey) -> Result<TargetDiscovery>
+/// The namespace is an identity-bearing descriptor fact, not an authorization
+/// decision. It is explicit because a collection named under the wrong key is
+/// a different collection that nothing else can find.
+pub fn discover_target<S>(
+    store: &mut S,
+    scope: Id,
+    namespace: VerifyingKey,
+) -> Result<TargetDiscovery>
 where
     S: CollectionStore,
 {
-    let descriptor = crate::collection_names::root_descriptor(scope, team);
+    let descriptor = crate::collection_names::root_descriptor(scope, namespace);
     // Written out rather than reached for: core deliberately offers no helper
     // for hashing a descriptor it did not store, because a handle computed
     // beside a store instead of by it can name a collection whose descriptor is
@@ -239,67 +143,6 @@ where
     })
 }
 
-/// One node the pile itself attests, by the key it signed its commits with.
-///
-/// A pile is a roster of its own writers: every commit carries the public key
-/// that signed it, and discovery keeps only commits whose signature verifies.
-/// So the set of keys that have ever written is readable from the pile, with
-/// no registry to maintain and no key to distribute.
-///
-/// This is *discovery*, and discovery is not entitlement. Having written to a
-/// pile makes a node addressable — something a secret can be sealed to by
-/// name — and nothing more. What a node may read is decided entirely by the
-/// grants an admin issues and the wraps a holder creates.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NodeObservation {
-    public_key: [u8; 32],
-    commits: usize,
-    collections: BTreeSet<CollectionHandle>,
-}
-
-impl NodeObservation {
-    /// Ed25519 public key this node signs with.
-    pub fn public_key(&self) -> [u8; 32] {
-        self.public_key
-    }
-
-    /// Commits in this pile whose signature this key verifies.
-    pub fn commits(&self) -> usize {
-        self.commits
-    }
-
-    /// Distinct collections this node has written into.
-    pub fn collections(&self) -> usize {
-        self.collections.len()
-    }
-}
-
-/// Every node that has written a verifiable commit into this pile.
-///
-/// Ordered by public key, so two runs over the same pile report the same
-/// roster in the same order.
-pub fn discover_nodes<S>(store: &mut S) -> Result<Vec<NodeObservation>>
-where
-    S: CollectionStore,
-{
-    let records =
-        discover_collection_records(store).context("discover native collection records")?;
-    let mut by_key: BTreeMap<[u8; 32], (usize, BTreeSet<CollectionHandle>)> = BTreeMap::new();
-    for commit in records.commits() {
-        let entry = by_key.entry(commit.public_key().raw).or_default();
-        entry.0 += 1;
-        entry.1.insert(commit.collection());
-    }
-    Ok(by_key
-        .into_iter()
-        .map(|(public_key, (commits, collections))| NodeObservation {
-            public_key,
-            commits,
-            collections,
-        })
-        .collect())
-}
-
 /// Resolve the durable signer path for a pile without touching the filesystem.
 pub fn signer_path(pile: &Path, explicit: Option<&Path>) -> PathBuf {
     signing_key_file::resolve_path(explicit, pile)
@@ -317,7 +160,7 @@ pub fn load_signer(pile: &Path, explicit: Option<&Path>) -> Result<SigningKey> {
 /// Explicitly initialize a durable signer, or load the concurrent winner.
 ///
 /// Initialization is separate from ordinary reads and writes so publication
-/// cannot silently mint a new authority.
+/// cannot silently mint a new identity.
 pub fn initialize_signer(pile: &Path, explicit: Option<&Path>) -> Result<SigningKey> {
     let path = signer_path(pile, explicit);
     signing_key_file::init(&path)
@@ -338,308 +181,6 @@ pub fn open_pile_strict(path: &Path) -> Result<Pile> {
         return Err(failure);
     }
     Ok(pile)
-}
-
-#[derive(Default)]
-struct FacultyRootObservation {
-    target_commits: BTreeMap<CollectionHandle, usize>,
-    local_known_roots: usize,
-    foreign_known_roots: usize,
-    unknown_named_roots: usize,
-}
-
-/// Observe named roots only to diagnose the migration boundary.
-///
-/// Discovery never supplies grant targets. The closed target set comes from
-/// `collection_names::table`; this pass exists only to count already-used
-/// targets, report ignored roots, and reject the common wrong-`--key` failure
-/// before it grants an otherwise empty parallel team.
-fn observe_faculty_roots<S>(pile: &mut S, team: VerifyingKey) -> Result<FacultyRootObservation>
-where
-    S: BlobStore + CollectionStore,
-{
-    let records =
-        discover_collection_records(pile).context("discover roots before WRITE bootstrap")?;
-    let reader = pile
-        .reader()
-        .context("open descriptor view before WRITE bootstrap")?;
-    observe_faculty_roots_in_records(&records, &reader, team)
-}
-
-fn observe_faculty_roots_in_records<R>(
-    records: &DiscoveredCollectionRecords,
-    reader: &R,
-    team: VerifyingKey,
-) -> Result<FacultyRootObservation>
-where
-    R: BlobStoreGet,
-{
-    let mut observed = FacultyRootObservation::default();
-    let mut collections = BTreeSet::new();
-    for commit in records.commits() {
-        *observed
-            .target_commits
-            .entry(commit.collection())
-            .or_default() += 1;
-        collections.insert(commit.collection());
-    }
-
-    let known_names = crate::collection_names::table()
-        .into_iter()
-        .map(|(_, name, _)| name)
-        .collect::<BTreeSet<_>>();
-    for collection in collections {
-        let Ok(blob): Result<Blob<SimpleArchive>, _> = reader.get(collection) else {
-            continue;
-        };
-        let Ok(facts) = TribleSet::try_from_blob(blob) else {
-            continue;
-        };
-        let Some(Ok(name)) = triblespace::core::collection::descriptor::name(&facts) else {
-            // Pre-naming roots are intentionally not authority targets.
-            continue;
-        };
-        let descriptor_team = triblespace::core::collection::descriptor::team(&facts);
-        if name.as_str() == triblespace::core::authority::AUTHORITY_COLLECTION_NAME {
-            // The authority ledger governs roots, so it is never a grant
-            // target. It is still decisive evidence of which team already
-            // inhabits this pile: ignoring it would let an interrupted
-            // grant-only initialization be silently parallel-rooted by a
-            // different key.
-            match descriptor_team {
-                Some(Ok(root)) if root == team => observed.local_known_roots += 1,
-                Some(Ok(_)) => observed.foreign_known_roots += 1,
-                _ => {}
-            }
-            continue;
-        }
-        if !known_names.contains(name.as_str()) {
-            observed.unknown_named_roots += 1;
-            continue;
-        }
-        match descriptor_team {
-            Some(Ok(root)) if root == team => observed.local_known_roots += 1,
-            Some(Ok(_)) => observed.foreign_known_roots += 1,
-            _ => {}
-        }
-    }
-
-    if observed.local_known_roots == 0 && observed.foreign_known_roots > 0 {
-        anyhow::bail!(
-            "the supplied signing key roots none of this pile's recognized faculty collections, \
-             while {} recognized root(s) belong to another team; refusing to create a parallel \
-             empty authority epoch — use the durable key that named the existing collections",
-            observed.foreign_known_roots
-        );
-    }
-    Ok(observed)
-}
-
-/// Reject unsafe authority expansion before granting planned WRITE targets.
-///
-/// One record discovery serves both checks: the signer must not open a
-/// parallel empty team epoch, and a future grant must not awaken a currently
-/// unauthorized COMMIT signed by that same local key. Foreign authors remain
-/// inert. This is read only and constructs no grants.
-pub fn preflight_team_of_one_write_targets<S>(
-    store: &mut S,
-    signer: &SigningKey,
-    targets: impl IntoIterator<Item = CollectionHandle>,
-) -> Result<()>
-where
-    S: BlobStore + CollectionStore,
-    S::Reader: BlobStoreMeta,
-{
-    let records = discover_collection_records(&mut *store)
-        .context("discover records before planned WRITE authority")?;
-    let team = signer.verifying_key();
-    {
-        let reader = store
-            .reader()
-            .context("open descriptor view before planned WRITE authority")?;
-        observe_faculty_roots_in_records(&records, &reader, team)?;
-    }
-    let authority = resolve_authority(&mut *store, team)
-        .map_err(|error| anyhow!("resolve authority before planned WRITE grants: {error}"))?;
-    let targets = targets.into_iter().collect::<BTreeSet<_>>();
-    for commit in records.commits() {
-        if targets.contains(&commit.collection())
-            && commit.public_key().raw == team.to_bytes()
-            && !authority.allows(&commit.public_key(), ACTION_WRITE, commit.collection())
-        {
-            anyhow::bail!(
-                "planned WRITE authority would awaken dormant local COMMIT {:X} on collection {}",
-                commit.id(),
-                hex::encode_upper(commit.collection().raw)
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Construct the closed, deterministic grant set without touching `pile`.
-///
-/// A scratch store deliberately runs the same public [`publish_grant`] path as
-/// the real publication. This keeps planning from duplicating the authority
-/// collection's signing transcript while guaranteeing that dry-run performs
-/// no `put` against the destination.
-fn expected_team_of_one_write_grants(
-    signer: &SigningKey,
-) -> Result<
-    Vec<(
-        Id,
-        &'static str,
-        CollectionHandle,
-        AuthorityGrant,
-        CollectionCommit,
-    )>,
-> {
-    let team = signer.verifying_key();
-    let mut scratch = MemoryRepo::default();
-    crate::collection_names::table()
-        .into_iter()
-        .map(|(scope, name, _reach)| {
-            let resource = IntoBlob::<SimpleArchive>::to_blob(
-                crate::collection_names::root_descriptor(scope, team).into_facts(),
-            )
-            .get_handle();
-            let grant = AuthorityGrant::root(team, resource, ACTION_WRITE, AuthorityMode::Invoke);
-            let commit = publish_grant(&mut scratch, team, signer, grant)
-                .map_err(|error| anyhow!("prepare {name} WRITE grant: {error}"))?;
-            Ok((scope, name, resource, grant, commit))
-        })
-        .collect()
-}
-
-/// Plan exact self-WRITE authority for every root collection in this build.
-///
-/// The pile is read only. Existing collection records influence reporting and
-/// the wrong-key guard, never the grant set. In particular, pre-naming,
-/// unknown, and foreign-team descriptors remain outside authority.
-pub fn plan_team_of_one_write_authority<S>(
-    pile: &mut S,
-    signer: &SigningKey,
-) -> Result<TeamOfOneWriteAuthorityReport>
-where
-    S: BlobStore + CollectionStore,
-{
-    let team = signer.verifying_key();
-    let observed = observe_faculty_roots(pile, team)?;
-    let resolution = resolve_authority(pile, team)
-        .map_err(|error| anyhow!("resolve current team authority: {error}"))?;
-    let rows = expected_team_of_one_write_grants(signer)?
-        .into_iter()
-        .map(|(scope, name, resource, grant, commit)| {
-            let accepted = resolution
-                .grant(commit.id())
-                .is_some_and(|accepted| accepted.commit() == commit && accepted.grant() == grant);
-            TeamOfOneWriteGrantRow {
-                scope,
-                name,
-                resource,
-                commit,
-                target_commits: observed
-                    .target_commits
-                    .get(&resource)
-                    .copied()
-                    .unwrap_or_default(),
-                accepted,
-            }
-        })
-        .collect();
-
-    Ok(TeamOfOneWriteAuthorityReport {
-        team_root: team.to_bytes(),
-        rows,
-        diagnostics: resolution.diagnostics().to_vec(),
-        published: Vec::new(),
-        ignored_foreign_roots: observed.foreign_known_roots,
-        ignored_unknown_roots: observed.unknown_named_roots,
-    })
-}
-
-/// Ensure the current build's exact team-of-one self-WRITE grant set.
-///
-/// Missing or incomplete occurrences are replayed through [`publish_grant`].
-/// Dependencies and records are content addressed, so an interrupted prefix
-/// and an exact rerun converge to the same bytes. The final positive fixed
-/// point is resolved again before success is returned.
-pub fn ensure_team_of_one_write_authority(
-    pile: &mut Pile,
-    signer: &SigningKey,
-) -> Result<TeamOfOneWriteAuthorityReport> {
-    let before = plan_team_of_one_write_authority(pile, signer)?;
-    let team = signer.verifying_key();
-    let expected = expected_team_of_one_write_grants(signer)?;
-    let missing = before
-        .rows
-        .iter()
-        .filter(|row| !row.accepted)
-        .map(|row| row.commit.id())
-        .collect::<BTreeSet<_>>();
-    let reader = pile
-        .reader()
-        .context("inspect fixed WRITE grant dependency closure")?;
-    let incomplete = expected
-        .iter()
-        .filter_map(|(_, _, _, _, commit)| {
-            (!commit_dependencies_resident(&reader, *commit)).then_some(commit.id())
-        })
-        .collect::<BTreeSet<_>>();
-    let mut published = Vec::new();
-    for (_, name, _, grant, expected_commit) in expected {
-        if !missing.contains(&expected_commit.id()) && !incomplete.contains(&expected_commit.id()) {
-            continue;
-        }
-        let commit = publish_grant(pile, team, signer, grant)
-            .map_err(|error| anyhow!("publish {name} WRITE grant: {error}"))?;
-        if commit != expected_commit {
-            anyhow::bail!("{name} WRITE grant changed identity between planning and publication");
-        }
-        if missing.contains(&commit.id()) {
-            published.push(commit.id());
-        }
-    }
-
-    let mut after = plan_team_of_one_write_authority(pile, signer)?;
-    if after.missing() != 0 {
-        anyhow::bail!(
-            "WRITE authority publication left {} of {} configured faculty roots unauthorized",
-            after.missing(),
-            after.rows.len()
-        );
-    }
-    let reader = pile
-        .reader()
-        .context("verify fixed WRITE grant dependency closure")?;
-    let incomplete = after
-        .rows
-        .iter()
-        .filter(|row| !commit_dependencies_resident(&reader, row.commit))
-        .count();
-    if incomplete != 0 {
-        anyhow::bail!(
-            "WRITE authority publication left {incomplete} of {} configured grant dependency closures incomplete",
-            after.rows.len()
-        );
-    }
-    after.published = published;
-    Ok(after)
-}
-
-fn commit_dependencies_resident(reader: &PileReader, commit: CollectionCommit) -> bool {
-    reader
-        .metadata(commit.collection())
-        .expect("pile metadata lookup is infallible")
-        .is_some()
-        && reader
-            .metadata(Handle::<SimpleArchive>::from_hash(commit.data()))
-            .expect("pile metadata lookup is infallible")
-            .is_some()
-        && reader
-            .metadata(commit.metadata())
-            .expect("pile metadata lookup is infallible")
-            .is_some()
 }
 
 /// Publish one complete fragment into one scoped native collection.
@@ -746,15 +287,12 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::encodings::utf8string::UTF8String;
-    use triblespace::core::collection::records::CollectionName;
-    use triblespace::core::collection::{
-        empty_metadata_handle, reach, simplearchive_union, CollectionRecord,
-    };
+    use triblespace::core::collection::{empty_metadata_handle, CollectionRecord};
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+    use triblespace::core::repo::{BlobStore, BlobStoreGet};
     use triblespace::core::trible::TribleSet;
     use triblespace::macros::entity;
 
@@ -912,22 +450,6 @@ mod tests {
             .verifying_key();
         let target_scope = crate::schemas::wiki::DEFAULT_SCOPE_ID;
         let other_scope = crate::schemas::compass::DEFAULT_SCOPE_ID;
-        let before_denied = fs::metadata(&files.pile).unwrap().len();
-        let denied = publish_fragment(
-            &files.pile,
-            Some(&files.key),
-            target_scope,
-            fragment.clone(),
-        )
-        .unwrap_err();
-        assert!(format!("{denied:#}").contains("no positive WRITE authority"));
-        assert_eq!(fs::metadata(&files.pile).unwrap().len(), before_denied);
-
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        let signer = load_signer(&files.pile, Some(&files.key)).unwrap();
-        ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-        pile.close().unwrap();
-
         let first = publish_fragment(
             &files.pile,
             Some(&files.key),
@@ -988,217 +510,6 @@ mod tests {
         let metadata_text: View<str> = reader.get(metadata_handle).unwrap();
         assert_eq!(&*metadata_text, "metadata attachment");
         pile.close().unwrap();
-    }
-
-    #[test]
-    fn write_authority_dry_run_and_exact_replay_are_byte_identical() {
-        let files = TestFiles::new();
-        let signer = initialize_signer(&files.pile, Some(&files.key)).unwrap();
-        let empty = fs::read(&files.pile).unwrap();
-
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        let plan = plan_team_of_one_write_authority(&mut pile, &signer).unwrap();
-        pile.close().unwrap();
-        assert_eq!(fs::read(&files.pile).unwrap(), empty);
-        assert_eq!(plan.rows().len(), crate::collection_names::table().len());
-        assert_eq!(plan.accepted(), 0);
-        assert_eq!(plan.missing(), plan.rows().len());
-        assert!(plan.published().is_empty());
-        let names = plan
-            .rows()
-            .iter()
-            .map(|row| row.name())
-            .collect::<BTreeSet<_>>();
-        for name in ["memory", "memory-comb", "posture-policy", "posture-scan"] {
-            assert!(names.contains(name));
-        }
-
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        let first = ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-        pile.close().unwrap();
-        assert_eq!(first.published().len(), first.rows().len());
-        assert_eq!(first.accepted(), first.rows().len());
-        assert_eq!(first.missing(), 0);
-        let after_first = fs::read(&files.pile).unwrap();
-
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        let replay = ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-        pile.close().unwrap();
-        assert!(replay.published().is_empty());
-        assert_eq!(replay.rows(), first.rows());
-        assert_eq!(fs::read(&files.pile).unwrap(), after_first);
-    }
-
-    #[test]
-    fn write_authority_repairs_an_accepted_grants_missing_blob_closure() {
-        let files = TestFiles::new();
-        let signer = initialize_signer(&files.pile, Some(&files.key)).unwrap();
-        let (_, _, _, grant, commit) = expected_team_of_one_write_grants(&signer)
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("the fixed WRITE manifest is nonempty");
-        let data: Blob<SimpleArchive> = grant.fragment().into_facts().to_blob();
-        assert_eq!(
-            Handle::<SimpleArchive>::to_hash(data.get_handle()),
-            commit.data()
-        );
-
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        pile.put::<SimpleArchive, _>(data).unwrap();
-        pile.insert(CollectionRecord::Commit(commit)).unwrap();
-
-        let before = plan_team_of_one_write_authority(&mut pile, &signer).unwrap();
-        assert!(before
-            .rows()
-            .iter()
-            .find(|row| row.commit() == commit)
-            .expect("the sparse grant belongs to the fixed manifest")
-            .accepted());
-        let reader = pile.reader().unwrap();
-        assert!(reader.metadata(commit.collection()).unwrap().is_none());
-        assert!(reader.metadata(commit.metadata()).unwrap().is_none());
-
-        let repaired = ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-        assert!(!repaired.published().contains(&commit.id()));
-        let reader = pile.reader().unwrap();
-        assert!(reader.metadata(commit.collection()).unwrap().is_some());
-        assert!(reader.metadata(commit.metadata()).unwrap().is_some());
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn write_authority_rejects_a_foreign_team_key_before_mutation() {
-        let files = TestFiles::new();
-        let local = initialize_signer(&files.pile, Some(&files.key)).unwrap();
-        let descriptor = crate::collection_names::root_descriptor(
-            crate::schemas::wiki::DEFAULT_SCOPE_ID,
-            local.verifying_key(),
-        );
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &descriptor,
-            entity! { _ @ metadata::tag: &id(31) },
-            &local,
-        )
-        .unwrap();
-        pile.close().unwrap();
-        let before = fs::read(&files.pile).unwrap();
-
-        let foreign = SigningKey::from_bytes(&[19; 32]);
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        let error = plan_team_of_one_write_authority(&mut pile, &foreign).unwrap_err();
-        pile.close().unwrap();
-        assert!(format!("{error:#}").contains("refusing to create a parallel empty authority"));
-        assert_eq!(fs::read(&files.pile).unwrap(), before);
-    }
-
-    #[test]
-    fn write_authority_rejects_a_foreign_key_after_grant_only_initialization() {
-        let files = TestFiles::new();
-        let local = initialize_signer(&files.pile, Some(&files.key)).unwrap();
-        let descriptor = crate::collection_names::root_descriptor(
-            crate::schemas::wiki::DEFAULT_SCOPE_ID,
-            local.verifying_key(),
-        );
-        let resource = collection_of(&descriptor);
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        publish_grant(
-            &mut pile,
-            local.verifying_key(),
-            &local,
-            AuthorityGrant::root(
-                local.verifying_key(),
-                resource,
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-        pile.close().unwrap();
-        let before = fs::read(&files.pile).unwrap();
-
-        let foreign = SigningKey::from_bytes(&[29; 32]);
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        let error = plan_team_of_one_write_authority(&mut pile, &foreign).unwrap_err();
-        pile.close().unwrap();
-        assert!(format!("{error:#}").contains("refusing to create a parallel empty authority"));
-        assert_eq!(fs::read(&files.pile).unwrap(), before);
-    }
-
-    #[test]
-    fn write_authority_ignores_unknown_and_foreign_roots_without_rewriting_targets() {
-        let files = TestFiles::new();
-        let signer = initialize_signer(&files.pile, Some(&files.key)).unwrap();
-        let foreign = SigningKey::from_bytes(&[23; 32]);
-        let local_known = crate::collection_names::root_descriptor(
-            crate::schemas::wiki::DEFAULT_SCOPE_ID,
-            signer.verifying_key(),
-        );
-        let foreign_known = crate::collection_names::root_descriptor(
-            crate::schemas::compass::DEFAULT_SCOPE_ID,
-            foreign.verifying_key(),
-        );
-        let unknown = simplearchive_union::descriptor(
-            &CollectionName::new("outside-faculties").unwrap(),
-            signer.verifying_key(),
-            reach::private(),
-        );
-
-        let mut pile = open_pile_strict(&files.pile).unwrap();
-        for (descriptor, writer, marker) in [
-            (&local_known, &signer, 41),
-            (&foreign_known, &foreign, 42),
-            (&unknown, &signer, 43),
-        ] {
-            simplearchive_union::publish_fragment_commit(
-                &mut pile,
-                descriptor,
-                entity! { _ @ metadata::tag: &id(marker) },
-                writer,
-            )
-            .unwrap();
-        }
-        let baseline = discover_collection_records(&mut pile)
-            .unwrap()
-            .commits()
-            .to_vec();
-        let report = ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-        let final_commits = discover_collection_records(&mut pile)
-            .unwrap()
-            .commits()
-            .to_vec();
-        pile.close().unwrap();
-
-        assert_eq!(report.ignored_foreign_roots(), 1);
-        assert_eq!(report.ignored_unknown_roots(), 1);
-        assert_eq!(report.rows().len(), crate::collection_names::table().len());
-        assert_eq!(report.accepted(), report.rows().len());
-        assert_eq!(
-            report
-                .rows()
-                .iter()
-                .find(|row| row.name() == "wiki")
-                .unwrap()
-                .target_commits(),
-            1
-        );
-
-        let mut expected = baseline
-            .into_iter()
-            .map(|commit| (commit.id(), commit))
-            .collect::<BTreeMap<_, _>>();
-        for row in report.rows() {
-            expected.insert(row.commit().id(), row.commit());
-        }
-        assert_eq!(
-            final_commits
-                .into_iter()
-                .map(|commit| (commit.id(), commit))
-                .collect::<BTreeMap<_, _>>(),
-            expected
-        );
     }
 
     #[test]

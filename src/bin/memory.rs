@@ -2898,12 +2898,8 @@ mod tests {
                 std::env::temp_dir().join(format!("faculties-memory-cover-{}.pile", ufoid().id));
             let key = pile.with_extension("key");
             File::create(&pile).expect("create test pile");
-            let signer = faculties::storage::initialize_signer(&pile, Some(&key))
+            faculties::storage::initialize_signer(&pile, Some(&key))
                 .expect("initialize test signer");
-            let mut store = open_pile_strict(&pile).expect("open test pile");
-            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer)
-                .expect("grant fixture team-of-one WRITE authority");
-            store.close().expect("close authorized test pile");
             Self { pile, key }
         }
 

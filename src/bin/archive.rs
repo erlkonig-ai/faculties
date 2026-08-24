@@ -1161,9 +1161,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::storage::{
-        ensure_team_of_one_write_authority, initialize_signer, open_pile_strict,
-    };
+    use faculties::storage::initialize_signer;
     use std::fs;
 
     struct Fixture {
@@ -1177,10 +1175,7 @@ mod tests {
         let pile = directory.path().join("archive.pile");
         fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
-        let signer = initialize_signer(&pile, Some(&key)).unwrap();
-        let mut store = open_pile_strict(&pile).unwrap();
-        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
         Fixture {
             _directory: directory,
             pile,

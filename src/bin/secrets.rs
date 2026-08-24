@@ -1,8 +1,8 @@
-//! `secrets` — exact vault epochs with direct public-key custody.
+//! `secrets` — capability-gated exact vault epochs with sealed custody.
 //!
-//! There is no identity, scope, password, revocation, or “latest version”
-//! language here. One vault is one private collection. Accepted exact `READ`
-//! authority determines its recipient keys, and every immutable secret is
+//! One vault is one private collection with one custody key. Exact `READ`
+//! proofs deliver that custody through subject-specific access envelopes;
+//! exact `WRITE` proofs admit collection commits. Every immutable secret is
 //! addressed by its exact id.
 
 use std::io::{Read, Write};
@@ -14,6 +14,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use faculties::clock;
 use faculties::secrets::{self, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict};
+use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
@@ -22,7 +23,7 @@ use zeroize::Zeroizing;
 #[command(
     version = faculties::GIT_VERSION,
     name = "secrets",
-    about = "Encrypted exact-version vaults backed by collection authority"
+    about = "Capability-gated exact-version vaults with sealed custody"
 )]
 struct Cli {
     /// Path to the pile file.
@@ -51,22 +52,21 @@ enum Command {
 
 #[derive(Subcommand)]
 enum VaultCommand {
-    /// Create one explicit team-of-one vault epoch.
+    /// Create one custody-backed vault epoch and founder access envelope.
     Create {
+        /// Exact vault id to create or retry. A fresh id is minted when omitted.
+        #[arg(long, value_parser = parse_id)]
+        id: Option<Id>,
         #[arg(long)]
         name: String,
     },
     /// List ready vaults and independently pending candidates.
     List,
-    /// List accepted direct `READ` recipient keys.
-    Members {
-        #[arg(long, value_parser = parse_id)]
-        vault: Id,
-    },
-    /// Wrap every secret in the observed vault before granting exact `READ`.
+    /// Deliver an exact delegated `READ` proof and custody envelope.
     Grant {
-        #[arg(long, value_parser = parse_id)]
-        vault: Id,
+        /// Unique 32-hex vault id or exact 64-hex collection handle.
+        #[arg(long, value_parser = parse_vault_selector)]
+        vault: VaultSelector,
         #[arg(long, value_parser = parse_public_key)]
         recipient: VerifyingKey,
     },
@@ -76,8 +76,9 @@ enum VaultCommand {
 enum SecretCommand {
     /// Add one immutable exact version to a vault.
     Add {
-        #[arg(long, value_parser = parse_id)]
-        vault: Id,
+        /// Unique 32-hex vault id or exact 64-hex collection handle.
+        #[arg(long, value_parser = parse_vault_selector)]
+        vault: VaultSelector,
         #[arg(long)]
         name: String,
         /// Literal value, `@file`, or `@-` for stdin.
@@ -86,11 +87,10 @@ enum SecretCommand {
     },
     /// Open one exact immutable secret id.
     Get {
-        #[arg(long, value_parser = parse_id)]
-        secret: Id,
-    },
-    /// Repair missing wraps for one exact id against current `READ` members.
-    Share {
+        /// Unique 32-hex vault id or exact 64-hex collection handle.
+        /// Omit only when the secret id is unique across every ready vault.
+        #[arg(long, value_parser = parse_vault_selector)]
+        vault: Option<VaultSelector>,
         #[arg(long, value_parser = parse_id)]
         secret: Id,
     },
@@ -102,6 +102,12 @@ enum SecretCommand {
 struct SecretsStorage<'a> {
     pile: &'a Path,
     key: Option<&'a Path>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VaultSelector {
+    Id(Id),
+    Collection(CollectionHandle),
 }
 
 impl SecretsStorage<'_> {
@@ -133,6 +139,24 @@ fn parse_id(raw: &str) -> std::result::Result<Id, String> {
         .ok_or_else(|| format!("'{raw}' is not one exact nonzero 32-digit hexadecimal id"))
 }
 
+fn parse_vault_selector(raw: &str) -> std::result::Result<VaultSelector, String> {
+    let raw = raw.trim();
+    match raw.len() {
+        32 => parse_id(raw).map(VaultSelector::Id),
+        64 => {
+            let bytes = hex::decode(raw)
+                .map_err(|_| format!("'{raw}' is not a hexadecimal collection handle"))?;
+            let bytes: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| format!("'{raw}' is not a 64-digit collection handle"))?;
+            Ok(VaultSelector::Collection(Inline::new(bytes)))
+        }
+        _ => Err(format!(
+            "'{raw}' is neither a 32-digit vault id nor a 64-digit collection handle"
+        )),
+    }
+}
+
 fn parse_public_key(raw: &str) -> std::result::Result<VerifyingKey, String> {
     let bytes = hex::decode(raw.trim())
         .map_err(|_| format!("'{raw}' is not a hexadecimal Ed25519 public key"))?;
@@ -148,6 +172,19 @@ fn fmt_id(id: Id) -> String {
 
 fn fmt_key(key: VerifyingKey) -> String {
     hex::encode(key.to_bytes())
+}
+
+fn fmt_collection(collection: CollectionHandle) -> String {
+    hex::encode(collection.raw)
+}
+
+fn fmt_selector(selector: VaultSelector) -> String {
+    match selector {
+        VaultSelector::Id(vault) => format!("id:{}", fmt_id(vault)),
+        VaultSelector::Collection(collection) => {
+            format!("collection:{}", fmt_collection(collection))
+        }
+    }
 }
 
 fn point_now() -> Result<secrets::IntervalValue> {
@@ -174,17 +211,33 @@ fn load_value(raw: String) -> Result<Zeroizing<Vec<u8>>> {
 
 fn require_location(
     discovery: &vaults::VaultDiscovery,
-    vault: Id,
+    selector: VaultSelector,
 ) -> Result<vaults::VaultLocation> {
-    discovery
-        .location(vault)
-        .copied()
-        .ok_or_else(|| anyhow!("vault {vault} is not ready for this node"))
+    match selector {
+        VaultSelector::Id(vault) => discovery.location(vault).copied().ok_or_else(|| {
+            anyhow!(
+                "vault id {} is absent or ambiguous for this node; use its exact collection handle",
+                fmt_id(vault)
+            )
+        }),
+        VaultSelector::Collection(collection) => discovery
+            .location_exact(collection)
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "vault collection {} is not ready for this node",
+                    fmt_collection(collection)
+                )
+            }),
+    }
 }
 
-fn cmd_vault_create(storage: SecretsStorage<'_>, name: String) -> Result<()> {
+fn cmd_vault_create(storage: SecretsStorage<'_>, vault: Id, name: String) -> Result<()> {
+    println!("selected vault {}  {name}", fmt_id(vault));
+    std::io::stdout()
+        .flush()
+        .context("announce selected vault id before publication")?;
     storage.with_pile(|pile, signer| {
-        let vault = genid().id;
         let location = vaults::create_vault(pile, signer, vault, &name, point_now()?)?;
         println!("vault {}  {name}", fmt_id(location.vault()));
         Ok(())
@@ -195,8 +248,14 @@ fn print_issues(discovery: &vaults::VaultDiscovery) {
     for issue in discovery.issues() {
         let identity = issue
             .vault()
-            .map(fmt_id)
-            .unwrap_or_else(|| hex::encode(issue.collection().raw));
+            .map(|vault| {
+                format!(
+                    "vault {} collection {}",
+                    fmt_id(vault),
+                    fmt_collection(issue.collection())
+                )
+            })
+            .unwrap_or_else(|| format!("collection {}", fmt_collection(issue.collection())));
         eprintln!(
             "pending/rejected {identity} [{:?}]: {}",
             issue.kind(),
@@ -211,19 +270,19 @@ fn cmd_vault_list(storage: SecretsStorage<'_>) -> Result<()> {
         if discovery.locations().is_empty() {
             println!("(no ready vaults)");
         }
-        for (vault, location) in discovery.locations() {
+        for (collection, location) in discovery.locations() {
             let snapshot = discovery
                 .snapshot()
-                .vault(*vault)
+                .vault_exact(*collection)
                 .expect("every ready location has one aggregate snapshot");
             let name = secrets::read_text(
                 discovery.snapshot().reader(),
                 snapshot.catalog().header.name,
             )?;
-            let members = vaults::vault_members(pile, location)?.len();
             println!(
-                "{}  {}  ({} secret(s), {members} member(s))",
-                fmt_id(*vault),
+                "{}  collection {}  {}  ({} secret(s))",
+                fmt_id(location.vault()),
+                fmt_collection(*collection),
                 name,
                 snapshot.catalog().secrets.len()
             );
@@ -233,33 +292,23 @@ fn cmd_vault_list(storage: SecretsStorage<'_>) -> Result<()> {
     })
 }
 
-fn cmd_vault_members(storage: SecretsStorage<'_>, vault: Id) -> Result<()> {
+fn cmd_vault_grant(
+    storage: SecretsStorage<'_>,
+    selector: VaultSelector,
+    recipient: VerifyingKey,
+) -> Result<()> {
     storage.with_pile(|pile, signer| {
         let discovery = vaults::discover_local_vaults(pile, signer)?;
-        let location = require_location(&discovery, vault)?;
-        for member in vaults::vault_members(pile, &location)? {
-            let key = VerifyingKey::from_bytes(&member)
-                .expect("authority projection contains validated Ed25519 keys");
-            println!("{}", fmt_key(key));
-        }
-        Ok(())
-    })
-}
-
-fn cmd_vault_grant(storage: SecretsStorage<'_>, vault: Id, recipient: VerifyingKey) -> Result<()> {
-    storage.with_pile(|pile, signer| {
-        let discovery = vaults::discover_local_vaults(pile, signer)?;
-        let location = require_location(&discovery, vault)?;
-        let (wraps, granted) =
+        let location = require_location(&discovery, selector)?;
+        let envelopes =
             vaults::grant_vault_read(pile, signer, &location, discovery.snapshot(), recipient)?;
-        if granted {
+        for envelope in envelopes {
             println!(
-                "granted {} after publishing {wraps} missing wrap(s)",
-                fmt_key(recipient)
-            );
-        } else {
-            println!(
-                "already granted {}; published {wraps} missing wrap(s)",
+                "access {}  vault {}  collection {}  selected-by {}  recipient {}",
+                fmt_id(envelope),
+                fmt_id(location.vault()),
+                fmt_collection(location.collection()),
+                fmt_selector(selector),
                 fmt_key(recipient)
             );
         }
@@ -269,15 +318,15 @@ fn cmd_vault_grant(storage: SecretsStorage<'_>, vault: Id, recipient: VerifyingK
 
 fn cmd_secret_add(
     storage: SecretsStorage<'_>,
-    vault: Id,
+    selector: VaultSelector,
     name: String,
     value: String,
 ) -> Result<()> {
     let plaintext = load_value(value)?;
     storage.with_pile(|pile, signer| {
         let discovery = vaults::discover_local_vaults(pile, signer)?;
-        let location = require_location(&discovery, vault)?;
-        let (secret, recipients) = vaults::add_secret(
+        let location = require_location(&discovery, selector)?;
+        let secret = vaults::add_secret(
             pile,
             signer,
             &location,
@@ -287,18 +336,32 @@ fn cmd_secret_add(
             point_now()?,
         )?;
         println!(
-            "secret {}  {name}  ({recipients} recipient(s))",
-            fmt_id(secret)
+            "secret {}  vault {}  collection {}  selected-by {}  {name}",
+            fmt_id(secret),
+            fmt_id(location.vault()),
+            fmt_collection(location.collection()),
+            fmt_selector(selector)
         );
         Ok(())
     })
 }
 
-fn cmd_secret_get(storage: SecretsStorage<'_>, secret: Id) -> Result<()> {
+fn cmd_secret_get(
+    storage: SecretsStorage<'_>,
+    selector: Option<VaultSelector>,
+    secret: Id,
+) -> Result<()> {
     let plaintext = Zeroizing::new(storage.with_pile(|pile, signer| {
-        vaults::discover_local_vaults(pile, signer)?
-            .snapshot()
-            .open(secret, signer)
+        let discovery = vaults::discover_local_vaults(pile, signer)?;
+        match selector {
+            Some(selector) => {
+                let location = require_location(&discovery, selector)?;
+                discovery
+                    .snapshot()
+                    .open_exact(location.collection(), secret, signer)
+            }
+            None => discovery.snapshot().open(secret, signer),
+        }
     })?);
     std::io::stdout()
         .write_all(&plaintext)
@@ -306,28 +369,22 @@ fn cmd_secret_get(storage: SecretsStorage<'_>, secret: Id) -> Result<()> {
     Ok(())
 }
 
-fn cmd_secret_share(storage: SecretsStorage<'_>, secret: Id) -> Result<()> {
-    storage.with_pile(|pile, signer| {
-        let discovery = vaults::discover_local_vaults(pile, signer)?;
-        let (vault, _) = discovery
-            .snapshot()
-            .lookup(secret)
-            .ok_or_else(|| anyhow!("secret {secret} not found"))?;
-        let location = require_location(&discovery, vault)?;
-        let added = vaults::share_secret(pile, signer, &location, discovery.snapshot(), secret)?;
-        println!("published {added} missing wrap(s) for {}", fmt_id(secret));
-        Ok(())
-    })
-}
-
 fn cmd_secret_list(storage: SecretsStorage<'_>) -> Result<()> {
     storage.with_pile(|pile, signer| {
         let discovery = vaults::discover_local_vaults(pile, signer)?;
         let mut count = 0;
-        for (vault, snapshot) in discovery.snapshot().vaults() {
+        for snapshot in discovery.snapshot().vaults() {
+            let collection = snapshot
+                .collection()
+                .expect("every discovered vault snapshot retains its exact collection");
             for secret in snapshot.catalog().secrets.values() {
                 let name = secrets::read_text(discovery.snapshot().reader(), secret.name)?;
-                println!("{}  vault {}  {name}", fmt_id(secret.id), fmt_id(*vault));
+                println!(
+                    "{}  vault {}  collection {}  {name}",
+                    fmt_id(secret.id),
+                    fmt_id(snapshot.id()),
+                    fmt_collection(collection)
+                );
                 count += 1;
             }
         }
@@ -347,17 +404,17 @@ fn main() -> Result<()> {
     };
     match cli.command {
         Command::Vault { command } => match command {
-            VaultCommand::Create { name } => cmd_vault_create(storage, name),
+            VaultCommand::Create { id, name } => {
+                cmd_vault_create(storage, id.unwrap_or_else(|| genid().id), name)
+            }
             VaultCommand::List => cmd_vault_list(storage),
-            VaultCommand::Members { vault } => cmd_vault_members(storage, vault),
             VaultCommand::Grant { vault, recipient } => cmd_vault_grant(storage, vault, recipient),
         },
         Command::Secret { command } => match command {
             SecretCommand::Add { vault, name, value } => {
                 cmd_secret_add(storage, vault, name, value)
             }
-            SecretCommand::Get { secret } => cmd_secret_get(storage, secret),
-            SecretCommand::Share { secret } => cmd_secret_share(storage, secret),
+            SecretCommand::Get { vault, secret } => cmd_secret_get(storage, vault, secret),
             SecretCommand::List => cmd_secret_list(storage),
         },
     }
@@ -372,13 +429,15 @@ mod tests {
     const KEY: &str = "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
 
     #[test]
-    fn v2_surface_accepts_only_vaults_and_exact_secret_ids() {
+    fn capability_surface_accepts_only_vaults_and_exact_secret_ids() {
         for args in [
             vec![
                 "secrets", "--pile", PILE, "vault", "create", "--name", "prod",
             ],
+            vec![
+                "secrets", "--pile", PILE, "vault", "create", "--id", ID, "--name", "prod",
+            ],
             vec!["secrets", "--pile", PILE, "vault", "list"],
-            vec!["secrets", "--pile", PILE, "vault", "members", "--vault", ID],
             vec![
                 "secrets",
                 "--pile",
@@ -391,14 +450,40 @@ mod tests {
                 KEY,
             ],
             vec![
+                "secrets",
+                "--pile",
+                PILE,
+                "vault",
+                "grant",
+                "--vault",
+                KEY,
+                "--recipient",
+                KEY,
+            ],
+            vec![
                 "secrets", "--pile", PILE, "secret", "add", "--vault", ID, "--name", "token",
                 "--value", "value",
             ],
+            vec![
+                "secrets", "--pile", PILE, "secret", "add", "--vault", KEY, "--name", "token",
+                "--value", "value",
+            ],
             vec!["secrets", "--pile", PILE, "secret", "get", "--secret", ID],
-            vec!["secrets", "--pile", PILE, "secret", "share", "--secret", ID],
+            vec![
+                "secrets", "--pile", PILE, "secret", "get", "--vault", ID, "--secret", ID,
+            ],
+            vec![
+                "secrets", "--pile", PILE, "secret", "get", "--vault", KEY, "--secret", ID,
+            ],
             vec!["secrets", "--pile", PILE, "secret", "list"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for removed in [
+            vec!["secrets", "--pile", PILE, "vault", "members", "--vault", ID],
+            vec!["secrets", "--pile", PILE, "secret", "share", "--secret", ID],
+        ] {
+            assert!(Cli::try_parse_from(removed).is_err());
         }
     }
 

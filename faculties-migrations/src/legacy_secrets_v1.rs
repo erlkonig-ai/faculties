@@ -5,7 +5,9 @@
 //! pile can be upgraded.  The constants below pin the already-written v1 wire
 //! identity and the parser accepts only its exact canonical records.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::fmt;
 
@@ -130,6 +132,7 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    #[cfg(test)]
     fn effective_admins(&self, scope: Id) -> HashSet<Id> {
         let mut admins = HashSet::new();
         let Some(creator) = self.scopes.get(&scope).map(|row| row.creator) else {
@@ -156,6 +159,7 @@ impl Catalog {
 
     /// The exact v1 least fixpoint: live grant edges rooted in each scope's
     /// effective administrators, with the scope creator always included.
+    #[cfg(test)]
     pub fn recipients_of(&self, scope: Id) -> BTreeSet<Id> {
         let mut admin_cache: HashMap<Id, HashSet<Id>> = HashMap::new();
         let mut edges: BTreeMap<Id, BTreeSet<Id>> = BTreeMap::new();

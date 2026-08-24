@@ -942,8 +942,6 @@ mod tests {
 
     use hifitime::Epoch;
 
-    use crate::test_support::grant_team_of_one_write_authority;
-
     fn at(seconds: f64) -> IntervalValue {
         let epoch = Epoch::from_tai_seconds(seconds);
         (epoch, epoch).try_to_inline().unwrap()
@@ -1054,7 +1052,6 @@ mod tests {
         fragment += untagged_fragment;
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        grant_team_of_one_write_authority(&mut pile, &signer);
         crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
             .commit(fragment)
             .unwrap();

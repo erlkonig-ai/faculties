@@ -305,7 +305,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use faculties::relations::ProfileInput;
-    use faculties::storage::{ensure_team_of_one_write_authority, initialize_signer};
+    use faculties::storage::initialize_signer;
     use hifitime::Epoch;
 
     use super::*;
@@ -344,10 +344,7 @@ mod tests {
         let pile = directory.0.join("status.pile");
         let key = directory.0.join("status.key");
         File::create(&pile).unwrap();
-        let signer = initialize_signer(&pile, Some(&key)).unwrap();
-        let mut store = open_pile_strict(&pile).unwrap();
-        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
         Fixture {
             _directory: directory,
             pile,
@@ -434,26 +431,45 @@ mod tests {
     }
 
     #[test]
-    fn foreign_signer_does_not_introduce_status_membership() {
+    fn open_status_collection_materializes_foreign_commit_without_claiming_authorship() {
         let fixture = fixture();
         let window = Id::new([0x83; 16]).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let team = load_signer(&fixture.pile, Some(&fixture.key))
+        let namespace = load_signer(&fixture.pile, Some(&fixture.key))
             .unwrap()
             .verifying_key();
-        let descriptor = faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, team);
+        let descriptor = faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, namespace);
+        let foreign = SigningKey::from_bytes(&[0x84; 32]);
         triblespace::core::collection::simplearchive_union::publish_fragment_commit(
             &mut pile,
             &descriptor,
             status::status_fragment(window, "foreign", at(30.0)).unwrap(),
-            &SigningKey::from_bytes(&[0x84; 32]),
+            &foreign,
         )
         .unwrap();
         pile.close().unwrap();
 
         storage(&fixture)
             .with_pile(|pile, signer| {
-                assert!(load_catalogs(pile, signer)?.status.is_empty());
+                let catalogs = load_catalogs(pile, signer)?;
+                let rows = status::load_status_rows(&catalogs.status)?;
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    status::read_text(&catalogs.reader, rows[0].text)?,
+                    "foreign"
+                );
+
+                let target =
+                    faculties::storage::discover_target(pile, DEFAULT_SCOPE_ID, namespace)?;
+                assert_eq!(target.commits().len(), 1);
+                assert_eq!(
+                    target.commits()[0].public_key().raw,
+                    foreign.verifying_key().to_bytes()
+                );
+                assert_ne!(
+                    target.commits()[0].public_key().raw,
+                    signer.verifying_key().to_bytes()
+                );
                 Ok(())
             })
             .unwrap();

@@ -509,10 +509,7 @@ mod tests {
             let pile = directory.path().join("gauge.pile");
             let key = directory.path().join("gauge.key");
             File::create(&pile).unwrap();
-            let signer = initialize_signer(&pile, Some(&key)).unwrap();
-            let mut store = open_pile_strict(&pile).unwrap();
-            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-            store.close().unwrap();
+            initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 pile,

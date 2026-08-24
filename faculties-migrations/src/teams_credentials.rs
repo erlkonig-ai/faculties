@@ -2,8 +2,8 @@
 //!
 //! `teams_cutover` treats the legacy Teams OAuth rows as a bounded retired
 //! partition: they are verified as source evidence, but neither their facts
-//! nor their plaintext payload blobs enter native Teams authority, because
-//! native authority never holds a secret in the clear. Live authentication was
+//! nor their plaintext payload blobs enter the native Teams collection, because
+//! that collection never holds a secret in the clear. Live authentication was
 //! meant to restart at a source-scoped auth profile naming exact encrypted
 //! Secrets versions.
 //!
@@ -14,7 +14,8 @@
 //!
 //! This module is the bridge, and it is deliberately **not** a pile writer.
 //! Moving a credential into the current shape means selecting one exact ready
-//! vault epoch and sealing to its current direct-key recipients. That choice
+//! vault epoch and sealing through its current capability/custody context.
+//! That choice
 //! belongs to the durable signer acting through the live commands, not to a
 //! source-reading migration. So this reads the frozen legacy branch, reports
 //! exactly which credential rows survive, and on request materializes their

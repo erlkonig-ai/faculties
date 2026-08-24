@@ -485,7 +485,7 @@ mod tests {
     use std::fs::File;
 
     use crate::storage::load_signer;
-    use crate::test_support::initialize_team_of_one_write_fixture;
+    use crate::test_support::initialize_open_collection_fixture;
 
     use super::*;
 
@@ -504,7 +504,7 @@ mod tests {
         let pile_path = directory.path().join("cognition.pile");
         let key_path = directory.path().join("cognition.key");
         File::create(&pile_path).unwrap();
-        initialize_team_of_one_write_fixture(&pile_path, Some(&key_path));
+        initialize_open_collection_fixture(&pile_path, Some(&key_path));
 
         let event = reason_fragment(
             Some(id(1)),
@@ -593,7 +593,7 @@ mod tests {
         let pile_path = directory.path().join("cognition.pile");
         let key_path = directory.path().join("cognition.key");
         File::create(&pile_path).unwrap();
-        initialize_team_of_one_write_fixture(&pile_path, Some(&key_path));
+        initialize_open_collection_fixture(&pile_path, Some(&key_path));
 
         let valid = reason_fragment(None, None, "valid", None, point(1.0));
         let invalid_id = id(11);

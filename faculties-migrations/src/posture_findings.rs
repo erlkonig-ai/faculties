@@ -107,8 +107,6 @@ impl FindingBridgePlan {
 ///
 /// Pure: it opens repositories read-only and writes nothing.
 pub fn plan(pile: &Path, key: Option<&Path>) -> Result<FindingBridgePlan> {
-    crate::write_authority::require_initialized(pile, key)
-        .context("Posture bridge planning requires initialized WRITE authority")?;
     let signer = load_signer(pile, key)?;
     let store = open_pile_strict(pile)?;
     let mut collection = open_scope(store, DEFAULT_SCAN_SCOPE_ID, signer);
@@ -139,8 +137,6 @@ pub fn publish(
     pile: &Path,
     key: Option<&Path>,
 ) -> Result<(FindingBridgePlan, Option<CollectionCommit>)> {
-    crate::write_authority::publish(pile, key)
-        .context("initialize WRITE authority before publishing Posture bridges")?;
     let plan = plan(pile, key)?;
     if plan.bridged.is_empty() {
         return Ok((plan, None));

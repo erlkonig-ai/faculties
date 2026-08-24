@@ -3203,7 +3203,7 @@ mod tests {
     };
     use crate::secrets::storage as vaults;
     use crate::storage::{load_signer, open_pile_strict, publish_fragment};
-    use crate::test_support::initialize_team_of_one_write_fixture;
+    use crate::test_support::initialize_open_collection_fixture;
     use triblespace::core::repo::pile::{Pile, PileReader};
 
     fn id(byte: u8) -> Id {
@@ -3251,7 +3251,7 @@ mod tests {
             let pile = directory.path().join("mail.pile");
             let key = directory.path().join("mail.key");
             File::create(&pile).unwrap();
-            initialize_team_of_one_write_fixture(&pile, Some(&key));
+            initialize_open_collection_fixture(&pile, Some(&key));
             let secret_vault = id(120);
             let signer = load_signer(&pile, Some(&key)).unwrap();
             let mut store = open_pile_strict(&pile).unwrap();
@@ -3312,8 +3312,7 @@ mod tests {
                 plaintext,
                 created_at,
             )
-            .unwrap()
-            .0;
+            .unwrap();
             drop(discovery);
             pile.close().unwrap();
             secret
@@ -3756,7 +3755,10 @@ mod tests {
             &outsider,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("no wrap for this signing key"));
+        assert!(
+            format!("{error:#}").contains("not the access-envelope subject"),
+            "{error:#}"
+        );
     }
 
     #[test]

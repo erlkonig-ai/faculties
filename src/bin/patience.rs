@@ -229,10 +229,7 @@ mod tests {
         let key_path = directory.path().join("patience.key");
         File::create(&pile_path).unwrap();
 
-        let signer = initialize_signer(&pile_path, Some(&key_path)).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-        pile.close().unwrap();
+        initialize_signer(&pile_path, Some(&key_path)).unwrap();
         let storage = PatienceStorage {
             pile: &pile_path,
             key: Some(&key_path),

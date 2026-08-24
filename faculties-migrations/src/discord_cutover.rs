@@ -162,9 +162,6 @@ pub fn publish(
     }
     plan.verify_conservation()?;
 
-    crate::write_authority::publish(target, key)
-        .context("initialize WRITE authority before Discord migration publication")?;
-
     let signer = load_signer(target, key)?;
     let pile = open_pile_strict(target)?;
     let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
@@ -290,8 +287,6 @@ mod tests {
         let key = directory.path().join("discord.key");
         File::create(&pile_path).unwrap();
         initialize_signer(&pile_path, Some(&key)).unwrap();
-        crate::write_authority::publish(&pile_path, Some(&key)).unwrap();
-
         let message = Id::new([0x31; 16]).unwrap();
         let mut message_fragment = Fragment::empty();
         let external =

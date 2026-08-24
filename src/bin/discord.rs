@@ -1224,10 +1224,7 @@ mod tests {
         let pile = directory.path().join("discord.pile");
         let key = directory.path().join("discord.key");
         File::create(&pile).unwrap();
-        let signer = faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
-        let mut store = open_pile_strict(&pile).unwrap();
-        faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
+        faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
         (pile, key)
     }
 

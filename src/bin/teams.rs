@@ -446,7 +446,7 @@ impl TeamsSession<'_> {
             .location(vault)
             .copied()
             .ok_or_else(|| anyhow::anyhow!("vault {vault} is not ready for this node"))?;
-        let (secret, _) = secrets_vaults::add_secret(
+        let secret = secrets_vaults::add_secret(
             self.collection.storage_mut(),
             &self.signer,
             &location,
@@ -3762,10 +3762,7 @@ mod tests {
             let pile = dir.join("test.pile");
             fs::File::create(&pile).unwrap();
             let key = dir.join("test.key");
-            let signer = initialize_signer(&pile, Some(&key)).unwrap();
-            let mut store = open_pile_strict(&pile).unwrap();
-            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-            store.close().unwrap();
+            initialize_signer(&pile, Some(&key)).unwrap();
             Self { dir, pile, key }
         }
 
@@ -3871,8 +3868,7 @@ mod tests {
             b"distinct-test-client-secret",
             clock::point_now().unwrap(),
         )
-        .unwrap()
-        .0;
+        .unwrap();
         drop(discovery);
         let token_bundle = DelegatedTokenBundle {
             access_token: "distinct-test-access-token".to_owned(),
@@ -3891,8 +3887,7 @@ mod tests {
             &serde_json::to_vec(&token_bundle).unwrap(),
             clock::point_now().unwrap(),
         )
-        .unwrap()
-        .0;
+        .unwrap();
         drop(discovery);
         pile.close().unwrap();
         (vault, client_id, token_id)

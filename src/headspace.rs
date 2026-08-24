@@ -1095,8 +1095,6 @@ mod tests {
 
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
     use crate::secrets;
-    use crate::test_support::grant_team_of_one_write_authority;
-
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
     }
@@ -1138,7 +1136,6 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x21; 32]);
-        grant_team_of_one_write_authority(&mut pile, &signer);
         let anchor = test_id(0x11);
         let profile = default_profile(anchor, "default");
         let config = default_config(anchor);
@@ -1194,7 +1191,6 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x22; 32]);
-        grant_team_of_one_write_authority(&mut pile, &signer);
         let anchor = test_id(0x23);
         let profile = default_profile(anchor, "only-profile");
         let mut profile_only = profile_anchor_fragment(anchor);
@@ -1265,19 +1261,36 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x41; 32]);
-        grant_team_of_one_write_authority(&mut pile, &signer);
         let vault = test_id(0x40);
-        let recipients = BTreeSet::from([signer.verifying_key().to_bytes()]);
-        let first = secrets::seal_version("hs/model", b"first", &recipients, at(3)).unwrap();
-        let first_id = first.secret;
-        let second = secrets::seal_version("hs/model", b"second", &recipients, at(4)).unwrap();
-        let mut vault_fragment =
-            secrets::vault_header_fragment(vault, "headspace-test", at(2)).unwrap();
-        vault_fragment += first.fragment;
-        vault_fragment += second.fragment;
-        let vault_facts = vault_fragment.facts().clone();
-        let secrets_reader = vault_fragment.blobs_mut().reader().unwrap();
-        let secrets = SecretsSnapshot::new(secrets_reader, [(vault, vault_facts)]).unwrap();
+        let location =
+            secrets::storage::create_vault(&mut pile, &signer, vault, "headspace-test", at(2))
+                .unwrap();
+        let discovery = secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
+        let first_id = secrets::storage::add_secret(
+            &mut pile,
+            &signer,
+            &location,
+            discovery.snapshot(),
+            "hs/model",
+            b"first",
+            at(3),
+        )
+        .unwrap();
+        drop(discovery);
+        let discovery = secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
+        secrets::storage::add_secret(
+            &mut pile,
+            &signer,
+            &location,
+            discovery.snapshot(),
+            "hs/model",
+            b"second",
+            at(4),
+        )
+        .unwrap();
+        drop(discovery);
+        let discovery = secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
+        let secrets = discovery.snapshot();
 
         let anchor = test_id(0x42);
         let mut profile = default_profile(anchor, "exact");
@@ -1289,9 +1302,10 @@ mod tests {
 
         let (headspace_facts, headspace_reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let headspace = project_result(&headspace_reader, &headspace_facts).unwrap();
-        validate_secret_references(&headspace, &secrets).unwrap();
-        let opened = open_active_secrets(&headspace, &secrets, &signer).unwrap();
+        validate_secret_references(&headspace, secrets).unwrap();
+        let opened = open_active_secrets(&headspace, secrets, &signer).unwrap();
         assert_eq!(opened.model_api_key.as_deref(), Some("first"));
+        drop(discovery);
         pile.close().unwrap();
     }
 
@@ -1307,7 +1321,6 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x53; 32]);
-        grant_team_of_one_write_authority(&mut pile, &signer);
         crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
             .commit(fragment)
             .unwrap();
@@ -1340,7 +1353,6 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x62; 32]);
-        grant_team_of_one_write_authority(&mut pile, &signer);
         crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
             .commit(legacy.clone())
             .unwrap();

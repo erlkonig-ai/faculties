@@ -1289,10 +1289,7 @@ mod tests {
             let pile = directory.path().join("linkedin.pile");
             let key = directory.path().join("linkedin.key");
             File::create(&pile).unwrap();
-            let signer = storage::initialize_signer(&pile, Some(&key)).unwrap();
-            let mut store = open_pile_strict(&pile).unwrap();
-            storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-            store.close().unwrap();
+            storage::initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 pile,

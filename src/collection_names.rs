@@ -1,11 +1,11 @@
-//! The name each faculty's root collection is known by within its team.
+//! The name each faculty's root collection is known by within its namespace.
 //!
 //! A root collection used to be anchored by an opaque minted scope id. It
 //! discriminated roots correctly and told a reader nothing: the id lived as a
 //! hex constant in one faculty's source, so "which collection is this?" was
 //! answerable only by someone holding the code. A root is now anchored by a
-//! NAME plus its team's root public key, and this is where a faculty says its
-//! name out loud.
+//! NAME plus its historical namespace public key, and this is where a faculty
+//! says its name out loud.
 //!
 //! The scope ids have not gone anywhere — they remain each schema's stable
 //! identifier and the key this table is read by, because the migration that
@@ -15,7 +15,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use triblespace::core::collection::reach;
 use triblespace::core::collection::records::CollectionName;
-use triblespace::core::collection::{simplearchive_union, Collection};
+use triblespace::core::collection::{simplearchive_union, Collection, CollectionAdmission};
 use triblespace::core::id::Id;
 use triblespace::core::trible::Fragment;
 
@@ -149,35 +149,29 @@ pub fn require_name(scope: Id) -> CollectionName {
     })
 }
 
-/// The canonical root descriptor for one scope within `team`.
+/// The canonical root descriptor for one scope within `namespace`.
 ///
-/// `team` is the team's ROOT key, a genesis fact archived offline, not the key
-/// that signs commits. They coincide only for a team of one, and a caller that
-/// means that has to say so by passing `signer.verifying_key()` — defaulting to
-/// it here would quietly root every collection at whichever key was writing.
-pub fn root_descriptor(scope: Id, team: VerifyingKey) -> Fragment {
-    simplearchive_union::descriptor(&require_name(scope), team, require_reach(scope))
+/// Existing faculties historically used the pile signer's public key for this
+/// namespace. It remains identity-bearing to preserve their collection
+/// handles, but authority is explicitly absent and admission is open.
+pub fn root_descriptor(scope: Id, namespace: VerifyingKey) -> Fragment {
+    simplearchive_union::descriptor(&require_name(scope), namespace, None, require_reach(scope))
 }
 
-/// Open one scope's collection as a TEAM OF ONE.
+/// Open one existing faculty collection under its historical local namespace.
 ///
-/// This pile's own durable identity is its team root. That is the honest anchor
-/// for a pile nobody else writes to, and promoting it to a real multi-node team
-/// later is a re-root — a new collection reached by deriving — rather than a
-/// rename.
-///
-/// It lives here, in one place, precisely because it is a judgement rather than
-/// a default: `Collection::new` deliberately refuses to guess a team, and
-/// fifteen call sites each spelling `signer.verifying_key()` would be fifteen
-/// places for that judgement to quietly diverge.
+/// Namespace and admission are both explicit. The namespace preserves the
+/// already-published descriptor handle; open admission means authorization is
+/// not inferred from it.
 pub fn open<S>(storage: S, scope: Id, signer: SigningKey) -> Collection<S> {
-    let team = signer.verifying_key();
+    let namespace = signer.verifying_key();
     Collection::new(
         storage,
         &require_name(scope),
-        team,
+        namespace,
         signer,
         require_reach(scope),
+        CollectionAdmission::open(),
     )
 }
 
@@ -186,6 +180,10 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeSet;
+    use triblespace::core::collection::descriptor;
+    use triblespace::core::metadata;
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
+    use triblespace::macros::entity;
 
     #[test]
     fn every_name_is_legal_and_no_two_scopes_share_one() {
@@ -204,5 +202,34 @@ mod tests {
     #[test]
     fn a_scope_with_no_name_is_loud_rather_than_invented() {
         assert!(name_for(Id::new([0x5a; 16]).unwrap()).is_none());
+    }
+
+    #[test]
+    fn existing_roots_preserve_namespace_without_implying_authority() {
+        let local = SigningKey::from_bytes(&[0x31; 32]);
+        let foreign = SigningKey::from_bytes(&[0x73; 32]);
+        let scope = wiki::DEFAULT_SCOPE_ID;
+        let descriptor_fragment = root_descriptor(scope, local.verifying_key());
+        assert_eq!(
+            descriptor::namespace(descriptor_fragment.facts())
+                .expect("a root descriptor has a namespace")
+                .expect("its namespace decodes"),
+            local.verifying_key()
+        );
+        assert!(descriptor::authority(descriptor_fragment.facts()).is_none());
+
+        let evidence = entity! { _ @ metadata::tag: &scope };
+        let expected = evidence.facts().clone();
+        let mut store = MemoryRepo::default();
+        simplearchive_union::publish_fragment_commit(
+            &mut store,
+            &descriptor_fragment,
+            evidence,
+            &foreign,
+        )
+        .unwrap();
+        let mut collection = open(store, scope, local);
+        let materialized = collection.materialize().unwrap();
+        assert!(expected.difference(&materialized).is_empty());
     }
 }

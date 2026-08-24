@@ -1147,9 +1147,7 @@ mod tests {
     use std::fs::{self, File};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use faculties::storage::{
-        ensure_team_of_one_write_authority, initialize_signer, open_pile_strict,
-    };
+    use faculties::storage::initialize_signer;
 
     use super::*;
 
@@ -1187,10 +1185,7 @@ mod tests {
         let pile = directory.0.join("body.pile");
         let key = directory.0.join("body.key");
         File::create(&pile).unwrap();
-        let signer = initialize_signer(&pile, Some(&key)).unwrap();
-        let mut store = open_pile_strict(&pile).unwrap();
-        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
         let storage = BodyStorage {
             pile: &pile,
             key: Some(&key),

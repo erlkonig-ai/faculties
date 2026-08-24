@@ -1,9 +1,9 @@
-//! Read-only diagnostics over one immutable, authorized collection snapshot.
+//! Read-only diagnostics over one immutable collection snapshot.
 //!
 //! Triage intentionally owns no branch, chain, repair protocol, or mutable
-//! workspace. Every command freezes the pile once, admits only commits signed
-//! by keys with exact positive WRITE authority, and projects the canonical
-//! faculty collections it needs from that same snapshot.
+//! workspace. Every command freezes the pile once and projects the canonical
+//! faculty collections it needs from that same snapshot under each
+//! collection's explicit admission policy.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -1232,7 +1232,7 @@ mod tests {
     use faculties::headspace::{self, Resolution};
     use faculties::memory::{ChunkDraft, ChunkDraftContent, RetractionDraft};
     use faculties::schemas::triage::{exec, KIND_EXEC_REQUEST_ID};
-    use faculties::storage::{ensure_team_of_one_write_authority, initialize_signer};
+    use faculties::storage::initialize_signer;
     use triblespace::core::metadata;
     use triblespace::macros::entity;
 
@@ -1265,10 +1265,7 @@ mod tests {
             let pile = directory.path().join("triage.pile");
             let key = directory.path().join("triage.key");
             File::create(&pile).unwrap();
-            let signer = initialize_signer(&pile, Some(&key)).unwrap();
-            let mut store = open_pile_strict(&pile).unwrap();
-            ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-            store.close().unwrap();
+            initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 pile,

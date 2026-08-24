@@ -1247,9 +1247,6 @@ pub fn publish(
     }
     plan.validate(source.reader())?;
 
-    crate::write_authority::publish(target, key)
-        .context("initialize WRITE authority before Memory migration publication")?;
-
     let signer = load_signer(target, key)?;
     let mut pile = open_pile_strict(target)?;
     let result = (|| {

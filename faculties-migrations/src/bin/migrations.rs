@@ -14,8 +14,6 @@
 //!   is the whole-pile path and the one to prefer.
 //! - `migrate-legacy <faculty>` migrates one faculty's branch in place, which
 //!   is what that faculty's own `migrate-legacy` subcommand used to do.
-//! - `faculty-write-authority` additively grants this pile's durable signer
-//!   WRITE access to the closed faculty-root manifest in this build.
 //! - `status-register` gives Compass's status register the identity it never
 //!   had, on the events written before that identity existed.
 //! - `mail-credentials` recovers the mail account the Secrets cutover sealed
@@ -34,7 +32,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
     activation_cutover, collection_cutover, collection_naming, disposable_cutover, legacy_password,
-    mail_credentials, posture_findings, status_register, teams_credentials, write_authority,
+    mail_credentials, posture_findings, status_register, teams_credentials,
 };
 use zeroize::Zeroizing;
 
@@ -85,11 +83,11 @@ enum Command {
         dry_run: bool,
     },
 
-    /// Re-seat every scoped root collection onto a name within a team.
+    /// Re-seat every scoped root collection onto a name within a namespace.
     ///
     /// A root used to be anchored by an opaque minted scope id, so the pile
     /// could not say which collection was which; it is now a name plus the
-    /// team's root key. That moves the descriptor's handle, so current code
+    /// historical namespace key. That moves the descriptor's handle, so current code
     /// looks for a collection nobody wrote and finds an empty one where the
     /// data is. Additive: the scoped collections stay exactly where they are
     /// and this appends the named ones beside them.
@@ -106,18 +104,6 @@ enum Command {
         /// where the two would quietly drift apart.
         #[arg(long = "name", value_name = "HEX=NAME")]
         names: Vec<String>,
-    },
-
-    /// Grant this pile's durable team-of-one key WRITE authority over every
-    /// exact root collection configured by the current Faculties build.
-    ///
-    /// Additive and closed: targets come only from the build's collection-name
-    /// table. Existing data and COMMITs are untouched; pre-naming, unknown,
-    /// and foreign-team collections receive nothing.
-    FacultyWriteAuthority {
-        /// Report the exact deterministic grants without writing.
-        #[arg(long)]
-        dry_run: bool,
     },
 
     /// Give Compass's status register the identity it never had:
@@ -383,7 +369,7 @@ fn collection_naming(
         collection_naming::publish(pile, key, &extra).context("publish the collection naming")?
     };
 
-    println!("Collection naming: scope anchors become names within a team");
+    println!("Collection naming: scope anchors become names within a namespace");
     println!("pile              : {}", pile.display());
     println!("already named     : {}", report.already_named);
     println!("settled           : {}", report.settled.len());
@@ -489,60 +475,6 @@ fn posture_findings(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()
     Ok(())
 }
 
-fn faculty_write_authority(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
-    let report = if dry_run {
-        write_authority::plan(pile, key).context("plan faculty WRITE authority")?
-    } else {
-        write_authority::publish(pile, key).context("publish faculty WRITE authority")?
-    };
-
-    println!("Faculty team-of-one WRITE authority");
-    println!("pile               : {}", pile.display());
-    println!(
-        "team root          : {}",
-        hex::encode_upper(report.team_root())
-    );
-    println!("configured roots   : {}", report.rows().len());
-    println!("accepted           : {}", report.accepted());
-    println!("missing            : {}", report.missing());
-    println!("authority diagnostics: {}", report.diagnostics().len());
-    println!("foreign roots ignored: {}", report.ignored_foreign_roots());
-    println!("unknown roots ignored: {}", report.ignored_unknown_roots());
-    if !dry_run {
-        println!("published this run : {}", report.published().len());
-    }
-
-    println!();
-    for row in report.rows() {
-        let state = if row.accepted() {
-            "accepted"
-        } else {
-            "would publish"
-        };
-        let target = if row.target_commits() == 0 {
-            "prospective".to_owned()
-        } else {
-            format!("{} target COMMIT(s)", row.target_commits())
-        };
-        println!(
-            "  {:<16} {}  grant {:X}  {state}; {target}",
-            row.name(),
-            hex::encode(row.resource().raw),
-            row.commit().id(),
-        );
-    }
-    for diagnostic in report.diagnostics() {
-        println!("  diagnostic: {diagnostic:?}");
-    }
-
-    if dry_run {
-        println!("\nDry run: nothing was written. Re-run without --dry-run to append.");
-    } else if report.published().is_empty() {
-        println!("\nAll configured WRITE grants were already accepted; nothing was written.");
-    }
-    Ok(())
-}
-
 fn list_faculties() {
     println!("Faculties `migrations migrate-legacy` can move, and the scope each lands in:");
     for faculty in Faculty::ALL {
@@ -587,13 +519,6 @@ fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
     println!("legacy pins  : {}", semantic.pin_count);
     println!("pin digest   : blake3:{}", hex::encode(semantic.digest));
     println!("publication  : {}", presence.status().label());
-    println!(
-        "fixed WRITE  : {}/{} exact grant(s), {}/{} dependency blob(s)",
-        presence.accepted_fixed_authority_grants(),
-        presence.fixed_authority_grants(),
-        presence.resident_fixed_authority_dependencies(),
-        presence.fixed_authority_dependencies(),
-    );
     println!();
 
     println!("Collections:");
@@ -602,10 +527,11 @@ fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
             activation_cutover::CandidateViewKey::Faculty(scope) => {
                 format!("faculty {scope:X}")
             }
+            activation_cutover::CandidateViewKey::AccessInbox => "Secrets access inbox".into(),
             activation_cutover::CandidateViewKey::Vault(vault) => format!("vault {vault:X}"),
         };
         println!(
-            "- {} | {} | {} | {}/{} exact COMMIT(s) | {}/{} dependency blob(s) | {}/{} authority grant(s), {}/{} blob(s){} | {} fact(s) | {:?}",
+            "- {} | {} | {} | {}/{} exact COMMIT(s) | {}/{} dependency blob(s) | {} fact(s) | {:?}",
             collection.name().as_str(),
             view,
             publication.status().label(),
@@ -613,15 +539,6 @@ fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
             publication.planned_commits(),
             publication.resident_dependencies(),
             publication.required_dependencies(),
-            publication.accepted_authority_grants(),
-            publication.required_authority_grants(),
-            publication.resident_authority_dependencies(),
-            publication.required_authority_dependencies(),
-            if publication.authority_policy_matches() {
-                ""
-            } else {
-                ", READ POLICY MISMATCH"
-            },
             collection.expected_facts().len(),
             collection.policy(),
         );
@@ -717,9 +634,6 @@ fn main() -> Result<()> {
         }
         Some(Command::CollectionNaming { dry_run, names }) => {
             collection_naming(&cli.pile, cli.key.as_deref(), dry_run, &names)
-        }
-        Some(Command::FacultyWriteAuthority { dry_run }) => {
-            faculty_write_authority(&cli.pile, cli.key.as_deref(), dry_run)
         }
         Some(Command::StatusRegister { dry_run }) => {
             status_register(&cli.pile, cli.key.as_deref(), dry_run)

@@ -1392,7 +1392,7 @@ mod tests {
     use hifitime::Epoch;
 
     use crate::storage::load_signer;
-    use crate::test_support::initialize_team_of_one_write_fixture;
+    use crate::test_support::initialize_open_collection_fixture;
 
     use super::*;
 
@@ -1413,7 +1413,7 @@ mod tests {
             let pile = directory.path().join("habit.pile");
             let key = directory.path().join("habit.key");
             File::create(&pile).unwrap();
-            initialize_team_of_one_write_fixture(&pile, Some(&key));
+            initialize_open_collection_fixture(&pile, Some(&key));
             Self {
                 _directory: directory,
                 pile,

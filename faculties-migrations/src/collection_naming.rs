@@ -1,12 +1,12 @@
-//! Re-seat every scoped root collection onto a name within a team.
+//! Re-seat every scoped root collection onto a name within a namespace.
 //!
 //! A root collection used to be anchored by an opaque minted scope id. It
 //! discriminated roots correctly and told a reader nothing: every faculty
 //! carried its scope as a hex constant in its own source, so "which collection
 //! is this?" was answerable only by someone holding the code, and the pile
 //! itself could say nothing about it. A root is now anchored by a name plus
-//! its team's root public key, which makes the pile self-describing and lets a
-//! collection authorize itself from its team root.
+//! its historical namespace key, which makes the pile self-describing without
+//! conflating identity with authorization.
 //!
 //! That changes the descriptor's bytes and therefore its handle: current code
 //! computes a handle no existing collection is under, and finds an empty
@@ -75,7 +75,7 @@ mod retired {
     }
 }
 
-/// One root collection's move from an opaque scope to a name within a team.
+/// One root collection's move from an opaque scope to a name within a namespace.
 #[derive(Clone, Debug)]
 pub struct Rename {
     /// Handle the collection lives under today.
@@ -84,7 +84,7 @@ pub struct Rename {
     pub new: CollectionHandle,
     /// The anchor it is leaving.
     pub scope: Id,
-    /// The name it takes within its team.
+    /// The name it takes within its namespace.
     pub name: String,
     /// Signed states to re-commit under `new`.
     pub commits: usize,
@@ -248,11 +248,10 @@ pub fn plan(
     extra: &[ExtraName],
 ) -> Result<CollectionNamingReport> {
     let signer = load_signer(pile, key).context("a re-commit needs the durable signing key")?;
-    // A team of one: this pile's own durable identity is its team root. That
-    // is the honest anchor for a pile nobody else writes to, and promoting it
-    // to a real multi-node team later is a re-root -- a new collection reached
-    // by deriving -- rather than a rename.
-    let team = signer.verifying_key();
+    // Historical named roots used this pile's durable signer as their
+    // identity namespace. Preserve that byte identity without treating the
+    // namespace as ambient authorization.
+    let namespace = signer.verifying_key();
     let mut store = open_pile_strict(pile)?;
     let result = (|| {
         let by_collection = collections_with_commits(&mut store)?;
@@ -277,8 +276,8 @@ pub fn plan(
             };
             let Some(scope) = one(&facts, retired::collection_scope.id()) else {
                 if matches!(
-                    triblespace::core::collection::descriptor::team(&facts),
-                    Some(Ok(root)) if root == team
+                    triblespace::core::collection::descriptor::namespace(&facts),
+                    Some(Ok(root)) if root == namespace
                 ) {
                     has_local_evidence = true;
                 }
@@ -299,20 +298,20 @@ pub fn plan(
                 ));
                 continue;
             };
-            // Before explicit authority, the collection facade admitted only
-            // the local signer. Preserve that historical boundary: a foreign
+            // The retired scoped facade admitted only the local signer.
+            // Preserve that historical boundary: a foreign
             // self-signed COMMIT beside the same opaque scope was inert and
             // must not become trusted merely because this migration re-signs
             // it.
             let commits = commits
                 .into_iter()
-                .filter(|commit| commit.public_key().raw == team.to_bytes())
+                .filter(|commit| commit.public_key().raw == namespace.to_bytes())
                 .collect::<Vec<_>>();
             if commits.is_empty() {
                 has_foreign_legacy_evidence = true;
                 report.unnamed.push((
                     old,
-                    "recognized legacy scope has no COMMIT authored by the supplied team-of-one key"
+                    "recognized legacy scope has no COMMIT authored by the supplied namespace key"
                         .into(),
                 ));
                 continue;
@@ -343,7 +342,7 @@ pub fn plan(
             // ever published, this constant is the second place that has to move,
             // and a mismatch shows up as a rename to a handle nothing opens.
             let new = prospective_handle(
-                simplearchive_union::descriptor(&named, team, reach::private()).facts(),
+                simplearchive_union::descriptor(&named, namespace, None, reach::private()).facts(),
             );
             let rename = Rename {
                 old,
@@ -373,7 +372,7 @@ pub fn plan(
         if !has_local_evidence && has_foreign_legacy_evidence {
             bail!(
                 "the supplied key authored none of this pile's recognized legacy collection \
-                 states; refusing to create a parallel named team"
+                 states; refusing to create a parallel named namespace"
             );
         }
         Ok(report)
@@ -392,22 +391,17 @@ pub fn publish(
     extra: &[ExtraName],
 ) -> Result<CollectionNamingReport> {
     let signer = load_signer(pile, key).context("a re-commit needs the durable signing key")?;
-    let team = signer.verifying_key();
+    let namespace = signer.verifying_key();
     let report = plan(pile, key, extra)?;
 
     let mut store = open_pile_strict(pile)?;
     let result = (|| {
-        // Preflight authority before storing a descriptor or re-seating a
-        // COMMIT. In particular, an existing foreign team must reject this
-        // key before a newly written local root could make the key appear
-        // legitimate to the guard.
-        faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer)
-            .context("initialize WRITE authority for named faculty roots")?;
         let by_collection = collections_with_commits(&mut store)?;
         let mut written = BTreeSet::new();
         for rename in &report.renames {
             let named = CollectionName::new(&rename.name).expect("plan checked this");
-            let descriptor = simplearchive_union::descriptor(&named, team, reach::private());
+            let descriptor =
+                simplearchive_union::descriptor(&named, namespace, None, reach::private());
             // The handle comes from the store, not from a second hash beside it.
             let new = store
                 .put::<SimpleArchive, _>(descriptor.facts().clone())
@@ -424,7 +418,7 @@ pub fn publish(
                 .unwrap_or_default();
             for commit in existing
                 .iter()
-                .filter(|commit| commit.public_key().raw == team.to_bytes())
+                .filter(|commit| commit.public_key().raw == namespace.to_bytes())
             {
                 let reseated =
                     CollectionCommit::sign(&signer, rename.new, commit.data(), commit.metadata());
@@ -454,10 +448,11 @@ mod tests {
     use triblespace::core::trible::Fragment;
     use triblespace::macros::entity;
 
-    fn legacy_descriptor(scope: Id, team: ed25519_dalek::VerifyingKey) -> Fragment {
+    fn legacy_descriptor(scope: Id, namespace: ed25519_dalek::VerifyingKey) -> Fragment {
         let mut descriptor = simplearchive_union::descriptor(
             &CollectionName::new("legacy-root").unwrap(),
-            team,
+            namespace,
+            None,
             reach::private(),
         );
         descriptor += entity! { retired::collection_scope: &scope };
@@ -478,7 +473,7 @@ mod tests {
     }
 
     /// Two scopes sharing a name would silently merge two collections into
-    /// one, since a root's identity is exactly its name and team.
+    /// one, since a root's identity is exactly its name and namespace.
     #[test]
     fn names_are_unique() {
         let mut seen = BTreeSet::new();
@@ -521,7 +516,7 @@ mod tests {
         let before = fs::read(&pile_path).unwrap();
 
         let error = publish(&pile_path, Some(&foreign_key), &[]).unwrap_err();
-        assert!(format!("{error:#}").contains("refusing to create a parallel named team"));
+        assert!(format!("{error:#}").contains("refusing to create a parallel named namespace"));
         assert_eq!(fs::read(&pile_path).unwrap(), before);
     }
 

@@ -40,6 +40,7 @@ pub mod disposable_cutover;
 pub mod files_cutover;
 pub mod habit_cutover;
 pub mod headspace_cutover;
+mod legacy_authority;
 pub mod legacy_password;
 pub(crate) mod legacy_secrets_v1;
 pub mod mail_credentials;
@@ -60,6 +61,5 @@ pub mod teams_cutover;
 pub mod voice_cutover;
 pub mod web_cutover;
 pub mod wiki_cutover;
-pub mod write_authority;
 
 pub mod per_faculty;

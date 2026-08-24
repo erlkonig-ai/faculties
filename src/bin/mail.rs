@@ -232,7 +232,7 @@ impl Storage<'_> {
         Ok(views)
     }
 
-    fn add_secret(&self, vault: Id, name: &str, plaintext: &[u8]) -> Result<(Id, usize)> {
+    fn add_secret(&self, vault: Id, name: &str, plaintext: &[u8]) -> Result<Id> {
         let mut pile = self.pile.borrow_mut();
         let pile = pile
             .as_mut()
@@ -428,10 +428,9 @@ fn account_set(
         }
         (None, Some(id), _, None) => id,
         (Some(value), None, _, Some(vault)) => {
-            let (id, recipients) =
-                storage.add_secret(vault, &mailbox_secret_name(anchor), value.as_bytes())?;
+            let id = storage.add_secret(vault, &mailbox_secret_name(anchor), value.as_bytes())?;
             eprintln!(
-                "Published mailbox credential {id:x} to vault {vault:x} for {recipients} recipient(s); if Mail publication is interrupted, retry with --credential-version {id:x}"
+                "Published mailbox credential {id:x} to vault {vault:x}; if Mail publication is interrupted, retry with --credential-version {id:x}"
             );
             views = storage.views()?;
             if !views.secrets.snapshot().contains(id) {
@@ -1250,10 +1249,7 @@ mod tests {
             let pile = directory.path().join("mail-cli.pile");
             let key = directory.path().join("mail-cli.key");
             File::create(&pile).unwrap();
-            let signer = initialize_signer(&pile, Some(&key)).unwrap();
-            let mut store = open_pile_strict(&pile).unwrap();
-            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-            store.close().unwrap();
+            initialize_signer(&pile, Some(&key)).unwrap();
 
             let account = id(70);
             let signer = load_signer(&pile, Some(&key)).unwrap();
@@ -1278,8 +1274,7 @@ mod tests {
                 b"mailbox password",
                 point_now().unwrap(),
             )
-            .unwrap()
-            .0;
+            .unwrap();
             drop(discovery);
             store.close().unwrap();
             let mut fragment = Fragment::empty();
@@ -1443,8 +1438,7 @@ mod tests {
                 &mailbox_secret_name(fixture.account),
                 b"replacement password",
             )
-            .unwrap()
-            .0;
+            .unwrap();
         let versions = storage
             .views()
             .unwrap()

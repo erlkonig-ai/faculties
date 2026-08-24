@@ -485,11 +485,8 @@ pub fn publish(
     }
     plan.verify_conservation()?;
 
-    crate::write_authority::publish(target, key)
-        .context("initialize WRITE authority before Teams migration publication")?;
-
-    // Load authority before touching the target. Keep one pile open for the
-    // exact-union preflight and all commits. Existing facts need not be a
+    // Keep one pile open for the exact-union preflight and all commits.
+    // Existing facts need not be a
     // valid catalog alone, because a killed prior run may have published only
     // a proper prefix; the complete post-migration union must be valid.
     let signer = load_signer(target, key)?;
@@ -673,8 +670,6 @@ mod tests {
         let key = directory.0.join("teams.key");
         File::create(&pile_path).unwrap();
         initialize_signer(&pile_path, Some(&key)).unwrap();
-        crate::write_authority::publish(&pile_path, Some(&key)).unwrap();
-
         let chat = Id::new([0x11; 16]).unwrap();
         let mut chat_fragment = Fragment::empty();
         let chat_external = chat_fragment.put::<UTF8String, _>("legacy-chat".to_owned());

@@ -1013,8 +1013,6 @@ mod tests {
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
 
-    use crate::test_support::grant_collection_write_authority;
-
     fn content_of(fragment: &Fragment) -> ContentHandle {
         find!(
             (content: ContentHandle),
@@ -1519,8 +1517,6 @@ mod tests {
             crate::schemas::files::DEFAULT_SCOPE_ID,
             signer.clone(),
         );
-        let resource = collection.collection();
-        grant_collection_write_authority(collection.storage_mut(), resource, &signer);
         let file = stage(
             b"slides".to_vec(),
             "deck.pptx",

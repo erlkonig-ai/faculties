@@ -69,7 +69,7 @@ impl SecretsMigrationPlan {
         &self.retained
     }
 
-    /// Exact bounded evidence omitted from native Secrets authority.
+    /// Exact bounded evidence omitted from native Secrets vault data.
     pub fn retired_facts(&self) -> &TribleSet {
         &self.retired
     }
@@ -358,8 +358,6 @@ mod tests {
         let key = directory.0.join("secrets.key");
         File::create(&pile_path).unwrap();
         initialize_signer(&pile_path, Some(&key)).unwrap();
-        crate::write_authority::publish(&pile_path, Some(&key)).unwrap();
-
         let identity = Id::new([0x11; 16]).unwrap();
         let mut identity_fragment = Fragment::empty();
         let name = identity_fragment.put("alice".to_owned());

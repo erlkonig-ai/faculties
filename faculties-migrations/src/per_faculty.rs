@@ -185,12 +185,6 @@ pub fn migrate(faculty: Faculty, pile: &Path, key: Option<&Path>) -> Result<()> 
     // is the only path that may publish it below.
     let publish = prepare(faculty, &source, pile, key)?;
 
-    // Migration is an explicit authority-initialization boundary. Ordinary
-    // faculty publication remains strict: it never manufactures a grant just
-    // because a caller attempted a write.
-    crate::write_authority::publish(pile, key)
-        .with_context(|| format!("initialize WRITE authority before migrating {faculty}"))?;
-
     let scope = faculty.scope();
     let before = materialize(pile, scope, &signer)
         .with_context(|| format!("materialize the current native {faculty} collection"))?;

@@ -726,7 +726,7 @@ mod tests {
 
     use crate::schemas::memory::DEFAULT_SCOPE_ID;
     use crate::storage::open_pile_strict;
-    use crate::test_support::initialize_team_of_one_write_fixture;
+    use crate::test_support::initialize_open_collection_fixture;
 
     fn point(seconds: f64) -> IntervalValue {
         let at = hifitime::Epoch::from_tai_seconds(seconds);
@@ -932,7 +932,7 @@ mod tests {
         let pile = directory.path().join("memory.pile");
         let key = directory.path().join("memory.key");
         File::create(&pile).unwrap();
-        let signer = initialize_team_of_one_write_fixture(&pile, Some(&key));
+        let signer = initialize_open_collection_fixture(&pile, Some(&key));
         let mut pile_store = open_pile_strict(&pile).unwrap();
         let before = {
             let mut collection =
@@ -968,7 +968,7 @@ mod tests {
         let pile = directory.path().join("memory.pile");
         let key = directory.path().join("memory.key");
         File::create(&pile).unwrap();
-        let signer = initialize_team_of_one_write_fixture(&pile, Some(&key));
+        let signer = initialize_open_collection_fixture(&pile, Some(&key));
         let mut pile_store = open_pile_strict(&pile).unwrap();
         let (left, left_id) = chunk_fragment(draft("left", [])).unwrap();
         let (right, right_id) = chunk_fragment(draft("right", [])).unwrap();

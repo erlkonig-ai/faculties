@@ -9,7 +9,7 @@
 //! catalog; focused capture binaries request only their source dependency
 //! closure. Most sources are fixed descriptor-handle collections. Secrets is
 //! deliberately different: it is the aggregate of exact vault epochs for
-//! which the pile signer currently has `READ` authority.
+//! which the pile signer has one verified exact `READ` capability.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -156,13 +156,14 @@ impl DatasetRevision {
     fn from_secrets(discovery: &vaults::VaultDiscovery) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"faculties.viewer.secrets-revision.v2");
-        for (vault, location) in discovery.locations() {
+        for (collection, location) in discovery.locations() {
             let snapshot = discovery
                 .snapshot()
-                .vault(*vault)
+                .vault_exact(*collection)
                 .expect("every ready vault location has one snapshot");
-            hasher.update(&vault.raw());
-            hasher.update(&location.team().to_bytes());
+            hasher.update(&location.vault().raw());
+            hasher.update(&location.namespace().to_bytes());
+            hasher.update(&location.authority().to_bytes());
             hasher.update(&location.collection().raw);
             match snapshot.facts().fingerprint().as_u128() {
                 Some(fingerprint) => {
@@ -850,11 +851,11 @@ mod tests {
     use triblespace::macros::{entity, find, pattern};
     use triblespace::prelude::*;
 
-    use crate::test_support::initialize_team_of_one_write_fixture;
+    use crate::test_support::initialize_open_collection_fixture;
 
     fn create_pile(path: &Path) {
         File::create(path).unwrap();
-        initialize_team_of_one_write_fixture(path, None);
+        initialize_open_collection_fixture(path, None);
     }
 
     fn publish_reason(path: &Path, text: &str, second: f64) {

@@ -652,9 +652,7 @@ mod tests {
     use triblespace::macros::{find, pattern};
 
     use super::*;
-    use faculties::storage::{
-        ensure_team_of_one_write_authority, initialize_signer, open_pile_strict,
-    };
+    use faculties::storage::{initialize_signer, open_pile_strict};
 
     #[test]
     fn cli_exposes_one_fixed_collection_without_legacy_coordinates() {
@@ -748,10 +746,7 @@ mod tests {
         let pile_path = directory.path().join("web.pile");
         let key_path = directory.path().join("web.key");
         File::create(&pile_path).unwrap();
-        let signer = initialize_signer(&pile_path, Some(&key_path)).unwrap();
-        let mut store = open_pile_strict(&pile_path).unwrap();
-        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
+        initialize_signer(&pile_path, Some(&key_path)).unwrap();
 
         WebStorage {
             pile: &pile_path,

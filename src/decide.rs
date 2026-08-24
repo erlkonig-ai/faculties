@@ -829,7 +829,7 @@ mod tests {
 
     use crate::schemas::decide::DEFAULT_SCOPE_ID;
     use crate::storage::{load_signer, open_pile_strict, publish_fragment};
-    use crate::test_support::initialize_team_of_one_write_fixture;
+    use crate::test_support::initialize_open_collection_fixture;
     use hifitime::Epoch;
 
     fn at(second: u8) -> IntervalValue {
@@ -854,7 +854,7 @@ mod tests {
             let pile = directory.path().join("decide.pile");
             let key = directory.path().join("decide.key");
             File::create(&pile).unwrap();
-            initialize_team_of_one_write_fixture(&pile, Some(&key));
+            initialize_open_collection_fixture(&pile, Some(&key));
             Self {
                 _directory: directory,
                 pile,

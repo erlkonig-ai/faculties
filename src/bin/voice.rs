@@ -1241,9 +1241,7 @@ mod tests {
     use triblespace::core::repo::BlobStoreGet;
 
     use faculties::schemas::voice::{utterance, KIND_UTTERANCE};
-    use faculties::storage::{
-        discover_target, ensure_team_of_one_write_authority, initialize_signer,
-    };
+    use faculties::storage::{discover_target, initialize_signer};
 
     fn dev(name: &str, default: bool) -> AudioDevice {
         AudioDevice {
@@ -1269,10 +1267,7 @@ mod tests {
         let pile = directory.path().join("voice.pile");
         let key = directory.path().join("voice.key");
         File::create(&pile).unwrap();
-        let signer = initialize_signer(&pile, Some(&key)).unwrap();
-        let mut store = open_pile_strict(&pile).unwrap();
-        ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
         let storage = VoiceStorage {
             pile: &pile,
             key: Some(&key),

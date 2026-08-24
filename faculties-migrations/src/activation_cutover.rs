@@ -12,9 +12,8 @@ use std::fmt;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::authority::resolve_authority;
 use triblespace::core::blob::{BlobEncoding, TryFromBlob};
-use triblespace::core::collection::reach;
+use triblespace::core::collection::{descriptor, reach, CapabilityPresentation, CollectionHandle};
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::InlineEncoding;
 use triblespace::core::repo::pile::PileReader;
@@ -104,15 +103,17 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum CandidateViewKey {
     Faculty(Id),
+    AccessInbox,
     Vault(Id),
 }
 
 /// Authority policy implied by one semantic target kind.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TargetPolicy {
-    Faculty,
+    Open,
     Vault {
-        readers: BTreeSet<secrets::RecipientPublicKey>,
+        authority: VerifyingKey,
+        write: CapabilityPresentation,
     },
 }
 
@@ -180,7 +181,7 @@ impl PlannedCollection {
                 name: faculties::collection_names::require_name(scope),
                 reach: faculties::collection_names::require_reach(scope),
                 view: CandidateViewKey::Faculty(scope),
-                policy: TargetPolicy::Faculty,
+                policy: TargetPolicy::Open,
                 fragments,
                 expected_facts,
             },
@@ -192,11 +193,39 @@ impl PlannedCollection {
         })
     }
 
-    fn vault(
+    pub(crate) fn access_inbox(
+        recipient: VerifyingKey,
+        fragments: impl IntoIterator<Item = Fragment>,
+        expected_facts: TribleSet,
+    ) -> Result<Self> {
+        let descriptor = secrets::storage::access_inbox_descriptor(recipient);
+        let name = descriptor::name(descriptor.facts())
+            .context("canonical Secrets access inbox has no collection name")??;
+        let fragments = fragments.into_iter().collect::<Vec<_>>();
+        let staged_facts = materialized_facts(&fragments);
+        if staged_facts != expected_facts {
+            bail!(
+                "erased Secrets access-inbox plan stages {} facts but expects {}",
+                staged_facts.len(),
+                expected_facts.len()
+            );
+        }
+        Ok(Self {
+            name,
+            reach: reach::private(),
+            view: CandidateViewKey::AccessInbox,
+            policy: TargetPolicy::Open,
+            fragments,
+            expected_facts,
+        })
+    }
+
+    pub(crate) fn vault(
         vault: Id,
         fragments: impl IntoIterator<Item = Fragment>,
         expected_facts: TribleSet,
-        readers: BTreeSet<secrets::RecipientPublicKey>,
+        authority: VerifyingKey,
+        write: CapabilityPresentation,
     ) -> Result<Self> {
         let name = secrets::vault_name(vault);
         let fragments = fragments.into_iter().collect::<Vec<_>>();
@@ -212,7 +241,7 @@ impl PlannedCollection {
             name,
             reach: reach::private(),
             view: CandidateViewKey::Vault(vault),
-            policy: TargetPolicy::Vault { readers },
+            policy: TargetPolicy::Vault { authority, write },
             fragments,
             expected_facts,
         })
@@ -306,7 +335,7 @@ impl SourceDisposition {
 /// Complete pure plan for one atomic activation candidate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivationPlan {
-    team: [u8; 32],
+    namespace: [u8; 32],
     collections: Vec<PlannedCollection>,
     consumptions: Vec<SourceConsumption>,
     dispositions: Vec<SourceDisposition>,
@@ -314,34 +343,23 @@ pub struct ActivationPlan {
 
 /// Complete semantic views from one closed candidate snapshot.
 ///
-/// `vaults` is the global structural census of every vault targeted by this
-/// activation. `local_vaults` is the strict subset for which the durable local
-/// signer has accepted exact-resource `READ` authority. Runtime references are
-/// validated only against that local subset.
+/// Vaults enter this value only through the durable signer's access inbox.
+/// There is deliberately no ambient/global vault census: an unanchored or
+/// otherwise undisclosed collection is inert even if its bytes remain in the
+/// preserved pile prefix.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CandidateViews {
     faculties: BTreeMap<Id, TribleSet>,
-    vaults: BTreeMap<Id, TribleSet>,
-    local_vaults: BTreeMap<Id, TribleSet>,
+    local_vaults: BTreeMap<CollectionHandle, (Id, TribleSet)>,
 }
 
 impl CandidateViews {
     pub fn new(
         faculties: BTreeMap<Id, TribleSet>,
-        vaults: BTreeMap<Id, TribleSet>,
-        local_vaults: BTreeMap<Id, TribleSet>,
+        local_vaults: BTreeMap<CollectionHandle, (Id, TribleSet)>,
     ) -> Result<Self> {
-        for (vault, local) in &local_vaults {
-            let Some(global) = vaults.get(vault) else {
-                bail!("local READ vault {vault:X} is absent from the global vault snapshot");
-            };
-            if local != global {
-                bail!("local READ vault {vault:X} differs from its global vault facts");
-            }
-        }
         Ok(Self {
             faculties,
-            vaults,
             local_vaults,
         })
     }
@@ -350,18 +368,14 @@ impl CandidateViews {
         &self.faculties
     }
 
-    pub fn vaults(&self) -> &BTreeMap<Id, TribleSet> {
-        &self.vaults
-    }
-
-    pub fn local_vaults(&self) -> &BTreeMap<Id, TribleSet> {
+    pub fn local_vaults(&self) -> &BTreeMap<CollectionHandle, (Id, TribleSet)> {
         &self.local_vaults
     }
 }
 
 impl ActivationPlan {
-    pub const fn team(&self) -> [u8; 32] {
-        self.team
+    pub const fn namespace(&self) -> [u8; 32] {
+        self.namespace
     }
 
     pub fn collections(&self) -> &[PlannedCollection] {
@@ -527,10 +541,14 @@ pub fn validate_candidate_views(reader: &PileReader, views: &CandidateViews) -> 
         schemas::relations::DEFAULT_SCOPE_ID,
     )?;
     relations::validate_catalog(reader, relation_facts).context("validate Relations candidate")?;
-    let _all_secrets = secrets::SecretsSnapshot::new(reader.clone(), views.vaults.clone())
-        .context("validate global Secrets vault candidate")?;
-    let local_secrets = secrets::SecretsSnapshot::new(reader.clone(), views.local_vaults.clone())
-        .context("validate local READ-authorized Secrets vault candidate")?;
+    let local_secrets = secrets::SecretsSnapshot::new_exact(
+        reader.clone(),
+        views
+            .local_vaults
+            .iter()
+            .map(|(collection, (vault, facts))| (*collection, *vault, facts.clone())),
+    )
+    .context("validate inbox-discovered local Secrets vault candidate")?;
     headspace::validate_secret_references(&headspace_catalog, &local_secrets)
         .context("validate Headspace candidate exact local Secrets references")?;
     status::validate_catalog(
@@ -596,12 +614,6 @@ pub fn plan(
     password: Option<&[u8]>,
 ) -> Result<ActivationPlan> {
     let mut frozen_collections = source.collection_store();
-    faculties::storage::preflight_team_of_one_write_targets(
-        &mut frozen_collections,
-        signer,
-        crate::collection_cutover::fixed_write_targets(signer),
-    )
-    .context("preflight durable team root and fixed activation WRITE targets")?;
     let mut collections = ActivationBuilder::default();
 
     let archive = archive_cutover::plan(source).context("plan Archive activation")?;
@@ -827,14 +839,19 @@ pub fn plan(
         password,
     )
     .context("plan direct Secrets vault activation")?;
-    if direct.team() != signer.verifying_key().to_bytes() {
-        bail!("direct Secrets plan belongs to a different durable team root");
+    if direct.namespace() != signer.verifying_key().to_bytes() {
+        bail!("direct Secrets plan belongs to a different durable collection namespace");
+    }
+    if !direct.vaults().is_empty() {
+        let fragments = direct.access_inbox().to_vec();
+        let expected_facts = materialized_facts(&fragments);
+        collections.push_target(PlannedCollection::access_inbox(
+            signer.verifying_key(),
+            fragments,
+            expected_facts,
+        )?);
     }
     for vault in direct.vaults() {
-        for recipient in &vault.recipients {
-            VerifyingKey::from_bytes(recipient)
-                .context("validate planned direct Secrets READ recipient")?;
-        }
         let fragments = vault
             .report
             .data_pending
@@ -846,7 +863,8 @@ pub fn plan(
             vault.vault,
             fragments,
             expected_facts,
-            vault.recipients.clone(),
+            vault.authority,
+            vault.write_presentation.clone(),
         )?);
     }
 
@@ -905,101 +923,52 @@ pub fn plan(
         wiki.materialized_facts(),
     )?);
 
-    // Prove the full cross-faculty world before a disposable COMMIT exists.
-    // Global vault validation sees every frozen authorized vault plus every
-    // staged direct projection; runtime references see only the hypothetical
-    // final subset for which the durable signer has exact READ.
-    let global = secrets::storage::discover_all_vaults_strict(&mut frozen_collections, signer)
-        .context("discover frozen global Secrets vault baseline")?;
-    let mut vault_facts = global
+    // Prove cross-faculty references against exactly the vaults reachable from
+    // the durable signer's inbox, plus the founder vaults this plan will add.
+    // The old unanchored direct collections remain in the prefix but never
+    // enter this runtime view.
+    let discovered = secrets::storage::discover_local_vaults(&mut frozen_collections, signer)
+        .context("discover frozen local Secrets vault baseline")?;
+    let mut local_vault_facts = discovered
         .snapshot()
         .vaults()
         .iter()
-        .map(|(vault, snapshot)| (*vault, snapshot.facts().clone()))
-        .collect::<BTreeMap<_, _>>();
-    let locations = global.locations().clone();
-    drop(global);
-
-    let planned_readers = direct
-        .vaults()
-        .iter()
-        .map(|vault| (vault.vault, vault.recipients.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let local_team_authority =
-        resolve_authority(&mut frozen_collections, signer.verifying_key())
-            .map_err(|error| anyhow!("resolve frozen local-team Secrets authority: {error}"))?;
+        .map(|snapshot| {
+            let collection = snapshot
+                .collection()
+                .context("inbox-discovered vault lost its exact collection identity")?;
+            Ok((collection, (snapshot.id(), snapshot.facts().clone())))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    drop(discovered);
     let mut staged_vaults = Fragment::empty();
     for vault in direct.vaults() {
-        let handle = secrets::vault_handle(vault.vault, signer.verifying_key());
-        let current = secrets::read_authority_recipient_keys(&local_team_authority, handle);
-        if !current.is_subset(&vault.recipients) {
-            bail!(
-                "frozen vault {:X} already has a READ recipient outside the projected legacy effective-recipient set",
-                vault.vault
-            );
+        let collection =
+            secrets::vault_handle(vault.vault, signer.verifying_key(), vault.authority);
+        let (id, facts) = local_vault_facts
+            .entry(collection)
+            .or_insert_with(|| (vault.vault, TribleSet::new()));
+        if *id != vault.vault {
+            bail!("one exact Secrets collection resolved to two graph-local vault ids");
         }
-        if let Some(location) = locations.get(&vault.vault) {
-            if location.team() != signer.verifying_key() {
-                bail!(
-                    "planned vault {:X} is already anchored by another team",
-                    vault.vault
-                );
-            }
-        }
-        let facts = vault_facts.entry(vault.vault).or_default();
         *facts += vault.required.facts().clone();
         staged_vaults += vault.required.clone();
-    }
-
-    let mut local_vault_facts = BTreeMap::new();
-    let mut final_readers = BTreeMap::new();
-    for (vault, facts) in &vault_facts {
-        let readers = if let Some(readers) = planned_readers.get(vault) {
-            readers.clone()
-        } else if let Some(location) = locations.get(vault) {
-            let authority = resolve_authority(&mut frozen_collections, location.team())
-                .map_err(|error| anyhow!("resolve frozen vault {vault:X} authority: {error}"))?;
-            secrets::read_authority_recipient_keys(&authority, location.collection())
-        } else {
-            BTreeSet::new()
-        };
-        final_readers.insert(*vault, readers.clone());
-        if readers.contains(&signer.verifying_key().to_bytes()) {
-            local_vault_facts.insert(*vault, facts.clone());
-        }
     }
 
     let staged_reader = staged_vaults
         .blobs_mut()
         .reader()
         .context("snapshot staged direct Secrets attachments")?;
-    let global_secrets = secrets::SecretsSnapshot::new(
+    let local_secrets = secrets::SecretsSnapshot::new_exact(
         PlannedActivationReader {
             overlay: &staged_reader,
             source: source.reader(),
         },
-        vault_facts,
+        local_vault_facts
+            .iter()
+            .map(|(collection, (vault, facts))| (*collection, *vault, facts.clone())),
     )
-    .context("validate planned global Secrets vault snapshot")?;
-    for (vault, snapshot) in global_secrets.vaults() {
-        let readers = &final_readers[vault];
-        for secret in snapshot.catalog().secrets.keys().copied() {
-            if !readers.is_subset(&snapshot.catalog().wrap_holders(secret)) {
-                bail!(
-                    "planned vault {vault:X} leaves an accepted READ recipient without a wrap for secret {secret:X}"
-                );
-            }
-        }
-    }
-    let local_secrets = secrets::SecretsSnapshot::new(
-        PlannedActivationReader {
-            overlay: &staged_reader,
-            source: source.reader(),
-        },
-        local_vault_facts,
-    )
-    .context("validate planned local READ-authorized Secrets vault snapshot")?;
-    drop(global_secrets);
+    .context("validate planned inbox-discovered Secrets vault snapshot")?;
 
     let headspace_catalog =
         headspace::project_result(source.reader(), &headspace.materialized_facts())
@@ -1051,7 +1020,7 @@ pub fn plan(
         retired_source_facts: secret_plan.report().retired_facts,
     });
     let activation = ActivationPlan {
-        team: signer.verifying_key().to_bytes(),
+        namespace: signer.verifying_key().to_bytes(),
         collections,
         consumptions,
         dispositions,
@@ -1060,7 +1029,7 @@ pub fn plan(
     Ok(activation)
 }
 
-fn materialized_facts(fragments: &[Fragment]) -> TribleSet {
+pub(crate) fn materialized_facts(fragments: &[Fragment]) -> TribleSet {
     fragments
         .iter()
         .fold(TribleSet::new(), |mut union, fragment| {
@@ -1286,16 +1255,11 @@ mod tests {
     use std::fs::File;
 
     use ed25519_dalek::SigningKey;
-    use hifitime::Epoch;
-    use triblespace::core::authority::{
-        publish_grant, AuthorityGrant, AuthorityMode, ACTION_WRITE,
-    };
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::BlobStore;
-    use triblespace::prelude::TryToInline;
 
     use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
 
@@ -1304,33 +1268,6 @@ mod tests {
             id: Id::new([byte; 16]).unwrap(),
             value: Inline::<Handle<SimpleArchive>>::new([byte; 32]),
         }
-    }
-
-    fn empty_mandatory_candidate_views() -> CandidateViews {
-        let faculties = [
-            schemas::blockdag::DEFAULT_SCOPE_ID,
-            schemas::atlas::DEFAULT_SCOPE_ID,
-            schemas::body::DEFAULT_SCOPE_ID,
-            schemas::cognition::DEFAULT_SCOPE_ID,
-            schemas::compass::DEFAULT_SCOPE_ID,
-            schemas::decide::DEFAULT_SCOPE_ID,
-            schemas::files::DEFAULT_SCOPE_ID,
-            schemas::headspace::DEFAULT_SCOPE_ID,
-            schemas::mail::DEFAULT_SCOPE_ID,
-            schemas::memory::DEFAULT_SCOPE_ID,
-            schemas::message::DEFAULT_SCOPE_ID,
-            schemas::planner::DEFAULT_SCOPE_ID,
-            schemas::posture::DEFAULT_POLICY_SCOPE_ID,
-            schemas::relations::DEFAULT_SCOPE_ID,
-            schemas::status::DEFAULT_SCOPE_ID,
-            schemas::teams::DEFAULT_SCOPE_ID,
-            schemas::voice::COLLECTION_SCOPE_ID,
-            schemas::wiki::DEFAULT_SCOPE_ID,
-        ]
-        .into_iter()
-        .map(|scope| (scope, TribleSet::new()))
-        .collect();
-        CandidateViews::new(faculties, BTreeMap::new(), BTreeMap::new()).unwrap()
     }
 
     #[test]
@@ -1345,7 +1282,6 @@ mod tests {
         let unknown = Id::new([0xE7; 16]).unwrap();
         let views = CandidateViews::new(
             BTreeMap::from([(unknown, TribleSet::new())]),
-            BTreeMap::new(),
             BTreeMap::new(),
         )
         .unwrap();
@@ -1366,231 +1302,12 @@ mod tests {
         assert!(format!("{error:#}").contains("no planned Archive collection"));
     }
 
-    #[test]
-    fn aggregate_plan_rejects_fixed_root_dormant_commit_before_source_planning() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source.pile");
-        let key = directory.path().join("source.key");
-        File::create(&path).unwrap();
-        let signer = faculties::storage::initialize_signer(&path, Some(&key)).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        publish_grant(
-            &mut pile,
-            signer.verifying_key(),
-            &signer,
-            AuthorityGrant::root(
-                signer.verifying_key(),
-                Inline::<Handle<SimpleArchive>>::new([0xE6; 32]),
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-        triblespace::core::collection::simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &faculties::collection_names::root_descriptor(
-                schemas::wiki::DEFAULT_SCOPE_ID,
-                signer.verifying_key(),
-            ),
-            Fragment::empty(),
-            &signer,
-        )
-        .unwrap();
-        pile.close().unwrap();
-
-        let source = crate::collection_cutover::freeze_source(&path).unwrap();
-        let error = plan(&source, &signer, None).unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("preflight durable team root and fixed activation WRITE targets"));
-        assert!(message.contains("would awaken dormant local COMMIT"));
-        assert!(!message.contains("plan Archive activation"));
-    }
-
-    #[test]
-    fn aggregate_plan_rejects_foreign_durable_key_before_source_planning() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source.pile");
-        File::create(&path).unwrap();
-        let local = SigningKey::from_bytes(&[0xE9; 32]);
-        let foreign = SigningKey::from_bytes(&[0xEA; 32]);
-        let mut pile = Pile::open(&path).unwrap();
-        triblespace::core::collection::simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &faculties::collection_names::root_descriptor(
-                schemas::wiki::DEFAULT_SCOPE_ID,
-                local.verifying_key(),
-            ),
-            Fragment::empty(),
-            &local,
-        )
-        .unwrap();
-        pile.close().unwrap();
-
-        let source = crate::collection_cutover::freeze_source(&path).unwrap();
-        let error = plan(&source, &foreign, None).unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("preflight durable team root and fixed activation WRITE targets"));
-        assert!(message.contains("refusing to create a parallel empty authority epoch"));
-        assert!(!message.contains("plan Archive activation"));
-    }
-
-    #[test]
-    fn candidate_validation_rejects_globally_present_but_nonlocal_secret_references() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("candidate.pile");
-        File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        let signer = SigningKey::from_bytes(&[0xE8; 32]);
-        faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-
-        let team = signer.verifying_key();
-        let vault = Id::new([0xE9; 16]).unwrap();
-        let outsider = SigningKey::from_bytes(&[0xEA; 32]);
-        let epoch = Epoch::from_unix_seconds(1.0);
-        let created_at = (epoch, epoch).try_to_inline().unwrap();
-        let sealed = secrets::seal_version(
-            "globally-visible",
-            b"not locally readable",
-            &BTreeSet::from([outsider.verifying_key().to_bytes()]),
-            created_at,
-        )
-        .unwrap();
-        let secret = sealed.secret;
-        let mut vault_fragment =
-            secrets::vault_header_fragment(vault, "global-only", created_at).unwrap();
-        vault_fragment += sealed.fragment;
-        let vault_facts = vault_fragment.facts().clone();
-        let vault_handle = secrets::vault_handle(vault, team);
-        publish_grant(
-            &mut pile,
-            team,
-            &signer,
-            AuthorityGrant::root(team, vault_handle, ACTION_WRITE, AuthorityMode::Invoke),
-        )
-        .unwrap();
-        secrets::vault_collection(&mut pile, vault, team, signer.clone())
-            .commit(vault_fragment)
-            .unwrap();
-        publish_grant(
-            &mut pile,
-            team,
-            &signer,
-            AuthorityGrant::root(
-                outsider.verifying_key(),
-                vault_handle,
-                secrets::ACTION_READ,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-        let authority = resolve_authority(&mut pile, team).unwrap();
-        let local_readers = secrets::read_authority_recipient_keys(&authority, vault_handle);
-        assert!(!local_readers.contains(&team.to_bytes()));
-
-        let headspace_anchor = Id::new([0xEB; 16]).unwrap();
-        let mut profile = headspace::default_profile(headspace_anchor, "global-only-secret");
-        profile.model_secret_version = Some(secret);
-        let (headspace_fragment, _, _) = headspace::add_profile_fragment(
-            &profile,
-            &headspace::default_config(headspace_anchor),
-            &[],
-        )
-        .unwrap();
-        let headspace_facts = headspace_fragment.facts().clone();
-        faculties::collection_names::open(
-            &mut pile,
-            schemas::headspace::DEFAULT_SCOPE_ID,
-            signer.clone(),
-        )
-        .commit(headspace_fragment)
-        .unwrap();
-
-        let mut teams_fragment = teams::source_fragment("tenant.example");
-        let teams_source = teams_fragment.root().unwrap();
-        let (auth_profile, _) = teams::auth_profile_fragment(
-            teams_source,
-            "client",
-            "user",
-            "offline_access",
-            None,
-            Some(secret),
-            [],
-        )
-        .unwrap();
-        teams_fragment += auth_profile;
-        let teams_facts = teams_fragment.facts().clone();
-        faculties::collection_names::open(
-            &mut pile,
-            schemas::teams::DEFAULT_SCOPE_ID,
-            signer.clone(),
-        )
-        .commit(teams_fragment)
-        .unwrap();
-
-        let (mail_fragment, _) = mail::account_config_fragment(
-            Id::new([0xEC; 16]).unwrap(),
-            mail::AccountConfigInput {
-                address: "operator@example.test".to_owned(),
-                display_name: "Operator".to_owned(),
-                pop_endpoint: "pop.example.test:995".to_owned(),
-                smtp_endpoint: "smtp.example.test:465".to_owned(),
-                username: "operator@example.test".to_owned(),
-                credential: secret,
-                enabled: true,
-                predecessors: Vec::new(),
-            },
-        )
-        .unwrap();
-        let mail_facts = mail_fragment.facts().clone();
-        faculties::collection_names::open(
-            &mut pile,
-            schemas::mail::DEFAULT_SCOPE_ID,
-            signer.clone(),
-        )
-        .commit(mail_fragment)
-        .unwrap();
-
-        let reader = pile.reader().unwrap();
-        pile.close().unwrap();
-
-        let global_vaults = BTreeMap::from([(vault, vault_facts)]);
-        for (scope, facts, context, detail) in [
-            (
-                schemas::headspace::DEFAULT_SCOPE_ID,
-                headspace_facts,
-                "validate Headspace candidate exact local Secrets references",
-                "missing exact model Secrets version",
-            ),
-            (
-                schemas::teams::DEFAULT_SCOPE_ID,
-                teams_facts,
-                "validate Teams candidate exact local Secrets references",
-                "unknown delegated token bundle Secrets version",
-            ),
-            (
-                schemas::mail::DEFAULT_SCOPE_ID,
-                mail_facts,
-                "validate Mail candidate cross-collection references",
-                "names unknown Secrets version",
-            ),
-        ] {
-            let mut faculties = empty_mandatory_candidate_views().faculties;
-            faculties.insert(scope, facts);
-            let views =
-                CandidateViews::new(faculties, global_vaults.clone(), BTreeMap::new()).unwrap();
-            let error = validate_candidate_views(&reader, &views).unwrap_err();
-            let message = format!("{error:#}");
-            assert!(message.contains(context), "{message}");
-            assert!(message.contains(detail), "{message}");
-        }
-    }
-
     fn collection(name: &str, scope_byte: u8) -> PlannedCollection {
         PlannedCollection {
             name: CollectionName::new(name).unwrap(),
             reach: reach::private(),
             view: CandidateViewKey::Faculty(Id::new([scope_byte; 16]).unwrap()),
-            policy: TargetPolicy::Faculty,
+            policy: TargetPolicy::Open,
             fragments: Vec::new(),
             expected_facts: TribleSet::new(),
         }
@@ -1639,8 +1356,7 @@ mod tests {
         let path = directory.path().join("source.pile");
         File::create(&path).unwrap();
         let signer = SigningKey::from_bytes(&[0xA4; 32]);
-        let mut pile = Pile::open(&path).unwrap();
-        faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
+        let pile = Pile::open(&path).unwrap();
         pile.close().unwrap();
 
         let source = TestSourceSpec::new(vec![TestBranchSpec::new(
@@ -1671,7 +1387,7 @@ mod tests {
         assert!(direct.vaults().is_empty());
 
         let activation = ActivationPlan {
-            team: signer.verifying_key().to_bytes(),
+            namespace: signer.verifying_key().to_bytes(),
             collections: Vec::new(),
             consumptions: vec![SourceConsumption {
                 name: "secrets-vaults".to_owned(),

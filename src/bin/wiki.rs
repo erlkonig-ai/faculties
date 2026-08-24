@@ -1625,10 +1625,7 @@ mod tests {
             let pile = directory.path().join("wiki.pile");
             let key = directory.path().join("wiki.key");
             File::create(&pile).unwrap();
-            let signer = faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
-            let mut store = faculties::storage::open_pile_strict(&pile).unwrap();
-            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-            store.close().unwrap();
+            faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 pile,

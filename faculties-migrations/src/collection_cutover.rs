@@ -28,15 +28,13 @@ use std::os::unix::fs::MetadataExt;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
-use ed25519_dalek::SigningKey;
-
 use faculties::storage::open_pile_strict;
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob, MemoryBlobStore};
-use triblespace::core::collection::{CollectionHandle, CollectionRecord, CollectionStore};
+use triblespace::core::collection::{CollectionRecord, CollectionStore};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
@@ -305,21 +303,6 @@ impl CollectionStore for FrozenCollectionStore {
     fn insert(&mut self, _record: CollectionRecord) -> std::result::Result<(), Self::InsertError> {
         Err(FrozenStoreWriteError)
     }
-}
-
-/// Exact fixed faculty handles that team-of-one activation will WRITE-grant.
-pub(crate) fn fixed_write_targets(signer: &SigningKey) -> BTreeSet<CollectionHandle> {
-    let team = signer.verifying_key();
-    faculties::collection_names::table()
-        .into_iter()
-        .map(|(scope, _, _)| {
-            faculties::collection_names::root_descriptor(scope, team)
-                .facts()
-                .clone()
-                .to_blob()
-                .get_handle()
-        })
-        .collect()
 }
 
 impl FrozenSource {

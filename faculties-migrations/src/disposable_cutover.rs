@@ -23,14 +23,14 @@ use std::os::unix::ffi::OsStrExt;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 
-use triblespace::core::authority::{
-    publish_grant, resolve_authority, AuthorityGrant, AuthorityMode, ACTION_WRITE,
-};
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, IntoBlob};
+use triblespace::core::capability::{
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityResource,
+};
 use triblespace::core::collection::{
-    discover_collection_records, simplearchive_union, CollectionCommit, CollectionHandle,
-    DiscoveredCollectionRecords,
+    discover_collection_records, simplearchive_union, CollectionAdmission, CollectionCommit,
+    CollectionHandle, DiscoveredCollectionRecords, ACTION_WRITE,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -41,11 +41,13 @@ use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::prelude::{Collection, CollectionName};
 
+#[cfg(test)]
+use crate::activation_cutover::materialized_facts;
 use crate::activation_cutover::{
     ActivationPlan, CandidateViewKey, CandidateViews, PlannedCollection, TargetPolicy,
 };
 use crate::collection_cutover::{FrozenSource, PhysicalSourceFingerprint};
-use faculties::storage::{ensure_team_of_one_write_authority, open_pile_strict};
+use faculties::storage::open_pile_strict;
 
 /// Result of a completely validated activation attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,8 +74,8 @@ pub fn activate<F>(
 where
     F: FnOnce(&PileReader, &CandidateViews) -> Result<()>,
 {
-    if plan.team() != signer.verifying_key().to_bytes() {
-        bail!("activation plan belongs to a different durable team root");
+    if plan.namespace() != signer.verifying_key().to_bytes() {
+        bail!("activation plan belongs to a different durable collection namespace");
     }
     plan.verify_source_coverage(source)?;
     let (target, candidate) = activation_paths(live)?;
@@ -117,8 +119,17 @@ struct Publication<'a> {
 }
 
 impl<'a> Publication<'a> {
-    fn new(plan: &'a PlannedCollection, team: ed25519_dalek::VerifyingKey) -> Self {
-        let descriptor = simplearchive_union::descriptor(plan.name(), team, plan.reach().clone());
+    fn new(plan: &'a PlannedCollection, namespace: ed25519_dalek::VerifyingKey) -> Self {
+        let authority = match plan.policy() {
+            TargetPolicy::Open => None,
+            TargetPolicy::Vault { authority, .. } => Some(*authority),
+        };
+        let descriptor = simplearchive_union::descriptor(
+            plan.name(),
+            namespace,
+            authority,
+            plan.reach().clone(),
+        );
         Self {
             handle: descriptor.facts().clone().to_blob().get_handle(),
             name: plan.name(),
@@ -160,11 +171,6 @@ pub struct CollectionPublicationPresence {
     present_commits: usize,
     required_dependencies: usize,
     resident_dependencies: usize,
-    required_authority_grants: usize,
-    accepted_authority_grants: usize,
-    required_authority_dependencies: usize,
-    resident_authority_dependencies: usize,
-    authority_policy_matches: bool,
 }
 
 impl CollectionPublicationPresence {
@@ -187,26 +193,6 @@ impl CollectionPublicationPresence {
     pub const fn resident_dependencies(&self) -> usize {
         self.resident_dependencies
     }
-
-    pub const fn required_authority_grants(&self) -> usize {
-        self.required_authority_grants
-    }
-
-    pub const fn accepted_authority_grants(&self) -> usize {
-        self.accepted_authority_grants
-    }
-
-    pub const fn required_authority_dependencies(&self) -> usize {
-        self.required_authority_dependencies
-    }
-
-    pub const fn resident_authority_dependencies(&self) -> usize {
-        self.resident_authority_dependencies
-    }
-
-    pub const fn authority_policy_matches(&self) -> bool {
-        self.authority_policy_matches
-    }
 }
 
 /// Exact native-publication presence for one frozen activation plan.
@@ -217,32 +203,12 @@ impl CollectionPublicationPresence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CutoverPublicationPresence {
     status: NativePublicationStatus,
-    fixed_authority_grants: usize,
-    accepted_fixed_authority_grants: usize,
-    fixed_authority_dependencies: usize,
-    resident_fixed_authority_dependencies: usize,
     collections: Vec<CollectionPublicationPresence>,
 }
 
 impl CutoverPublicationPresence {
     pub const fn status(&self) -> NativePublicationStatus {
         self.status
-    }
-
-    pub const fn fixed_authority_grants(&self) -> usize {
-        self.fixed_authority_grants
-    }
-
-    pub const fn accepted_fixed_authority_grants(&self) -> usize {
-        self.accepted_fixed_authority_grants
-    }
-
-    pub const fn fixed_authority_dependencies(&self) -> usize {
-        self.fixed_authority_dependencies
-    }
-
-    pub const fn resident_fixed_authority_dependencies(&self) -> usize {
-        self.resident_fixed_authority_dependencies
     }
 
     pub fn collections(&self) -> &[CollectionPublicationPresence] {
@@ -253,12 +219,6 @@ impl CutoverPublicationPresence {
 #[derive(Default)]
 struct ExpectedPublication {
     commits: BTreeMap<Id, CollectionCommit>,
-    dependencies: BTreeSet<[u8; 32]>,
-}
-
-#[derive(Default)]
-struct ExpectedAuthority {
-    grants: BTreeMap<Id, (CollectionCommit, AuthorityGrant)>,
     dependencies: BTreeSet<[u8; 32]>,
 }
 
@@ -275,9 +235,14 @@ fn expected_publication(
     publication: &Publication<'_>,
     signer: &SigningKey,
 ) -> Result<ExpectedPublication> {
+    let authority = match publication.policy {
+        TargetPolicy::Open => None,
+        TargetPolicy::Vault { authority, .. } => Some(*authority),
+    };
     let descriptor = simplearchive_union::descriptor(
         publication.name,
         signer.verifying_key(),
+        authority,
         publication.reach.clone(),
     );
     let mut commits = BTreeMap::new();
@@ -303,32 +268,6 @@ fn expected_publication(
     })
 }
 
-fn expected_authority(
-    publication: &Publication<'_>,
-    signer: &SigningKey,
-) -> Result<ExpectedAuthority> {
-    let mut scratch = MemoryRepo::default();
-    let mut grants = BTreeMap::new();
-    for grant in planned_grants(publication, signer)? {
-        let commit = publish_grant(&mut scratch, signer.verifying_key(), signer, grant)
-            .map_err(|error| anyhow!("prepare {} authority: {error}", publication.name.as_str()))?;
-        grants.insert(commit.id(), (commit, grant));
-    }
-    let dependencies = scratch_dependencies(&mut scratch);
-    Ok(ExpectedAuthority {
-        grants,
-        dependencies,
-    })
-}
-
-fn commit_dependencies(commit: CollectionCommit) -> [[u8; 32]; 3] {
-    [
-        commit.collection().raw,
-        commit.data().raw,
-        commit.metadata().raw,
-    ]
-}
-
 fn resident_dependencies(reader: &PileReader, dependencies: &BTreeSet<[u8; 32]>) -> Result<usize> {
     dependencies.iter().try_fold(0, |present, raw| {
         let handle = Inline::<Handle<UnknownBlob>>::new(*raw);
@@ -351,8 +290,8 @@ pub fn inspect_publication(
     signer: &SigningKey,
     plan: &ActivationPlan,
 ) -> Result<CutoverPublicationPresence> {
-    if plan.team() != signer.verifying_key().to_bytes() {
-        bail!("activation plan belongs to a different durable team root");
+    if plan.namespace() != signer.verifying_key().to_bytes() {
+        bail!("activation plan belongs to a different durable collection namespace");
     }
     plan.verify_source_coverage(source)?;
     let publications = plan
@@ -373,18 +312,6 @@ fn inspect_publications(
     let records = discover_collection_records(&mut store)
         .context("discover frozen native collection records")?;
     let observed_commits = commit_map(records.commits());
-    let authority = resolve_authority(&mut store, signer.verifying_key())
-        .map_err(|error| anyhow!("resolve frozen native authority: {error}"))?;
-    let fixed = faculties::storage::plan_team_of_one_write_authority(&mut store, signer)
-        .context("inspect fixed faculty WRITE authority")?;
-
-    let mut fixed_dependencies = BTreeSet::new();
-    let mut fixed_by_resource = BTreeMap::new();
-    for row in fixed.rows() {
-        fixed_dependencies.extend(commit_dependencies(row.commit()));
-        fixed_by_resource.insert(row.resource(), (row.commit(), row.accepted()));
-    }
-    let resident_fixed_dependencies = resident_dependencies(source.reader(), &fixed_dependencies)?;
 
     let mut collections = Vec::with_capacity(publications.len());
     for publication in publications {
@@ -396,55 +323,14 @@ fn inspect_publications(
             .count();
         let resident = resident_dependencies(source.reader(), &expected.dependencies)?;
 
-        let (required_grants, accepted_grants, authority_dependencies, policy_matches) =
-            match publication.policy {
-                TargetPolicy::Faculty => {
-                    let Some((commit, accepted)) = fixed_by_resource.get(&publication.handle)
-                    else {
-                        bail!(
-                            "planned faculty collection {} is absent from the fixed WRITE manifest",
-                            publication.name.as_str()
-                        );
-                    };
-                    let dependencies = commit_dependencies(*commit).into_iter().collect();
-                    (1, usize::from(*accepted), dependencies, true)
-                }
-                TargetPolicy::Vault { readers } => {
-                    let expected_authority = expected_authority(publication, signer)?;
-                    let accepted = expected_authority
-                        .grants
-                        .values()
-                        .filter(|(commit, grant)| {
-                            authority.grant(commit.id()).is_some_and(|actual| {
-                                actual.commit() == *commit && actual.grant() == *grant
-                            })
-                        })
-                        .count();
-                    let actual_readers = faculties::secrets::read_authority_recipient_keys(
-                        &authority,
-                        publication.handle,
-                    );
-                    (
-                        expected_authority.grants.len(),
-                        accepted,
-                        expected_authority.dependencies,
-                        actual_readers == *readers,
-                    )
-                }
-            };
-        let resident_authority = resident_dependencies(source.reader(), &authority_dependencies)?;
-
-        let complete = present_commits == expected.commits.len()
-            && resident == expected.dependencies.len()
-            && accepted_grants == required_grants
-            && resident_authority == authority_dependencies.len()
-            && policy_matches;
+        let complete =
+            present_commits == expected.commits.len() && resident == expected.dependencies.len();
         let status = if complete {
             NativePublicationStatus::Complete
-        } else if expected.commits.is_empty() || present_commits > 0 {
-            NativePublicationStatus::Partial
-        } else {
+        } else if !expected.commits.is_empty() && present_commits == 0 {
             NativePublicationStatus::Missing
+        } else {
+            NativePublicationStatus::Partial
         };
         collections.push(CollectionPublicationPresence {
             status,
@@ -452,20 +338,12 @@ fn inspect_publications(
             present_commits,
             required_dependencies: expected.dependencies.len(),
             resident_dependencies: resident,
-            required_authority_grants: required_grants,
-            accepted_authority_grants: accepted_grants,
-            required_authority_dependencies: authority_dependencies.len(),
-            resident_authority_dependencies: resident_authority,
-            authority_policy_matches: policy_matches,
         });
     }
 
-    let fixed_complete = fixed.accepted() == fixed.rows().len()
-        && resident_fixed_dependencies == fixed_dependencies.len();
-    let all_complete = fixed_complete
-        && collections
-            .iter()
-            .all(|collection| collection.status == NativePublicationStatus::Complete);
+    let all_complete = collections
+        .iter()
+        .all(|collection| collection.status == NativePublicationStatus::Complete);
     let planned_commits = collections
         .iter()
         .map(CollectionPublicationPresence::planned_commits)
@@ -476,9 +354,7 @@ fn inspect_publications(
         .sum::<usize>();
     let status = if all_complete {
         NativePublicationStatus::Complete
-    } else if (planned_commits > 0 && present_commits == 0)
-        || (planned_commits == 0 && fixed.accepted() == 0)
-    {
+    } else if planned_commits > 0 && present_commits == 0 {
         NativePublicationStatus::Missing
     } else {
         NativePublicationStatus::Partial
@@ -486,10 +362,6 @@ fn inspect_publications(
 
     Ok(CutoverPublicationPresence {
         status,
-        fixed_authority_grants: fixed.rows().len(),
-        accepted_fixed_authority_grants: fixed.accepted(),
-        fixed_authority_dependencies: fixed_dependencies.len(),
-        resident_fixed_authority_dependencies: resident_fixed_dependencies,
         collections,
     })
 }
@@ -503,7 +375,6 @@ struct ScopeSnapshot {
 struct CandidateWorld {
     baseline_records: DiscoveredCollectionRecords,
     final_records: DiscoveredCollectionRecords,
-    authority: Vec<CollectionCommit>,
     baseline: BTreeMap<CollectionHandle, ScopeSnapshot>,
     final_scopes: BTreeMap<CollectionHandle, ScopeSnapshot>,
     returned: BTreeMap<CollectionHandle, Vec<CollectionCommit>>,
@@ -590,6 +461,7 @@ fn assert_live_unchanged(source: &FrozenSource, lexical_live: &Path, target: &Pa
 
 fn validate_plan(signer: &SigningKey, publications: &[Publication<'_>]) -> Result<()> {
     let mut handles = BTreeSet::new();
+    let mut saw_access_inbox = false;
     for publication in publications {
         let handle = publication_handle(publication, signer.verifying_key());
         if !handles.insert(handle) {
@@ -598,12 +470,40 @@ fn validate_plan(signer: &SigningKey, publications: &[Publication<'_>]) -> Resul
                 hex::encode_upper(handle.raw)
             );
         }
-        if !matches!(
-            (publication.view, publication.policy),
-            (CandidateViewKey::Faculty(_), TargetPolicy::Faculty)
-                | (CandidateViewKey::Vault(_), TargetPolicy::Vault { .. })
-        ) {
-            bail!("candidate target policy disagrees with its semantic view");
+        match (publication.view, publication.policy) {
+            (CandidateViewKey::Faculty(_), TargetPolicy::Open) => {}
+            (CandidateViewKey::AccessInbox, TargetPolicy::Open) => {
+                saw_access_inbox = true;
+            }
+            (CandidateViewKey::Vault(_), TargetPolicy::Vault { authority, write }) => {
+                if !saw_access_inbox {
+                    bail!("custody vault publication precedes its founder access inbox");
+                }
+                if *authority != signer.verifying_key() || write.subject() != signer.verifying_key()
+                {
+                    bail!("planned custody vault is not rooted in the durable founder");
+                }
+                let atom = CapabilityAtom::new(
+                    CapabilityAction::new(ACTION_WRITE),
+                    CapabilityResource::from(publication.handle),
+                );
+                let verified = write
+                    .proof()
+                    .verify_claim(
+                        *authority,
+                        triblespace::core::clock::epoch_now(),
+                        CapabilityClaim::new(
+                            write.subject(),
+                            atom,
+                            CapabilityMode::InvokeAndDelegate,
+                        ),
+                    )
+                    .context("verify planned founder WRITE proof")?;
+                if verified.effective_validity().is_some() {
+                    bail!("planned founder WRITE proof is bounded");
+                }
+            }
+            _ => bail!("candidate target policy disagrees with its semantic view"),
         }
         let facts: TribleSet = publication
             .fragments
@@ -622,45 +522,9 @@ fn validate_plan(signer: &SigningKey, publications: &[Publication<'_>]) -> Resul
     Ok(())
 }
 
-fn planned_grants(
-    publication: &Publication<'_>,
-    signer: &SigningKey,
-) -> Result<Vec<AuthorityGrant>> {
-    match publication.policy {
-        TargetPolicy::Faculty => Ok(Vec::new()),
-        TargetPolicy::Vault { readers } => {
-            let mut grants = vec![AuthorityGrant::root(
-                signer.verifying_key(),
-                publication.handle,
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            )];
-            for reader in readers {
-                grants.push(AuthorityGrant::root(
-                    ed25519_dalek::VerifyingKey::from_bytes(reader)
-                        .context("validate planned vault READ recipient")?,
-                    publication.handle,
-                    faculties::secrets::ACTION_READ,
-                    AuthorityMode::Invoke,
-                ));
-            }
-            Ok(grants)
-        }
-    }
-}
-
-fn future_write_targets(
-    signer: &SigningKey,
-    publications: &[Publication<'_>],
-) -> BTreeSet<CollectionHandle> {
-    let mut targets = crate::collection_cutover::fixed_write_targets(signer);
-    targets.extend(publications.iter().map(|publication| publication.handle));
-    targets
-}
-
 fn publication_handle(
     publication: &Publication<'_>,
-    _team: ed25519_dalek::VerifyingKey,
+    _namespace: ed25519_dalek::VerifyingKey,
 ) -> CollectionHandle {
     publication.handle
 }
@@ -670,12 +534,19 @@ fn publication_collection<S>(
     signer: &SigningKey,
     publication: &Publication<'_>,
 ) -> Collection<S> {
+    let admission = match publication.policy {
+        TargetPolicy::Open => CollectionAdmission::open(),
+        TargetPolicy::Vault { authority, write } => {
+            CollectionAdmission::capability(*authority, vec![write.clone()])
+        }
+    };
     Collection::new(
         storage,
         publication.name,
         signer.verifying_key(),
         signer.clone(),
         publication.reach.clone(),
+        admission,
     )
 }
 
@@ -685,110 +556,89 @@ fn build_world(
     publications: &[Publication<'_>],
 ) -> Result<CandidateWorld> {
     let mut pile = open_pile_strict(candidate)?;
-    let result = (|| {
-        faculties::storage::preflight_team_of_one_write_targets(
-            &mut pile,
-            signer,
-            future_write_targets(signer, publications),
-        )
-        .context("recheck dormant COMMITs before candidate WRITE grants")?;
-        let baseline_records = discover_collection_records(&mut pile)?;
-        let mut authority = ensure_team_of_one_write_authority(&mut pile, signer)
-            .context("initialize candidate WRITE authority")?
-            .rows()
-            .iter()
-            .map(|row| row.commit())
-            .collect::<Vec<_>>();
-        let team = signer.verifying_key();
-        for publication in publications {
-            for grant in planned_grants(publication, signer)? {
-                authority.push(
-                    publish_grant(&mut pile, team, signer, grant)
-                        .map_err(|error| anyhow!("publish planned candidate authority: {error}"))?,
-                );
-            }
-        }
-        let baseline = snapshots(&mut pile, signer, publications)?;
-        let mut returned = BTreeMap::new();
-        for publication in publications {
-            let mut collection = publication_collection(&mut pile, signer, publication);
-            let handle = collection.collection();
-            let mut commits = Vec::new();
-            for fragment in publication.fragments {
-                commits.push(
-                    collection
-                        .commit(fragment.clone())
-                        .with_context(|| format!("publish {} commit", publication.name.as_str()))?,
-                );
-            }
-            returned.insert(handle, commits);
-        }
-        let final_scopes = snapshots(&mut pile, signer, publications)?;
-        let authority_resolution = resolve_authority(&mut pile, team)
-            .map_err(|error| anyhow!("resolve final candidate authority: {error}"))?;
-        let mut faculty_views = BTreeMap::new();
-        for publication in publications {
-            let handle = publication_handle(publication, team);
-            let facts = final_scopes[&handle].facts.clone();
-            match publication.view {
-                CandidateViewKey::Faculty(scope) => {
-                    faculty_views.insert(scope, facts);
+    let result =
+        (|| {
+            let baseline_records = discover_collection_records(&mut pile)?;
+            let namespace = signer.verifying_key();
+            let baseline = snapshots(&mut pile, signer, publications)?;
+            let mut returned = BTreeMap::new();
+            for publication in publications {
+                let mut collection = publication_collection(&mut pile, signer, publication);
+                let handle = collection.collection();
+                let mut commits = Vec::new();
+                for fragment in publication.fragments {
+                    commits.push(collection.commit(fragment.clone()).with_context(|| {
+                        format!("publish {} commit", publication.name.as_str())
+                    })?);
                 }
-                CandidateViewKey::Vault(vault) => {
-                    let readers = faculties::secrets::read_authority_recipient_keys(
-                        &authority_resolution,
-                        handle,
-                    );
-                    let TargetPolicy::Vault { readers: expected } = publication.policy else {
-                        unreachable!("view/policy agreement validated before publication")
-                    };
-                    if readers != *expected {
-                        bail!(
-                            "final vault {vault:X} READ recipients differ from the projected legacy effective-recipient set"
-                        );
+                returned.insert(handle, commits);
+            }
+            let final_scopes = snapshots(&mut pile, signer, publications)?;
+            let mut faculty_views = BTreeMap::new();
+            for publication in publications {
+                let handle = publication_handle(publication, namespace);
+                let facts = final_scopes[&handle].facts.clone();
+                match publication.view {
+                    CandidateViewKey::Faculty(scope) => {
+                        faculty_views.insert(scope, facts);
                     }
+                    CandidateViewKey::AccessInbox | CandidateViewKey::Vault(_) => {}
                 }
             }
-        }
-        let global = faculties::secrets::storage::discover_all_vaults_strict(&mut pile, signer)
-            .context("discover complete global candidate vault snapshot")?;
-        let mut vault_views = BTreeMap::new();
-        let mut local_vault_views = BTreeMap::new();
-        for (vault, snapshot) in global.snapshot().vaults() {
-            let location = &global.locations()[vault];
-            let authority = resolve_authority(&mut pile, location.team()).map_err(|error| {
-                anyhow!("resolve candidate vault {vault:X} READ authority: {error}")
+            let discovered = faculties::secrets::storage::discover_local_vaults(&mut pile, signer)
+                .context("discover inbox-addressed candidate vaults")?;
+            for publication in publications {
+                let CandidateViewKey::Vault(vault) = publication.view else {
+                    continue;
+                };
+                let location = discovered.location_exact(publication.handle).ok_or_else(|| {
+                anyhow!("planned custody vault {vault:X} is not ready through the founder inbox")
             })?;
-            let readers = faculties::secrets::read_authority_recipient_keys(
-                &authority,
-                location.collection(),
-            );
-            for secret in snapshot.catalog().secrets.keys().copied() {
-                if !readers.is_subset(&snapshot.catalog().wrap_holders(secret)) {
+                let TargetPolicy::Vault { authority, .. } = publication.policy else {
+                    unreachable!("view/policy agreement validated before publication")
+                };
+                if location.authority() != *authority {
+                    bail!("planned custody vault {vault:X} resolved under a different authority");
+                }
+                if discovered
+                    .snapshot()
+                    .vault_exact(publication.handle)
+                    .expect("ready location has a vault snapshot")
+                    .facts()
+                    != &final_scopes[&publication.handle].facts
+                {
                     bail!(
-                        "final vault {vault:X} leaves an accepted READ recipient without a wrap for secret {secret:X}"
+                        "planned custody vault {vault:X} differs from its runtime materialization"
                     );
                 }
             }
-            if readers.contains(&signer.verifying_key().to_bytes()) {
-                local_vault_views.insert(*vault, snapshot.facts().clone());
-            }
-            vault_views.insert(*vault, snapshot.facts().clone());
-        }
-        let views = CandidateViews::new(faculty_views, vault_views, local_vault_views)?;
-        let final_records = discover_collection_records(&mut pile)?;
-        let reader = pile.reader()?;
-        Ok(CandidateWorld {
-            baseline_records,
-            final_records,
-            authority,
-            baseline,
-            final_scopes,
-            returned,
-            views,
-            reader,
-        })
-    })();
+            let local_vault_views = discovered
+                .snapshot()
+                .vaults()
+                .iter()
+                .map(|snapshot| {
+                    (
+                        snapshot
+                            .collection()
+                            .expect("inbox-discovered snapshot has exact collection identity"),
+                        (snapshot.id(), snapshot.facts().clone()),
+                    )
+                })
+                .collect();
+            let views = CandidateViews::new(faculty_views, local_vault_views)?;
+            drop(discovered);
+            let final_records = discover_collection_records(&mut pile)?;
+            let reader = pile.reader()?;
+            Ok(CandidateWorld {
+                baseline_records,
+                final_records,
+                baseline,
+                final_scopes,
+                returned,
+                views,
+                reader,
+            })
+        })();
     finish_pile(pile, result)
 }
 
@@ -813,16 +663,6 @@ fn snapshots(
 
 fn validate_world(world: &CandidateWorld, publications: &[Publication<'_>]) -> Result<()> {
     let mut expected_commits = commit_map(world.baseline_records.commits());
-    for commit in &world.authority {
-        if let Some(previous) = expected_commits.insert(commit.id(), *commit) {
-            if previous != *commit {
-                bail!(
-                    "WRITE grant COMMIT {:X} collides with baseline",
-                    commit.id()
-                );
-            }
-        }
-    }
     for commit in world.returned.values().flatten() {
         if let Some(previous) = expected_commits.insert(commit.id(), *commit) {
             if previous != *commit {
@@ -835,10 +675,7 @@ fn validate_world(world: &CandidateWorld, publications: &[Publication<'_>]) -> R
         || world.final_records.derives() != world.baseline_records.derives()
         || world.final_records.diagnostics() != world.baseline_records.diagnostics()
     {
-        bail!(
-            "final collection-record census is not exactly baseline plus WRITE grants and \
-             returned COMMITs"
-        );
+        bail!("final collection-record census is not exactly baseline plus returned COMMITs");
     }
 
     for publication in publications {
@@ -1176,7 +1013,6 @@ mod tests {
             let key = directory.path().join("self.key");
             File::create(&live).unwrap();
             let signer = initialize_signer(&live, Some(&key)).unwrap();
-            crate::write_authority::publish(&live, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 live,
@@ -1228,11 +1064,12 @@ mod tests {
     ) -> Vec<Publication<'a>> {
         let name = Box::leak(Box::new(faculties::collection_names::require_name(SCOPE)));
         let reach = Box::leak(Box::new(faculties::collection_names::require_reach(SCOPE)));
-        let handle = simplearchive_union::descriptor(name, signer.verifying_key(), reach.clone())
-            .facts()
-            .clone()
-            .to_blob()
-            .get_handle();
+        let handle =
+            simplearchive_union::descriptor(name, signer.verifying_key(), None, reach.clone())
+                .facts()
+                .clone()
+                .to_blob()
+                .get_handle();
         let facts = Box::leak(Box::new(fragments.iter().fold(
             TribleSet::new(),
             |mut all, fragment| {
@@ -1245,65 +1082,10 @@ mod tests {
             name,
             reach,
             view: CandidateViewKey::Faculty(SCOPE),
-            policy: &TargetPolicy::Faculty,
+            policy: &TargetPolicy::Open,
             fragments,
             facts,
         }]
-    }
-
-    struct VaultPublication {
-        handle: CollectionHandle,
-        name: CollectionName,
-        reach: Fragment,
-        view: CandidateViewKey,
-        policy: TargetPolicy,
-        fragments: Vec<Fragment>,
-        facts: TribleSet,
-    }
-
-    impl VaultPublication {
-        fn new(
-            vault: Id,
-            signer: &SigningKey,
-            readers: BTreeSet<faculties::secrets::RecipientPublicKey>,
-            fragments: Vec<Fragment>,
-        ) -> Self {
-            let name = faculties::secrets::vault_name(vault);
-            let reach = triblespace::core::collection::reach::private();
-            let handle =
-                simplearchive_union::descriptor(&name, signer.verifying_key(), reach.clone())
-                    .facts()
-                    .clone()
-                    .to_blob()
-                    .get_handle();
-            let facts = fragments
-                .iter()
-                .fold(TribleSet::new(), |mut all, fragment| {
-                    all += fragment.facts().clone();
-                    all
-                });
-            Self {
-                handle,
-                name,
-                reach,
-                view: CandidateViewKey::Vault(vault),
-                policy: TargetPolicy::Vault { readers },
-                fragments,
-                facts,
-            }
-        }
-
-        fn publication(&self) -> Publication<'_> {
-            Publication {
-                handle: self.handle,
-                name: &self.name,
-                reach: &self.reach,
-                view: self.view,
-                policy: &self.policy,
-                fragments: &self.fragments,
-                facts: &self.facts,
-            }
-        }
     }
 
     fn at(byte: u8) -> faculties::secrets::IntervalValue {
@@ -1369,8 +1151,8 @@ mod tests {
         };
         foundation += sealed;
         // This recipient becomes effective only after the original version
-        // was sealed, so direct planning must synthesize exactly one DEK wrap
-        // without ever authenticating or decrypting the opaque body.
+        // was sealed. The custody cutover must preserve that historical wrap
+        // set rather than reconstructing an enumerable reader census.
         let late_signer = SigningKey::from_bytes(&[0x32; 32]);
         let late = legacy_fixture::prepare_node_identity(
             "late-reader",
@@ -1388,51 +1170,6 @@ mod tests {
             at(6),
         );
         (foundation, vault, secret, malformed_body, body)
-    }
-
-    fn publish_vault(
-        fixture: &Fixture,
-        vault: Id,
-        fragment: Fragment,
-        readers: impl IntoIterator<Item = ed25519_dalek::VerifyingKey>,
-    ) {
-        let mut pile = open_pile_strict(&fixture.live).unwrap();
-        let handle = faculties::secrets::vault_handle(vault, fixture.signer.verifying_key());
-        publish_grant(
-            &mut pile,
-            fixture.signer.verifying_key(),
-            &fixture.signer,
-            AuthorityGrant::root(
-                fixture.signer.verifying_key(),
-                handle,
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-        faculties::secrets::vault_collection(
-            &mut pile,
-            vault,
-            fixture.signer.verifying_key(),
-            fixture.signer.clone(),
-        )
-        .commit(fragment)
-        .unwrap();
-        for reader in readers {
-            publish_grant(
-                &mut pile,
-                fixture.signer.verifying_key(),
-                &fixture.signer,
-                AuthorityGrant::root(
-                    reader,
-                    handle,
-                    faculties::secrets::ACTION_READ,
-                    AuthorityMode::Invoke,
-                ),
-            )
-            .unwrap();
-        }
-        pile.close().unwrap();
     }
 
     #[test]
@@ -1515,30 +1252,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(direct.vaults().len(), 1);
-        assert_eq!(direct.report().synthesized_wraps(), 1);
+        assert_eq!(direct.report().custody_wraps_added(), 1);
+        assert_eq!(direct.report().pending_access_envelopes(), 1);
         let vault_plan = &direct.vaults()[0];
-        let fragments = vault_plan
+        let vault_collection = faculties::secrets::vault_handle(
+            vault,
+            fixture.signer.verifying_key(),
+            vault_plan.authority,
+        );
+        let vault_fragments = vault_plan
             .report
             .data_pending
             .then(|| vault_plan.required.clone())
             .into_iter()
-            .collect();
-        let publication = VaultPublication::new(
+            .collect::<Vec<_>>();
+        let access_fragments = direct.access_inbox().to_vec();
+        let access_plan = PlannedCollection::access_inbox(
+            fixture.signer.verifying_key(),
+            access_fragments.clone(),
+            materialized_facts(&access_fragments),
+        )
+        .unwrap();
+        let target_plan = PlannedCollection::vault(
             vault,
-            &fixture.signer,
-            vault_plan.recipients.clone(),
-            fragments,
-        );
+            vault_fragments.clone(),
+            materialized_facts(&vault_fragments),
+            vault_plan.authority,
+            vault_plan.write_presentation.clone(),
+        )
+        .unwrap();
+        let planned = [access_plan, target_plan];
+        let publications = planned
+            .iter()
+            .map(|plan| Publication::new(plan, fixture.signer.verifying_key()))
+            .collect::<Vec<_>>();
         let outcome = activate_publications(
             &fixture.live,
             &fixture.target(),
             &fixture.candidate,
             &frozen,
             &fixture.signer,
-            &[publication.publication()],
+            &publications,
             |_, views| {
-                assert!(views.vaults().contains_key(&vault));
-                assert!(views.local_vaults().contains_key(&vault));
+                assert!(views.local_vaults().contains_key(&vault_collection));
                 Ok(())
             },
         )
@@ -1549,42 +1305,25 @@ mod tests {
             frozen_bytes
         );
 
-        let fixed_name = CollectionName::new("secrets").unwrap();
-        let fixed_reach = triblespace::core::collection::reach::private();
-        let fixed_handle = simplearchive_union::descriptor(
-            &fixed_name,
-            fixture.signer.verifying_key(),
-            fixed_reach,
-        )
-        .facts()
-        .clone()
-        .to_blob()
-        .get_handle();
         let mut pile = open_pile_strict(&fixture.live).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
-        assert!(records
-            .commits()
-            .iter()
-            .all(|commit| commit.collection() != fixed_handle));
-        let authority = resolve_authority(&mut pile, fixture.signer.verifying_key()).unwrap();
-        assert!(authority
-            .grants()
-            .all(|accepted| accepted.grant().resource() != fixed_handle));
-        let reader = pile.reader().unwrap();
-        assert!(reader.metadata(fixed_handle).unwrap().is_none());
-        let facts = faculties::secrets::vault_collection(
-            &mut pile,
-            vault,
-            fixture.signer.verifying_key(),
-            fixture.signer.clone(),
-        )
-        .materialize()
-        .unwrap();
-        let catalog = faculties::secrets::validate_catalog(&reader, vault, &facts).unwrap();
+        let discovered =
+            faculties::secrets::storage::discover_local_vaults(&mut pile, &fixture.signer).unwrap();
+        let snapshot = discovered.snapshot().vault_exact(vault_collection).unwrap();
+        let catalog = snapshot.catalog();
         assert_eq!(catalog.secrets[&secret].body, legacy_body);
-        let body: anybytes::Bytes = reader.get(catalog.secrets[&secret].body).unwrap();
+        assert_eq!(
+            catalog
+                .wraps_for(secret, catalog.custody.unwrap().public_key)
+                .len(),
+            1
+        );
+        let body: anybytes::Bytes = discovered
+            .snapshot()
+            .reader()
+            .get(catalog.secrets[&secret].body)
+            .unwrap();
         assert_eq!(body.as_ref(), malformed_body);
-        drop(reader);
+        drop(discovered);
         pile.close().unwrap();
 
         let activated_bytes = fs::read(&fixture.live).unwrap();
@@ -1608,15 +1347,30 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(replay.report().synthesized_wraps(), 0);
+        assert_eq!(replay.report().custody_wraps_added(), 0);
+        assert_eq!(replay.report().pending_access_envelopes(), 0);
         assert_eq!(replay.report().pending_vaults(), 0);
         let replay_vault = &replay.vaults()[0];
-        let replay_publication = VaultPublication::new(
+        let replay_access_fragments = replay.access_inbox().to_vec();
+        let replay_access = PlannedCollection::access_inbox(
+            fixture.signer.verifying_key(),
+            replay_access_fragments.clone(),
+            materialized_facts(&replay_access_fragments),
+        )
+        .unwrap();
+        let replay_target = PlannedCollection::vault(
             vault,
-            &fixture.signer,
-            replay_vault.recipients.clone(),
             Vec::new(),
-        );
+            TribleSet::new(),
+            replay_vault.authority,
+            replay_vault.write_presentation.clone(),
+        )
+        .unwrap();
+        let replay_planned = [replay_access, replay_target];
+        let replay_publications = replay_planned
+            .iter()
+            .map(|plan| Publication::new(plan, fixture.signer.verifying_key()))
+            .collect::<Vec<_>>();
         let before_replay = fs::read(&fixture.live).unwrap();
         let outcome = activate_publications(
             &fixture.live,
@@ -1624,7 +1378,7 @@ mod tests {
             &fixture.candidate,
             &replay_source,
             &fixture.signer,
-            &[replay_publication.publication()],
+            &replay_publications,
             |_, _| Ok(()),
         )
         .unwrap();
@@ -1633,16 +1387,70 @@ mod tests {
     }
 
     #[test]
-    fn direct_plan_rejects_local_dormant_commit_but_global_discovery_ignores_foreign_inert_commit()
-    {
+    fn direct_secrets_migration_preserves_post_v1_versions_and_only_rewraps_their_dek() {
         let fixture = Fixture::new();
-        let (legacy, vault, _, _, _) = direct_legacy_fragment(&fixture);
-        let header = faculties::secrets::vault_header_fragment(vault, "dormant", at(5)).unwrap();
+        let vault = Id::new([0x45; 16]).unwrap();
+        let mut post_v1 =
+            faculties::secrets::legacy_vault_header_fragment(vault, "epoch", at(2)).unwrap();
+        let sealed = faculties::secrets::seal_version(
+            "post-v1",
+            b"the encrypted body must remain byte-identical",
+            fixture.signer.verifying_key().to_bytes(),
+            at(7),
+        )
+        .unwrap();
+        let post_secret = sealed.secret;
+        post_v1 += sealed.fragment;
+        let post_facts = post_v1.facts().clone();
+        let mut post_blobs = post_v1.blobs().clone();
+        let post_reader = post_blobs.reader().unwrap();
+        let post_catalog =
+            faculties::secrets::validate_catalog(&post_reader, vault, &post_facts).unwrap();
+        let post_body = post_catalog.secrets[&post_secret].body;
+        let post_body_bytes: anybytes::Bytes = post_reader.get(post_body).unwrap();
+        let post_body_bytes = post_body_bytes.as_ref().to_vec();
+        let post_wrap = *post_catalog
+            .wraps
+            .values()
+            .find(|wrap| wrap.secret == post_secret)
+            .unwrap();
+        drop(post_reader);
+
+        let direct_descriptor = simplearchive_union::descriptor(
+            &faculties::secrets::vault_name(vault),
+            fixture.signer.verifying_key(),
+            None,
+            triblespace::core::collection::reach::private(),
+        );
+        let legacy_collection = direct_descriptor.facts().clone().to_blob().get_handle();
+        let pile = open_pile_strict(&fixture.live).unwrap();
+        let mut direct_collection = Collection::new(
+            pile,
+            &faculties::secrets::vault_name(vault),
+            fixture.signer.verifying_key(),
+            fixture.signer.clone(),
+            triblespace::core::collection::reach::private(),
+            CollectionAdmission::open(),
+        );
+        direct_collection.commit(post_v1).unwrap();
+        direct_collection.close().unwrap();
+
+        let foreign = text_fragment(0x46, "foreign dormant direct-vault commit");
         let mut pile = open_pile_strict(&fixture.live).unwrap();
         simplearchive_union::publish_fragment_commit(
             &mut pile,
-            &faculties::secrets::vault_descriptor(vault, fixture.signer.verifying_key()),
-            header,
+            &direct_descriptor,
+            foreign.clone(),
+            &SigningKey::from_bytes(&[0x46; 32]),
+        )
+        .unwrap();
+        simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &crate::legacy_authority::test_support::descriptor(fixture.signer.verifying_key()),
+            crate::legacy_authority::test_support::root_read_grant(
+                fixture.signer.verifying_key(),
+                legacy_collection,
+            ),
             &fixture.signer,
         )
         .unwrap();
@@ -1650,246 +1458,109 @@ mod tests {
 
         let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
             legacy_secrets::COLLECTION_NAME,
-            Id::new([0x43; 16]).unwrap(),
-            SigningKey::from_bytes(&[0x43; 32]),
-            vec![TestDeltaSpec::authored(legacy, "legacy Secrets")],
+            Id::new([0x44; 16]).unwrap(),
+            SigningKey::from_bytes(&[0x44; 32]),
+            vec![TestDeltaSpec::authored(
+                Fragment::empty(),
+                "authored empty legacy Secrets",
+            )],
         )])
         .freeze(&fixture.live)
         .unwrap()
         .source;
         let projection = secrets_cutover::plan(&frozen).unwrap();
         let mut store = frozen.collection_store();
-        let error = match secrets_vault_cutover::plan_from_legacy_in_store(
+        let direct = secrets_vault_cutover::plan_from_legacy_in_store(
             &mut store,
             &fixture.signer,
             frozen.reader(),
             projection.retained_facts().clone(),
             None,
-        ) {
-            Ok(_) => panic!("dormant local vault COMMIT was accepted"),
-            Err(error) => error,
-        };
-        assert!(format!("{error:#}").contains("would awaken dormant local COMMIT"));
-
-        let foreign_fixture = Fixture::new();
-        let foreign = SigningKey::from_bytes(&[0x77; 32]);
-        let foreign_vault = Id::new([0x77; 16]).unwrap();
-        let mut pile = open_pile_strict(&foreign_fixture.live).unwrap();
-        simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &faculties::secrets::vault_descriptor(
-                foreign_vault,
-                foreign_fixture.signer.verifying_key(),
-            ),
-            faculties::secrets::vault_header_fragment(foreign_vault, "foreign", at(6)).unwrap(),
-            &foreign,
         )
         .unwrap();
-        pile.close().unwrap();
-        let before = fs::read(&foreign_fixture.live).unwrap();
-        let frozen = freeze_source(&foreign_fixture.live).unwrap();
-        let outcome = activate_publications(
-            &foreign_fixture.live,
-            &foreign_fixture.target(),
-            &foreign_fixture.candidate,
-            &frozen,
-            &foreign_fixture.signer,
-            &[],
-            |_, views| {
-                assert!(!views.vaults().contains_key(&foreign_vault));
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(outcome, ActivationOutcome::AlreadyActive);
-        assert_eq!(fs::read(&foreign_fixture.live).unwrap(), before);
-    }
+        assert_eq!(direct.report().source_facts, 0);
+        assert_eq!(direct.vaults().len(), 1);
+        assert_eq!(direct.vaults()[0].vault, vault);
+        assert_eq!(direct.report().custody_wraps_added(), 1);
+        assert_eq!(direct.report().preserved_wraps(), 1);
+        assert_eq!(direct.report().pending_access_envelopes(), 1);
+        assert_eq!(direct.report().pending_vaults(), 1);
 
-    #[test]
-    fn activation_rejects_local_dormant_commit_on_any_fixed_grant_target() {
-        let directory = tempfile::tempdir().unwrap();
-        let live = directory.path().join("self.pile");
-        let candidate = directory.path().join("self.candidate.pile");
-        let key = directory.path().join("self.key");
-        File::create(&live).unwrap();
-        let signer = initialize_signer(&live, Some(&key)).unwrap();
-        let mut pile = open_pile_strict(&live).unwrap();
-        // Seed a resolvable authority ledger without granting any canonical
-        // faculty root. Activation's deterministic team-of-one grant set will
-        // later include Wiki and would otherwise awaken this local COMMIT.
-        publish_grant(
-            &mut pile,
-            signer.verifying_key(),
-            &signer,
-            AuthorityGrant::root(
-                signer.verifying_key(),
-                Inline::new([0xA1; 32]),
-                ACTION_WRITE,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-        simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &faculties::collection_names::root_descriptor(
-                faculties::schemas::wiki::DEFAULT_SCOPE_ID,
-                signer.verifying_key(),
-            ),
-            text_fragment(0xA2, "dormant Wiki"),
-            &signer,
-        )
-        .unwrap();
-        pile.close().unwrap();
+        let mut staged = direct.vaults()[0].required.clone();
+        assert!(post_facts.difference(staged.facts()).is_empty());
+        assert_eq!(
+            foreign.facts().difference(staged.facts()),
+            foreign.facts().clone()
+        );
+        let staged_facts = staged.facts().clone();
+        let staged_reader = staged.blobs_mut().reader().unwrap();
+        let catalog =
+            faculties::secrets::validate_catalog(&staged_reader, vault, &staged_facts).unwrap();
+        assert_eq!(catalog.secrets[&post_secret].body, post_body);
+        assert_eq!(catalog.wraps[&post_wrap.id], post_wrap);
+        assert_eq!(
+            catalog
+                .wraps_for(post_secret, catalog.custody.unwrap().public_key)
+                .len(),
+            1
+        );
+        let staged_body: anybytes::Bytes = staged_reader.get(post_body).unwrap();
+        assert_eq!(staged_body.as_ref(), post_body_bytes);
+        drop(staged_reader);
 
-        let before = fs::read(&live).unwrap();
-        let frozen = freeze_source(&live).unwrap();
-        let error = activate_publications(
-            &live,
-            &live.canonicalize().unwrap(),
-            &candidate,
-            &frozen,
-            &signer,
-            &[],
-            |_, _| Ok(()),
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("would awaken dormant local COMMIT"));
-        assert_eq!(fs::read(&live).unwrap(), before);
-        assert!(!candidate.exists());
-    }
-
-    #[test]
-    fn exact_vault_readers_reject_extra_baseline_grant_without_a_target_commit() {
-        let fixture = Fixture::new();
-        let vault = Id::new([0x78; 16]).unwrap();
-        let outsider = SigningKey::from_bytes(&[0x78; 32]).verifying_key();
-        let handle = faculties::secrets::vault_handle(vault, fixture.signer.verifying_key());
-        let mut pile = open_pile_strict(&fixture.live).unwrap();
-        publish_grant(
-            &mut pile,
+        let vault_plan = &direct.vaults()[0];
+        let target_collection = faculties::secrets::vault_handle(
+            vault,
             fixture.signer.verifying_key(),
-            &fixture.signer,
-            AuthorityGrant::root(
-                outsider,
-                handle,
-                faculties::secrets::ACTION_READ,
-                AuthorityMode::Invoke,
-            ),
-        )
-        .unwrap();
-        pile.close().unwrap();
-        let before = fs::read(&fixture.live).unwrap();
-        let frozen = freeze_source(&fixture.live).unwrap();
-        let publication = VaultPublication::new(
-            vault,
-            &fixture.signer,
-            BTreeSet::from([fixture.signer.verifying_key().to_bytes()]),
-            Vec::new(),
+            vault_plan.authority,
         );
-        let presence =
-            inspect_publications(&frozen, &fixture.signer, &[publication.publication()]).unwrap();
-        assert_eq!(presence.status(), NativePublicationStatus::Partial);
-        assert!(!presence.collections()[0].authority_policy_matches());
-        let error = activate_publications(
-            &fixture.live,
-            &fixture.target(),
-            &fixture.candidate,
-            &frozen,
-            &fixture.signer,
-            &[publication.publication()],
-            |_, _| Ok(()),
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("READ recipients differ"));
-        assert_eq!(fs::read(&fixture.live).unwrap(), before);
-        assert!(!fixture.candidate.exists());
-    }
-
-    #[test]
-    fn final_world_rejects_reader_without_wrap_and_cross_vault_secret_collision() {
-        let fixture = Fixture::new();
-        let vault = Id::new([0x79; 16]).unwrap();
-        let secret = Id::new([0x7A; 16]).unwrap();
-        let outsider = SigningKey::from_bytes(&[0x79; 32]).verifying_key();
-        let mut fragment =
-            faculties::secrets::vault_header_fragment(vault, "missing-wrap", at(7)).unwrap();
-        fragment += faculties::secrets::encrypted_secret_fragment(
-            secret,
-            "credential",
-            vec![0; 24 + 16],
-            at(8),
-        )
-        .unwrap();
-        fragment += faculties::secrets::recipient_wrap_fragment(
-            Id::new([0x7B; 16]).unwrap(),
-            secret,
-            fixture.signer.verifying_key().to_bytes(),
-            vec![0; 48 + 32],
-        )
-        .unwrap();
-        publish_vault(
-            &fixture,
-            vault,
-            fragment,
-            [fixture.signer.verifying_key(), outsider],
-        );
-        let before = fs::read(&fixture.live).unwrap();
-        let frozen = freeze_source(&fixture.live).unwrap();
-        let error = activate_publications(
-            &fixture.live,
-            &fixture.target(),
-            &fixture.candidate,
-            &frozen,
-            &fixture.signer,
-            &[],
-            |_, _| Ok(()),
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("accepted READ recipient without a wrap"));
-        assert_eq!(fs::read(&fixture.live).unwrap(), before);
-
-        let duplicate_fixture = Fixture::new();
-        let vault_a = Id::new([0x7C; 16]).unwrap();
-        let vault_b = Id::new([0x7D; 16]).unwrap();
-        let duplicate_secret = Id::new([0x7E; 16]).unwrap();
-        let secret_fragment = faculties::secrets::encrypted_secret_fragment(
-            duplicate_secret,
-            "duplicate",
-            vec![0; 24 + 16],
-            at(9),
-        )
-        .unwrap();
-        for (vault, wrap_byte) in [(vault_a, 0x7F), (vault_b, 0x80)] {
-            let mut fragment = faculties::secrets::vault_header_fragment(
+        let access_fragments = direct.access_inbox().to_vec();
+        let vault_fragments = vec![vault_plan.required.clone()];
+        let planned = [
+            PlannedCollection::access_inbox(
+                fixture.signer.verifying_key(),
+                access_fragments.clone(),
+                materialized_facts(&access_fragments),
+            )
+            .unwrap(),
+            PlannedCollection::vault(
                 vault,
-                if vault == vault_a { "one" } else { "two" },
-                at(10),
+                vault_fragments.clone(),
+                materialized_facts(&vault_fragments),
+                vault_plan.authority,
+                vault_plan.write_presentation.clone(),
             )
-            .unwrap();
-            fragment += secret_fragment.clone();
-            fragment += faculties::secrets::recipient_wrap_fragment(
-                Id::new([wrap_byte; 16]).unwrap(),
-                duplicate_secret,
-                duplicate_fixture.signer.verifying_key().to_bytes(),
-                vec![0; 48 + 32],
-            )
-            .unwrap();
-            publish_vault(&duplicate_fixture, vault, fragment, std::iter::empty());
-        }
-        let before = fs::read(&duplicate_fixture.live).unwrap();
-        let frozen = freeze_source(&duplicate_fixture.live).unwrap();
-        let error = activate_publications(
-            &duplicate_fixture.live,
-            &duplicate_fixture.target(),
-            &duplicate_fixture.candidate,
+            .unwrap(),
+        ];
+        let publications = planned
+            .iter()
+            .map(|plan| Publication::new(plan, fixture.signer.verifying_key()))
+            .collect::<Vec<_>>();
+        let outcome = activate_publications(
+            &fixture.live,
+            &fixture.target(),
+            &fixture.candidate,
             &frozen,
-            &duplicate_fixture.signer,
-            &[],
+            &fixture.signer,
+            &publications,
             |_, _| Ok(()),
         )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("occurs in both vault"));
-        assert_eq!(fs::read(&duplicate_fixture.live).unwrap(), before);
+        .unwrap();
+        assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+
+        let mut pile = open_pile_strict(&fixture.live).unwrap();
+        let discovered =
+            faculties::secrets::storage::discover_local_vaults(&mut pile, &fixture.signer).unwrap();
+        assert_eq!(discovered.snapshot().vaults().len(), 1);
+        assert!(discovered.location_exact(legacy_collection).is_none());
+        let target = discovered
+            .snapshot()
+            .vault_exact(target_collection)
+            .unwrap();
+        assert_eq!(target.catalog().secrets[&post_secret].body, post_body);
+        assert_eq!(target.catalog().wraps[&post_wrap.id], post_wrap);
+        drop(discovered);
+        pile.close().unwrap();
     }
 
     #[test]

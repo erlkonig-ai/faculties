@@ -25,10 +25,7 @@ impl TestPile {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.pile");
         fs::File::create(&path).unwrap();
-        let signer = faculties::storage::initialize_signer(&path, None).unwrap();
-        let mut store = faculties::storage::open_pile_strict(&path).unwrap();
-        faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-        store.close().unwrap();
+        faculties::storage::initialize_signer(&path, None).unwrap();
         Self { dir, path }
     }
 }

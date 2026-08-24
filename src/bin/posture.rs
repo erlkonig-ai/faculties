@@ -2002,11 +2002,11 @@ impl PostureStorage<'_> {
     }
 }
 
-/// The team an already-open collection belongs to.
-fn collection_team(collection: &Collection<Pile>) -> Result<ed25519_dalek::VerifyingKey> {
-    triblespace::core::collection::descriptor::team(collection.descriptor().facts())
-        .ok_or_else(|| anyhow!("a Posture root descriptor names the team it belongs to"))?
-        .map_err(|error| anyhow!("decode the team on the Posture root descriptor: {error}"))
+/// The namespace an already-open collection belongs to.
+fn collection_namespace(collection: &Collection<Pile>) -> Result<ed25519_dalek::VerifyingKey> {
+    triblespace::core::collection::descriptor::namespace(collection.descriptor().facts())
+        .ok_or_else(|| anyhow!("a Posture root descriptor names its namespace"))?
+        .map_err(|error| anyhow!("decode the namespace on the Posture root descriptor: {error}"))
 }
 
 fn materialize_stable(
@@ -2015,12 +2015,12 @@ fn materialize_stable(
     author: [u8; 32],
     label: &str,
 ) -> Result<(TribleSet, Vec<CollectionCommit>)> {
-    // The team is read back off the collection we already hold rather than
-    // passed in beside it: it is a property of that collection, and a second
-    // copy travelling alongside is a second thing that can disagree.
-    let team = collection_team(collection)?;
+    // The namespace is read back off the collection we already hold rather
+    // than passed in beside it: it is a property of that collection, and a
+    // second copy travelling alongside is a second thing that can disagree.
+    let namespace = collection_namespace(collection)?;
     loop {
-        let before = discover_target(collection.storage_mut(), scope, team)
+        let before = discover_target(collection.storage_mut(), scope, namespace)
             .with_context(|| format!("discover fixed Posture {label} descriptor"))?;
         let before = before
             .commits()
@@ -2031,7 +2031,7 @@ fn materialize_stable(
         let facts = collection
             .materialize()
             .with_context(|| format!("materialize authored Posture {label} collection"))?;
-        let after = discover_target(collection.storage_mut(), scope, team)
+        let after = discover_target(collection.storage_mut(), scope, namespace)
             .with_context(|| format!("rediscover fixed Posture {label} descriptor"))?;
         let after = after
             .commits()
@@ -5883,10 +5883,7 @@ mod tests {
             let pile = directory.path().join("posture-test.pile");
             let key = directory.path().join("posture-test.key");
             File::create(&pile).unwrap();
-            let signer = faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
-            let mut store = faculties::storage::open_pile_strict(&pile).unwrap();
-            faculties::storage::ensure_team_of_one_write_authority(&mut store, &signer).unwrap();
-            store.close().unwrap();
+            faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
                 pile,
@@ -6854,7 +6851,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_signer_cannot_introduce_scan_membership_and_descriptor_is_fixed() {
+    fn open_scan_collection_materializes_foreign_commits_without_claiming_authorship() {
         let store = TestStore::new();
         let (files, omissions) = sample_scan_inputs();
         let (fragment, _) = build_scan_fragment(
@@ -6865,16 +6862,18 @@ mod tests {
             None,
             IMPLEMENTED.iter().copied().collect(),
         );
+        let expected = fragment.facts().clone();
         let mut pile = open_pile_strict(&store.pile).unwrap();
-        // Use the explicit low-level publication seam: the high-level
-        // `Collection::commit` correctly refuses this writer. The foreign key
-        // must still address the SAME collection — same name, same team — or
-        // this proves only that two different collections do not see each
-        // other, which is trivial.
-        let team = faculties::storage::load_signer(&store.pile, Some(&store.key))
+        // Ordinary faculty collections are deliberately Open: their private
+        // reach and the local store boundary, not an ambient authority ledger,
+        // determine who can deliver bytes. A foreign signer therefore joins
+        // the same namespaced collection, but local-authorship queries must not
+        // mistake that commit for one of ours.
+        let namespace = faculties::storage::load_signer(&store.pile, Some(&store.key))
             .unwrap()
             .verifying_key();
-        let descriptor = faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, team);
+        let descriptor =
+            faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, namespace);
         let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
         triblespace::core::collection::simplearchive_union::publish_fragment_commit(
             &mut pile,
@@ -6886,7 +6885,7 @@ mod tests {
         pile.close().unwrap();
 
         let view = store.storage().scan_view().unwrap();
-        assert!(view.facts.is_empty());
+        assert_eq!(view.facts, expected);
         assert!(store
             .storage()
             .authored_commits(DEFAULT_SCAN_SCOPE_ID, "scan")
@@ -6894,10 +6893,10 @@ mod tests {
             .is_empty());
 
         let mut pile = open_pile_strict(&store.pile).unwrap();
-        let target = discover_target(&mut pile, DEFAULT_SCAN_SCOPE_ID, team).unwrap();
+        let target = discover_target(&mut pile, DEFAULT_SCAN_SCOPE_ID, namespace).unwrap();
         assert_eq!(
             target.descriptor().facts(),
-            faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, team).facts()
+            faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, namespace).facts()
         );
         assert_eq!(target.commits().len(), 1);
         pile.close().unwrap();

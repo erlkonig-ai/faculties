@@ -24,11 +24,11 @@ use triblespace::prelude::*;
 use crate::collection_cutover::{
     project_legacy_authored_commits, FrozenSource, LegacyCommitCoordinate, LegacyPinCoordinate,
 };
-use crate::write_authority::publish_fragments;
 use faculties::schemas::status::{
     status as status_attr, DEFAULT_SCOPE_ID, KIND_STATUS_UPDATE, STATUS_BRANCH_NAME,
 };
 use faculties::status::{self, StatusRow};
+use faculties::storage::publish_fragments;
 
 /// One native commit projected from one exact authored legacy commit.
 #[derive(Clone, Debug, Eq, PartialEq)]

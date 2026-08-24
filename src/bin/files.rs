@@ -2172,10 +2172,7 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let path = dir.join("test.pile");
             fs::File::create(&path).unwrap();
-            let signer = initialize_signer(&path, None).unwrap();
-            let mut pile = open_pile_strict(&path).unwrap();
-            faculties::storage::ensure_team_of_one_write_authority(&mut pile, &signer).unwrap();
-            pile.close().unwrap();
+            initialize_signer(&path, None).unwrap();
             Self { dir, path }
         }
     }
