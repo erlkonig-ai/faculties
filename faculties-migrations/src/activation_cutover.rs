@@ -596,6 +596,8 @@ pub fn plan(
     password: Option<&[u8]>,
 ) -> Result<ActivationPlan> {
     let mut frozen_collections = source.collection_store();
+    faculties::storage::preflight_team_of_one_signer(&mut frozen_collections, signer)
+        .context("preflight durable team root before activation planning")?;
     crate::collection_cutover::reject_dormant_local_commits(
         &mut frozen_collections,
         signer,
@@ -1403,6 +1405,34 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("preflight dormant COMMITs on fixed activation WRITE targets"));
         assert!(message.contains("would awaken dormant local COMMIT"));
+        assert!(!message.contains("plan Archive activation"));
+    }
+
+    #[test]
+    fn aggregate_plan_rejects_foreign_durable_key_before_source_planning() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.pile");
+        File::create(&path).unwrap();
+        let local = SigningKey::from_bytes(&[0xE9; 32]);
+        let foreign = SigningKey::from_bytes(&[0xEA; 32]);
+        let mut pile = Pile::open(&path).unwrap();
+        triblespace::core::collection::simplearchive_union::publish_fragment_commit(
+            &mut pile,
+            &faculties::collection_names::root_descriptor(
+                schemas::wiki::DEFAULT_SCOPE_ID,
+                local.verifying_key(),
+            ),
+            Fragment::empty(),
+            &local,
+        )
+        .unwrap();
+        pile.close().unwrap();
+
+        let source = crate::collection_cutover::freeze_source(&path).unwrap();
+        let error = plan(&source, &foreign, None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("preflight durable team root before activation planning"));
+        assert!(message.contains("refusing to create a parallel empty authority epoch"));
         assert!(!message.contains("plan Archive activation"));
     }
 

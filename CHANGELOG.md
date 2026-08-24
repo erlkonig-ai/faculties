@@ -16,7 +16,9 @@ All notable changes to this project will be documented in this file.
   second time; `activate-cutover` remains the authoritative aggregate semantic
   validator. The fixed WRITE bootstrap now also replays an already-accepted
   grant when its descriptor or metadata blob is absent, so “ensure” repairs
-  the same complete dependency closure that planning verifies.
+  the same complete dependency closure that planning verifies. Aggregate
+  planning now also rejects a durable key that would open a parallel empty
+  team epoch before running any faculty transform.
 
 - **`converse` — a half-duplex talk-loop bridge.** Three seams that already
   existed are now joined into one spoken loop: a listener appends utterances

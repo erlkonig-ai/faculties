@@ -424,6 +424,20 @@ where
     Ok(observed)
 }
 
+/// Reject a durable signer that would open a parallel team-of-one epoch.
+///
+/// This is the read-only identity boundary shared by authority publication and
+/// migration planning. It deliberately performs only root observation: no
+/// grants are constructed, authority is not resolved, and the store is never
+/// mutated. Callers that do substantial planning can therefore reject the
+/// common wrong-`--key` failure before doing that work.
+pub fn preflight_team_of_one_signer<S>(store: &mut S, signer: &SigningKey) -> Result<()>
+where
+    S: BlobStore + CollectionStore,
+{
+    observe_faculty_roots(store, signer.verifying_key()).map(|_| ())
+}
+
 /// Construct the closed, deterministic grant set without touching `pile`.
 ///
 /// A scratch store deliberately runs the same public [`publish_grant`] path as
