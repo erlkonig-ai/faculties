@@ -200,22 +200,19 @@ fn next_unused_id(used: &mut BTreeSet<Id>) -> Id {
     }
 }
 
-/// A historical scope admitted creation time as a set of observations, while
-/// a vault header has one immutable scalar. Refuse a non-singleton set rather
-/// than silently choosing a winner; the copied legacy branch retains every
-/// original observation until an explicit projection policy is chosen.
+/// Project historical scope-creation observations onto one vault genesis.
+///
+/// Legacy scope identity was `(creator, name)`, so repeated creation calls
+/// reasserted the same intrinsic scope with another timestamp. The earliest
+/// point is the actual genesis: it is deterministic, independent of authored
+/// order, and composes over union (`min(A ∪ B) = min(min(A), min(B))`). The
+/// preserved legacy prefix still carries every original observation.
 fn vault_created_at(scope: &legacy::ScopeRow) -> Result<legacy::IntervalValue> {
-    if scope.created_at.len() != 1 {
-        bail!(
-            "legacy scope {} has {} creation observations; a vault requires exactly one",
-            scope.id,
-            scope.created_at.len()
-        );
-    }
-    Ok(*scope
+    scope
         .created_at
         .first()
-        .expect("one legacy scope creation observation checked above"))
+        .copied()
+        .ok_or_else(|| anyhow!("legacy scope {} has no creation observation", scope.id))
 }
 
 /// Translate an exact pre-collection legacy Secrets projection directly into
@@ -434,25 +431,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hifitime::Epoch;
+    use triblespace::prelude::TryToInline;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
     }
 
-    fn at(byte: u8) -> legacy::IntervalValue {
-        Inline::new([byte; 32])
+    fn at(seconds: f64) -> legacy::IntervalValue {
+        let instant = Epoch::from_unix_seconds(seconds);
+        (instant, instant).try_to_inline().unwrap()
     }
 
     #[test]
-    fn repeated_legacy_creation_observations_are_not_arbitrated() {
+    fn repeated_legacy_creation_observations_project_to_the_earliest_point() {
         let scope = legacy::ScopeRow {
             id: id(1),
             creator: id(2),
-            created_at: BTreeSet::from([at(3), at(4)]),
+            created_at: BTreeSet::from([at(4.0), at(3.0)]),
             name: Inline::new([5; 32]),
         };
 
-        let error = vault_created_at(&scope).unwrap_err().to_string();
-        assert!(error.contains("2 creation observations"), "{error}");
+        assert_eq!(vault_created_at(&scope).unwrap(), at(3.0));
     }
 }

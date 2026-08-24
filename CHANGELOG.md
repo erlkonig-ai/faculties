@@ -18,7 +18,11 @@ All notable changes to this project will be documented in this file.
   grant when its descriptor or metadata blob is absent, so “ensure” repairs
   the same complete dependency closure that planning verifies. Aggregate
   planning now also rejects a durable key that would open a parallel empty
-  team epoch before running any faculty transform.
+  team epoch before running any faculty transform. If one valid historical
+  Secrets scope carries repeated creation observations, direct vault
+  activation now projects their earliest point as the immutable vault genesis;
+  intrinsic scope identity was `(creator, name)`, and the preserved legacy
+  prefix retains the complete observation set.
 
 - **`converse` — a half-duplex talk-loop bridge.** Three seams that already
   existed are now joined into one spoken loop: a listener appends utterances
