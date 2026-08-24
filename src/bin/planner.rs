@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::{Parser, Subcommand};
+use faculties::clock;
 use faculties::legacy_hint::open_scope;
 use faculties::planner::{
     self as planner_model, cancellation_fragment, event_facts, event_fragment, note_fragment,
@@ -207,24 +208,26 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
     }
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
+#[cfg(test)]
 fn point_interval(epoch: Epoch) -> IntervalValue {
     (epoch, epoch)
         .try_to_inline()
         .expect("an Epoch point is a valid interval")
 }
 
-fn epoch_to_chrono_utc(epoch: Epoch) -> DateTime<Utc> {
+fn epoch_to_chrono_utc(epoch: Epoch) -> Result<DateTime<Utc>> {
     let seconds = epoch.to_unix_seconds();
-    Utc.timestamp_opt(
-        seconds as i64,
-        ((seconds.fract() * 1e9) as u32).min(999_999_999),
-    )
-    .single()
-    .unwrap_or_else(Utc::now)
+    if !seconds.is_finite() {
+        bail!("Planner timestamp is not finite");
+    }
+    let whole = seconds.floor();
+    if whole < i64::MIN as f64 || whole > i64::MAX as f64 {
+        bail!("Planner timestamp is outside the displayable UTC range");
+    }
+    let nanos = ((seconds - whole) * 1e9).round().clamp(0.0, 999_999_999.0) as u32;
+    Utc.timestamp_opt(whole as i64, nanos)
+        .single()
+        .ok_or_else(|| anyhow!("Planner timestamp is outside the displayable UTC range"))
 }
 
 fn chrono_to_epoch(datetime: DateTime<Utc>) -> Epoch {
@@ -277,11 +280,11 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn fmt_interval(interval: IntervalValue) -> String {
+fn fmt_interval(interval: IntervalValue) -> Result<String> {
     let (start, end) = unpack_interval(interval);
-    let start = epoch_to_chrono_utc(start);
-    let end = epoch_to_chrono_utc(end);
-    if start == end {
+    let start = epoch_to_chrono_utc(start)?;
+    let end = epoch_to_chrono_utc(end)?;
+    let formatted = if start == end {
         start.format("%Y-%m-%d %H:%M UTC").to_string()
     } else if (end - start).num_seconds() == 86_400
         && start.format("%H:%M:%S").to_string() == "00:00:00"
@@ -293,7 +296,8 @@ fn fmt_interval(interval: IntervalValue) -> String {
             start.format("%Y-%m-%d %H:%M"),
             end.format("%Y-%m-%d %H:%M UTC")
         )
-    }
+    };
+    Ok(formatted)
 }
 
 fn resolve_event_id(input: &str, catalog: &PlannerCatalog) -> Result<Id> {
@@ -378,7 +382,7 @@ fn cmd_add(
     let mut fragment = event_fragment(&draft)?;
     let event_id = fragment.root().expect("event fragment has one root");
     if let Some(note) = note {
-        fragment += note_fragment(event_id, &note, point_interval(now_epoch()))?;
+        fragment += note_fragment(event_id, &note, clock::point_now()?)?;
     }
     storage.update("add event", |_| Ok((Some(fragment), ())))?;
     println!("Added event {}", fmt_id(event_id));
@@ -401,7 +405,7 @@ fn rrule_occurrences(row: &EventRow, window: (Epoch, Epoch)) -> Result<Vec<(Epoc
     let mut occurrences = Vec::new();
 
     if let Some(rule) = &row.rrule {
-        let dtstart = epoch_to_chrono_utc(base_start)
+        let dtstart = epoch_to_chrono_utc(base_start)?
             .format("%Y%m%dT%H%M%SZ")
             .to_string();
         let combined = format!("DTSTART:{dtstart}\nRRULE:{rule}");
@@ -409,8 +413,8 @@ fn rrule_occurrences(row: &EventRow, window: (Epoch, Epoch)) -> Result<Vec<(Epoc
             .parse::<RRuleSet>()
             .with_context(|| format!("parse RRULE on event {}", fmt_id(row.id)))?;
         let result = set
-            .after(epoch_to_chrono_utc(window_start).with_timezone(&Tz::UTC))
-            .before(epoch_to_chrono_utc(window_end).with_timezone(&Tz::UTC))
+            .after(epoch_to_chrono_utc(window_start)?.with_timezone(&Tz::UTC))
+            .before(epoch_to_chrono_utc(window_end)?.with_timezone(&Tz::UTC))
             .all(10_000);
         occurrences.extend(result.dates.into_iter().map(|datetime| {
             let start = chrono_to_epoch(datetime.with_timezone(&Utc));
@@ -482,14 +486,14 @@ fn collect_occurrences(
     Ok(occurrences)
 }
 
-fn print_occurrences(occurrences: &[Occurrence]) {
+fn print_occurrences(occurrences: &[Occurrence]) -> Result<()> {
     if occurrences.is_empty() {
         println!("(no events)");
-        return;
+        return Ok(());
     }
     for occurrence in occurrences {
-        let start = epoch_to_chrono_utc(occurrence.start);
-        let end = epoch_to_chrono_utc(occurrence.end);
+        let start = epoch_to_chrono_utc(occurrence.start)?;
+        let end = epoch_to_chrono_utc(occurrence.end)?;
         let time = if (end - start).num_seconds() == 86_400
             && start.format("%H:%M:%S").to_string() == "00:00:00"
         {
@@ -522,6 +526,7 @@ fn print_occurrences(occurrences: &[Occurrence]) {
         }
         println!("{line}");
     }
+    Ok(())
 }
 
 fn cmd_list(
@@ -545,49 +550,43 @@ fn cmd_list(
             &loaded.catalog,
             (start, end),
             show_cancelled,
-        )?);
+        )?)?;
         Ok(())
     })
 }
 
-fn local_day_window(days: i64) -> (Epoch, Epoch) {
-    let now = chrono::Local::now();
+fn local_day_window(days: i64) -> Result<(Epoch, Epoch)> {
+    let timezone = chrono::Local;
+    let now = epoch_to_chrono_utc(clock::now()?)?.with_timezone(&timezone);
     let start = now
         .date_naive()
         .and_hms_opt(0, 0, 0)
         .expect("midnight exists");
     let end = start + chrono::Duration::days(days);
-    (
-        chrono_to_epoch(
-            now.timezone()
-                .from_local_datetime(&start)
-                .single()
-                .expect("local midnight is unambiguous")
-                .with_timezone(&Utc),
-        ),
-        chrono_to_epoch(
-            now.timezone()
-                .from_local_datetime(&end)
-                .single()
-                .expect("local midnight is unambiguous")
-                .with_timezone(&Utc),
-        ),
-    )
+    let start = timezone
+        .from_local_datetime(&start)
+        .single()
+        .ok_or_else(|| anyhow!("local start-of-day is ambiguous or unavailable"))?;
+    let end = timezone
+        .from_local_datetime(&end)
+        .single()
+        .ok_or_else(|| anyhow!("local end-of-day is ambiguous or unavailable"))?;
+    Ok((
+        chrono_to_epoch(start.with_timezone(&Utc)),
+        chrono_to_epoch(end.with_timezone(&Utc)),
+    ))
 }
 
 fn cmd_relative(storage: PlannerStorage<'_>, days: i64) -> Result<()> {
+    let window = local_day_window(days)?;
     storage.with_view(|loaded| {
-        print_occurrences(&collect_occurrences(
-            &loaded.catalog,
-            local_day_window(days),
-            false,
-        )?);
+        print_occurrences(&collect_occurrences(&loaded.catalog, window, false)?)?;
         Ok(())
     })
 }
 
 fn cmd_next(storage: PlannerStorage<'_>) -> Result<()> {
-    let now = now_epoch();
+    let now = clock::now()?;
     let far = Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0);
     storage.with_view(|loaded| {
         let occurrences = collect_occurrences(&loaded.catalog, (now, far), false)?;
@@ -596,7 +595,7 @@ fn cmd_next(storage: PlannerStorage<'_>) -> Result<()> {
             .filter(|occurrence| occurrence.end >= now)
             .take(1)
             .collect();
-        print_occurrences(&next);
+        print_occurrences(&next)?;
         Ok(())
     })
 }
@@ -605,7 +604,7 @@ fn cmd_note(storage: PlannerStorage<'_>, id: String, text: String) -> Result<()>
     let text = faculties::text_arg(&text, "note")?;
     let event_id = storage.update("add event note", |loaded| {
         let event_id = resolve_event_id(&id, &loaded.catalog)?;
-        let fragment = note_fragment(event_id, &text, point_interval(now_epoch()))?;
+        let fragment = note_fragment(event_id, &text, clock::point_now()?)?;
         Ok((Some(fragment), event_id))
     })?;
     println!("Added note to event {}", fmt_id(event_id));
@@ -617,7 +616,7 @@ fn cmd_show(storage: PlannerStorage<'_>, id: String) -> Result<()> {
         let event_id = resolve_event_id(&id, &loaded.catalog)?;
         let row = &loaded.catalog.events[&event_id];
         println!("event {}  {}", fmt_id(event_id), row.summary);
-        println!("  time:     {}", fmt_interval(row.time));
+        println!("  time:     {}", fmt_interval(row.time)?);
         if let Some(location) = &row.location {
             println!("  location: {location}");
         }
@@ -646,7 +645,7 @@ fn cmd_show(storage: PlannerStorage<'_>, id: String) -> Result<()> {
             println!("  notes:");
             for note in notes {
                 let when = unpack_interval(note.created_at).0;
-                let when = epoch_to_chrono_utc(when).format("%Y-%m-%d %H:%M UTC");
+                let when = epoch_to_chrono_utc(when)?.format("%Y-%m-%d %H:%M UTC");
                 println!("  - [{when}] {}", read_text(&loaded.reader, note.text)?);
             }
         }

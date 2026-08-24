@@ -21,8 +21,8 @@ use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use faculties::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::{
-    compass, habits, mail as mail_model, memory as memory_model, message, orient as orient_model,
-    relations, status, teams as teams_model, wiki as wiki_model,
+    clock, compass, habits, mail as mail_model, memory as memory_model, message,
+    orient as orient_model, relations, status, teams as teams_model, wiki as wiki_model,
 };
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -163,10 +163,7 @@ enum WaitTarget {
     },
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
+#[cfg(test)]
 fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
     (epoch, epoch).try_to_inline().unwrap()
 }
@@ -367,7 +364,7 @@ fn render_native_messages(
         writeln!(out, "- None").unwrap();
         return Ok(out);
     }
-    let now = interval_key(epoch_interval(now_epoch()));
+    let now = interval_key(clock::point_now()?);
     for row in unread {
         writeln!(
             out,
@@ -614,7 +611,7 @@ fn render_native_mail(
         writeln!(out, "- None").unwrap();
         return Ok(out);
     }
-    let now = interval_key(epoch_interval(now_epoch()));
+    let now = interval_key(clock::point_now()?);
     for (wire, summary) in rows.into_iter().take(limit) {
         let age = summary
             .claimed_at
@@ -1219,8 +1216,7 @@ fn save_checkpoint(
     view: &orient_model::WatchedView,
     newly_observed: impl IntoIterator<Item = Id>,
 ) -> Result<()> {
-    let (mut fragment, _) =
-        orient_model::checkpoint_fragment(persona, view, epoch_interval(now_epoch()))?;
+    let (mut fragment, _) = orient_model::checkpoint_fragment(persona, view, clock::point_now()?)?;
     fragment += orient_model::seen_notes_fragment(persona, newly_observed);
     open_scope(
         pile,
@@ -1319,7 +1315,7 @@ fn cmd_show(
         habits = Some(render_native_habits(&observe_habits(
             &catalogs,
             pile_path,
-            epoch_seconds(now_epoch()),
+            epoch_seconds(clock::now()?),
         )?));
         let goals = render_native_compass_goals(&catalogs, doing_limit, todo_limit);
         let window_status = render_window_status(&catalogs)?;
@@ -1706,7 +1702,7 @@ fn cmd_wait(
         // Already-due habits establish a quiet, process-local baseline. A
         // rearmed one-shot watcher therefore waits for a transition instead
         // of reporting the same unsatisfied intention forever.
-        let mut habit_seen = observe_habits(&catalogs, pile_path, epoch_seconds(now_epoch()))?;
+        let mut habit_seen = observe_habits(&catalogs, pile_path, epoch_seconds(clock::now()?))?;
         let mut last_habit_sweep = Instant::now();
 
         match check_news_once(&mut pile, &signer, &catalogs, persona_id, false)? {
@@ -1737,7 +1733,7 @@ fn cmd_wait(
                 .map_err(|error| anyhow!("stat pile {}: {error}", pile_path.display()))?
                 .len();
             let pile_changed = current_length != observed_length;
-            let now_secs = epoch_seconds(now_epoch());
+            let now_secs = epoch_seconds(clock::now()?);
             let cooldown_elapsed = habit_seen
                 .next_cooldown_at
                 .is_some_and(|deadline| now_secs >= deadline);

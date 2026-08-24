@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::clock;
 use faculties::decide;
 use faculties::files;
 use faculties::legacy_hint::open_scope;
@@ -21,7 +22,6 @@ use faculties::schemas::{
 };
 use faculties::secrets::storage as vaults;
 use faculties::storage::{load_signer, open_pile_strict};
-use hifitime::Epoch;
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
@@ -300,10 +300,7 @@ fn parse_id(raw: &str) -> std::result::Result<Id, String> {
 }
 
 fn point_now() -> Result<mail::IntervalValue> {
-    let now = Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))?;
-    (now, now)
-        .try_to_inline()
-        .map_err(|error| anyhow!("encode current clock: {error:?}"))
+    clock::point_now()
 }
 
 fn persona_selector() -> Result<String> {

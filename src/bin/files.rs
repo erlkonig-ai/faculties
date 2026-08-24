@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::clock;
 use faculties::files as file_capability;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::embeddings;
@@ -187,9 +188,8 @@ enum Command {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-fn now_tai() -> Inline<inlineencodings::NsTAIInterval> {
-    let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
-    (now, now).try_to_inline().expect("valid TAI interval")
+fn now_tai() -> Result<Inline<inlineencodings::NsTAIInterval>> {
+    clock::point_now()
 }
 
 fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
@@ -738,7 +738,7 @@ fn cmd_add(
     let root_content = content_handle_of(&tree, root_id);
 
     // Create import entity, spreading the tree into it.
-    let ts = now_tai();
+    let ts = now_tai()?;
     let mut import_frag = Fragment::empty();
     let source_h: TextHandle = import_frag.put(source.clone());
     import_frag += entity! {

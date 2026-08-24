@@ -10,6 +10,7 @@
 //! ```
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use hifitime::{Duration as HifiDuration, Epoch};
 
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
@@ -126,7 +127,7 @@ impl DiscordLive {
                 Ok(MessageRow {
                     id: message.observation,
                     anchor: message.anchor,
-                    at: ns_to_chrono(discord::interval_key(message.created_at)),
+                    at: ns_to_chrono(discord::interval_key(message.created_at))?,
                     author_id: message.author,
                     author_name: authors
                         .get(&message.author)
@@ -181,12 +182,31 @@ fn newest_complete_message_groups(all_messages: Vec<MessageRow>, limit: usize) -
     messages
 }
 
-fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
-    let secs = (ns / 1_000_000_000) as i64;
-    let nanos = ((ns % 1_000_000_000) as u32).min(999_999_999);
-    Utc.timestamp_opt(secs, nanos)
+fn epoch_to_chrono(epoch: Epoch) -> anyhow::Result<DateTime<Utc>> {
+    let secs = epoch.to_unix_seconds();
+    if !secs.is_finite() {
+        anyhow::bail!("Discord timestamp is not finite");
+    }
+    let whole = secs.floor();
+    if whole < i64::MIN as f64 || whole > i64::MAX as f64 {
+        anyhow::bail!("Discord timestamp is outside the displayable UTC range");
+    }
+    let nanos = ((secs - whole) * 1e9).round().clamp(0.0, 999_999_999.0) as u32;
+    Utc.timestamp_opt(whole as i64, nanos)
         .single()
-        .unwrap_or_else(Utc::now)
+        .ok_or_else(|| anyhow::anyhow!("Discord timestamp is outside the displayable UTC range"))
+}
+
+fn ns_to_chrono(ns: i128) -> anyhow::Result<DateTime<Utc>> {
+    epoch_to_chrono(Epoch::from_tai_duration(
+        HifiDuration::from_total_nanoseconds(ns),
+    ))
+}
+
+fn current_utc() -> Option<DateTime<Utc>> {
+    crate::clock::now()
+        .ok()
+        .and_then(|epoch| epoch_to_chrono(epoch).ok())
 }
 
 fn id_hex(id: Id) -> String {
@@ -298,7 +318,7 @@ impl DiscordViewer {
             let Some(live) = self.live.as_ref() else {
                 return;
             };
-            let now = Utc::now();
+            let now = current_utc();
 
             ctx.grid(|g| {
                 if let Some(diagnostic) = &live.diagnostic {
@@ -394,7 +414,7 @@ fn render_message_card(
     ui: &mut egui::Ui,
     msg: &MessageRow,
     live: &DiscordLive,
-    now: DateTime<Utc>,
+    now: Option<DateTime<Utc>>,
 ) {
     let bubble_fill = ui.visuals().window_fill;
     // Header accent = channel's hashed colour so all messages from
@@ -455,15 +475,19 @@ fn render_message_card(
                                 .color(text_on_accent),
                             );
                         }
-                        ui.label(
-                            egui::RichText::new(format!(
+                        let time = match now {
+                            Some(now) => format!(
                                 "· {} · {}",
                                 format_chat_time(msg.at),
                                 age_label(now, msg.at)
-                            ))
-                            .monospace()
-                            .small()
-                            .color(text_on_accent),
+                            ),
+                            None => format!("· {}", format_chat_time(msg.at)),
+                        };
+                        ui.label(
+                            egui::RichText::new(time)
+                                .monospace()
+                                .small()
+                                .color(text_on_accent),
                         );
                     });
 

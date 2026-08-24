@@ -8,12 +8,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
+use faculties::clock;
 use faculties::headspace::{self, Catalog, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict};
-use hifitime::Epoch;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
@@ -549,10 +549,7 @@ fn secret_label(role: SecretRole, profile: Id) -> String {
 }
 
 fn point_now() -> Result<secrets_model::IntervalValue> {
-    let now = Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))?;
-    (now, now)
-        .try_to_inline()
-        .map_err(|error| anyhow!("encode current clock: {error:?}"))
+    clock::point_now()
 }
 
 struct SecretSuccessor {

@@ -46,6 +46,7 @@ pub mod atlas;
 pub mod blockdag;
 pub mod body;
 pub mod bootstrap;
+pub mod clock;
 pub mod cognition;
 pub mod collection_names;
 pub mod comb;

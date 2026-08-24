@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use faculties::clock;
 use faculties::secrets::{self, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict};
-use hifitime::Epoch;
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
@@ -151,10 +151,7 @@ fn fmt_key(key: VerifyingKey) -> String {
 }
 
 fn point_now() -> Result<secrets::IntervalValue> {
-    let now = Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))?;
-    Ok((now, now)
-        .try_to_inline()
-        .expect("a clock point is a valid interval"))
+    clock::point_now()
 }
 
 fn load_value(raw: String) -> Result<Zeroizing<Vec<u8>>> {

@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::clock;
 use faculties::legacy_hint::open_scope;
 #[cfg(feature = "local-embed")]
 use faculties::schemas::embeddings::{self, Embedding768};
@@ -14,6 +15,7 @@ use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki::{
     self as wiki_model, EntryRecord, RevisionDraft, RevisionReadModel, RevisionRecord, WikiCatalog,
 };
+#[cfg(test)]
 use hifitime::Epoch;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::pile::{Pile, PileReader};
@@ -254,10 +256,7 @@ impl WikiStorage<'_> {
 }
 
 fn now_interval() -> Result<Inline<inlineencodings::NsTAIInterval>> {
-    let now = Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))?;
-    (now, now)
-        .try_to_inline()
-        .map_err(|error| anyhow!("encode timestamp: {error:?}"))
+    clock::point_now()
 }
 
 fn entry_label(entry: &EntryRecord) -> String {

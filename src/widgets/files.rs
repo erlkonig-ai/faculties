@@ -181,6 +181,12 @@ fn epoch_to_chrono(e: Epoch) -> anyhow::Result<DateTime<Utc>> {
         .ok_or_else(|| anyhow::anyhow!("Files timestamp is outside the displayable UTC range"))
 }
 
+fn current_utc() -> Option<DateTime<Utc>> {
+    crate::clock::now()
+        .ok()
+        .and_then(|epoch| epoch_to_chrono(epoch).ok())
+}
+
 fn id_hex(id: Id) -> String {
     format!("{id:x}")
 }
@@ -279,12 +285,12 @@ impl FilesViewer {
                     return;
                 }
                 let shown = live.imports.len();
-                let now = Utc::now();
+                let now = current_utc();
                 let newest_age = live
                     .imports
                     .first()
                     .map(|r| r.imported_at)
-                    .map(|t| age_label(now, t));
+                    .and_then(|at| now.map(|now| age_label(now, at)));
 
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
@@ -419,7 +425,7 @@ fn extract_tree(
 fn render_import_card(
     ui: &mut egui::Ui,
     row: &ImportRow,
-    now: DateTime<Utc>,
+    now: Option<DateTime<Utc>>,
     open_root: &mut Option<Id>,
 ) {
     let bubble_fill = ui.visuals().window_fill;
@@ -469,12 +475,17 @@ fn render_import_card(
                                 .strong()
                                 .color(text_on_accent),
                         );
-                        ui.label(
-                            egui::RichText::new(format!("· {}", age_label(now, row.imported_at)))
+                        if let Some(now) = now {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "· {}",
+                                    age_label(now, row.imported_at)
+                                ))
                                 .monospace()
                                 .small()
                                 .color(text_on_accent),
-                        );
+                            );
+                        }
                         if row.is_reimport {
                             ui.label(
                                 egui::RichText::new("· RE-IMPORT")

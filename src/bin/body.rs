@@ -21,6 +21,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::clock;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
 use faculties::storage::{load_signer, open_pile_strict, publish_fragment};
@@ -170,9 +171,8 @@ enum Command {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-fn now_tai() -> Inline<inlineencodings::NsTAIInterval> {
-    let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
-    (now, now).try_to_inline().expect("valid TAI interval")
+fn now_tai() -> Result<Inline<inlineencodings::NsTAIInterval>> {
+    clock::point_now()
 }
 
 fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
@@ -632,7 +632,7 @@ fn felt_fragment(
 }
 
 fn keep_felt(collection: &mut Collection<Pile>, felt: &Felt, note: Option<&str>) -> Result<()> {
-    let fragment = felt_fragment(felt, note, now_tai());
+    let fragment = felt_fragment(felt, note, now_tai()?);
     let id = fragment.root().expect("capture id");
     collection
         .commit(fragment)
@@ -690,7 +690,7 @@ fn latest_intent(space: &TribleSet, reader: &PileReader) -> Result<Option<(i128,
 fn cmd_intent(storage: BodyStorage<'_>, text: Option<&str>) -> Result<()> {
     match text {
         Some(t) => {
-            let fragment = intent_fragment(t, now_tai());
+            let fragment = intent_fragment(t, now_tai()?);
             let id = fragment.root().expect("intent id");
             storage.publish(fragment)?;
             println!("  intent {} set: {t}", &fmt_id(id)[..12]);
@@ -879,7 +879,7 @@ fn cmd_look(
     let pose_json = daemon_get(daemon, "/api/state/full")
         .map(|v| v.to_string())
         .unwrap_or_default();
-    let fragment = vision_capture_fragment(bytes, pose_json, note, w, h, now_tai());
+    let fragment = vision_capture_fragment(bytes, pose_json, note, w, h, now_tai()?);
     let cap_id = fragment.root().expect("capture has an id");
     storage.publish(fragment)?;
 
@@ -996,7 +996,7 @@ fn cmd_observe(daemon: &str, python: &str, frame: Option<&Path>, no_frame: bool)
         (Some(p), w, h)
     };
     let obs = serde_json::json!({
-        "t": format_time(interval_key(now_tai())),
+        "t": format_time(interval_key(now_tai()?)),
         "frame": frame_path.as_ref().map(|p| p.display().to_string()),
         "frame_size": [fw, fh],
         "state": state,

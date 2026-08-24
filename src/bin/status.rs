@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::clock;
 use faculties::legacy_hint::open_scope;
 use faculties::relations::{self, Head, SelectorOutcome};
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID;
 use faculties::status;
 use faculties::storage::{load_signer, open_pile_strict};
-use hifitime::Epoch;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
@@ -138,13 +138,6 @@ fn commit_status(
         .context("commit authored Status event")
 }
 
-fn now_interval() -> status::IntervalValue {
-    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_unix_seconds(0.0));
-    (now, now)
-        .try_to_inline()
-        .expect("current point time is inline")
-}
-
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
@@ -232,7 +225,7 @@ fn cmd_set(storage: StatusStorage<'_>, persona: Option<&str>, text: String) -> R
     let persona = persona.ok_or_else(|| {
         anyhow!("no persona — set $PERSONA or pass --persona <Relations label or exact id>")
     })?;
-    let (_, window) = store_status_at(storage, persona, text, now_interval())?;
+    let (_, window) = store_status_at(storage, persona, text, clock::point_now()?)?;
     println!("{} → {text}", fmt_id(window));
     Ok(())
 }
@@ -246,7 +239,7 @@ fn cmd_list(storage: StatusStorage<'_>) -> Result<()> {
             return Ok(());
         }
 
-        let now = status::point_timestamp(now_interval())?;
+        let now = status::point_timestamp(clock::point_now()?)?;
         let mut rows: Vec<(String, Id, String, String)> = latest
             .into_values()
             .map(|row| {
@@ -282,7 +275,7 @@ fn cmd_show(storage: StatusStorage<'_>, selector: String, limit: usize) -> Resul
             println!("- (no status set)");
             return Ok(());
         }
-        let now = status::point_timestamp(now_interval())?;
+        let now = status::point_timestamp(clock::point_now()?)?;
         for (index, ((at, _), row)) in rows.into_iter().take(limit).enumerate() {
             let text = status::read_text(&catalogs.reader, row.text)?;
             let age = format_age(now, at);
@@ -313,6 +306,7 @@ mod tests {
 
     use faculties::relations::ProfileInput;
     use faculties::storage::{ensure_team_of_one_write_authority, initialize_signer};
+    use hifitime::Epoch;
 
     use super::*;
 

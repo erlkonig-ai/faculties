@@ -103,11 +103,9 @@ fn format_time_marker(key: i128) -> String {
     format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}")
 }
 
-/// Current TAI time as a ns key, or 0 if the system clock is unavailable.
-fn now_key() -> i128 {
-    Epoch::now()
-        .map(|e| e.to_tai_duration().total_nanoseconds())
-        .unwrap_or(0)
+/// Current TAI time as a ns key, when the system clock is available.
+fn now_key() -> Option<i128> {
+    crate::clock::tai_nanoseconds_now().ok()
 }
 
 /// First 8 hex chars of an Id — compact label for pills / hover.
@@ -653,7 +651,7 @@ pub struct BranchTimeline {
     /// Pixels per minute of wall time.
     timeline_scale: f32,
     /// Tracks the first render so we can initialize `timeline_start` to
-    /// "now" before painting.
+    /// current time, or to the newest event when the clock is unavailable.
     first_render: bool,
     /// The most-recently-clicked event, if any. Hosts can read this to
     /// drive floating detail cards.
@@ -684,10 +682,6 @@ impl BranchTimeline {
     /// Render the timeline from immutable datasets resolved by stable key.
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, datasets: &WidgetContext<'_>) {
         let now = now_key();
-        if self.first_render {
-            self.timeline_start = now;
-            self.first_render = false;
-        }
 
         // Refresh if any keyed dataset appeared, disappeared, or changed.
         let revisions = source_revisions(&self.sources, datasets);
@@ -706,12 +700,27 @@ impl BranchTimeline {
             .unwrap_or_default();
         let sources = self.sources.clone();
         let viewport_height = self.viewport_height;
+        if self.first_render {
+            if let Some(anchor) = now.or_else(|| events.iter().map(|event| event.ts_ns).max()) {
+                self.timeline_start = anchor;
+                self.first_render = false;
+            }
+        }
 
         // Visible time span in the viewport — used for the right-
         // aligned scale chip in the legend row so the viewer always
         // knows what range they're looking at without manually
         // reading the tick marks.
         ctx.section("Activity", |ctx| {
+            if self.first_render {
+                ctx.ui_mut().label(
+                    egui::RichText::new("CURRENT TIME UNAVAILABLE · NO TIMELINE EVENTS")
+                        .monospace()
+                        .small()
+                        .weak(),
+                );
+                return;
+            }
             // Paint the viewport directly on the section ctx (no
             // grid wrapper) so it runs edge-to-edge inside the
             // section, matching the wiki graph's treatment. Legend
@@ -726,7 +735,7 @@ impl BranchTimeline {
         &mut self,
         ctx: &mut CardCtx<'_>,
         viewport_height: f32,
-        now: i128,
+        now: Option<i128>,
         events: &[Event],
         sources: &[TimelineSource],
     ) {
@@ -824,7 +833,9 @@ impl BranchTimeline {
             }
 
             if viewport_response.double_clicked() {
-                self.timeline_start = now;
+                if let Some(now) = now {
+                    self.timeline_start = now;
+                }
             }
         }
 
@@ -920,7 +931,7 @@ impl BranchTimeline {
         // NOW marker — a dashed horizontal guideline at current time
         // so the viewer can orient immediately. Only painted when
         // `now` falls inside the visible window.
-        if now >= view_end && now <= view_start {
+        if let Some(now) = now.filter(|now| *now >= view_end && *now <= view_start) {
             // egui only repaints on input events, which froze the
             // marker until the mouse moved. Schedule a repaint for
             // when the marker will have travelled ~1px at the current

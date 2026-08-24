@@ -12,13 +12,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use faculties::clock;
 use faculties::legacy_hint::open_scope;
 use faculties::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
-use hifitime::Epoch;
 use triblespace::core::collection::Collection;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
@@ -339,9 +339,8 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn now_observation() -> relations::ObservedAt {
-    let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
-    (now, now).try_to_inline().expect("current epoch is inline")
+fn now_observation() -> Result<relations::ObservedAt> {
+    clock::point_now()
 }
 
 fn resolve_person_anchor(
@@ -502,7 +501,7 @@ fn cmd_add(
     let person = id.unwrap_or_else(|| genid().id);
     let (mut fragment, profile_id, lifecycle_id) =
         relations::person_fragment(person, profile.into_profile(label))?;
-    fragment += relations::person_provenance_fragment(person, source, &[now_observation()])?;
+    fragment += relations::person_provenance_fragment(person, source, &[now_observation()?])?;
     storage.update(|_, _| Ok((Some(fragment), ())))?;
     println!("person: {}", fmt_id(person));
     println!("profile: {}", fmt_id(profile_id));
@@ -798,7 +797,7 @@ fn cmd_group_create(storage: RelationsStorage<'_>, name: String) -> Result<()> {
         }
         let group = genid().id;
         let (mut fragment, snapshot) = relations::group_create_fragment(group, name)?;
-        fragment += relations::group_provenance_fragment(group, &[now_observation()]);
+        fragment += relations::group_provenance_fragment(group, &[now_observation()?]);
         Ok((Some(fragment), (group, snapshot)))
     })?;
     println!("group: {}\nsnapshot: {}", fmt_id(group), fmt_id(snapshot));

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Faculty-authored chronology now fails closed on clock errors.** Clock reads
+  that timestamp collection facts or operational records pass through one
+  fallible shared capability. A failed read therefore aborts before a
+  collection commit, credential update, or transcript append instead of
+  becoming a signed 1970/TAI-zero observation. The affected read-only widgets
+  represent an unavailable current instant as unknown or omit its age marker;
+  source records with genuinely absent timestamps remain optional and
+  unchanged.
+
 - **`migrations plan-cutover` now recognizes an already-published native
   cutover.** Planning still derives the legacy projection from one frozen pile
   prefix, then deterministically replays each planned commit and authority

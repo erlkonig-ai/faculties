@@ -101,12 +101,22 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 
 fn epoch_to_chrono(e: Epoch) -> Option<DateTime<Utc>> {
     let secs = e.to_unix_seconds();
-    Utc.timestamp_opt(secs as i64, ((secs.fract() * 1e9) as u32).min(999_999_999))
-        .single()
+    if !secs.is_finite() {
+        return None;
+    }
+    let whole = secs.floor();
+    if whole < i64::MIN as f64 || whole > i64::MAX as f64 {
+        return None;
+    }
+    let nanos = ((secs - whole) * 1e9).round().clamp(0.0, 999_999_999.0) as u32;
+    Utc.timestamp_opt(whole as i64, nanos).single()
 }
 
-fn current_week_monday() -> NaiveDate {
-    let today = Utc::now().date_naive();
+fn current_utc() -> Option<DateTime<Utc>> {
+    crate::clock::now().ok().and_then(epoch_to_chrono)
+}
+
+fn week_monday(today: NaiveDate) -> NaiveDate {
     today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64)
 }
 
@@ -451,8 +461,9 @@ impl PlannerViewer {
             };
 
             ctx.grid(|g| {
-                let monday = current_week_monday();
-                let today = Utc::now().date_naive();
+                let now = current_utc();
+                let today = now.as_ref().map(|now| now.date_naive());
+                let monday = today.map(week_monday);
 
                 for diagnostic in &live.diagnostics {
                     g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
@@ -461,12 +472,15 @@ impl PlannerViewer {
                 // Header line — week-of label + event count.
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
-                    let label = format!(
-                        "WEEK OF {} — {} EVENT{}",
-                        monday.format("%-d %b %Y").to_string().to_uppercase(),
-                        live.events.len(),
-                        if live.events.len() == 1 { "" } else { "S" },
-                    );
+                    let count = live.events.len();
+                    let plural = if count == 1 { "" } else { "S" };
+                    let label = match monday {
+                        Some(monday) => format!(
+                            "WEEK OF {} — {count} EVENT{plural}",
+                            monday.format("%-d %b %Y").to_string().to_uppercase(),
+                        ),
+                        None => format!("CURRENT WEEK UNAVAILABLE — {count} EVENT{plural}"),
+                    };
                     ui.label(
                         egui::RichText::new(label)
                             .monospace()
@@ -477,9 +491,11 @@ impl PlannerViewer {
                 });
 
                 // Week grid card.
-                g.full(|ctx| {
-                    render_week_grid(ctx.ui_mut(), live, monday, today);
-                });
+                if let (Some(monday), Some(now)) = (monday, now.as_ref()) {
+                    g.full(|ctx| {
+                        render_week_grid(ctx.ui_mut(), live, monday, now);
+                    });
+                }
 
                 // Agenda list.
                 if live.events.is_empty() {
@@ -518,7 +534,7 @@ impl PlannerViewer {
                             format_day_section(*date),
                             if n == 1 { "" } else { "S" },
                         );
-                        let is_today = *date == today;
+                        let is_today = today.is_some_and(|today| *date == today);
                         g.full(|ctx| {
                             render_day_section_header(ctx.ui_mut(), &header, is_today);
                         });
@@ -543,7 +559,8 @@ const HOUR_END: u32 = 22;
 const PX_PER_HOUR: f32 = 18.0;
 const HOUR_LABEL_WIDTH: f32 = 36.0;
 
-fn render_week_grid(ui: &mut egui::Ui, live: &PlannerLive, monday: NaiveDate, today: NaiveDate) {
+fn render_week_grid(ui: &mut egui::Ui, live: &PlannerLive, monday: NaiveDate, now: &DateTime<Utc>) {
+    let today = now.date_naive();
     let width = ui.available_width();
     let hours_visible = (HOUR_END - HOUR_START) as f32;
     let grid_height = DAY_HEADER_HEIGHT + ALL_DAY_HEIGHT + hours_visible * PX_PER_HOUR;
@@ -675,7 +692,6 @@ fn render_week_grid(ui: &mut egui::Ui, live: &PlannerLive, monday: NaiveDate, to
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(60));
 
-        let now = Utc::now();
         let now_hour_f = now.hour() as f32 + now.minute() as f32 / 60.0;
         if now_hour_f >= HOUR_START as f32 && now_hour_f <= HOUR_END as f32 {
             let day_index = (today - monday).num_days() as u32;

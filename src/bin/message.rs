@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::clock;
 use faculties::legacy_hint::open_scope;
 use faculties::message::{self, IntervalValue, MessageRow};
 use faculties::relations::{self, IdentityComponents};
 use faculties::schemas::message::DEFAULT_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
-use hifitime::Epoch;
 use triblespace::core::collection::Collection;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
@@ -170,16 +170,6 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
     }
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-fn epoch_interval(epoch: Epoch) -> IntervalValue {
-    (epoch, epoch)
-        .try_to_inline()
-        .expect("a point in time is a valid interval")
-}
-
 fn interval_key(interval: IntervalValue) -> i128 {
     let (lower, _): (i128, i128) = interval
         .try_from_inline()
@@ -250,7 +240,7 @@ fn cmd_send(storage: MessageStorage<'_>, text: String, from: String, to: String)
             let recipient =
                 message::resolve_recipient(reader, relation_facts, &to)?.require_unique(&to)?;
             let (fragment, message_id) =
-                message::message_fragment(from_id, &recipient, &text, epoch_interval(now_epoch()));
+                message::message_fragment(from_id, &recipient, &text, clock::point_now()?);
             Ok((Some(fragment), (message_id, from_id, recipient.anchor())))
         })?;
     println!(
@@ -284,7 +274,7 @@ fn cmd_ack(storage: MessageStorage<'_>, id: String, by: String) -> Result<()> {
                 return Ok((None, (message_id, reader_id, true)));
             }
             let (fragment, _) =
-                message::read_fragment(message_id, reader_id, Some(epoch_interval(now_epoch())));
+                message::read_fragment(message_id, reader_id, Some(clock::point_now()?));
             Ok((Some(fragment), (message_id, reader_id, false)))
         },
     )?;
@@ -319,7 +309,7 @@ fn cmd_ack_all(storage: MessageStorage<'_>, by: String, from: Option<String>) ->
                 .transpose()?;
             let identities = IdentityComponents::from_facts(relation_facts)?;
             let reads = message::load_read_rows(message_facts)?;
-            let observed_at = epoch_interval(now_epoch());
+            let observed_at = clock::point_now()?;
             let mut fragment = Fragment::empty();
             let mut count = 0usize;
             for row in message::load_message_rows(message_facts)? {
@@ -363,7 +353,7 @@ fn cmd_list(storage: MessageStorage<'_>, reader: String, unread: bool, limit: us
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        let now = interval_key(epoch_interval(now_epoch()));
+        let now = interval_key(clock::point_now()?);
         let mut shown = 0usize;
         for row in messages {
             let incoming = message::is_inbox_message(&row, reader_id, relation_facts, &identities)?;

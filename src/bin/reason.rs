@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser};
-use faculties::cognition;
+use faculties::{clock, cognition};
+#[cfg(test)]
 use hifitime::Epoch;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -39,10 +40,7 @@ struct Cli {
     command: Vec<String>,
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
+#[cfg(test)]
 fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
     (epoch, epoch).try_to_inline().unwrap()
 }
@@ -107,7 +105,7 @@ fn append_reason(
         worker_id,
         text,
         command_text,
-        epoch_interval(now_epoch()),
+        clock::point_now()?,
     )
     .map(|(event, _)| event)
 }
@@ -177,7 +175,7 @@ fn main() -> Result<()> {
     }
 
     let command_text = render_command(&cli.command);
-    let created_at = epoch_interval(now_epoch());
+    let created_at = clock::point_now()?;
     let (reason_id, reason_event) =
         described_reason_fragment(turn_id, worker_id, &text, None, created_at);
     let (action_event_id, action_event) = described_reason_fragment(

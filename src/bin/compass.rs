@@ -6,7 +6,7 @@ use faculties::schemas::compass::{
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
-use faculties::{compass, relations};
+use faculties::{clock, compass, relations};
 use hifitime::Epoch;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -124,14 +124,6 @@ enum Command {
 /// Query helpers that operate directly on the checked-out TribleSet + workspace.
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-fn epoch_interval(epoch: Epoch) -> IntervalValue {
-    (epoch, epoch).try_to_inline().unwrap()
-}
 
 fn interval_key(interval: IntervalValue) -> i128 {
     let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
@@ -657,7 +649,7 @@ fn cmd_add(
             None => None,
         };
         let task_ref = genid().id;
-        let now = epoch_interval(now_epoch());
+        let now = clock::point_now()?;
         let mut change = compass::kind_catalog_fragment();
         change += compass::goal_fragment(task_ref, title, tags, parent_id, now)?;
         change += compass::status_fragment(task_ref, status, by_id, now)?;
@@ -715,7 +707,7 @@ fn cmd_move(
     let resolved = storage.update(persona, |space, _reader, by_id| {
         let task_id = resolve_task_id(&id, space)?;
         let mut change = compass::kind_catalog_fragment();
-        change += compass::status_fragment(task_id, status, by_id, epoch_interval(now_epoch()))?;
+        change += compass::status_fragment(task_id, status, by_id, clock::point_now()?)?;
         Ok((Some(change), task_id))
     })?;
     println!("Moved goal {:x} to {}", resolved, rendered_status);
@@ -748,7 +740,7 @@ fn cmd_note(
             .iter()
             .map(|input| resolve_note_id(input, space))
             .collect::<Result<_>>()?;
-        let now = epoch_interval(now_epoch());
+        let now = clock::point_now()?;
         let note_id = genid().id;
         let mut change = compass::kind_catalog_fragment();
         change += compass::note_fragment(
@@ -943,8 +935,7 @@ fn cmd_prioritize(
         }
 
         let mut change = compass::kind_catalog_fragment();
-        change +=
-            compass::priority_fragment(higher_id, lower_id, true, epoch_interval(now_epoch()));
+        change += compass::priority_fragment(higher_id, lower_id, true, clock::point_now()?);
         Ok((
             Some(change),
             (
@@ -984,8 +975,7 @@ fn cmd_deprioritize(
         }
 
         let mut change = compass::kind_catalog_fragment();
-        change +=
-            compass::priority_fragment(higher_id, lower_id, false, epoch_interval(now_epoch()));
+        change += compass::priority_fragment(higher_id, lower_id, false, clock::point_now()?);
         Ok((
             Some(change),
             (

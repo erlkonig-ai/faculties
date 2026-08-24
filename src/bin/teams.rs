@@ -4,7 +4,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration as StdDuration;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
@@ -26,6 +25,7 @@ use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
+use faculties::clock;
 use faculties::files as file_capability;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::archive::{archive, RawBytes};
@@ -434,7 +434,13 @@ impl TeamsSession<'_> {
         Ok(())
     }
 
-    fn add_secret(&mut self, vault: Id, name: &str, plaintext: &[u8]) -> Result<Id> {
+    fn add_secret(
+        &mut self,
+        vault: Id,
+        name: &str,
+        plaintext: &[u8],
+        observed_at: Inline<NsTAIInterval>,
+    ) -> Result<Id> {
         let location = self
             .secrets
             .location(vault)
@@ -447,7 +453,7 @@ impl TeamsSession<'_> {
             self.secrets.snapshot(),
             name,
             plaintext,
-            epoch_interval(now_epoch()),
+            observed_at,
         )
         .with_context(|| format!("publish Teams credential in vault {vault}"))?;
         self.refresh_secrets()?;
@@ -1061,7 +1067,8 @@ fn get_app_token(
     session: &TeamsSession<'_>,
 ) -> Result<(String, AppConfig)> {
     let app_config = app_config(config, session)?;
-    let now_key = interval_key(epoch_interval(now_epoch()));
+    let now = clock::now()?;
+    let now_key = interval_key(clock::point(now)?);
 
     if let Some(cache) = app_token_cache {
         if cache.expires_at_key > now_key + 30 * 1_000_000_000 {
@@ -1074,7 +1081,7 @@ fn get_app_token(
         &app_config.client_id,
         &app_config.client_secret,
     )?;
-    let expires_at = epoch_interval(epoch_after_seconds(now_epoch(), token.expires_in));
+    let expires_at = clock::point(epoch_after_seconds(clock::now()?, token.expires_in))?;
     let expires_at_key = interval_key(expires_at);
     let access_token = token.access_token;
     *app_token_cache = Some(AppTokenCache {
@@ -1125,7 +1132,7 @@ fn get_delegated_token(
     let plaintext = open_exact_secret(session, secret)?;
     let bundle: DelegatedTokenBundle =
         serde_json::from_slice(&plaintext).context("decode Teams delegated-token bundle")?;
-    if bundle.expires_at_unix > now_epoch_secs() + 30 {
+    if bundle.expires_at_unix > now_epoch_secs()? + 30 {
         return Ok(bundle.access_token);
     }
     let refresh = bundle.refresh_token.as_deref().ok_or_else(|| {
@@ -1142,7 +1149,7 @@ fn get_delegated_token(
         refresh_token: refreshed
             .refresh_token
             .or_else(|| bundle.refresh_token.clone()),
-        expires_at_unix: now_epoch_secs() + refreshed.expires_in,
+        expires_at_unix: now_epoch_secs()? + refreshed.expires_in,
         token_type: refreshed.token_type.or(bundle.token_type),
         scope: refreshed
             .scope
@@ -1158,7 +1165,7 @@ fn get_delegated_token(
         .context("read delegated-token secret name")?;
     let encoded =
         serde_json::to_vec(&next_bundle).context("encode refreshed Teams token bundle")?;
-    let next_secret = session.add_secret(vault, &name, &encoded)?;
+    let next_secret = session.add_secret(vault, &name, &encoded, clock::point_now()?)?;
     let client_repair = config
         .client_secret_version
         .map(|id| format!(" --client-secret-version {id:x}"))
@@ -1222,11 +1229,8 @@ fn oauth_error_kind(body: &str) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-fn now_epoch_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs() as i64
+fn now_epoch_secs() -> Result<i64> {
+    Ok(clock::now()?.to_unix_seconds() as i64)
 }
 
 fn load_context(
@@ -1284,7 +1288,7 @@ fn store_context(
     }
     fragment += teams_core::context_fragment(
         source_id,
-        epoch_interval(now_epoch()),
+        clock::point_now()?,
         supersedes,
         presentation_name,
         presentation_boundary,
@@ -1608,7 +1612,7 @@ fn login_device_code_collection(
     }
 
     let interval = device.interval.unwrap_or(5).max(1) as u64;
-    let deadline = now_epoch_secs() + device.expires_in;
+    let deadline = now_epoch_secs()? + device.expires_in;
     let token = poll_device_token(tenant, client_id, &device.device_code, interval, deadline)?;
     let user_id = fetch_me_id(&token.access_token)?;
     let source_tenant =
@@ -1638,15 +1642,21 @@ fn login_device_code_collection(
     let bundle = DelegatedTokenBundle {
         access_token: token.access_token,
         refresh_token: token.refresh_token,
-        expires_at_unix: now_epoch_secs() + token.expires_in,
+        expires_at_unix: now_epoch_secs()? + token.expires_in,
         token_type: token.token_type,
         scope: Some(canonical_scopes.clone()),
     };
+    let encoded_bundle =
+        serde_json::to_vec(&bundle).context("encode Teams delegated-token bundle")?;
+    // Read chronology before the first durable append so a clock failure
+    // cannot leave a partially published login.
+    let observed_at = clock::point_now()?;
     let client_version = if let Some(client_secret) = client_secret {
         let client_version = session.add_secret(
             vault,
             &teams_secret_name(source, "client-secret"),
             client_secret.as_bytes(),
+            observed_at,
         )?;
         eprintln!(
             "Published client-secret version {client_version:x} in vault {vault:x}; if later login publication is interrupted, repair with `teams auth set --tenant {source_tenant} --client-id {client_id} --user-id {user_id} --scopes @SCOPES --client-secret-version {client_version:x}`."
@@ -1656,12 +1666,11 @@ fn login_device_code_collection(
         explicit_client_version.or(inherited_client_version)
     };
 
-    let encoded_bundle =
-        serde_json::to_vec(&bundle).context("encode Teams delegated-token bundle")?;
     let token_version = session.add_secret(
         vault,
         &teams_secret_name(source, "delegated-token"),
         &encoded_bundle,
+        observed_at,
     )?;
     let client_repair = client_version
         .map(|id| format!(" --client-secret-version {id:x}"))
@@ -1742,7 +1751,7 @@ fn poll_device_token(
     let mut interval = interval_secs;
 
     loop {
-        if now_epoch_secs() >= deadline {
+        if now_epoch_secs()? >= deadline {
             bail!("device code expired before authorization completed");
         }
 
@@ -3566,10 +3575,6 @@ fn infer_extension(media_type: Option<&str>) -> Option<&'static str> {
     }
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
 fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
     (epoch, epoch).try_to_inline().unwrap()
 }
@@ -3852,7 +3857,7 @@ mod tests {
             &signer,
             vault,
             "teams-test",
-            epoch_interval(now_epoch()),
+            clock::point_now().unwrap(),
         )
         .unwrap();
         let discovery = secrets_vaults::discover_local_vaults(&mut pile, &signer).unwrap();
@@ -3864,7 +3869,7 @@ mod tests {
             discovery.snapshot(),
             "teams/client-secret/test",
             b"distinct-test-client-secret",
-            epoch_interval(now_epoch()),
+            clock::point_now().unwrap(),
         )
         .unwrap()
         .0;
@@ -3872,7 +3877,7 @@ mod tests {
         let token_bundle = DelegatedTokenBundle {
             access_token: "distinct-test-access-token".to_owned(),
             refresh_token: Some("distinct-test-refresh-token".to_owned()),
-            expires_at_unix: now_epoch_secs() + 3600,
+            expires_at_unix: now_epoch_secs().unwrap() + 3600,
             token_type: Some("Bearer".to_owned()),
             scope: Some("Chat.ReadWrite offline_access".to_owned()),
         };
@@ -3884,7 +3889,7 @@ mod tests {
             discovery.snapshot(),
             "teams/delegated-token/test",
             &serde_json::to_vec(&token_bundle).unwrap(),
-            epoch_interval(now_epoch()),
+            clock::point_now().unwrap(),
         )
         .unwrap()
         .0;
@@ -3950,7 +3955,9 @@ mod tests {
         fixture
             .storage()
             .with_session(|session| {
-                let secret = session.add_secret(vault, "teams/session-test", b"exact-vault")?;
+                let observed_at = clock::point_now()?;
+                let secret =
+                    session.add_secret(vault, "teams/session-test", b"exact-vault", observed_at)?;
                 assert_eq!(session.secrets.snapshot().lookup(secret).unwrap().0, vault);
                 assert_eq!(
                     session.secrets.snapshot().open(secret, &session.signer)?,
@@ -3958,7 +3965,7 @@ mod tests {
                 );
                 let missing = Id::new([0xE6; 16]).unwrap();
                 let error = session
-                    .add_secret(missing, "teams/session-test", b"wrong-vault")
+                    .add_secret(missing, "teams/session-test", b"wrong-vault", observed_at)
                     .unwrap_err();
                 assert!(error.to_string().contains("not ready for this node"));
                 Ok(())

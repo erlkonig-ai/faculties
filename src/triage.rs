@@ -52,7 +52,9 @@ pub struct ScanSources<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ScanOptions {
-    pub now: i128,
+    /// Current TAI coordinate. Without it, in-progress attempts remain
+    /// running and no stale classification is inferred.
+    pub now: Option<i128>,
     pub stale_after_ns: i128,
     pub recent_attempts: usize,
     pub loop_min: usize,
@@ -145,6 +147,8 @@ pub struct QueueCounts {
     pub pending: usize,
     pub running: usize,
     pub stale: usize,
+    /// In-progress requests whose running/stale state needs a current clock.
+    pub age_unknown: usize,
     pub done: usize,
     /// Attempt slots with competing in-progress or result event identities.
     pub forked: usize,
@@ -302,11 +306,8 @@ pub struct ScanReport {
     pub suggestions: Vec<String>,
 }
 
-pub fn now_tai_ns() -> i128 {
-    Epoch::now()
-        .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-        .to_tai_duration()
-        .total_nanoseconds()
+pub fn now_tai_ns() -> Result<i128> {
+    crate::clock::tai_nanoseconds_now()
 }
 
 pub fn interval_key(interval: Interval) -> i128 {
@@ -675,7 +676,7 @@ where
 
 pub fn exec_queue_counts(
     state: &ExecState,
-    now: i128,
+    now: Option<i128>,
     stale_after_ns: i128,
 ) -> Result<QueueProjection> {
     queue_counts(
@@ -696,7 +697,7 @@ pub fn exec_queue_counts(
 
 pub fn model_queue_counts(
     state: &ModelChatState,
-    now: i128,
+    now: Option<i128>,
     stale_after_ns: i128,
 ) -> Result<QueueProjection> {
     queue_counts(
@@ -725,7 +726,7 @@ fn queue_counts(
     requests: impl IntoIterator<Item = Id>,
     in_progress: impl IntoIterator<Item = (Id, Id, Option<u64>, i128)>,
     results: impl IntoIterator<Item = (Id, Id, Option<u64>)>,
-    now: i128,
+    now: Option<i128>,
     stale_after_ns: i128,
     label: &str,
 ) -> Result<QueueProjection> {
@@ -827,10 +828,12 @@ fn queue_counts(
         } else if evidence.results.len() == 1 {
             counts.done += 1;
         } else if let Some((_, started_at)) = evidence.in_progress.first() {
-            if now.saturating_sub(*started_at) >= stale_after_ns.max(0) {
-                counts.stale += 1;
-            } else {
-                counts.running += 1;
+            match now {
+                Some(now) if now.saturating_sub(*started_at) >= stale_after_ns.max(0) => {
+                    counts.stale += 1;
+                }
+                Some(_) => counts.running += 1,
+                None => counts.age_unknown += 1,
             }
         } else {
             counts.pending += 1;
@@ -840,6 +843,7 @@ fn queue_counts(
         counts.pending
             + counts.running
             + counts.stale
+            + counts.age_unknown
             + counts.done
             + counts.forked
             + counts.invalid,
@@ -1140,6 +1144,7 @@ fn scan_suggestions(
     if model_queue.pending > 0
         && model_queue.running == 0
         && model_queue.stale == 0
+        && model_queue.age_unknown == 0
         && model_queue.forked == 0
     {
         suggestions
@@ -1148,6 +1153,7 @@ fn scan_suggestions(
     if exec_queue.pending > 0
         && exec_queue.running == 0
         && exec_queue.stale == 0
+        && exec_queue.age_unknown == 0
         && exec_queue.forked == 0
     {
         suggestions
@@ -1190,6 +1196,8 @@ fn scan_suggestions(
         && model_queue.running == 0
         && exec_queue.stale == 0
         && model_queue.stale == 0
+        && exec_queue.age_unknown == 0
+        && model_queue.age_unknown == 0
         && exec_queue.forked == 0
         && model_queue.forked == 0
         && exec_queue.invalid == 0
@@ -1208,7 +1216,7 @@ impl ScanReport {
     /// Re-derive all wall-clock-dependent request states without reprojecting
     /// immutable collection data. Widgets call this on every render so an
     /// unchanged start event can cross the Running→Stale boundary.
-    pub fn refresh_time(&mut self, now: i128, stale_after_ns: i128) -> Result<()> {
+    pub fn refresh_time(&mut self, now: Option<i128>, stale_after_ns: i128) -> Result<()> {
         let exec = exec_queue_counts(&self.exec_state, now, stale_after_ns)?;
         let model = model_queue_counts(&self.model_state, now, stale_after_ns)?;
         let mut diagnostics = exec.diagnostics;
@@ -1343,6 +1351,7 @@ mod tests {
             counts.pending
                 + counts.running
                 + counts.stale
+                + counts.age_unknown
                 + counts.done
                 + counts.forked
                 + counts.invalid,
@@ -1361,7 +1370,7 @@ mod tests {
         state.in_progress.push(start(12, id(3), None, 100));
         state.results.push(result(13, id(4), None, 900));
 
-        let first = exec_queue_counts(&state, 1_000, 100).unwrap();
+        let first = exec_queue_counts(&state, Some(1_000), 100).unwrap();
         assert_eq!(
             first.counts,
             QueueCounts {
@@ -1369,6 +1378,7 @@ mod tests {
                 pending: 1,
                 running: 1,
                 stale: 1,
+                age_unknown: 0,
                 done: 1,
                 forked: 0,
                 invalid: 0,
@@ -1376,10 +1386,16 @@ mod tests {
         );
         assert_partition(&first.counts);
 
-        let later = exec_queue_counts(&state, 1_050, 100).unwrap();
+        let later = exec_queue_counts(&state, Some(1_050), 100).unwrap();
         assert_eq!(later.counts.running, 0);
         assert_eq!(later.counts.stale, 2);
         assert_partition(&later.counts);
+
+        let without_clock = exec_queue_counts(&state, None, 100).unwrap();
+        assert_eq!(without_clock.counts.running, 0);
+        assert_eq!(without_clock.counts.stale, 0);
+        assert_eq!(without_clock.counts.age_unknown, 2);
+        assert_partition(&without_clock.counts);
     }
 
     #[test]
@@ -1390,7 +1406,7 @@ mod tests {
         state.results.push(result(11, request.id, Some(1), 100));
         state.in_progress.push(start(12, request.id, Some(2), 190));
 
-        let queue = exec_queue_counts(&state, 200, 100).unwrap();
+        let queue = exec_queue_counts(&state, Some(200), 100).unwrap();
         assert_eq!(queue.counts.running, 1);
         assert_eq!(queue.counts.done, 0);
         assert_eq!(collect_exec_attempts(&state, 10).len(), 1);
@@ -1423,7 +1439,7 @@ mod tests {
             });
         }
 
-        let queue = model_queue_counts(&state, 20, 100).unwrap();
+        let queue = model_queue_counts(&state, Some(20), 100).unwrap();
         assert_eq!(queue.counts.done, 2);
         assert_partition(&queue.counts);
     }
@@ -1453,7 +1469,7 @@ mod tests {
             .results
             .push(result(15, historical_fork.id, Some(2), 50));
 
-        let queue = exec_queue_counts(&state, 100, 1_000).unwrap();
+        let queue = exec_queue_counts(&state, Some(100), 1_000).unwrap();
         assert_eq!(queue.counts.forked, 1);
         assert_eq!(queue.counts.done, 1);
         assert_eq!(queue.forks.len(), 2);
@@ -1477,7 +1493,7 @@ mod tests {
         state.results.push(result(12, request.id, Some(1), 20));
         state.results.push(result(13, id(99), Some(1), 30));
 
-        let queue = exec_queue_counts(&state, 100, 10).unwrap();
+        let queue = exec_queue_counts(&state, Some(100), 10).unwrap();
         assert_eq!(queue.counts.invalid, 1);
         assert_eq!(queue.counts.requests, 1);
         assert_eq!(queue.diagnostics.len(), 2);

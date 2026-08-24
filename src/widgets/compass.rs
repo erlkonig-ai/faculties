@@ -49,14 +49,12 @@ fn fmt_id_full(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn now_tai_ns() -> i128 {
-    hifitime::Epoch::now()
-        .map(|e| e.to_tai_duration().total_nanoseconds())
-        .unwrap_or(0)
+fn now_tai_ns() -> Option<i128> {
+    crate::clock::tai_nanoseconds_now().ok()
 }
 
-fn format_age(now_key: i128, maybe_key: Option<i128>) -> String {
-    let Some(key) = maybe_key else {
+fn format_age(now_key: Option<i128>, maybe_key: Option<i128>) -> String {
+    let (Some(now_key), Some(key)) = (now_key, maybe_key) else {
         return "-".to_string();
     };
     let delta_ns = now_key.saturating_sub(key);

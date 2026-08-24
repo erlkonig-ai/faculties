@@ -21,8 +21,6 @@
 //! panel.render(ctx, status_view, relations_view);
 //! ```
 
-use hifitime::Epoch;
-
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
@@ -157,13 +155,14 @@ fn id_hex(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn now_tai_ns() -> i128 {
-    Epoch::now()
-        .map(|e| e.to_tai_duration().total_nanoseconds())
-        .unwrap_or(0)
+fn now_tai_ns() -> Option<i128> {
+    crate::clock::tai_nanoseconds_now().ok()
 }
 
-fn age_label(now: i128, at: i128) -> String {
+fn age_label(now: Option<i128>, at: i128) -> String {
+    let Some(now) = now else {
+        return "unknown".to_owned();
+    };
     let secs = ((now - at) / 1_000_000_000).max(0);
     if secs < 60 {
         format!("{secs}s")
@@ -291,7 +290,7 @@ impl StatusViewer {
 /// One window's current status as a low-chrome roster row:
 /// `[dot] NAME            <age>` on top, the status text wrapping
 /// beneath. Matches orient's Window status section — a glance, not a card.
-fn render_status_row(ui: &mut egui::Ui, w: &WindowStatus, now: i128) {
+fn render_status_row(ui: &mut egui::Ui, w: &WindowStatus, now: Option<i128>) {
     let accent = window_color(w.window);
     let muted = color_muted(ui);
 

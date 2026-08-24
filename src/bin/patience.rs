@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
-use faculties::cognition;
+use faculties::{clock, cognition};
+#[cfg(test)]
 use hifitime::Epoch;
 use humantime::parse_duration;
 use std::path::{Path, PathBuf};
@@ -37,10 +38,7 @@ struct Cli {
     command: Vec<String>,
 }
 
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
+#[cfg(test)]
 fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
     (epoch, epoch).try_to_inline().unwrap()
 }
@@ -119,7 +117,7 @@ fn append_timeout_extension(
         request_id,
         worker_id,
         timeout_ms,
-        epoch_interval(now_epoch()),
+        clock::point_now()?,
     )
     .map(|(event, _)| event)
 }

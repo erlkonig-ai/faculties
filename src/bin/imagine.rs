@@ -145,10 +145,7 @@ fn main() -> anyhow::Result<()> {
     let out = match &cli.out {
         Some(p) => PathBuf::from(p),
         None => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let ts = faculties::clock::tai_nanoseconds_now()?;
             PathBuf::from(format!("/tmp/imagine/{ts}_{}.png", cli.seed))
         }
     };

@@ -41,15 +41,16 @@ fn id_hex(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn now_tai_ns() -> i128 {
-    hifitime::Epoch::now()
-        .map(|e| e.to_tai_duration().total_nanoseconds())
-        .unwrap_or(0)
+fn now_tai_ns() -> Option<i128> {
+    crate::clock::tai_nanoseconds_now().ok()
 }
 
-fn format_age(now_key: i128, maybe_key: Option<i128>) -> String {
+fn format_age(now_key: Option<i128>, maybe_key: Option<i128>) -> String {
     let Some(key) = maybe_key else {
         return "-".to_string();
+    };
+    let Some(now_key) = now_key else {
+        return "unknown".to_string();
     };
     let delta_ns = now_key.saturating_sub(key);
     let delta_s = (delta_ns / 1_000_000_000).max(0) as i64;
@@ -64,7 +65,7 @@ fn format_age(now_key: i128, maybe_key: Option<i128>) -> String {
     }
 }
 
-fn format_age_key(now_key: i128, past_key: i128) -> String {
+fn format_age_key(now_key: Option<i128>, past_key: i128) -> String {
     format_age(now_key, Some(past_key))
 }
 
@@ -734,7 +735,7 @@ fn render_badge(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
 fn render_message(
     ui: &mut egui::Ui,
     msg: &MessageRow,
-    now: i128,
+    now: Option<i128>,
     names: &HashMap<Id, String>,
     // Lowercased search needle ("" = no search).
     search_needle: &str,

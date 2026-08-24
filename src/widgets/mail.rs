@@ -851,7 +851,7 @@ fn body_format(ui: &egui::Ui, color: egui::Color32) -> egui::TextFormat {
 
 fn format_relative_age(ts: Option<i128>) -> Option<String> {
     let ts = ts?;
-    let now = now_tai_ns();
+    let now = crate::clock::tai_nanoseconds_now().ok()?;
     let secs = ((now - ts) / 1_000_000_000).max(0) as i64;
     Some(format_age_secs(secs))
 }
@@ -870,12 +870,6 @@ fn format_age_secs(secs: i64) -> String {
     } else {
         format!("{}y", secs / (86400 * 365))
     }
-}
-
-fn now_tai_ns() -> i128 {
-    use hifitime::Epoch;
-    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_tai_seconds(0.0));
-    now.to_tai_duration().total_nanoseconds()
 }
 
 #[cfg(test)]

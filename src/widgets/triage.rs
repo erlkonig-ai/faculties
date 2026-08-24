@@ -196,7 +196,7 @@ impl TriageLive {
                 messages: source_view(messages),
             },
             ScanOptions {
-                now: triage_model::now_tai_ns(),
+                now: triage_model::now_tai_ns().ok(),
                 stale_after_ns: STALE_SECONDS as i128 * 1_000_000_000,
                 recent_attempts: MAX_EVENTS,
                 loop_min: 3,
@@ -342,7 +342,7 @@ impl TriageLive {
         }
     }
 
-    fn refresh_time(&mut self, now: i128) {
+    fn refresh_time(&mut self, now: Option<i128>) {
         let Some(report) = self.report.as_mut() else {
             return;
         };
@@ -390,9 +390,12 @@ fn format_time(at: Option<i128>) -> String {
     format!("{hour:02}:{minute:02}:{second:02}")
 }
 
-fn age_label(now: i128, at: Option<i128>) -> String {
+fn age_label(now: Option<i128>, at: Option<i128>) -> String {
     let Some(at) = at else {
         return "TIME UNKNOWN".to_owned();
+    };
+    let Some(now) = now else {
+        return "AGE UNKNOWN".to_owned();
     };
     let secs = (now.saturating_sub(at) / 1_000_000_000).max(0) as i64;
     if secs < 60 {
@@ -452,7 +455,7 @@ impl TriageViewer {
                 cognition, headspace, secrets, relations, messages,
             ));
         }
-        let now = triage_model::now_tai_ns();
+        let now = triage_model::now_tai_ns().ok();
         if let Some(live) = self.live.as_mut() {
             live.refresh_time(now);
         }
@@ -784,6 +787,9 @@ fn render_queue_row(
         render_count(ui, "REQ", counts.requests, text, muted);
         render_count(ui, "PEND", counts.pending, text, muted);
         render_count(ui, "RUN", counts.running, text, muted);
+        if counts.age_unknown > 0 {
+            render_count_colored(ui, "AGE?", counts.age_unknown, color_reason());
+        }
         if counts.stale > 0 {
             // Stale items are surfaced in error red so they catch
             // the eye — the user probably wants to triage them.
@@ -839,7 +845,7 @@ fn render_count_colored(ui: &mut egui::Ui, label: &str, n: usize, color: egui::C
 
 // ── Event card ──────────────────────────────────────────────────────
 
-fn render_event_card(ui: &mut egui::Ui, ev: &EventRow, now: i128) {
+fn render_event_card(ui: &mut egui::Ui, ev: &EventRow, now: Option<i128>) {
     let bubble_fill = ui.visuals().window_fill;
     let accent = if ev.is_error {
         color_error()

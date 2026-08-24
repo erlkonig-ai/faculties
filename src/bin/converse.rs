@@ -86,10 +86,11 @@
 use std::io::{Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use faculties::clock;
 
 /// Default system context for the brain turn. Deliberately short: the pile's
 /// configured system_prompt is the SHELL-LOOP prompt (one command per turn)
@@ -356,10 +357,11 @@ fn handle_line(
 
     if let Some(reason) = drop_reason {
         println!("[heard ] {text:?} ({dur_s:.2}s) → DROPPED: {reason}");
+        let recorded_at = now_ms()?;
         log_turn(
             &args.out,
             &serde_json::json!({
-                "utc_ms": now_ms(), "utc_ms_heard": utc_ms, "heard": text,
+                "utc_ms": recorded_at, "utc_ms_heard": utc_ms, "heard": text,
                 "dur_s": dur_s, "dropped": reason,
             }),
         );
@@ -399,7 +401,7 @@ fn handle_line(
     println!("[reply ] ({brain_used}, {brain_s:.2}s) {reply}");
 
     // --- Mouth (half-duplex: hold the pause file across the whole window) ---
-    let speak_start = now_ms();
+    let speak_start = now_ms()?;
     let t = Instant::now();
     let _guard = PauseGuard::hold(pause_path);
     let spoke = match args.speak {
@@ -427,7 +429,7 @@ fn handle_line(
         }
     };
     drop(_guard);
-    let speak_end = now_ms();
+    let speak_end = now_ms()?;
     *speak_window = Some((speak_start, speak_end));
     let speak_s = t.elapsed().as_secs_f64();
 
@@ -491,11 +493,8 @@ fn log_turn(path: &Path, record: &serde_json::Value) {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+fn now_ms() -> Result<u64> {
+    Ok(clock::now()?.to_unix_milliseconds() as u64)
 }
 
 /// Holds the half-duplex pause file for a scope; removal is the Drop so the

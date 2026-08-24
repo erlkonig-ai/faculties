@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use hifitime::{Duration as HifiDuration, Epoch};
 
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
@@ -164,7 +165,8 @@ fn load_source_messages(dataset: DatasetView<'_>, source: Id) -> anyhow::Result<
                 .created_at
                 .or(message.modified_at)
                 .map(teams::interval_key)
-                .map(ns_to_chrono);
+                .map(ns_to_chrono)
+                .transpose()?;
             Ok(MessageRow {
                 id: message.message,
                 observation: message.observation,
@@ -180,12 +182,31 @@ fn load_source_messages(dataset: DatasetView<'_>, source: Id) -> anyhow::Result<
         .collect()
 }
 
-fn ns_to_chrono(ns: i128) -> DateTime<Utc> {
-    let secs = (ns / 1_000_000_000) as i64;
-    let nanos = ((ns % 1_000_000_000) as u32).min(999_999_999);
-    Utc.timestamp_opt(secs, nanos)
+fn epoch_to_chrono(epoch: Epoch) -> anyhow::Result<DateTime<Utc>> {
+    let secs = epoch.to_unix_seconds();
+    if !secs.is_finite() {
+        anyhow::bail!("Teams timestamp is not finite");
+    }
+    let whole = secs.floor();
+    if whole < i64::MIN as f64 || whole > i64::MAX as f64 {
+        anyhow::bail!("Teams timestamp is outside the displayable UTC range");
+    }
+    let nanos = ((secs - whole) * 1e9).round().clamp(0.0, 999_999_999.0) as u32;
+    Utc.timestamp_opt(whole as i64, nanos)
         .single()
-        .unwrap_or_else(Utc::now)
+        .ok_or_else(|| anyhow::anyhow!("Teams timestamp is outside the displayable UTC range"))
+}
+
+fn ns_to_chrono(ns: i128) -> anyhow::Result<DateTime<Utc>> {
+    epoch_to_chrono(Epoch::from_tai_duration(
+        HifiDuration::from_total_nanoseconds(ns),
+    ))
+}
+
+fn current_utc() -> Option<DateTime<Utc>> {
+    crate::clock::now()
+        .ok()
+        .and_then(|epoch| epoch_to_chrono(epoch).ok())
 }
 
 fn id_hex(id: Id) -> String {
@@ -297,7 +318,7 @@ impl TeamsViewer {
 
         ctx.section("Teams", |ctx| {
             let Some(live) = self.live.as_ref() else { return };
-            let now = Utc::now();
+            let now = current_utc();
 
             ctx.grid(|g| {
                 for diagnostic in &live.diagnostics {
@@ -375,7 +396,12 @@ impl TeamsViewer {
 
 // ── Message card ────────────────────────────────────────────────────
 
-fn render_message_card(ui: &mut egui::Ui, msg: &MessageRow, live: &TeamsLive, now: DateTime<Utc>) {
+fn render_message_card(
+    ui: &mut egui::Ui,
+    msg: &MessageRow,
+    live: &TeamsLive,
+    now: Option<DateTime<Utc>>,
+) {
     let bubble_fill = ui.visuals().window_fill;
     let accent = chat_color(msg.chat_id);
     let text_on_accent = colorhash::text_color_on(accent);
@@ -437,12 +463,13 @@ fn render_message_card(ui: &mut egui::Ui, msg: &MessageRow, live: &TeamsLive, no
                                     .color(text_on_accent),
                             );
                         }
-                        let time = msg
-                            .at
-                            .map(|at| {
+                        let time = match (msg.at, now) {
+                            (Some(at), Some(now)) => {
                                 format!("· {} · {}", format_chat_time(at), age_label(now, at))
-                            })
-                            .unwrap_or_else(|| "· SOURCE TIME UNKNOWN".to_owned());
+                            }
+                            (Some(at), None) => format!("· {}", format_chat_time(at)),
+                            (None, _) => "· SOURCE TIME UNKNOWN".to_owned(),
+                        };
                         ui.label(
                             egui::RichText::new(time)
                                 .monospace()

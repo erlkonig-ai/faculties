@@ -26,7 +26,7 @@ use faculties::memory_cover::{
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
 use faculties::{
     blockdag::{self, CatalogValidation},
-    cognition as cognition_model, comb as comb_model, memory as memory_model,
+    clock, cognition as cognition_model, comb as comb_model, memory as memory_model,
 };
 use hifitime::Epoch;
 use triblespace::core::blob::Bytes;
@@ -842,8 +842,7 @@ fn cmd_create(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let range = match explicit_range {
         Some(range) => range,
         None => {
-            let now =
-                Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+            let now = clock::now()?;
             (now, now)
         }
     };
@@ -885,9 +884,9 @@ fn create_chunk(
         reference_ids.insert(target);
     }
 
-    let start_at: Inline<NsTAIInterval> = (range.0, range.0).try_to_inline().unwrap();
-    let end_at: Inline<NsTAIInterval> = (range.1, range.1).try_to_inline().unwrap();
-    let observed_at: Inline<NsTAIInterval> = (observed_at, observed_at).try_to_inline().unwrap();
+    let start_at = clock::point(range.0)?;
+    let end_at = clock::point(range.1)?;
+    let observed_at = clock::point(observed_at)?;
     let (fragment, chunk_id) = memory_model::chunk_fragment(memory_model::ChunkDraft {
         content: memory_model::ChunkDraftContent::Text(summary_text.to_owned()),
         start_at,
@@ -965,9 +964,9 @@ fn create_image_chunk(
     bytes: &[u8],
     range: (Epoch, Epoch),
 ) -> Result<Id> {
-    let start_at: Inline<NsTAIInterval> = (range.0, range.0).try_to_inline().unwrap();
-    let end_at: Inline<NsTAIInterval> = (range.1, range.1).try_to_inline().unwrap();
-    let observed_at: Inline<NsTAIInterval> = (range.1, range.1).try_to_inline().unwrap();
+    let start_at = clock::point(range.0)?;
+    let end_at = clock::point(range.1)?;
+    let observed_at = clock::point(range.1)?;
     let (fragment, chunk_id) = memory_model::chunk_fragment(memory_model::ChunkDraft {
         content: memory_model::ChunkDraftContent::Image(bytes.to_vec()),
         start_at,
@@ -1010,9 +1009,9 @@ fn comb_advance(
     position: Option<Epoch>,
     grain: Option<&str>,
 ) -> Result<()> {
-    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-    let position = position.map(|value| (value, value).try_to_inline().unwrap());
-    let observed_at = (now, now).try_to_inline().unwrap();
+    let now = clock::now()?;
+    let position = position.map(clock::point).transpose()?;
+    let observed_at = clock::point(now)?;
     let predecessors = loaded
         .comb_catalog
         .resolution(stream, persona)
@@ -1302,11 +1301,6 @@ fn cmd_replay(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 // supersede subcommand
 // ---------------------------------------------------------------------------
 
-fn point_now() -> Inline<NsTAIInterval> {
-    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-    (now, now).try_to_inline().unwrap()
-}
-
 fn chunk_draft_from_row(
     loaded: &LoadedMemory,
     row: &memory_model::ChunkRow,
@@ -1339,7 +1333,7 @@ fn chunk_draft_from_row(
         about_exec_result: row.about_exec_result,
         about_archive_message: row.about_archive_message,
         predecessors,
-        observed_at: BTreeSet::from([point_now()]),
+        observed_at: BTreeSet::from([clock::point_now()?]),
         aliases: BTreeSet::new(),
     })
 }
@@ -1431,7 +1425,7 @@ fn cmd_retract(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         memory_model::retraction_fragment(memory_model::RetractionDraft {
             reason: (!reason.is_empty()).then_some(reason.clone()),
             predecessors: BTreeSet::from([old]),
-            observed_at: BTreeSet::from([point_now()]),
+            observed_at: BTreeSet::from([clock::point_now()?]),
         })?;
     storage.publish_memory(&loaded, fragment)?;
 
@@ -1491,8 +1485,8 @@ fn cmd_respan(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let loaded = storage.load()?;
     let old = resolve_chunk_id(&loaded, &args[0]).map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
     let row = &loaded.catalog.chunks[&old];
-    let start_at: Inline<NsTAIInterval> = (range_start, range_start).try_to_inline().unwrap();
-    let end_at: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
+    let start_at = clock::point(range_start)?;
+    let end_at = clock::point(range_end)?;
     let draft = chunk_draft_from_row(&loaded, row, start_at, end_at, BTreeSet::from([old]))?;
     let (fragment, new_chunk) = memory_model::chunk_fragment(draft)?;
     storage.publish_memory(&loaded, fragment)?;
@@ -2072,8 +2066,7 @@ fn cmd_cover(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                 None,
                 DEFAULT_SIM_THRESHOLD,
             )?;
-            let now =
-                Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+            let now = clock::now().context("generate cover state timestamp")?;
             let (chunks, total) = cover_write_state(&dir, &cover, chunk_chars, fmt_epoch(now))?;
             println!(
                 "cover: generated {chunks} chunks (~{chunk_chars} chars each, {total} chars total); run 'memory cover continue'"

@@ -288,7 +288,7 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn now_key() -> i128 {
+fn now_key() -> Result<i128> {
     triage_model::now_tai_ns()
 }
 
@@ -384,7 +384,7 @@ fn cmd_scan(
     let secrets = snapshot.secrets()?;
     let relations = snapshot.relations()?;
     let messages = snapshot.messages(&relations)?;
-    let now = now_key();
+    let now = now_key()?;
     let stale_ns = stale_min.max(0) as i128 * 60 * 1_000_000_000;
     let report = triage_model::project_scan(
         ScanSources {
@@ -395,7 +395,7 @@ fn cmd_scan(
             messages: messages.source(),
         },
         ScanOptions {
-            now,
+            now: Some(now),
             stale_after_ns: stale_ns,
             recent_attempts: recent,
             loop_min,
@@ -433,20 +433,22 @@ fn cmd_scan(
     println!();
     println!("Queues");
     println!(
-        "- exec: requests={} pending={} running={} stale={} forked={} invalid={} done={}",
+        "- exec: requests={} pending={} running={} age_unknown={} stale={} forked={} invalid={} done={}",
         report.exec_queue.requests,
         report.exec_queue.pending,
         report.exec_queue.running,
+        report.exec_queue.age_unknown,
         report.exec_queue.stale,
         report.exec_queue.forked,
         report.exec_queue.invalid,
         report.exec_queue.done
     );
     println!(
-        "- model: requests={} pending={} running={} stale={} forked={} invalid={} done={}",
+        "- model: requests={} pending={} running={} age_unknown={} stale={} forked={} invalid={} done={}",
         report.model_queue.requests,
         report.model_queue.pending,
         report.model_queue.running,
+        report.model_queue.age_unknown,
         report.model_queue.stale,
         report.model_queue.forked,
         report.model_queue.invalid,
@@ -515,7 +517,7 @@ fn cmd_loops(snapshot: &TriageSnapshot, recent: usize, min_repeat: usize) -> Res
     let cognition = snapshot.cognition()?;
     let state = collect_exec_state(&cognition.reader, &cognition.facts)?;
     let report = build_loop_report(&state, recent, min_repeat);
-    let now = now_key();
+    let now = now_key()?;
     println!("Triage loops");
     println!("- Cognition facts: {}", cognition.facts.len());
     println!("- recent attempts: {}", report.recent.len());
@@ -663,7 +665,7 @@ fn cmd_timeline(snapshot: &TriageSnapshot, recent: usize) -> Result<()> {
     let model_state = collect_model_chat_state(&cognition.reader, &cognition.facts)?;
     let reason_state = collect_reason_state(&cognition.reader, &cognition.facts)?;
     let rows = build_timeline_rows(&exec_state, &model_state, &reason_state, recent);
-    let now = now_key();
+    let now = now_key()?;
     println!("Triage timeline");
     println!("- Cognition facts: {}", cognition.facts.len());
     println!("- rows: {}", rows.len());
@@ -1002,7 +1004,7 @@ fn cmd_turn(snapshot: &TriageSnapshot, turn: usize, full: bool) -> Result<()> {
     let exec_state = collect_exec_state(&cognition.reader, &cognition.facts)?;
     let model_state = collect_model_chat_state(&cognition.reader, &cognition.facts)?;
     let request = select_request(&exec_state, turn)?;
-    let now = now_key();
+    let now = now_key()?;
     println!("Turn #{turn}");
     println!("- Cognition facts: {}", cognition.facts.len());
     println!("- request: {}", fmt_id(request.id));

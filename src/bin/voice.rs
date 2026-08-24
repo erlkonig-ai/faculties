@@ -52,6 +52,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::clock;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::voice::{
     route, CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID, KIND_LIVE_RECORD, KIND_ROUTE,
@@ -167,9 +168,8 @@ enum Command {
 
 // ── time / id helpers (mirrors body/headspace) ─────────────────────────────
 
-fn now_tai() -> Inline<inlineencodings::NsTAIInterval> {
-    let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
-    (now, now).try_to_inline().expect("valid TAI interval")
+fn now_tai() -> Result<Inline<inlineencodings::NsTAIInterval>> {
+    clock::point_now()
 }
 
 fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
@@ -620,7 +620,7 @@ fn route_set_fragment(
 }
 
 fn store_route(session: &mut VoiceSession<'_>, channel: &str, devices: &[String]) -> Result<()> {
-    let generation = route_set_fragment(channel, devices, now_tai());
+    let generation = route_set_fragment(channel, devices, now_tai()?);
     session.commit(generation, "voice route set")?;
     Ok(())
 }
@@ -643,7 +643,7 @@ fn log_utterance(
         }
         None => None,
     };
-    let fragment = voice_model::utterance_fragment(channel, text, audio, now_tai())?;
+    let fragment = voice_model::utterance_fragment(channel, text, audio, now_tai()?)?;
     let id = fragment.root().expect("utterance id");
     session.commit(fragment, commit_msg)?;
     println!("  logged utterance {} [{channel}]", &fmt_id(id)[..12]);

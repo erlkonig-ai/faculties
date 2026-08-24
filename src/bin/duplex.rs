@@ -146,10 +146,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use faculties::clock;
 
 /// Samples in one model frame at 24 kHz (80 ms).
 const FRAME_SAMPLES: usize = 1920;
@@ -424,11 +425,8 @@ fn default_session() -> PathBuf {
     std::env::temp_dir().join("duplex")
 }
 
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+fn now_millis() -> Result<u64> {
+    Ok(clock::now()?.to_unix_milliseconds() as u64)
 }
 
 // ── the transcript file ────────────────────────────────────────────────────
@@ -531,7 +529,7 @@ fn write_cursor(session: &Path, seq: u64) -> Result<()> {
 /// the model quiet while a reader catches up. A file survives the reader
 /// dying; the deadline means the channel recovers when it does.
 fn take_floor(session: &Path, hold_secs: u64) -> Result<()> {
-    let deadline = now_millis() + hold_secs.saturating_mul(1_000);
+    let deadline = now_millis()?.saturating_add(hold_secs.saturating_mul(1_000));
     let staged = session.join(".hold.tmp");
     std::fs::write(&staged, deadline.to_string())?;
     std::fs::rename(&staged, session.join(HOLD_FILE)).context("publish the floor hold")?;
@@ -539,18 +537,18 @@ fn take_floor(session: &Path, hold_secs: u64) -> Result<()> {
     Ok(())
 }
 
-fn floor_held(session: &Path) -> bool {
+fn floor_held(session: &Path) -> Result<bool> {
     let Ok(text) = std::fs::read_to_string(session.join(HOLD_FILE)) else {
-        return false;
+        return Ok(false);
     };
     let deadline: u64 = text.trim().parse().unwrap_or(0);
-    if now_millis() > deadline {
+    if now_millis()? > deadline {
         // Expired holds are cleared by whoever notices, so a dead reader
         // cannot mute the channel indefinitely.
         let _ = std::fs::remove_file(session.join(HOLD_FILE));
-        return false;
+        return Ok(false);
     }
-    true
+    Ok(true)
 }
 
 fn give_floor(session: &Path) -> Result<()> {
@@ -565,10 +563,7 @@ fn give_floor(session: &Path) -> Result<()> {
 fn inject(session: &Path, text: &str) -> Result<PathBuf> {
     let dir = session.join(INJECT_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let stamp = clock::tai_nanoseconds_now()?;
     let staged = dir.join(format!(".{stamp}.tmp"));
     let published = dir.join(format!("{stamp}.txt"));
     std::fs::write(&staged, text)?;
@@ -702,7 +697,7 @@ fn cmd_status(session: &Path) -> Result<()> {
     );
     println!(
         "floor     : {}",
-        if floor_held(session) {
+        if floor_held(session)? {
             "HELD — the model is silent"
         } else {
             "free — the model may speak"
@@ -1495,13 +1490,10 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     use faculties::legacy_hint::open_scope;
     use faculties::schemas::voice::{CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
     use faculties::storage::{load_signer, open_pile_strict};
-    use hifitime::Epoch;
     use triblespace::core::metadata;
     use triblespace::prelude::*;
 
-    let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
-    let stamp: Inline<inlineencodings::NsTAIInterval> =
-        (now, now).try_to_inline().expect("valid TAI interval");
+    let stamp = clock::point_now()?;
     let fragment = faculties::voice::utterance_fragment(CHANNEL_SHOUT, text, None, stamp)?;
 
     let signer = load_signer(pile_path, key)?;
@@ -1757,7 +1749,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         // anything can be spoken at, and never on the frame's critical path.
         if last_control_poll.elapsed() >= Duration::from_millis(250) {
             last_control_poll = Instant::now();
-            let now_held = floor_held(session);
+            let now_held = floor_held(session)?;
             if now_held != held {
                 println!(
                     "duplex: floor {}",
@@ -1814,10 +1806,10 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             let _ = level;
             if !far_talking && far_loud >= VOICE_ONSET_FRAMES {
                 far_talking = true;
-                far_started_ms = now_millis();
+                far_started_ms = now_millis()?;
             } else if far_talking && far_quiet >= VOICE_RELEASE_FRAMES {
                 far_talking = false;
-                let seconds = (now_millis().saturating_sub(far_started_ms)) as f64 / 1000.0;
+                let seconds = (now_millis()?.saturating_sub(far_started_ms)) as f64 / 1000.0;
                 seq += 1;
                 let line = Line {
                     seq,
@@ -2053,7 +2045,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
                 session,
                 &Line {
                     seq,
-                    at_ms: now_millis(),
+                    at_ms: now_millis()?,
                     speaker: speaker.tag().into(),
                     text: line.clone(),
                 },
@@ -2090,7 +2082,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     // far end talking right up to the end leaves no trace at all, which reads
     // as "they said nothing" rather than "we stopped listening".
     if far_talking {
-        let seconds = (now_millis().saturating_sub(far_started_ms)) as f64 / 1000.0;
+        let seconds = (now_millis()?.saturating_sub(far_started_ms)) as f64 / 1000.0;
         seq += 1;
         let _ = append_line(
             session,
@@ -2113,7 +2105,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             session,
             &Line {
                 seq,
-                at_ms: now_millis(),
+                at_ms: now_millis()?,
                 speaker: Speaker::Model.tag().into(),
                 text: line.clone(),
             },
@@ -2327,15 +2319,15 @@ mod tests {
     fn the_floor_is_held_until_given_back_and_expires_on_its_own() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path();
-        assert!(!floor_held(session));
+        assert!(!floor_held(session).unwrap());
         take_floor(session, 60).unwrap();
-        assert!(floor_held(session));
+        assert!(floor_held(session).unwrap());
         give_floor(session).unwrap();
-        assert!(!floor_held(session));
+        assert!(!floor_held(session).unwrap());
         // A reader that never comes back must not mute the channel forever.
         take_floor(session, 0).unwrap();
         std::thread::sleep(Duration::from_millis(5));
-        assert!(!floor_held(session));
+        assert!(!floor_held(session).unwrap());
     }
 
     #[test]
@@ -2357,10 +2349,10 @@ mod tests {
         }
         cmd_read(session, false, false, 60).unwrap();
         assert_eq!(read_cursor(session), 0, "reading must not consume");
-        assert!(floor_held(session), "reading takes the floor");
+        assert!(floor_held(session).unwrap(), "reading takes the floor");
         cmd_say(session, "a reply", false).unwrap();
         assert_eq!(read_cursor(session), 3, "acting on a read consumes it");
-        assert!(!floor_held(session), "saying gives the floor back");
+        assert!(!floor_held(session).unwrap(), "saying gives the floor back");
         assert_eq!(drain_inject(session), vec!["a reply"]);
     }
 

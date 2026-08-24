@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::clock;
 use faculties::habits::{self, Catalog, DeclaredState, Habit, State};
 use faculties::schemas::habit::{Condition, DEFAULT_SCOPE_ID};
-use hifitime::Epoch;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -77,18 +77,6 @@ enum Command {
     Resume { label: String },
     /// Validate the complete native Habit catalog and its attachments.
     Check,
-}
-
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-fn point(epoch: Epoch) -> habits::IntervalValue {
-    (epoch, epoch).try_to_inline().unwrap()
-}
-
-fn now_secs() -> i64 {
-    (now_epoch().to_tai_duration().total_nanoseconds() / 1_000_000_000) as i64
 }
 
 fn id_list(habits: &[&Habit]) -> String {
@@ -275,7 +263,7 @@ fn state_detail(state: &State) -> Option<String> {
 
 fn cmd_list(pile: &Path, key: Option<&Path>, only_due: bool) -> Result<()> {
     let catalog = habits::read_catalog(pile, key)?;
-    let now = now_secs();
+    let now = (clock::tai_nanoseconds_now()? / 1_000_000_000) as i64;
     let at = habits::evaluation_dir(pile);
     let mut shown = 0usize;
     let mut unevaluable = 0usize;
@@ -387,7 +375,7 @@ fn cmd_show(pile: &Path, key: Option<&Path>, selector: &str) -> Result<()> {
 fn cmd_done(pile: &Path, key: Option<&Path>, label: &str) -> Result<()> {
     let catalog = habits::read_catalog(pile, key)?;
     let habit = select_live_habit(&catalog, label)?;
-    let (fragment, occurrence) = habits::completion_fragment(habit.id, point(now_epoch()))?;
+    let (fragment, occurrence) = habits::completion_fragment(habit.id, clock::point_now()?)?;
     habits::publish(pile, key, fragment)?;
     println!("done {} [{occurrence:x}]", habit.label);
     Ok(())
@@ -403,7 +391,7 @@ fn cmd_state(pile: &Path, key: Option<&Path>, label: &str, desired: DeclaredStat
     }
     let predecessors = activation.head_ids();
     let (fragment, assertion) =
-        habits::state_fragment(habit.id, desired, &predecessors, point(now_epoch()))?;
+        habits::state_fragment(habit.id, desired, &predecessors, clock::point_now()?)?;
     habits::publish(pile, key, fragment)?;
     println!("{} {} [{assertion:x}]", desired.as_str(), habit.label);
     Ok(())

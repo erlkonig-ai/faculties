@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
-use faculties::headspace;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use faculties::secrets::storage as vaults;
 use faculties::storage::{load_signer, open_pile_strict};
-use hifitime::Epoch;
+use faculties::{clock, headspace};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
@@ -173,7 +172,7 @@ fn cmd_search(
 
     if !cli.no_store {
         storage.store(
-            search_fragment(provider, query, &results)?,
+            search_fragment(provider, query, &results, clock::point_now()?)?,
             "web search observation",
         )?;
     }
@@ -206,7 +205,7 @@ fn cmd_fetch(
         return Ok(());
     }
     storage.store(
-        fetch_fragment(provider, url, &content),
+        fetch_fragment(provider, url, &content, clock::point_now()?),
         "web fetch observation",
     )
 }
@@ -377,7 +376,12 @@ fn provider_name(provider: Provider) -> &'static str {
     }
 }
 
-fn search_fragment(provider: Provider, query: &str, results: &[SearchResult]) -> Result<Fragment> {
+fn search_fragment(
+    provider: Provider,
+    query: &str,
+    results: &[SearchResult],
+    observed_at: Inline<NsTAIInterval>,
+) -> Result<Fragment> {
     let mut fragment = Fragment::empty();
     let query_handle = fragment.put(query.to_owned());
     let mut result_ids = Vec::with_capacity(results.len());
@@ -411,32 +415,29 @@ fn search_fragment(provider: Provider, query: &str, results: &[SearchResult]) ->
         metadata::tag: &web_schema::kind_search,
         web_schema::query: query_handle,
         web_schema::provider: provider_name(provider),
-        metadata::created_at: epoch_interval(now_epoch()),
+        metadata::created_at: observed_at,
         web_schema::result*: result_ids,
     };
     Ok(fragment)
 }
 
-fn fetch_fragment(provider: Provider, url: &str, content: &str) -> Fragment {
+fn fetch_fragment(
+    provider: Provider,
+    url: &str,
+    content: &str,
+    observed_at: Inline<NsTAIInterval>,
+) -> Fragment {
     let mut fragment = Fragment::empty();
     let url = fragment.put(url.to_owned());
     let content = fragment.put(content.to_owned());
     fragment += entity! { _ @
         metadata::tag: &web_schema::kind_fetch,
         web_schema::provider: provider_name(provider),
-        metadata::created_at: epoch_interval(now_epoch()),
+        metadata::created_at: observed_at,
         web_schema::url: url,
         web_schema::content: content,
     };
     fragment
-}
-
-fn now_epoch() -> Epoch {
-    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
-}
-
-fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
-    (epoch, epoch).try_to_inline().unwrap()
 }
 
 // --- Tavily ---
@@ -647,6 +648,7 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
 mod tests {
     use std::fs::File;
 
+    use hifitime::Epoch;
     use triblespace::macros::{find, pattern};
 
     use super::*;
@@ -709,6 +711,7 @@ mod tests {
                     snippet: Some("two".to_owned()),
                 },
             ],
+            clock::point(Epoch::from_unix_seconds(1.0)).unwrap(),
         )
         .unwrap();
 
@@ -755,7 +758,12 @@ mod tests {
             key: Some(&key_path),
         }
         .store(
-            fetch_fragment(Provider::Exa, "https://example.test", "body"),
+            fetch_fragment(
+                Provider::Exa,
+                "https://example.test",
+                "body",
+                clock::point(Epoch::from_unix_seconds(1.0)).unwrap(),
+            ),
             "test Web observation",
         )
         .unwrap();

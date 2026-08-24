@@ -34,6 +34,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::clock;
 use faculties::decide::{self, Resolution};
 use faculties::legacy_hint::open_scope;
 #[cfg(test)]
@@ -2064,7 +2065,7 @@ fn read_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result<Str
 }
 
 fn now_epoch() -> Result<Epoch> {
-    Epoch::now().map_err(|error| anyhow!("read current time: {error:?}"))
+    clock::now()
 }
 
 fn point_interval(epoch: Epoch) -> IntervalValue {

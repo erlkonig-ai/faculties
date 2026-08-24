@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::clock;
 use faculties::decide::{
     self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
 };
@@ -209,7 +210,7 @@ fn fmt_id(id: Id) -> String {
 }
 
 fn now_epoch() -> Result<Epoch> {
-    Epoch::now().map_err(|error| anyhow!("read current clock: {error:?}"))
+    clock::now()
 }
 
 fn epoch_interval(epoch: Epoch) -> IntervalValue {
