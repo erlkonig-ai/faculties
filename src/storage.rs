@@ -35,7 +35,7 @@ use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
     discover_collection_records, CollectionCommit, CollectionDerive, CollectionMerge,
-    CollectionRecordDiagnostic, CollectionStore,
+    CollectionRecordDiagnostic, CollectionStore, DiscoveredCollectionRecords,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -360,6 +360,20 @@ where
 {
     let records =
         discover_collection_records(pile).context("discover roots before WRITE bootstrap")?;
+    let reader = pile
+        .reader()
+        .context("open descriptor view before WRITE bootstrap")?;
+    observe_faculty_roots_in_records(&records, &reader, team)
+}
+
+fn observe_faculty_roots_in_records<R>(
+    records: &DiscoveredCollectionRecords,
+    reader: &R,
+    team: VerifyingKey,
+) -> Result<FacultyRootObservation>
+where
+    R: BlobStoreGet,
+{
     let mut observed = FacultyRootObservation::default();
     let mut collections = BTreeSet::new();
     for commit in records.commits() {
@@ -374,9 +388,6 @@ where
         .into_iter()
         .map(|(_, name, _)| name)
         .collect::<BTreeSet<_>>();
-    let reader = pile
-        .reader()
-        .context("open descriptor view before WRITE bootstrap")?;
     for collection in collections {
         let Ok(blob): Result<Blob<SimpleArchive>, _> = reader.get(collection) else {
             continue;
@@ -424,18 +435,46 @@ where
     Ok(observed)
 }
 
-/// Reject a durable signer that would open a parallel team-of-one epoch.
+/// Reject unsafe authority expansion before granting planned WRITE targets.
 ///
-/// This is the read-only identity boundary shared by authority publication and
-/// migration planning. It deliberately performs only root observation: no
-/// grants are constructed, authority is not resolved, and the store is never
-/// mutated. Callers that do substantial planning can therefore reject the
-/// common wrong-`--key` failure before doing that work.
-pub fn preflight_team_of_one_signer<S>(store: &mut S, signer: &SigningKey) -> Result<()>
+/// One record discovery serves both checks: the signer must not open a
+/// parallel empty team epoch, and a future grant must not awaken a currently
+/// unauthorized COMMIT signed by that same local key. Foreign authors remain
+/// inert. This is read only and constructs no grants.
+pub fn preflight_team_of_one_write_targets<S>(
+    store: &mut S,
+    signer: &SigningKey,
+    targets: impl IntoIterator<Item = CollectionHandle>,
+) -> Result<()>
 where
     S: BlobStore + CollectionStore,
+    S::Reader: BlobStoreMeta,
 {
-    observe_faculty_roots(store, signer.verifying_key()).map(|_| ())
+    let records = discover_collection_records(&mut *store)
+        .context("discover records before planned WRITE authority")?;
+    let team = signer.verifying_key();
+    {
+        let reader = store
+            .reader()
+            .context("open descriptor view before planned WRITE authority")?;
+        observe_faculty_roots_in_records(&records, &reader, team)?;
+    }
+    let authority = resolve_authority(&mut *store, team)
+        .map_err(|error| anyhow!("resolve authority before planned WRITE grants: {error}"))?;
+    let targets = targets.into_iter().collect::<BTreeSet<_>>();
+    for commit in records.commits() {
+        if targets.contains(&commit.collection())
+            && commit.public_key().raw == team.to_bytes()
+            && !authority.allows(&commit.public_key(), ACTION_WRITE, commit.collection())
+        {
+            anyhow::bail!(
+                "planned WRITE authority would awaken dormant local COMMIT {:X} on collection {}",
+                commit.id(),
+                hex::encode_upper(commit.collection().raw)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Construct the closed, deterministic grant set without touching `pile`.

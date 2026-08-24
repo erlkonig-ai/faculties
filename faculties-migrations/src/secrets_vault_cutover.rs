@@ -235,7 +235,7 @@ where
     let team = signer.verifying_key();
     let catalog = legacy::validate_catalog(reader, &source)
         .context("validate projected pre-collection Secrets catalog")?;
-    crate::collection_cutover::reject_dormant_local_commits(
+    faculties::storage::preflight_team_of_one_write_targets(
         &mut *pile,
         signer,
         catalog

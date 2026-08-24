@@ -686,7 +686,7 @@ fn build_world(
 ) -> Result<CandidateWorld> {
     let mut pile = open_pile_strict(candidate)?;
     let result = (|| {
-        crate::collection_cutover::reject_dormant_local_commits(
+        faculties::storage::preflight_team_of_one_write_targets(
             &mut pile,
             signer,
             future_write_targets(signer, publications),

@@ -596,14 +596,12 @@ pub fn plan(
     password: Option<&[u8]>,
 ) -> Result<ActivationPlan> {
     let mut frozen_collections = source.collection_store();
-    faculties::storage::preflight_team_of_one_signer(&mut frozen_collections, signer)
-        .context("preflight durable team root before activation planning")?;
-    crate::collection_cutover::reject_dormant_local_commits(
+    faculties::storage::preflight_team_of_one_write_targets(
         &mut frozen_collections,
         signer,
         crate::collection_cutover::fixed_write_targets(signer),
     )
-    .context("preflight dormant COMMITs on fixed activation WRITE targets")?;
+    .context("preflight durable team root and fixed activation WRITE targets")?;
     let mut collections = ActivationBuilder::default();
 
     let archive = archive_cutover::plan(source).context("plan Archive activation")?;
@@ -1403,7 +1401,7 @@ mod tests {
         let source = crate::collection_cutover::freeze_source(&path).unwrap();
         let error = plan(&source, &signer, None).unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("preflight dormant COMMITs on fixed activation WRITE targets"));
+        assert!(message.contains("preflight durable team root and fixed activation WRITE targets"));
         assert!(message.contains("would awaken dormant local COMMIT"));
         assert!(!message.contains("plan Archive activation"));
     }
@@ -1431,7 +1429,7 @@ mod tests {
         let source = crate::collection_cutover::freeze_source(&path).unwrap();
         let error = plan(&source, &foreign, None).unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("preflight durable team root before activation planning"));
+        assert!(message.contains("preflight durable team root and fixed activation WRITE targets"));
         assert!(message.contains("refusing to create a parallel empty authority epoch"));
         assert!(!message.contains("plan Archive activation"));
     }
