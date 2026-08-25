@@ -8,15 +8,16 @@ All notable changes to this project will be documented in this file.
   boundaries.** The original
   pre-collection transition is `migrations legacy-branches plan|activate`;
   `plan-cutover` and `activate-cutover` are removed rather than retained as
-  ambiguous aliases. The later native direct-recipient Secrets generation has
-  its own `migrations secrets-custody plan|activate` lane. That lane reads only
-  exact native predecessor vaults, observes Headspace, Teams, Mail and their
-  dependencies for cross-collection validation, and never consults the
-  retained pre-collection Secrets branch or asks for its password. Unlike the
-  historical branch migration, custody activation is online and additive: one
-  migration-specific lock serializes competing random custody genesis while
-  unrelated pile writers remain online; founder inbox COMMITs precede vault
-  COMMITs, and a fresh domain replan must find no work left.
+  ambiguous aliases. The later unpublished subject-bearing Secrets envelope
+  generation has its own `migrations secrets-direct-proofs plan|activate`
+  bridge and a distinct retired wire tag. Its trust basis is the durable root's
+  signature on delivery into that same root's deterministic private inbox, the
+  recipient-sealed context, and the matching custody declaration in the
+  existing root/root vault — never the retired proof signatures. Planning is
+  read-only and classifies exact pending, complete, ambiguous, and malformed
+  states. Activation is online and additive: it appends each fresh direct root
+  proof's claims and native proof record, then one access-inbox COMMIT per
+  pending vault, touches no vault COMMIT, and replans to zero pending work.
 
 - **Faculty-authored chronology now fails closed on clock errors.** Clock reads
   that timestamp collection facts or operational records pass through one
@@ -111,16 +112,18 @@ All notable changes to this project will be documented in this file.
   vault epoch is one capability-anchored private collection with a random
   custody key. Every immutable secret version has exactly one DEK wrap to that
   custody key, independent of the number of readers. Exact `READ` and unbounded
-  `WRITE` capability proofs travel in a recipient-sealed access envelope along
-  with the custody seed; a recipient's private open-admission inbox is only an
+  `WRITE` proof identities are named in the recipient-sealed access envelope;
+  their complete claims live in content-addressed blobs and their proofs in the
+  native proof store. A recipient's private open-admission inbox is only an
   untrusted delivery index, and every candidate is independently authenticated
   and validated before it can admit commits or decrypt data. Grants are thus
   constant in vault size and do not enumerate membership. The live CLI manages
   explicit epochs with `secrets vault create|list|grant` and exact immutable
   versions with `secrets secret add|get|list`; the enumerable `members` and
-  per-secret `share` surfaces are gone. `migrations secrets-custody activate`
-  preserves historical secret ids, encrypted bodies, and source evidence while
-  re-sealing only each DEK into a capability-anchored custody successor.
+  per-secret `share` surfaces are gone. The pre-collection migration preserves
+  historical secret ids, encrypted bodies, and source evidence while re-sealing
+  only each DEK into a capability-anchored custody successor; the later
+  `secrets-direct-proofs` bridge changes only access evidence.
 
 - **The Teams credentials the cutover retired are recoverable.** The collection
   cutover treats the legacy Teams OAuth rows as a bounded retired partition:

@@ -26,7 +26,8 @@ use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, IntoBlob};
 use triblespace::core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityResource,
+    CapabilityAction, CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityProofBundle,
+    CapabilityProofId, CapabilityRequest, CapabilityResource,
 };
 use triblespace::core::collection::{
     discover_collection_records, simplearchive_union, CollectionAdmission, CollectionCommit,
@@ -37,7 +38,7 @@ use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, CapabilityProofStore};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::prelude::{Collection, CollectionName};
 
@@ -115,6 +116,7 @@ struct Publication<'a> {
     view: CandidateViewKey,
     policy: &'a TargetPolicy,
     fragments: &'a [Fragment],
+    proof_bundles: &'a [CapabilityProofBundle],
     facts: &'a TribleSet,
 }
 
@@ -137,6 +139,7 @@ impl<'a> Publication<'a> {
             view: plan.view(),
             policy: plan.policy(),
             fragments: plan.fragments(),
+            proof_bundles: plan.proof_bundles(),
             facts: plan.expected_facts(),
         }
     }
@@ -169,6 +172,8 @@ pub struct CollectionPublicationPresence {
     status: NativePublicationStatus,
     planned_commits: usize,
     present_commits: usize,
+    planned_proofs: usize,
+    present_proofs: usize,
     required_dependencies: usize,
     resident_dependencies: usize,
 }
@@ -184,6 +189,14 @@ impl CollectionPublicationPresence {
 
     pub const fn present_commits(&self) -> usize {
         self.present_commits
+    }
+
+    pub const fn planned_proofs(&self) -> usize {
+        self.planned_proofs
+    }
+
+    pub const fn present_proofs(&self) -> usize {
+        self.present_proofs
     }
 
     pub const fn required_dependencies(&self) -> usize {
@@ -220,6 +233,7 @@ impl CutoverPublicationPresence {
 #[derive(Default)]
 struct ExpectedPublication {
     commits: BTreeMap<Id, CollectionCommit>,
+    proofs: BTreeMap<CapabilityProofId, CapabilityProof>,
     dependencies: BTreeSet<[u8; 32]>,
 }
 
@@ -247,6 +261,7 @@ fn expected_publication(
         publication.reach.clone(),
     );
     let mut commits = BTreeMap::new();
+    let mut proofs = BTreeMap::new();
     let mut dependencies = BTreeSet::new();
     for fragment in publication.fragments {
         // Bound scratch memory to one fragment. Large migrations can carry
@@ -263,8 +278,33 @@ fn expected_publication(
         commits.insert(commit.id(), commit);
         dependencies.extend(scratch_dependencies(&mut scratch));
     }
+    for bundle in publication.proof_bundles {
+        bundle
+            .to_bytes()
+            .map_err(|error| anyhow!("validate planned capability bundle: {error}"))?;
+        for (step, (handle, claim)) in bundle
+            .proof()
+            .claim_handles()
+            .zip(bundle.claims())
+            .enumerate()
+        {
+            if claim.get_handle() != handle {
+                bail!("planned capability claim {step} does not match its signed handle");
+            }
+            dependencies.insert(handle.raw);
+        }
+        let proof = bundle.proof().clone();
+        let id = proof.id();
+        if proofs
+            .insert(id, proof.clone())
+            .is_some_and(|previous| previous != proof)
+        {
+            bail!("planned capability proof id collision");
+        }
+    }
     Ok(ExpectedPublication {
         commits,
+        proofs,
         dependencies,
     })
 }
@@ -323,12 +363,27 @@ fn inspect_publications(
             .filter(|(id, commit)| observed_commits.get(*id) == Some(*commit))
             .count();
         let resident = resident_dependencies(source.reader(), &expected.dependencies)?;
+        let mut present_proofs = 0;
+        for (id, expected_proof) in &expected.proofs {
+            if store
+                .proof(*id)
+                .context("inspect planned native capability proof")?
+                .as_ref()
+                == Some(expected_proof)
+            {
+                present_proofs += 1;
+            }
+        }
 
-        let complete =
-            present_commits == expected.commits.len() && resident == expected.dependencies.len();
+        let complete = present_commits == expected.commits.len()
+            && present_proofs == expected.proofs.len()
+            && resident == expected.dependencies.len();
         let status = if complete {
             NativePublicationStatus::Complete
-        } else if !expected.commits.is_empty() && present_commits == 0 {
+        } else if (!expected.commits.is_empty() || !expected.proofs.is_empty())
+            && present_commits == 0
+            && present_proofs == 0
+        {
             NativePublicationStatus::Missing
         } else {
             NativePublicationStatus::Partial
@@ -337,6 +392,8 @@ fn inspect_publications(
             status,
             planned_commits: expected.commits.len(),
             present_commits,
+            planned_proofs: expected.proofs.len(),
+            present_proofs,
             required_dependencies: expected.dependencies.len(),
             resident_dependencies: resident,
         });
@@ -353,9 +410,20 @@ fn inspect_publications(
         .iter()
         .map(CollectionPublicationPresence::present_commits)
         .sum::<usize>();
+    let planned_proofs = collections
+        .iter()
+        .map(CollectionPublicationPresence::planned_proofs)
+        .sum::<usize>();
+    let present_proofs = collections
+        .iter()
+        .map(CollectionPublicationPresence::present_proofs)
+        .sum::<usize>();
     let status = if all_complete {
         NativePublicationStatus::Complete
-    } else if planned_commits > 0 && present_commits == 0 {
+    } else if (planned_commits > 0 || planned_proofs > 0)
+        && present_commits == 0
+        && present_proofs == 0
+    {
         NativePublicationStatus::Missing
     } else {
         NativePublicationStatus::Partial
@@ -376,6 +444,8 @@ struct ScopeSnapshot {
 struct CandidateWorld {
     baseline_records: DiscoveredCollectionRecords,
     final_records: DiscoveredCollectionRecords,
+    baseline_proofs: BTreeMap<CapabilityProofId, CapabilityProof>,
+    final_proofs: BTreeMap<CapabilityProofId, CapabilityProof>,
     baseline: BTreeMap<CollectionHandle, ScopeSnapshot>,
     final_scopes: BTreeMap<CollectionHandle, ScopeSnapshot>,
     returned: BTreeMap<CollectionHandle, Vec<CollectionCommit>>,
@@ -415,7 +485,7 @@ where
         let final_fingerprint = PhysicalSourceFingerprint::capture(candidate)
             .context("fingerprint fully published candidate")?;
         validate_world(&world, publications)?;
-        validate_attachments(&world.reader, publications)?;
+        validate_attachments(&world.reader, &world.final_proofs, publications)?;
         validate(&world.reader, &world.views)
             .context("validate faculty-local and cross-collection candidate semantics")?;
 
@@ -472,15 +542,23 @@ fn validate_plan(signer: &SigningKey, publications: &[Publication<'_>]) -> Resul
             );
         }
         match (publication.view, publication.policy) {
-            (CandidateViewKey::Faculty(_), TargetPolicy::Open) => {}
+            (CandidateViewKey::Faculty(_), TargetPolicy::Open) => {
+                if !publication.proof_bundles.is_empty() {
+                    bail!("ordinary faculty publication carries capability proof bundles");
+                }
+            }
             (CandidateViewKey::AccessInbox, TargetPolicy::Open) => {
                 saw_access_inbox = true;
             }
             (CandidateViewKey::Vault(_), TargetPolicy::Vault { authority, write }) => {
+                if !publication.proof_bundles.is_empty() {
+                    bail!("vault publication carries access-inbox proof bundles");
+                }
                 if !saw_access_inbox {
                     bail!("custody vault publication precedes its founder access inbox");
                 }
-                if *authority != signer.verifying_key() || write.subject() != signer.verifying_key()
+                if *authority != signer.verifying_key()
+                    || write.expected_leaf() != signer.verifying_key()
                 {
                     bail!("planned custody vault is not rooted in the durable founder");
                 }
@@ -489,15 +567,12 @@ fn validate_plan(signer: &SigningKey, publications: &[Publication<'_>]) -> Resul
                     CapabilityResource::from(publication.handle),
                 );
                 let verified = write
-                    .proof()
-                    .verify_claim(
+                    .bundle()
+                    .verify(
                         *authority,
                         triblespace::core::clock::epoch_now(),
-                        CapabilityClaim::new(
-                            write.subject(),
-                            atom,
-                            CapabilityMode::InvokeAndDelegate,
-                        ),
+                        write.expected_leaf(),
+                        CapabilityRequest::new(atom, CapabilityMode::InvokeAndDelegate),
                     )
                     .context("verify planned founder WRITE proof")?;
                 if verified.effective_validity().is_some() {
@@ -560,10 +635,20 @@ fn build_world(
     let result =
         (|| {
             let baseline_records = discover_collection_records(&mut pile)?;
+            let baseline_proofs = proof_map(&mut pile)?;
             let namespace = signer.verifying_key();
             let baseline = snapshots(&mut pile, signer, publications)?;
             let mut returned = BTreeMap::new();
             for publication in publications {
+                for bundle in publication.proof_bundles {
+                    faculties::secrets::storage::persist_proof_bundle(&mut pile, bundle)
+                        .with_context(|| {
+                            format!(
+                                "persist {} capability proof closure",
+                                publication.name.as_str()
+                            )
+                        })?;
+                }
                 let mut collection = publication_collection(&mut pile, signer, publication);
                 let handle = collection.collection();
                 let mut commits = Vec::new();
@@ -629,10 +714,13 @@ fn build_world(
             let views = CandidateViews::new(faculty_views, local_vault_views)?;
             drop(discovered);
             let final_records = discover_collection_records(&mut pile)?;
+            let final_proofs = proof_map(&mut pile)?;
             let reader = pile.reader()?;
             Ok(CandidateWorld {
                 baseline_records,
                 final_records,
+                baseline_proofs,
+                final_proofs,
                 baseline,
                 final_scopes,
                 returned,
@@ -679,6 +767,24 @@ fn validate_world(world: &CandidateWorld, publications: &[Publication<'_>]) -> R
         bail!("final collection-record census is not exactly baseline plus returned COMMITs");
     }
 
+    let mut expected_proofs = world.baseline_proofs.clone();
+    for bundle in publications
+        .iter()
+        .flat_map(|publication| publication.proof_bundles)
+    {
+        let proof = bundle.proof().clone();
+        let id = proof.id();
+        if expected_proofs
+            .insert(id, proof.clone())
+            .is_some_and(|previous| previous != proof)
+        {
+            bail!("planned capability proof collides with the frozen source");
+        }
+    }
+    if world.final_proofs != expected_proofs {
+        bail!("final native proof census is not exactly baseline plus planned proofs");
+    }
+
     for publication in publications {
         let handle = publication.handle;
         let baseline = &world.baseline[&handle];
@@ -714,7 +820,29 @@ fn commit_map(commits: &[CollectionCommit]) -> BTreeMap<Id, CollectionCommit> {
         .collect()
 }
 
-fn validate_attachments(reader: &PileReader, publications: &[Publication<'_>]) -> Result<()> {
+fn proof_map(pile: &mut Pile) -> Result<BTreeMap<CapabilityProofId, CapabilityProof>> {
+    let proofs = pile
+        .proofs()
+        .context("enumerate candidate capability proofs")?;
+    let mut by_id = BTreeMap::new();
+    for proof in proofs {
+        let proof = proof.context("read candidate capability proof")?;
+        let id = proof.id();
+        if by_id
+            .insert(id, proof.clone())
+            .is_some_and(|previous| previous != proof)
+        {
+            bail!("candidate capability proof id collision");
+        }
+    }
+    Ok(by_id)
+}
+
+fn validate_attachments(
+    reader: &PileReader,
+    proofs: &BTreeMap<CapabilityProofId, CapabilityProof>,
+    publications: &[Publication<'_>],
+) -> Result<()> {
     for publication in publications {
         for fragment in publication.fragments {
             let mut blobs = fragment.blobs().clone();
@@ -734,6 +862,36 @@ fn validate_attachments(reader: &PileReader, publications: &[Publication<'_>]) -
                 if rehashed.get_handle() != handle || actual.bytes != expected.bytes {
                     bail!(
                         "candidate {} attachment differs from plan",
+                        publication.name.as_str()
+                    );
+                }
+            }
+        }
+        for bundle in publication.proof_bundles {
+            let id = bundle.proof().id();
+            if proofs.get(&id) != Some(bundle.proof()) {
+                bail!(
+                    "candidate {} native proof differs from plan",
+                    publication.name.as_str()
+                );
+            }
+            for (step, (handle, expected)) in bundle
+                .proof()
+                .claim_handles()
+                .zip(bundle.claims())
+                .enumerate()
+            {
+                let actual: triblespace::core::blob::Blob<
+                    triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+                > = reader.get(handle).with_context(|| {
+                    format!(
+                        "read planned {} capability claim {step}",
+                        publication.name.as_str()
+                    )
+                })?;
+                if actual != *expected {
+                    bail!(
+                        "candidate {} capability claim {step} differs from plan",
                         publication.name.as_str()
                     );
                 }
@@ -987,11 +1145,11 @@ mod tests {
     use triblespace::prelude::{blobencodings, BlobStorePut, ExclusiveId, Inline};
 
     use super::*;
+    use crate::collection_cutover::freeze_source;
     use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
-    use crate::collection_cutover::{freeze_source, snapshot_native_collections};
     use crate::legacy_secrets_v1 as legacy_secrets;
     use crate::legacy_secrets_v1::test_support as legacy_fixture;
-    use crate::{secrets_custody_cutover, secrets_cutover, secrets_vault_cutover};
+    use crate::{secrets_cutover, secrets_vault_cutover};
     use faculties::storage::initialize_signer;
 
     /// A REAL scope, not a synthetic id. A root is anchored by a name now, so
@@ -1085,6 +1243,7 @@ mod tests {
             view: CandidateViewKey::Faculty(SCOPE),
             policy: &TargetPolicy::Open,
             fragments,
+            proof_bundles: &[],
             facts,
         }]
     }
@@ -1228,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_secrets_activation_has_no_fixed_target_and_replays_byte_identically() {
+    fn pre_collection_secrets_activation_issues_direct_proofs_and_replays_byte_identically() {
         let fixture = Fixture::new();
         let (legacy, vault, secret, malformed_body, legacy_body) = direct_legacy_fragment(&fixture);
         let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
@@ -1255,6 +1414,12 @@ mod tests {
         assert_eq!(direct.vaults().len(), 1);
         assert_eq!(direct.report().custody_wraps_added(), 1);
         assert_eq!(direct.report().pending_access_envelopes(), 1);
+        assert_eq!(direct.access_bundles().len(), 2);
+        let expected_proofs = direct
+            .access_bundles()
+            .iter()
+            .map(|bundle| (bundle.proof().id(), bundle.proof().clone()))
+            .collect::<BTreeMap<_, _>>();
         let vault_plan = &direct.vaults()[0];
         let vault_collection = faculties::secrets::vault_handle(
             vault,
@@ -1271,6 +1436,7 @@ mod tests {
         let access_plan = PlannedCollection::access_inbox(
             fixture.signer.verifying_key(),
             access_fragments.clone(),
+            direct.access_bundles().iter().cloned(),
             materialized_facts(&access_fragments),
         )
         .unwrap();
@@ -1307,6 +1473,15 @@ mod tests {
         );
 
         let mut pile = open_pile_strict(&fixture.live).unwrap();
+        assert_eq!(proof_map(&mut pile).unwrap(), expected_proofs);
+        let reader = pile.reader().unwrap();
+        for bundle in direct.access_bundles() {
+            for (handle, claim) in bundle.proof().claim_handles().zip(bundle.claims()) {
+                let actual: Blob<triblespace::core::blob::encodings::simplearchive::SimpleArchive> =
+                    reader.get(handle).unwrap();
+                assert_eq!(&actual, claim);
+            }
+        }
         let discovered =
             faculties::secrets::storage::discover_local_vaults(&mut pile, &fixture.signer).unwrap();
         let snapshot = discovered.snapshot().vault_exact(vault_collection).unwrap();
@@ -1356,6 +1531,7 @@ mod tests {
         let replay_access = PlannedCollection::access_inbox(
             fixture.signer.verifying_key(),
             replay_access_fragments.clone(),
+            replay.access_bundles().iter().cloned(),
             materialized_facts(&replay_access_fragments),
         )
         .unwrap();
@@ -1385,188 +1561,6 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, ActivationOutcome::AlreadyActive);
         assert_eq!(fs::read(&fixture.live).unwrap(), before_replay);
-    }
-
-    #[test]
-    fn direct_secrets_migration_preserves_post_v1_versions_and_only_rewraps_their_dek() {
-        let fixture = Fixture::new();
-        let vault = Id::new([0x45; 16]).unwrap();
-        let mut post_v1 =
-            faculties::secrets::legacy_vault_header_fragment(vault, "epoch", at(2)).unwrap();
-        let sealed = faculties::secrets::seal_version(
-            "post-v1",
-            b"the encrypted body must remain byte-identical",
-            fixture.signer.verifying_key().to_bytes(),
-            at(7),
-        )
-        .unwrap();
-        let post_secret = sealed.secret;
-        post_v1 += sealed.fragment;
-        let post_facts = post_v1.facts().clone();
-        let mut post_blobs = post_v1.blobs().clone();
-        let post_reader = post_blobs.reader().unwrap();
-        let post_catalog =
-            faculties::secrets::validate_catalog(&post_reader, vault, &post_facts).unwrap();
-        let post_body = post_catalog.secrets[&post_secret].body;
-        let post_body_bytes: anybytes::Bytes = post_reader.get(post_body).unwrap();
-        let post_body_bytes = post_body_bytes.as_ref().to_vec();
-        let post_wrap = *post_catalog
-            .wraps
-            .values()
-            .find(|wrap| wrap.secret == post_secret)
-            .unwrap();
-        drop(post_reader);
-
-        let direct_descriptor = simplearchive_union::descriptor(
-            &faculties::secrets::vault_name(vault),
-            fixture.signer.verifying_key(),
-            None,
-            triblespace::core::collection::reach::private(),
-        );
-        let legacy_collection = direct_descriptor.facts().clone().to_blob().get_handle();
-        let pile = open_pile_strict(&fixture.live).unwrap();
-        let mut direct_collection = Collection::new(
-            pile,
-            &faculties::secrets::vault_name(vault),
-            fixture.signer.verifying_key(),
-            fixture.signer.clone(),
-            triblespace::core::collection::reach::private(),
-            CollectionAdmission::open(),
-        );
-        direct_collection.commit(post_v1).unwrap();
-        direct_collection.close().unwrap();
-
-        let foreign = text_fragment(0x46, "foreign dormant direct-vault commit");
-        let mut pile = open_pile_strict(&fixture.live).unwrap();
-        simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &direct_descriptor,
-            foreign.clone(),
-            &SigningKey::from_bytes(&[0x46; 32]),
-        )
-        .unwrap();
-        simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &crate::legacy_authority::test_support::descriptor(fixture.signer.verifying_key()),
-            crate::legacy_authority::test_support::root_read_grant(
-                fixture.signer.verifying_key(),
-                legacy_collection,
-            ),
-            &fixture.signer,
-        )
-        .unwrap();
-        pile.close().unwrap();
-
-        let frozen = TestSourceSpec::new(vec![TestBranchSpec::new(
-            legacy_secrets::COLLECTION_NAME,
-            Id::new([0x44; 16]).unwrap(),
-            SigningKey::from_bytes(&[0x44; 32]),
-            vec![TestDeltaSpec::authored(
-                text_fragment(0x47, "not a legacy Secrets catalog"),
-                "retained branch that custody-only migration must ignore",
-            )],
-        )])
-        .freeze(&fixture.live)
-        .unwrap()
-        .source;
-        let mut wrong_lane = frozen.collection_store();
-        let error = secrets_vault_cutover::plan_from_legacy_in_store(
-            &mut wrong_lane,
-            &fixture.signer,
-            frozen.reader(),
-            TribleSet::new(),
-            None,
-        )
-        .err()
-        .expect("legacy lane must reject a native direct-vault generation");
-        assert!(format!("{error:#}").contains("use `migrations secrets-custody"));
-
-        let mut store = frozen.collection_store();
-        let direct = secrets_vault_cutover::plan_from_direct_in_store(
-            &mut store,
-            &fixture.signer,
-            frozen.reader(),
-        )
-        .unwrap();
-        assert_eq!(direct.report().pre_collection_source_facts, 0);
-        assert_eq!(direct.report().direct_source_facts, post_facts.len());
-        assert_eq!(direct.report().source_facts, post_facts.len());
-        assert_eq!(direct.vaults().len(), 1);
-        assert_eq!(direct.vaults()[0].vault, vault);
-        assert_eq!(direct.report().custody_wraps_added(), 1);
-        assert_eq!(direct.report().preserved_wraps(), 1);
-        assert_eq!(direct.report().pending_access_envelopes(), 1);
-        assert_eq!(direct.report().pending_vaults(), 1);
-
-        let mut staged = direct.vaults()[0].required.clone();
-        assert!(post_facts.difference(staged.facts()).is_empty());
-        assert_eq!(
-            foreign.facts().difference(staged.facts()),
-            foreign.facts().clone()
-        );
-        let staged_facts = staged.facts().clone();
-        let staged_reader = staged.blobs_mut().reader().unwrap();
-        let catalog =
-            faculties::secrets::validate_catalog(&staged_reader, vault, &staged_facts).unwrap();
-        assert_eq!(catalog.secrets[&post_secret].body, post_body);
-        assert_eq!(catalog.wraps[&post_wrap.id], post_wrap);
-        assert_eq!(
-            catalog
-                .wraps_for(post_secret, catalog.custody.unwrap().public_key)
-                .len(),
-            1
-        );
-        let staged_body: anybytes::Bytes = staged_reader.get(post_body).unwrap();
-        assert_eq!(staged_body.as_ref(), post_body_bytes);
-        drop(staged_reader);
-
-        let vault_plan = &direct.vaults()[0];
-        let target_collection = faculties::secrets::vault_handle(
-            vault,
-            fixture.signer.verifying_key(),
-            vault_plan.authority,
-        );
-        let custody_source = snapshot_native_collections(&fixture.live).unwrap();
-        let custody = secrets_custody_cutover::plan(&custody_source, &fixture.signer).unwrap();
-        assert_eq!(custody.report().pre_collection_source_facts, 0);
-        assert_eq!(custody.report().direct_source_facts, post_facts.len());
-        assert_eq!(custody.pending_access_commits(), 1);
-        assert_eq!(custody.pending_vault_commits(), 1);
-        let before_activation = fs::read(&fixture.live).unwrap();
-        #[cfg(unix)]
-        let inode = fs::metadata(&fixture.live).unwrap().ino();
-        let outcome = secrets_custody_cutover::activate(&fixture.live, &fixture.signer).unwrap();
-        assert_eq!(
-            outcome,
-            secrets_custody_cutover::AdditiveActivationOutcome::Published { commits: 2 }
-        );
-        let after_activation = fs::read(&fixture.live).unwrap();
-        assert!(after_activation.starts_with(&before_activation));
-        #[cfg(unix)]
-        assert_eq!(fs::metadata(&fixture.live).unwrap().ino(), inode);
-
-        let mut pile = open_pile_strict(&fixture.live).unwrap();
-        let discovered =
-            faculties::secrets::storage::discover_local_vaults(&mut pile, &fixture.signer).unwrap();
-        assert_eq!(discovered.snapshot().vaults().len(), 1);
-        assert!(discovered.location_exact(legacy_collection).is_none());
-        let target = discovered
-            .snapshot()
-            .vault_exact(target_collection)
-            .unwrap();
-        assert_eq!(target.catalog().secrets[&post_secret].body, post_body);
-        assert_eq!(target.catalog().wraps[&post_wrap.id], post_wrap);
-        drop(discovered);
-        pile.close().unwrap();
-
-        let replay_source = snapshot_native_collections(&fixture.live).unwrap();
-        let replay = secrets_custody_cutover::plan(&replay_source, &fixture.signer).unwrap();
-        assert_eq!(replay.pending_commits(), 0);
-        let outcome = secrets_custody_cutover::activate(&fixture.live, &fixture.signer).unwrap();
-        assert_eq!(
-            outcome,
-            secrets_custody_cutover::AdditiveActivationOutcome::AlreadyActive
-        );
     }
 
     #[test]
@@ -1913,7 +1907,7 @@ mod tests {
         let publications = publications(&fragment, &fixture.signer);
         let mut pile = open_pile_strict(&fixture.live).unwrap();
         let reader = pile.reader().unwrap();
-        let error = validate_attachments(&reader, &publications).unwrap_err();
+        let error = validate_attachments(&reader, &BTreeMap::new(), &publications).unwrap_err();
         pile.close().unwrap();
         assert!(format!("{error:#}").contains("read planned wiki attachment"));
     }

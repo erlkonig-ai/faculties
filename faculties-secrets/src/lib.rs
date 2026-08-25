@@ -2,7 +2,7 @@
 //!
 //! One vault epoch is one private `SimpleArchive`-union collection with one
 //! random custody keypair. Every new secret has one DEK wrap to that custody
-//! key. Exact blob-native `READ(vault)` proofs authorize subject-specific
+//! key. Exact native `READ(vault)` proof bundles authorize subject-specific
 //! delivery of the custody seed; they are never enumerated into ambient
 //! membership. Collection `WRITE` remains a separate exact capability.
 
@@ -18,7 +18,7 @@ use dryoc::types::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::Epoch;
 use triblespace::core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
+    CapabilityAction, CapabilityAtom, CapabilityMode, CapabilityProofBundle, CapabilityRequest,
     CapabilityResource,
 };
 use triblespace::core::collection::{
@@ -48,9 +48,11 @@ pub const ACTION_READ: Id = triblespace::macros::id_hex!("A6378B816786E9F08A579B
 
 /// Version marker at the start of every sealed custody-seed plaintext.
 ///
-/// Minted with `trible genid` on 2026-08-24.
+/// Minted with `trible genid` on 2026-08-25 for the direct-proof envelope
+/// frame. The prior unpublished leaf-credential format has no runtime
+/// compatibility path; only the explicit one-time migration recognizes it.
 pub const ACCESS_ENVELOPE_FORMAT_V1: Id =
-    triblespace::macros::id_hex!("B4A31C5D175AD83A341C3BABBB1138A7");
+    triblespace::macros::id_hex!("0444B547B64A83CB156D3CAA917DAB89");
 
 pub const VAULT_NAME_PREFIX: &str = "vault-";
 pub const VAULT_NAME_DIGITS: usize = 25;
@@ -232,7 +234,7 @@ pub struct VaultAccess {
     collection: CollectionHandle,
     subject: VerifyingKey,
     custody: SigningKey,
-    read_proofs: Vec<CapabilityProof>,
+    read_bundles: Vec<CapabilityProofBundle>,
     write_presentations: Vec<CapabilityPresentation>,
 }
 
@@ -243,11 +245,11 @@ impl VaultAccess {
         trust_root: VerifyingKey,
         subject: VerifyingKey,
         custody: SigningKey,
-        read_proofs: Vec<CapabilityProof>,
+        read_bundles: Vec<CapabilityProofBundle>,
         write_presentations: Vec<CapabilityPresentation>,
     ) -> Result<Self> {
-        if read_proofs.is_empty() {
-            bail!("vault access requires at least one exact READ proof");
+        if read_bundles.is_empty() {
+            bail!("vault access requires at least one exact READ proof bundle");
         }
         if write_presentations.is_empty() {
             bail!("vault access requires at least one exact WRITE presentation");
@@ -259,7 +261,7 @@ impl VaultAccess {
             collection,
             subject,
             custody,
-            read_proofs,
+            read_bundles,
             write_presentations,
         };
         let instant = triblespace::core::clock::epoch_now();
@@ -288,8 +290,8 @@ impl VaultAccess {
         &self.custody
     }
 
-    pub fn read_proofs(&self) -> &[CapabilityProof] {
-        &self.read_proofs
+    pub fn read_bundles(&self) -> &[CapabilityProofBundle] {
+        &self.read_bundles
     }
 
     pub fn write_presentations(&self) -> &[CapabilityPresentation] {
@@ -305,10 +307,10 @@ impl VaultAccess {
             CapabilityAction::new(ACTION_READ),
             CapabilityResource::from(self.collection),
         );
-        let claim = CapabilityClaim::new(self.subject, atom, CapabilityMode::Invoke);
+        let request = CapabilityRequest::new(atom, CapabilityMode::Invoke);
         let mut failures = Vec::new();
-        for proof in &self.read_proofs {
-            match proof.verify_claim(self.trust_root, instant, claim) {
+        for bundle in &self.read_bundles {
+            match bundle.verify(self.trust_root, instant, self.subject, request) {
                 Ok(_) => return Ok(()),
                 Err(error) => failures.push(error.to_string()),
             }
@@ -331,11 +333,12 @@ impl VaultAccess {
         );
         for (index, presentation) in self.write_presentations.iter().enumerate() {
             let verified = presentation
-                .proof()
-                .verify_claim(
+                .bundle()
+                .verify(
                     self.trust_root,
                     instant,
-                    CapabilityClaim::new(presentation.subject(), atom, CapabilityMode::Invoke),
+                    presentation.expected_leaf(),
+                    CapabilityRequest::new(atom, CapabilityMode::Invoke),
                 )
                 .with_context(|| format!("verify vault WRITE presentation {index}"))?;
             if verified.effective_validity().is_some() {
@@ -1204,7 +1207,7 @@ mod tests {
     use super::*;
     use rand_core::OsRng;
     use triblespace::core::blob::IntoBlob;
-    use triblespace::core::capability::{CapabilityGrant, CapabilityProofStep};
+    use triblespace::core::capability::CapabilityClaim;
     use triblespace::core::collection::descriptor as descriptor_facts;
     use triblespace::core::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
@@ -1230,17 +1233,19 @@ mod tests {
         )
     }
 
-    fn root_proof(
+    fn root_bundle(
         root: &SigningKey,
         subject: VerifyingKey,
         collection: CollectionHandle,
         action: Id,
         mode: CapabilityMode,
-    ) -> CapabilityProof {
-        CapabilityProof::new(vec![CapabilityProofStep::issue(
+    ) -> CapabilityProofBundle {
+        CapabilityProofBundle::issue_root(
             root,
-            CapabilityGrant::root(subject, atom(collection, action), mode, None),
-        )])
+            CapabilityClaim::root(atom(collection, action), mode, None),
+            subject,
+        )
+        .unwrap()
     }
 
     fn catalog_from_fragment(vault: Id, fragment: &mut Fragment) -> VaultCatalog {
@@ -1559,14 +1564,14 @@ mod tests {
         let outsider = key(4);
         let custody = SigningKey::generate(&mut OsRng);
         let collection = vault_handle(vault, namespace, root.verifying_key());
-        let read = root_proof(
+        let read = root_bundle(
             &root,
             subject.verifying_key(),
             collection,
             ACTION_READ,
             CapabilityMode::InvokeAndDelegate,
         );
-        let write = root_proof(
+        let write = root_bundle(
             &root,
             subject.verifying_key(),
             collection,
@@ -1574,14 +1579,11 @@ mod tests {
             CapabilityMode::Invoke,
         );
         write
-            .verify_claim(
+            .verify(
                 root.verifying_key(),
                 triblespace::core::clock::epoch_now(),
-                CapabilityClaim::new(
-                    subject.verifying_key(),
-                    atom(collection, ACTION_WRITE),
-                    CapabilityMode::Invoke,
-                ),
+                subject.verifying_key(),
+                CapabilityRequest::new(atom(collection, ACTION_WRITE), CapabilityMode::Invoke),
             )
             .unwrap();
 
@@ -1634,7 +1636,7 @@ mod tests {
         assert!(snapshot.open(secret, &outsider).is_err());
 
         let wrong_resource = vault_handle(id(41), namespace, root.verifying_key());
-        let wrong_read = root_proof(
+        let wrong_read = root_bundle(
             &root,
             subject.verifying_key(),
             wrong_resource,
@@ -1655,7 +1657,7 @@ mod tests {
         )
         .is_err());
 
-        let wrong_subject_read = root_proof(
+        let wrong_subject_read = root_bundle(
             &root,
             outsider.verifying_key(),
             collection,
@@ -1696,7 +1698,7 @@ mod tests {
         )
         .is_err());
 
-        let wrong_write = root_proof(
+        let wrong_write = root_bundle(
             &root,
             subject.verifying_key(),
             wrong_resource,

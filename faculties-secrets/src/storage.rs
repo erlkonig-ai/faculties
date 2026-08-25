@@ -16,8 +16,8 @@ use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityGrant, CapabilityMode,
-    CapabilityProof, CapabilityProofStep, CapabilityResource,
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+    CapabilityProofId, CapabilityRequest, CapabilityResource,
 };
 use triblespace::core::collection::{
     descriptor, reach, simplearchive_union, CapabilityPresentation, CollectionAdmission,
@@ -27,12 +27,12 @@ use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::metadata;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pile::{GetBlobError, Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::{
+    BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofStore,
+};
 use triblespace::prelude::*;
 
-use super::access::{
-    build_access_envelope, load_access_envelope, open_access_envelope, read_proof_issuer,
-};
+use super::access::{build_access_envelope, load_access_envelope, open_access_envelope};
 use super::schema::{KIND_ACCESS_ENVELOPE, KIND_VAULT};
 use super::{
     load_catalog, parse_vault_name, seal_version, validate_catalog, vault_collection,
@@ -409,6 +409,66 @@ fn header_count(facts: &TribleSet) -> usize {
     .count()
 }
 
+fn load_proof_bundle<S, R>(
+    store: &mut S,
+    reader: &R,
+    id: CapabilityProofId,
+    label: &str,
+) -> Result<CapabilityProofBundle>
+where
+    S: CapabilityProofStore,
+    R: BlobStoreGet,
+{
+    let proof = store
+        .proof(id)
+        .map_err(|error| anyhow!("look up exact {label} proof: {error}"))?
+        .ok_or_else(|| anyhow!("exact {label} proof is not resident"))?;
+    if proof.id() != id {
+        bail!("proof store returned the wrong {label} proof id");
+    }
+    let claims = proof
+        .claim_handles()
+        .enumerate()
+        .map(|(step, handle)| {
+            reader
+                .get::<Blob<SimpleArchive>, _>(handle)
+                .map_err(|error| anyhow!("read {label} claim {step}: {error}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(CapabilityProofBundle::new(proof, claims))
+}
+
+/// Persist one explicit proof closure in publication order: all named claims,
+/// then the native proof record that makes its exact id discoverable.
+///
+/// Storage does not confer authority. Callers must verify the bundle against
+/// their exact root, subject, action, resource, mode, and instant before using
+/// it for an authorization decision.
+pub fn persist_proof_bundle<S>(store: &mut S, bundle: &CapabilityProofBundle) -> Result<()>
+where
+    S: BlobStorePut + CapabilityProofStore,
+{
+    let handles = bundle.proof().claim_handles().collect::<Vec<_>>();
+    if handles.len() != bundle.claims().len() {
+        bail!(
+            "proof names {} claims but its bundle carries {}",
+            handles.len(),
+            bundle.claims().len()
+        );
+    }
+    for (step, (expected, claim)) in handles.into_iter().zip(bundle.claims()).enumerate() {
+        let actual = store
+            .put::<SimpleArchive, _>(claim.clone())
+            .map_err(|error| anyhow!("persist capability claim {step}: {error}"))?;
+        if actual != expected {
+            bail!("capability claim {step} does not match its proof handle");
+        }
+    }
+    store
+        .insert_proof(bundle.proof().clone())
+        .map_err(|error| anyhow!("persist exact capability proof: {error}"))
+}
+
 /// One commit-local access-inbox candidate whose descriptor, proofs, sealed
 /// seed, and delivery signer have all been validated.
 ///
@@ -420,9 +480,9 @@ pub struct ValidatedAccessCandidate {
     publisher: VerifyingKey,
     location: VaultLocation,
     custody: SigningKey,
-    read_proof: CapabilityProof,
+    read_bundle: CapabilityProofBundle,
     writer: VerifyingKey,
-    write_proof: CapabilityProof,
+    write_bundle: CapabilityProofBundle,
 }
 
 impl ValidatedAccessCandidate {
@@ -442,16 +502,16 @@ impl ValidatedAccessCandidate {
         &self.custody
     }
 
-    pub fn read_proof(&self) -> &CapabilityProof {
-        &self.read_proof
+    pub fn read_bundle(&self) -> &CapabilityProofBundle {
+        &self.read_bundle
     }
 
     pub fn writer(&self) -> VerifyingKey {
         self.writer
     }
 
-    pub fn write_proof(&self) -> &CapabilityProof {
-        &self.write_proof
+    pub fn write_bundle(&self) -> &CapabilityProofBundle {
+        &self.write_bundle
     }
 }
 
@@ -462,7 +522,9 @@ pub fn discover_access_candidates<S>(
     recipient: &SigningKey,
 ) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)>
 where
-    S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
+    S: BlobStore<Reader = PileReader>
+        + CapabilityProofStore
+        + triblespace::core::collection::CollectionStore,
 {
     discover_access_candidates_with(store, recipient, parse_descriptor)
 }
@@ -475,10 +537,14 @@ where
 /// authority, and sealed-frame readability before touching durable storage.
 pub fn discover_staged_access_candidates(
     fragments: &[Fragment],
+    bundles: &[CapabilityProofBundle],
     recipient: &SigningKey,
     publisher: &SigningKey,
 ) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)> {
     let mut scratch = MemoryRepo::default();
+    for bundle in bundles {
+        persist_proof_bundle(&mut scratch, bundle)?;
+    }
     for fragment in fragments {
         access_inbox_collection(&mut scratch, recipient.verifying_key(), publisher.clone())
             .commit(fragment.clone())
@@ -493,7 +559,7 @@ fn discover_access_candidates_with<S, F>(
     mut parse: F,
 ) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)>
 where
-    S: BlobStore + triblespace::core::collection::CollectionStore,
+    S: BlobStore + CapabilityProofStore + triblespace::core::collection::CollectionStore,
     S::Reader: BlobStoreMeta,
     F: FnMut(
         &S::Reader,
@@ -604,22 +670,59 @@ where
                     continue;
                 }
             };
-            let opened =
-                match open_access_envelope(&reader, &row, recipient, location.authority, instant) {
-                    Ok(opened) => opened,
-                    Err(error) => {
-                        commit_valid = false;
-                        issues.push(issue(
-                            VaultDiscoveryIssueKind::InvalidEnvelope,
-                            Some(id),
-                            Some(location.authority),
-                            location.collection,
-                            Some(location.vault),
-                            error.to_string(),
-                        ));
-                        continue;
-                    }
-                };
+            let read_bundle = match load_proof_bundle(store, &reader, row.read_proof, "READ") {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    commit_valid = false;
+                    issues.push(issue(
+                        VaultDiscoveryIssueKind::InvalidEnvelope,
+                        Some(id),
+                        Some(location.authority),
+                        location.collection,
+                        Some(location.vault),
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+            let write_bundle = match load_proof_bundle(store, &reader, row.write_proof, "WRITE") {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    commit_valid = false;
+                    issues.push(issue(
+                        VaultDiscoveryIssueKind::InvalidEnvelope,
+                        Some(id),
+                        Some(location.authority),
+                        location.collection,
+                        Some(location.vault),
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+            let opened = match open_access_envelope(
+                &reader,
+                &row,
+                recipient,
+                location.authority,
+                instant,
+                read_bundle,
+                write_bundle,
+            ) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    commit_valid = false;
+                    issues.push(issue(
+                        VaultDiscoveryIssueKind::InvalidEnvelope,
+                        Some(id),
+                        Some(location.authority),
+                        location.collection,
+                        Some(location.vault),
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
             if publisher != opened.read_issuer {
                 commit_valid = false;
                 issues.push(issue(
@@ -637,9 +740,9 @@ where
                 publisher,
                 location,
                 custody: opened.custody,
-                read_proof: opened.read_proof,
+                read_bundle: opened.read_bundle,
                 writer: opened.writer,
-                write_proof: opened.write_proof,
+                write_bundle: opened.write_bundle,
             });
         }
         if commit_valid {
@@ -653,7 +756,7 @@ fn presentations(candidates: &[ValidatedAccessCandidate]) -> Vec<CapabilityPrese
     candidates
         .iter()
         .map(|candidate| {
-            CapabilityPresentation::new(candidate.writer, candidate.write_proof.clone())
+            CapabilityPresentation::new(candidate.writer, candidate.write_bundle.clone())
         })
         .collect()
 }
@@ -672,25 +775,31 @@ fn write_atom(collection: CollectionHandle) -> CapabilityAtom {
     )
 }
 
-fn root_proof(root: &SigningKey, atom: CapabilityAtom, mode: CapabilityMode) -> CapabilityProof {
-    CapabilityProof::new(vec![CapabilityProofStep::issue(
+fn root_bundle(
+    root: &SigningKey,
+    atom: CapabilityAtom,
+    mode: CapabilityMode,
+) -> CapabilityProofBundle {
+    CapabilityProofBundle::issue_root(
         root,
-        CapabilityGrant::root(root.verifying_key(), atom, mode, None),
-    )])
+        CapabilityClaim::root(atom, mode, None),
+        root.verifying_key(),
+    )
+    .expect("a parentless root claim is issuable")
 }
 
 /// Root-issued, unbounded founder proofs for one exact vault.
 pub fn founder_proofs(
     root: &SigningKey,
     location: VaultLocation,
-) -> (CapabilityProof, CapabilityProof) {
+) -> (CapabilityProofBundle, CapabilityProofBundle) {
     (
-        root_proof(
+        root_bundle(
             root,
             read_atom(location.collection),
             CapabilityMode::InvokeAndDelegate,
         ),
-        root_proof(
+        root_bundle(
             root,
             write_atom(location.collection),
             CapabilityMode::InvokeAndDelegate,
@@ -713,7 +822,7 @@ fn retain_descriptor(fragment: &mut Fragment, location: VaultLocation) -> Result
 ///
 /// The publisher must be the exact issuer of the READ leaf. This makes the
 /// inbox COMMIT the delivery signature and prevents a third party from copying
-/// valid proof blobs while substituting a different custody seed.
+/// valid proof evidence while substituting a different custody seed.
 #[allow(clippy::too_many_arguments)]
 pub fn publish_access_envelope(
     store: &mut Pile,
@@ -721,23 +830,23 @@ pub fn publish_access_envelope(
     location: VaultLocation,
     custody: &SigningKey,
     subject: VerifyingKey,
-    read_proof: &CapabilityProof,
+    read_bundle: &CapabilityProofBundle,
     writer: VerifyingKey,
-    write_proof: &CapabilityProof,
+    write_bundle: &CapabilityProofBundle,
     instant: Epoch,
 ) -> Result<Id> {
     let mut envelope = build_access_envelope(
         location.collection,
         custody,
         subject,
-        read_proof,
+        read_bundle,
         writer,
-        write_proof,
+        write_bundle,
         location.authority,
         instant,
     )
     .context("build custody access envelope")?;
-    let issuer = read_proof_issuer(read_proof, location.authority, "READ")?;
+    let issuer = read_bundle.proof().leaf_issuer();
     if publisher.verifying_key() != issuer {
         bail!("access-inbox publisher is not the exact READ leaf issuer");
     }
@@ -745,6 +854,8 @@ pub fn publish_access_envelope(
         .root()
         .context("access envelope did not export its intrinsic id")?;
     retain_descriptor(&mut envelope, location)?;
+    persist_proof_bundle(store, read_bundle).context("persist READ proof closure")?;
+    persist_proof_bundle(store, write_bundle).context("persist WRITE proof closure")?;
     access_inbox_collection(&mut *store, subject, publisher.clone())
         .commit(envelope)
         .context("publish subject-specific access envelope")?;
@@ -759,7 +870,9 @@ pub fn publish_access_envelope(
 /// custody key are discarded only after the real vault catalog is known.
 pub fn discover_local_vaults<S>(store: &mut S, signing_key: &SigningKey) -> Result<VaultDiscovery>
 where
-    S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
+    S: BlobStore<Reader = PileReader>
+        + CapabilityProofStore
+        + triblespace::core::collection::CollectionStore,
 {
     let (candidates, mut issues) = discover_access_candidates(store, signing_key)?;
     let mut by_collection = BTreeMap::<CollectionHandle, Vec<ValidatedAccessCandidate>>::new();
@@ -867,7 +980,7 @@ where
             first.custody.clone(),
             matching
                 .iter()
-                .map(|candidate| candidate.read_proof.clone())
+                .map(|candidate| candidate.read_bundle.clone())
                 .collect(),
             presentations(&candidates),
         ) {
@@ -910,19 +1023,6 @@ fn fresh_custody_key() -> SigningKey {
     SigningKey::from_bytes(seed.as_array())
 }
 
-fn proof_allows(
-    proof: &CapabilityProof,
-    root: VerifyingKey,
-    subject: VerifyingKey,
-    atom: CapabilityAtom,
-    mode: CapabilityMode,
-    instant: Epoch,
-) -> bool {
-    proof
-        .verify_claim(root, instant, CapabilityClaim::new(subject, atom, mode))
-        .is_ok()
-}
-
 /// Create one capability-anchored custody vault.
 ///
 /// The founder envelope is published first.  A retry reuses a valid
@@ -958,12 +1058,12 @@ pub fn create_vault(
             candidate.location == location
                 && candidate.writer == signing_key.verifying_key()
                 && candidate
-                    .read_proof
-                    .verify_claim(
+                    .read_bundle
+                    .verify(
                         authority,
                         instant,
-                        CapabilityClaim::new(
-                            signing_key.verifying_key(),
+                        signing_key.verifying_key(),
+                        CapabilityRequest::new(
                             read_atom(collection),
                             CapabilityMode::InvokeAndDelegate,
                         ),
@@ -1106,48 +1206,37 @@ pub fn add_secret<R: BlobStoreGet>(
     Ok(secret)
 }
 
-fn delegating_read_proof(
+fn delegating_read_bundle(
     access: &VaultAccess,
     issuer: &SigningKey,
     recipient: VerifyingKey,
     instant: Epoch,
-) -> Result<CapabilityProof> {
+) -> Result<CapabilityProofBundle> {
     if issuer.verifying_key() != access.subject() {
         bail!("vault READ delegation requires the access-envelope subject key");
     }
     let atom = read_atom(access.collection());
-    for parent in access.read_proofs() {
-        if !proof_allows(
-            parent,
+    for parent in access.read_bundles() {
+        let verified = match parent.verify(
             access.trust_root(),
-            issuer.verifying_key(),
-            atom,
-            CapabilityMode::InvokeAndDelegate,
             instant,
+            issuer.verifying_key(),
+            CapabilityRequest::new(atom, CapabilityMode::InvokeAndDelegate),
         ) {
-            continue;
-        }
-        let parent_credential = parent
-            .credential()
-            .expect("a verified nonempty proof has a leaf credential");
-        let child = CapabilityProofStep::issue(
-            issuer,
-            CapabilityGrant::delegated(
-                parent_credential,
-                recipient,
-                atom,
-                CapabilityMode::Invoke,
-                None,
-            ),
-        );
-        let mut steps = parent.steps().to_vec();
-        steps.push(child);
-        let child = CapabilityProof::new(steps);
+            Ok(verified) => verified,
+            Err(_) => continue,
+        };
+        let child_claim =
+            CapabilityClaim::delegated(verified.claim_handle(), atom, CapabilityMode::Invoke, None);
+        let child = verified
+            .delegate(issuer, child_claim, recipient)
+            .context("issue delegated READ proof")?;
         child
-            .verify_claim(
+            .verify(
                 access.trust_root(),
                 instant,
-                CapabilityClaim::new(recipient, atom, CapabilityMode::Invoke),
+                recipient,
+                CapabilityRequest::new(atom, CapabilityMode::Invoke),
             )
             .context("verify newly delegated READ proof")?;
         return Ok(child);
@@ -1174,16 +1263,14 @@ pub fn grant_vault_read<R: BlobStoreGet>(
         .access_exact(location.collection)
         .expect("checked_vault requires access");
     let instant = triblespace::core::clock::epoch_now();
-    let child_read = delegating_read_proof(access, signing_key, recipient, instant)?;
+    let child_read = delegating_read_bundle(access, signing_key, recipient, instant)?;
     let mut envelope_ids = Vec::new();
     let mut envelopes = Fragment::empty();
     let mut seen = BTreeSet::new();
+    let mut write_bundles = Vec::new();
     for writer in access.write_presentations() {
-        let credential = writer
-            .proof()
-            .credential()
-            .context("vault WRITE presentation has no leaf credential")?;
-        if !seen.insert((writer.subject().to_bytes(), credential.raw)) {
+        let proof_id = writer.bundle().proof().id();
+        if !seen.insert((writer.expected_leaf().to_bytes(), proof_id.raw)) {
             continue;
         }
         let envelope = build_access_envelope(
@@ -1191,8 +1278,8 @@ pub fn grant_vault_read<R: BlobStoreGet>(
             access.custody(),
             recipient,
             &child_read,
-            writer.subject(),
-            writer.proof(),
+            writer.expected_leaf(),
+            writer.bundle(),
             access.trust_root(),
             instant,
         )
@@ -1203,11 +1290,17 @@ pub fn grant_vault_read<R: BlobStoreGet>(
                 .context("delegated access envelope did not export its intrinsic id")?,
         );
         envelopes += envelope;
+        write_bundles.push(writer.bundle().clone());
     }
     if envelope_ids.is_empty() {
         bail!("vault access has no distinct WRITE presentation");
     }
     retain_descriptor(&mut envelopes, *location)?;
+    persist_proof_bundle(store, &child_read).context("persist delegated READ proof closure")?;
+    for (index, bundle) in write_bundles.iter().enumerate() {
+        persist_proof_bundle(store, bundle)
+            .with_context(|| format!("persist WRITE presentation {index}"))?;
+    }
     access_inbox_collection(&mut *store, recipient, signing_key.clone())
         .commit(envelopes)
         .context("publish complete delegated access envelope set")?;
@@ -1324,19 +1417,27 @@ mod tests {
 
         let (founder_read, founder_write) = founder_proofs(&founder, location);
         let write_atom = write_atom(location.collection());
-        let parent = founder_write.credential().unwrap();
-        let mut writer_steps = founder_write.steps().to_vec();
-        writer_steps.push(CapabilityProofStep::issue(
-            &founder,
-            CapabilityGrant::delegated(
-                parent,
+        let instant = triblespace::core::clock::epoch_now();
+        let verified_founder_write = founder_write
+            .verify(
+                founder.verifying_key(),
+                instant,
+                founder.verifying_key(),
+                CapabilityRequest::new(write_atom, CapabilityMode::InvokeAndDelegate),
+            )
+            .unwrap();
+        let writer_write = verified_founder_write
+            .delegate(
+                &founder,
+                CapabilityClaim::delegated(
+                    verified_founder_write.claim_handle(),
+                    write_atom,
+                    CapabilityMode::Invoke,
+                    None,
+                ),
                 writer.verifying_key(),
-                write_atom,
-                CapabilityMode::Invoke,
-                None,
-            ),
-        ));
-        let writer_write = CapabilityProof::new(writer_steps);
+            )
+            .unwrap();
         publish_access_envelope(
             &mut pile,
             &founder,
@@ -1466,15 +1567,16 @@ mod tests {
             instant + hifitime::Duration::from_seconds(3600.0),
         )
         .unwrap();
-        let bounded_read = CapabilityProof::new(vec![CapabilityProofStep::issue(
+        let bounded_read = CapabilityProofBundle::issue_root(
             &founder,
-            CapabilityGrant::root(
-                founder.verifying_key(),
+            CapabilityClaim::root(
                 read_atom(location.collection()),
                 CapabilityMode::InvokeAndDelegate,
                 Some(validity),
             ),
-        )]);
+            founder.verifying_key(),
+        )
+        .unwrap();
         let (_, write) = founder_proofs(&founder, location);
         publish_access_envelope(
             &mut pile,
@@ -1567,6 +1669,8 @@ mod tests {
         retain_descriptor(&mut delivery, location).unwrap();
 
         let mut pile = files.open();
+        persist_proof_bundle(&mut pile, &read).unwrap();
+        persist_proof_bundle(&mut pile, &write).unwrap();
         access_inbox_collection(&mut pile, founder.verifying_key(), founder.clone())
             .commit(delivery)
             .unwrap();

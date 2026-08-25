@@ -34,14 +34,16 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob, MemoryBlobStore};
+use triblespace::core::capability::{CapabilityProof, CapabilityProofId};
 use triblespace::core::collection::{CollectionRecord, CollectionStore};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{
-    self, BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinSnapshotSource,
+    self, BlobStore, BlobStoreGet, BlobStorePut, CapabilityProofStore, CommitHandle,
+    PinSnapshotSource,
 };
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::{entity, find, pattern};
@@ -245,23 +247,12 @@ pub struct FrozenSource {
     collections: FrozenCollectionStore,
 }
 
-/// One append-stable snapshot of native collection records and their blobs.
-///
-/// Records are captured before the blob reader. Concurrent appenders may
-/// therefore make the reader a strict superset of the record set, but every
-/// captured record's complete dependency prefix is necessarily readable.
-/// Unlike [`FrozenSource`], this does not hash or freeze the physical pile:
-/// unrelated later appends commute with a native additive migration.
-pub struct NativeCollectionSnapshot {
-    reader: PileReader,
-    collections: FrozenCollectionStore,
-}
-
 /// Read-only native collection records captured beside the frozen blob reader.
 #[derive(Clone)]
 pub(crate) struct FrozenCollectionStore {
     reader: PileReader,
     records: Vec<CollectionRecord>,
+    proofs: Vec<CapabilityProof>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,6 +304,33 @@ impl CollectionStore for FrozenCollectionStore {
     }
 
     fn insert(&mut self, _record: CollectionRecord) -> std::result::Result<(), Self::InsertError> {
+        Err(FrozenStoreWriteError)
+    }
+}
+
+impl CapabilityProofStore for FrozenCollectionStore {
+    type ProofsError = Infallible;
+    type InsertError = FrozenStoreWriteError;
+    type ProofIter<'a> = std::vec::IntoIter<Result<CapabilityProof, Infallible>>;
+
+    fn proofs<'a>(&'a mut self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+        Ok(self
+            .proofs
+            .iter()
+            .cloned()
+            .map(Ok)
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
+
+    fn proof(
+        &mut self,
+        id: CapabilityProofId,
+    ) -> Result<Option<CapabilityProof>, Self::ProofsError> {
+        Ok(self.proofs.iter().find(|proof| proof.id() == id).cloned())
+    }
+
+    fn insert_proof(&mut self, _proof: CapabilityProof) -> Result<(), Self::InsertError> {
         Err(FrozenStoreWriteError)
     }
 }
@@ -406,58 +424,6 @@ impl FrozenSource {
             deltas,
         }))
     }
-}
-
-impl NativeCollectionSnapshot {
-    pub fn reader(&self) -> &PileReader {
-        &self.reader
-    }
-
-    pub(crate) fn collection_store(&self) -> FrozenCollectionStore {
-        self.collections.clone()
-    }
-}
-
-/// Capture only the native collection state needed by an additive migration.
-///
-/// This deliberately has no unchanged-file assertion. A collection record is
-/// visible only after its content-addressed dependencies, and pile appends are
-/// atomic at the record boundary, so a fixed record set plus a reader captured
-/// immediately afterwards is a coherent monotone source snapshot even while
-/// unrelated writers continue appending.
-pub fn snapshot_native_collections(path: &Path) -> Result<NativeCollectionSnapshot> {
-    let mut pile = open_pile_strict(path)?;
-    let result = snapshot_native_collections_in(&mut pile);
-    let close = pile.close();
-    match (result, close) {
-        (Ok(snapshot), Ok(())) => Ok(snapshot),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(anyhow!("close native collection snapshot: {error}")),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing snapshot also failed: {close_error}")))
-        }
-    }
-}
-
-/// Capture a native collection snapshot without reopening an already-owned
-/// pile. `records()` and `reader()` each refresh, so the second call includes
-/// every dependency needed by the fixed record prefix captured by the first.
-pub(crate) fn snapshot_native_collections_in(pile: &mut Pile) -> Result<NativeCollectionSnapshot> {
-    let records = pile
-        .records()
-        .context("snapshot native collection records")?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("decode native collection record snapshot")?;
-    let reader = pile
-        .reader()
-        .context("snapshot native collection blobs after records")?;
-    Ok(NativeCollectionSnapshot {
-        collections: FrozenCollectionStore {
-            reader: reader.clone(),
-            records,
-        },
-        reader,
-    })
 }
 
 /// Project every authored legacy delta into self-contained content and
@@ -886,15 +852,20 @@ pub fn freeze_source(path: &Path) -> Result<FrozenSource> {
             .context("snapshot frozen native collection records")?
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("decode frozen native collection record")?;
+        let proofs = pile
+            .proofs()
+            .context("snapshot frozen native capability proofs")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("decode frozen native capability proof")?;
         for pin in &legacy_pins {
             let _: TribleSet = reader
                 .get(pin.value)
                 .with_context(|| format!("read frozen legacy pin {:X}", pin.id))?;
         }
-        Ok((legacy_pins, reader, records))
+        Ok((legacy_pins, reader, records, proofs))
     })();
     let close = pile.close();
-    let (legacy_pins, reader, records) = match (result, close) {
+    let (legacy_pins, reader, records, proofs) = match (result, close) {
         (Ok(value), Ok(())) => value,
         (Err(error), Ok(())) => return Err(error),
         (Ok(_), Err(error)) => return Err(anyhow!("close frozen source pile: {error}")),
@@ -915,6 +886,7 @@ pub fn freeze_source(path: &Path) -> Result<FrozenSource> {
         collections: FrozenCollectionStore {
             reader: reader.clone(),
             records,
+            proofs,
         },
         reader,
     })
@@ -1025,7 +997,9 @@ pub(crate) mod test_support {
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::{Inline, TryToInline};
     use triblespace::core::metadata;
-    use triblespace::core::repo::{self, BlobStore, BlobStorePut, CommitHandle};
+    use triblespace::core::repo::{
+        self, BlobStore, BlobStorePut, CapabilityProofStore, CommitHandle,
+    };
     use triblespace::core::trible::{Fragment, TribleSet};
     use triblespace::macros::entity;
 
@@ -1158,6 +1132,10 @@ pub(crate) mod test_support {
                 .records()
                 .context("snapshot immutable fixture collection records")?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            let proofs = pile
+                .proofs()
+                .context("snapshot immutable fixture capability proofs")?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             pile.close()
                 .context("close immutable legacy fixture pile")?;
             let physical_fingerprint = PhysicalSourceFingerprint::capture(path)?;
@@ -1171,6 +1149,7 @@ pub(crate) mod test_support {
                     collections: FrozenCollectionStore {
                         reader: reader.clone(),
                         records,
+                        proofs,
                     },
                     reader,
                 },
@@ -1603,6 +1582,7 @@ mod tests {
             collections: FrozenCollectionStore {
                 reader: detached_reader.clone(),
                 records: Vec::new(),
+                proofs: Vec::new(),
             },
             reader: detached_reader,
         };

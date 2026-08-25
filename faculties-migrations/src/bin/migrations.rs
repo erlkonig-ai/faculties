@@ -9,9 +9,8 @@
 //!
 //! - `legacy-branches plan|activate` is the original whole-pile transition
 //!   from named branch pins into native collections.
-//! - `secrets-custody plan|activate` upgrades the later native direct-vault
-//!   Secrets generation into capability-anchored custody epochs. It never
-//!   consults the older pre-collection Secrets branch.
+//! - `secrets-direct-proofs plan|activate` additively bridges the unpublished
+//!   subject-bearing Secrets access envelopes to direct native proofs.
 //! - `migrate-legacy <faculty>` migrates one faculty's branch in place, which
 //!   is what that faculty's own `migrate-legacy` subcommand used to do.
 //! - `status-register` gives Compass's status register the identity it never
@@ -32,8 +31,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
     activation_cutover, collection_cutover, collection_naming, disposable_cutover, legacy_password,
-    mail_credentials, posture_findings, secrets_custody_cutover, status_register,
-    teams_credentials,
+    mail_credentials, posture_findings, secrets_direct_proofs, status_register, teams_credentials,
 };
 use zeroize::Zeroizing;
 
@@ -65,8 +63,10 @@ enum Command {
         action: StoppedWorldAction,
     },
 
-    /// Additively upgrade native direct-recipient Secrets vaults to capability/custody.
-    SecretsCustody {
+    /// Additively bridge retired subject-bearing Secrets access envelopes to
+    /// direct native capability proofs. The durable pile signer is the sole
+    /// trust root; this migration never asks for a password.
+    SecretsDirectProofs {
         #[command(subcommand)]
         action: AdditiveAction,
     },
@@ -172,10 +172,90 @@ enum StoppedWorldAction {
 
 #[derive(Clone, Copy, Subcommand)]
 enum AdditiveAction {
-    /// Validate one known pile prefix and report the missing custody COMMITs.
+    /// Read and validate the exact predecessor/successor state without writing.
     Plan,
-    /// Append and validate the missing custody COMMITs while other writers continue.
+    /// Append missing proof closures and one successor inbox COMMIT per vault.
     Activate,
+}
+
+fn plan_secrets_direct_proofs(pile: &Path, key: Option<&Path>) -> Result<()> {
+    let signer = faculties::storage::load_signer(pile, key)
+        .context("load durable signer for Secrets direct-proof planning")?;
+    let plan = secrets_direct_proofs::plan_path(pile, &signer)
+        .context("plan Secrets direct-proof bridge")?;
+
+    let pending = plan.count(secrets_direct_proofs::DirectProofState::Pending);
+    let complete = plan.count(secrets_direct_proofs::DirectProofState::Complete);
+    let ambiguous = plan.count(secrets_direct_proofs::DirectProofState::Ambiguous);
+    let malformed = plan.count(secrets_direct_proofs::DirectProofState::Malformed);
+    println!("Retired Secrets envelopes -> direct capability proofs");
+    println!("pile        : {}", pile.display());
+    println!(
+        "publication : {}",
+        if plan.is_blocked() {
+            "blocked"
+        } else if pending == 0 {
+            "complete"
+        } else {
+            "pending"
+        }
+    );
+    println!("pending     : {pending}");
+    println!("complete    : {complete}");
+    println!("ambiguous   : {ambiguous}");
+    println!("malformed   : {malformed}");
+    println!("proofs      : {} pending", plan.pending_proofs());
+    println!("inbox commits: {pending} pending");
+    println!();
+    println!("Vaults and candidates:");
+    for report in plan.reports() {
+        let subject = report
+            .vault
+            .map(|vault| format!("vault {vault:X}"))
+            .or_else(|| {
+                report
+                    .predecessor
+                    .map(|candidate| format!("candidate {candidate:X}"))
+            })
+            .unwrap_or_else(|| "unidentified candidate".to_owned());
+        let secrets = report
+            .secret_versions
+            .map(|count| format!(" | {count} secret(s)"))
+            .unwrap_or_default();
+        println!(
+            "- {subject} | {}{secrets} | {}",
+            report.state.label(),
+            report.detail
+        );
+    }
+    if plan.reports().is_empty() {
+        println!("- no retired subject-bearing envelopes were found");
+    }
+    println!();
+    if plan.is_blocked() {
+        println!("Activation will refuse to append while any candidate is ambiguous or malformed.");
+    } else if pending == 0 {
+        println!("Every retired envelope already has one exact direct-proof successor; activation would leave the pile unchanged.");
+    } else {
+        println!("Activation will append each pending proof closure, then one root-signed access-inbox COMMIT per vault.");
+    }
+    Ok(())
+}
+
+fn activate_secrets_direct_proofs(pile: &Path, key: Option<&Path>) -> Result<()> {
+    let signer = faculties::storage::load_signer(pile, key)
+        .context("load durable signer for Secrets direct-proof activation")?;
+    match secrets_direct_proofs::activate(pile, &signer)
+        .context("activate additive Secrets direct-proof bridge")?
+    {
+        secrets_direct_proofs::AdditiveActivationOutcome::Published { inbox_commits } => println!(
+            "Activated {inbox_commits} direct-proof access successor(s); retired rows remain inert and unchanged."
+        ),
+        secrets_direct_proofs::AdditiveActivationOutcome::AlreadyActive => println!(
+            "Secrets direct-proof publication was already complete; the live pile was unchanged."
+        ),
+    }
+    Ok(())
 }
 
 fn teams_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
@@ -554,12 +634,14 @@ fn plan_legacy_branches(pile: &Path, key: Option<&Path>) -> Result<()> {
             activation_cutover::CandidateViewKey::Vault(vault) => format!("vault {vault:X}"),
         };
         println!(
-            "- {} | {} | {} | {}/{} exact COMMIT(s) | {}/{} dependency blob(s) | {} fact(s) | {:?}",
+            "- {} | {} | {} | {}/{} exact COMMIT(s) | {}/{} native proof(s) | {}/{} dependency blob(s) | {} fact(s) | {:?}",
             collection.name().as_str(),
             view,
             publication.status().label(),
             publication.present_commits(),
             publication.planned_commits(),
+            publication.present_proofs(),
+            publication.planned_proofs(),
             publication.resident_dependencies(),
             publication.required_dependencies(),
             collection.expected_facts().len(),
@@ -643,85 +725,6 @@ fn activate_legacy_branches(pile: &Path, key: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn plan_secrets_custody(pile: &Path, key: Option<&Path>) -> Result<()> {
-    let signer = faculties::storage::load_signer(pile, key)
-        .context("load durable signer for Secrets custody planning")?;
-    let source = collection_cutover::snapshot_native_collections(pile)
-        .with_context(|| format!("snapshot Secrets custody source {}", pile.display()))?;
-    let plan = secrets_custody_cutover::plan(&source, &signer)
-        .context("plan native direct-vault Secrets custody cutover")?;
-
-    let report = plan.report();
-    println!("Native direct Secrets -> capability/custody plan");
-    println!("source       : {}", pile.display());
-    println!(
-        "publication  : {}",
-        if plan.pending_commits() == 0 {
-            "complete"
-        } else {
-            "pending"
-        }
-    );
-    println!("source vaults: {}", report.vaults.len());
-    println!("secrets      : {}", report.secret_versions());
-    println!("old wraps    : {}", report.preserved_wraps());
-    println!("custody wraps: {}", report.custody_wraps_added());
-    println!("inbox commits: {} pending", plan.pending_access_commits());
-    println!("vault commits: {} pending", plan.pending_vault_commits());
-    println!();
-
-    println!("Vaults:");
-    for vault in &report.vaults {
-        println!(
-            "- {:X} | {} secret(s) | inbox {} | vault {}",
-            vault.vault,
-            vault.secret_versions,
-            if vault.access_pending {
-                "pending"
-            } else {
-                "ready"
-            },
-            if vault.data_pending {
-                "pending"
-            } else {
-                "ready"
-            },
-        );
-    }
-    if report.vaults.is_empty() {
-        println!("- no retired native direct-recipient vaults were discovered");
-    }
-
-    println!();
-    if plan.pending_commits() == 0 {
-        println!(
-            "Every planned custody successor is already complete; `secrets-custody activate` would leave the pile unchanged."
-        );
-    } else {
-        println!(
-            "`secrets-custody activate` will append the pending access and vault COMMITs while unrelated pile writers remain online."
-        );
-    }
-    Ok(())
-}
-
-fn activate_secrets_custody(pile: &Path, key: Option<&Path>) -> Result<()> {
-    let signer = faculties::storage::load_signer(pile, key)
-        .context("load durable signer for Secrets custody activation")?;
-    let outcome = secrets_custody_cutover::activate(pile, &signer)
-        .context("activate additive Secrets custody migration")?;
-
-    match outcome {
-        secrets_custody_cutover::AdditiveActivationOutcome::Published { commits } => println!(
-            "Activated capability/custody successors with {commits} additive COMMIT(s); unrelated pile writers did not need to stop."
-        ),
-        secrets_custody_cutover::AdditiveActivationOutcome::AlreadyActive => println!(
-            "Secrets capability/custody publication was already complete; the live pile was unchanged."
-        ),
-    }
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -729,9 +732,11 @@ fn main() -> Result<()> {
             StoppedWorldAction::Plan => plan_legacy_branches(&cli.pile, cli.key.as_deref()),
             StoppedWorldAction::Activate => activate_legacy_branches(&cli.pile, cli.key.as_deref()),
         },
-        Some(Command::SecretsCustody { action }) => match action {
-            AdditiveAction::Plan => plan_secrets_custody(&cli.pile, cli.key.as_deref()),
-            AdditiveAction::Activate => activate_secrets_custody(&cli.pile, cli.key.as_deref()),
+        Some(Command::SecretsDirectProofs { action }) => match action {
+            AdditiveAction::Plan => plan_secrets_direct_proofs(&cli.pile, cli.key.as_deref()),
+            AdditiveAction::Activate => {
+                activate_secrets_direct_proofs(&cli.pile, cli.key.as_deref())
+            }
         },
         Some(Command::MigrateLegacy { faculty }) => {
             per_faculty::migrate(faculty, &cli.pile, cli.key.as_deref())

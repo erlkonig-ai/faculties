@@ -1,5 +1,5 @@
-//! Projection from pre-collection or native direct-recipient Secrets
-//! generations to capability-anchored custody vault epochs.
+//! Projection from pre-collection Secrets to capability-anchored custody
+//! vault epochs.
 //!
 //! The source generation remains immutable evidence. Planning validates every
 //! source and target catalog, stages the exact encrypted
@@ -22,19 +22,17 @@ use faculties::secrets::{self, RecipientPublicKey, VaultCatalog};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityGrant, CapabilityMode,
-    CapabilityProof, CapabilityProofStep, CapabilityResource,
+    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+    CapabilityRequest, CapabilityResource,
 };
-use triblespace::core::collection::simplearchive_union::SimpleArchiveCollection;
 use triblespace::core::collection::{
-    discover_collection_records_scoped, reach, CapabilityPresentation, CollectionAdmission,
-    CollectionHandle, ACTION_WRITE,
+    CapabilityPresentation, CollectionAdmission, CollectionHandle, ACTION_WRITE,
 };
 use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, CapabilityProofStore};
 use triblespace::prelude::*;
 
-use crate::{legacy_authority, legacy_secrets_v1 as legacy};
+use crate::legacy_secrets_v1 as legacy;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultMigrationReport {
@@ -48,10 +46,8 @@ pub struct VaultMigrationReport {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SecretsVaultMigrationReport {
-    /// Total source facts consumed across both predecessor generations.
+    /// Total pre-collection source facts consumed.
     pub source_facts: usize,
-    pub pre_collection_source_facts: usize,
-    pub direct_source_facts: usize,
     pub vaults: Vec<VaultMigrationReport>,
 }
 
@@ -101,6 +97,7 @@ pub(crate) struct VaultPlan {
 pub struct SecretsVaultMigrationPlan {
     namespace: RecipientPublicKey,
     access_inbox: Vec<Fragment>,
+    access_bundles: Vec<CapabilityProofBundle>,
     vaults: Vec<VaultPlan>,
     report: SecretsVaultMigrationReport,
 }
@@ -121,6 +118,10 @@ impl SecretsVaultMigrationPlan {
     pub(crate) fn access_inbox(&self) -> &[Fragment] {
         &self.access_inbox
     }
+
+    pub(crate) fn access_bundles(&self) -> &[CapabilityProofBundle] {
+        &self.access_bundles
+    }
 }
 
 fn capability_atom(collection: CollectionHandle, action: Id) -> CapabilityAtom {
@@ -130,16 +131,21 @@ fn capability_atom(collection: CollectionHandle, action: Id) -> CapabilityAtom {
     )
 }
 
-fn root_proof(root: &SigningKey, collection: CollectionHandle, action: Id) -> CapabilityProof {
-    CapabilityProof::new(vec![CapabilityProofStep::issue(
+fn root_bundle(
+    root: &SigningKey,
+    collection: CollectionHandle,
+    action: Id,
+) -> CapabilityProofBundle {
+    CapabilityProofBundle::issue_root(
         root,
-        CapabilityGrant::root(
-            root.verifying_key(),
+        CapabilityClaim::root(
             capability_atom(collection, action),
             CapabilityMode::InvokeAndDelegate,
             None,
         ),
-    )])
+        root.verifying_key(),
+    )
+    .expect("a parentless founder claim is issuable")
 }
 
 fn planning_instant() -> Epoch {
@@ -147,43 +153,6 @@ fn planning_instant() -> Epoch {
     // pure plan independent of a wall-clock read while still exercising the
     // same claim verification as the live envelope path.
     Epoch::from_tai_seconds(0.0)
-}
-
-fn materialize_legacy_vault<S>(
-    pile: &mut S,
-    vault: Id,
-    namespace: VerifyingKey,
-    signer: &SigningKey,
-    expected: CollectionHandle,
-) -> Result<TribleSet>
-where
-    S: BlobStore + triblespace::core::collection::CollectionStore,
-    S::Reader: BlobStoreMeta,
-{
-    let collection = SimpleArchiveCollection::new(
-        secrets::vault_name(vault),
-        namespace,
-        None,
-        reach::private(),
-    );
-    if collection.collection() != expected {
-        bail!("retired direct-vault inventory changed collection identity");
-    }
-    let records = discover_collection_records_scoped(
-        &mut *pile,
-        expected,
-        Inline::new(signer.verifying_key().to_bytes()),
-    )
-    .with_context(|| format!("discover root-authored direct vault {vault:X} commits"))?;
-    if records.commits().is_empty() {
-        bail!("retired root READ inventory names vault {vault:X} without a root-authored commit");
-    }
-    // Production direct Secrets exposed only durable-root writes. The exact
-    // strictly verified root ticket preserves that contract; unrelated
-    // foreign commits on the old open-shaped handle remain inert.
-    collection
-        .attach_exact(pile, records.commits())
-        .with_context(|| format!("materialize exact retired direct vault {vault:X} ticket"))
 }
 
 fn materialize_custody_vault<S>(
@@ -212,7 +181,7 @@ where
 #[derive(Clone)]
 struct FounderAccess {
     custody: SigningKey,
-    read_proof: CapabilityProof,
+    read_bundle: CapabilityProofBundle,
     write_presentation: CapabilityPresentation,
 }
 
@@ -235,22 +204,22 @@ fn existing_founder_access(
         if candidate.writer() != signer.verifying_key() {
             continue;
         }
-        let Ok(read) = candidate.read_proof().verify_claim(
+        let Ok(read) = candidate.read_bundle().verify(
             authority,
             instant,
-            CapabilityClaim::new(
-                signer.verifying_key(),
+            signer.verifying_key(),
+            CapabilityRequest::new(
                 capability_atom(collection, secrets::ACTION_READ),
                 CapabilityMode::InvokeAndDelegate,
             ),
         ) else {
             continue;
         };
-        let Ok(write) = candidate.write_proof().verify_claim(
+        let Ok(write) = candidate.write_bundle().verify(
             authority,
             instant,
-            CapabilityClaim::new(
-                candidate.writer(),
+            candidate.writer(),
+            CapabilityRequest::new(
                 capability_atom(collection, ACTION_WRITE),
                 CapabilityMode::InvokeAndDelegate,
             ),
@@ -267,10 +236,10 @@ fn existing_founder_access(
         }
         usable.push(FounderAccess {
             custody: candidate.custody().clone(),
-            read_proof: candidate.read_proof().clone(),
+            read_bundle: candidate.read_bundle().clone(),
             write_presentation: CapabilityPresentation::new(
                 candidate.writer(),
-                candidate.write_proof().clone(),
+                candidate.write_bundle().clone(),
             ),
         });
     }
@@ -428,19 +397,20 @@ fn vault_created_at(scope: &legacy::ScopeRow) -> Result<legacy::IntervalValue> {
         .ok_or_else(|| anyhow!("legacy scope {} has no creation observation", scope.id))
 }
 
-/// Shared projection from explicit predecessor generations into custody
-/// successors. Public migration entry points below choose which source
-/// generation is admissible rather than exposing an ambient mixed resolver.
-fn plan_from_sources_in_store<S>(
+/// Project one exact pre-collection source into freshly issued direct-proof
+/// custody successors. No native authority ledger or retired signature blobs
+/// participate in source discovery.
+fn plan_from_source_in_store<S>(
     pile: &mut S,
     signer: &SigningKey,
     reader: &PileReader,
     source: TribleSet,
     password: Option<&[u8]>,
-    direct_inventory: BTreeMap<Id, CollectionHandle>,
 ) -> Result<SecretsVaultMigrationPlan>
 where
-    S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
+    S: BlobStore<Reader = PileReader>
+        + CapabilityProofStore
+        + triblespace::core::collection::CollectionStore,
     S::Reader: BlobStoreMeta,
 {
     let authority = signer.verifying_key();
@@ -451,26 +421,14 @@ where
     let identity_keys = legacy::identity_public_keys(reader, &catalog)?;
     let (access_candidates, _) = discover_access_candidates(&mut *pile, signer)
         .context("discover existing founder access candidates")?;
-    let source_vaults = catalog
-        .scopes
-        .keys()
-        .copied()
-        .chain(direct_inventory.keys().copied())
-        .collect::<BTreeSet<_>>();
+    let source_vaults = catalog.scopes.keys().copied().collect::<BTreeSet<_>>();
 
-    let mut direct_by_vault = BTreeMap::new();
     let mut target_by_vault = BTreeMap::new();
     let mut used_ids = source.iter().map(|fact| *fact.e()).collect::<BTreeSet<_>>();
     used_ids.extend(access_candidates.iter().map(ValidatedAccessCandidate::id));
     for vault in source_vaults.iter().copied() {
-        let direct = match direct_inventory.get(&vault).copied() {
-            Some(collection) => {
-                materialize_legacy_vault(pile, vault, namespace, signer, collection)?
-            }
-            None => TribleSet::new(),
-        };
         let collection = secrets::vault_handle(vault, namespace, authority);
-        let write = root_proof(signer, collection, ACTION_WRITE);
+        let write = root_bundle(signer, collection, ACTION_WRITE);
         let target = materialize_custody_vault(
             pile,
             vault,
@@ -479,113 +437,84 @@ where
             authority,
             CapabilityPresentation::new(authority, write),
         )?;
-        used_ids.extend(direct.iter().map(|fact| *fact.e()));
         used_ids.extend(target.iter().map(|fact| *fact.e()));
-        direct_by_vault.insert(vault, direct);
         target_by_vault.insert(vault, target);
     }
-    let direct_source_facts = direct_by_vault.values().map(TribleSet::len).sum::<usize>();
-    let pre_collection_source_facts = source.len();
+    let source_facts = source.len();
 
     let mut claimed_secrets = BTreeMap::<Id, Id>::new();
     let mut access_inbox = Vec::new();
+    let mut access_bundles = Vec::new();
     let mut vaults = Vec::with_capacity(source_vaults.len());
 
     for vault in source_vaults {
-        let scope = catalog.scopes.get(&vault);
+        let scope = catalog
+            .scopes
+            .get(&vault)
+            .expect("source vault ids came from the validated scope catalog");
         let mut required = Fragment::empty();
-        let scope_header = if let Some(scope) = scope {
-            let created_at = vault_created_at(scope)?;
-            let vault_name = legacy::read_text(reader, scope.name)
-                .with_context(|| format!("read legacy scope {} name", scope.id))?;
-            required += secrets::legacy_vault_header_fragment(scope.id, &vault_name, created_at)?;
-            let header = secrets::load_catalog(scope.id, required.facts())?.header;
-            if header.name != scope.name {
-                bail!("vault header did not preserve the legacy scope name handle");
-            }
-
-            let scoped_secrets = catalog
-                .secrets
-                .values()
-                .filter(|secret| secret.scope == scope.id)
-                .collect::<Vec<_>>();
-            for secret in &scoped_secrets {
-                let body = legacy::read_bytes(reader, secret.body)
-                    .with_context(|| format!("read legacy secret {} encrypted body", secret.id))?;
-                required += secrets::encrypted_secret_fragment(
-                    secret.id,
-                    &secret.name,
-                    body.clone(),
-                    secret.created_at,
-                )?;
-                put_text_exact(
-                    &mut required,
-                    secret.display_name,
-                    secret.name.clone(),
-                    "legacy secret name",
-                )?;
-                put_bytes_exact(
-                    &mut required,
-                    secret.body,
-                    body,
-                    "legacy encrypted secret body",
-                )?;
-            }
-
-            let scoped_secret_ids = scoped_secrets
-                .iter()
-                .map(|secret| secret.id)
-                .collect::<BTreeSet<_>>();
-            let old_wraps = catalog
-                .wraps
-                .values()
-                .filter(|wrap| scoped_secret_ids.contains(&wrap.secret))
-                .collect::<Vec<_>>();
-            for wrap in &old_wraps {
-                let recipient = identity_keys
-                    .get(&wrap.recipient)
-                    .copied()
-                    .ok_or_else(|| anyhow!("legacy wrap {} recipient has no exact key", wrap.id))?;
-                let sealed = legacy::read_bytes(reader, wrap.sealed_dek)
-                    .with_context(|| format!("read legacy wrap {} sealed DEK", wrap.id))?;
-                required += secrets::recipient_wrap_fragment(
-                    wrap.id,
-                    wrap.secret,
-                    recipient,
-                    sealed.clone(),
-                )?;
-                put_bytes_exact(&mut required, wrap.sealed_dek, sealed, "legacy sealed DEK")?;
-            }
-            Some((vault_name, created_at))
-        } else {
-            None
-        };
-
-        let direct_existing = direct_by_vault
-            .remove(&vault)
-            .expect("one direct source snapshot per source vault");
-        merge_materialized_vault(
-            reader,
-            vault,
-            &direct_existing,
-            &mut required,
-            "legacy direct-recipient source",
-        )?;
-        let direct_catalog = validate_staged_vault(vault, &mut required)?;
-        if direct_catalog.custody.is_some() {
-            bail!(
-                "unanchored direct-recipient source vault {:X} already declares custody",
-                vault
-            );
+        let created_at = vault_created_at(scope)?;
+        let vault_name = legacy::read_text(reader, scope.name)
+            .with_context(|| format!("read legacy scope {} name", scope.id))?;
+        required += secrets::legacy_vault_header_fragment(scope.id, &vault_name, created_at)?;
+        let header = secrets::load_catalog(scope.id, required.facts())?.header;
+        if header.name != scope.name {
+            bail!("vault header did not preserve the legacy scope name handle");
         }
-        let (vault_name, created_at) = match scope_header {
-            Some(header) => header,
-            None => (
-                secrets::read_text(reader, direct_catalog.header.name)
-                    .with_context(|| format!("read direct-only vault {vault:X} name"))?,
-                direct_catalog.header.created_at,
-            ),
-        };
+
+        let scoped_secrets = catalog
+            .secrets
+            .values()
+            .filter(|secret| secret.scope == scope.id)
+            .collect::<Vec<_>>();
+        for secret in &scoped_secrets {
+            let body = legacy::read_bytes(reader, secret.body)
+                .with_context(|| format!("read legacy secret {} encrypted body", secret.id))?;
+            required += secrets::encrypted_secret_fragment(
+                secret.id,
+                &secret.name,
+                body.clone(),
+                secret.created_at,
+            )?;
+            put_text_exact(
+                &mut required,
+                secret.display_name,
+                secret.name.clone(),
+                "legacy secret name",
+            )?;
+            put_bytes_exact(
+                &mut required,
+                secret.body,
+                body,
+                "legacy encrypted secret body",
+            )?;
+        }
+
+        let scoped_secret_ids = scoped_secrets
+            .iter()
+            .map(|secret| secret.id)
+            .collect::<BTreeSet<_>>();
+        let old_wraps = catalog
+            .wraps
+            .values()
+            .filter(|wrap| scoped_secret_ids.contains(&wrap.secret))
+            .collect::<Vec<_>>();
+        for wrap in &old_wraps {
+            let recipient = identity_keys
+                .get(&wrap.recipient)
+                .copied()
+                .ok_or_else(|| anyhow!("legacy wrap {} recipient has no exact key", wrap.id))?;
+            let sealed = legacy::read_bytes(reader, wrap.sealed_dek)
+                .with_context(|| format!("read legacy wrap {} sealed DEK", wrap.id))?;
+            required +=
+                secrets::recipient_wrap_fragment(wrap.id, wrap.secret, recipient, sealed.clone())?;
+            put_bytes_exact(&mut required, wrap.sealed_dek, sealed, "legacy sealed DEK")?;
+        }
+
+        let source_catalog = validate_staged_vault(vault, &mut required)?;
+        if source_catalog.custody.is_some() {
+            bail!("pre-collection source vault {vault:X} already declares custody");
+        }
 
         let target_existing = target_by_vault
             .remove(&vault)
@@ -602,8 +531,8 @@ where
         };
 
         let collection = secrets::vault_handle(vault, namespace, authority);
-        let root_read = root_proof(signer, collection, secrets::ACTION_READ);
-        let root_write = root_proof(signer, collection, ACTION_WRITE);
+        let root_read = root_bundle(signer, collection, secrets::ACTION_READ);
+        let root_write = root_bundle(signer, collection, ACTION_WRITE);
         let existing_access = existing_founder_access(
             &access_candidates,
             signer,
@@ -617,11 +546,11 @@ where
         )?;
         if !target_existing.is_empty() && existing_access.is_none() {
             bail!(
-                "anchored target vault {vault:X} exists without a usable founder access envelope"
+                "anchored target vault {vault:X} has no usable direct-proof founder access envelope; run `migrations secrets-direct-proofs activate` to bridge an unpublished subject-bearing predecessor before replaying this plan"
             );
         }
 
-        let direct_recipients = direct_catalog
+        let source_recipients = source_catalog
             .wraps
             .values()
             .map(|wrap| wrap.recipient)
@@ -630,8 +559,8 @@ where
             Some(founder) => (founder, false),
             None => (
                 FounderAccess {
-                    custody: fresh_custody_key(&direct_recipients),
-                    read_proof: root_read,
+                    custody: fresh_custody_key(&source_recipients),
+                    read_bundle: root_read,
                     write_presentation: CapabilityPresentation::new(authority, root_write),
                 },
                 true,
@@ -643,14 +572,16 @@ where
                 collection,
                 &founder.custody,
                 authority,
-                &founder.read_proof,
-                founder.write_presentation.subject(),
-                founder.write_presentation.proof(),
+                &founder.read_bundle,
+                founder.write_presentation.expected_leaf(),
+                founder.write_presentation.bundle(),
                 authority,
                 planning_instant(),
             )
             .with_context(|| format!("build founder access envelope for vault {vault:X}"))?;
             retain_vault_descriptor(&mut envelope, vault, namespace, authority)?;
+            access_bundles.push(founder.read_bundle.clone());
+            access_bundles.push(founder.write_presentation.bundle().clone());
             access_inbox.push(envelope);
         }
 
@@ -669,18 +600,18 @@ where
         )?;
 
         let custody_public = founder.custody.verifying_key().to_bytes();
-        let mut known_wraps = direct_catalog.wraps.clone();
+        let mut known_wraps = source_catalog.wraps.clone();
         if let Some(target) = &target_catalog {
             for (id, wrap) in &target.wraps {
                 if known_wraps
                     .insert(*id, *wrap)
                     .is_some_and(|previous| previous != *wrap)
                 {
-                    bail!("direct source and anchored target disagree about wrap {id:X}");
+                    bail!("pre-collection source and anchored target disagree about wrap {id:X}");
                 }
             }
         }
-        let secret_ids = direct_catalog
+        let secret_ids = source_catalog
             .secrets
             .keys()
             .copied()
@@ -704,26 +635,14 @@ where
                 ),
                 _ => {}
             }
-            if !direct_catalog.secrets.contains_key(&secret) {
-                bail!("anchored target secret {secret:X} has no custody wrap and no direct source");
+            if !source_catalog.secrets.contains_key(&secret) {
+                bail!("anchored target secret {secret:X} has no custody wrap and no pre-collection source");
             }
             let wrap = next_unused_id(&mut used_ids);
-            let fragment = if catalog.secrets.contains_key(&secret) {
-                let dek =
-                    legacy::recover_dek_for_migration(reader, &catalog, secret, signer, password)?;
-                let sealed = legacy::seal_dek_for_recipient(&dek, custody_public)?;
-                secrets::recipient_wrap_fragment(wrap, secret, custody_public, sealed)?
-            } else {
-                secrets::rewrap_version_for_migration(
-                    reader,
-                    &direct_catalog,
-                    secret,
-                    signer,
-                    custody_public,
-                    wrap,
-                )
-                .with_context(|| format!("custody-wrap post-v1 direct vault secret {secret:X}"))?
-            };
+            let dek =
+                legacy::recover_dek_for_migration(reader, &catalog, secret, signer, password)?;
+            let sealed = legacy::seal_dek_for_recipient(&dek, custody_public)?;
+            let fragment = secrets::recipient_wrap_fragment(wrap, secret, custody_public, sealed)?;
             required += fragment;
             custody_wraps_added += 1;
         }
@@ -760,14 +679,13 @@ where
     }
 
     let report = SecretsVaultMigrationReport {
-        source_facts: pre_collection_source_facts + direct_source_facts,
-        pre_collection_source_facts,
-        direct_source_facts,
+        source_facts,
         vaults: vaults.iter().map(|vault| vault.report.clone()).collect(),
     };
     Ok(SecretsVaultMigrationPlan {
         namespace: namespace_bytes,
         access_inbox,
+        access_bundles,
         vaults,
         report,
     })
@@ -775,9 +693,7 @@ where
 
 /// Translate an exact pre-collection Secrets projection directly into zero or
 /// more current vault plans. The projection is an in-memory source boundary,
-/// never a fixed native `secrets` collection or an authority target. A native
-/// direct-vault generation is rejected rather than silently mixing two
-/// independently named migrations.
+/// never a fixed native `secrets` collection or an authority target.
 pub(crate) fn plan_from_legacy_in_store<S>(
     pile: &mut S,
     signer: &SigningKey,
@@ -786,47 +702,13 @@ pub(crate) fn plan_from_legacy_in_store<S>(
     password: Option<&[u8]>,
 ) -> Result<SecretsVaultMigrationPlan>
 where
-    S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
+    S: BlobStore<Reader = PileReader>
+        + CapabilityProofStore
+        + triblespace::core::collection::CollectionStore,
     S::Reader: BlobStoreMeta,
 {
-    let direct_inventory = legacy_authority::discover_root_direct_vaults(&mut *pile, signer)
-        .context("check for a native direct-vault predecessor generation")?;
-    if !direct_inventory.is_empty() {
-        bail!(
-            "native direct-recipient Secrets vaults are already present; use `migrations secrets-custody plan|activate` instead of replaying the legacy-branch migration"
-        );
-    }
-    plan_from_sources_in_store(pile, signer, reader, source, password, BTreeMap::new())
+    plan_from_source_in_store(pile, signer, reader, source, password)
         .context("plan custody successors from pre-collection Secrets evidence")
-}
-
-/// Upgrade the retired native direct-recipient vault generation without
-/// consulting the older pre-collection Secrets branch.
-///
-/// The direct-vault inventory is reconstructed from the durable root's exact
-/// historical READ grants. No pre-collection projection or password enters
-/// this API: every secret, attachment and direct DEK wrap used by this path
-/// must already be present in the native predecessor collections.
-pub(crate) fn plan_from_direct_in_store<S>(
-    pile: &mut S,
-    signer: &SigningKey,
-    reader: &PileReader,
-) -> Result<SecretsVaultMigrationPlan>
-where
-    S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
-    S::Reader: BlobStoreMeta,
-{
-    let direct_inventory = legacy_authority::discover_root_direct_vaults(&mut *pile, signer)
-        .context("discover retired root READ direct-vault inventory")?;
-    plan_from_sources_in_store(
-        pile,
-        signer,
-        reader,
-        TribleSet::new(),
-        None,
-        direct_inventory,
-    )
-    .context("plan custody successors from native direct-recipient vaults")
 }
 
 #[cfg(test)]

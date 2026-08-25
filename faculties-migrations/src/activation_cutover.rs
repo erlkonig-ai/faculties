@@ -13,6 +13,7 @@ use std::fmt;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::{BlobEncoding, TryFromBlob};
+use triblespace::core::capability::CapabilityProofBundle;
 use triblespace::core::collection::{descriptor, reach, CapabilityPresentation, CollectionHandle};
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::InlineEncoding;
@@ -49,12 +50,6 @@ pub fn requires_legacy_password(error: &anyhow::Error) -> bool {
 pub(crate) struct PlannedActivationReader<'a, Overlay> {
     overlay: &'a Overlay,
     source: &'a PileReader,
-}
-
-impl<'a, Overlay> PlannedActivationReader<'a, Overlay> {
-    pub(crate) const fn new(overlay: &'a Overlay, source: &'a PileReader) -> Self {
-        Self { overlay, source }
-    }
 }
 
 #[derive(Debug)]
@@ -137,6 +132,7 @@ pub struct PlannedCollection {
     view: CandidateViewKey,
     policy: TargetPolicy,
     fragments: Vec<Fragment>,
+    proof_bundles: Vec<CapabilityProofBundle>,
     expected_facts: TribleSet,
 }
 
@@ -155,6 +151,12 @@ impl PlannedCollection {
 
     pub fn fragments(&self) -> &[Fragment] {
         &self.fragments
+    }
+
+    /// Exact native proofs and ordered claim closures that must be resident
+    /// before this collection's COMMITs become visible.
+    pub fn proof_bundles(&self) -> &[CapabilityProofBundle] {
+        &self.proof_bundles
     }
 
     pub fn expected_facts(&self) -> &TribleSet {
@@ -189,6 +191,7 @@ impl PlannedCollection {
                 view: CandidateViewKey::Faculty(scope),
                 policy: TargetPolicy::Open,
                 fragments,
+                proof_bundles: Vec::new(),
                 expected_facts,
             },
             consumption: SourceConsumption {
@@ -202,12 +205,14 @@ impl PlannedCollection {
     pub(crate) fn access_inbox(
         recipient: VerifyingKey,
         fragments: impl IntoIterator<Item = Fragment>,
+        proof_bundles: impl IntoIterator<Item = CapabilityProofBundle>,
         expected_facts: TribleSet,
     ) -> Result<Self> {
         let descriptor = secrets::storage::access_inbox_descriptor(recipient);
         let name = descriptor::name(descriptor.facts())
             .context("canonical Secrets access inbox has no collection name")??;
         let fragments = fragments.into_iter().collect::<Vec<_>>();
+        let proof_bundles = proof_bundles.into_iter().collect::<Vec<_>>();
         let staged_facts = materialized_facts(&fragments);
         if staged_facts != expected_facts {
             bail!(
@@ -222,6 +227,7 @@ impl PlannedCollection {
             view: CandidateViewKey::AccessInbox,
             policy: TargetPolicy::Open,
             fragments,
+            proof_bundles,
             expected_facts,
         })
     }
@@ -249,6 +255,7 @@ impl PlannedCollection {
             view: CandidateViewKey::Vault(vault),
             policy: TargetPolicy::Vault { authority, write },
             fragments,
+            proof_bundles: Vec::new(),
             expected_facts,
         })
     }
@@ -854,6 +861,7 @@ pub fn plan(
         collections.push_target(PlannedCollection::access_inbox(
             signer.verifying_key(),
             fragments,
+            direct.access_bundles().iter().cloned(),
             expected_facts,
         )?);
     }
@@ -1315,6 +1323,7 @@ mod tests {
             view: CandidateViewKey::Faculty(Id::new([scope_byte; 16]).unwrap()),
             policy: TargetPolicy::Open,
             fragments: Vec::new(),
+            proof_bundles: Vec::new(),
             expected_facts: TribleSet::new(),
         }
     }

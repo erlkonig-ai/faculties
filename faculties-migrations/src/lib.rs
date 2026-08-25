@@ -21,8 +21,8 @@
 //!   proves complete legacy-source coverage.
 //! - [`disposable_cutover`] builds that aggregate plan into a disposable
 //!   sibling pile and atomically replaces an unchanged live pile.
-//! - [`secrets_custody_cutover`] upgrades the later native direct-recipient
-//!   generation online through ordered additive COMMITs and a domain replan.
+//! - [`secrets_direct_proofs`] is the additive, migration-local bridge from
+//!   unpublished subject-bearing access rows to current direct proof records.
 //!
 //! The `migrations` binary is the only consumer.
 
@@ -41,7 +41,6 @@ pub mod disposable_cutover;
 pub mod files_cutover;
 pub mod habit_cutover;
 pub mod headspace_cutover;
-mod legacy_authority;
 pub mod legacy_password;
 pub(crate) mod legacy_secrets_v1;
 pub mod mail_credentials;
@@ -53,8 +52,8 @@ pub mod planner_cutover;
 pub mod posture_cutover;
 pub mod posture_findings;
 pub mod relations_cutover;
-pub mod secrets_custody_cutover;
 pub mod secrets_cutover;
+pub mod secrets_direct_proofs;
 pub mod secrets_vault_cutover;
 pub mod status_cutover;
 pub mod status_register;
