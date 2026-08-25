@@ -58,16 +58,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Move the original named legacy branches into native collections.
+    /// With every pile writer stopped, move the original named legacy branches
+    /// into native collections through a validated disposable replacement.
     LegacyBranches {
         #[command(subcommand)]
         action: StoppedWorldAction,
     },
 
-    /// Upgrade native direct-recipient Secrets vaults to capability/custody.
+    /// Additively upgrade native direct-recipient Secrets vaults to capability/custody.
     SecretsCustody {
         #[command(subcommand)]
-        action: StoppedWorldAction,
+        action: AdditiveAction,
     },
 
     /// With every pile writer stopped, migrate one faculty's legacy branch
@@ -163,9 +164,17 @@ enum Command {
 
 #[derive(Clone, Copy, Subcommand)]
 enum StoppedWorldAction {
-    /// Freeze one source snapshot and prove the exact migration without writing.
+    /// Validate the frozen legacy source and report the disposable replacement.
     Plan,
-    /// Build and validate a disposable sibling, then atomically replace the unchanged live pile.
+    /// With every pile writer stopped, atomically replace the validated source.
+    Activate,
+}
+
+#[derive(Clone, Copy, Subcommand)]
+enum AdditiveAction {
+    /// Validate one known pile prefix and report the missing custody COMMITs.
+    Plan,
+    /// Append and validate the missing custody COMMITs while other writers continue.
     Activate,
 }
 
@@ -637,48 +646,46 @@ fn activate_legacy_branches(pile: &Path, key: Option<&Path>) -> Result<()> {
 fn plan_secrets_custody(pile: &Path, key: Option<&Path>) -> Result<()> {
     let signer = faculties::storage::load_signer(pile, key)
         .context("load durable signer for Secrets custody planning")?;
-    let source = collection_cutover::freeze_source(pile)
-        .with_context(|| format!("freeze Secrets custody source {}", pile.display()))?;
+    let source = collection_cutover::snapshot_native_collections(pile)
+        .with_context(|| format!("snapshot Secrets custody source {}", pile.display()))?;
     let plan = secrets_custody_cutover::plan(&source, &signer)
         .context("plan native direct-vault Secrets custody cutover")?;
-    let presence = disposable_cutover::inspect_collections(
-        &source,
-        &signer,
-        plan.namespace(),
-        plan.collections(),
-    )
-    .context("inspect Secrets custody publication")?;
 
-    let physical = source.physical_fingerprint();
     let report = plan.report();
     println!("Native direct Secrets -> capability/custody plan");
     println!("source       : {}", pile.display());
-    println!("source bytes : {}", physical.length);
-    println!("source hash  : blake3:{}", hex::encode(physical.digest));
-    println!("publication  : {}", presence.status().label());
+    println!(
+        "publication  : {}",
+        if plan.pending_commits() == 0 {
+            "complete"
+        } else {
+            "pending"
+        }
+    );
     println!("source vaults: {}", report.vaults.len());
     println!("secrets      : {}", report.secret_versions());
     println!("old wraps    : {}", report.preserved_wraps());
     println!("custody wraps: {}", report.custody_wraps_added());
+    println!("inbox commits: {} pending", plan.pending_access_commits());
+    println!("vault commits: {} pending", plan.pending_vault_commits());
     println!();
 
-    println!("Collections:");
-    for (collection, publication) in plan.collections().iter().zip(presence.collections()) {
-        let view = match collection.view() {
-            activation_cutover::CandidateViewKey::AccessInbox => "Secrets access inbox".into(),
-            activation_cutover::CandidateViewKey::Vault(vault) => format!("vault {vault:X}"),
-            activation_cutover::CandidateViewKey::Faculty(_) => continue,
-        };
+    println!("Vaults:");
+    for vault in &report.vaults {
         println!(
-            "- {} | {} | {} | {}/{} exact COMMIT(s) | {}/{} dependency blob(s) | {} fact(s)",
-            collection.name().as_str(),
-            view,
-            publication.status().label(),
-            publication.present_commits(),
-            publication.planned_commits(),
-            publication.resident_dependencies(),
-            publication.required_dependencies(),
-            collection.expected_facts().len(),
+            "- {:X} | {} secret(s) | inbox {} | vault {}",
+            vault.vault,
+            vault.secret_versions,
+            if vault.access_pending {
+                "pending"
+            } else {
+                "ready"
+            },
+            if vault.data_pending {
+                "pending"
+            } else {
+                "ready"
+            },
         );
     }
     if report.vaults.is_empty() {
@@ -686,16 +693,14 @@ fn plan_secrets_custody(pile: &Path, key: Option<&Path>) -> Result<()> {
     }
 
     println!();
-    match presence.status() {
-        disposable_cutover::NativePublicationStatus::Complete => println!(
+    if plan.pending_commits() == 0 {
+        println!(
             "Every planned custody successor is already complete; `secrets-custody activate` would leave the pile unchanged."
-        ),
-        disposable_cutover::NativePublicationStatus::Partial => println!(
-            "Custody publication is partial. `secrets-custody activate` can complete and validate the deterministic remainder."
-        ),
-        disposable_cutover::NativePublicationStatus::Missing => println!(
-            "Custody publication is missing. `secrets-custody activate` would publish and validate it."
-        ),
+        );
+    } else {
+        println!(
+            "`secrets-custody activate` will append the pending access and vault COMMITs while unrelated pile writers remain online."
+        );
     }
     Ok(())
 }
@@ -703,25 +708,14 @@ fn plan_secrets_custody(pile: &Path, key: Option<&Path>) -> Result<()> {
 fn activate_secrets_custody(pile: &Path, key: Option<&Path>) -> Result<()> {
     let signer = faculties::storage::load_signer(pile, key)
         .context("load durable signer for Secrets custody activation")?;
-    let source = collection_cutover::freeze_source(pile)
-        .with_context(|| format!("freeze Secrets custody source {}", pile.display()))?;
-    let plan = secrets_custody_cutover::plan(&source, &signer)
-        .context("plan native direct-vault Secrets custody cutover")?;
-    let outcome = disposable_cutover::activate_collections(
-        pile,
-        &signer,
-        &source,
-        plan.namespace(),
-        plan.collections(),
-        secrets_custody_cutover::validate_candidate_views,
-    )
-    .context("activate disposable Secrets custody candidate")?;
+    let outcome = secrets_custody_cutover::activate(pile, &signer)
+        .context("activate additive Secrets custody migration")?;
 
     match outcome {
-        disposable_cutover::ActivationOutcome::Activated { appended_bytes } => println!(
-            "Activated capability/custody successors by appending {appended_bytes} candidate byte(s); every predecessor byte remains in the exact source prefix."
+        secrets_custody_cutover::AdditiveActivationOutcome::Published { commits } => println!(
+            "Activated capability/custody successors with {commits} additive COMMIT(s); unrelated pile writers did not need to stop."
         ),
-        disposable_cutover::ActivationOutcome::AlreadyActive => println!(
+        secrets_custody_cutover::AdditiveActivationOutcome::AlreadyActive => println!(
             "Secrets capability/custody publication was already complete; the live pile was unchanged."
         ),
     }
@@ -736,8 +730,8 @@ fn main() -> Result<()> {
             StoppedWorldAction::Activate => activate_legacy_branches(&cli.pile, cli.key.as_deref()),
         },
         Some(Command::SecretsCustody { action }) => match action {
-            StoppedWorldAction::Plan => plan_secrets_custody(&cli.pile, cli.key.as_deref()),
-            StoppedWorldAction::Activate => activate_secrets_custody(&cli.pile, cli.key.as_deref()),
+            AdditiveAction::Plan => plan_secrets_custody(&cli.pile, cli.key.as_deref()),
+            AdditiveAction::Activate => activate_secrets_custody(&cli.pile, cli.key.as_deref()),
         },
         Some(Command::MigrateLegacy { faculty }) => {
             per_faculty::migrate(faculty, &cli.pile, cli.key.as_deref())

@@ -39,7 +39,7 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{
     self, BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinSnapshotSource,
 };
@@ -245,6 +245,18 @@ pub struct FrozenSource {
     collections: FrozenCollectionStore,
 }
 
+/// One append-stable snapshot of native collection records and their blobs.
+///
+/// Records are captured before the blob reader. Concurrent appenders may
+/// therefore make the reader a strict superset of the record set, but every
+/// captured record's complete dependency prefix is necessarily readable.
+/// Unlike [`FrozenSource`], this does not hash or freeze the physical pile:
+/// unrelated later appends commute with a native additive migration.
+pub struct NativeCollectionSnapshot {
+    reader: PileReader,
+    collections: FrozenCollectionStore,
+}
+
 /// Read-only native collection records captured beside the frozen blob reader.
 #[derive(Clone)]
 pub(crate) struct FrozenCollectionStore {
@@ -394,6 +406,58 @@ impl FrozenSource {
             deltas,
         }))
     }
+}
+
+impl NativeCollectionSnapshot {
+    pub fn reader(&self) -> &PileReader {
+        &self.reader
+    }
+
+    pub(crate) fn collection_store(&self) -> FrozenCollectionStore {
+        self.collections.clone()
+    }
+}
+
+/// Capture only the native collection state needed by an additive migration.
+///
+/// This deliberately has no unchanged-file assertion. A collection record is
+/// visible only after its content-addressed dependencies, and pile appends are
+/// atomic at the record boundary, so a fixed record set plus a reader captured
+/// immediately afterwards is a coherent monotone source snapshot even while
+/// unrelated writers continue appending.
+pub fn snapshot_native_collections(path: &Path) -> Result<NativeCollectionSnapshot> {
+    let mut pile = open_pile_strict(path)?;
+    let result = snapshot_native_collections_in(&mut pile);
+    let close = pile.close();
+    match (result, close) {
+        (Ok(snapshot), Ok(())) => Ok(snapshot),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(anyhow!("close native collection snapshot: {error}")),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing snapshot also failed: {close_error}")))
+        }
+    }
+}
+
+/// Capture a native collection snapshot without reopening an already-owned
+/// pile. `records()` and `reader()` each refresh, so the second call includes
+/// every dependency needed by the fixed record prefix captured by the first.
+pub(crate) fn snapshot_native_collections_in(pile: &mut Pile) -> Result<NativeCollectionSnapshot> {
+    let records = pile
+        .records()
+        .context("snapshot native collection records")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("decode native collection record snapshot")?;
+    let reader = pile
+        .reader()
+        .context("snapshot native collection blobs after records")?;
+    Ok(NativeCollectionSnapshot {
+        collections: FrozenCollectionStore {
+            reader: reader.clone(),
+            records,
+        },
+        reader,
+    })
 }
 
 /// Project every authored legacy delta into self-contained content and

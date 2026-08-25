@@ -25,8 +25,9 @@ use triblespace::core::collection::{
 };
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::metadata;
+use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pile::{GetBlobError, Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
 
 use super::access::{
@@ -191,7 +192,10 @@ pub fn access_inbox_handle(recipient: VerifyingKey) -> CollectionHandle {
         .get_handle()
 }
 
-fn access_inbox_collection<S>(
+/// Construct the low-level collection facade for one recipient's private
+/// access inbox. Inbox COMMITs remain untrusted candidates until discovery
+/// validates their envelope, proof closure, publisher, and vault descriptor.
+pub fn access_inbox_collection<S>(
     storage: S,
     recipient: VerifyingKey,
     publisher: SigningKey,
@@ -235,6 +239,44 @@ fn descriptor_facts(
         }
         Err(GetBlobError::ConversionError(error)) => match error {},
     };
+    decode_descriptor_facts(blob, collection)
+}
+
+fn portable_descriptor_facts<R>(
+    reader: &R,
+    collection: CollectionHandle,
+) -> std::result::Result<TribleSet, DescriptorReadError>
+where
+    R: BlobStoreGet + BlobStoreMeta,
+{
+    match reader.metadata(collection) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(DescriptorReadError::Missing(format!(
+                "collection descriptor {} is not resident",
+                bytes_hex(&collection.raw)
+            )));
+        }
+        Err(error) => {
+            return Err(DescriptorReadError::Invalid(format!(
+                "inspect collection descriptor {}: {error}",
+                bytes_hex(&collection.raw)
+            )));
+        }
+    }
+    let blob: Blob<SimpleArchive> = reader.get(collection).map_err(|error| {
+        DescriptorReadError::Invalid(format!(
+            "read collection descriptor {}: {error}",
+            bytes_hex(&collection.raw)
+        ))
+    })?;
+    decode_descriptor_facts(blob, collection)
+}
+
+fn decode_descriptor_facts(
+    blob: Blob<SimpleArchive>,
+    collection: CollectionHandle,
+) -> std::result::Result<TribleSet, DescriptorReadError> {
     let actual = blob.get_handle();
     if actual != collection {
         return Err(DescriptorReadError::Invalid(format!(
@@ -251,14 +293,36 @@ fn parse_descriptor(
     reader: &PileReader,
     collection: CollectionHandle,
 ) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)> {
-    let facts = descriptor_facts(reader, collection).map_err(|error| match error {
+    let facts = descriptor_facts(reader, collection).map_err(classify_descriptor_error)?;
+    parse_descriptor_value(facts, collection)
+}
+
+fn parse_portable_descriptor<R>(
+    reader: &R,
+    collection: CollectionHandle,
+) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)>
+where
+    R: BlobStoreGet + BlobStoreMeta,
+{
+    let facts = portable_descriptor_facts(reader, collection).map_err(classify_descriptor_error)?;
+    parse_descriptor_value(facts, collection)
+}
+
+fn classify_descriptor_error(error: DescriptorReadError) -> (VaultDiscoveryIssueKind, String) {
+    match error {
         DescriptorReadError::Missing(detail) => {
             (VaultDiscoveryIssueKind::MissingDescriptor, detail)
         }
         DescriptorReadError::Invalid(detail) => {
             (VaultDiscoveryIssueKind::InvalidDescriptor, detail)
         }
-    })?;
+    }
+}
+
+fn parse_descriptor_value(
+    facts: TribleSet,
+    collection: CollectionHandle,
+) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)> {
     let name = descriptor::name(&facts)
         .ok_or_else(|| {
             (
@@ -349,7 +413,7 @@ fn header_count(facts: &TribleSet) -> usize {
 /// seed, and delivery signer have all been validated.
 ///
 /// The vault itself may not have been committed yet. This is the narrow
-/// pre-genesis view used by crash-safe creation and stopped-world migration.
+/// pre-genesis view used by crash-safe creation and additive migration.
 #[derive(Clone)]
 pub struct ValidatedAccessCandidate {
     id: Id,
@@ -399,7 +463,42 @@ pub fn discover_access_candidates<S>(
 ) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)>
 where
     S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
-    S::Reader: triblespace::core::repo::BlobStoreMeta,
+{
+    discover_access_candidates_with(store, recipient, parse_descriptor)
+}
+
+/// Publish proposed inbox fragments into an ephemeral repository and discover
+/// them through the same commit-local validation loop as a live pile.
+///
+/// This is a pre-publication boundary for migrations and other producers that
+/// must prove exact row shape, descriptor closure, proof validity, publisher
+/// authority, and sealed-frame readability before touching durable storage.
+pub fn discover_staged_access_candidates(
+    fragments: &[Fragment],
+    recipient: &SigningKey,
+    publisher: &SigningKey,
+) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)> {
+    let mut scratch = MemoryRepo::default();
+    for fragment in fragments {
+        access_inbox_collection(&mut scratch, recipient.verifying_key(), publisher.clone())
+            .commit(fragment.clone())
+            .context("stage access-inbox COMMIT for runtime validation")?;
+    }
+    discover_access_candidates_with(&mut scratch, recipient, parse_portable_descriptor)
+}
+
+fn discover_access_candidates_with<S, F>(
+    store: &mut S,
+    recipient: &SigningKey,
+    mut parse: F,
+) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)>
+where
+    S: BlobStore + triblespace::core::collection::CollectionStore,
+    S::Reader: BlobStoreMeta,
+    F: FnMut(
+        &S::Reader,
+        CollectionHandle,
+    ) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)>,
 {
     let inbox = access_inbox_handle(recipient.verifying_key());
     let commits =
@@ -497,7 +596,7 @@ where
                     continue;
                 }
             };
-            let location = match parse_descriptor(&reader, row.vault) {
+            let location = match parse(&reader, row.vault) {
                 Ok(location) => location,
                 Err((kind, detail)) => {
                     commit_valid = false;

@@ -6,43 +6,221 @@
 //! consulted, so a pile may discard that older source generation without
 //! losing its path to the current custody model.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
+use triblespace::core::collection::CollectionAdmission;
+use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::{BlobStore, TribleSet};
 
-use crate::activation_cutover::{
-    materialized_facts, CandidateViews, PlannedActivationReader, PlannedCollection,
-};
-use crate::collection_cutover::FrozenSource;
-use crate::secrets_vault_cutover::{self, SecretsVaultMigrationReport};
+use crate::activation_cutover::PlannedActivationReader;
+use crate::collection_cutover::{snapshot_native_collections_in, NativeCollectionSnapshot};
+use crate::secrets_vault_cutover::{self, SecretsVaultMigrationPlan, SecretsVaultMigrationReport};
+use faculties::storage::open_pile_strict;
 use faculties::{decide, files, headspace, mail, relations, schemas, secrets, teams};
 
 /// Complete publication plan for one native Secrets generation upgrade.
 #[derive(Clone)]
 pub struct SecretsCustodyCutoverPlan {
-    namespace: [u8; 32],
-    collections: Vec<PlannedCollection>,
-    report: SecretsVaultMigrationReport,
+    direct: SecretsVaultMigrationPlan,
 }
 
 impl SecretsCustodyCutoverPlan {
-    pub const fn namespace(&self) -> [u8; 32] {
-        self.namespace
+    fn namespace(&self) -> [u8; 32] {
+        self.direct.namespace()
     }
 
-    pub fn collections(&self) -> &[PlannedCollection] {
-        &self.collections
+    pub fn report(&self) -> &SecretsVaultMigrationReport {
+        self.direct.report()
     }
 
-    pub const fn report(&self) -> &SecretsVaultMigrationReport {
-        &self.report
+    pub fn pending_commits(&self) -> usize {
+        self.pending_access_commits() + self.pending_vault_commits()
+    }
+
+    pub fn pending_access_commits(&self) -> usize {
+        self.direct.access_inbox().len()
+    }
+
+    pub fn pending_vault_commits(&self) -> usize {
+        self.direct
+            .vaults()
+            .iter()
+            .filter(|vault| vault.report.data_pending)
+            .count()
+    }
+}
+
+/// Result of ensuring the custody successor directly in the live pile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdditiveActivationOutcome {
+    Published { commits: usize },
+    AlreadyActive,
+}
+
+/// Additively publish and validate the native custody successor.
+///
+/// A host-local advisory lock keyed by the opened pile's physical identity
+/// serializes only competing custody activators. It does not lock the pile:
+/// unrelated collection and blob appends continue to commute with the
+/// migration. Every COMMIT remains its own atomic visibility boundary, with
+/// the access envelope intentionally published before the vault. Re-running
+/// this function repairs any crash prefix idempotently.
+pub fn activate(pile_path: &Path, signer: &SigningKey) -> Result<AdditiveActivationOutcome> {
+    let mut pile = open_pile_strict(pile_path)?;
+    let _activation = match CustodyActivationLock::acquire(&pile) {
+        Ok(activation) => activation,
+        Err(error) => return finish_live_pile(pile, Err(error)),
+    };
+    let result = (|| {
+        let source = snapshot_native_collections_in(&mut pile)
+            .context("capture native collection snapshot for Secrets custody activation")?;
+        let migration = plan(&source, signer)?;
+        let pending = migration.pending_commits();
+        if pending == 0 {
+            return Ok(AdditiveActivationOutcome::AlreadyActive);
+        }
+
+        publish_live(&mut pile, signer, &migration)?;
+        let final_source = snapshot_native_collections_in(&mut pile)
+            .context("capture published Secrets custody snapshot")?;
+        let remaining = plan(&final_source, signer)
+            .context("replan additive Secrets custody publication")?
+            .pending_commits();
+        if remaining != 0 {
+            bail!("Secrets custody publication left {remaining} pending COMMIT(s)");
+        }
+        Ok(AdditiveActivationOutcome::Published { commits: pending })
+    })();
+    finish_live_pile(pile, result)
+}
+
+struct CustodyActivationLock {
+    file: File,
+}
+
+impl CustodyActivationLock {
+    fn acquire(pile: &Pile) -> Result<Self> {
+        let path = custody_activation_lock_path(pile)?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("open custody activation lock {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(TryLockError::WouldBlock) => bail!(
+                "another Secrets custody activation already holds {}",
+                path.display()
+            ),
+            Err(TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("lock custody activation {}", path.display()))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn custody_activation_lock_path(pile: &Pile) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = pile
+        .backing_file_metadata()
+        .context("inspect physical pile identity for custody activation")?;
+    Ok(PathBuf::from(format!(
+        "/tmp/faculties-secrets-custody-v1-{:016x}-{:016x}.lock",
+        metadata.dev(),
+        metadata.ino()
+    )))
+}
+
+#[cfg(not(unix))]
+fn custody_activation_lock_path(_pile: &Pile) -> Result<PathBuf> {
+    bail!("safe physical-identity custody activation locking is not implemented on this platform")
+}
+
+impl Drop for CustodyActivationLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn publish_live(
+    pile: &mut triblespace::core::repo::pile::Pile,
+    signer: &SigningKey,
+    plan: &SecretsCustodyCutoverPlan,
+) -> Result<usize> {
+    if plan.namespace() != signer.verifying_key().to_bytes() {
+        bail!("Secrets custody plan belongs to a different durable namespace");
+    }
+    let mut published = 0;
+    {
+        let mut inbox = secrets::storage::access_inbox_collection(
+            &mut *pile,
+            signer.verifying_key(),
+            signer.clone(),
+        );
+        for fragment in plan.direct.access_inbox() {
+            inbox
+                .commit(fragment.clone())
+                .context("publish founder access-inbox COMMIT")?;
+            published += 1;
+        }
+    }
+
+    for vault in plan
+        .direct
+        .vaults()
+        .iter()
+        .filter(|vault| vault.report.data_pending)
+    {
+        if vault.authority != signer.verifying_key()
+            || vault.write_presentation.subject() != signer.verifying_key()
+        {
+            bail!("custody vault is not rooted in the durable signer");
+        }
+        secrets::vault_collection(
+            &mut *pile,
+            vault.vault,
+            signer.verifying_key(),
+            signer.clone(),
+            CollectionAdmission::capability(
+                vault.authority,
+                vec![vault.write_presentation.clone()],
+            ),
+        )
+        .commit(vault.required.clone())
+        .with_context(|| format!("publish custody vault {:X} COMMIT", vault.vault))?;
+        published += 1;
+    }
+    Ok(published)
+}
+
+fn finish_live_pile<T>(pile: triblespace::core::repo::pile::Pile, result: Result<T>) -> Result<T> {
+    let close = pile.close();
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(anyhow!("close live pile: {error}")),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing live pile also failed: {close_error}")))
+        }
     }
 }
 
 /// Plan only from the already-native direct-recipient generation.
-pub fn plan(source: &FrozenSource, signer: &SigningKey) -> Result<SecretsCustodyCutoverPlan> {
+pub fn plan(
+    source: &NativeCollectionSnapshot,
+    signer: &SigningKey,
+) -> Result<SecretsCustodyCutoverPlan> {
     let mut store = source.collection_store();
     let direct =
         secrets_vault_cutover::plan_from_direct_in_store(&mut store, signer, source.reader())
@@ -51,85 +229,13 @@ pub fn plan(source: &FrozenSource, signer: &SigningKey) -> Result<SecretsCustody
         bail!("Secrets custody plan belongs to a different durable namespace");
     }
 
-    let mut collections = Vec::new();
-    if !direct.vaults().is_empty() {
-        let fragments = direct.access_inbox().to_vec();
-        collections.push(PlannedCollection::access_inbox(
-            signer.verifying_key(),
-            fragments.clone(),
-            materialized_facts(&fragments),
-        )?);
-    }
-    for vault in direct.vaults() {
-        let fragments = vault
-            .report
-            .data_pending
-            .then(|| vault.required.clone())
-            .into_iter()
-            .collect::<Vec<_>>();
-        let expected_facts = materialized_facts(&fragments);
-        collections.push(PlannedCollection::vault(
-            vault.vault,
-            fragments,
-            expected_facts,
-            vault.authority,
-            vault.write_presentation.clone(),
-        )?);
-    }
     validate_planned_world(source, signer, &direct)
         .context("validate native Secrets custody plan against current consumers")?;
-    // These are observations, not write targets. They put the exact native
-    // consumers of Secrets into the candidate view so the final validator can
-    // prove that every stored reference still resolves after the successor is
-    // published. Empty fragment lists mean no COMMIT can be emitted.
-    collections.extend(
-        observed_scopes()
-            .into_iter()
-            .map(PlannedCollection::observe),
-    );
-
-    Ok(SecretsCustodyCutoverPlan {
-        namespace: direct.namespace(),
-        collections,
-        report: direct.report().clone(),
-    })
-}
-
-/// Validate the exact Secrets world exposed through the recipient's inbox.
-///
-/// Candidate construction has already required every planned target to be
-/// discoverable through its founder envelope. Re-running the domain parser
-/// here keeps the standalone migration's final semantic check explicit rather
-/// than borrowing the unrelated all-faculty validator.
-pub fn validate_candidate_views(
-    reader: &triblespace::core::repo::pile::PileReader,
-    views: &CandidateViews,
-) -> Result<()> {
-    let expected_scopes = BTreeSet::from(observed_scopes());
-    if views.faculties().keys().copied().collect::<BTreeSet<_>>() != expected_scopes {
-        bail!("Secrets custody candidate has the wrong observed consumer set");
-    }
-    for (collection, (vault, facts)) in views.local_vaults() {
-        let catalog = secrets::validate_catalog(reader, *vault, facts)
-            .with_context(|| format!("validate custody vault {vault:X} at {collection:?}"))?;
-        if catalog.custody.is_none() {
-            bail!("inbox-discovered vault {vault:X} has no custody declaration");
-        }
-    }
-
-    let local_secrets = secrets::SecretsSnapshot::new_exact(
-        reader.clone(),
-        views
-            .local_vaults()
-            .iter()
-            .map(|(collection, (vault, facts))| (*collection, *vault, facts.clone())),
-    )
-    .context("validate inbox-discovered Secrets custody snapshot")?;
-    validate_consumers(reader, views.faculties(), &local_secrets)
+    Ok(SecretsCustodyCutoverPlan { direct })
 }
 
 fn validate_planned_world(
-    source: &FrozenSource,
+    source: &NativeCollectionSnapshot,
     signer: &SigningKey,
     direct: &secrets_vault_cutover::SecretsVaultMigrationPlan,
 ) -> Result<()> {
@@ -173,6 +279,7 @@ fn validate_planned_world(
             .map(|(collection, (vault, facts))| (*collection, *vault, facts.clone())),
     )
     .context("validate planned custody successor vaults")?;
+    validate_staged_access_inbox(signer, direct, &local_secrets)?;
 
     let scopes = observed_scopes();
     let consumer_facts = scopes
@@ -185,6 +292,100 @@ fn validate_planned_world(
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     validate_consumers(source.reader(), &consumer_facts, &local_secrets)
+}
+
+fn validate_staged_access_inbox<R>(
+    signer: &SigningKey,
+    direct: &SecretsVaultMigrationPlan,
+    local_secrets: &secrets::SecretsSnapshot<R>,
+) -> Result<()>
+where
+    R: triblespace::core::repo::BlobStoreGet,
+{
+    let expected = direct
+        .vaults()
+        .iter()
+        .filter(|vault| vault.report.access_pending)
+        .map(|vault| {
+            let location = secrets::storage::VaultLocation::new(
+                vault.vault,
+                signer.verifying_key(),
+                vault.authority,
+            );
+            (location.collection(), (location, vault))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if expected.len() != direct.access_inbox().len() {
+        bail!(
+            "Secrets custody plan staged {} access envelope(s) for {} pending vault(s)",
+            direct.access_inbox().len(),
+            expected.len()
+        );
+    }
+    if expected.is_empty() {
+        return Ok(());
+    }
+
+    // Exercise the exact runtime inbox path in memory before the first live
+    // COMMIT. This catches a malformed row, missing descriptor/proof blob,
+    // publisher mismatch, or sealed-frame mismatch while the live pile is
+    // still untouched.
+    let (candidates, issues) =
+        secrets::storage::discover_staged_access_candidates(direct.access_inbox(), signer, signer)
+            .context("discover staged founder access envelopes")?;
+    if !issues.is_empty() {
+        let detail = issues
+            .iter()
+            .map(|issue| format!("{:?}: {}", issue.kind(), issue.detail()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("staged founder access envelope failed runtime discovery: {detail}");
+    }
+    if candidates.len() != expected.len() {
+        bail!(
+            "runtime discovery admitted {} staged access candidate(s); expected {}",
+            candidates.len(),
+            expected.len()
+        );
+    }
+
+    let mut seen = BTreeMap::new();
+    for candidate in candidates {
+        let location = candidate.location();
+        let Some((expected_location, vault)) = expected.get(&location.collection()) else {
+            bail!(
+                "runtime discovery admitted unexpected custody collection {:?}",
+                location.collection()
+            );
+        };
+        if location != *expected_location
+            || candidate.publisher() != signer.verifying_key()
+            || candidate.writer() != vault.write_presentation.subject()
+        {
+            bail!(
+                "runtime discovery changed the authority of custody vault {:X}",
+                vault.vault
+            );
+        }
+        let declared_custody = local_secrets
+            .vault_exact(location.collection())
+            .and_then(|snapshot| snapshot.catalog().custody)
+            .context("planned custody vault has no exact custody declaration")?
+            .public_key;
+        if candidate.custody().verifying_key().to_bytes() != declared_custody {
+            bail!(
+                "staged access envelope and custody vault {:X} name different custody keys",
+                vault.vault
+            );
+        }
+        if seen.insert(location.collection(), candidate.id()).is_some() {
+            bail!(
+                "runtime discovery admitted competing founder envelopes for vault {:X}",
+                vault.vault
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_consumers<R>(
@@ -242,5 +443,92 @@ fn observed<'a>(
 ) -> Result<&'a TribleSet> {
     views
         .get(&scope)
-        .ok_or_else(|| anyhow!("Secrets custody candidate has no observed {name} collection"))
+        .ok_or_else(|| anyhow!("Secrets custody plan has no observed {name} collection"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_lock_serializes_only_competing_activators() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("self.pile");
+        File::create(&path).unwrap();
+        let first_pile = open_pile_strict(&path).unwrap();
+        let second_pile = open_pile_strict(&path).unwrap();
+
+        let first = CustodyActivationLock::acquire(&first_pile).unwrap();
+        let error = CustodyActivationLock::acquire(&second_pile)
+            .err()
+            .expect("a second activator must not plan a competing custody epoch");
+        assert!(format!("{error:#}").contains("another Secrets custody activation"));
+
+        drop(first);
+        CustodyActivationLock::acquire(&second_pile).unwrap();
+        first_pile.close().unwrap();
+        second_pile.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_lock_converges_across_hard_links_and_renames() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("self.pile");
+        let alias = directory.path().join("hard-link.pile");
+        let renamed = directory.path().join("renamed.pile");
+        File::create(&original).unwrap();
+        std::fs::hard_link(&original, &alias).unwrap();
+
+        let first_pile = open_pile_strict(&original).unwrap();
+        let first = CustodyActivationLock::acquire(&first_pile).unwrap();
+        let alias_pile = open_pile_strict(&alias).unwrap();
+        assert!(CustodyActivationLock::acquire(&alias_pile).is_err());
+
+        std::fs::rename(&original, &renamed).unwrap();
+        let renamed_pile = open_pile_strict(&renamed).unwrap();
+        assert!(CustodyActivationLock::acquire(&renamed_pile).is_err());
+
+        drop(first);
+        CustodyActivationLock::acquire(&renamed_pile).unwrap();
+        first_pile.close().unwrap();
+        alias_pile.close().unwrap();
+        renamed_pile.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_lock_does_not_serialize_distinct_piles() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.pile");
+        let second_path = directory.path().join("second.pile");
+        File::create(&first_path).unwrap();
+        File::create(&second_path).unwrap();
+        let first_pile = open_pile_strict(&first_path).unwrap();
+        let second_pile = open_pile_strict(&second_path).unwrap();
+
+        let _first = CustodyActivationLock::acquire(&first_pile).unwrap();
+        let _second = CustodyActivationLock::acquire(&second_pile).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_lock_does_not_block_ordinary_pile_appends() {
+        use triblespace::prelude::{blobencodings, BlobStorePut};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("self.pile");
+        File::create(&path).unwrap();
+        let activation_pile = open_pile_strict(&path).unwrap();
+        let _activation = CustodyActivationLock::acquire(&activation_pile).unwrap();
+
+        let mut writer = open_pile_strict(&path).unwrap();
+        writer
+            .put::<blobencodings::RawBytes, _>(b"ordinary concurrent append".to_vec())
+            .unwrap();
+        writer.close().unwrap();
+        drop(_activation);
+        activation_pile.close().unwrap();
+    }
 }

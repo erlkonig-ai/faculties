@@ -165,23 +165,6 @@ impl PlannedCollection {
         &self.policy
     }
 
-    /// Include one existing native faculty collection in the closed candidate
-    /// view without publishing a COMMIT to it.
-    ///
-    /// Later migrations use this to validate cross-collection references
-    /// against the exact post-migration world while keeping their write set
-    /// limited to the collections they actually change.
-    pub(crate) fn observe(scope: Id) -> Self {
-        Self {
-            name: faculties::collection_names::require_name(scope),
-            reach: faculties::collection_names::require_reach(scope),
-            view: CandidateViewKey::Faculty(scope),
-            policy: TargetPolicy::Open,
-            fragments: Vec::new(),
-            expected_facts: TribleSet::new(),
-        }
-    }
-
     fn new(
         name: &'static str,
         scope: Id,

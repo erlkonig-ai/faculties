@@ -1,8 +1,8 @@
-//! Stopped-world projection from the frozen pre-collection/direct-recipient
-//! Secrets generations to capability-anchored custody vault epochs.
+//! Projection from pre-collection or native direct-recipient Secrets
+//! generations to capability-anchored custody vault epochs.
 //!
-//! The copied pile prefix retains the old branch byte-for-byte. Planning
-//! validates every source and target catalog, stages the exact encrypted
+//! The source generation remains immutable evidence. Planning validates every
+//! source and target catalog, stages the exact encrypted
 //! bodies and direct wraps, adds one custody declaration and exactly one
 //! custody wrap per secret, and emits one founder access envelope into the
 //! durable signer's deterministic inbox. There is no intermediary fixed

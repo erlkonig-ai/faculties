@@ -4,14 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-- **Stopped-world migrations now have stable semantic names.** The original
+- **Migration generations now have stable semantic names and fitting execution
+  boundaries.** The original
   pre-collection transition is `migrations legacy-branches plan|activate`;
   `plan-cutover` and `activate-cutover` are removed rather than retained as
   ambiguous aliases. The later native direct-recipient Secrets generation has
   its own `migrations secrets-custody plan|activate` lane. That lane reads only
   exact native predecessor vaults, observes Headspace, Teams, Mail and their
   dependencies for cross-collection validation, and never consults the
-  retained pre-collection Secrets branch or asks for its password.
+  retained pre-collection Secrets branch or asks for its password. Unlike the
+  historical branch migration, custody activation is online and additive: one
+  migration-specific lock serializes competing random custody genesis while
+  unrelated pile writers remain online; founder inbox COMMITs precede vault
+  COMMITs, and a fresh domain replan must find no work left.
 
 - **Faculty-authored chronology now fails closed on clock errors.** Clock reads
   that timestamp collection facts or operational records pass through one

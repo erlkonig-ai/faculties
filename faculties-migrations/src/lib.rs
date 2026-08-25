@@ -1,5 +1,4 @@
-//! Stopped-world migrations from a pre-collection Faculties pile into native
-//! collections.
+//! Explicit migrations between Faculties storage generations.
 //!
 //! This crate exists so the faculties do not carry it. Every faculty reads
 //! native `Collection`s now; the transforms that got a pile there are needed
@@ -12,8 +11,8 @@
 //!
 //! Layout:
 //!
-//! - [`collection_cutover`] freezes one immutable source snapshot and provides
-//!   the shared legacy-branch projection and publication primitives.
+//! - [`collection_cutover`] freezes immutable legacy sources and captures
+//!   append-stable native collection prefixes for additive migrations.
 //! - One `*_cutover` module per faculty holds that faculty's typed transform:
 //!   `plan(&FrozenSource)` builds a plan whose `verify_conservation` proves the
 //!   produced fragments re-union to exactly the original `TribleSet`, and
@@ -22,6 +21,8 @@
 //!   proves complete legacy-source coverage.
 //! - [`disposable_cutover`] builds that aggregate plan into a disposable
 //!   sibling pile and atomically replaces an unchanged live pile.
+//! - [`secrets_custody_cutover`] upgrades the later native direct-recipient
+//!   generation online through ordered additive COMMITs and a domain replan.
 //!
 //! The `migrations` binary is the only consumer.
 

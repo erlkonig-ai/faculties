@@ -74,39 +74,13 @@ pub fn activate<F>(
 where
     F: FnOnce(&PileReader, &CandidateViews) -> Result<()>,
 {
-    plan.verify_source_coverage(source)?;
-    activate_collections(
-        live,
-        signer,
-        source,
-        plan.namespace(),
-        plan.collections(),
-        validate,
-    )
-}
-
-/// Publish one explicitly scoped set of collection projections through the
-/// same disposable-candidate boundary as the historical aggregate cutover.
-///
-/// Unlike [`activate`], this does not claim complete legacy-branch coverage.
-/// It is the primitive for later, independently named native-generation
-/// migrations such as the Secrets custody cutover.
-pub fn activate_collections<F>(
-    live: &Path,
-    signer: &SigningKey,
-    source: &FrozenSource,
-    namespace: [u8; 32],
-    collections: &[PlannedCollection],
-    validate: F,
-) -> Result<ActivationOutcome>
-where
-    F: FnOnce(&PileReader, &CandidateViews) -> Result<()>,
-{
-    if namespace != signer.verifying_key().to_bytes() {
-        bail!("publication plan belongs to a different durable collection namespace");
+    if plan.namespace() != signer.verifying_key().to_bytes() {
+        bail!("activation plan belongs to a different durable collection namespace");
     }
+    plan.verify_source_coverage(source)?;
     let (target, candidate) = activation_paths(live)?;
-    let publications = collections
+    let publications = plan
+        .collections()
         .iter()
         .map(|plan| Publication::new(plan, signer.verifying_key()))
         .collect::<Vec<_>>();
@@ -318,21 +292,11 @@ pub fn inspect_publication(
     plan: &ActivationPlan,
 ) -> Result<CutoverPublicationPresence> {
     plan.verify_source_coverage(source)?;
-    inspect_collections(source, signer, plan.namespace(), plan.collections())
-}
-
-/// Inspect one independently named native-generation migration without
-/// asserting that it accounts for every retained legacy branch.
-pub fn inspect_collections(
-    source: &FrozenSource,
-    signer: &SigningKey,
-    namespace: [u8; 32],
-    collections: &[PlannedCollection],
-) -> Result<CutoverPublicationPresence> {
-    if namespace != signer.verifying_key().to_bytes() {
+    if plan.namespace() != signer.verifying_key().to_bytes() {
         bail!("publication plan belongs to a different durable collection namespace");
     }
-    let publications = collections
+    let publications = plan
+        .collections()
         .iter()
         .map(|plan| Publication::new(plan, signer.verifying_key()))
         .collect::<Vec<_>>();
@@ -1023,8 +987,8 @@ mod tests {
     use triblespace::prelude::{blobencodings, BlobStorePut, ExclusiveId, Inline};
 
     use super::*;
-    use crate::collection_cutover::freeze_source;
     use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
+    use crate::collection_cutover::{freeze_source, snapshot_native_collections};
     use crate::legacy_secrets_v1 as legacy_secrets;
     use crate::legacy_secrets_v1::test_support as legacy_fixture;
     use crate::{secrets_custody_cutover, secrets_cutover, secrets_vault_cutover};
@@ -1562,19 +1526,24 @@ mod tests {
             fixture.signer.verifying_key(),
             vault_plan.authority,
         );
-        let custody = secrets_custody_cutover::plan(&frozen, &fixture.signer).unwrap();
+        let custody_source = snapshot_native_collections(&fixture.live).unwrap();
+        let custody = secrets_custody_cutover::plan(&custody_source, &fixture.signer).unwrap();
         assert_eq!(custody.report().pre_collection_source_facts, 0);
         assert_eq!(custody.report().direct_source_facts, post_facts.len());
-        let outcome = activate_collections(
-            &fixture.live,
-            &fixture.signer,
-            &frozen,
-            custody.namespace(),
-            custody.collections(),
-            secrets_custody_cutover::validate_candidate_views,
-        )
-        .unwrap();
-        assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+        assert_eq!(custody.pending_access_commits(), 1);
+        assert_eq!(custody.pending_vault_commits(), 1);
+        let before_activation = fs::read(&fixture.live).unwrap();
+        #[cfg(unix)]
+        let inode = fs::metadata(&fixture.live).unwrap().ino();
+        let outcome = secrets_custody_cutover::activate(&fixture.live, &fixture.signer).unwrap();
+        assert_eq!(
+            outcome,
+            secrets_custody_cutover::AdditiveActivationOutcome::Published { commits: 2 }
+        );
+        let after_activation = fs::read(&fixture.live).unwrap();
+        assert!(after_activation.starts_with(&before_activation));
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&fixture.live).unwrap().ino(), inode);
 
         let mut pile = open_pile_strict(&fixture.live).unwrap();
         let discovered =
@@ -1590,18 +1559,14 @@ mod tests {
         drop(discovered);
         pile.close().unwrap();
 
-        let replay_source = freeze_source(&fixture.live).unwrap();
+        let replay_source = snapshot_native_collections(&fixture.live).unwrap();
         let replay = secrets_custody_cutover::plan(&replay_source, &fixture.signer).unwrap();
-        let outcome = activate_collections(
-            &fixture.live,
-            &fixture.signer,
-            &replay_source,
-            replay.namespace(),
-            replay.collections(),
-            secrets_custody_cutover::validate_candidate_views,
-        )
-        .unwrap();
-        assert_eq!(outcome, ActivationOutcome::AlreadyActive);
+        assert_eq!(replay.pending_commits(), 0);
+        let outcome = secrets_custody_cutover::activate(&fixture.live, &fixture.signer).unwrap();
+        assert_eq!(
+            outcome,
+            secrets_custody_cutover::AdditiveActivationOutcome::AlreadyActive
+        );
     }
 
     #[test]
