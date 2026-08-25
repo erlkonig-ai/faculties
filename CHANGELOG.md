@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Stopped-world migrations now have stable semantic names.** The original
+  pre-collection transition is `migrations legacy-branches plan|activate`;
+  `plan-cutover` and `activate-cutover` are removed rather than retained as
+  ambiguous aliases. The later native direct-recipient Secrets generation has
+  its own `migrations secrets-custody plan|activate` lane. That lane reads only
+  exact native predecessor vaults, observes Headspace, Teams, Mail and their
+  dependencies for cross-collection validation, and never consults the
+  retained pre-collection Secrets branch or asks for its password.
+
 - **Faculty-authored chronology now fails closed on clock errors.** Clock reads
   that timestamp collection facts or operational records pass through one
   fallible shared capability. A failed read therefore aborts before a
@@ -13,7 +22,7 @@ All notable changes to this project will be documented in this file.
   source records with genuinely absent timestamps remain optional and
   unchanged.
 
-- **`migrations plan-cutover` now recognizes an already-published native
+- **`migrations legacy-branches plan` now recognizes an already-published native
   cutover.** Planning still derives the legacy projection from one frozen pile
   prefix, then deterministically replays each planned collection commit and
   Secrets access-envelope publication in bounded scratch storage and compares
@@ -23,7 +32,7 @@ All notable changes to this project will be documented in this file.
   fragment as a real commit, and flags vault custody or access drift. This
   keeps the read-only planner useful after a cutover without mistaking a
   completed live pile for work that should be activated a second time;
-  `activate-cutover` remains the aggregate semantic validator. If one valid
+  `legacy-branches activate` remains the aggregate semantic validator. If one valid
   historical Secrets scope carries repeated creation observations, direct
   vault activation projects their earliest point as the immutable vault
   genesis; intrinsic scope identity was `(creator, name)`, and the preserved
@@ -104,7 +113,7 @@ All notable changes to this project will be documented in this file.
   constant in vault size and do not enumerate membership. The live CLI manages
   explicit epochs with `secrets vault create|list|grant` and exact immutable
   versions with `secrets secret add|get|list`; the enumerable `members` and
-  per-secret `share` surfaces are gone. Aggregate `migrations activate-cutover`
+  per-secret `share` surfaces are gone. `migrations secrets-custody activate`
   preserves historical secret ids, encrypted bodies, and source evidence while
   re-sealing only each DEK into a capability-anchored custody successor.
 

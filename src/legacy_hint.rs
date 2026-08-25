@@ -247,7 +247,7 @@ pub fn legacy_migration_hint(
     Some(format!(
         "note: this pile's native `{branch_name}` collection has no commits, but its legacy `{branch_name}` branch still holds {about}.\n\
          note: current faculties read only native collections, so that history stays invisible until it is migrated. Nothing has been lost — the legacy branch is intact and migration only adds to it.\n\
-         note: stop every writer on this pile, then run `migrations --pile <this pile> plan-cutover` to see exactly what would move, and `migrations --pile <this pile> activate-cutover` to migrate."
+         note: stop every writer on this pile, then run `migrations --pile <this pile> legacy-branches plan` to see exactly what would move, and `migrations --pile <this pile> legacy-branches activate` to migrate."
     ))
 }
 
@@ -492,7 +492,7 @@ mod tests {
             "hint must state the count it found: {hint}"
         );
         assert!(
-            hint.contains("activate-cutover"),
+            hint.contains("legacy-branches activate"),
             "hint must name the command that fixes it: {hint}"
         );
         assert!(
@@ -582,7 +582,7 @@ mod tests {
             "the naming migration is the one that applies: {hint}"
         );
         assert!(
-            !hint.contains("activate-cutover"),
+            !hint.contains("legacy-branches activate"),
             "this pile already cut over; naming it again is not cutting it over: {hint}"
         );
         assert!(
@@ -604,7 +604,7 @@ mod tests {
         let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_namespace()).unwrap();
         pile.close().unwrap();
 
-        assert!(hint.contains("activate-cutover"), "{hint}");
+        assert!(hint.contains("legacy-branches activate"), "{hint}");
         assert!(!hint.contains("collection-naming"), "{hint}");
     }
 

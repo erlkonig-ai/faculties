@@ -1,4 +1,4 @@
-//! `migrations` — inspect and execute migrations of a pre-collection pile.
+//! `migrations` — inspect and execute explicitly named Faculties migrations.
 //!
 //! Every migration verb lives here, and nowhere else. The faculties read
 //! native collections only; a pile written before the storage cutover keeps
@@ -7,11 +7,11 @@
 //! exactly that reason: deleting it would make an existing user's data
 //! invisible the day they upgrade.
 //!
-//! - `plan-cutover` freezes one source snapshot, runs every typed transform,
-//!   and prints the exact coverage proof without writing anything.
-//! - `activate-cutover` reruns that same pure boundary, publishes into a
-//!   disposable sibling, and atomically replaces an unchanged live pile. This
-//!   is the whole-pile path and the one to prefer.
+//! - `legacy-branches plan|activate` is the original whole-pile transition
+//!   from named branch pins into native collections.
+//! - `secrets-custody plan|activate` upgrades the later native direct-vault
+//!   Secrets generation into capability-anchored custody epochs. It never
+//!   consults the older pre-collection Secrets branch.
 //! - `migrate-legacy <faculty>` migrates one faculty's branch in place, which
 //!   is what that faculty's own `migrate-legacy` subcommand used to do.
 //! - `status-register` gives Compass's status register the identity it never
@@ -32,7 +32,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
     activation_cutover, collection_cutover, collection_naming, disposable_cutover, legacy_password,
-    mail_credentials, posture_findings, status_register, teams_credentials,
+    mail_credentials, posture_findings, secrets_custody_cutover, status_register,
+    teams_credentials,
 };
 use zeroize::Zeroizing;
 
@@ -40,7 +41,7 @@ use zeroize::Zeroizing;
 #[command(
     version = faculties::GIT_VERSION,
     name = "migrations",
-    about = "Plan and execute migrations of a pre-collection Faculties pile"
+    about = "Plan and execute explicitly named Faculties data migrations"
 )]
 struct Cli {
     #[arg(long, env = "PILE")]
@@ -57,13 +58,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Freeze the pile once and prove complete legacy-source coverage without
-    /// writing a candidate or changing the live file.
-    PlanCutover,
+    /// Move the original named legacy branches into native collections.
+    LegacyBranches {
+        #[command(subcommand)]
+        action: StoppedWorldAction,
+    },
 
-    /// With every pile writer stopped, build and validate a disposable native
-    /// candidate and atomically replace the unchanged live pile.
-    ActivateCutover,
+    /// Upgrade native direct-recipient Secrets vaults to capability/custody.
+    SecretsCustody {
+        #[command(subcommand)]
+        action: StoppedWorldAction,
+    },
 
     /// With every pile writer stopped, migrate one faculty's legacy branch
     /// into its native collection, in place, leaving the rest of the pile
@@ -154,6 +159,14 @@ enum Command {
 
     /// List the faculty names `migrate-legacy` accepts.
     Faculties,
+}
+
+#[derive(Clone, Copy, Subcommand)]
+enum StoppedWorldAction {
+    /// Freeze one source snapshot and prove the exact migration without writing.
+    Plan,
+    /// Build and validate a disposable sibling, then atomically replace the unchanged live pile.
+    Activate,
 }
 
 fn teams_credentials(pile: &Path, export: Option<&Path>) -> Result<()> {
@@ -482,7 +495,7 @@ fn list_faculties() {
     }
 }
 
-fn activation_plan(
+fn legacy_branches_plan(
     source: &collection_cutover::FrozenSource,
     signer: &ed25519_dalek::SigningKey,
 ) -> Result<activation_cutover::ActivationPlan> {
@@ -501,18 +514,19 @@ fn activation_plan(
     }
 }
 
-fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
+fn plan_legacy_branches(pile: &Path, key: Option<&Path>) -> Result<()> {
     let signer = faculties::storage::load_signer(pile, key)
         .context("load durable signer for activation planning")?;
     let source = collection_cutover::freeze_source(pile)
-        .with_context(|| format!("freeze cutover source {}", pile.display()))?;
-    let plan = activation_plan(&source, &signer).context("plan aggregate collection cutover")?;
+        .with_context(|| format!("freeze legacy-branch source {}", pile.display()))?;
+    let plan = legacy_branches_plan(&source, &signer)
+        .context("plan legacy-branch collection migration")?;
     let presence = disposable_cutover::inspect_publication(&source, &signer, &plan)
-        .context("inspect native cutover publication")?;
+        .context("inspect legacy-branch publication")?;
 
     let semantic = source.fingerprint();
     let physical = source.physical_fingerprint();
-    println!("Native collection cutover plan");
+    println!("Legacy branches -> native collections plan");
     println!("source       : {}", pile.display());
     println!("source bytes : {}", physical.length);
     println!("source hash  : blake3:{}", hex::encode(physical.digest));
@@ -547,13 +561,13 @@ fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
     println!();
     match presence.status() {
         disposable_cutover::NativePublicationStatus::Complete => println!(
-            "All exact planned native publications are already complete. `activate-cutover` would add no planned collection bytes; it remains the authoritative aggregate semantic validation."
+            "All exact legacy-branch publications are already complete. `legacy-branches activate` would add no planned collection bytes; it remains the authoritative aggregate semantic validation."
         ),
         disposable_cutover::NativePublicationStatus::Partial => println!(
-            "Native publication is partial. `activate-cutover` is the authoritative check for whether the deterministic remainder can be completed and validated."
+            "Legacy-branch publication is partial. `legacy-branches activate` is the authoritative check for whether the deterministic remainder can be completed and validated."
         ),
         disposable_cutover::NativePublicationStatus::Missing => println!(
-            "Native publication is missing. `activate-cutover` would publish and validate the deterministic plan."
+            "Legacy-branch publication is missing. `legacy-branches activate` would publish and validate the deterministic plan."
         ),
     }
 
@@ -585,12 +599,13 @@ fn plan_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn activate_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
+fn activate_legacy_branches(pile: &Path, key: Option<&Path>) -> Result<()> {
     let signer = faculties::storage::load_signer(pile, key)
         .context("load durable signer for disposable activation")?;
     let source = collection_cutover::freeze_source(pile)
-        .with_context(|| format!("freeze cutover source {}", pile.display()))?;
-    let plan = activation_plan(&source, &signer).context("plan aggregate collection cutover")?;
+        .with_context(|| format!("freeze legacy-branch source {}", pile.display()))?;
+    let plan = legacy_branches_plan(&source, &signer)
+        .context("plan legacy-branch collection migration")?;
     let retired_source_facts = plan.retired_source_facts();
     let outcome = disposable_cutover::activate(
         pile,
@@ -604,13 +619,11 @@ fn activate_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
     match outcome {
         disposable_cutover::ActivationOutcome::Activated { appended_bytes } => {
             println!(
-                "Activated native collections by appending {appended_bytes} candidate byte(s); the original source prefix is preserved exactly."
+                "Activated legacy branches into native collections by appending {appended_bytes} candidate byte(s); the original source prefix is preserved exactly."
             );
         }
         disposable_cutover::ActivationOutcome::AlreadyActive => {
-            println!(
-                "Native collection activation was already complete; the live pile was unchanged."
-            );
+            println!("Legacy-branch activation was already complete; the live pile was unchanged.");
         }
     }
     if retired_source_facts > 0 {
@@ -621,11 +634,111 @@ fn activate_cutover(pile: &Path, key: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn plan_secrets_custody(pile: &Path, key: Option<&Path>) -> Result<()> {
+    let signer = faculties::storage::load_signer(pile, key)
+        .context("load durable signer for Secrets custody planning")?;
+    let source = collection_cutover::freeze_source(pile)
+        .with_context(|| format!("freeze Secrets custody source {}", pile.display()))?;
+    let plan = secrets_custody_cutover::plan(&source, &signer)
+        .context("plan native direct-vault Secrets custody cutover")?;
+    let presence = disposable_cutover::inspect_collections(
+        &source,
+        &signer,
+        plan.namespace(),
+        plan.collections(),
+    )
+    .context("inspect Secrets custody publication")?;
+
+    let physical = source.physical_fingerprint();
+    let report = plan.report();
+    println!("Native direct Secrets -> capability/custody plan");
+    println!("source       : {}", pile.display());
+    println!("source bytes : {}", physical.length);
+    println!("source hash  : blake3:{}", hex::encode(physical.digest));
+    println!("publication  : {}", presence.status().label());
+    println!("source vaults: {}", report.vaults.len());
+    println!("secrets      : {}", report.secret_versions());
+    println!("old wraps    : {}", report.preserved_wraps());
+    println!("custody wraps: {}", report.custody_wraps_added());
+    println!();
+
+    println!("Collections:");
+    for (collection, publication) in plan.collections().iter().zip(presence.collections()) {
+        let view = match collection.view() {
+            activation_cutover::CandidateViewKey::AccessInbox => "Secrets access inbox".into(),
+            activation_cutover::CandidateViewKey::Vault(vault) => format!("vault {vault:X}"),
+            activation_cutover::CandidateViewKey::Faculty(_) => continue,
+        };
+        println!(
+            "- {} | {} | {} | {}/{} exact COMMIT(s) | {}/{} dependency blob(s) | {} fact(s)",
+            collection.name().as_str(),
+            view,
+            publication.status().label(),
+            publication.present_commits(),
+            publication.planned_commits(),
+            publication.resident_dependencies(),
+            publication.required_dependencies(),
+            collection.expected_facts().len(),
+        );
+    }
+    if report.vaults.is_empty() {
+        println!("- no retired native direct-recipient vaults were discovered");
+    }
+
+    println!();
+    match presence.status() {
+        disposable_cutover::NativePublicationStatus::Complete => println!(
+            "Every planned custody successor is already complete; `secrets-custody activate` would leave the pile unchanged."
+        ),
+        disposable_cutover::NativePublicationStatus::Partial => println!(
+            "Custody publication is partial. `secrets-custody activate` can complete and validate the deterministic remainder."
+        ),
+        disposable_cutover::NativePublicationStatus::Missing => println!(
+            "Custody publication is missing. `secrets-custody activate` would publish and validate it."
+        ),
+    }
+    Ok(())
+}
+
+fn activate_secrets_custody(pile: &Path, key: Option<&Path>) -> Result<()> {
+    let signer = faculties::storage::load_signer(pile, key)
+        .context("load durable signer for Secrets custody activation")?;
+    let source = collection_cutover::freeze_source(pile)
+        .with_context(|| format!("freeze Secrets custody source {}", pile.display()))?;
+    let plan = secrets_custody_cutover::plan(&source, &signer)
+        .context("plan native direct-vault Secrets custody cutover")?;
+    let outcome = disposable_cutover::activate_collections(
+        pile,
+        &signer,
+        &source,
+        plan.namespace(),
+        plan.collections(),
+        secrets_custody_cutover::validate_candidate_views,
+    )
+    .context("activate disposable Secrets custody candidate")?;
+
+    match outcome {
+        disposable_cutover::ActivationOutcome::Activated { appended_bytes } => println!(
+            "Activated capability/custody successors by appending {appended_bytes} candidate byte(s); every predecessor byte remains in the exact source prefix."
+        ),
+        disposable_cutover::ActivationOutcome::AlreadyActive => println!(
+            "Secrets capability/custody publication was already complete; the live pile was unchanged."
+        ),
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::PlanCutover) => plan_cutover(&cli.pile, cli.key.as_deref()),
-        Some(Command::ActivateCutover) => activate_cutover(&cli.pile, cli.key.as_deref()),
+        Some(Command::LegacyBranches { action }) => match action {
+            StoppedWorldAction::Plan => plan_legacy_branches(&cli.pile, cli.key.as_deref()),
+            StoppedWorldAction::Activate => activate_legacy_branches(&cli.pile, cli.key.as_deref()),
+        },
+        Some(Command::SecretsCustody { action }) => match action {
+            StoppedWorldAction::Plan => plan_secrets_custody(&cli.pile, cli.key.as_deref()),
+            StoppedWorldAction::Activate => activate_secrets_custody(&cli.pile, cli.key.as_deref()),
+        },
         Some(Command::MigrateLegacy { faculty }) => {
             per_faculty::migrate(faculty, &cli.pile, cli.key.as_deref())
         }

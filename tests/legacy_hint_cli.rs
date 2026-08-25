@@ -84,7 +84,7 @@ fn a_legacy_only_pile_tells_the_operator_how_to_migrate() {
         "the hint must name the binary that owns the migration: {stderr}"
     );
     assert!(
-        stderr.contains("plan-cutover") && stderr.contains("activate-cutover"),
+        stderr.contains("legacy-branches plan") && stderr.contains("legacy-branches activate"),
         "the hint must name both verbs: {stderr}"
     );
 }

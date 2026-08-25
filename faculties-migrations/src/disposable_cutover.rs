@@ -74,13 +74,39 @@ pub fn activate<F>(
 where
     F: FnOnce(&PileReader, &CandidateViews) -> Result<()>,
 {
-    if plan.namespace() != signer.verifying_key().to_bytes() {
-        bail!("activation plan belongs to a different durable collection namespace");
-    }
     plan.verify_source_coverage(source)?;
+    activate_collections(
+        live,
+        signer,
+        source,
+        plan.namespace(),
+        plan.collections(),
+        validate,
+    )
+}
+
+/// Publish one explicitly scoped set of collection projections through the
+/// same disposable-candidate boundary as the historical aggregate cutover.
+///
+/// Unlike [`activate`], this does not claim complete legacy-branch coverage.
+/// It is the primitive for later, independently named native-generation
+/// migrations such as the Secrets custody cutover.
+pub fn activate_collections<F>(
+    live: &Path,
+    signer: &SigningKey,
+    source: &FrozenSource,
+    namespace: [u8; 32],
+    collections: &[PlannedCollection],
+    validate: F,
+) -> Result<ActivationOutcome>
+where
+    F: FnOnce(&PileReader, &CandidateViews) -> Result<()>,
+{
+    if namespace != signer.verifying_key().to_bytes() {
+        bail!("publication plan belongs to a different durable collection namespace");
+    }
     let (target, candidate) = activation_paths(live)?;
-    let publications = plan
-        .collections()
+    let publications = collections
         .iter()
         .map(|plan| Publication::new(plan, signer.verifying_key()))
         .collect::<Vec<_>>();
@@ -199,7 +225,8 @@ impl CollectionPublicationPresence {
 ///
 /// `Complete` means deterministic replay has no planned collection bytes to
 /// add. It deliberately does not re-run the aggregate faculty semantic
-/// validator; `activate-cutover` remains the authoritative validation command.
+/// validator; the corresponding named migration's `activate` command remains
+/// the authoritative validation command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CutoverPublicationPresence {
     status: NativePublicationStatus,
@@ -290,12 +317,22 @@ pub fn inspect_publication(
     signer: &SigningKey,
     plan: &ActivationPlan,
 ) -> Result<CutoverPublicationPresence> {
-    if plan.namespace() != signer.verifying_key().to_bytes() {
-        bail!("activation plan belongs to a different durable collection namespace");
-    }
     plan.verify_source_coverage(source)?;
-    let publications = plan
-        .collections()
+    inspect_collections(source, signer, plan.namespace(), plan.collections())
+}
+
+/// Inspect one independently named native-generation migration without
+/// asserting that it accounts for every retained legacy branch.
+pub fn inspect_collections(
+    source: &FrozenSource,
+    signer: &SigningKey,
+    namespace: [u8; 32],
+    collections: &[PlannedCollection],
+) -> Result<CutoverPublicationPresence> {
+    if namespace != signer.verifying_key().to_bytes() {
+        bail!("publication plan belongs to a different durable collection namespace");
+    }
+    let publications = collections
         .iter()
         .map(|plan| Publication::new(plan, signer.verifying_key()))
         .collect::<Vec<_>>();
@@ -990,7 +1027,7 @@ mod tests {
     use crate::collection_cutover::test_support::{TestBranchSpec, TestDeltaSpec, TestSourceSpec};
     use crate::legacy_secrets_v1 as legacy_secrets;
     use crate::legacy_secrets_v1::test_support as legacy_fixture;
-    use crate::{secrets_cutover, secrets_vault_cutover};
+    use crate::{secrets_custody_cutover, secrets_cutover, secrets_vault_cutover};
     use faculties::storage::initialize_signer;
 
     /// A REAL scope, not a synthetic id. A root is anchored by a name now, so
@@ -1461,24 +1498,35 @@ mod tests {
             Id::new([0x44; 16]).unwrap(),
             SigningKey::from_bytes(&[0x44; 32]),
             vec![TestDeltaSpec::authored(
-                Fragment::empty(),
-                "authored empty legacy Secrets",
+                text_fragment(0x47, "not a legacy Secrets catalog"),
+                "retained branch that custody-only migration must ignore",
             )],
         )])
         .freeze(&fixture.live)
         .unwrap()
         .source;
-        let projection = secrets_cutover::plan(&frozen).unwrap();
+        let mut wrong_lane = frozen.collection_store();
+        let error = secrets_vault_cutover::plan_from_legacy_in_store(
+            &mut wrong_lane,
+            &fixture.signer,
+            frozen.reader(),
+            TribleSet::new(),
+            None,
+        )
+        .err()
+        .expect("legacy lane must reject a native direct-vault generation");
+        assert!(format!("{error:#}").contains("use `migrations secrets-custody"));
+
         let mut store = frozen.collection_store();
-        let direct = secrets_vault_cutover::plan_from_legacy_in_store(
+        let direct = secrets_vault_cutover::plan_from_direct_in_store(
             &mut store,
             &fixture.signer,
             frozen.reader(),
-            projection.retained_facts().clone(),
-            None,
         )
         .unwrap();
-        assert_eq!(direct.report().source_facts, 0);
+        assert_eq!(direct.report().pre_collection_source_facts, 0);
+        assert_eq!(direct.report().direct_source_facts, post_facts.len());
+        assert_eq!(direct.report().source_facts, post_facts.len());
         assert_eq!(direct.vaults().len(), 1);
         assert_eq!(direct.vaults()[0].vault, vault);
         assert_eq!(direct.report().custody_wraps_added(), 1);
@@ -1514,36 +1562,16 @@ mod tests {
             fixture.signer.verifying_key(),
             vault_plan.authority,
         );
-        let access_fragments = direct.access_inbox().to_vec();
-        let vault_fragments = vec![vault_plan.required.clone()];
-        let planned = [
-            PlannedCollection::access_inbox(
-                fixture.signer.verifying_key(),
-                access_fragments.clone(),
-                materialized_facts(&access_fragments),
-            )
-            .unwrap(),
-            PlannedCollection::vault(
-                vault,
-                vault_fragments.clone(),
-                materialized_facts(&vault_fragments),
-                vault_plan.authority,
-                vault_plan.write_presentation.clone(),
-            )
-            .unwrap(),
-        ];
-        let publications = planned
-            .iter()
-            .map(|plan| Publication::new(plan, fixture.signer.verifying_key()))
-            .collect::<Vec<_>>();
-        let outcome = activate_publications(
+        let custody = secrets_custody_cutover::plan(&frozen, &fixture.signer).unwrap();
+        assert_eq!(custody.report().pre_collection_source_facts, 0);
+        assert_eq!(custody.report().direct_source_facts, post_facts.len());
+        let outcome = activate_collections(
             &fixture.live,
-            &fixture.target(),
-            &fixture.candidate,
-            &frozen,
             &fixture.signer,
-            &publications,
-            |_, _| Ok(()),
+            &frozen,
+            custody.namespace(),
+            custody.collections(),
+            secrets_custody_cutover::validate_candidate_views,
         )
         .unwrap();
         assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
@@ -1561,6 +1589,19 @@ mod tests {
         assert_eq!(target.catalog().wraps[&post_wrap.id], post_wrap);
         drop(discovered);
         pile.close().unwrap();
+
+        let replay_source = freeze_source(&fixture.live).unwrap();
+        let replay = secrets_custody_cutover::plan(&replay_source, &fixture.signer).unwrap();
+        let outcome = activate_collections(
+            &fixture.live,
+            &fixture.signer,
+            &replay_source,
+            replay.namespace(),
+            replay.collections(),
+            secrets_custody_cutover::validate_candidate_views,
+        )
+        .unwrap();
+        assert_eq!(outcome, ActivationOutcome::AlreadyActive);
     }
 
     #[test]

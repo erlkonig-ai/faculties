@@ -46,13 +46,19 @@ pub fn requires_legacy_password(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Clone, Copy)]
-struct PlannedActivationReader<'a, Overlay> {
+pub(crate) struct PlannedActivationReader<'a, Overlay> {
     overlay: &'a Overlay,
     source: &'a PileReader,
 }
 
+impl<'a, Overlay> PlannedActivationReader<'a, Overlay> {
+    pub(crate) const fn new(overlay: &'a Overlay, source: &'a PileReader) -> Self {
+        Self { overlay, source }
+    }
+}
+
 #[derive(Debug)]
-struct PlannedActivationReadError(String);
+pub(crate) struct PlannedActivationReadError(String);
 
 impl fmt::Display for PlannedActivationReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -157,6 +163,23 @@ impl PlannedCollection {
 
     pub fn policy(&self) -> &TargetPolicy {
         &self.policy
+    }
+
+    /// Include one existing native faculty collection in the closed candidate
+    /// view without publishing a COMMIT to it.
+    ///
+    /// Later migrations use this to validate cross-collection references
+    /// against the exact post-migration world while keeping their write set
+    /// limited to the collections they actually change.
+    pub(crate) fn observe(scope: Id) -> Self {
+        Self {
+            name: faculties::collection_names::require_name(scope),
+            reach: faculties::collection_names::require_reach(scope),
+            view: CandidateViewKey::Faculty(scope),
+            policy: TargetPolicy::Open,
+            fragments: Vec::new(),
+            expected_facts: TribleSet::new(),
+        }
     }
 
     fn new(

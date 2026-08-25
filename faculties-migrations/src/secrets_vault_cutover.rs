@@ -48,7 +48,10 @@ pub struct VaultMigrationReport {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SecretsVaultMigrationReport {
+    /// Total source facts consumed across both predecessor generations.
     pub source_facts: usize,
+    pub pre_collection_source_facts: usize,
+    pub direct_source_facts: usize,
     pub vaults: Vec<VaultMigrationReport>,
 }
 
@@ -425,15 +428,16 @@ fn vault_created_at(scope: &legacy::ScopeRow) -> Result<legacy::IntervalValue> {
         .ok_or_else(|| anyhow!("legacy scope {} has no creation observation", scope.id))
 }
 
-/// Translate an exact pre-collection legacy Secrets projection directly into
-/// zero or more vault plans. The projection is an in-memory source boundary,
-/// never a fixed native `secrets` collection or an authority target.
-pub(crate) fn plan_from_legacy_in_store<S>(
+/// Shared projection from explicit predecessor generations into custody
+/// successors. Public migration entry points below choose which source
+/// generation is admissible rather than exposing an ambient mixed resolver.
+fn plan_from_sources_in_store<S>(
     pile: &mut S,
     signer: &SigningKey,
     reader: &PileReader,
     source: TribleSet,
     password: Option<&[u8]>,
+    direct_inventory: BTreeMap<Id, CollectionHandle>,
 ) -> Result<SecretsVaultMigrationPlan>
 where
     S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
@@ -447,8 +451,6 @@ where
     let identity_keys = legacy::identity_public_keys(reader, &catalog)?;
     let (access_candidates, _) = discover_access_candidates(&mut *pile, signer)
         .context("discover existing founder access candidates")?;
-    let direct_inventory = legacy_authority::discover_root_direct_vaults(&mut *pile, signer)
-        .context("discover retired root READ direct-vault inventory")?;
     let source_vaults = catalog
         .scopes
         .keys()
@@ -482,6 +484,8 @@ where
         direct_by_vault.insert(vault, direct);
         target_by_vault.insert(vault, target);
     }
+    let direct_source_facts = direct_by_vault.values().map(TribleSet::len).sum::<usize>();
+    let pre_collection_source_facts = source.len();
 
     let mut claimed_secrets = BTreeMap::<Id, Id>::new();
     let mut access_inbox = Vec::new();
@@ -756,7 +760,9 @@ where
     }
 
     let report = SecretsVaultMigrationReport {
-        source_facts: source.len(),
+        source_facts: pre_collection_source_facts + direct_source_facts,
+        pre_collection_source_facts,
+        direct_source_facts,
         vaults: vaults.iter().map(|vault| vault.report.clone()).collect(),
     };
     Ok(SecretsVaultMigrationPlan {
@@ -765,6 +771,62 @@ where
         vaults,
         report,
     })
+}
+
+/// Translate an exact pre-collection Secrets projection directly into zero or
+/// more current vault plans. The projection is an in-memory source boundary,
+/// never a fixed native `secrets` collection or an authority target. A native
+/// direct-vault generation is rejected rather than silently mixing two
+/// independently named migrations.
+pub(crate) fn plan_from_legacy_in_store<S>(
+    pile: &mut S,
+    signer: &SigningKey,
+    reader: &PileReader,
+    source: TribleSet,
+    password: Option<&[u8]>,
+) -> Result<SecretsVaultMigrationPlan>
+where
+    S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
+    S::Reader: BlobStoreMeta,
+{
+    let direct_inventory = legacy_authority::discover_root_direct_vaults(&mut *pile, signer)
+        .context("check for a native direct-vault predecessor generation")?;
+    if !direct_inventory.is_empty() {
+        bail!(
+            "native direct-recipient Secrets vaults are already present; use `migrations secrets-custody plan|activate` instead of replaying the legacy-branch migration"
+        );
+    }
+    plan_from_sources_in_store(pile, signer, reader, source, password, BTreeMap::new())
+        .context("plan custody successors from pre-collection Secrets evidence")
+}
+
+/// Upgrade the retired native direct-recipient vault generation without
+/// consulting the older pre-collection Secrets branch.
+///
+/// The direct-vault inventory is reconstructed from the durable root's exact
+/// historical READ grants. No pre-collection projection or password enters
+/// this API: every secret, attachment and direct DEK wrap used by this path
+/// must already be present in the native predecessor collections.
+pub(crate) fn plan_from_direct_in_store<S>(
+    pile: &mut S,
+    signer: &SigningKey,
+    reader: &PileReader,
+) -> Result<SecretsVaultMigrationPlan>
+where
+    S: BlobStore<Reader = PileReader> + triblespace::core::collection::CollectionStore,
+    S::Reader: BlobStoreMeta,
+{
+    let direct_inventory = legacy_authority::discover_root_direct_vaults(&mut *pile, signer)
+        .context("discover retired root READ direct-vault inventory")?;
+    plan_from_sources_in_store(
+        pile,
+        signer,
+        reader,
+        TribleSet::new(),
+        None,
+        direct_inventory,
+    )
+    .context("plan custody successors from native direct-recipient vaults")
 }
 
 #[cfg(test)]

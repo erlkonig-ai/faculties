@@ -53,7 +53,7 @@ macro_rules! faculties {
         }
 
         impl Faculty {
-            /// Every migratable faculty, in the order `plan-cutover` lists them.
+            /// Every migratable faculty, in the order `legacy-branches plan` lists them.
             pub const ALL: &'static [Faculty] = &[ $( Faculty::$variant ),+ ];
 
             /// The name used on the command line and in the aggregate plan.

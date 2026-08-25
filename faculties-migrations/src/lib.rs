@@ -52,6 +52,7 @@ pub mod planner_cutover;
 pub mod posture_cutover;
 pub mod posture_findings;
 pub mod relations_cutover;
+pub mod secrets_custody_cutover;
 pub mod secrets_cutover;
 pub mod secrets_vault_cutover;
 pub mod status_cutover;
