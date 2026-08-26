@@ -42,18 +42,71 @@ DUE_ONLY=0
 found=0
 report=""
 
-note() { found=1; report="${report}$1"$'\n'; }
+# In --due mode the ANSWER is a boolean, so stop at the first finding. The full
+# report costs ~6s across 75 trees; the question "is there anything" usually
+# costs a fraction of that, and it is the one asked every 60 seconds.
+note() {
+  found=1
+  report="${report}$1"$'\n'
+  [ "$DUE_ONLY" = "1" ] && exit 0
+}
 
+# A WORKTREE's `.git` is a FILE, not a directory. Testing `-d` skipped all 33 of
+# them here against 42 real repositories -- a 44% blind spot in exactly the
+# artifact class this file exists for. Worktrees are also the only place a
+# DETACHED HEAD can hide, and a detached worktree is invisible to every
+# branch-based check by construction: there is no branch to be unmerged.
 for repo in "$ROOT"/*/; do
-  [ -d "$repo/.git" ] || continue
+  [ -e "$repo/.git" ] || continue
   name=$(basename "$repo")
   cd "$repo" 2>/dev/null || continue
+
+  # Worktrees SHARE the parent repository's refs, so running the branch checks in
+  # each one would report the same branch once per worktree. Give them only the
+  # checks that are theirs: what HEAD is doing, and what is uncommitted in them.
+  is_worktree=0
+  [ -f "$repo/.git" ] && is_worktree=1
+
+  if [ "$is_worktree" = "1" ]; then
+    wdirty=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+    [ "${wdirty:-0}" -gt 0 ] && note "  $name (worktree): $wdirty tracked file(s) uncommitted"
+    # A detached worktree looks healthy and has silently stopped following its
+    # branch. On 2026-08-26 both Sparks sat detached at a109514 -- correct
+    # CONTENT, no attachment -- so `git pull` did nothing and they fell six
+    # commits behind without a symptom. `git checkout <sha>` is the usual cause;
+    # `git checkout -B <name> <sha>` is what was meant.
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+      # ORPHANED, not detached: the .git file points at worktree metadata the
+      # parent repository has already pruned, so this is a dead directory
+      # wearing a worktree's clothes. `git worktree prune` removed the record
+      # and left the tree. It reports as detached to any naive check because
+      # every git query against it fails identically.
+      note "  $name (worktree): ORPHANED -- gitdir is gone, run 'git worktree prune' in the parent and remove this directory"
+    elif [ -z "$(git branch --show-current 2>/dev/null)" ]; then
+      note "  $name (worktree): DETACHED at $(git log --oneline -1 2>/dev/null | cut -c1-40)"
+    fi
+    continue
+  fi
 
   # 1. Uncommitted work. Ignores untracked build noise; tracked edits only,
   #    because an untracked file is usually a log and a tracked edit is usually
   #    a thought someone had.
+  # AGE IT. Work uncommitted for ten minutes is work in progress; work
+  # uncommitted for six hours has been forgotten. Flagging both makes the
+  # detector fire continuously while someone is editing, which is the noise
+  # failure -- a detector you learn to ignore is a detector that is off.
+  # STRANDED_MINUTES sets the line; the default assumes a session boundary.
+  mins=${STRANDED_MINUTES:-90}
   dirty=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
-  [ "${dirty:-0}" -gt 0 ] && note "  $name: $dirty tracked file(s) uncommitted"
+  if [ "${dirty:-0}" -gt 0 ]; then
+    oldest=$(git status --porcelain --untracked-files=no 2>/dev/null | awk '{print $NF}' \
+             | while read -r f; do [ -e "$f" ] && stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null; done \
+             | sort -n | head -1)
+    if [ -n "$oldest" ]; then
+      agem=$(( ( $(date +%s) - oldest ) / 60 ))
+      [ "$agem" -ge "$mins" ] && note "  $name: $dirty tracked file(s) uncommitted, oldest ${agem}m"
+    fi
+  fi
 
   # 2. Local commits on no remote. This is the one that loses work outright, and
   #    it is the check `worktree-audit.py` declares it does not do.
@@ -72,6 +125,28 @@ for repo in "$ROOT"/*/; do
     n=$(git rev-list --count "$br" --not --remotes 2>/dev/null || echo 0)
     [ "${n:-0}" -gt 0 ] && note "  $name: branch '$br' has $n commit(s) on no remote"
   done
+
+  # 2b. EVERY BRANCH OWES A DISPOSITION. A branch is fine if it is one of three
+  #     things, and needs a decision if it is none of them:
+  #       merged into main and deleted  -- the work landed
+  #       named `negative-*`            -- a measured dead end, kept deliberately
+  #       under a live worktree         -- someone is working in it
+  #     Anything else is the ambiguous middle, and the ambiguous middle is where
+  #     everything stranded on 2026-08-26 was living. The point is not to delete
+  #     it; it is that "I have not decided" stops being a silent option.
+  wt_branches=$(git worktree list --porcelain 2>/dev/null | sed -n 's/^branch refs\/heads\///p' | tr '\n' '|')
+  # for-each-ref carries the committer date, so this is ONE call rather than a
+  # `git log` per branch. That mattered: the per-branch form pushed a detector
+  # that runs every 60 seconds from 4.4s to 5.6s.
+  now=$(date +%s)
+  git for-each-ref --format='%(refname:short) %(committerdate:unix)' refs/heads 2>/dev/null | while read -r br when; do
+    case "$br" in main|master|negative-*|negative/*) continue ;; esac
+    case "|$wt_branches" in *"|$br|"*) continue ;; esac   # a live worktree is a claim
+    age=$(( (now - ${when:-$now}) / 86400 ))
+    [ "$age" -ge 2 ] && echo "  $name: branch '$br' owes a disposition (${age}d idle) -- merge+delete, rename negative-*, or claim it"
+  done > /tmp/.sw_disp.$$ 2>/dev/null
+  if [ -s /tmp/.sw_disp.$$ ]; then found=1; report="${report}$(cat /tmp/.sw_disp.$$)"$'\n'; fi
+  rm -f /tmp/.sw_disp.$$
 
   # 3. Merged and not deleted. Cheap, and it is the husk that made finished work
   #    look unfinished all day.
