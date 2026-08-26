@@ -122,6 +122,16 @@ for repo in "$ROOT"/*/; do
   if [ "$(git remote 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ]; then continue; fi
 
   for br in $(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null); do
+    # `archive-*`/`archive/*` is a CLAIM, and it carries an obligation: naming a
+    # branch this way asserts that its bytes are preserved somewhere durable that
+    # is NOT this checkout, and that a note somewhere says where. It exists
+    # because a branch can be legitimately unpushable -- 2026-08-26, playground's
+    # Teams-daemon tip could not go to `origin` because posture correctly found a
+    # protected term in the range, so it was bundled into the pile (which
+    # replicates to three machines) and given a wiki fragment. Without this case
+    # the detector would nag forever about a thing that was already handled, and a
+    # detector that cries wolf on resolved work teaches you to skim it.
+    case "$br" in archive-*|archive/*) continue ;; esac
     n=$(git rev-list --count "$br" --not --remotes 2>/dev/null || echo 0)
     [ "${n:-0}" -gt 0 ] && note "  $name: branch '$br' has $n commit(s) on no remote"
   done
@@ -130,6 +140,7 @@ for repo in "$ROOT"/*/; do
   #     things, and needs a decision if it is none of them:
   #       merged into main and deleted  -- the work landed
   #       named `negative-*`            -- a measured dead end, kept deliberately
+  #       named `archive-*`/`archive/*` -- preserved deliberately; see below
   #       under a live worktree         -- someone is working in it
   #     Anything else is the ambiguous middle, and the ambiguous middle is where
   #     everything stranded on 2026-08-26 was living. The point is not to delete
@@ -140,10 +151,10 @@ for repo in "$ROOT"/*/; do
   # that runs every 60 seconds from 4.4s to 5.6s.
   now=$(date +%s)
   git for-each-ref --format='%(refname:short) %(committerdate:unix)' refs/heads 2>/dev/null | while read -r br when; do
-    case "$br" in main|master|negative-*|negative/*) continue ;; esac
+    case "$br" in main|master|negative-*|negative/*|archive-*|archive/*) continue ;; esac
     case "|$wt_branches" in *"|$br|"*) continue ;; esac   # a live worktree is a claim
     age=$(( (now - ${when:-$now}) / 86400 ))
-    [ "$age" -ge 2 ] && echo "  $name: branch '$br' owes a disposition (${age}d idle) -- merge+delete, rename negative-*, or claim it"
+    [ "$age" -ge 2 ] && echo "  $name: branch '$br' owes a disposition (${age}d idle) -- merge+delete, rename negative-*/archive-*, or claim it"
   done > /tmp/.sw_disp.$$ 2>/dev/null
   if [ -s /tmp/.sw_disp.$$ ]; then found=1; report="${report}$(cat /tmp/.sw_disp.$$)"$'\n'; fi
   rm -f /tmp/.sw_disp.$$
