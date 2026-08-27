@@ -35,7 +35,14 @@ All notable changes to this project will be documented in this file.
   incoming direction for free, so unreferenced live entries are listed too, and
   the number of indexed legacy anchors is printed beside the class counts so a
   zero there reads as "none is cited" rather than "the index is empty".
-  `wiki check` shares the classifier; `wiki links <id>` is unchanged.
+  `wiki check` shares the classifier, and `wiki links <id>` now says WHY a
+  selector failed instead of only that it did: a legacy anchor is named as
+  one, along with the entry it stood for, and an id no fragment ever had is
+  told apart from it. That is not hypothetical -- both wiki ids named by the
+  standing orphan goals fail the lookup, and both turn out to be anchors
+  (`720f8deb…` for "Review: S199 — Scoring Assumption Check", `772353f1…` for
+  "Session Reflection: The Encoding Problem"), which "no Wiki id matches"
+  alone could never have told anyone. Only the failure path pays for it.
 
 - **`gauge`'s frontier model now lives in `faculties::wiki`.** `gauge` is
   wiki-only -- every faculty import in it is wiki or generic infrastructure,

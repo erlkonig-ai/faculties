@@ -958,7 +958,10 @@ fn cmd_links(storage: WikiStorage<'_>, id: Option<String>, top: usize, strict: b
     let Some(id) = id else {
         return cmd_link_audit(&view, &catalog, top, strict);
     };
-    let entry = mutation_entry(&catalog.revisions, &id)?;
+    let entry = match mutation_entry(&catalog.revisions, &id) {
+        Ok(entry) => entry,
+        Err(error) => return Err(explain_selector(&view, &catalog, &id, error)),
+    };
     println!("outgoing:");
     for target in derived_links(&view.reader, entry)? {
         println!("  {target:x}");
@@ -968,6 +971,66 @@ fn cmd_links(storage: WikiStorage<'_>, id: Option<String>, top: usize, strict: b
         println!("  {source:x}");
     }
     Ok(())
+}
+
+/// Say WHY an id does not resolve, not merely that it does not.
+///
+/// An id someone is holding -- out of an old note, a compass goal, a
+/// pre-cutover citation -- fails for three different reasons, and "no Wiki id
+/// matches" is the same sentence for all of them. Only reached on the failure
+/// path, so the ordinary lookup pays nothing for it.
+fn explain_selector(
+    view: &CollectionView,
+    catalog: &WikiCatalog,
+    raw: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let Some(target) = Id::from_hex(raw.trim()) else {
+        return error;
+    };
+    let model = match FrontierModel::load(catalog, &view.reader, &view.facts) {
+        Ok(model) => model,
+        Err(load_error) => return error.context(load_error),
+    };
+    let entry = |index: usize| {
+        let entry = &model.entries[index];
+        format!("{} [wiki:{:x}]", short(&entry.title(), 55), entry.label)
+    };
+    let diagnosis = match model.classify(target) {
+        LinkClass::Legacy { entries, retired } => format!(
+            "it is a LEGACY FRAGMENT ANCHOR for {}{}. Anchors stopped being \
+             selectors on 2026-08-18 -- an id names a revision or it names \
+             nothing -- so cite a revision of that entry instead.",
+            entries
+                .iter()
+                .map(|index| entry(*index))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            if retired { " (archived)" } else { "" }
+        ),
+        LinkClass::Unwritten(Some(kind)) => format!(
+            "it names a {}, not a page. Nothing in the wiki is addressable by it.",
+            kind.label()
+        ),
+        LinkClass::Unwritten(None) => {
+            "no fragment has ever had it, at any revision. If it came from another \
+             pile, it is that pile's id and does not travel."
+                .to_owned()
+        }
+        // A resolvable id reaches here only when the selector spans entries.
+        LinkClass::Live(index) | LinkClass::Retired(index) => {
+            format!("it resolves to {}", entry(index))
+        }
+        LinkClass::Ambiguous(candidates) => format!(
+            "it names several disconnected entries: {}",
+            candidates
+                .iter()
+                .map(|index| entry(*index))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ),
+    };
+    error.context(diagnosis)
 }
 
 fn describe_target(model: &FrontierModel, reference: &LinkReference) -> String {
@@ -2236,6 +2299,55 @@ mod tests {
         assert_eq!(
             read_string(&after.reader, head.content).unwrap(),
             format!("see #link(\"wiki:{target:x}\")[the page]")
+        );
+    }
+
+    /// A selector that does not resolve must say WHICH kind of not-resolving.
+    ///
+    /// Measured need, not a hypothetical: the two wiki ids named by the
+    /// standing orphan goals both fail this lookup, and both turn out to be
+    /// legacy anchors rather than typos -- which "no Wiki id matches" alone
+    /// could never tell anyone.
+    #[test]
+    fn a_failed_selector_says_whether_it_is_an_anchor_or_nothing() {
+        let fixture = Fixture::new();
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let (author_fragment, _) = wiki_model::author_record(&signer.verifying_key());
+        let (legacy, anchor, _v1, _v2) = legacy_anchor_pair();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer)
+            .commit(author_fragment + legacy)
+            .unwrap();
+        pile.close().unwrap();
+
+        let storage = fixture.storage();
+        let view = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&view.facts).unwrap();
+
+        let anchor_hex = format!("{anchor:x}");
+        let reported = explain_selector(
+            &view,
+            &catalog,
+            &anchor_hex,
+            anyhow!("no Wiki id matches '{anchor_hex}'"),
+        )
+        .to_string();
+        assert!(
+            reported.contains("LEGACY FRAGMENT ANCHOR"),
+            "an anchor must be named as one; got: {reported}"
+        );
+
+        let never = "ffffffffffffffffffffffffffffffff";
+        let reported = explain_selector(
+            &view,
+            &catalog,
+            never,
+            anyhow!("no Wiki id matches '{never}'"),
+        )
+        .to_string();
+        assert!(
+            reported.contains("no fragment has ever had it") && !reported.contains("ANCHOR"),
+            "an id no fragment ever had must not be called an anchor; got: {reported}"
         );
     }
 }
